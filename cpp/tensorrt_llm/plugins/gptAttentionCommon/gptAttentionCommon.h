@@ -135,6 +135,9 @@ protected:
         int32_t max_blocks_per_sequence;
         int32_t const* host_context_lengths;
         void* workspace;
+        float2 const* mrope_rotary_sin_cos = nullptr;
+        int32_t const* mrope_position_deltas = nullptr;
+
         // optional when relative position
         T const* relative_attention_bias = nullptr;
         int relative_attention_bias_stride = 0;
@@ -237,6 +240,9 @@ protected:
         int32_t* semaphores;
         void* workspace;
         int32_t const* host_past_key_value_lengths;
+        float2 const* mrope_rotary_sin_cos = nullptr;
+        int32_t const* mrope_position_deltas = nullptr;
+
         // optional when relative position
         T const* relative_attention_bias = nullptr;
         int relative_attention_bias_stride = 0;
@@ -293,7 +299,8 @@ protected:
     {
         return mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kROPE_GPTJ
             || mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kROPE_GPT_NEOX
-            || mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kLONG_ROPE;
+            || mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kLONG_ROPE
+            || mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kROPE_M;
     }
 
     bool isLongRoPE() const
@@ -304,6 +311,11 @@ protected:
     bool isUnfusedCrossAttention() const
     {
         return !mEnableContextFMHA && mCrossAttention;
+    }
+
+    bool isMRoPE() const
+    {
+        return mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kROPE_M;
     }
 
     bool isCrossAttention() const

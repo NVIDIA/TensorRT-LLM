@@ -116,6 +116,7 @@ struct FusedQKVMaskedAttentionDispatchParams
     int max_distance = 0;
     bool block_sparse_attention = false;
     BlockSparseParams block_sparse_params;
+    int32_t const* mrope_position_deltas;
 };
 
 template <typename T, typename KVCacheBuffer>
@@ -251,6 +252,9 @@ bool GPTAttentionPluginCommon::convertMMHAParamsToXQAParams(tensorrt_llm::kernel
         = generationsParams.spec_decoding_is_generation_length_variable;
     xqaParams.spec_decoding_max_generation_length = generationsParams.spec_decoding_max_generation_length;
 
+    xqaParams.mrope_rotary_sin_cos = generationsParams.mrope_rotary_sin_cos;
+    xqaParams.mrope_position_deltas = generationsParams.mrope_position_deltas;
+
     xqaParams.total_num_input_tokens = generationsParams.total_num_input_tokens;
     xqaParams.fp8_out_scale = (mFP8ContextFMHA ? generationsParams.attention_output_orig_quant : nullptr);
     return true;
@@ -376,6 +380,8 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
 
     // cross attn
     params.memory_length_per_sample = input_params.memory_length_per_sample;
+
+    params.mrope_position_deltas = input_params.mrope_position_deltas;
     sync_check_cuda_error();
 
     masked_multihead_attention(params, input_params.kv_block_array, input_params.shift_k_cache_buffer, stream);
@@ -1248,6 +1254,8 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T> const& para
         preprocessingParams.cu_kv_seq_lens = cu_kv_seqlens;
         preprocessingParams.rotary_embedding_inv_freq = rotary_inv_freq_buf;
         preprocessingParams.rotary_coef_cache_buffer = params.rotary_cos_sin;
+        preprocessingParams.mrope_rotary_sin_cos = params.mrope_rotary_sin_cos;
+        preprocessingParams.mrope_position_deltas = params.mrope_position_deltas;
         preprocessingParams.kvScaleOrigQuant = params.kv_scale_orig_quant;
         preprocessingParams.spec_decoding_position_offsets = nullptr;
 
@@ -1861,6 +1869,7 @@ int GPTAttentionPluginCommon::enqueueGeneration(EnqueueGenerationParams<T> const
     dispatch_params.memory_length_per_sample = params.encoder_input_lengths;
     dispatch_params.block_sparse_attention = mMaskType == AttentionMaskType::BLOCKSPARSE;
     dispatch_params.block_sparse_params = mBlockSparseParams;
+    dispatch_params.mrope_position_deltas = params.mrope_position_deltas;
 
     using DataType = typename SATypeConverter<T>::Type;
     if (!isCrossAttention())

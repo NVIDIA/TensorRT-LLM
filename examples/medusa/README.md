@@ -5,9 +5,9 @@ This document shows how to build and run a model using Medusa decoding([`Github`
 ## Overview
 Different from other models, Medusa decoding need a base model and Medusa heads.
 
-The TensorRT-LLM Medusa Decoding implementation can be found in [tensorrt_llm/models/medusa/model.py](../../tensorrt_llm/models/medusa/model.py), which actually adds MedusaHeads to a base model.
+The TensorRT-LLM Medusa Decoding implementation can be found in [tensorrt_llm/models/medusa/model.py](../../tensorrt_llm/models/medusa/model.py). The implementation adds Medusa heads to a base model.
 
-For more info about Medusa visit [speculative decoding documentation](../../docs/source/speculative_decoding.md).
+For more info about Medusa visit [speculative decoding documentation](https://nvidia.github.io/TensorRT-LLM/advanced/speculative-decoding.html).
 
 ## Support Matrix
   * GPU Compute Capability >= 8.0 (Ampere or newer)
@@ -92,12 +92,12 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_base_model_fp8_medusa_fp16 
 
 ### Run
 To run a TensorRT-LLM model with Medusa decoding support, we can use `../run.py` script, with an additional argument `--medusa_choices`.
-The `--medusa_choices` is of type list[list[int]], And also the built engine with Medusa decoding support.
+The `--medusa_choices` is of type `list[list[int]]`.
 
 Medusa decoding is supported by Python runtime and C++ runtime with inflight-batching. C++ runtime is recommended for performance.
 For Python runtime use `--use_py_session` flag to `run.py`.
 
-Note: Medusa decoding only supporting greedy decoding `temperature=1.0` now. So also need `--temperature 1.0`.
+Medusa decoding only supporting greedy decoding, indicated by `temperature=1.0` argument. The output is equivalent to the base model inference with `--temperature 0.0` (equivalent to `--temperature 1.0 --top-k 1`).
 
 ```bash
 # Medusa decoding using vicuna-7b-v1.3 model with 1 GPU

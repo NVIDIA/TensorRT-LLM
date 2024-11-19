@@ -27,7 +27,7 @@ from ..functional import (ACT2FN, AllReduceFusionOp, AllReduceFusionParams,
                           concat, constant, embedding, generate_alibi_slopes,
                           gpt_attention, matmul, mul, shape, slice, softmax,
                           split, where)
-from ..layers import SpecDecodingParams
+from ..layers import MropeParams, SpecDecodingParams
 from ..layers.embedding import Embedding
 from ..layers.linear import Linear, RowLinear
 from ..module import Module
@@ -104,14 +104,16 @@ class SmoothQuantLinear(Linear):
                  tp_group=None,
                  tp_size=1,
                  gather_output=True,
-                 quant_mode=QuantMode(0)):
+                 quant_mode=QuantMode(0),
+                 prefer_managed_weight=True):
         super().__init__(in_features,
                          out_features,
                          bias=bias,
                          dtype=dtype,
                          tp_group=tp_group,
                          tp_size=tp_size,
-                         gather_output=gather_output)
+                         gather_output=gather_output,
+                         prefer_managed_weight=prefer_managed_weight)
 
         if not quant_mode.has_act_and_weight_quant():
             raise ValueError(
@@ -123,7 +125,8 @@ class SmoothQuantLinear(Linear):
             weights_dtype = "int8"
 
         self.weight = Parameter(shape=(self.out_features, self.in_features),
-                                dtype=weights_dtype)
+                                dtype=weights_dtype,
+                                prefer_managed=self.prefer_managed_weight)
 
         if quant_mode.has_act_and_weight_quant():
             scale_shape = (1, self.out_features
@@ -174,13 +177,15 @@ class SmoothQuantRowLinear(RowLinear):
             tp_group=None,
             tp_size=1,
             quant_mode=QuantMode(0),
+            prefer_managed_weight=True,
     ):
         super().__init__(in_features,
                          out_features,
                          bias=bias,
                          dtype=dtype,
                          tp_group=tp_group,
-                         tp_size=tp_size)
+                         tp_size=tp_size,
+                         prefer_managed_weight=prefer_managed_weight)
         if not quant_mode.has_act_and_weight_quant():
             raise ValueError(
                 "SmoothQuant Linear has to have act+weight quantization mode set"
@@ -190,7 +195,8 @@ class SmoothQuantRowLinear(RowLinear):
             weights_dtype = "int8"
 
         self.weight = Parameter(shape=(self.out_features, self.in_features),
-                                dtype=weights_dtype)
+                                dtype=weights_dtype,
+                                prefer_managed=self.prefer_managed_weight)
         self.smoother = Parameter(shape=(1, self.in_features), dtype="float32")
         if quant_mode.has_act_and_weight_quant():
             scale_shape = (1, self.out_features
@@ -712,6 +718,7 @@ class WeightOnlyQuantLinear(Linear):
         transa=False,
         transb=False,
         is_qkv=False,
+        prefer_managed_weight=True,
     ):
         multiple = 64 * tp_size
         self.is_padded = False
@@ -729,7 +736,8 @@ class WeightOnlyQuantLinear(Linear):
                          tp_group=tp_group,
                          tp_size=tp_size,
                          gather_output=gather_output,
-                         is_qkv=is_qkv)
+                         is_qkv=is_qkv,
+                         prefer_managed_weight=prefer_managed_weight)
         if quant_mode.is_int8_weight_only():
             self.weight_only_quant_mode = 1
             quant_type_size_in_bits = 8
@@ -740,7 +748,8 @@ class WeightOnlyQuantLinear(Linear):
         self.weight = Parameter(shape=(self.in_features,
                                        int(self.out_features *
                                            quant_type_size_in_bits / 8)),
-                                dtype="int8")
+                                dtype="int8",
+                                prefer_managed=self.prefer_managed_weight)
 
         scale_shape = (self.out_features, )
         self.per_channel_scale = Parameter(shape=scale_shape, dtype=dtype)
@@ -804,6 +813,7 @@ class WeightOnlyQuantRowLinear(RowLinear):
             tp_size=1,
             tp_rank=0,
             quant_mode=QuantMode.use_weight_only(),
+            prefer_managed_weight=True,
     ):
         multiple = 64 * tp_size
         self.is_padded = False
@@ -819,7 +829,8 @@ class WeightOnlyQuantRowLinear(RowLinear):
                          bias=bias,
                          dtype=dtype,
                          tp_group=tp_group,
-                         tp_size=tp_size)
+                         tp_size=tp_size,
+                         prefer_managed_weight=prefer_managed_weight)
         if quant_mode.is_int8_weight_only():
             self.weight_only_quant_mode = 1
         elif quant_mode.is_int4_weight_only():
@@ -828,7 +839,8 @@ class WeightOnlyQuantRowLinear(RowLinear):
         self.weight = Parameter(shape=(self.in_features,
                                        int(self.out_features /
                                            self.weight_only_quant_mode)),
-                                dtype="int8")
+                                dtype="int8",
+                                prefer_managed=prefer_managed_weight)
         self.per_channel_scale = Parameter(shape=(self.out_features, ),
                                            dtype=dtype)
         self.tp_rank = tp_rank
@@ -954,6 +966,7 @@ class WeightOnlyGroupwiseQuantLinear(Linear):
         use_w4a8_awq=False,
         use_int8_weight=False,
         is_qkv=False,
+        prefer_managed_weight=True,
     ):
         multiple = max((128 if use_w4a8_awq else 64), group_size) * tp_size
         self.is_padded = False
@@ -971,7 +984,8 @@ class WeightOnlyGroupwiseQuantLinear(Linear):
                          tp_group=tp_group,
                          tp_size=tp_size,
                          gather_output=gather_output,
-                         is_qkv=is_qkv)
+                         is_qkv=is_qkv,
+                         prefer_managed_weight=prefer_managed_weight)
 
         # Flags for indicating whether the corresponding inputs are applied in quant_algo
         BIAS = 1
@@ -989,7 +1003,8 @@ class WeightOnlyGroupwiseQuantLinear(Linear):
         pack_ratio = 2 if use_int8_weight else 4
         self.weight = Parameter(shape=(self.in_features,
                                        self.out_features // pack_ratio),
-                                dtype=dtype)
+                                dtype=dtype,
+                                prefer_managed=self.prefer_managed_weight)
 
         scale_shape = (self.in_features // group_size, self.out_features)
         self.weights_scaling_factor = Parameter(shape=scale_shape, dtype=dtype)
@@ -1077,7 +1092,8 @@ class WeightOnlyGroupwiseQuantRowLinear(RowLinear):
                  tp_size=1,
                  tp_rank=0,
                  use_w4a8_awq=False,
-                 use_int8_weight=False):
+                 use_int8_weight=False,
+                 prefer_managed_weight=True):
         multiple = max((128 if use_w4a8_awq else 64), group_size) * tp_size
         self.is_padded = False
         if in_features % multiple > 0:
@@ -1091,7 +1107,8 @@ class WeightOnlyGroupwiseQuantRowLinear(RowLinear):
                          bias=bias,
                          dtype=dtype,
                          tp_group=tp_group,
-                         tp_size=tp_size)
+                         tp_size=tp_size,
+                         prefer_managed_weight=prefer_managed_weight)
 
         # Flags for indicating whether the corresponding inputs are applied in quant_algo
         BIAS = 1
@@ -1109,7 +1126,8 @@ class WeightOnlyGroupwiseQuantRowLinear(RowLinear):
         pack_ratio = 2 if use_int8_weight else 4
         self.weight = Parameter(shape=(self.in_features,
                                        self.out_features // pack_ratio),
-                                dtype=dtype)
+                                dtype=dtype,
+                                prefer_managed=self.prefer_managed_weight)
         scale_shape = (self.in_features // group_size, self.out_features)
         self.weights_scaling_factor = Parameter(shape=scale_shape, dtype=dtype)
         self.tp_rank = tp_rank
@@ -1252,13 +1270,15 @@ class Int8SmoothQuantRowLinear(RowLinear):
                  bias=True,
                  dtype=None,
                  tp_group=None,
-                 tp_size=1):
+                 tp_size=1,
+                 prefer_managed_weight=True):
         super().__init__(in_features,
                          out_features,
                          bias=bias,
                          dtype=dtype,
                          tp_group=tp_group,
-                         tp_size=tp_size)
+                         tp_size=tp_size,
+                         prefer_managed_weight=prefer_managed_weight)
         self.activation_scaling_factor = Parameter(shape=(1, ),
                                                    dtype=trt.float32)
         self.weights_scaling_factor = Parameter(shape=(self.out_features, ),
@@ -1266,7 +1286,8 @@ class Int8SmoothQuantRowLinear(RowLinear):
         self.prequant_scaling_factor = Parameter(shape=(self.in_features, ),
                                                  dtype=dtype)
         self.weight = Parameter(shape=(self.out_features, self.in_features),
-                                dtype=trt.int8)
+                                dtype=trt.int8,
+                                prefer_managed=self.prefer_managed_weight)
 
     def forward(self, x, lora_runtime_params=None, reduce_fusion_params=None):
         lora_hidden_state = x if lora_runtime_params is not None else None
@@ -1311,6 +1332,7 @@ class Int8SmoothQuantLinear(Linear):
         tp_group=None,
         tp_size=1,
         gather_output=True,
+        prefer_managed_weight=True,
     ):
         super().__init__(in_features,
                          out_features,
@@ -1318,7 +1340,8 @@ class Int8SmoothQuantLinear(Linear):
                          dtype=dtype,
                          tp_group=tp_group,
                          tp_size=tp_size,
-                         gather_output=gather_output)
+                         gather_output=gather_output,
+                         prefer_managed_weight=prefer_managed_weight)
         self.activation_scaling_factor = Parameter(shape=(1, ),
                                                    dtype=trt.float32)
 
@@ -1327,7 +1350,8 @@ class Int8SmoothQuantLinear(Linear):
         self.prequant_scaling_factor = Parameter(shape=(self.in_features, ),
                                                  dtype=dtype)
         self.weight = Parameter(shape=(self.out_features, self.in_features),
-                                dtype=trt.int8)
+                                dtype=trt.int8,
+                                prefer_managed=self.prefer_managed_weight)
 
     def forward(self, x, lora_runtime_params=None):
         lora_hidden_state = x if lora_runtime_params is not None else None
@@ -2245,6 +2269,7 @@ class SmoothQuantAttention(Module):
         kv_cache_params=None,
         attention_params=None,
         spec_decoding_params=None,
+        mrope_params=None,
         encoder_output=None,
         position_embedding=None,
         norm_before_bmm1=False,
@@ -2268,6 +2293,9 @@ class SmoothQuantAttention(Module):
 
         if spec_decoding_params is None:
             spec_decoding_params = SpecDecodingParams()
+
+        if mrope_params is None:
+            mrope_params = MropeParams()
 
         if default_net().plugin_config.gpt_attention_plugin:
 
@@ -2340,6 +2368,8 @@ class SmoothQuantAttention(Module):
                 spec_decoding_position_offsets,
                 spec_decoding_packed_mask=spec_decoding_params.
                 spec_decoding_packed_mask,
+                mrope_rotary_sin_cos=mrope_params.mrope_rotary_sin_cos,
+                mrope_position_deltas=mrope_params.mrope_position_deltas,
                 host_runtime_perf_knobs=attention_params.
                 host_runtime_perf_knobs,
                 host_context_progress=attention_params.host_context_progress,

@@ -59,6 +59,7 @@ def create_trt_config_from_hf(model_dir,
         'num_attention_heads': n_head,
         'hidden_size': n_embd,
         'intermediate_size': inter_size,
+        'moe_intermediate_size': moe_inter_size,
         'num_key_value_heads': n_kv_head,
         'vocab_size': vocab_size,
         'position_embedding_type': 'rope_gpt_neox',
@@ -69,10 +70,10 @@ def create_trt_config_from_hf(model_dir,
         'rotary_scaling': rotary_scaling,
         'moe': {
             'num_experts': moe_num_experts,
+            'shared_expert_intermediate_size':
+            moe_num_shared_experts * moe_inter_size,
             'top_k': moe_top_k,
             'normalization_mode': moe_renorm_mode,
-            'num_shared_experts': moe_num_shared_experts,
-            'moe_intermediate_size': moe_inter_size,
         },
         'mapping': {
             'world_size': mapping.tp_size * mapping.pp_size,
@@ -220,54 +221,60 @@ def convert_deepseek(hf_model,
                 model_params, prefix + 'mlp.experts.down_proj', dtype)
             weights.update(
                 get_trtllm_linear_weight(moe_experts_down_proj_weights,
-                                         trtllm_prex + 'mlp.moe.proj.'))
+                                         trtllm_prex + 'mlp.proj.'))
             ##mlp.experts.up_gate.weight
             moe_experts_up_gate_proj_weights = get_weight(
                 model_params, prefix + 'mlp.experts.up_gate_proj', dtype)
             weights.update(
                 get_trtllm_linear_weight(moe_experts_up_gate_proj_weights,
-                                         trtllm_prex + 'mlp.moe.fc.'))
+                                         trtllm_prex + 'mlp.fc.'))
             ## MOE hardcoded routing_input into trt.float32, please refer to moe.py line 397
             moe_experts_gate_weights = get_weight(model_params,
                                                   prefix + 'mlp.gate',
                                                   torch.float32)
             weights.update(
                 get_trtllm_linear_weight(moe_experts_gate_weights,
-                                         trtllm_prex + 'mlp.moe.router.'))
+                                         trtllm_prex + 'mlp.router.'))
 
-            if moe_config.num_shared_experts > 0:
-                ## mlp.shared_experts.gate_proj.weight
-                shared_moe_gate_proj_weights = get_weight(
-                    model_params, prefix + 'mlp.shared_experts.gate_proj',
-                    dtype)
-                split_v = split_matrix_tp(shared_moe_gate_proj_weights,
-                                          mapping.tp_size,
-                                          mapping.tp_rank,
-                                          dim=0)
-                weights.update(
-                    get_trtllm_linear_weight(
-                        split_v, trtllm_prex + 'mlp.shared_experts.fc.'))
-                # mlp.shared_experts.down_proj.weight
+            if moe_config.shared_expert_intermediate_size > 0:
+                shared_moe_up_proj_weights = get_weight(
+                    model_params, prefix + 'mlp.shared_experts.up_proj', dtype)
+                shared_moe_up_proj_weights = split_matrix_tp(
+                    shared_moe_up_proj_weights,
+                    mapping.tp_size,
+                    mapping.tp_rank,
+                    dim=0)
                 shared_moe_down_proj_weights = get_weight(
                     model_params, prefix + 'mlp.shared_experts.down_proj',
                     dtype)
-                split_v = split_matrix_tp(shared_moe_down_proj_weights,
-                                          mapping.tp_size,
-                                          mapping.tp_rank,
-                                          dim=1)
+                shared_moe_down_proj_weights = split_matrix_tp(
+                    shared_moe_down_proj_weights,
+                    mapping.tp_size,
+                    mapping.tp_rank,
+                    dim=1)
+                shared_moe_gate_proj_weights = get_weight(
+                    model_params, prefix + 'mlp.shared_experts.gate_proj',
+                    dtype)
+                shared_moe_gate_proj_weights = split_matrix_tp(
+                    shared_moe_gate_proj_weights,
+                    mapping.tp_size,
+                    mapping.tp_rank,
+                    dim=0)
+                shared_moe_gate_up_proj_weights = torch.concat(
+                    [shared_moe_up_proj_weights, shared_moe_gate_proj_weights],
+                    dim=-2)
+
+                ## mlp.shared_experts.gate_up_proj.weight
                 weights.update(
                     get_trtllm_linear_weight(
-                        split_v, trtllm_prex + 'mlp.shared_experts.proj.'))
-                ## mlp.shared_experts.up_proj.weight
-                shared_moe_up_proj_weights = get_weight(
-                    model_params, prefix + 'mlp.shared_experts.up_proj', dtype)
-                split_v = split_matrix_tp(shared_moe_up_proj_weights,
-                                          mapping.tp_size,
-                                          mapping.tp_rank,
-                                          dim=0)
+                        shared_moe_gate_up_proj_weights,
+                        trtllm_prex + 'mlp.shared_expert.fc.'))
+
+                ## mlp.shared_experts.down_proj.weight
                 weights.update(
                     get_trtllm_linear_weight(
-                        split_v, trtllm_prex + 'mlp.shared_experts.gate.'))
+                        shared_moe_down_proj_weights,
+                        trtllm_prex + 'mlp.shared_expert.proj.'))
 
         else:
             ## Current deepseek model has one MLP layer only, if it goes large consider to do fuse

@@ -176,8 +176,13 @@ def parse_arguments():
         type=int,
         default=4,
         help=
-        'Maximum depth of the EAGLE choices tree, i.e. maximum number of accepted tokens.'
+        'Maximum depth of the EAGLE choices tree, i.e. maximum number of accepted draft tokens.'
     )
+    parser.add_argument(
+        '--max_non_leaves_per_layer',
+        type=int,
+        default=10,
+        help='Maximum number of non-leaf nodes in the EAGLE choice tree.')
     args = parser.parse_args()
     return args
 
@@ -191,6 +196,8 @@ if __name__ == '__main__':
     print(tensorrt_llm.__version__)
     args = parse_arguments()
     world_size = args.tp_size * args.pp_size
+
+    assert args.pp_size == 1, "Pipeline parallelism is not supported in EAGLE yet."
 
     tik = time.time()
 
@@ -310,6 +317,7 @@ if __name__ == '__main__':
         'share_embedding_table': args.use_embedding_sharing,
         'max_draft_len': args.max_draft_len,
         'num_eagle_layers': args.num_eagle_layers,
+        'max_non_leaves_per_layer': args.max_non_leaves_per_layer,
         'eagle_net_config': eagle_net_config
     }
 

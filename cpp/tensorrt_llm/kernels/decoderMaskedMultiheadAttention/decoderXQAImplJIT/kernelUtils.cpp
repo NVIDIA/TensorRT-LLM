@@ -73,7 +73,7 @@ bool supportConfigCommon(XQAParams const& xqaParams, bool forConfigurePlugin)
         return false;
     }
     if (!contains({PositionEmbeddingType::kROPE_GPTJ, PositionEmbeddingType::kROPE_GPT_NEOX,
-                      PositionEmbeddingType::kLONG_ROPE},
+                      PositionEmbeddingType::kROPE_M, PositionEmbeddingType::kLONG_ROPE},
             xqaParams.position_embedding_type))
     {
         return false;

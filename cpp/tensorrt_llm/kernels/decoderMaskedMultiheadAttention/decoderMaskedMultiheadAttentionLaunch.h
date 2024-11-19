@@ -75,7 +75,8 @@ inline size_t smem_size_in_bytes(Multihead_attention_params<T, DO_CROSS_ATTENTIO
 
     size_t transpose_rotary_size = 0;
     if (params.position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX
-        || params.position_embedding_type == PositionEmbeddingType::kLONG_ROPE)
+        || params.position_embedding_type == PositionEmbeddingType::kLONG_ROPE
+        || params.position_embedding_type == PositionEmbeddingType::kROPE_M)
     {
         assert(params.rotary_embedding_dim > 0);
         transpose_rotary_size = 2 * params.rotary_embedding_dim * sizeof(Tk);
@@ -416,7 +417,8 @@ void mmha_launch_kernel(KernelParamsType const& params, KVCacheBuffer const& kv_
     assert((params.rotary_embedding_dim != 0)
         == (params.position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX
             || params.position_embedding_type == PositionEmbeddingType::kROPE_GPTJ
-            || params.position_embedding_type == PositionEmbeddingType::kLONG_ROPE));
+            || params.position_embedding_type == PositionEmbeddingType::kLONG_ROPE
+            || params.position_embedding_type == PositionEmbeddingType::kROPE_M));
     if (params.beam_width == 1)
     {
         mmha_launch_kernel_dispatch<T, KVCacheBuffer, KernelParamsType, Dh, false, BLOCK_SPARSE_ATTN,

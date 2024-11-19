@@ -35,11 +35,11 @@
 #include <mpi.h>
 #else
 // Dummy defines to avoid #if in wider places.
-typedef int MPI_Datatype;
-typedef int MPI_Comm;
-typedef int MPI_Request;
-typedef int MPI_Message;
-typedef int MPI_Op;
+typedef void* MPI_Datatype;
+typedef void* MPI_Comm;
+typedef void* MPI_Request;
+typedef void* MPI_Message;
+typedef void* MPI_Op;
 
 typedef struct MPI_Status
 {

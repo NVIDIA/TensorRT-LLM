@@ -171,19 +171,18 @@ class OpenAIServer:
                         index=i,
                         delta=DeltaMessage(
                             role=role, content=content),
-                        logprobs=None,
                         finish_reason=None)
                     chunk = ChatCompletionStreamResponse(
                         choices=[choice_data], model=self.model)
                     chunk.usage = stream_usage_info(num_tokens, 0)
 
                     data = chunk.model_dump_json(exclude_unset=True)
-                    yield f"data: {data}\n\n"
+                    return data
 
             async for res in promise:
                 prompt_tokens = len(res.prompt_token_ids)
                 if first_iteration:
-                    yield_first_chat(prompt_tokens, role=role)
+                    yield f"data: {yield_first_chat(prompt_tokens, role=role)} \n\n"
 
                     if request.echo:
                         last_msg_content = ""
@@ -194,7 +193,7 @@ class OpenAIServer:
                                 "content"]
 
                         if last_msg_content:
-                            yield_first_chat(prompt_tokens, content=last_msg_content)
+                            yield f"data: {yield_first_chat(prompt_tokens, content=last_msg_content)}\n\n"
                 first_iteration = False
 
                 for output in res.outputs:
@@ -215,24 +214,24 @@ class OpenAIServer:
                     else:
                         delta_message = DeltaMessage(content=delta_text)
 
-                    if len(output.token_ids_diff) > 0:
-                        # Send token-by-token response for each request.n
-                        choice_data = ChatCompletionResponseStreamChoice(
-                            index=i,
-                            delta=delta_message,
-                            finish_reason=None)
-                        if request.logprobs:
-                            logprobs = output.logprobs_diff
-                            token_ids = output.token_ids_diff
-                            choice_data.logprobs = create_logprobs(token_ids, logprobs)
-                        chunk = ChatCompletionStreamResponse(
-                            choices=[choice_data], model=self.model)
-                        chunk.usage = stream_usage_info(
-                            prompt_tokens, output.length)
-                        data = chunk.model_dump_json()
-                        yield f"data: {data}\n\n"
-                    else:
+                    choice = ChatCompletionResponseStreamChoice(
+                        index=i,
+                        delta=delta_message,
+                        finish_reason=None)
+                    if request.logprobs:
+                        logprobs = output.logprobs_diff
+                        token_ids = output.token_ids_diff
+                        choice.logprobs = create_logprobs(token_ids, logprobs)
+                    if output.finish_reason is not None:
+                        choice.finish_reason = output.finish_reason
+                        choice.stop_reason = output.stop_reason
                         finish_reason_sent[i] = True
+                    chunk = ChatCompletionStreamResponse(
+                        choices=[choice], model=self.model)
+                    chunk.usage = stream_usage_info(
+                        prompt_tokens, output.length)
+                    data = chunk.model_dump_json(exclude_unset=True)
+                    yield f"data: {data}\n\n"
 
             if (request.stream_options
                     and request.stream_options.include_usage):
@@ -250,7 +249,7 @@ class OpenAIServer:
                 yield f"data: {final_usage_data}\n\n"
             yield f"data: [DONE]\n\n"
 
-        async def create_chat_response(promise: RequestOutput) -> JSONResponse:
+        async def create_chat_response(promise: RequestOutput) -> ChatCompletionResponse:
             await promise.aresult()
             choices: List[ChatCompletionResponseChoice] = []
             role = get_role()
@@ -271,6 +270,8 @@ class OpenAIServer:
                 choice = ChatCompletionResponseChoice(
                     index=output.index,
                     message=message,
+                    finish_reason=output.finish_reason,
+                    stop_reason=output.stop_reason,
                 )
 
                 if request.logprobs:
@@ -376,7 +377,11 @@ class OpenAIServer:
                         model=self.model,
                         choices=[
                             CompletionResponseStreamChoice(
-                                index=response_idx, text=delta_text)
+                                index=response_idx,
+                                text=delta_text,
+                                stop_reason=output.stop_reason,
+                                finish_reason=output.finish_reason,
+                            )
                         ])
                     response_json = response.model_dump_json(
                         exclude_unset=False)
@@ -399,6 +404,8 @@ class OpenAIServer:
                     choice = CompletionResponseChoice(
                         index=idx,
                         text=output_text,
+                        stop_reason=output.stop_reason,
+                        finish_reason=output.finish_reason,
                     )
                     choices[idx] = choice
 

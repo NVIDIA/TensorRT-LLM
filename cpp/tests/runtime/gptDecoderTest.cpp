@@ -103,7 +103,7 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
         vocabSizePadded, maxSeqLength, streamPtr);
     ASSERT_TRUE(static_cast<bool>(decoder));
 
-    auto batchSlots = getDefaultBatchSlots(batchSize, manager);
+    auto batchSlots = getDefaultBatchSlots(batchSize);
     decoder->setup(samplingConfig, batchSize, batchSlots);
 
     // set up inputs

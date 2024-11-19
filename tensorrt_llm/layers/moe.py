@@ -26,12 +26,13 @@ from tensorrt_llm.layers.lora import LoraParams
 
 from .._common import default_net, default_trtnet
 from .._utils import QuantModeWrapper, int32_array
-from ..functional import (AllReduceFusionParams, _add_plugin_info,
-                          _create_tensor, allreduce, cast, concat, constant,
-                          div, expand, gather_nd, is_gated_activation,
-                          non_gated_version, nonzero, reduce_scatter,
-                          repeat_interleave, scatter, scatter_nd, shape,
-                          softmax, split, sum, topk, unsqueeze)
+from ..functional import (AllReduceFusionParams, SideStreamIDType,
+                          _add_plugin_info, _create_tensor, allreduce, cast,
+                          concat, constant, cuda_stream_sync, div, expand,
+                          gather_nd, is_gated_activation, non_gated_version,
+                          nonzero, reduce_scatter, repeat_interleave, scatter,
+                          scatter_nd, shape, sigmoid, softmax, split, sum, topk,
+                          unsqueeze)
 from ..layers import MLP, GatedMLP
 from ..mapping import Mapping
 from ..module import Module, ModuleList
@@ -64,8 +65,7 @@ class MoeConfig:
         DEVICE_LIMITED_RENORM = 4
 
     num_experts: int = 0
-    moe_intermediate_size: int = 0  # Add moe inter size (shanshan)
-    num_shared_experts: int = 0  # Add number of shared experts (shanshan)
+    shared_expert_intermediate_size: int = 0
 
     top_k: int = 0
     normalization_mode: ExpertScaleNormalizationMode = ExpertScaleNormalizationMode.RENORMALIZE
@@ -119,7 +119,8 @@ def _moe_plugin(moe_config,
                 tp_size=1,
                 ep_size=1,
                 tp_rank=0,
-                ep_rank=0):
+                ep_rank=0,
+                side_stream_id=SideStreamIDType.disable):
     if isinstance(dtype, str):
         dtype = str_dtype_to_trt(dtype)
 
@@ -212,6 +213,10 @@ def _moe_plugin(moe_config,
         "force_determinism", np.array([int(False)], dtype=np.int32),
         trt.PluginFieldType.INT32)
 
+    p_side_stream_id = trt.PluginField("side_stream_id",
+                                       np.array(side_stream_id, dtype=np.int32),
+                                       trt.PluginFieldType.INT32)
+
     use_lora = default_net().plugin_config.lora_plugin is not None
     p_use_lora = trt.PluginField("use_lora", np.array([int(use_lora)],
                                                       np.int32),
@@ -231,7 +236,8 @@ def _moe_plugin(moe_config,
         p_expert_inter_size, p_activation_type, p_type_id, p_weight_type_id,
         p_output_type_id, p_quant_mode, p_use_finished, p_use_bias, p_tp_size,
         p_tp_rank, p_ep_size, p_ep_rank, p_normalization_mode,
-        p_sparse_mixer_epsilon, p_force_determinism, p_use_lora
+        p_sparse_mixer_epsilon, p_force_determinism, p_side_stream_id,
+        p_use_lora
     ]
 
     if use_lora:
@@ -311,6 +317,8 @@ def _moe_plugin(moe_config,
             if layer.get_input(ii).dtype == str_dtype_to_trt("int8"):
                 layer.get_input(ii).set_dynamic_range(-127, 127)
     output = _create_tensor(layer.get_output(0), layer)
+    if side_stream_id != SideStreamIDType.disable:
+        output = (output, _create_tensor(layer.get_output(1), layer))
     return output
 
 
@@ -535,7 +543,9 @@ class MixtureOfExperts(Module):
                 finished=None,
                 lora_layer_params=None,
                 reduce_fusion_params: Optional[AllReduceFusionParams] = None,
-                last_local_layer_residual=None):
+                last_local_layer_residual=None,
+                side_stream_id: Optional[SideStreamIDType] = SideStreamIDType.
+                disable):
         moe_router_lora_params = None
         if lora_layer_params is not None:
             moe_router_lora_params = lora_layer_params.get_runtime_params(
@@ -548,14 +558,18 @@ class MixtureOfExperts(Module):
         ]:
             routing = self.group_limited_greedy(routing)
         output = self.forward_experts(hidden_states, routing, finished,
-                                      lora_layer_params)
+                                      lora_layer_params, side_stream_id)
+        if side_stream_id != SideStreamIDType.disable:
+            output, hidden_states = output
         if self.use_all_reduce:
             output = self.forward_allreduce(output, reduce_fusion_params,
                                             last_local_layer_residual)
+        if side_stream_id != SideStreamIDType.disable:
+            output = (output, hidden_states)
         return output
 
     def forward_experts(self, hidden_states, routing, finished,
-                        lora_layer_params):
+                        lora_layer_params, side_stream_id):
 
         if self.quant_mode.has_fp8_qdq():
             assert self.fc.weight.value.dtype == trt.fp8, (
@@ -627,7 +641,8 @@ class MixtureOfExperts(Module):
                              tp_size=self.mapping.moe_tp_size,
                              tp_rank=self.mapping.moe_tp_rank,
                              ep_size=self.mapping.moe_ep_size,
-                             ep_rank=self.mapping.moe_ep_rank)
+                             ep_rank=self.mapping.moe_ep_rank,
+                             side_stream_id=side_stream_id)
 
         return output
 
@@ -750,7 +765,8 @@ class MoeOOTB(MOE):
         )
 
     def forward_experts(self, hidden_states, routing, finished,
-                        lora_layer_params):
+                        lora_layer_params, side_stream_id):
+        assert side_stream_id == SideStreamIDType.disable, "MoeOOTB does not support using side stream"
         # TODO: https://nvbugspro.nvidia.com/bug/4781396 after this nvbug is fixed, we will remove this check.
         if lora_layer_params is not None:
             for module in ["mlp_h_to_4h", "mlp_4h_to_h", "mlp_gate"]:
@@ -905,7 +921,7 @@ class MoeOOTB(MOE):
 
 
 # Add SharedMoE class
-class SharedMoE(Module):
+class SharedMoE(MOE):
 
     def __init__(self,
                  moe_config: MoeConfig,
@@ -915,42 +931,81 @@ class SharedMoE(Module):
                  mapping: Mapping = Mapping(),
                  bias: bool = True,
                  dtype=None,
+                 tp_group: List[int] = None,
+                 tp_size: int = 1,
                  quant_mode=QuantMode(0),
-                 **kwargs):
-        super().__init__()
-
-        self.moe_config = moe_config
-        self.hidden_size = hidden_size
-        self.ffn_hidden_size = ffn_hidden_size
-        self.hidden_act = hidden_act
-        self.mapping = mapping
-        self.bias = bias
-        self.dtype = dtype
-        self.quant_mode = quant_mode
-
-        self.moe = MOE(hidden_size=self.hidden_size,
-                       moe_config=self.moe_config,
-                       mapping=self.mapping,
-                       ffn_hidden_size=self.moe_config.moe_intermediate_size,
-                       hidden_act=self.hidden_act,
-                       dtype=self.dtype,
-                       bias=False,
-                       tp_group=self.mapping.tp_group,
-                       tp_size=self.mapping.tp_size,
-                       quant_mode=self.quant_mode)
-        ClsMLP = GatedMLP if is_gated_activation(self.hidden_act) else MLP
-        self.shared_experts = ClsMLP(
-            hidden_size=self.hidden_size,
-            ffn_hidden_size=self.ffn_hidden_size,
-            hidden_act=non_gated_version(self.hidden_act),  # deepseek use SiLU
+                 use_shared_gate: bool = False,
+                 use_side_stream: bool = False):
+        super().__init__(
+            moe_config=moe_config,
+            hidden_size=hidden_size,
+            ffn_hidden_size=ffn_hidden_size,
+            hidden_act=hidden_act,
+            mapping=mapping,
+            bias=bias,
+            dtype=dtype,
+            tp_group=tp_group,
+            tp_size=tp_size,
+            quant_mode=quant_mode,
+            use_all_reduce=False,
+        )
+        self.shared_expert = MLP(
+            hidden_size=hidden_size,
+            ffn_hidden_size=moe_config.shared_expert_intermediate_size,
+            hidden_act=hidden_act,
             bias=False,
             dtype=self.dtype,
-            tp_group=self.mapping.tp_group,
-            tp_size=self.mapping.tp_size,
-            quant_mode=self.quant_mode)
-
-    def forward(self, hidden_states):
-        if self.moe_config.num_shared_experts > 0:
-            return self.moe(hidden_states) + self.shared_experts(hidden_states)
+            tp_group=tp_group,
+            tp_size=tp_size,
+            quant_mode=self.quant_mode,
+            is_expert=True,
+        )
+        if use_shared_gate:
+            self.shared_expert_gate = RowLinear(
+                hidden_size,
+                1,
+                bias=False,
+                dtype=dtype,
+                tp_group=None,
+                tp_size=1,
+            )
         else:
-            return self.moe(hidden_states)
+            self.shared_expert_gate = None
+        self.use_side_stream = use_side_stream
+
+    def forward(self, hidden_states, lora_layer_params=None):
+        side_stream_id = SideStreamIDType.moe if self.use_side_stream else SideStreamIDType.disable
+        if self.use_side_stream:
+            hidden_states_sync = hidden_states
+            routed_output, hidden_states = super().forward(
+                hidden_states,
+                lora_layer_params=lora_layer_params,
+                side_stream_id=side_stream_id,
+            )
+        else:
+            routed_output = super().forward(
+                hidden_states,
+                lora_layer_params=lora_layer_params,
+            )
+        shared_output = self.shared_expert(
+            hidden_states,
+            lora_layer_params=lora_layer_params,
+        )
+        if self.shared_expert_gate is not None:
+            gate_lora_params = None
+            if lora_layer_params is not None:
+                gate_lora_params = lora_layer_params.get_runtime_params(
+                    0, "mlp_router")
+            shared_output = sigmoid(
+                self.shared_expert_gate(hidden_states,
+                                        gate_lora_params)) * shared_output
+        if self.use_side_stream:
+            # hidden_states_sync is included in the inputs to ensure that its
+            # memory space is not reused for other tensors on the main stream
+            # until the side stream has finished
+            shared_output = cuda_stream_sync(
+                [shared_output, hidden_states_sync], side_stream_id)
+        hidden_states = routed_output + shared_output
+        if self.tp_size > 1 and self.tp_group is not None:
+            hidden_states = allreduce(hidden_states, self.tp_group)
+        return hidden_states

@@ -54,6 +54,8 @@ struct XQAParams
     int const* spec_decoding_generation_lengths;      // variable input lengths.
     bool spec_decoding_is_generation_length_variable; // whether the generation lengths actually vary
     int32_t spec_decoding_max_generation_length;      // max possible input length
+    float2 const* mrope_rotary_sin_cos = nullptr;
+    int32_t const* mrope_position_deltas = nullptr;
 
     // almost copy from GPTAttentionPluginCommon.
     // maybe use one struct for parameters in GPTAttentionPluginCommon and share the same here.

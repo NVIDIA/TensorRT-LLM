@@ -230,6 +230,8 @@ def convert_hf_opt(hf_model,
         lm_head_w = torch.matmul(embed_w.float(), project_out.float()).to(dtype)
         embed_w = torch.matmul(embed_w.float(),
                                project_in.t().float()).to(dtype)
+    elif 'lm_head.weight' in model_params.keys():
+        lm_head_w = get_weight(model_params, 'lm_head', dtype)
     else:
         lm_head_w = embed_w.clone()
 

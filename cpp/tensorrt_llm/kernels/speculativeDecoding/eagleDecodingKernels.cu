@@ -98,11 +98,11 @@ namespace
 template <int BLOCK_SIZE>
 __global__ void prepareCtxEagleNetInputsKernel(SizeType32* eagleNetSequenceLengths, SizeType32* eagleNetContextLengths,
     TokenIdType* outputIds, SizeType32* positionIds, SizeType32* hiddenStatesIndices, SizeType32* lastTokenIndices,
-    SizeType32* numOutputTokens, SizeType32* numLastTokenIndices, SizeType32* hiddenSizeBatchLevelStarts,
-    TokenIdType const* inputIds, SizeType32 const* baseNetSequenceLengths, SizeType32 const* baseNetContextLengths,
+    SizeType32* numLastTokenIndices, SizeType32* hiddenSizeBatchLevelStarts, TokenIdType const* inputIds,
+    SizeType32 const* baseNetSequenceLengths, SizeType32 const* baseNetContextLengths,
     TokenIdType const* acceptedTokens, SizeType32 const* acceptedLens, SizeType32 const* prevDraftLens,
     SizeType32 const* prevPaths, SizeType32 const* bestPathIds, SizeType32 batchSize, SizeType32 maxPathLen,
-    SizeType32 maxDecodingTokens)
+    SizeType32 maxDecodingTokens, SizeType32 maxNonLeavesPerLayer)
 {
     typedef cub::BlockScan<SizeType32, BLOCK_SIZE> BlockScan;
     __shared__ typename BlockScan::TempStorage tempStorage;
@@ -133,6 +133,11 @@ __global__ void prepareCtxEagleNetInputsKernel(SizeType32* eagleNetSequenceLengt
             // Number of output tokens for EagleNet is accepted len.
             numDecodingTokens = acceptedLens[bid];
         }
+    }
+
+    for (SizeType32 ii = bid; ii < maxNonLeavesPerLayer * batchSize; ii += BLOCK_SIZE)
+    {
+        lastTokenIndices[ii] = 1;
     }
 
     SizeType32 outputStartPos{0};
@@ -215,9 +220,9 @@ __global__ void prepareCtxEagleNetInputsKernel(SizeType32* eagleNetSequenceLengt
     // The last thread writes number of flattened tokens.
     if (bid == BLOCK_SIZE - 1)
     {
-        numOutputTokens[0] = outputStartPos + numDecodingTokens;
         // After the first EagleNet we predict exactly one set of logits per request.
         numLastTokenIndices[0] = batchSize;
+
         // Set last hiddenSizeBatchLevelStarts.
         hiddenSizeBatchLevelStarts[batchSize] = batchSize;
     }
@@ -226,19 +231,20 @@ __global__ void prepareCtxEagleNetInputsKernel(SizeType32* eagleNetSequenceLengt
 
 void invokePrepareCtxEagleNetInputs(SizeType32* eagleNetSequenceLengths, SizeType32* eagleNetContextLengths,
     TokenIdType* outputIds, SizeType32* positionIds, SizeType32* hiddenStatesIndices, SizeType32* lastTokenIndices,
-    SizeType32* numOutputTokens, SizeType32* numLastTokenIndices, SizeType32* hiddenSizeBatchLevelStarts,
-    TokenIdType const* inputIds, SizeType32 const* baseNetSequenceLengths, SizeType32 const* baseNetContextLengths,
+    SizeType32* numLastTokenIndices, SizeType32* hiddenSizeBatchLevelStarts, TokenIdType const* inputIds,
+    SizeType32 const* baseNetSequenceLengths, SizeType32 const* baseNetContextLengths,
     TokenIdType const* acceptedTokens, SizeType32 const* acceptedLens, SizeType32 const* prevDraftLens,
     SizeType32 const* prevPaths, SizeType32 const* bestPathIds, SizeType32 batchSize, SizeType32 maxPathLen,
-    SizeType32 maxDecodingTokens, cudaStream_t stream)
+    SizeType32 maxDecodingTokens, SizeType32 maxNonLeavesPerLayer, cudaStream_t stream)
 {
     SizeType32 constexpr BLOCK_SIZE = 512;
     TLLM_CHECK_WITH_INFO(
         batchSize <= BLOCK_SIZE, "Batch size larger than %d is not supported for EAGLE yet", batchSize);
     prepareCtxEagleNetInputsKernel<BLOCK_SIZE><<<1, BLOCK_SIZE, 0, stream>>>(eagleNetSequenceLengths,
-        eagleNetContextLengths, outputIds, positionIds, hiddenStatesIndices, lastTokenIndices, numOutputTokens,
-        numLastTokenIndices, hiddenSizeBatchLevelStarts, inputIds, baseNetSequenceLengths, baseNetContextLengths,
-        acceptedTokens, acceptedLens, prevDraftLens, prevPaths, bestPathIds, batchSize, maxPathLen, maxDecodingTokens);
+        eagleNetContextLengths, outputIds, positionIds, hiddenStatesIndices, lastTokenIndices, numLastTokenIndices,
+        hiddenSizeBatchLevelStarts, inputIds, baseNetSequenceLengths, baseNetContextLengths, acceptedTokens,
+        acceptedLens, prevDraftLens, prevPaths, bestPathIds, batchSize, maxPathLen, maxDecodingTokens,
+        maxNonLeavesPerLayer);
 }
 
 namespace
@@ -431,13 +437,13 @@ template <int BLOCK_SIZE>
 __global__ void prepareGenEagleNetInputsKernel(SizeType32* nextSequenceLengths, SizeType32* nextContextLengths,
     TokenIdType* outputIds, SizeType32* positionIds, SizeType32* specDecodingGenLengths,
     SizeType32* specDecodingPositionOffsets, SizeType32* specDecodingPackedMasks, SizeType32* hiddenStatesIndices,
-    SizeType32* lastTokenIndices, SizeType32* numOutputTokens, SizeType32* numLastTokenIndices,
-    SizeType32* outputHiddenSizeBatchStartsPerLevel, SizeType32* cumSumGenerationLengths,
-    SizeType32* maxGenerationLength, TokenIdType const* nextDraftIds, SizeType32 const* selectedDraftIndices,
-    SizeType32 const* selectedDraftPosIds, SizeType32 const* numSelectedDraftIndices,
-    SizeType32 const* eagleNet0SequenceLengths, SizeType32 const* prevContextLengths,
-    SizeType32 const* inputHiddenSizeBatchStartsPerLevel, SizeType32 const* parentNonLeafInLevelOffset,
-    SizeType32 levelIdx, SizeType32 batchSize, SizeType32 maxPathLen, SizeType32 maxDecodingTokens)
+    SizeType32* lastTokenIndices, SizeType32* numLastTokenIndices, SizeType32* outputHiddenSizeBatchStartsPerLevel,
+    SizeType32* cumSumGenerationLengths, SizeType32* maxGenerationLength, TokenIdType const* nextDraftIds,
+    SizeType32 const* selectedDraftIndices, SizeType32 const* selectedDraftPosIds,
+    SizeType32 const* numSelectedDraftIndices, SizeType32 const* eagleNet0SequenceLengths,
+    SizeType32 const* prevContextLengths, SizeType32 const* inputHiddenSizeBatchStartsPerLevel,
+    SizeType32 const* parentNonLeafInLevelOffset, SizeType32 levelIdx, SizeType32 batchSize, SizeType32 maxPathLen,
+    SizeType32 maxDecodingTokens, SizeType32 maxNonLeavesPerLayer)
 {
     typedef cub::BlockScan<SizeType32, BLOCK_SIZE> BlockScan;
     typedef cub::BlockReduce<SizeType32, BLOCK_SIZE> BlockReduce;
@@ -551,7 +557,7 @@ __global__ void prepareGenEagleNetInputsKernel(SizeType32* nextSequenceLengths, 
 
         auto const lastStart = inputHiddenSizeBatchStartsPerLevel[(levelIdx - 1) * batchSize + batchSize];
         // Set new layer idx.
-        outputHiddenSizeBatchStartsPerLevel[levelIdx * batchSize + bid] = lastStart + outputLastIndicesBase;
+        outputHiddenSizeBatchStartsPerLevel[levelIdx * batchSize + bid] = lastStart + bid * maxNonLeavesPerLayer;
     }
 
     __syncthreads();
@@ -559,12 +565,11 @@ __global__ void prepareGenEagleNetInputsKernel(SizeType32* nextSequenceLengths, 
     // The last valid thread fills the number of tokens.
     if (bid == batchSize - 1)
     {
-        numOutputTokens[0] = outputIndexBase + nextDraftLen;
         // Set the total number of logits needed after the next iteration.
         numLastTokenIndices[0] = lastIndices;
         // Set last outputHiddenSizeBatchStartsPerLevel.
         outputHiddenSizeBatchStartsPerLevel[levelIdx * batchSize + batchSize]
-            = outputHiddenSizeBatchStartsPerLevel[levelIdx * batchSize + batchSize - 1] + numNextLogits;
+            = outputHiddenSizeBatchStartsPerLevel[levelIdx * batchSize + batchSize - 1] + maxNonLeavesPerLayer;
     }
 }
 
@@ -774,12 +779,12 @@ void invokePrepareGenEagleNetInputs(PrepareGenEagleNetInputsParams const& params
         prepareGenEagleNetInputsKernel<BLOCK_SIZE><<<1, BLOCK_SIZE, 0, params.stream>>>(params.nextSequenceLengths,
             params.nextContextLengths, params.outputIds, params.positionIds, params.specDecodingGenLengths,
             params.specDecodingPositionOffsets, params.specDecodingPackedMasks, params.hiddenStatesIndices,
-            params.lastTokenIndices, params.numOutputTokens, params.numLastTokenIndices,
-            params.outputHiddenSizeBatchStartsPerLevel, params.cumSumGenerationLengths, params.maxGenerationLength,
-            params.nextDraftIds, params.selectedDraftIndices, params.selectedDraftPosOffsets,
-            params.numSelectedDraftIndices, params.eagleNet0SequenceLengths, params.prevContextLengths,
-            params.inputHiddenSizeBatchStartsPerLevel, params.parentNonLeafInLevelOffset, params.levelIdx,
-            params.batchSize, params.maxPathLen, params.maxDecodingTokens);
+            params.lastTokenIndices, params.numLastTokenIndices, params.outputHiddenSizeBatchStartsPerLevel,
+            params.cumSumGenerationLengths, params.maxGenerationLength, params.nextDraftIds,
+            params.selectedDraftIndices, params.selectedDraftPosOffsets, params.numSelectedDraftIndices,
+            params.eagleNet0SequenceLengths, params.prevContextLengths, params.inputHiddenSizeBatchStartsPerLevel,
+            params.parentNonLeafInLevelOffset, params.levelIdx, params.batchSize, params.maxPathLen,
+            params.maxDecodingTokens, params.maxNonLeavesPerLayer);
 
         sync_check_cuda_error();
     }
@@ -803,11 +808,13 @@ namespace
 
 template <typename T>
 __global__ void assembleDraftLogitsOffsets(T const** logitsPtrs, T const* logits, TokenIdType** outputIdsPtrs,
-    TokenIdType* outputIds, SizeType32 numInputLogits, SizeType32 maxDecodingDraftTokens, SizeType32 vocabSizePadded)
+    TokenIdType* outputIds, bool* skipDecode, runtime::SizeType32 const* numValidLogits, SizeType32 batchSize,
+    SizeType32 maxDecodingDraftTokens, SizeType32 vocabSizePadded)
 {
     auto const tix = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
+    auto const isValid{tix < numValidLogits[0]};
 
-    if (tix < numInputLogits)
+    if (isValid)
     {
         // logits: [numInputLogits, vocab_size]
         // logitsPtrs: [numInputLogits][1, vocab_size]
@@ -817,29 +824,34 @@ __global__ void assembleDraftLogitsOffsets(T const** logitsPtrs, T const* logits
         // outputIdsPtrs: [numInputLogits][maxDecodingDraftTokens]
         outputIdsPtrs[tix] = outputIds + tix * maxDecodingDraftTokens;
     }
+
+    skipDecode[tix] = !isValid;
 }
 
 } // namespace
 
 template <typename T>
 void invokeAssembleDraftLogitsOffsets(T const** logitsPtrs, T const* logits, runtime::TokenIdType** outputIdsPtrs,
-    runtime::TokenIdType* outputIds, runtime::SizeType32 numInputLogits, runtime::SizeType32 maxDecodingDraftTokens,
+    runtime::TokenIdType* outputIds, bool* skipDecode, runtime::SizeType32 const* numValidLogits,
+    runtime::SizeType32 numInputLogits, runtime::SizeType32 batchSize, runtime::SizeType32 maxDecodingDraftTokens,
     runtime::SizeType32 vocabSizePadded, cudaStream_t stream)
 {
     SizeType32 constexpr BLOCK_SIZE = 512;
 
-    assembleDraftLogitsOffsets<T><<<divUp(numInputLogits, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(
-        logitsPtrs, logits, outputIdsPtrs, outputIds, numInputLogits, maxDecodingDraftTokens, vocabSizePadded);
+    assembleDraftLogitsOffsets<T><<<divUp(numInputLogits, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(logitsPtrs, logits,
+        outputIdsPtrs, outputIds, skipDecode, numValidLogits, batchSize, maxDecodingDraftTokens, vocabSizePadded);
 
     sync_check_cuda_error();
 }
 
 template void invokeAssembleDraftLogitsOffsets(float const** logitsPtrs, float const* logits,
-    runtime::TokenIdType** outputIdsPtrs, runtime::TokenIdType* outputIds, runtime::SizeType32 numInputLogits,
+    runtime::TokenIdType** outputIdsPtrs, runtime::TokenIdType* outputIds, bool* skipDecode,
+    runtime::SizeType32 const* numValidLogits, runtime::SizeType32 numInputLogits, runtime::SizeType32 batchSize,
     runtime::SizeType32 maxDecodingDraftTokens, runtime::SizeType32 vocabSizePadded, cudaStream_t stream);
 
 template void invokeAssembleDraftLogitsOffsets(__half const** logitsPtrs, __half const* logits,
-    runtime::TokenIdType** outputIdsPtrs, runtime::TokenIdType* outputIds, runtime::SizeType32 numInputLogits,
+    runtime::TokenIdType** outputIdsPtrs, runtime::TokenIdType* outputIds, bool* skipDecode,
+    runtime::SizeType32 const* numValidLogits, runtime::SizeType32 numInputLogits, runtime::SizeType32 batchSize,
     runtime::SizeType32 maxDecodingDraftTokens, runtime::SizeType32 vocabSizePadded, cudaStream_t stream);
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -970,8 +982,8 @@ __global__ void extracTopKsFromSuccessorsArray(SizeType32* topKs, SizeType32* to
 // Extract topKs from paths and layerId
 void invokeExtractTopKsFromPath(runtime::SizeType32 const* paths, runtime::SizeType32* topKs,
     runtime::SizeType32* topKOffset, runtime::SizeType32* numSuccessorsForEachNode, runtime::SizeType32 layerId,
-    runtime::SizeType32 batchSize, runtime::SizeType32 numInputLogits, runtime::SizeType32 maxDecodingTokens,
-    runtime::SizeType32 maxPathLen, cudaStream_t stream)
+    runtime::SizeType32 batchSize, runtime::SizeType32 maxDecodingTokens, runtime::SizeType32 maxPathLen,
+    cudaStream_t stream)
 {
 
     TLLM_CHECK_WITH_INFO(
@@ -999,8 +1011,8 @@ namespace
 {
 __global__ void copyOutputTokensIds(TokenIdType** tmpOutputIdsPtrs, SizeType32 const* topKs,
     SizeType32 const* topKOffset, TokenIdType const* pluginInputDraftIdsPtrs, SizeType32 const* pluginInputDraftLens,
-    TokenIdType* pluginOutputDraftIdsPtrs, SizeType32* pluginOutputDraftLens, SizeType32 layerId, SizeType32 batchSize,
-    SizeType32 numInputLogits, SizeType32 maxDecodingDraftTokens)
+    SizeType32 const* numValidLogits, TokenIdType* pluginOutputDraftIdsPtrs, SizeType32* pluginOutputDraftLens,
+    SizeType32 layerId, SizeType32 batchSize, SizeType32 maxDecodingDraftTokens)
 {
     // tmpOutputIdsPtrs: shape [numInputLogits][maxDecodingDraftTokens]
     // topKs: shape [numInputLogits]
@@ -1030,7 +1042,7 @@ __global__ void copyOutputTokensIds(TokenIdType** tmpOutputIdsPtrs, SizeType32 c
 
         // Compute the topK offset
         SizeType32 startTopKOffset = topKOffset[tix];
-        SizeType32 endTopkOffset = tix + 1 < batchSize ? topKOffset[tix + 1] : numInputLogits;
+        SizeType32 endTopkOffset = tix + 1 < batchSize ? topKOffset[tix + 1] : numValidLogits[0];
 
         for (SizeType32 ii = startTopKOffset; ii < endTopkOffset; ii++)
         {
@@ -1051,15 +1063,16 @@ __global__ void copyOutputTokensIds(TokenIdType** tmpOutputIdsPtrs, SizeType32 c
 // Copy output draft token ids from temporary buffer to plugin output buffer, also update the draft token length
 void invokeCopyOutputTokensIds(runtime::TokenIdType** tmpOutputIdsPtrs, runtime::SizeType32 const* topKs,
     runtime::SizeType32 const* topKOffset, runtime::TokenIdType const* pluginInputDraftIdsPtrs,
-    runtime::SizeType32 const* pluginInputDraftLens, runtime::TokenIdType* pluginOutputDraftIdsPtrs,
-    runtime::SizeType32* pluginOutputDraftLens, runtime::SizeType32 layerId, runtime::SizeType32 batchSize,
-    runtime::SizeType32 numInputLogits, runtime::SizeType32 maxDecodingDraftTokens, cudaStream_t stream)
+    runtime::SizeType32 const* pluginInputDraftLens, runtime::SizeType32 const* numValidLogits,
+    runtime::TokenIdType* pluginOutputDraftIdsPtrs, runtime::SizeType32* pluginOutputDraftLens,
+    runtime::SizeType32 layerId, runtime::SizeType32 batchSize, runtime::SizeType32 maxDecodingDraftTokens,
+    cudaStream_t stream)
 {
     SizeType32 constexpr BLOCK_SIZE = 512;
 
     copyOutputTokensIds<<<divUp(batchSize, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(tmpOutputIdsPtrs, topKs, topKOffset,
-        pluginInputDraftIdsPtrs, pluginInputDraftLens, pluginOutputDraftIdsPtrs, pluginOutputDraftLens, layerId,
-        batchSize, numInputLogits, maxDecodingDraftTokens);
+        pluginInputDraftIdsPtrs, pluginInputDraftLens, numValidLogits, pluginOutputDraftIdsPtrs, pluginOutputDraftLens,
+        layerId, batchSize, maxDecodingDraftTokens);
 }
 
 namespace

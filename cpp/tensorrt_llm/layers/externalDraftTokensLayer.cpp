@@ -37,13 +37,19 @@ namespace tensorrt_llm::layers
 
 template <typename T>
 ExternalDraftTokensLayer<T>::ExternalDraftTokensLayer(executor::DecodingMode const& mode,
-    DecoderDomain const& decoderDomain, std::shared_ptr<BufferManager> bufferManager)
+    DecoderDomain const& decoderDomain, std::shared_ptr<BufferManager> bufferManager, bool isDeterministic,
+    bool isAirTopP)
     : BaseLayer(decoderDomain, bufferManager)
     , mDecodingMode(mode)
+    , mIsDeterministic(isDeterministic)
+    , mIsAirTopP(isAirTopP)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     TLLM_CHECK_WITH_INFO(!mDecodingMode.isBeamSearch(), "ExternalDraftTokensLayer does not support Beam search mode");
+
+    auto const deviceId = getDevice();
+    TLLM_CUDA_CHECK(cudaGetDeviceProperties(&mDeviceProp, deviceId));
 
     allocateBuffer(decoderDomain.getBatchSize());
 
@@ -58,11 +64,15 @@ void ExternalDraftTokensLayer<T>::allocateBuffer(SizeType32 batchSize)
     // top k workspace size
     auto workspaceSize = getTopKWorkspaceSize<T>(batchSize, 1, TOP_K_MAX, mDecoderDomain.getVocabSizePadded());
     mWorkspaceSize = std::max(workspaceSize, mWorkspaceSize);
-    // top p workspace size
-    workspaceSize = getTopPWorkspaceSize<T>(batchSize, mDecoderDomain.getVocabSizePadded());
-    mWorkspaceSize = std::max(workspaceSize, mWorkspaceSize);
-    // multinomial (top p == 1) workspace size
-    workspaceSize = getTopPWorkspaceSize<float>(batchSize, mDecoderDomain.getVocabSizePadded());
+    // top p and multinomial (top p == 1) workspace size
+    if (!mIsAirTopP)
+    {
+        workspaceSize = getTopPWorkspaceSize<T>(batchSize, mDecoderDomain.getVocabSizePadded());
+    }
+    else
+    {
+        workspaceSize = getAirTopPWorkspaceSize<T>(batchSize, mDecoderDomain.getVocabSizePadded(), mIsDeterministic);
+    }
     mWorkspaceSize = std::max(workspaceSize, mWorkspaceSize);
 
     // batchsize here is maxBatchSize
@@ -168,6 +178,20 @@ void ExternalDraftTokensLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWid
     invokeSetupTopKTopPRuntimeArgs(batchSize,                                           //
         {topKsPtr, runtimeTopK.front(), bufferCast<SizeType32>(*mRuntimeTopKHost)}, {}, //
         skipDecodeTopKHostPtr, skipDecodeTopPHostPtr, batchSlotsHostPtr, false);
+
+    if (mIsAirTopP)
+    {
+        auto smCnt = mDeviceProp.multiProcessorCount;
+        if (smCnt <= 0)
+        {
+            auto const deviceId = getDevice();
+            cudaDeviceProp prop{};
+            TLLM_CUDA_CHECK(cudaGetDeviceProperties(&prop, deviceId));
+            smCnt = prop.multiProcessorCount;
+        }
+        mAirTopPBlockNum
+            = calcAirTopPBlockNum<T>(batchSize, mDecoderDomain.getVocabSizePadded(), smCnt, mIsDeterministic);
+    }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -330,7 +354,17 @@ void ExternalDraftTokensLayer<T>::multinomialSampling(std::shared_ptr<BaseDecodi
     params.maxBatchSize = mDecoderDomain.getBatchSize();
     params.vocabSizePadded = mDecoderDomain.getVocabSizePadded();
 
-    invokeBatchTopPSampling<T>(params, getStream());
+    if (!mIsAirTopP)
+    {
+        invokeBatchTopPSampling<T>(params, getStream());
+    }
+    else
+    {
+        params.blockNum = mAirTopPBlockNum;
+        params.isDeterministic = mIsDeterministic;
+        invokeBatchAirTopPSampling<T>(params, getStream());
+    }
+
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -423,7 +457,17 @@ void ExternalDraftTokensLayer<T>::getAllTopPs(std::shared_ptr<BaseDecodingOutput
     params.returnAllSelectedTokens = true;
     params.maxSeqLen = mDecoderDomain.getVocabSizePadded();
 
-    invokeBatchTopPSampling<T>(params, getStream());
+    if (!mIsAirTopP)
+    {
+        invokeBatchTopPSampling<T>(params, getStream());
+    }
+    else
+    {
+        params.blockNum = mAirTopPBlockNum;
+        params.isDeterministic = mIsDeterministic;
+        invokeBatchAirTopPSampling<T>(params, getStream());
+    }
+
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 

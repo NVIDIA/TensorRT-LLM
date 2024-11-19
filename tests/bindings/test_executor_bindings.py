@@ -875,6 +875,14 @@ def test_prompt_tuning_config():
     assert (config.embedding_table == embedding_table).all()
 
 
+def test_mrope_config():
+    mrope_rotary_sin_cos = torch.ones(1, 4194304)
+    mrope_position_deltas = torch.tensor([-50])
+    config = trtllm.MropeConfig(mrope_rotary_sin_cos, mrope_position_deltas)
+    assert (config.mrope_rotary_sin_cos == mrope_rotary_sin_cos).all()
+    assert (config.mrope_position_deltas == mrope_position_deltas).all()
+
+
 def test_lora_config():
     task_id = 1
     lora_config = trtllm.LoraConfig(task_id)

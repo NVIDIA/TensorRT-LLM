@@ -14,10 +14,10 @@
  * limitations under the License.
  */
 
-#ifndef _WIN32
+#ifdef __GNUC__ // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
-#endif // #ifndef _WIN32
+#endif // __GNUC__
 
 #include "cutlass/epilogue/collective/default_epilogue.hpp"
 #include "cutlass/epilogue/thread/linear_combination.h"
@@ -34,9 +34,9 @@
 #include "cutlass_extensions/epilogue_helpers.h"
 #include "cutlass_extensions/gemm_configs.h"
 
-#ifndef _WIN32
+#ifdef __GNUC__ // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic pop
-#endif // #ifndef _WIN32
+#endif          // __GNUC__
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -161,8 +161,11 @@ void sm90_generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType 
                 sizeof(typename CollectiveEpilogue::SharedStorage))>,
             KernelSchedule>::CollectiveOp;
 
+        using TileScheduler = cute::conditional_t<size<0>(CTAShape{}) == Int<64>{}, cutlass::gemm::PersistentScheduler,
+            cutlass::gemm::StreamKScheduler>;
+
         using GemmKernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, // Indicates ProblemShape
-            CollectiveMainloop, CollectiveEpilogue>;
+            CollectiveMainloop, CollectiveEpilogue, TileScheduler>;
 
         if (occupancy != nullptr)
         {

@@ -27,6 +27,7 @@ from ..bindings import executor as trtllm
 from ..bindings.executor import (ExternalDraftTokensConfig, OrchestratorConfig,
                                  ParallelConfig)
 from ..builder import EngineConfig
+from ..layers import MropeParams
 from ..logger import logger
 from ..mapping import Mapping
 from .generation import (LogitsProcessor, LoraManager, SamplingConfig,
@@ -188,7 +189,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
         if is_enc_dec:
             encoder_config_path = Path(engine_dir) / "encoder" / "config.json"
             encoder_json_config = GptJsonConfig.parse_file(encoder_config_path)
-            encoder_json_config.model_config
+            encoder_model_config = encoder_json_config.model_config
             decoder_config_path = Path(engine_dir) / "decoder" / "config.json"
             decoder_json_config = GptJsonConfig.parse_file(decoder_config_path)
             decoder_model_config = decoder_json_config.model_config
@@ -196,6 +197,17 @@ class ModelRunnerCpp(ModelRunnerMixin):
 
             if not use_kv_cache:
                 assert max_output_len == 1 or max_output_len is None, 'Disabled KV cache is intended for context phase only now.'
+
+            if max_input_len is None:
+                max_input_len = encoder_model_config.max_input_len
+
+            max_seq_len = decoder_model_config.max_seq_len
+            # specifically set max_seq_len as decoder config. max_seq_len >= decoder_prefix_length + max_output_len.
+
+            if max_batch_size is None:
+                max_batch_size = decoder_model_config.max_batch_size
+            else:
+                assert max_batch_size <= decoder_model_config.max_batch_size
 
             tp_size = decoder_json_config.tensor_parallelism
             pp_size = decoder_json_config.pipeline_parallelism
@@ -231,7 +243,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
             return cls(executor,
                        max_batch_size=max_batch_size,
                        max_input_len=max_input_len,
-                       max_seq_len=max_input_len + max_output_len,
+                       max_seq_len=max_seq_len,
                        max_beam_width=max_beam_width,
                        model_config=decoder_model_config,
                        world_config=world_config,
@@ -422,22 +434,33 @@ class ModelRunnerCpp(ModelRunnerMixin):
                    lora_manager=lora_manager)
 
     def _check_inputs(self, batch_input_ids: List[List[int]],
+                      encoder_input_ids: Optional[List[List[int]]],
                       sampling_config: trtllm.SamplingConfig, max_new_tokens):
-        batch_size = len(batch_input_ids)
+        batch_size = len(encoder_input_ids) if encoder_input_ids else len(
+            batch_input_ids)
         if batch_size > self.max_batch_size:
             raise RuntimeError(
                 f"Input batch size ({batch_size}) exceeds the engine or specified limit ({self.max_batch_size})"
             )
-        input_lengths = [len(x) for x in batch_input_ids]
+        input_lengths = [
+            len(x) for x in encoder_input_ids
+        ] if encoder_input_ids else [len(x) for x in batch_input_ids]
         max_length = max(input_lengths)
         if max_length > self.max_input_len:
             raise RuntimeError(
                 f"Maximum input length ({max_length}) exceeds the engine or specified limit ({self.max_input_len})"
             )
-        if max_length + max_new_tokens > self.max_seq_len:
-            raise RuntimeError(
-                f"Maximum input length ({max_length}) + maximum new tokens ({max_new_tokens}) exceeds the engine or specified limit ({self.max_seq_len})"
-            )
+        if encoder_input_ids:
+            decoder_max_length = max([len(x) for x in batch_input_ids])
+            if decoder_max_length + max_new_tokens > self.max_seq_len:
+                raise RuntimeError(
+                    f"Decoder prefix tokens ({decoder_max_length}) + maximum new tokens ({max_new_tokens}) exceeds the engine or specified limit ({self.max_seq_len})"
+                )
+        else:
+            if max_length + max_new_tokens > self.max_seq_len:
+                raise RuntimeError(
+                    f"Maximum input length ({max_length}) + maximum new tokens ({max_new_tokens}) exceeds the engine or specified limit ({self.max_seq_len})"
+                )
         if sampling_config.beam_width > self.max_beam_width:
             raise RuntimeError(
                 f"Num beams ({sampling_config.beam_width}) exceeds the engine or specified limit ({self.max_beam_width})"
@@ -500,6 +523,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
             encoder_output_lengths: List[int] = None,
             cross_attention_masks: List[
                 torch.Tensor] = None,  # TODO: add to doc string
+            mrope_params: Optional[MropeParams] = None,
             sampling_config: Optional[SamplingConfig] = None,
             lora_uids: Optional[list] = None,
             lookahead_config: list[int] | None = None,
@@ -611,9 +635,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
         else:
             sampling_config = copy.deepcopy(sampling_config)
 
-        self._check_inputs(
-            encoder_input_ids_list if encoder_input_ids else
-            batch_input_ids_list, sampling_config, max_new_tokens)
+        self._check_inputs(batch_input_ids_list, encoder_input_ids_list,
+                           sampling_config, max_new_tokens)
 
         output_config = trtllm.OutputConfig(
             return_context_logits=self.gather_context_logits,
@@ -624,6 +647,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
         prompt_tuning_configs = self._prepare_ptuning_executor(
             batch_input_ids_list, prompt_table, prompt_tasks,
             input_token_extra_ids)
+        mrope_configs = self._prepare_mrope_executor(batch_input_ids_list,
+                                                     mrope_params)
 
         stop_words_list = self._prepare_words_list(stop_words_list,
                                                    len(batch_input_ids_list))
@@ -687,6 +712,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 streaming=streaming,
                 output_config=output_config,
                 prompt_tuning_config=prompt_tuning_config,
+                mrope_config=mrope_config,
                 lora_config=lora_config,
                 return_all_generated_tokens=return_all_generated_tokens,
                 logits_post_processor_name=logits_post_processor_name,
@@ -694,10 +720,10 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 skip_cross_attn_blocks=skip_cross_attn_blocks,
             ) for i,
             (input_ids, stop_words, bad_words, prompt_tuning_config,
-             lora_config, logits_post_processor_name,
+             mrope_config, lora_config, logits_post_processor_name,
              external_draft_tokens_config) in enumerate(
                  zip(batch_input_ids_list, stop_words_list, bad_words_list,
-                     prompt_tuning_configs, lora_configs,
+                     prompt_tuning_configs, mrope_configs, lora_configs,
                      logits_processor_names, external_draft_tokens_configs))
         ]
 
@@ -756,6 +782,31 @@ class ModelRunnerCpp(ModelRunnerMixin):
                     for i in range(len(batch_input_ids_list))
                 ]
         return prompt_tuning_configs
+
+    def _prepare_mrope_executor(self, batch_input_ids_list, mrope: MropeParams):
+        mrope_configs = len(batch_input_ids_list) * [None]
+        if mrope != None:
+            mrope_rotary_sin_cos = mrope.mrope_rotary_sin_cos
+            assert isinstance(
+                mrope_rotary_sin_cos,
+                torch.Tensor), "mrope_rotary_sin_cos should be torch.Tensor"
+            mrope_rotary_sin_cos_data = mrope_rotary_sin_cos.to(
+                dtype=torch.float32).to(torch.device('cpu'))
+
+            mrope_position_deltas = mrope.mrope_position_deltas
+            assert isinstance(
+                mrope_position_deltas,
+                torch.Tensor), "mrope_position_deltas should be torch.Tensor"
+            mrope_position_deltas_data = mrope_position_deltas.to(
+                dtype=torch.int32).to(torch.device('cpu'))
+
+            mrope_configs = [
+                trtllm.MropeConfig(
+                    mrope_rotary_sin_cos=mrope_rotary_sin_cos_data[i],
+                    mrope_position_deltas=mrope_position_deltas_data[i])
+                for i in range(len(batch_input_ids_list))
+            ]
+        return mrope_configs
 
     def _prepare_lora_configs(self, lora_uids, batch_size):
         if lora_uids is None:

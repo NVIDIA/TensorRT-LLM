@@ -800,7 +800,7 @@ void GptDecoderBatched::newRequestEagle(
     TensorPtr draftPathsHost = manager.pinnedPool(draftPathsSlice->getShape(), nvinfer1::DataType::kINT32);
     auto const depth = utils::initTensorsFromChoices(modelConfig.getSpeculativeDecodingModule(),
         eagleChoicesOpt.value_or(eagleModule->getDefaultEagleChoices()), topKs, nullptr, nullptr, nullptr,
-        draftPathsHost, nullptr);
+        draftPathsHost, nullptr, {eagleModule->getMaxNonLeafNodesPerLayer()});
     TLLM_CHECK_WITH_INFO(depth == modelConfig.getSpeculativeDecodingModule().getMaxDraftPathLen(),
         "EAGLE-1 requires Eagle-tree depth being equal to the the number of build-time EAGLE layers.");
 

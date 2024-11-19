@@ -416,34 +416,33 @@ std::set<int> getLocalGroup(std::set<int> const& group)
             ranks.push_back(myRank);
             for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it)
             {
-                LOCAL_COMM_SESSION.recvValue(rank, *it, 0);
+                COMM_SESSION.recvValue(rank, *it, 0);
                 ranks.push_back(rank);
             }
             for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it)
             {
-                LOCAL_COMM_SESSION.send(ranks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32, *it, 0);
+                COMM_SESSION.send(ranks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32, *it, 0);
             }
 
             localRanks.clear();
             localRanks.push_back(myLocalRank);
             for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it)
             {
-                LOCAL_COMM_SESSION.recvValue(rank, *it, 0);
+                COMM_SESSION.recvValue(rank, *it, 0);
                 localRanks.push_back(rank);
             }
             for (auto it = std::next(std::begin(group), 1); it != group.end(); ++it)
             {
-                LOCAL_COMM_SESSION.send(localRanks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32, *it, 0);
+                COMM_SESSION.send(localRanks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32, *it, 0);
             }
         }
         else
         {
-            LOCAL_COMM_SESSION.sendValue(myRank, *group.begin(), 0);
-            LOCAL_COMM_SESSION.recv(ranks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32, *group.begin(), 0);
+            COMM_SESSION.sendValue(myRank, *group.begin(), 0);
+            COMM_SESSION.recv(ranks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32, *group.begin(), 0);
 
-            LOCAL_COMM_SESSION.sendValue(myLocalRank, *group.begin(), 0);
-            LOCAL_COMM_SESSION.recv(
-                localRanks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32, *group.begin(), 0);
+            COMM_SESSION.sendValue(myLocalRank, *group.begin(), 0);
+            COMM_SESSION.recv(localRanks.data(), localSize, tensorrt_llm::mpi::MpiType::kINT32, *group.begin(), 0);
         }
     }
 
@@ -732,7 +731,6 @@ IPluginV2* AllreducePluginCreator::createPlugin(char const* name, PluginFieldCol
             bias = *static_cast<int8_t const*>(fields[i].data);
         }
     }
-
     try
     {
         auto* obj = new AllreducePlugin(group, type, strategy, config, fusion_op, counter, eps, affine, bias);

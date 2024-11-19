@@ -3,7 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List, Optional
 
-from pydantic import BaseModel, computed_field, model_validator
+from pydantic import (AliasChoices, BaseModel, Field, computed_field,
+                      model_validator)
 
 from tensorrt_llm.bench.utils import (VALID_CACHE_DTYPES, VALID_COMPUTE_DTYPES,
                                       VALID_QUANT_ALGOS)
@@ -71,13 +72,14 @@ class InferenceRequest(BaseModel):
     task_id: int
     prompt: Optional[str] = None
     output_tokens: int
-    logits: Optional[List[int]] = None
+    input_ids: Optional[List[int]] = Field(
+        alias=AliasChoices("input_ids", "logits"))
 
     @model_validator(mode="after")
     def verify_prompt_and_logits(self) -> InferenceRequest:
-        if self.prompt is None and self.logits is None:
+        if self.prompt is None and self.input_ids is None:
             raise ValueError(
-                f"Both prompt and logits for {self.task_id} are both None.")
+                f"Both prompt and input_ids for {self.task_id} are both None.")
         return self
 
 

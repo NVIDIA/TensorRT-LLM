@@ -513,13 +513,13 @@ void TllmRuntime::setInputTensorsImpl(SizeType32 contextIndex, TensorMap const& 
                 ITensor::toString(maxShape).c_str());
         }
         auto* const data = tensor->data();
-        if (data)
+        if (static_cast<bool>(data))
         {
             context.setInputTensorAddress(name.c_str(), data);
         }
         else
         {
-            TLLM_CHECK_WITH_INFO(tensor->getSize() == 0, std::string("Invalid data for tensor: ") + name.c_str());
+            TLLM_CHECK_WITH_INFO(tensor->getSize() == 0, std::string("Invalid data for tensor: ") + name);
             // TensorRT runtime does not support nullptr.
             if (!mDummyTensor)
             {
@@ -563,7 +563,7 @@ void TllmRuntime::setInputTensors(SizeType32 contextIndex, TensorMap const& tens
     if (mUseShapeInference)
     {
         NVTX3_SCOPED_RANGE(infer_shapes);
-        char const* missing;
+        char const* missing = nullptr;
         auto const nbMissing = context.inferShapes(1, &missing);
         if (nbMissing > 0)
         {

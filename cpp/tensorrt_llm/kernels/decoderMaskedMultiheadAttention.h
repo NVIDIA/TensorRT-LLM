@@ -197,6 +197,7 @@ struct Multihead_attention_params_base
     int* block_counter = nullptr;
 
     int const* memory_length_per_sample = nullptr;
+    int32_t const* mrope_position_deltas = nullptr;
 };
 
 template <typename T, bool USE_CROSS_ATTENTION = false>

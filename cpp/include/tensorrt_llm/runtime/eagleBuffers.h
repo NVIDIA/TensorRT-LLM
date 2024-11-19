@@ -77,6 +77,8 @@ public:
         TensorPtr eagleNetGenContextLengthsHost;
         //! [maxBatchSize] or [numSequences]
         TensorPtr eagleNetGenPastKeyValueLengthsHost;
+        //! [maxBatchSize * maxDecodingTokens] or [numSequences * maxDecodingTokens]
+        TensorPtr inputGenTokensHost;
 
         void create(SizeType32 maxNumSequences, runtime::TllmRuntime const& runtime,
             runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig);

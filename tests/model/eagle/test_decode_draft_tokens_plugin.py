@@ -40,7 +40,7 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
         ################# CASE 0 ##########################
         # BS=1, topK sampling
         # 1 input logits, from node "0"
-        # layerId = 0
+        # layer_id = 0
         # logits_data_type = float32
 
         logits_data_type = torch.float32
@@ -50,6 +50,10 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             ],
             dtype=logits_data_type,
             device="cuda")  # shape: [num_tokens, vocab_size_padded]
+
+        num_last_token_indices = torch.tensor([1],
+                                              dtype=torch.int32,
+                                              device="cuda")  # shape: [1]
 
         rand_sample = torch.tensor([0], dtype=torch.float32,
                                    device="cuda")  # shape: [num_tokens]
@@ -69,8 +73,8 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
         input_draft_lens = torch.tensor([0], dtype=torch.int32,
                                         device="cuda")  # shape: [batch_size]
 
-        topKSampling = True
-        layerId = 0
+        top_k_sampling = True
+        layer_id = 0
         ref_return_draft_token_ids = torch.tensor(
             [[6, 3, 2, -1, -1, -1, -1]], dtype=torch.int32,
             device="cuda")  # shape: [batch_size, max_decoding_draft_tokens]
@@ -79,15 +83,15 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             [3], dtype=torch.int32, device="cuda")  # shape: [batch_size]
 
         test_cases += [[
-            logits, rand_sample, paths, input_draft_token_ids, input_draft_lens,
-            topKSampling, layerId, ref_return_draft_token_ids,
-            ref_return_draft_len
+            logits, num_last_token_indices, rand_sample, paths,
+            input_draft_token_ids, input_draft_lens, top_k_sampling, layer_id,
+            ref_return_draft_token_ids, ref_return_draft_len
         ]]
 
         ################# CASE 1 ##########################
         # BS=2, topK sampling
         # 2 input logits, from req0 node "0" and req1 node "0"
-        # layerId = 0
+        # layer_id = 0
         # logits_data_type = float32
 
         logits_data_type = torch.float32
@@ -98,6 +102,10 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             ],
             dtype=logits_data_type,
             device="cuda")  # shape: [num_tokens, vocab_size_padded]
+
+        num_last_token_indices = torch.tensor([2],
+                                              dtype=torch.int32,
+                                              device="cuda")  # shape: [1]
 
         rand_sample = torch.tensor([0, 0], dtype=torch.float32,
                                    device="cuda")  # shape: [num_tokens]
@@ -120,8 +128,8 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
                                         dtype=torch.int32,
                                         device="cuda")  # shape: [batch_size]
 
-        topKSampling = True
-        layerId = 0
+        top_k_sampling = True
+        layer_id = 0
         ref_return_draft_token_ids = torch.tensor(
             [[3, 2, -1, -1], [1, 3, 5, -1]], dtype=torch.int32,
             device="cuda")  # shape: [batch_size, max_decoding_draft_tokens]
@@ -130,15 +138,15 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             [2, 3], dtype=torch.int32, device="cuda")  # shape: [batch_size]
 
         test_cases += [[
-            logits, rand_sample, paths, input_draft_token_ids, input_draft_lens,
-            topKSampling, layerId, ref_return_draft_token_ids,
-            ref_return_draft_len
+            logits, num_last_token_indices, rand_sample, paths,
+            input_draft_token_ids, input_draft_lens, top_k_sampling, layer_id,
+            ref_return_draft_token_ids, ref_return_draft_len
         ]]
 
         ################# CASE 2 ##########################
         # BS=1, topK sampling
         # 2 input loigts, from req0 node "1" and "3"
-        # layerId = 1
+        # layer_id = 1
         # logits_data_type = float32
 
         logits_data_type = torch.float32
@@ -149,6 +157,10 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             ],
             dtype=logits_data_type,
             device="cuda")  # shape: [num_tokens, vocab_size_padded]
+
+        num_last_token_indices = torch.tensor([2],
+                                              dtype=torch.int32,
+                                              device="cuda")  # shape: [1]
 
         rand_sample = torch.tensor([0, 0], dtype=torch.float32,
                                    device="cuda")  # shape: [num_tokens]
@@ -168,8 +180,8 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
         input_draft_lens = torch.tensor([3], dtype=torch.int32,
                                         device="cuda")  # shape: [batch_size]
 
-        topKSampling = True
-        layerId = 1
+        top_k_sampling = True
+        layer_id = 1
         ref_return_draft_token_ids = torch.tensor(
             [[6, 3, 2, 3, 1, -1, -1]], dtype=torch.int32,
             device="cuda")  # shape: [batch_size, max_decoding_draft_tokens]
@@ -178,15 +190,15 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             [5], dtype=torch.int32, device="cuda")  # shape: [batch_size]
 
         test_cases += [[
-            logits, rand_sample, paths, input_draft_token_ids, input_draft_lens,
-            topKSampling, layerId, ref_return_draft_token_ids,
-            ref_return_draft_len
+            logits, num_last_token_indices, rand_sample, paths,
+            input_draft_token_ids, input_draft_lens, top_k_sampling, layer_id,
+            ref_return_draft_token_ids, ref_return_draft_len
         ]]
 
         ################# CASE 3 ##########################
         # BS=2, topK sampling
         # 1 input loigts, from req1, node "3"
-        # layerId = 1
+        # layer_id = 1
         # logits_data_type = float32
 
         logits_data_type = torch.float32
@@ -196,6 +208,10 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             ],
             dtype=logits_data_type,
             device="cuda")  # shape: [num_tokens, vocab_size_padded]
+
+        num_last_token_indices = torch.tensor([1],
+                                              dtype=torch.int32,
+                                              device="cuda")  # shape: [1]
 
         rand_sample = torch.tensor([0], dtype=torch.float32,
                                    device="cuda")  # shape: [num_tokens]
@@ -217,8 +233,8 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
                                         dtype=torch.int32,
                                         device="cuda")  # shape: [batch_size]
 
-        topKSampling = True
-        layerId = 1
+        top_k_sampling = True
+        layer_id = 1
         ref_return_draft_token_ids = torch.tensor(
             [[2, 1, -1, -1], [1, 2, 3, 5]], dtype=torch.int32,
             device="cuda")  # shape: [batch_size, max_decoding_draft_tokens]
@@ -227,15 +243,15 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             [2, 4], dtype=torch.int32, device="cuda")  # shape: [batch_size]
 
         test_cases += [[
-            logits, rand_sample, paths, input_draft_token_ids, input_draft_lens,
-            topKSampling, layerId, ref_return_draft_token_ids,
-            ref_return_draft_len
+            logits, num_last_token_indices, rand_sample, paths,
+            input_draft_token_ids, input_draft_lens, top_k_sampling, layer_id,
+            ref_return_draft_token_ids, ref_return_draft_len
         ]]
 
         ################# CASE 4 ##########################
         # BS=2, topK sampling
         # 2 input logits, from req0 node "4" and req1 node "4"
-        # layerId = 2
+        # layer_id = 2
         # logits_data_type = float32
 
         logits_data_type = torch.float32
@@ -246,6 +262,10 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             ],
             dtype=logits_data_type,
             device="cuda")  # shape: [num_tokens, vocab_size_padded]
+
+        num_last_token_indices = torch.tensor([2],
+                                              dtype=torch.int32,
+                                              device="cuda")  # shape: [1]
 
         rand_sample = torch.tensor([0, 0], dtype=torch.float32,
                                    device="cuda")  # shape: [num_tokens]
@@ -270,8 +290,8 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
                                         dtype=torch.int32,
                                         device="cuda")  # shape: [batch_size]
 
-        topKSampling = True
-        layerId = 2
+        top_k_sampling = True
+        layer_id = 2
         ref_return_draft_token_ids = torch.tensor(
             [[1, 2, 3, 4, 5, 3, 2], [1, 2, 3, 4, 5, 5, 4]],
             dtype=torch.int32,
@@ -281,15 +301,15 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             [7, 7], dtype=torch.int32, device="cuda")  # shape: [batch_size]
 
         test_cases += [[
-            logits, rand_sample, paths, input_draft_token_ids, input_draft_lens,
-            topKSampling, layerId, ref_return_draft_token_ids,
-            ref_return_draft_len
+            logits, num_last_token_indices, rand_sample, paths,
+            input_draft_token_ids, input_draft_lens, top_k_sampling, layer_id,
+            ref_return_draft_token_ids, ref_return_draft_len
         ]]
 
         ################# CASE 5 ##########################
         # BS=1, topK sampling
         # 1 input logits, from req0 node "0"
-        # layerId = 0
+        # layer_id = 0
         # logits_data_type = float16
 
         logits_data_type = torch.float16
@@ -299,6 +319,10 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             ],
             dtype=logits_data_type,
             device="cuda")  # shape: [num_tokens, vocab_size_padded]
+
+        num_last_token_indices = torch.tensor([1],
+                                              dtype=torch.int32,
+                                              device="cuda")  # shape: [1]
 
         rand_sample = torch.tensor([0], dtype=torch.float32,
                                    device="cuda")  # shape: [num_tokens]
@@ -318,8 +342,8 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
         input_draft_lens = torch.tensor([0], dtype=torch.int32,
                                         device="cuda")  # shape: [batch_size]
 
-        topKSampling = True
-        layerId = 0
+        top_k_sampling = True
+        layer_id = 0
         ref_return_draft_token_ids = torch.tensor(
             [[6, 3, 2, -1, -1, -1, -1]], dtype=torch.int32,
             device="cuda")  # shape: [batch_size, max_decoding_draft_tokens]
@@ -328,17 +352,73 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             [3], dtype=torch.int32, device="cuda")  # shape: [batch_size]
 
         test_cases += [[
-            logits, rand_sample, paths, input_draft_token_ids, input_draft_lens,
-            topKSampling, layerId, ref_return_draft_token_ids,
-            ref_return_draft_len
+            logits, num_last_token_indices, rand_sample, paths,
+            input_draft_token_ids, input_draft_lens, top_k_sampling, layer_id,
+            ref_return_draft_token_ids, ref_return_draft_len
+        ]]
+
+        ################# CASE 6 ##########################
+        # BS=1, topK sampling
+        # 5 input logits, only the 1st is valid, from req0 node "0"
+        # layer_id = 0
+        # logits_data_type = float16
+
+        logits_data_type = torch.float16
+        logits = torch.tensor(
+            [
+                [-100, -100, 0, 1, -100, -100, 2, -100],  # Top3 id = 6, 3, 2
+                [0, 1, -100, -100, -100, -100, -100, 2],  # Top3 id = 7, 1, 0
+                [0, 1, -100, -100, -100, -100, -100, 2],  # Top3 id = 7, 1, 0
+                [0, 1, -100, -100, -100, -100, -100, 2],  # Top3 id = 7, 1, 0
+                [0, 1, -100, -100, -100, -100, -100, 2],  # Top3 id = 7, 1, 0
+            ],
+            dtype=logits_data_type,
+            device="cuda")  # shape: [num_tokens, vocab_size_padded]
+
+        num_last_token_indices = torch.tensor([1],
+                                              dtype=torch.int32,
+                                              device="cuda")  # shape: [1]
+
+        rand_sample = torch.tensor([0], dtype=torch.float32,
+                                   device="cuda")  # shape: [num_tokens]
+
+        paths = torch.tensor(
+            [[[0, 1, 4, 6], [0, 1, 4, 7], [0, 2, -1, -1], [0, 3, 5, -1],
+              [-1, -1, -1, -1], [-1, -1, -1, -1], [-1, -1, -1, -1],
+              [-1, -1, -1, -1]]],
+            dtype=torch.int32,
+            device="cuda"
+        )  # shape: [batch_size, max_decoding_tokens, max_path_len] -> [1, 8, 4]
+
+        input_draft_token_ids = torch.tensor(
+            [[-1, -1, -1, -1, -1, -1, -1]], dtype=torch.int32,
+            device="cuda")  # shape: [batch_size, max_decoding_draft_tokens]
+
+        input_draft_lens = torch.tensor([0], dtype=torch.int32,
+                                        device="cuda")  # shape: [batch_size]
+
+        top_k_sampling = True
+        layer_id = 0
+        ref_return_draft_token_ids = torch.tensor(
+            [[6, 3, 2, -1, -1, -1, -1]], dtype=torch.int32,
+            device="cuda")  # shape: [batch_size, max_decoding_draft_tokens]
+
+        ref_return_draft_len = torch.tensor(
+            [3], dtype=torch.int32, device="cuda")  # shape: [batch_size]
+
+        test_cases += [[
+            logits, num_last_token_indices, rand_sample, paths,
+            input_draft_token_ids, input_draft_lens, top_k_sampling, layer_id,
+            ref_return_draft_token_ids, ref_return_draft_len
         ]]
 
         return test_cases
 
     @parameterized.expand(load_test_cases, name_func=unittest_name_func)
-    def test_sample_draft_tokens_plugin(self, logits, rand_sample, paths,
+    def test_sample_draft_tokens_plugin(self, logits, num_last_token_indices,
+                                        rand_sample, paths,
                                         input_draft_token_ids, input_draft_lens,
-                                        topKSampling, layerId,
+                                        top_k_sampling, layer_id,
                                         ref_return_draft_token_ids,
                                         ref_return_draft_len):
         # test data
@@ -353,6 +433,11 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
                               dtype=tensorrt_llm.torch_dtype_to_trt(
                                   logits.dtype),
                               shape=logits.shape)
+            num_last_token_indices_t = Tensor(
+                name='num_last_token_indices',
+                dtype=tensorrt_llm.torch_dtype_to_trt(
+                    num_last_token_indices.dtype),
+                shape=num_last_token_indices.shape)
             rand_sample_t = Tensor(name='rand_sample',
                                    dtype=trt.float32,
                                    shape=rand_sample.shape)
@@ -365,9 +450,10 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
                                         shape=input_draft_lens.shape)
 
             output = tensorrt_llm.models.eagle.model.eagle_draft_decoder_plugin(
-                layer_idx=layerId,
-                top_k_sampling=topKSampling,
+                layer_idx=layer_id,
+                top_k_sampling=top_k_sampling,
                 logits=logits_t,
+                num_last_token_indices=num_last_token_indices_t,
                 rand_sample=rand_sample_t,
                 tree_params=TreeParams(paths=paths_t),
                 input_draft_token_ids=input_draft_token_ids_t,
@@ -382,6 +468,7 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
         session = create_session(builder, network, precision='float32')
         inputs = {
             "logits": logits,
+            "num_last_token_indices": num_last_token_indices,
             "rand_sample": rand_sample,
             "paths": paths,
             "input_draft_token_ids": input_draft_token_ids,

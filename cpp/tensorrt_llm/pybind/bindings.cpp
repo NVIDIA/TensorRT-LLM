@@ -245,6 +245,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property("max_prompt_embedding_table_size", &tr::ModelConfig::getMaxPromptEmbeddingTableSize,
             &tr::ModelConfig::setMaxPromptEmbeddingTableSize)
         .def_property_readonly("use_prompt_tuning", &tr::ModelConfig::usePromptTuning)
+        .def_property_readonly("use_mrope", &tr::ModelConfig::useMrope)
         .def_property("use_lora_plugin", py::overload_cast<>(&tr::ModelConfig::useLoraPlugin, py::const_),
             py::overload_cast<bool>(&tr::ModelConfig::useLoraPlugin))
         .def_property("compute_context_logits", py::overload_cast<>(&tr::ModelConfig::computeContextLogits, py::const_),

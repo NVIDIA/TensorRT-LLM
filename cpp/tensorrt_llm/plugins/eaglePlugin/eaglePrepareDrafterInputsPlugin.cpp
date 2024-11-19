@@ -36,8 +36,11 @@ static char const* EAGLE_PREPARE_DRAFTER_INPUTS_PLUGIN_NAME{"EaglePrepareDrafter
 PluginFieldCollection EaglePrepareDrafterInputsPluginCreator::mFC{};
 std::vector<nvinfer1::PluginField> EaglePrepareDrafterInputsPluginCreator::mPluginAttributes;
 
-EaglePrepareDrafterInputsPlugin::EaglePrepareDrafterInputsPlugin(int32_t layerIdx)
+EaglePrepareDrafterInputsPlugin::EaglePrepareDrafterInputsPlugin(
+    int32_t layerIdx, int32_t numLayers, int32_t maxNonLeavesPerLayer)
     : mLayerIdx(layerIdx)
+    , mNumLayers(numLayers)
+    , mMaxNonLeavesPerLayer(maxNonLeavesPerLayer)
 {
 }
 
@@ -45,6 +48,9 @@ void EaglePrepareDrafterInputsPlugin::initFieldsToSerialize()
 {
     mDataToSerialize.clear();
     mDataToSerialize.emplace_back(PluginField("layer_idx", &mLayerIdx, PluginFieldType::kINT32, 1));
+    mDataToSerialize.emplace_back(PluginField("num_layers", &mNumLayers, PluginFieldType::kINT32, 1));
+    mDataToSerialize.emplace_back(
+        PluginField("max_non_leaves_per_layer", &mMaxNonLeavesPerLayer, PluginFieldType::kINT32, 1));
     mFCToSerialize.nbFields = mDataToSerialize.size();
     mFCToSerialize.fields = mDataToSerialize.data();
 }
@@ -99,7 +105,7 @@ char const* EaglePrepareDrafterInputsPlugin::getPluginNamespace() const noexcept
 // IPluginV3OneBuild methods
 int32_t EaglePrepareDrafterInputsPlugin::getNbOutputs() const noexcept
 {
-    return 12;
+    return 11;
 }
 
 int32_t EaglePrepareDrafterInputsPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int32_t nbInputs,
@@ -136,11 +142,13 @@ int32_t EaglePrepareDrafterInputsPlugin::getOutputShapes(nvinfer1::DimsExprs con
     nvinfer1::DimsExprs const* shapeInputs, int32_t nbShapeInputs, nvinfer1::DimsExprs* outputs, int32_t nbOutputs,
     nvinfer1::IExprBuilder& exprBuilder) noexcept
 {
-    TLLM_CHECK(nbOutputs == 12);
-    TLLM_CHECK(nbInputs == 12);
+    TLLM_CHECK(nbOutputs == 11);
+    TLLM_CHECK(nbInputs == 14);
     TLLM_CHECK(nbShapeInputs == 0);
     auto const numTokens = inputs[getIdx(InputIdxEntry::INPUT_IDS)].d[0];
     auto const batchSizeExpr = inputs[getIdx(InputIdxEntry::PREV_DRAFT_PATHS)].d[0];
+    auto const numGenRequestsExpr = inputs[getIdx(InputIdxEntry::SPEC_DECODING_GENERATION_LENGTHS)].d[0];
+    auto const numInputGenTokensExpr = inputs[getIdx(InputIdxEntry::INPUT_GEN_TOKENS)].d[0];
     auto const maxDecodingLenExpr = inputs[getIdx(InputIdxEntry::PREV_DRAFT_PATHS)].d[1];
     auto const maxPathLenExpr = inputs[getIdx(InputIdxEntry::PREV_DRAFT_PATHS)].d[2];
 
@@ -171,14 +179,29 @@ int32_t EaglePrepareDrafterInputsPlugin::getOutputShapes(nvinfer1::DimsExprs con
             || outputIndex == getIdx(OutputIdxEntry::HIDDEN_STATES_INDICES)
             || (mLayerIdx == 0 && outputIndex == getIdx(OutputIdxEntry::POSITION_IDS)))
         {
-            auto optValue = exprBuilder.operation(DimensionOperation::kPROD, *maxDecodingLenExpr, *batchSizeExpr);
-            auto upperBound = exprBuilder.operation(DimensionOperation::kSUM, *optValue, *numTokens);
-
-            SizeType32 outSizeIndex = getIdx(OutputIdxEntry::NUM_OUTPUT_TOKENS);
-            auto outSizeTensor = exprBuilder.declareSizeTensor(outSizeIndex, *optValue, *upperBound);
-
-            outputs[outputIndex].nbDims = 1;
-            outputs[outputIndex].d[0] = outSizeTensor;
+            if (mLayerIdx == 0)
+            {
+                // We have at most numGenRequests * (mNumLayers + 1) accepted tokens per step for gen requests and
+                // input_ids - numGenTokens tokens for context requests.
+                auto numOutputGenTokensExpr = exprBuilder.operation(
+                    DimensionOperation::kPROD, *numGenRequestsExpr, *exprBuilder.constant(mNumLayers + 1));
+                auto numInputCtxTokensExpr
+                    = exprBuilder.operation(DimensionOperation::kSUB, *numTokens, *numInputGenTokensExpr);
+                outputs[outputIndex].nbDims = 1;
+                outputs[outputIndex].d[0] = exprBuilder.operation(DimensionOperation::kMAX, *exprBuilder.constant(1),
+                    *exprBuilder.operation(DimensionOperation::kSUM, *numOutputGenTokensExpr, *numInputCtxTokensExpr));
+            }
+            else
+            {
+                // At most we have mMaxNonLeavesPerLayer non-leaves at this layer.
+                // And in total we pass all non-leaves + all their preceding nodes.
+                // batchSize * mMaxNonLeavesPerLayer * layerIdx
+                outputs[outputIndex].nbDims = 1;
+                outputs[outputIndex].d[0] = exprBuilder.operation(DimensionOperation::kPROD,
+                    *exprBuilder.operation(DimensionOperation::kPROD, *exprBuilder.constant(mLayerIdx),
+                        *exprBuilder.constant(mMaxNonLeavesPerLayer)),
+                    *batchSizeExpr);
+            }
         }
         else if (mLayerIdx > 0 && outputIndex == getIdx(OutputIdxEntry::POSITION_IDS))
         {
@@ -187,20 +210,14 @@ int32_t EaglePrepareDrafterInputsPlugin::getOutputShapes(nvinfer1::DimsExprs con
         }
         else if (outputIndex == getIdx(OutputIdxEntry::LAST_TOKEN_INDICES))
         {
-            auto upperBound = exprBuilder.operation(DimensionOperation::kPROD, *maxDecodingLenExpr, *batchSizeExpr);
-            auto optValue = exprBuilder.operation(DimensionOperation::kCEIL_DIV, *upperBound, *exprBuilder.constant(2));
-
-            SizeType32 outSizeIndex = getIdx(OutputIdxEntry::NUM_LAST_TOKEN_INDICES);
-            auto outSizeTensor = exprBuilder.declareSizeTensor(outSizeIndex, *optValue, *upperBound);
-
             outputs[outputIndex].nbDims = 1;
-            outputs[outputIndex].d[0] = outSizeTensor;
+            outputs[outputIndex].d[0] = exprBuilder.operation(
+                DimensionOperation::kPROD, *exprBuilder.constant(mMaxNonLeavesPerLayer), *batchSizeExpr);
         }
-        else if (outputIndex == getIdx(OutputIdxEntry::NUM_OUTPUT_TOKENS)
-            || outputIndex == getIdx(OutputIdxEntry::NUM_LAST_TOKEN_INDICES))
+        else if (outputIndex == getIdx(OutputIdxEntry::NUM_LAST_TOKEN_INDICES))
         {
-            // size tensors must be declared as 0-D
-            outputs[outputIndex].nbDims = 0;
+            outputs[outputIndex].nbDims = 1;
+            outputs[outputIndex].d[0] = exprBuilder.constant(1);
         }
         else if (outputIndex == getIdx(OutputIdxEntry::HIDDEN_SIZE_BATCH_LEVEL_STARTS))
         {
@@ -265,6 +282,11 @@ void EaglePrepareDrafterInputsPlugin::prepareCtxEagleNetData(nvinfer1::PluginTen
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto const batchSize = inputDesc[getIdx(InputIdxEntry::SEQUENCE_LENGTHS)].dims.d[0];
+
+    auto const numTokens = inputDesc[getIdx(InputIdxEntry::INPUT_IDS)].dims.d[0];
+    auto const numGenRequests = inputDesc[getIdx(InputIdxEntry::SPEC_DECODING_GENERATION_LENGTHS)].dims.d[0];
+    auto const numInputGenTokens = inputDesc[getIdx(InputIdxEntry::INPUT_GEN_TOKENS)].dims.d[0];
+
     auto const maxPathLen = inputDesc[getIdx(InputIdxEntry::ACCEPTED_TOKENS)].dims.d[1];
     auto const maxDecodingTokens = inputDesc[getIdx(InputIdxEntry::NEXT_DRAFT_PATHS)].dims.d[1];
 
@@ -274,7 +296,6 @@ void EaglePrepareDrafterInputsPlugin::prepareCtxEagleNetData(nvinfer1::PluginTen
     auto positionIds = reinterpret_cast<SizeType32*>(outputs[getIdx(OutputIdxEntry::POSITION_IDS)]);
     auto hiddenStatesIndices = reinterpret_cast<SizeType32*>(outputs[getIdx(OutputIdxEntry::HIDDEN_STATES_INDICES)]);
     auto lastTokenIndices = reinterpret_cast<SizeType32*>(outputs[getIdx(OutputIdxEntry::LAST_TOKEN_INDICES)]);
-    auto numOutputTokens = reinterpret_cast<SizeType32*>(outputs[getIdx(OutputIdxEntry::NUM_OUTPUT_TOKENS)]);
     auto numLastTokenIndices = reinterpret_cast<SizeType32*>(outputs[getIdx(OutputIdxEntry::NUM_LAST_TOKEN_INDICES)]);
     auto hiddenSizeBatchLevelStarts
         = reinterpret_cast<SizeType32*>(outputs[getIdx(OutputIdxEntry::HIDDEN_SIZE_BATCH_LEVEL_STARTS)]);
@@ -288,12 +309,14 @@ void EaglePrepareDrafterInputsPlugin::prepareCtxEagleNetData(nvinfer1::PluginTen
     auto prevPaths = reinterpret_cast<SizeType32 const*>(inputs[getIdx(InputIdxEntry::PREV_DRAFT_PATHS)]);
     auto bestPathIds = reinterpret_cast<SizeType32 const*>(inputs[getIdx(InputIdxEntry::ACCEPTED_PATHS)]);
 
-    invokePrepareCtxEagleNetInputs(eagleNetSequenceLengths, eagleNetContextLengths, outputIds, positionIds,
-        hiddenStatesIndices, lastTokenIndices, numOutputTokens, numLastTokenIndices, hiddenSizeBatchLevelStarts,
-        inputIds, baseNetSequenceLengths, baseNetContextLengths, acceptedTokens, acceptedLens, prevDraftLens, prevPaths,
-        bestPathIds, batchSize, maxPathLen, maxDecodingTokens, stream);
+    auto const numOutputTokens = (numTokens - numInputGenTokens) + (numGenRequests * (mNumLayers + 1));
+    cudaMemsetAsync(positionIds, 0, numOutputTokens * sizeof(SizeType32), stream);
+    cudaMemsetAsync(hiddenStatesIndices, 0, numOutputTokens * sizeof(SizeType32), stream);
 
-    auto const numTokens = inputDesc[getIdx(InputIdxEntry::INPUT_IDS)].dims.d[0];
+    invokePrepareCtxEagleNetInputs(eagleNetSequenceLengths, eagleNetContextLengths, outputIds, positionIds,
+        hiddenStatesIndices, lastTokenIndices, numLastTokenIndices, hiddenSizeBatchLevelStarts, inputIds,
+        baseNetSequenceLengths, baseNetContextLengths, acceptedTokens, acceptedLens, prevDraftLens, prevPaths,
+        bestPathIds, batchSize, maxPathLen, maxDecodingTokens, mMaxNonLeavesPerLayer, stream);
 
     sync_check_cuda_error();
 
@@ -322,7 +345,6 @@ void EaglePrepareDrafterInputsPlugin::prepareGenEagleNetData(nvinfer1::PluginTen
         = reinterpret_cast<SizeType32*>(outputs[getIdx(OutputIdxEntry::SPEC_DECODING_PACKED_MASK)]);
     auto hiddenStatesIndices = reinterpret_cast<SizeType32*>(outputs[getIdx(OutputIdxEntry::HIDDEN_STATES_INDICES)]);
     auto lastTokenIndices = reinterpret_cast<SizeType32*>(outputs[getIdx(OutputIdxEntry::LAST_TOKEN_INDICES)]);
-    auto numOutputTokens = reinterpret_cast<SizeType32*>(outputs[getIdx(OutputIdxEntry::NUM_OUTPUT_TOKENS)]);
     auto numLastTokenIndices = reinterpret_cast<SizeType32*>(outputs[getIdx(OutputIdxEntry::NUM_LAST_TOKEN_INDICES)]);
     auto outputHiddenSizeBatchStartsPerLevel
         = reinterpret_cast<SizeType32*>(outputs[getIdx(OutputIdxEntry::HIDDEN_SIZE_BATCH_LEVEL_STARTS)]);
@@ -357,6 +379,7 @@ void EaglePrepareDrafterInputsPlugin::prepareGenEagleNetData(nvinfer1::PluginTen
     SizeType32* maxGenerationLength
         = reinterpret_cast<SizeType32*>(tc::nextWorkspacePtr(workspaceBytePtr, offset, 1 * sizeof(SizeType32)));
 
+    cudaMemsetAsync(hiddenStatesIndices, 0, batchSize * mMaxNonLeavesPerLayer * mLayerIdx * sizeof(SizeType32), stream);
     cudaMemsetAsync(selectedMasks, 0, batchSize * maxDecodingTokens * maxDecodingTokens * sizeof(int8_t), stream);
     // Prefill mask setting all to leaves.
     cudaMemsetAsync(isLeafMask, 1, batchSize * maxDecodingTokens * sizeof(int8_t), stream);
@@ -371,7 +394,6 @@ void EaglePrepareDrafterInputsPlugin::prepareGenEagleNetData(nvinfer1::PluginTen
     params.specDecodingPackedMasks = specDecodingPackedMasks;
     params.hiddenStatesIndices = hiddenStatesIndices;
     params.lastTokenIndices = lastTokenIndices;
-    params.numOutputTokens = numOutputTokens;
     params.numLastTokenIndices = numLastTokenIndices;
     params.outputHiddenSizeBatchStartsPerLevel = outputHiddenSizeBatchStartsPerLevel;
 
@@ -395,6 +417,7 @@ void EaglePrepareDrafterInputsPlugin::prepareGenEagleNetData(nvinfer1::PluginTen
     params.batchSize = batchSize;
     params.maxPathLen = maxPathLen;
     params.maxDecodingTokens = maxDecodingTokens;
+    params.maxNonLeavesPerLayer = mMaxNonLeavesPerLayer;
     params.stream = stream;
 
     params.checkParams();
@@ -459,7 +482,9 @@ EaglePrepareDrafterInputsPluginCreator::EaglePrepareDrafterInputsPluginCreator()
 {
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
-    mPluginAttributes.emplace_back(PluginField("layer_idx", nullptr, PluginFieldType::kINT32, 0));
+    mPluginAttributes.emplace_back(PluginField("layer_idx", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("num_layers", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("max_non_leaves_per_layer", nullptr, PluginFieldType::kINT32, 1));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }
@@ -485,6 +510,8 @@ nvinfer1::IPluginV3* EaglePrepareDrafterInputsPluginCreator::createPlugin(
     try
     {
         int32_t layerIdx{0};
+        int32_t numLayers{0};
+        int32_t maxNonLeavesPerLayer{0};
         // Read configurations from each fields
         for (int i = 0; i < fc->nbFields; ++i)
         {
@@ -494,8 +521,18 @@ nvinfer1::IPluginV3* EaglePrepareDrafterInputsPluginCreator::createPlugin(
                 TLLM_CHECK(fc->fields[i].type == PluginFieldType::kINT32);
                 layerIdx = *static_cast<int32_t const*>(fc->fields[i].data);
             }
+            else if (!strcmp(attrName, "num_layers"))
+            {
+                TLLM_CHECK(fc->fields[i].type == PluginFieldType::kINT32);
+                numLayers = *static_cast<int32_t const*>(fc->fields[i].data);
+            }
+            else if (!strcmp(attrName, "max_non_leaves_per_layer"))
+            {
+                TLLM_CHECK(fc->fields[i].type == PluginFieldType::kINT32);
+                maxNonLeavesPerLayer = *static_cast<int32_t const*>(fc->fields[i].data);
+            }
         }
-        return new EaglePrepareDrafterInputsPlugin(layerIdx);
+        return new EaglePrepareDrafterInputsPlugin(layerIdx, numLayers, maxNonLeavesPerLayer);
     }
     catch (std::exception const& e)
     {

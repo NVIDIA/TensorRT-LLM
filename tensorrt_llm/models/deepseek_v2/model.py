@@ -19,9 +19,9 @@ import torch
 
 from ..._utils import pad_vocab_size, torch_dtype_to_str
 from ...functional import Tensor, non_gated_version, recv, send
-from ...layers import (AttentionMaskType, ColumnLinear, DeepseekV2Attention,
-                       Embedding, GatedMLP, MoeConfig, PositionEmbeddingType,
-                       RmsNorm, SharedMoE)
+from ...layers import (MOE, AttentionMaskType, ColumnLinear,
+                       DeepseekV2Attention, Embedding, GatedMLP, MoeConfig,
+                       PositionEmbeddingType, RmsNorm, SharedMoE)
 from ...mapping import Mapping
 from ...module import Module
 from ...plugin import init_all_reduce_helper
@@ -73,8 +73,6 @@ class DeepseekV2DecoderLayer(Module):
             tp_size=config.mapping.tp_size,
             tp_rank=config.mapping.tp_rank)
 
-        ClsMLP = GatedMLP
-
         ### Added deepseek MoE and shared_experts
         ### First decoder layer: MLA + dense MLP + input_layernorm(RMSNorm) + post_attention_layernorm(RMSNorm)
         ### Rest decoder layer: MLA + MoE MLP + MoE Gate + shared_experts(MLP) + input_layernorm(RMSNorm) + post_attention_layernorm(RMSNorm)
@@ -82,30 +80,36 @@ class DeepseekV2DecoderLayer(Module):
 
         ### Distinguish dense MLP and MoE MLP
         # dense_config = DenseConfig(intermediate_size=config.intermediate_size)
-        moe_config = MoeConfig(num_experts=config.moe_num_experts,
-                               moe_intermediate_size=config.moe_inter_size,
-                               num_shared_experts=config.moe_num_shared_experts,
-                               top_k=config.moe_top_k,
-                               normalization_mode=config.moe_renorm_mode,
-                               device_limited_n_group=config.moe_n_group,
-                               device_limited_topk_group=config.moe_topk_group,
-                               device_limited_routed_scaling_factor=config.
-                               moe_routed_scaling_factor)
+        moe_config = MoeConfig(
+            num_experts=config.moe_num_experts,
+            shared_expert_intermediate_size=config.moe_num_shared_experts *
+            config.moe_inter_size,
+            top_k=config.moe_top_k,
+            normalization_mode=config.moe_renorm_mode,
+            device_limited_n_group=config.moe_n_group,
+            device_limited_topk_group=config.moe_topk_group,
+            device_limited_routed_scaling_factor=config.
+            moe_routed_scaling_factor)
 
         # layer_config = LayerMLPConfig(config=[dense_config, moe_config], moe_layer_idx_min=0,
         #                             moe_layer_idx_max=config.num_hidden_layers,
         #                             total_num_layers=config.num_hidden_layers)
-        mlp_kwargs = {}
-        if config.moe_num_experts > 0 and layer_idx > 0:
-            mlp_hidden_size = moe_config.num_shared_experts * moe_config.moe_intermediate_size
+        if moe_config.num_experts > 0 and layer_idx > 0:
             hidden_act = config.hidden_act
-            ClsMLP = SharedMoE
-            mlp_kwargs = {"moe_config": moe_config, "mapping": config.mapping}
+            mlp_hidden_size = config.moe_inter_size
+            mlp_kwargs = {'moe_config': moe_config, 'mapping': config.mapping}
+            if moe_config.shared_expert_intermediate_size > 0:
+                ClsMLP = SharedMoE
+                mlp_kwargs['use_shared_gate'] = False
+                mlp_kwargs['use_side_stream'] = False
+            else:
+                ClsMLP = MOE
         else:
             ClsMLP = GatedMLP
             mlp_hidden_size = config.intermediate_size
             hidden_act = non_gated_version(
                 config.hidden_act)  # back to non gated for dense layers
+            mlp_kwargs = {}
 
         self.mlp = ClsMLP(hidden_size=config.hidden_size,
                           ffn_hidden_size=mlp_hidden_size,

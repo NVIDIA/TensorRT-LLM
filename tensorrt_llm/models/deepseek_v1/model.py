@@ -17,9 +17,9 @@ from typing import Optional
 
 from ..._utils import pad_vocab_size
 from ...functional import Tensor, non_gated_version, recv, send
-from ...layers import (Attention, AttentionMaskType, ColumnLinear, Embedding,
-                       GatedMLP, MoeConfig, PositionEmbeddingType, RmsNorm,
-                       SharedMoE)
+from ...layers import (MOE, Attention, AttentionMaskType, ColumnLinear,
+                       Embedding, GatedMLP, MoeConfig, PositionEmbeddingType,
+                       RmsNorm, SharedMoE)
 from ...mapping import Mapping
 from ...module import Module
 from ...plugin import init_all_reduce_helper
@@ -61,20 +61,23 @@ class DeepseekDecoderLayer(Module):
             tp_rank=config.mapping.tp_rank,
             quant_mode=config.quant_mode)
 
-        ClsMLP = GatedMLP
         moe_config = MoeConfig.from_dict(config.moe)
-
-        mlp_kwargs = {}
         if moe_config.num_experts > 0 and layer_idx > 0:
-            mlp_hidden_size = moe_config.num_shared_experts * moe_config.moe_intermediate_size
+            mlp_hidden_size = config.moe_intermediate_size
             hidden_act = config.hidden_act
-            ClsMLP = SharedMoE
-            mlp_kwargs = {"moe_config": moe_config, "mapping": config.mapping}
+            mlp_kwargs = {'moe_config': moe_config, 'mapping': config.mapping}
+            if moe_config.shared_expert_intermediate_size > 0:
+                ClsMLP = SharedMoE
+                mlp_kwargs['use_shared_gate'] = False
+                mlp_kwargs['use_side_stream'] = False
+            else:
+                ClsMLP = MOE
         else:
             ClsMLP = GatedMLP
             mlp_hidden_size = config.intermediate_size
             hidden_act = non_gated_version(
                 config.hidden_act)  # back to non gated for dense layers
+            mlp_kwargs = {}
 
         self.mlp = ClsMLP(hidden_size=config.hidden_size,
                           ffn_hidden_size=mlp_hidden_size,

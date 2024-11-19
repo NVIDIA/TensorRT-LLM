@@ -162,6 +162,8 @@ bool GPTAttentionPlugin::isEntryUsed(IdxEntry const& entry) const
     case IdxEntry::SPEC_DECODING_GENERATION_LENGTHS: return mIsSpecDecodingEnabled;
     case IdxEntry::SPEC_DECODING_PACKED_MASK: return mIsSpecDecodingEnabled;
     case IdxEntry::SPEC_DECODING_POSITION_OFFSETS: return mIsSpecDecodingEnabled;
+    case IdxEntry::MROPE_ROTARY_SIN_COS: return isMRoPE();
+    case IdxEntry::MROPE_POSITION_DELTAS: return isMRoPE();
     case IdxEntry::HOST_RUNTIME_PERF_KNOBS: return true;
     case IdxEntry::HOST_CONTEXT_PROGRESS: return true;
     case IdxEntry::MLA_FUSED_Q_PROJ_TENSOR: return mIsMLAEnabled;
@@ -265,6 +267,14 @@ bool GPTAttentionPlugin::supportsFormatCombination(
     {
         posCaseLine = __LINE__;
         result = inOut[pos].type == nvinfer1::DataType::kINT32;
+    }
+    else if (isMRoPE() && (pos == getIdx(IdxEntry::MROPE_ROTARY_SIN_COS)))
+    {
+        return inOut[pos].type == nvinfer1::DataType::kFLOAT;
+    }
+    else if (isMRoPE() && (pos == getIdx(IdxEntry::MROPE_POSITION_DELTAS)))
+    {
+        return inOut[pos].type == nvinfer1::DataType::kINT32;
     }
     else if (pos == getIdx(IdxEntry::HOST_RUNTIME_PERF_KNOBS) || pos == getIdx(IdxEntry::HOST_CONTEXT_PROGRESS))
     {
@@ -411,13 +421,15 @@ void GPTAttentionPlugin::configurePluginImpl(nvinfer1::DynamicPluginTensorDesc c
     int const num_requests = 256;
     int const sink_token_length = 0;
 
-    EnqueueGenerationParams<T> enqueueParams{/*attention_input=*/nullptr,
+    EnqueueGenerationParams<T> enqueueParams{
+        /*attention_input=*/nullptr,
         /*qkv_bias=*/nullptr,
         /*attention_mask*/ nullptr,
         /*rotary_inv_freq*/ nullptr,
         /*input_seq_length=*/0,
         /*sequence_lengths=*/nullptr,
-        /*past_kv_length=*/0, beamWidth,
+        /*past_kv_length=*/0,
+        beamWidth,
         /*context_lengths=*/nullptr,
         /*kv_scale_orig_quant=*/nullptr,
         /*kv_scale_quant_orig=*/nullptr,
@@ -428,12 +440,19 @@ void GPTAttentionPlugin::configurePluginImpl(nvinfer1::DynamicPluginTensorDesc c
         /*block_offsets=*/nullptr,
         /*host_primary_pool_pointer=*/nullptr,
         /*host_secondary_pool_pointer=*/nullptr,
-        /*attention_mask_stride*/ 0, max_attention_window_size, cyclic_attention_window_size, sink_token_length,
+        /*attention_mask_stride*/ 0,
+        max_attention_window_size,
+        cyclic_attention_window_size,
+        sink_token_length,
         num_requests,
         /*max_blocks_per_sequence=*/0,
         /*cache_indir=*/nullptr,
         /*workspace=*/nullptr,
-        /*max_context_kv_len_list=*/nullptr};
+        /*max_context_kv_len_list=*/nullptr,
+        /*mrope_rotary_sin_cos*/ nullptr,
+        /*mrope_position_deltas*/ nullptr,
+
+    };
 
     prepareEnqueueGeneration<T, KVCacheBuffer>(enqueueParams);
 
@@ -699,6 +718,12 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         rotary_cos_sin = reinterpret_cast<float2 const*>(inputs[getIdx(IdxEntry::ROTARY_COS_SIN)]);
     }
 
+    auto const mrope_rotary_sin_cos
+        = isMRoPE() ? reinterpret_cast<float2 const*>(inputs[getIdx(IdxEntry::MROPE_ROTARY_SIN_COS)]) : nullptr;
+
+    auto const mrope_position_deltas
+        = isMRoPE() ? reinterpret_cast<int32_t const*>(inputs[getIdx(IdxEntry::MROPE_POSITION_DELTAS)]) : nullptr;
+
     if (mUnfuseQkvGemm)
     {
         int const max_seqlen = inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims.d[mRemovePadding ? 0 : 1];
@@ -932,7 +957,9 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
             cyclic_attention_window_size, sink_token_length, context_q_lengths, sequence_kv_length, kv_scale_orig_quant,
             kv_scale_quant_orig, attention_output_orig_quant, alibi_slopes, context_buf_, key_value_cache,
             block_offsets, host_block_offsets, host_primary_pool_pointer, host_secondary_pool_pointer, batch_size,
-            localNbTokens, max_blocks_per_sequence, host_context_lengths, workspace};
+            localNbTokens, max_blocks_per_sequence, host_context_lengths, workspace, mrope_rotary_sin_cos,
+            mrope_position_deltas};
+
         enqueue_params.runtime_perf_knobs = runtime_perf_knobs;
         if (isRelativePosition())
         {
@@ -1007,7 +1034,8 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
             kv_scale_quant_orig, attention_output_orig_quant, alibi_slopes, context_buf_, key_value_cache,
             block_offsets, host_primary_pool_pointer, host_secondary_pool_pointer, attention_mask_stride,
             max_attention_window_size, cyclic_attention_window_size, sink_token_length, num_requests,
-            max_blocks_per_sequence, cache_indir, mMultiBlockSemaphores.get(), workspace, max_context_kv_len_list};
+            max_blocks_per_sequence, cache_indir, mMultiBlockSemaphores.get(), workspace, max_context_kv_len_list,
+            mrope_rotary_sin_cos, mrope_position_deltas};
         enqueue_params.host_context_lengths = host_context_lengths;
         enqueue_params.runtime_perf_knobs = runtime_perf_knobs;
         if (isRelativePosition())

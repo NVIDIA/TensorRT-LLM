@@ -431,6 +431,8 @@ def load_hf_qwen(model_dir: str, load_model_on_cpu: bool = False):
         config = json.load(f)
     if config['architectures'] == ['Qwen2ForSequenceClassification']:
         from transformers import Qwen2ForSequenceClassification as model_cls
+    elif config['architectures'] == ['Qwen2VLForConditionalGeneration']:
+        from transformers import Qwen2VLForConditionalGeneration as model_cls
     else:
         from transformers import AutoModelForCausalLM as model_cls
 
@@ -677,16 +679,16 @@ def convert_hf_qwen(hf_model,
             ## mlp.shared_expert.gate_up_proj.weight
             weights.update(
                 get_tllm_linear_weight(shared_expert_gate_up_proj,
-                                       tllm_prex + 'shared_expert.fc.', None,
-                                       use_weight_only,
+                                       tllm_prex + 'mlp.shared_expert.fc.',
+                                       None, use_weight_only,
                                        plugin_weight_only_quant_type, dtype,
                                        use_gemm_woq_plugin))
 
             ## mlp.shared_expert.down_proj.weight
             weights.update(
                 get_tllm_linear_weight(shared_expert_down_proj.to(dtype),
-                                       tllm_prex + 'shared_expert.proj.', None,
-                                       use_weight_only,
+                                       tllm_prex + 'mlp.shared_expert.proj.',
+                                       None, use_weight_only,
                                        plugin_weight_only_quant_type, dtype,
                                        use_gemm_woq_plugin))
 
@@ -695,7 +697,7 @@ def convert_hf_qwen(hf_model,
             weights.update(
                 get_tllm_linear_weight(
                     moe_shared_expert_gate_weights,
-                    tllm_prex + 'shared_expert_gate.',
+                    tllm_prex + 'mlp.shared_expert_gate.',
                     None,
                     False,  # Router should never be quantized
                     plugin_weight_only_quant_type,

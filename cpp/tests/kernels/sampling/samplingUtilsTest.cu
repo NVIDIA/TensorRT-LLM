@@ -54,7 +54,7 @@ TEST_F(SamplingUtilsKernelTest, CurandInitialize)
         curandState_t* curandStates;
         cudaMalloc(&curandStates, sizeof(curandState_t) * batchSize);
         // Initialize curand states.
-        auto batchSlots = getDefaultBatchSlots(batchSize, *this->mBufferManager);
+        auto batchSlots = getDefaultBatchSlots(batchSize);
         auto batchSlotsPtr = bufferCast<SizeType32>(*batchSlots);
         tk::invokeCurandInitialize(curandStates, batchSlotsPtr, batchSize, seed, this->mStream->get());
         sync_check_cuda_error();

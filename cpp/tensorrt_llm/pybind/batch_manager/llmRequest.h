@@ -57,6 +57,8 @@ public:
         std::optional<std::vector<SizeType32>> positionIds = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
+        std::optional<TensorPtr> mropeRotarySinCos = std::nullopt,
+        std::optional<SizeType32> mropePositionDeltas = std::nullopt,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
         std::optional<TensorPtr> loraConfig = std::nullopt,
         std::optional<executor::LookaheadDecodingConfig> lookaheadConfig = std::nullopt,
@@ -76,8 +78,9 @@ public:
             samplingConfig, isStreaming, endId, padId, embeddingBias, badWordsList, stopWordsList,
             positionIds.has_value() ? std::make_shared<std::vector<SizeType32>>(std::move(positionIds.value()))
                                     : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),
-            promptEmbeddingTable, promptVocabSize, loraTaskId, loraWeights, loraConfig, lookaheadConfig,
-            kvCacheRetentionConfig, returnLogProbs, returnContextLogits, returnGenerationLogits,
+            promptEmbeddingTable, promptVocabSize, mropeRotarySinCos, mropePositionDeltas, loraTaskId, loraWeights,
+            loraConfig, lookaheadConfig, kvCacheRetentionConfig, returnLogProbs, returnContextLogits,
+            returnGenerationLogits,
             draftTokens.has_value() ? std::make_shared<VecTokens>(std::move(draftTokens.value()))
                                     : std::make_shared<VecTokens>(),
             draftLogits, excludeInputFromOutput, logitsPostProcessor, applyLogitsPostProcessorBatched,

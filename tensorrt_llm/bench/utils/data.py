@@ -79,7 +79,7 @@ def create_dataset_from_stream(
         # Each line should be a complete JSON dictionary with no indentation
         # or newline characters.
         data = json.loads(line)
-        logits = data.get("logits", None)
+        logits = data.get("input_ids", None)
         prompt = data.get("prompt", None)
         task_id = data["task_id"]
         osl = data["output_tokens"]
@@ -91,7 +91,7 @@ def create_dataset_from_stream(
             task_id=task_id,
             prompt=prompt,
             output_tokens=output_limiter(osl),
-            logits=logits,
+            input_ids=logits,
         )
         max_isl = max(max_isl, len(logits))
         max_osl = max(max_osl, osl)

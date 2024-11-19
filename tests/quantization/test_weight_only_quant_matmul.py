@@ -81,7 +81,7 @@ class TestWeightOnlyQuantMatmul(unittest.TestCase):
                                  network,
                                  precision=dtype,
                                  int8=True,
-                                 memory_pool_limit=33554432)
+                                 memory_pool_limit=133554432)
         inputs = {
             'x': mat1,
         }

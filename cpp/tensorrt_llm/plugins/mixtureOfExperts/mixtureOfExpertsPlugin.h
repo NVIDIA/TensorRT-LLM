@@ -24,6 +24,7 @@
 #include "tensorrt_llm/kernels/mixtureOfExperts/moe_kernels.h"
 #include "tensorrt_llm/plugins/common/gemmPluginProfiler.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
+#include "tensorrt_llm/plugins/cudaStreamPlugin/cudaStreamPlugin.h"
 #include "tensorrt_llm/plugins/gemmPlugin/gemmPlugin.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include <cassert>
@@ -106,8 +107,8 @@ public:
         nvinfer1::DataType weight_type, nvinfer1::DataType output_type, tensorrt_llm::common::QuantMode quant_mode,
         bool use_finished, bool use_bias, int tp_size, int tp_rank, int ep_size, int ep_rank,
         MOEExpertScaleNormalizationMode normalization_mode, float sparse_mixer_epsilon, bool force_determinism,
-        MixtureOfExpertsPluginProfilerPtr gemm_profiler_ptr, bool use_lora, nvinfer1::DataType lora_type,
-        LoraPluginProfilerPtr lora_profiler, int max_low_rank);
+        int side_stream_id, MixtureOfExpertsPluginProfilerPtr gemm_profiler_ptr, bool use_lora,
+        nvinfer1::DataType lora_type, LoraPluginProfilerPtr lora_profiler, int max_low_rank);
     MixtureOfExpertsPlugin(void const* data, size_t length, MixtureOfExpertsPluginProfilerPtr gemm_profiler_ptr,
         LoraPluginProfilerPtr lora_profiler);
     MixtureOfExpertsPlugin(MixtureOfExpertsPlugin const&);
@@ -139,7 +140,7 @@ public:
 
     int getNbOutputs() const noexcept override
     {
-        return 1;
+        return 1 + useSideStream();
     }
 
     int initialize() noexcept override;
@@ -170,6 +171,10 @@ private:
 
     GemmDims mDims{};
     bool mUseDeterministicKernels = false;
+    int mSideStreamId = 0;
+
+    int mDebugStallMain = 0;
+    int mDebugStallSide = 0;
 
     GemmIDMoe mGemmId1{};
     GemmIDMoe mGemmId2{};
@@ -197,6 +202,7 @@ private:
     std::vector<int32_t> mLoraExpandGatedRanks{};
 
     cudaEvent_t mMemcpyEvent;
+    nvinfer1::pluginInternal::SideStream* mSideStreamPtr;
 
     // The below are not serialised
     std::string const mLayerName{};
@@ -277,6 +283,11 @@ private:
     bool hasExpertFp8FinalQuantScales() const
     {
         return hasExpertFp8QuantScales() && mOutputType == nvinfer1::DataType::kFP8;
+    }
+
+    bool useSideStream() const
+    {
+        return mSideStreamId > 0;
     }
 
     bool hasLora() const
@@ -388,6 +399,11 @@ private:
     constexpr static IndexType getOutputTensorIndex()
     {
         return 0;
+    }
+
+    IndexType getOutputDummyTensorIndex() const
+    {
+        return getOutputTensorIndex() + useSideStream();
     }
 
     /**

@@ -14,10 +14,10 @@
  * limitations under the License.
  */
 
-#ifndef _WIN32
+#ifdef __GNUC__ // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
-#endif // #ifndef _WIN32
+#endif // __GNUC__
 
 // clang-format off
 #include <cutlass/gemm/device/default_gemm_configuration.h>
@@ -36,9 +36,9 @@
 #include "cutlass_extensions/gemm/kernel/default_int8_traits.h"
 #include "cutlass_extensions/gemm/kernel/gemm_with_epilogue_visitor.h"
 
-#ifndef _WIN32
+#ifdef __GNUC__ // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic pop
-#endif // #ifndef _WIN32
+#endif          // __GNUC__
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.h"

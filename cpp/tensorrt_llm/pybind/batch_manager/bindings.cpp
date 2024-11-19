@@ -237,6 +237,8 @@ void initBindings(pybind11::module_& m)
                      std::optional<std::vector<tb::LlmRequest::SizeType32>> position_ids,
                      std::optional<at::Tensor> prompt_embedding_table,
                      std::optional<tb::LlmRequest::SizeType32> prompt_vocab_size,
+                     std::optional<at::Tensor> mrope_rotary_sin_cos,
+                     std::optional<tb::LlmRequest::SizeType32> mrope_position_deltas,
                      std::optional<LoraTaskIdType> lora_task_id, std::optional<at::Tensor> lora_weights,
                      std::optional<at::Tensor> lora_config,
                      std::optional<executor::LookaheadDecodingConfig> lookahead_config,
@@ -269,6 +271,7 @@ void initBindings(pybind11::module_& m)
                      auto stop_words_list_tensor_ptr = makeOptionalTensor(stop_words_list);
                      auto prompt_embedding_table_tensor_ptr = makeOptionalTensor(prompt_embedding_table);
                      auto lora_weights_tensor_ptr = makeOptionalTensor(lora_weights);
+                     auto mrope_rotary_sin_cos_tensor_ptr = makeOptionalTensor(mrope_rotary_sin_cos);
                      auto lora_config_tensor_ptr = makeOptionalTensor(lora_config);
                      auto draft_logits_tensor_ptr = makeOptionalTensor(draft_logits);
                      auto encoder_input_features_tensor_ptr = makeOptionalTensor(encoder_input_features);
@@ -277,19 +280,20 @@ void initBindings(pybind11::module_& m)
                      return tb::LlmRequest{request_id, max_new_tokens, input_tokens, sampling_config, is_streaming,
                          end_id, pad_id, embedding_bias_tensor_ptr, bad_words_list_tensor_ptr,
                          stop_words_list_tensor_ptr, position_ids, prompt_embedding_table_tensor_ptr, prompt_vocab_size,
-                         lora_task_id, lora_weights_tensor_ptr, lora_config_tensor_ptr, lookahead_config,
-                         kv_cache_retention_config, return_log_probs, return_context_logits, return_generation_logits,
-                         draft_tokens, draft_logits_tensor_ptr, exclude_input_from_output, logits_post_processor,
-                         apply_logits_post_processor_batched, encoder_input_tokens, return_encoder_output, client_id,
-                         priority, encoder_input_features_tensor_ptr, encoder_output_length,
-                         cross_attention_mask_tensor_ptr, llm_request_type, input_token_extra_ids,
-                         num_return_sequences};
+                         mrope_rotary_sin_cos_tensor_ptr, mrope_position_deltas, lora_task_id, lora_weights_tensor_ptr,
+                         lora_config_tensor_ptr, lookahead_config, kv_cache_retention_config, return_log_probs,
+                         return_context_logits, return_generation_logits, draft_tokens, draft_logits_tensor_ptr,
+                         exclude_input_from_output, logits_post_processor, apply_logits_post_processor_batched,
+                         encoder_input_tokens, return_encoder_output, client_id, priority,
+                         encoder_input_features_tensor_ptr, encoder_output_length, cross_attention_mask_tensor_ptr,
+                         llm_request_type, input_token_extra_ids, num_return_sequences};
                  }),
             py::arg("request_id"), py::arg("max_new_tokens"), py::arg("input_tokens"), py::arg("sampling_config"),
             py::arg("is_streaming"), py::arg("end_id") = std::nullopt, py::arg("pad_id") = std::nullopt,
             py::arg("embedding_bias") = std::nullopt, py::arg("bad_words_list") = std::nullopt,
             py::arg("stop_words_list") = std::nullopt, py::arg("position_ids") = std::nullopt,
             py::arg("prompt_embedding_table") = std::nullopt, py::arg("prompt_vocab_size") = std::nullopt,
+            py::arg("mrope_rotary_sin_cos") = std::nullopt, py::arg("mrope_position_deltas") = std::nullopt,
             py::arg("lora_task_id") = std::nullopt, py::arg("lora_weights") = std::nullopt,
             py::arg("lora_config") = std::nullopt, py::arg("lookahead_config") = std::nullopt,
             py::arg("kv_cache_retention_config") = std::nullopt, py::arg("return_log_probs") = false,

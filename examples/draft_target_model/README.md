@@ -6,7 +6,7 @@ This document shows how to build and run a model using Draft-Target-Model specul
 
 The Draft-Target-Model involves the use of two distinct LLM models trained independently but sharing the same vocabulary: a smaller Draft model and a larger Target model. For example, GPT 125M / 6.7B models can serve as the Draft / Target model.
 
-There are two styles of using Draft-Target-Model in TensorRT-LLM now. The first one is using TensorRT-LLM-BLS in Triton, which more information and detailed steps can be found in [speculative decoding documentation](../../docs/source/speculative_decoding.md). The second one is using it directly in TensorRT-LLM, which steps can be found in this document and the code can be found in [examples/run.py](../run.py).
+There are two styles of using Draft-Target-Model in TensorRT-LLM. The first one is using TensorRT-LLM-BLS in Triton, which more information and detailed steps can be found in [speculative decoding documentation](https://nvidia.github.io/TensorRT-LLM/advanced/speculative-decoding.html). The second one is using it directly in TensorRT-LLM, which steps can be found in this document and the code can be found in [examples/run.py](../run.py).
 
 The Draft-Target-Model has 4 additional hyperparameters that you need to specify to control the process of generation:
 - `draft_len`: the number of tokens the draft model generated in one iteration, which the range is from 4 to 10 in common usage. Empirically, the larger the value is, the higher acceptance ratio but higher overhead is expected at the same time, so the right balance based on the models and application scenarios needs to be found.

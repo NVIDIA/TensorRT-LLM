@@ -166,12 +166,20 @@ class RequestRecord(BaseModel):
     end_timestamp: int = -1
     decode_iteration: int = 0
 
-    def register_event(self, is_error: bool, is_final: bool, timestamp: int,
-                       decoding_iter: int, tokens: List[int]) -> None:
+    def register_event(self,
+                       is_error: bool,
+                       is_final: bool,
+                       timestamp: int,
+                       decoding_iter: int,
+                       tokens: List[int],
+                       first_token_timestamp: int = None) -> None:
         if is_final:
             self.end_timestamp = timestamp
         elif self.first_token_timestamp == -1:
             self.first_token_timestamp = timestamp
+
+        if first_token_timestamp is not None and is_final:
+            self.first_token_timestamp = first_token_timestamp
 
         if is_error:
             self.error_tokens += 1

@@ -38,6 +38,13 @@ static std::optional<int32_t> getIntEnv(char const* name)
     return {val};
 };
 
+// Returns true if the env variable exists and is set to "1"
+static bool getBoolEnv(char const* name)
+{
+    char const* env = std::getenv(name);
+    return env && env[0] == '1' && env[1] == '\0';
+}
+
 // XQA kernels (optimized kernels for generation phase).
 bool forceXQAKernels()
 {
@@ -143,15 +150,8 @@ bool getEnvEnablePDL()
         // PDL only available when arch >= 90
         if (getSMVersion() >= 90)
         {
-            char const* enable_pdl = std::getenv("TRTLLM_ENABLE_PDL");
-            if (enable_pdl)
-            {
-                // PDL will be enabled by setting the env variables `TRTLLM_ENABLE_PDL` to `1`
-                if (enable_pdl[0] == '1' && enable_pdl[1] == '\0')
-                {
-                    enablePDL = true;
-                }
-            }
+            // PDL will be enabled by setting the env variables `TRTLLM_ENABLE_PDL` to `1`
+            enablePDL = getBoolEnv("TRTLLM_ENABLE_PDL");
         }
     }
     return enablePDL;
@@ -159,22 +159,7 @@ bool getEnvEnablePDL()
 
 bool getEnvUseUCXKvCache()
 {
-    static bool init = false;
-    static bool useUCXKVCache = false;
-    if (!init)
-    {
-        init = true;
-        {
-            char const* use_ucx_kv_cache = std::getenv("TRTLLM_USE_UCX_KVCACHE");
-            if (use_ucx_kv_cache)
-            {
-                if (use_ucx_kv_cache[0] == '1' && use_ucx_kv_cache[1] == '\0')
-                {
-                    useUCXKVCache = true;
-                }
-            }
-        }
-    }
+    static bool const useUCXKVCache = getBoolEnv("TRTLLM_USE_UCX_KVCACHE");
     return useUCXKVCache;
 }
 
@@ -195,4 +180,11 @@ std::string getEnvUCXInterface()
     }
     return ucxInterface;
 }
+
+bool getEnvDisaggLayerwise()
+{
+    static bool const disaggLayerwise = getBoolEnv("TRTLLM_DISAGG_LAYERWISE");
+    return disaggLayerwise;
+}
+
 } // namespace tensorrt_llm::common

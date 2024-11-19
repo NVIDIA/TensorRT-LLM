@@ -47,8 +47,8 @@ TransformerBuffers::TransformerBuffers(
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK(modelConfig.isTransformerBased());
-    auto& manager = runtime.getBufferManager();
-    auto& engine = runtime.getEngine();
+    auto const& manager = runtime.getBufferManager();
+    auto const& engine = runtime.getEngine();
 
     auto const localNbLayers = modelConfig.getNbAttentionLayers(worldConfig.getPipelineParallelism());
     auto firstAttentionLayerId = worldConfig.getPipelineParallelRank() * localNbLayers;
@@ -60,7 +60,7 @@ TransformerBuffers::TransformerBuffers(
             = std::find(layerTypes.begin(), layerTypes.end(), ModelConfig::LayerType::kATTENTION) - layerTypes.begin();
     }
 
-    nvinfer1::DataType kvDtype;
+    nvinfer1::DataType kvDtype{};
 
     if (modelConfig.isPagedKVCache())
     {
@@ -84,7 +84,7 @@ TransformerBuffers::TransformerBuffers(
         sinkTokenLengths = manager.emptyTensor(MemoryType::kCPU, nvinfer1::DataType::kINT32);
         SizeType32 perfKnobSize = 16;
         runtimePerfKnobsHost = BufferManager::cpu(ITensor::makeShape({perfKnobSize}), nvinfer1::DataType::kINT64);
-        auto runtimePerfKnobsHostPtr = bufferCast<int64_t>(*runtimePerfKnobsHost);
+        auto* runtimePerfKnobsHostPtr = bufferCast<int64_t>(*runtimePerfKnobsHost);
         std::fill_n(runtimePerfKnobsHostPtr, perfKnobSize, -1);
         contextProgressHost = BufferManager::cpu(ITensor::makeShape({1}), nvinfer1::DataType::kINT64);
         bufferCast<int64_t>(*contextProgressHost)[0] = 0;
@@ -290,7 +290,7 @@ void TransformerBuffers::prepareContextStep(RuntimeBuffers* runtimeBuffers, Tens
     auto& hiddenStates = runtimeBuffers->hiddenStates;
     auto& promptTuningTasksHost = runtimeBuffers->promptTuningTasksHost;
     auto& promptTuningParams = runtimeBuffers->promptTuningParams;
-    auto& stream = manager.getStream();
+    auto const& stream = manager.getStream();
     SizeType32 const batchSize = generationConfig.batchSize;
     SizeType32 const maxInputLength = generationConfig.maxInputLength;
     auto const& inputShape = inputIds->getShape();
@@ -301,14 +301,14 @@ void TransformerBuffers::prepareContextStep(RuntimeBuffers* runtimeBuffers, Tens
 
     if (modelConfig.useGptAttentionPlugin())
     {
-        auto pastKeyValueLengthsPtr = bufferCast<SizeType32>(*pastKeyValueLengths);
+        auto* pastKeyValueLengthsPtr = bufferCast<SizeType32>(*pastKeyValueLengths);
         TLLM_CHECK(pastKeyValueLengths->getSize() == static_cast<std::size_t>(batchSize));
 
-        auto RequestTypesPtr = bufferCast<int32_t>(*requestTypes);
+        auto* RequestTypesPtr = bufferCast<int32_t>(*requestTypes);
         TLLM_CHECK(requestTypes->getSize() == static_cast<std::size_t>(batchSize));
         std::fill_n(RequestTypesPtr, batchSize, 0);
 
-        auto maxAttentionWindowsPtr = bufferCast<SizeType32>(*maxAttentionWindows);
+        auto* maxAttentionWindowsPtr = bufferCast<SizeType32>(*maxAttentionWindows);
         auto const attentionWindowLength = generationConfig.maxAttentionWindowVec.size();
         for (SizeType32 i = 0; i < localNbLayers; ++i)
         {
@@ -318,7 +318,7 @@ void TransformerBuffers::prepareContextStep(RuntimeBuffers* runtimeBuffers, Tens
 
         bufferCast<SizeType32>(*sinkTokenLengths)[0] = generationConfig.sinkTokenLength;
 
-        auto const contextLengthsHostPtr = bufferCast<SizeType32 const>(*contextLengthsHost);
+        auto const* const contextLengthsHostPtr = bufferCast<SizeType32 const>(*contextLengthsHost);
         auto const modelVariant = modelConfig.getModelVariant();
 
         if (modelVariant == ModelConfig::ModelVariant::kGpt
@@ -341,7 +341,7 @@ void TransformerBuffers::prepareContextStep(RuntimeBuffers* runtimeBuffers, Tens
                 modelConfig.useGptAttentionPlugin(), modelConfig.usePackedInput());
             if (modelConfig.usePackedInput())
             {
-                int num_tokens = (int) positionIdsVec.size() / 2;
+                auto const num_tokens = static_cast<SizeType32>(positionIdsVec.size()) / 2;
                 auto const positionIdsShape = ITensor::makeShape({2, num_tokens});
                 positionIds = manager.copyFrom(positionIdsVec, positionIdsShape, MemoryType::kGPU);
             }
@@ -365,6 +365,7 @@ void TransformerBuffers::prepareContextStep(RuntimeBuffers* runtimeBuffers, Tens
         {
             std::vector<SizeType32> reqBeamWidths(batchSize, 1);
             std::vector<SizeType32> reqPromptLengths;
+            reqPromptLengths.reserve(batchSize);
             for (SizeType32 i = 0; i < batchSize; ++i)
             {
                 reqPromptLengths.push_back(contextLengthsHostPtr[i]);
@@ -392,14 +393,18 @@ void TransformerBuffers::prepareContextStep(RuntimeBuffers* runtimeBuffers, Tens
                 attentionMaskData + (i + 1) * maxInputLength, std::begin(positionIdsVec) + i * maxInputLength, 0);
         }
         for (std::size_t i = 0; i < positionIdsVec.size(); ++i)
+        {
             if (attentionMaskData[i] == 0)
+            {
                 positionIdsVec[i] = 1;
+            }
+        }
         positionIds = manager.copyFrom(positionIdsVec, attentionMask->getShape(), MemoryType::kGPU);
     }
 
     if (worldConfig.isPipelineParallel())
     {
-        auto const hiddenSize = hiddenStates->getShape().d[hiddenStates->getShape().nbDims - 1];
+        auto const hiddenSize = hiddenStates->getDimension<-1>();
         auto const hiddenStatesShape = modelConfig.usePackedInput()
             ? ITensor::makeShape({inputShape.d[0], hiddenSize})
             : ITensor::makeShape({inputShape.d[0], inputShape.d[1], hiddenSize});
@@ -418,7 +423,7 @@ void TransformerBuffers::prepareContextStep(RuntimeBuffers* runtimeBuffers, Tens
 }
 
 static std::vector<SizeType32> getPositionIdsGenerationPhaseGlm(SizeType32 const& batchSize, SizeType32 const& beamSize,
-    SizeType32 const& step, SizeType32 const* pInputLengths, bool useGptAttentionPlugin, bool usePackedInput)
+    SizeType32 const& step, SizeType32 const* pInputLengths, bool useGptAttentionPlugin)
 {
     TLLM_CHECK(pInputLengths != nullptr);
 
@@ -462,7 +467,7 @@ void TransformerBuffers::copyAttentionMasks(
     auto offset = 0;
     for (auto contextBatchId = 0; contextBatchId < numContextBatches; ++contextBatchId)
     {
-        auto& buffers = contextBatches.at(contextBatchId);
+        auto const& buffers = contextBatches.at(contextBatchId);
         auto contextBatchSize = buffers.generationConfig.batchSize;
         auto attentionMaskSlice = ITensor::slice(attentionMask, offset, contextBatchSize);
         manager.copy(*buffers.transformerBuffers->attentionMask, *attentionMaskSlice);
@@ -507,9 +512,13 @@ void TransformerBuffers::tile(RuntimeBuffers* runtimeBuffers, BufferManager& man
     if (!modelConfig.isPagedKVCache())
     {
         for (auto& buffer : presentKeysVals)
+        {
             utils::tileBufferReplace(buffer, beamWidth, manager);
+        }
         for (auto& buffer : presentKeysValsAlt)
+        {
             utils::tileBufferReplace(buffer, beamWidth, manager);
+        }
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -527,7 +536,7 @@ void TransformerBuffers::postContextStep(RuntimeBuffers* runtimeBuffers,
     if (modelConfig.useGptAttentionPlugin())
     {
         requestTypes->reshape(ITensor::makeShape({batchSize * beamWidth}));
-        auto hostRequestTypes = bufferCast<int32_t>(*requestTypes);
+        auto* hostRequestTypes = bufferCast<int32_t>(*requestTypes);
         std::fill_n(hostRequestTypes, requestTypes->getSize(), 1);
     }
     else
@@ -568,7 +577,7 @@ void TransformerBuffers::prepareNextStep(RuntimeBuffers* runtimeBuffers, SizeTyp
     auto& contextLengthsDevice = runtimeBuffers->contextLengthsDevice;
     auto& hiddenStates = runtimeBuffers->hiddenStates;
     auto& generationConfig = runtimeBuffers->generationConfig;
-    auto& stream = manager.getStream();
+    auto const& stream = manager.getStream();
     SizeType32 const batchSize = generationConfig.batchSize;
     SizeType32 const beamWidth = generationConfig.beamWidth;
     auto const inputShape = [&modelConfig, batchSize, beamWidth]()
@@ -578,16 +587,14 @@ void TransformerBuffers::prepareNextStep(RuntimeBuffers* runtimeBuffers, SizeTyp
             // batch in last dim
             return ITensor::makeShape({batchSize * beamWidth});
         }
-        else
-        {
-            // batch in first dim
-            return ITensor::makeShape({batchSize * beamWidth, 1});
-        }
+
+        // batch in first dim
+        return ITensor::makeShape({batchSize * beamWidth, 1});
     }();
     if (modelConfig.useGptAttentionPlugin())
     {
-        auto const contextLengthsHostPtr = bufferCast<SizeType32 const>(*contextLengthsHost);
-        auto const pastKeyValueLengthsPtr = bufferCast<SizeType32>(*pastKeyValueLengths);
+        auto const* const contextLengthsHostPtr = bufferCast<SizeType32 const>(*contextLengthsHost);
+        auto* const pastKeyValueLengthsPtr = bufferCast<SizeType32>(*pastKeyValueLengths);
         auto const tensorBatchSize = static_cast<SizeType32>(pastKeyValueLengths->getSize());
         SizeType32 const srcStride{modelConfig.useGptAttentionPlugin() ? 1 : beamWidth};
         TLLM_CHECK(static_cast<std::size_t>(tensorBatchSize * srcStride) == contextLengthsDevice->getSize());
@@ -607,8 +614,8 @@ void TransformerBuffers::prepareNextStep(RuntimeBuffers* runtimeBuffers, SizeTyp
         }
         else if (modelVariant == ModelConfig::ModelVariant::kChatGlm)
         {
-            auto const positionIdsVec = getPositionIdsGenerationPhaseGlm(batchSize, beamWidth, step,
-                contextLengthsHostPtr, modelConfig.useGptAttentionPlugin(), modelConfig.usePackedInput());
+            auto const positionIdsVec = getPositionIdsGenerationPhaseGlm(
+                batchSize, beamWidth, step, contextLengthsHostPtr, modelConfig.useGptAttentionPlugin());
             if (modelConfig.usePackedInput())
             {
                 auto const positionIdsShape = ITensor::makeShape({2, batchSize * beamWidth});
@@ -648,18 +655,24 @@ void TransformerBuffers::prepareNextStep(RuntimeBuffers* runtimeBuffers, SizeTyp
                 std::begin(positionIdsVec) + i * newLength, 0);
         }
         for (std::size_t i = 0; i < positionIdsVec.size(); ++i)
+        {
             if (attentionMaskPtr[i] == 0)
+            {
                 positionIdsVec[i] = 1;
+            }
+        }
         std::vector<SizeType32> positionIdsEndVec(nbInputs);
         for (SizeType32 i = 0; i < nbInputs; ++i)
+        {
             positionIdsEndVec[i] = positionIdsVec[(i + 1) * newLength - 1];
+        }
 
         positionIds = manager.copyFrom(positionIdsEndVec, ITensor::makeShape({nbInputs, 1}), MemoryType::kGPU);
     }
 
     if (worldConfig.isPipelineParallel())
     {
-        auto const hiddenSize = hiddenStates->getShape().d[hiddenStates->getShape().nbDims - 1];
+        auto const hiddenSize = hiddenStates->getDimension<-1>();
         auto const hiddenStatesShape = modelConfig.usePackedInput()
             ? ITensor::makeShape({inputShape.d[0], hiddenSize})
             : ITensor::makeShape({inputShape.d[0], inputShape.d[1], hiddenSize});
@@ -686,12 +699,12 @@ void TransformerBuffers::getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers,
     inputBuffers.clear();
     outputBuffers.clear();
 
-    auto& logits = runtimeBuffers->logits;
-    auto& hiddenStates = runtimeBuffers->hiddenStates;
-    auto& contextLengthsDevice = runtimeBuffers->contextLengthsDevice;
-    auto& contextLengthsHost = runtimeBuffers->contextLengthsHost;
-    auto& lastTokenIds = runtimeBuffers->lastTokenIds;
-    auto& requestTypes = runtimeBuffers->requestTypes;
+    auto const& logits = runtimeBuffers->logits;
+    auto const& hiddenStates = runtimeBuffers->hiddenStates;
+    auto const& contextLengthsDevice = runtimeBuffers->contextLengthsDevice;
+    auto const& contextLengthsHost = runtimeBuffers->contextLengthsHost;
+    auto const& lastTokenIds = runtimeBuffers->lastTokenIds;
+    auto const& requestTypes = runtimeBuffers->requestTypes;
 
     if (worldConfig.isLastPipelineParallelRank())
     {

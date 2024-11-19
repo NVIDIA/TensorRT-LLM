@@ -235,8 +235,23 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
                 auto const curSeqLen = sequenceLengths == nullptr ? 0 : sequenceLengths[batchSlot];
                 auto const outIdx = returnAllSelectedTokens ? tokenIdx * maxTopK + ki : curSeqLen + tokenIdx;
                 outputIdsRequestPtr[outIdx] = outputId;
-                // cum log prob is not supported with returnAllSelectedTokens
-                if (!returnAllSelectedTokens)
+
+                if (returnAllSelectedTokens)
+                {
+                    // 'outputLogProbs' is the probability induced by the top-k sampling:
+                    // NOT normalized (same way as OpenAI does):
+                    // log_prob = log P(i | i is in vocab) = log(expLogit)
+                    // normalized:
+                    // log_prob = log P(i | i is in top-k) = log(expLogit / sum)
+                    if (outputLogProbs != nullptr)
+                    {
+                        // outputLogProbs shape: [maxBatchSize, maxTopK]
+                        auto logProb = logf(expLogit);
+                        auto const normalizedProb = normalizeLogProbs ? logProb - logf(sSum) : logProb;
+                        outputLogProbs[batchSlot * maxTopK + ki] = normalizedProb;
+                    }
+                }
+                else
                 {
                     if (cumLogProbs != nullptr || outputLogProbs != nullptr)
                     {
@@ -247,17 +262,14 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
                         }
                         if (outputLogProbs != nullptr)
                         {
-                            // 'outputLogProbs' is the probability induced by the top-k sampling:
-                            // NOT normalized (same way as OpenAI does):
-                            // log_prob = log P(i | i is in vocab) = log(expLogit)
-                            // normalized:
-                            // log_prob = log P(i | i is in top-k) = log(expLogit / sum)
-                            outputLogProbs[curSeqLen * maxBatchSize + batchSlot]
-                                = normalizeLogProbs ? logProb - logf(sSum) : logProb;
+                            auto const normalizedProb = normalizeLogProbs ? logProb - logf(sSum) : logProb;
+                            // outputLogProbs shape: [maxSeqLen, maxBatchSize]
+                            outputLogProbs[curSeqLen * maxBatchSize + batchSlot] = normalizedProb;
                         }
                     }
                     break;
                 }
+
                 if (returnAllSelectedTokens && randNum <= 0.0f)
                 {
                     if (ki < k - 1)

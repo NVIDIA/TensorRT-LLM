@@ -1500,7 +1500,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     int const beam0_context_length
         = HAS_BEAMS && tlength > cyclic_kv_cache_len ? 0 : params.input_lengths[batch_beam_idx];
     // The position of the current timestep, and it is used to apply the position embedding
-    int const current_pos_idx = (!POS_SHIFT || DO_CROSS_ATTENTION) ? tlength : kv_loop_length;
+    int current_pos_idx = (!POS_SHIFT || DO_CROSS_ATTENTION) ? tlength : kv_loop_length;
 
     // The offset in the Q and K buffer also accounts for the batch.
     auto const qk_vec_idx = tidx * QK_VEC_SIZE;
@@ -1667,6 +1667,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         break;
     }
     case PositionEmbeddingType::kLONG_ROPE:
+    case PositionEmbeddingType::kROPE_M:
     case PositionEmbeddingType::kROPE_GPT_NEOX:
     {
         bool const do_rotary = is_valid_qk_vec && QK_VEC_SIZE * tidx < params.rotary_embedding_dim;
@@ -1680,6 +1681,10 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         int const smem_pitch = half_rotary_dim; // TODO: adjust for bank conflicts
 
         assert(half_rotary_dim % QK_VEC_SIZE == 0);
+        if (params.position_embedding_type == PositionEmbeddingType::kROPE_M)
+        {
+            current_pos_idx += params.mrope_position_deltas[batch_idx];
+        }
 
         if (do_rotary)
         {

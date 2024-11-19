@@ -15,8 +15,10 @@
  */
 
 // Ignore CUTLASS warnings about type punning
+#ifdef __GNUC__ // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
+#endif // __GNUC__
 
 #include "cutlass/array.h"
 #include "cutlass/numeric_conversion.h"
@@ -44,7 +46,9 @@
 #include "cutlass_extensions/gemm/kernel/moe_cutlass_kernel.h"
 #include "cutlass_extensions/gemm/threadblock/default_mma.h"
 
+#ifdef __GNUC__ // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic pop
+#endif          // __GNUC__
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"

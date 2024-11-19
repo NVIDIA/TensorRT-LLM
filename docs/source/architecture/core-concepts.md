@@ -254,3 +254,131 @@ subsets of layers. Tensor Parallelism usually leads to more balanced executions
 but requires more memory bandwidth between the GPUs. Pipeline Parallelism
 reduces the need for high-bandwidth communication but may incur load-balancing
 issues and may be less efficient in terms of GPU utilization.
+
+## Examples
+
+Here are examples of Llama 3.1 70B and Llama 3.1 405B showing how to perform multi-GPU and multi-node inference in TensorRT-LLM. The example of Llama 3.1 70B performs multi-GPU inference on a single node, while the example of Llama 3.1 405B performs multi-node inference.
+
+### Llama 3.1 70B
+
+The following sample commands build an engine for running the Llama 3.1 70B model with tensor parallelism (TP=4) using 4 GPUs on a single node.
+
+```bash
+folder_trt_llm=../TensorRT-LLM
+model_dir=Llama-3.1-70B
+ckpt_dir=ckpt_llama_3.1_70b
+engine_dir=engine_llama_3.1_70b
+dtype=bfloat16
+tp_size=4
+pp_size=1
+kv_cache_type=paged
+max_input_len=128
+max_output_len=128
+max_batch_size=4
+workers=$(( tp_size * pp_size ))
+
+python ${folder_trt_llm}/examples/llama/convert_checkpoint.py \
+    --output_dir ${ckpt_dir} \
+    --model_dir ${model_dir} \
+    --dtype ${dtype} \
+    --tp_size ${tp_size} \
+    --pp_size ${pp_size} \
+    --workers ${workers} \
+    --use_parallel_embedding
+
+trtllm-build \
+    --output_dir ${engine_dir} \
+    --checkpoint_dir ${ckpt_dir} \
+    --gemm_plugin ${dtype} \
+    --gpt_attention_plugin ${dtype} \
+    --kv_cache_type ${kv_cache_type} \
+    --max_input_len ${max_input_len} \
+    --max_seq_len $(( max_input_len + max_output_len )) \
+    --max_batch_size ${max_batch_size} \
+    --workers ${workers}
+```
+
+The following sample commands perform inference using 4 GPUs on a single node by running `examples/run.py`.
+
+```bash
+input_text="Born in north-east France, Soyer trained as a"
+
+mpirun -n $(( tp_size * pp_size )) \
+    python ${folder_trt_llm}/examples/run.py \
+        --engine_dir ${engine_dir} \
+        --tokenizer_dir ${model_dir} \
+        --input_text "${input_text}" \
+        --max_output_len ${max_output_len}
+```
+
+### Llama 3.1 405B
+
+The following sample commands build an engine for running the Llama 3.1 405B model with tensor parallelism (TP=16) on 2 nodes that each have 8 GPUs. Although the model runs on multiple nodes, you can build the engine on a single node.
+
+```bash
+folder_trt_llm=../TensorRT-LLM
+model_dir=Llama-3.1-405B
+ckpt_dir=ckpt_llama_3.1_405b
+engine_dir=engine_llama_3.1_405b
+dtype=bfloat16
+tp_size=16
+pp_size=1
+kv_cache_type=paged
+max_input_len=128
+max_output_len=128
+max_batch_size=4
+workers=8
+
+python ${folder_trt_llm}/examples/llama/convert_checkpoint.py \
+    --output_dir ${ckpt_dir} \
+    --model_dir ${model_dir} \
+    --dtype ${dtype} \
+    --tp_size ${tp_size} \
+    --pp_size ${pp_size} \
+    --workers ${workers} \
+    --use_parallel_embedding
+
+trtllm-build \
+    --output_dir ${engine_dir} \
+    --checkpoint_dir ${ckpt_dir} \
+    --gemm_plugin ${dtype} \
+    --gpt_attention_plugin ${dtype} \
+    --kv_cache_type ${kv_cache_type} \
+    --max_input_len ${max_input_len} \
+    --max_seq_len $(( max_input_len + max_output_len )) \
+    --max_batch_size ${max_batch_size} \
+    --workers ${workers}
+```
+
+The following sample script, `launch_llama_3.1_405b.sh`, shows how to perform inference with Slurm on 2 nodes that each have 8 GPUs. If you use a different workload management software, the key concern is to run the `examples/run.py` command.
+
+```bash
+#!/bin/bash
+#SBATCH --account account
+#SBATCH --partition partition
+#SBATCH --job-name job-name
+#SBATCH --time 1:00:00
+#SBATCH --nodes 2
+
+folder_trt_llm=../TensorRT-LLM
+engine_dir=engine_llama_3.1_405b
+model_dir=Llama-3.1-405B
+max_output_len=128
+
+input_text="Born in north-east France, Soyer trained as a"
+
+srun \
+    --ntasks-per-node 8 \
+    --mpi pmix \
+    python ${folder_trt_llm}/examples/run.py \
+        --engine_dir ${engine_dir} \
+        --tokenizer_dir ${model_dir} \
+        --input_text "${input_text}" \
+        --max_output_len ${max_output_len}
+```
+
+You can perform inference by running the script on the Slurm cluster.
+
+```bash
+sbatch launch_llama_3.1_405b.sh
+```

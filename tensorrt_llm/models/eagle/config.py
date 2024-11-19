@@ -22,8 +22,10 @@ class EagleConfig(LLaMAConfig):
                  *,
                  num_eagle_layers: int = 1,
                  max_draft_len: int = 63,
+                 max_non_leaves_per_layer: int = 10,
                  **kwargs):
         self.num_eagle_layers = num_eagle_layers
+        self.max_non_leaves_per_layer = max_non_leaves_per_layer
         self.max_draft_len = max_draft_len
         self.eagle_net_config = LLaMAConfig.from_dict(
             kwargs["eagle_net_config"])
@@ -34,6 +36,7 @@ class EagleConfig(LLaMAConfig):
         output = super().to_dict()
         # Serialize the fields added in EagleConfig
         output['num_eagle_layers'] = self.num_eagle_layers
+        output['max_non_leaves_per_layer'] = self.max_non_leaves_per_layer
         output['max_draft_len'] = self.max_draft_len
         output['eagle_net_config'] = self.eagle_net_config.to_dict()
         return output

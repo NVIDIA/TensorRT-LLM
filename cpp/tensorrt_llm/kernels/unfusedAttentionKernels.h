@@ -106,6 +106,9 @@ struct QKVPreprocessingParams
     float const* kvScaleOrigQuant{nullptr};
     int const* spec_decoding_position_offsets{nullptr};
 
+    float2 const* mrope_rotary_sin_cos{nullptr};
+    int32_t const* mrope_position_deltas{nullptr};
+
     // Scalars.
     int batch_size{0};
     int max_input_seq_len{0};

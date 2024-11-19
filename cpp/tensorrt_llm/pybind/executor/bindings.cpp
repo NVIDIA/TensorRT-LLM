@@ -314,6 +314,11 @@ void InitBindings(pybind11::module_& m)
         .def_property_readonly("embedding_table", &tle::PromptTuningConfig::getEmbeddingTable)
         .def_property_readonly("input_token_extra_ids", &tle::PromptTuningConfig::getInputTokenExtraIds);
 
+    py::class_<tle::MropeConfig>(m, "MropeConfig")
+        .def(py::init<Tensor, SizeType32>(), py::arg("mrope_rotary_sin_cos"), py::arg("mrope_position_deltas"))
+        .def_property_readonly("mrope_rotary_sin_cos", &tle::MropeConfig::getMRopeRotarySinCos)
+        .def_property_readonly("mrope_position_deltas", &tle::MropeConfig::getMRopePositionDeltas);
+
     py::class_<tle::LoraConfig>(m, "LoraConfig")
         .def(py::init<uint64_t, std::optional<Tensor>, std::optional<Tensor>>(), py::arg("task_id"),
             py::arg("weights") = py::none(), py::arg("config") = py::none())
@@ -391,7 +396,8 @@ void InitBindings(pybind11::module_& m)
                     std::optional<std::list<tle::VecTokens>> badWords,
                     std::optional<std::list<tle::VecTokens>> stopWords, std::optional<tle::Tensor> embeddingBias,
                     std::optional<tle::ExternalDraftTokensConfig> externalDraftTokensConfig,
-                    std::optional<tle::PromptTuningConfig> pTuningConfig, std::optional<tle::LoraConfig> loraConfig,
+                    std::optional<tle::PromptTuningConfig> pTuningConfig, std::optional<tle::MropeConfig> mRopeConfig,
+                    std::optional<tle::LoraConfig> loraConfig,
                     std::optional<tle::LookaheadDecodingConfig> lookaheadConfig,
                     std::optional<tle::KvCacheRetentionConfig> kvCacheRetentionConfig,
                     std::optional<std::string> logitsPostProcessorName,
@@ -413,10 +419,10 @@ void InitBindings(pybind11::module_& m)
                     TLLM_CHECK_WITH_INFO(maxTokens.has_value(), "missing required argument max_tokens");
                     return std::make_unique<tle::Request>(inputTokenIds, maxTokens.value(), streaming, samplingConfig,
                         outputConfig, endId, padId, positionIds, badWords, stopWords, embeddingBias,
-                        externalDraftTokensConfig, pTuningConfig, loraConfig, lookaheadConfig, kvCacheRetentionConfig,
-                        logitsPostProcessorName, encoderInputTokenIds, clientId, returnAllGeneratedTokens, priority,
-                        type, contextPhaseParams, encoderInputFeatures, encoderOutputLength, crossAttentionMask,
-                        numReturnSequences, eagleConfig, skipCrossAttnBlocks);
+                        externalDraftTokensConfig, pTuningConfig, mRopeConfig, loraConfig, lookaheadConfig,
+                        kvCacheRetentionConfig, logitsPostProcessorName, encoderInputTokenIds, clientId,
+                        returnAllGeneratedTokens, priority, type, contextPhaseParams, encoderInputFeatures,
+                        encoderOutputLength, crossAttentionMask, numReturnSequences, eagleConfig, skipCrossAttnBlocks);
                 }),
             py::arg("input_token_ids"), py::kw_only(), py::arg("max_tokens") = py::none(),
             py::arg("max_new_tokens") = py::none(), py::arg("streaming") = false,
@@ -425,10 +431,11 @@ void InitBindings(pybind11::module_& m)
             py::arg("pad_id") = py::none(), py::arg("position_ids") = py::none(), py::arg("bad_words") = py::none(),
             py::arg("stop_words") = py::none(), py::arg("embedding_bias") = py::none(),
             py::arg("external_draft_tokens_config") = py::none(), py::arg("prompt_tuning_config") = py::none(),
-            py::arg("lora_config") = py::none(), py::arg("lookahead_config") = py::none(),
-            py::arg("kv_cache_retention_config") = py::none(), py::arg("logits_post_processor_name") = py::none(),
-            py::arg("encoder_input_token_ids") = py::none(), py::arg("client_id") = py::none(),
-            py::arg("return_all_generated_tokens") = false, py::arg("priority") = tle::Request::kDefaultPriority,
+            py::arg("mrope_config") = py::none(), py::arg("lora_config") = py::none(),
+            py::arg("lookahead_config") = py::none(), py::arg("kv_cache_retention_config") = py::none(),
+            py::arg("logits_post_processor_name") = py::none(), py::arg("encoder_input_token_ids") = py::none(),
+            py::arg("client_id") = py::none(), py::arg("return_all_generated_tokens") = false,
+            py::arg("priority") = tle::Request::kDefaultPriority,
             py::arg_v("type", tle::RequestType::REQUEST_TYPE_CONTEXT_AND_GENERATION,
                 "RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION"),
             py::arg("context_phase_params") = py::none(), py::arg("encoder_input_features") = py::none(),
@@ -451,6 +458,7 @@ void InitBindings(pybind11::module_& m)
             &tle::Request::setExternalDraftTokensConfig)
         .def_property(
             "prompt_tuning_config", &tle::Request::getPromptTuningConfig, &tle::Request::setPromptTuningConfig)
+        .def_property("mrope_config", &tle::Request::getMropeConfig, &tle::Request::setMropeConfig)
         .def_property("lora_config", &tle::Request::getLoraConfig, &tle::Request::setLoraConfig)
         .def_property("lookahead_config", &tle::Request::getLookaheadConfig, &tle::Request::setLookaheadConfig)
         .def_property("kv_cache_retention_config", &tle::Request::getKvCacheRetentionConfig,
