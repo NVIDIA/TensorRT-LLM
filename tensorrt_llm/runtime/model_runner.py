@@ -464,7 +464,7 @@ class ModelRunnerMixin:
             task_vocab_size = torch.tensor([task_vocab_size], dtype=torch.int32)
             prompt_table_data = prompt_table_data.view(-1, hidden_size)
         else:
-            prompt_table_data = torch.empty([1, self.hidden_size],
+            prompt_table_data = torch.empty([1, self.hidden_size * self.mapping.tp_size],
                                             dtype=self.dtype)
             task_vocab_size = torch.zeros([1], dtype=torch.int32)
 
