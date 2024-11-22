@@ -45,9 +45,9 @@ std::vector<LoraModule> LoraModule::createLoraModules(std::vector<std::string> c
         case ModuleType::kATTN_Q: modules.emplace_back(t, hidden, numHeads * attnHeadSize, false, true, -1, 0); break;
         case ModuleType::kATTN_K: modules.emplace_back(t, hidden, numKvHeads * attnHeadSize, false, true, -1, 0); break;
         case ModuleType::kATTN_V: modules.emplace_back(t, hidden, numKvHeads * attnHeadSize, false, true, -1, 0); break;
-        case ModuleType::kCROSS_ATTN_Q: modules.emplace_back(t, hidden, numHeads * attnHeadSize, false, true, -1, 0); break;
-        case ModuleType::kCROSS_ATTN_K: modules.emplace_back(t, hidden, numKvHeads * attnHeadSize, false, true, -1, 0); break;
-        case ModuleType::kCROSS_ATTN_V: modules.emplace_back(t, hidden, numKvHeads * attnHeadSize, false, true, -1, 0); break;
+        case ModuleType::kCROSS_ATTN_Q:
+        case ModuleType::kCROSS_ATTN_K:
+        case ModuleType::kCROSS_ATTN_V: modules.emplace_back(t, hidden, hidden, false, true, -1, 0); break;
         case ModuleType::kATTN_DENSE:
         case ModuleType::kCROSS_ATTN_DENSE: modules.emplace_back(t, hidden, hidden, false, true, 1, -1); break;
         case ModuleType::kMLP_H_TO_4H: modules.emplace_back(t, hidden, mlpHidden, false, true, -1, 0); break;
