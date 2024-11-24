@@ -157,6 +157,10 @@ def parse_arguments():
         help=
         'N-way expert parallelism size for MOE, default is 1, which will do tp-only for MoE'
     )
+    parser.add_argument(
+        "--trust_remote_code",
+        action="store_true",
+        help="Pass trust_remote_code=True to HF loading functions as needed")
     args = parser.parse_args()
     return args
 
@@ -233,6 +237,7 @@ def convert_and_save_hf(args):
                                  mapping=mapping,
                                  quant_config=quant_config,
                                  calib_dataset=args.calib_dataset,
+                                 trust_remote_code=args.trust_remote_code,
                                  **override_fields)
     else:
 
@@ -249,6 +254,7 @@ def convert_and_save_hf(args):
                 mapping=mapping,
                 quant_config=quant_config,
                 use_hf_gptq_checkpoint=use_hf_gptq_checkpoint,
+                trust_remote_code=args.trust_remote_code,
                 **override_fields)
             qwen.save_checkpoint(args.output_dir, save_config=(rank == 0))
             del qwen
