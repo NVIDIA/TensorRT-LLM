@@ -221,7 +221,7 @@ public:
         tk::invokeAddBiasSoftMax(logitsDevicePtr, logitsPtrsDevicePtr, bufferCast<T>(*logitsDevice), biasDevicePtr,
             bufferCast<int32_t>(*endIdsDevice),
             reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*finishedDevice)),
-            batchSlotsPtr, batchSize, maxBatchSize, beamWidth, vocabSize, vocabSizePadded, !computeSoftmax, false,
+            batchSlotsPtr, batchSize, maxBatchSize, beamWidth, vocabSize, vocabSizePadded, !computeSoftmax, false, nullptr,
             this->mStream->get());
 
         this->mStream->synchronize();

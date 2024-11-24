@@ -97,6 +97,7 @@ private:
     TensorPtr mOutputIdsDevice;
     TensorPtr mNewTokens;
     TensorPtr mEndIdsDevice;
+    TensorPtr mMinPsDevice;
     TensorPtr mBatchSlots;
 
     TensorPtr mBadWordsLens;

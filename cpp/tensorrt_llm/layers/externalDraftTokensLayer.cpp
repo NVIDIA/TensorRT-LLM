@@ -208,6 +208,7 @@ void ExternalDraftTokensLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutpu
     auto const batchSize = inputs->logits.value()->getDimension<0>();
 
     auto const* endIds = bufferCast<TokenIdType>(*inputs->endIds);
+    auto const* minPs = bufferCast<float const*>(*inputs->minPs);
 
     FinishedState const* finishedInput = (inputs->finished)
         ? reinterpret_cast<FinishedState const*>(bufferCast<FinishedState::UnderlyingType>(*inputs->finished.value()))
@@ -223,7 +224,7 @@ void ExternalDraftTokensLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutpu
     mBufferManager->copy(runtimeLogitsPtr, *mTargetLogits);
     invokeAddBiasSoftMax(runtimeLogitsPtr, logitsPtrsPtr, runtimeLogitsPtr, biasPtr, endIds, finishedInput,
         batchSlotsPtr, batchSize, mDecoderDomain.getBatchSize(), /* bw */ 1, mDecoderDomain.getVocabSize(),
-        mDecoderDomain.getVocabSizePadded(), /*skipSoftMax*/ false, /* batchSlotLogits */ false, getStream());
+        mDecoderDomain.getVocabSizePadded(), /*skipSoftMax*/ false, /* batchSlotLogits */ false, minPs, getStream());
 
     // Fill the buffer for selected ids from sampling with zero. -1 will be set as a boundary if topP kernel is required
     auto& outputIdsAfterSamplingTensor = const_cast<ITensor&>(*mOutputIdsAfterSampling);
@@ -296,14 +297,14 @@ void ExternalDraftTokensLayer<T>::acceptDraftTokens(std::shared_ptr<BaseDecoding
             workspace->getDeviceBatchSlotsPtr(), batchSize, maxBatchSize, beamWidth * maxTokensPerStep,
             mDecoderDomain.getVocabSize(), mDecoderDomain.getVocabSizePadded(),
             /* skip softmax */ false,
-            /* batchSlotLogits */ true, getStream());
+            /* batchSlotLogits */ true, nullptr, getStream());
     }
 
     invokeAddBiasSoftMax(bufferCast<T>(*mTargetLogits), static_cast<T**>(nullptr), bufferCast<T>(*inputs->targetProbs),
         static_cast<T*>(nullptr), nullptr, finishedInput, workspace->getDeviceBatchSlotsPtr(), batchSize, maxBatchSize,
         beamWidth /* 1 */, mDecoderDomain.getVocabSize(), mDecoderDomain.getVocabSizePadded(),
         /* skip softmax */ false,
-        /* batchSlotLogits */ false, getStream());
+        /* batchSlotLogits */ false, nullptr, getStream());
 
     sync_check_cuda_error();
 

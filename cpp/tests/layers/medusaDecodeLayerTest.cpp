@@ -199,6 +199,7 @@ void MedusaDecodingLayerTest<T>::setup(SamplingParams& params)
     trk::invokeFill(*mFinishedDevice, uint8_t{0}, *mStream);
     trk::invokeFill(*mOutputIdsDevice, SizeType32{0}, *mStream);
     trk::invokeFill(*mEndIdsDevice, TokenIdType{endId}, *mStream);
+    trk::invokeFill(*mMinPsDevice, float*{nullptr}, *mStream);
     trk::invokeFill(*mNextDraftTokensDevice, TokenIdType{-1}, *mStream);
     trk::invokeFill(*mPathsDevice, SizeType32{-1}, *mStream);
     trk::invokeFill(*mTreeIdsDevice, SizeType32{0}, *mStream);
@@ -264,7 +265,7 @@ void MedusaDecodingLayerTest<T>::setup(SamplingParams& params)
 template <typename T>
 std::shared_ptr<MedusaDecodingInputs> MedusaDecodingLayerTest<T>::createInputTensors()
 {
-    auto forwardParams = std::make_shared<MedusaDecodingInputs>(mEndIdsDevice, mBatchSlots, mBatchSize);
+    auto forwardParams = std::make_shared<MedusaDecodingInputs>(mEndIdsDevice, mMinPsDevice, mBatchSlots, mBatchSize);
 
     auto batchSlots = BufferRange<SizeType32>(*mBatchSlots);
 

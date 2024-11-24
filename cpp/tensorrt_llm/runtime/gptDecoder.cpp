@@ -364,30 +364,30 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
     if (decodingMode.isTopKorTopP())
     {
         forwardParams
-            = std::make_shared<tl::SamplingInputs>(input.endIds, input.batchSlots, input.step, ite, input.batchSize);
+            = std::make_shared<tl::SamplingInputs>(input.endIds, input.minPs, input.batchSlots, input.step, ite, input.batchSize);
     }
     else if (decodingMode.isBeamSearch())
     {
-        forwardParams = std::make_shared<tl::DecodingInputs>(input.endIds, input.batchSlots, input.step, ite,
+        forwardParams = std::make_shared<tl::DecodingInputs>(input.endIds, input.minPs, input.batchSlots, input.step, ite,
             input.batchSize, input.maxAttentionWindow, input.sinkTokenLength);
     }
     else if (decodingMode.isMedusa())
     {
-        forwardParams = std::make_shared<tl::MedusaDecodingInputs>(input.endIds, input.batchSlots, input.batchSize);
+        forwardParams = std::make_shared<tl::MedusaDecodingInputs>(input.endIds, input.minPs, input.batchSlots, input.batchSize);
     }
     else if (decodingMode.isLookahead())
     {
-        forwardParams = std::make_shared<tl::LookaheadDecodingInputs>(input.endIds, input.batchSlots);
+        forwardParams = std::make_shared<tl::LookaheadDecodingInputs>(input.endIds, input.minPs, input.batchSlots);
     }
     else if (decodingMode.isExplicitDraftTokens())
     {
         forwardParams
-            = std::make_shared<tl::ExplicitDraftTokensInputs>(input.endIds, input.batchSlots, input.batchSize);
+            = std::make_shared<tl::ExplicitDraftTokensInputs>(input.endIds, input.minPs, input.batchSlots, input.batchSize);
     }
     else if (decodingMode.isExternalDraftTokens())
     {
         forwardParams = std::make_shared<tl::ExternalDraftTokensInputs>(
-            input.endIds, input.batchSlots, input.step, ite, input.batchSize);
+            input.endIds, input.minPs, input.batchSlots, input.step, ite, input.batchSize);
     }
     else if (decodingMode.isEagle())
     {

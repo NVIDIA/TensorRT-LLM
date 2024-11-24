@@ -160,6 +160,7 @@ void DynamicDecodeLayerTest<T>::allocateData(TestSamplingParams const& params, T
     mNewTokens
         = BufferManager::pinned(ITensor::makeShape({mMaxTokensPerStep, mMaxBatchSize}), nvinfer1::DataType::kINT32);
     mEndIdsDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+    mMinPsDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT64);
 
     mEmbeddingBiasHost = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize, mVocabSizePadded}), dataType);
     mEmbeddingBiasDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize, mVocabSizePadded}), dataType);
@@ -248,6 +249,7 @@ void DynamicDecodeLayerTest<T>::setup(uint64_t seed, TestSamplingParams const& p
     trk::invokeFill(*mOutputLogProbsTiledDevice, float{0.0f}, *mStream);
     trk::invokeFill(*mRefLogProbsHost, float{0.0f}, *mStream);
     trk::invokeFill(*mEndIdsDevice, TokenIdType{mEndId}, *mStream);
+    trk::invokeFill(*mMinPsDevice, float*{nullptr}, *mStream);
 
     auto batchSlotsPtr = bufferCast<SizeType32>(*mBatchSlots);
     for (SizeType32 bi = 0; bi < mBatchSize; ++bi)
@@ -488,11 +490,11 @@ std::shared_ptr<DecodingInputs> DynamicDecodeLayerTest<T>::createInputTensors(Si
     std::shared_ptr<DecodingInputs> forwardParams;
     if (mDecodingMode.isTopKorTopP())
     {
-        forwardParams = std::make_shared<SamplingInputs>(mEndIdsDevice, mBatchSlots, step, ite, mBatchSize);
+        forwardParams = std::make_shared<SamplingInputs>(mEndIdsDevice, mMinPsDevice, mBatchSlots, step, ite, mBatchSize);
     }
     else if (mDecodingMode.isMedusa())
     {
-        forwardParams = std::make_shared<MedusaDecodingInputs>(mEndIdsDevice, mBatchSlots, mBatchSize);
+        forwardParams = std::make_shared<MedusaDecodingInputs>(mEndIdsDevice, mMinPsDevice, mBatchSlots, mBatchSize);
     }
 
     forwardParams->embeddingBias = mEmbeddingBiasDevice;

@@ -98,9 +98,10 @@ GptDecoderBatched::GptDecoderBatched(std::size_t vocabSize, std::size_t vocabSiz
     { // prevent reusing these vars after std::move
         auto dummyLogits = mBufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
         auto endIds = mBufferManager.emptyTensor(MemoryType::kGPU, nvTokenIdType);
+        auto minP = mBufferManager.emptyTensor(MemoryType::kGPU, TRTDataType<float*>::value);
         auto batchSlots = mBufferManager.emptyTensor(MemoryType::kPINNED, nvSizeType);
         dInput = std::make_unique<DecodingInput>(
-            0, 0, 0, 0, std::move(dummyLogits), std::move(endIds), std::move(batchSlots));
+            0, 0, 0, 0, std::move(dummyLogits), std::move(endIds), std::move(minP), std::move(batchSlots));
     }
     dInput->sequenceLimitLength = mBufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
     dInput->lengths = mBufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
@@ -281,6 +282,7 @@ void GptDecoderBatched::setup(executor::DecodingMode const& mode, SizeType32 max
     dInput.badWordsLists.resize(maxBatchSize);
 
     const_cast<ITensor&>(*dInput.endIds).reshape(maxBatchSizeShape);
+    const_cast<ITensor&>(*dInput.minPs).reshape(maxBatchSizeShape);
     const_cast<ITensor&>(*dInput.batchSlots).reshape(maxBatchSizeShape);
     auto& sequenceLimitLength = const_cast<ITensor&>(*dInput.sequenceLimitLength);
     sequenceLimitLength.reshape(maxBatchSizeShape);
@@ -474,6 +476,19 @@ void GptDecoderBatched::newRequest(SizeType32 batchSlot, decoder_batch::Request 
 
     TensorPtr endIdTensorPtr{ITensor::slice(constPointerCast(dJointInput.endIds), batchSlot, 1)};
     kernels::invokeFill(*endIdTensorPtr, endId, *stream);
+    TensorPtr minPTensorPtr{ITensor::slice(constPointerCast(dJointInput.minPs), batchSlot, 1)};
+    int wordsLen = 0;
+    if (request.badWordsList)
+    {
+        wordsLen = request.badWordsList->getShape().d[1];
+    }
+
+    if (wordsLen > 0)
+    {
+        kernels::invokeFill(*minPTensorPtr, (int64_t)(intptr_t)bufferCast<TokenIdType>(*request.badWordsList), *stream);
+    } else {
+        kernels::invokeFill(*minPTensorPtr, (int64_t)0, *stream);
+    }
 
     TensorPtr embeddingBiasSlice = ITensor::slice(constPointerCast(dJointInput.embeddingBias), batchSlot, 1);
     if (request.embeddingBias)
@@ -501,7 +516,10 @@ void GptDecoderBatched::newRequest(SizeType32 batchSlot, decoder_batch::Request 
                 = bufferCast<TokenIdType>(*requestWordsList);
             bufferCast<SizeType32>(*constPointerCast(jointWordsLens))[batchSlot] = wordsLen;
             // FIXME(nkorobov): this is monotonically growing size
-            jointMaxWordsLen = std::max(static_cast<SizeType32>(wordsLen), jointMaxWordsLen);
+            if (wordsLen > 0)
+            {
+                jointMaxWordsLen = std::max(static_cast<SizeType32>(wordsLen - 1), jointMaxWordsLen);
+            }
 
             // NOTE(nkorobov): jointWordsList is not used in gptDecoder, but required to keep <name>WordsList's
             // memory allocated
@@ -1114,6 +1132,7 @@ CudaEvent GptDecoderBatched::postProcessRequest(
     // Prepare a slice of dJointInput and dJointOutput for gatherTree
     DecodingInput dInput{dJointInput};
     slice(dInput.endIds, dJointInput.endIds);
+    slice(dInput.minPs, dJointInput.minPs);
     slice(dInput.lengths, dJointInput.lengths);
 
     DecodingOutput dOutput{
