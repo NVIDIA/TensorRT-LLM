@@ -87,7 +87,7 @@ struct FusedQKVMaskedAttentionDispatchParams
     int const* input_lengths;
     int timestep;
     float q_scaling;
-    float qk_tanh_scale;
+    float attn_logit_softcapping_scale;
     int relative_attention_bias_stride;
     T const* linear_bias_slopes;
     int const* ia3_tasks;
@@ -330,8 +330,8 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
     params.position_shift_enabled = input_params.position_shift_enabled;
     // Note: keep norm factor (sqrt(K_dim)) when adopting megatron T5 structure (may adjust)
     params.inv_sqrt_dh = 1.F / (sqrtf((float) params.hidden_size_per_head) * input_params.q_scaling);
-    params.qk_tanh_scale = input_params.qk_tanh_scale;
-    params.qk_tanh_inverse_scale = 1.0f / input_params.qk_tanh_scale;
+    params.attn_logit_softcapping_scale = input_params.attn_logit_softcapping_scale;
+    params.attn_logit_softcapping_inverse_scale = 1.0f / input_params.attn_logit_softcapping_scale;
 
     params.relative_attention_bias = reinterpret_cast<DataType const*>(input_params.relative_attention_bias);
     params.relative_attention_bias_stride = input_params.relative_attention_bias_stride;
@@ -405,7 +405,7 @@ INSTANTIATE_MMHA_DISPATCH(__nv_bfloat16, __nv_bfloat16)
 
 GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads, int vision_start, int vision_length,
     int num_kv_heads, int layer_idx_in_cache_pool, int head_size, int unidirectional, float q_scaling,
-    float qk_tanh_scale, tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
+    float attn_logit_softcapping_scale, tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
     int rotary_embedding_dim, // for RoPE. Use 0 for non-RoPE
     float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
     float rotary_embedding_scale, float rotary_embedding_short_m_scale, float rotary_embedding_long_m_scale,
@@ -429,7 +429,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads,
     , mHeadSize(head_size)
     , mUnidirectional(unidirectional)
     , mQScaling(q_scaling)
-    , mQKTanhScale(qk_tanh_scale)
+    , mAttnLogitSoftcappingScale(attn_logit_softcapping_scale)
     , mRotaryEmbeddingDim(rotary_embedding_dim)
     , mRotaryEmbeddingBase(rotary_embedding_base)
     , mRotaryEmbeddingScaleType(rotary_embedding_scale_type)
@@ -563,7 +563,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(void const* data, size_t leng
     read(d, mHeadSize);
     read(d, mUnidirectional);
     read(d, mQScaling);
-    read(d, mQKTanhScale);
+    read(d, mAttnLogitSoftcappingScale);
     read(d, mPositionEmbeddingType);
     read(d, mRotaryEmbeddingDim);
     read(d, mRotaryEmbeddingBase);
@@ -1376,7 +1376,7 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T> const& para
 
         if (!isCrossAttention())
         {
-            // self attention, write to Q/K/V
+            // self attention, write to from QKV to Q/K/V
             invokeAddFusedQKVBiasTranspose(q_buf_2_, k_buf_2_, v_buf_2_, const_cast<T*>(params.attention_input),
                 const_cast<T*>(params.qkv_bias), params.q_seq_lengths, mRemovePadding ? padding_offset : nullptr,
                 params.batch_size, params.input_seq_length, params.num_tokens, mNumHeads, mNumKVHeads, getHeadSize(),
@@ -1386,8 +1386,9 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T> const& para
         }
         else
         {
-            // cross attention, write Q from self QKV, write KV from cross QKV
-            // kernel modified accordingly to handle nullptr buffer
+            // cross attention, write from self QKV [*, head_num * head_size + 2 * kv_head_num * head_size]to Q, write
+            // from cross KV [*, 2 * kv_head_num * head_size] to K/V kernel modified accordingly to handle nullptr
+            // buffer
             invokeAddFusedQKVBiasTranspose(q_buf_2_, (T*) nullptr, (T*) nullptr, const_cast<T*>(params.attention_input),
                 const_cast<T*>(params.qkv_bias), params.q_seq_lengths, mRemovePadding ? padding_offset : nullptr,
                 params.batch_size, params.input_seq_length, params.num_tokens, mNumHeads, mNumKVHeads, getHeadSize(),
@@ -1398,9 +1399,9 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T> const& para
             invokeAddFusedQKVBiasTranspose((T*) nullptr, k_buf_2_, v_buf_2_, const_cast<T*>(params.cross_kv),
                 const_cast<T*>(params.qkv_bias), params.encoder_input_lengths,
                 mRemovePadding ? encoder_padding_offset : nullptr, params.batch_size, params.cross_kv_length,
-                params.num_encoder_tokens, 0, mNumKVHeads, getHeadSize(), mRotaryEmbeddingDim, mRotaryEmbeddingBase,
-                mRotaryEmbeddingScaleType, mRotaryEmbeddingScale, mRotaryEmbeddingMaxPositions, position_embedding_type,
-                (float*) nullptr, 0, stream);
+                params.num_encoder_tokens, /*mNumHeads*/ 0, mNumKVHeads, getHeadSize(), mRotaryEmbeddingDim,
+                mRotaryEmbeddingBase, mRotaryEmbeddingScaleType, mRotaryEmbeddingScale, mRotaryEmbeddingMaxPositions,
+                position_embedding_type, (float*) nullptr, 0, stream);
             sync_check_cuda_error();
         }
 
@@ -1518,8 +1519,8 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T> const& para
             param.k_length = attention_seq_len_2;
             param.num_heads = mNumHeads;
             param.qk_scale = qk_scale_softmax;
-            param.qk_tanh_scale = mQKTanhScale;
-            param.qk_tanh_inverse_scale = 1.0f / mQKTanhScale;
+            param.attn_logit_softcapping_scale = mAttnLogitSoftcappingScale;
+            param.attn_logit_softcapping_inverse_scale = 1.0f / mAttnLogitSoftcappingScale;
             param.linear_bias_slopes = const_cast<T*>(linear_bias_slopes); // (head_num,), optional
             param.block_sparse_attn = mMaskType == AttentionMaskType::BLOCKSPARSE;
             param.block_sparse_params = mBlockSparseParams;
@@ -1551,8 +1552,8 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T> const& para
             param.k_length = attention_seq_len_2;
             param.num_heads = mNumHeads;
             param.qk_scale = qk_scale_softmax;
-            param.qk_tanh_scale = mQKTanhScale;
-            param.qk_tanh_inverse_scale = 1.0f / mQKTanhScale;
+            param.attn_logit_softcapping_scale = mAttnLogitSoftcappingScale;
+            param.attn_logit_softcapping_inverse_scale = 1.0f / mAttnLogitSoftcappingScale;
             param.linear_bias_slopes = const_cast<T*>(linear_bias_slopes); // (head_num,), optional
             param.block_sparse_attn = mMaskType == AttentionMaskType::BLOCKSPARSE;
             param.block_sparse_params = mBlockSparseParams;
@@ -1832,7 +1833,7 @@ int GPTAttentionPluginCommon::enqueueGeneration(EnqueueGenerationParams<T> const
     dispatch_params.input_lengths = params.context_lengths;
     dispatch_params.timestep = timestep;
     dispatch_params.q_scaling = q_scaling;
-    dispatch_params.qk_tanh_scale = mQKTanhScale;
+    dispatch_params.attn_logit_softcapping_scale = mAttnLogitSoftcappingScale;
     dispatch_params.linear_bias_slopes = isALiBi() ? params.alibi_slopes : nullptr;
     dispatch_params.ia3_tasks = ia3_tasks;
     dispatch_params.ia3_key_weights = ia3_key_weights;
@@ -2016,7 +2017,7 @@ int GPTAttentionPluginCommon::initialize() noexcept
             fmhaParams.headSizeV = mMLAParams.v_head_dim;
         }
         fmhaParams.qScaling = mQScaling;
-        fmhaParams.qkTanhScale = mQKTanhScale;
+        fmhaParams.attnLogitSoftcappingScale = mAttnLogitSoftcappingScale;
         fmhaParams.hasAlibi = isALiBi();
         fmhaParams.scaleAlibi = isAliBiWithScale();
         fmhaParams.tpSize = mTpSize;
@@ -2045,7 +2046,7 @@ int GPTAttentionPluginCommon::initialize() noexcept
             fmhaParams.headSizeV = mMLAParams.kv_lora_rank;
             fmhaParams.qScaling = mQScaling * sqrt((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim))
                 / sqrtf((float) (mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim));
-            fmhaParams.qkTanhScale = mQKTanhScale;
+            fmhaParams.attnLogitSoftcappingScale = mAttnLogitSoftcappingScale;
             fmhaParams.hasAlibi = isALiBi();
             fmhaParams.scaleAlibi = isAliBiWithScale();
             fmhaParams.tpSize = mTpSize;
@@ -2111,7 +2112,7 @@ size_t GPTAttentionPluginCommon::getCommonSerializationSize() const noexcept
 {
     return sizeof(mLayerIdx) + sizeof(mNumHeads) + +sizeof(mVisionStart) + sizeof(mVisionLength) + sizeof(mNumKVHeads)
         + sizeof(mLayerIdxInCachePool) + sizeof(mHeadSize) + sizeof(mUnidirectional) + sizeof(mQScaling)
-        + sizeof(mQKTanhScale) + sizeof(mPositionEmbeddingType) + sizeof(mRotaryEmbeddingDim)
+        + sizeof(mAttnLogitSoftcappingScale) + sizeof(mPositionEmbeddingType) + sizeof(mRotaryEmbeddingDim)
         + sizeof(mRotaryEmbeddingBase) + sizeof(mRotaryEmbeddingScaleType) + sizeof(mRotaryEmbeddingScale)
         + sizeof(mRotaryEmbeddingShortMscale) + sizeof(mRotaryEmbeddingLongMscale)
         + sizeof(mRotaryEmbeddingMaxPositions) + sizeof(mRotaryEmbeddingOriginalMaxPositions) + sizeof(mTpSize)
@@ -2139,7 +2140,7 @@ void GPTAttentionPluginCommon::serializeCommon(void* buffer) const noexcept
     write(d, mHeadSize);
     write(d, mUnidirectional);
     write(d, mQScaling);
-    write(d, mQKTanhScale);
+    write(d, mAttnLogitSoftcappingScale);
     write(d, mPositionEmbeddingType);
     write(d, mRotaryEmbeddingDim);
     write(d, mRotaryEmbeddingBase);
@@ -2237,7 +2238,8 @@ GPTAttentionPluginCreatorCommon::GPTAttentionPluginCreatorCommon()
     mPluginAttributes.emplace_back(PluginField("head_size", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("unidirectional", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("q_scaling", nullptr, PluginFieldType::kFLOAT32, 1.0));
-    mPluginAttributes.emplace_back(PluginField("qk_tanh_scale", nullptr, PluginFieldType::kFLOAT32, 0.0));
+    mPluginAttributes.emplace_back(
+        PluginField("attn_logit_softcapping_scale", nullptr, PluginFieldType::kFLOAT32, 0.0));
     mPluginAttributes.emplace_back(PluginField("position_embedding_type", nullptr, PluginFieldType::kINT8, 0));
     mPluginAttributes.emplace_back(PluginField("rotary_embedding_dim", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("rotary_embedding_base", nullptr, PluginFieldType::kFLOAT32, 0));

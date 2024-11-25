@@ -15,6 +15,7 @@
  */
 
 #include "eagleDecodingLayer.h"
+#include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/kernels/penaltyTypes.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/common.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/eagleDecodingKernels.h"
@@ -60,6 +61,12 @@ void EagleDecodingLayer<T>::allocateBuffer()
     mEagleNetGenRequestTypes = mBufferManager->gpu(batchSizeShape, TRTDataType<SizeType32>::value);
     mEagleNetGenContextLengths = mBufferManager->gpu(batchSizeShape, TRTDataType<SizeType32>::value);
     mEagleNetGenPastKeyValueLengths = mBufferManager->gpu(batchSizeShape, TRTDataType<SizeType32>::value);
+
+    SizeType32 constexpr NUM_BUFFERS{2};
+    size_t workspaces[NUM_BUFFERS];
+    workspaces[0] = mDecoderDomain.getBatchSize() * sizeof(SizeType32);
+    workspaces[1] = mDecoderDomain.getBatchSize() * sizeof(SizeType32);
+    mWorkspaceSize = calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -118,6 +125,9 @@ void EagleDecodingLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> co
     auto inputs = std::dynamic_pointer_cast<EagleInputs>(baseInputs);
     auto outputs = std::dynamic_pointer_cast<EagleOutputs>(baseOutputs);
 
+    // Convert batch slots and seq slots to have -1 for the ctx requests not in the last chunk.
+    augmentBatchSlots(*outputs, *inputs, workspace);
+
     // Slice output ids, pos ids, next draft tokens.
     unpackData(*outputs, *inputs, workspace);
 
@@ -131,16 +141,49 @@ void EagleDecodingLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> co
 }
 
 template <typename T>
-void EagleDecodingLayer<T>::unpackData(EagleOutputs const& outputs, EagleInputs const& inputs,
+void EagleDecodingLayer<T>::augmentBatchSlots(EagleOutputs const& outputs, EagleInputs const& inputs,
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto const batchSize = inputs.localBatchSize;
+    auto const engineBatchSize = inputs.nextDraftLens->getDimension<0>();
+
+    int8_t* workspaceBytePtr = reinterpret_cast<int8_t*>(workspace->getRawWorkspaceDevicePtr());
+    size_t offset{0};
+
+    SizeType32* augmentedSeqSlots = reinterpret_cast<SizeType32*>(
+        nextWorkspacePtr(workspaceBytePtr, offset, engineBatchSize * sizeof(SizeType32)));
+    SizeType32* augmentedBatchSlots = reinterpret_cast<SizeType32*>(
+        nextWorkspacePtr(workspaceBytePtr, offset, engineBatchSize * sizeof(SizeType32)));
+
+    auto chunkedContextNextTokens = bufferCast<SizeType32>(*inputs.chunkedContextNextTokens);
+    auto lastDraftLens = bufferCast<SizeType32>(*inputs.lastDraftLens);
+
+    invokeAugmentBatchSlots(augmentedSeqSlots, augmentedBatchSlots, chunkedContextNextTokens, lastDraftLens,
+        bufferCast<SizeType32>(*inputs.seqSlots), workspace->getDeviceBatchSlotsPtr(), engineBatchSize, batchSize,
+        getStream());
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+template <typename T>
+void EagleDecodingLayer<T>::unpackData(EagleOutputs const& outputs, EagleInputs const& inputs,
+    std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    auto const engineBatchSize = inputs.nextDraftLens->getDimension<0>();
     auto const maxSeqLen = outputs.outputIds->getDimension<-1>();
 
+    int8_t* workspaceBytePtr = reinterpret_cast<int8_t*>(workspace->getRawWorkspaceDevicePtr());
+    size_t offset{0};
+
+    SizeType32* augmentedSeqSlots = reinterpret_cast<SizeType32*>(
+        nextWorkspacePtr(workspaceBytePtr, offset, engineBatchSize * sizeof(SizeType32)));
+
     UnpackEagleDataParams params;
-    params.batchSlots = bufferCast<SizeType32>(*inputs.seqSlots);
+    params.batchSlots = augmentedSeqSlots;
     params.inputCurandState = reinterpret_cast<curandState_t*>(bufferCastOrNull<int8_t>(mCurandStatesDevice));
 
     params.inputTemperatures = bufferCast<float>(*mTemperatureDevice);
@@ -177,7 +220,7 @@ void EagleDecodingLayer<T>::unpackData(EagleOutputs const& outputs, EagleInputs 
     params.outputEagleNetGenContextLengths = bufferCast<SizeType32>(*mEagleNetGenContextLengths);
     params.outputEagleNetGenPastKeyValueLengths = bufferCast<SizeType32>(*mEagleNetGenPastKeyValueLengths);
 
-    params.batchSize = batchSize;
+    params.batchSize = engineBatchSize;
     params.maxDecodingTokens = mDecoderDomain.getSpeculativeDecodingModule()->getMaxDecodingTokens();
     params.maxPathLength = mDecoderDomain.getSpeculativeDecodingModule()->getMaxPathLen();
     params.maxSeqLen = maxSeqLen;
@@ -204,16 +247,21 @@ void EagleDecodingLayer<T>::convertToPackedMask(EagleOutputs const& outputs, Eag
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto batchSlots = bufferCast<SizeType32>(*inputs.seqSlots);
-    auto packedMasksDevice = bufferCast<SizeType32>(*outputs.packedMasks);
-    auto nextDraftPaths = bufferCast<SizeType32>(*outputs.nextDraftPaths);
-
-    auto const batchSize = inputs.localBatchSize;
+    auto const engineBatchSize = inputs.nextDraftLens->getDimension<0>();
     auto const maxDecodingTokens = mDecoderDomain.getSpeculativeDecodingModule()->getMaxDecodingTokens();
     auto const maxPathLen = mDecoderDomain.getSpeculativeDecodingModule()->getMaxPathLen();
 
+    int8_t* workspaceBytePtr = reinterpret_cast<int8_t*>(workspace->getRawWorkspaceDevicePtr());
+    size_t offset{0};
+    SizeType32* augmentedSeqSlots = reinterpret_cast<SizeType32*>(
+        nextWorkspacePtr(workspaceBytePtr, offset, engineBatchSize * sizeof(SizeType32)));
+
+    auto batchSlots = augmentedSeqSlots;
+    auto packedMasksDevice = bufferCast<SizeType32>(*outputs.packedMasks);
+    auto nextDraftPaths = bufferCast<SizeType32>(*outputs.nextDraftPaths);
+
     invokeGetPackedMaskFromPath(
-        packedMasksDevice, batchSlots, nextDraftPaths, batchSize, maxDecodingTokens, maxPathLen, getStream());
+        packedMasksDevice, batchSlots, nextDraftPaths, engineBatchSize, maxDecodingTokens, maxPathLen, getStream());
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -225,11 +273,19 @@ void EagleDecodingLayer<T>::packAcceptedPaths(EagleOutputs const& outputs, Eagle
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     auto const batchSize = inputs.localBatchSize;
+    auto const engineBatchSize = inputs.nextDraftLens->getDimension<0>();
+
+    int8_t* workspaceBytePtr = reinterpret_cast<int8_t*>(workspace->getRawWorkspaceDevicePtr());
+    size_t offset{0};
+    nextWorkspacePtr(workspaceBytePtr, offset, engineBatchSize * sizeof(SizeType32));
+
+    SizeType32* augmentedBatchSlots = reinterpret_cast<SizeType32*>(
+        nextWorkspacePtr(workspaceBytePtr, offset, engineBatchSize * sizeof(SizeType32)));
 
     auto numNewTokens = bufferCast<SizeType32>(*outputs.numNewTokens.value());
     auto numNewTokensCumSum = bufferCast<SizeType32>(*outputs.numNewTokensCumSum);
     auto pathsOffsets = bufferCast<SizeType32>(*outputs.pathsOffsets);
-    auto batchSlots = workspace->getDeviceBatchSlotsPtr();
+    auto batchSlots = augmentedBatchSlots;
     auto bestPathIndicesSlotsPtr = bufferCast<SizeType32>(*inputs.acceptedPathIds);
     auto lastDraftPathsSlotsPtr = bufferCast<SizeType32>(*inputs.lastDraftPaths);
 
@@ -238,7 +294,8 @@ void EagleDecodingLayer<T>::packAcceptedPaths(EagleOutputs const& outputs, Eagle
     TLLM_CHECK_WITH_INFO(numNewTokensCumSum != nullptr, "numNewTokensCumSum must be provided for EagleDecodingLayer");
     TLLM_CHECK_WITH_INFO(pathsOffsets != nullptr, "pathsOffsets must be provided for EagleDecodingLayer");
     invokePackAcceptedPaths(numNewTokensCumSum, pathsOffsets, numNewTokens, bestPathIndicesSlotsPtr,
-        lastDraftPathsSlotsPtr, batchSlots, batchSize, mDecoderDomain.getSpeculativeDecodingModule()->getMaxNumPaths(),
+        lastDraftPathsSlotsPtr, batchSlots, batchSize, engineBatchSize,
+        mDecoderDomain.getSpeculativeDecodingModule()->getMaxNumPaths(),
         mDecoderDomain.getSpeculativeDecodingModule()->getMaxPathLen(), true, getStream());
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);

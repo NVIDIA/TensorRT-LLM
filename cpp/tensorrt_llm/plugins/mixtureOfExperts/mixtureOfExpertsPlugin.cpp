@@ -370,7 +370,11 @@ bool MixtureOfExpertsPlugin::supportsFormatCombination(
     }
     else if (useSideStream() && pos == nbInputs + getOutputDummyTensorIndex())
     {
-        return inOut[pos].type == mType;
+        return inOut[pos].type == inOut[getInputDummyTensorIndex()].type;
+    }
+    else if (useSideStream() && pos == getInputDummyTensorIndex())
+    {
+        return true;
     }
     else if (hasExpertFp8QuantScales() && getExpertFP8Dequant1Index() <= pos && pos <= getExpertFP8QuantFinalIndex())
     {
@@ -695,12 +699,12 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         mSideStreamPtr->waitMainStreamOnSideStream(stream);
         // Provide data dependency for the shared experts running after this plugin by copying inputs on the main stream
         size_t count = 1;
-        for (int i = 0; i < inputDesc[getInputTensorIndex()].dims.nbDims; ++i)
+        for (int i = 0; i < inputDesc[getInputDummyTensorIndex()].dims.nbDims; ++i)
         {
-            count *= inputDesc[getInputTensorIndex()].dims.d[i];
+            count *= inputDesc[getInputDummyTensorIndex()].dims.d[i];
         }
-        count *= tensorrt_llm::runtime::BufferDataType(inputDesc[getInputTensorIndex()].type).getSize();
-        TLLM_CUDA_CHECK(cudaMemcpyAsync(outputs[getOutputDummyTensorIndex()], inputs[getInputTensorIndex()], count,
+        count *= tensorrt_llm::runtime::BufferDataType(inputDesc[getInputDummyTensorIndex()].type).getSize();
+        TLLM_CUDA_CHECK(cudaMemcpyAsync(outputs[getOutputDummyTensorIndex()], inputs[getInputDummyTensorIndex()], count,
             cudaMemcpyDeviceToDevice, stream));
         // Switch from the main stream to the side stream
         stream = mSideStreamPtr->getStream();
@@ -793,7 +797,7 @@ nvinfer1::DataType MixtureOfExpertsPlugin::getOutputDataType(
     TLLM_CHECK(inputTypes[getInputTensorIndex()] == mType);
     if (useSideStream() && index == getOutputDummyTensorIndex())
     {
-        return mType;
+        return inputTypes[getInputDummyTensorIndex()];
     }
     return mOutputType;
 }

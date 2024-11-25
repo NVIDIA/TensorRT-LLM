@@ -416,7 +416,9 @@ class LLM:
             model_world_size=self.args.parallel_config.world_size,
             mpi_session=self.mpi_session,
             reuse_mpi_comm=external_mpi_comm_available(
-                self.args.parallel_config.world_size))
+                self.args.parallel_config.world_size),
+            enable_processes_for_single_gpu=self.args.
+            enable_processes_for_single_gpu)
 
     def _try_load_tokenizer(self) -> Optional[TokenizerBase]:
         if self.args.skip_tokenizer_init:

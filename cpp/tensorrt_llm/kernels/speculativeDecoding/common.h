@@ -32,16 +32,24 @@ namespace tensorrt_llm::kernels::speculative_decoding
 //! \param pathsOffsets input buffer [maxBatchSize * maxDraftLen], slices of accepted paths packed in memory
 //! \param acceptedLengths input buffer [maxBatchSize], length of the data accepted tokens
 //! \param bestPathIds input buffer [maxBatchSize], indices of the selected paths
-//! \param paths input buffer [batchSize, numPaths, maxPathLen] if isPathsLinearBatchIdx else [maxBatchSize, numPaths,
-//! maxPathLen], paths to restore sequences from outputIds and targetIds. Should be filled with -1 for everything that
-//! is not path. \param batchSlots input buffer [batchSize], address map from local index to global index [0, batchSize]
-//! -> [0, maxBatchSize] \param batchSize current batch size \param numPaths maximum number of tokens per step
-//! configured in the system \param maxPathLen maximum sequence length of the sequence containing draft tokens \param
-//! isPathsLinearBatchIdx \param stream stream
+//! \param paths input buffer [engineBatchSize, numPaths, maxPathLen] if isPathsLinearBatchIdx else [maxBatchSize,
+//! numPaths, maxPathLen], paths to restore sequences from outputIds and targetIds. Should be filled with -1 for
+//! everything that is not path. \param batchSlots input buffer [engineBatchSize], address map from local index to
+//! global index [0, batchSize]
+//! -> [0, maxBatchSize]
+//! \param batchSize the number of sequences to be decoded
+//! \param engineBatchSize number of sequences processed in the engine.
+//! Includes chunked context reqs that are not in the last chunk.
+//! \param numPaths maximum number of tokens per step
+//! configured in the system
+//! \param maxPathLen maximum sequence length of the sequence containing draft tokens
+//! \param isPathsLinearBatchIdx access paths using batch slot or linear batch idx
+//! \param stream stream
 void invokePackAcceptedPaths(runtime::SizeType32* acceptedLengthsCumSum, runtime::SizeType32* pathsOffsets,
     runtime::SizeType32 const* acceptedLengths, runtime::SizeType32 const* bestPathIds,
     runtime::SizeType32 const* paths, runtime::SizeType32 const* batchSlots, runtime::SizeType32 batchSize,
-    runtime::SizeType32 numPaths, runtime::SizeType32 maxPathLen, bool isPathsLinearBatchIdx, cudaStream_t stream);
+    runtime::SizeType32 engineBatchSize, runtime::SizeType32 numPaths, runtime::SizeType32 maxPathLen,
+    bool isPathsLinearBatchIdx, cudaStream_t stream);
 
 template <typename T>
 struct AcceptDraftTokensByIdsWithPathsParams

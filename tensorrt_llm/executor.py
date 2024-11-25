@@ -6,6 +6,7 @@ import datetime
 import faulthandler
 import io
 import json
+import multiprocessing
 import os
 import pickle  # nosec B403
 import secrets
@@ -13,6 +14,7 @@ import signal
 import time
 import traceback
 from abc import ABC, abstractmethod
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
@@ -35,9 +37,14 @@ from .llmapi.tracer import (VizTracer, enable_llm_tracer, get_tracer,
                             global_tracer, set_global_tracer)
 from .llmapi.utils import (AsyncQueue, ManagedThread, SamplingParams,
                            _SyncQueue, enable_llm_debug, print_colored)
+from .logger import set_level
 from .lora_manager import LoraManager
 from .prompt_adapter_manager import PromptAdapterManager
 from .runtime.model_runner import _engine_config_to_model_config
+
+if enable_llm_debug():
+    # Mainly enable more detailed logging from cpp runtime.
+    set_level("info")
 
 
 @dataclass(slots=True)
@@ -632,6 +639,7 @@ class GenerationExecutor(ABC):
         world_size: int = 0,
         mpi_session: Optional[MpiSession] = None,
         reuse_mpi_comm: bool = False,
+        enable_processes_for_single_gpu: bool = False
     ) -> Union["ExecutorBindingsProxy", "ExecutorBindingsWorker"]:
 
         if world_size == 0:
@@ -659,7 +667,49 @@ class GenerationExecutor(ABC):
                                          model_world_size=model_world_size,
                                          mpi_session=mpi_session)
 
-        return ExecutorBindingsWorker(**worker_kwargs)
+        # For single-gpu case:
+        # Partition the workload to multiple process for performance. While this requires uses to protect their entrypoint
+        # to `if __name__ == "__main__":`.
+        try:
+            if enable_processes_for_single_gpu:
+                ctx = multiprocessing.get_context("fork")
+                mpi_session = ProcessPoolExecutorSession(n_workers=1,
+                                                         mp_context=ctx)
+                return ExecutorBindingsProxy(worker_kwargs,
+                                             model_world_size=model_world_size,
+                                             mpi_session=mpi_session)
+        finally:
+            # If the user's entrypoint is not protected by `if __name__ == "__main__":`, it will fall back to the traditional
+            # single process way.
+            return ExecutorBindingsWorker(engine=engine,
+                                          executor_config=executor_config)
+
+
+class ProcessPoolExecutorSession(MpiSession):
+    # This process pool is introduced for better recoverable exceptions handling.
+    # It replaces MpiPoolExecutor for single-gpu case.
+
+    def __init__(self, n_workers: int, **kwargs):
+        self.n_workers = n_workers
+        self.mpi_pool = ProcessPoolExecutor(max_workers=self.n_workers,
+                                            **kwargs)
+
+    def submit(self, task: Callable, *args,
+               **kwargs) -> List[concurrent.futures.Future]:
+        return [
+            self.mpi_pool.submit(task, *args, **kwargs)
+            for i in range(self.n_workers)
+        ]
+
+    def submit_sync(self, task: Callable, *args, **kwargs) -> List[Any]:
+        futures = [
+            self.mpi_pool.submit(task, *args, **kwargs)
+            for i in range(self.n_workers)
+        ]
+        return [future.result() for future in futures]
+
+    def shutdown(self):
+        self.mpi_pool.shutdown(wait=False)
 
 
 class ExecutorBindingsWorker(GenerationExecutor):
@@ -1297,7 +1347,6 @@ class ExecutorBindingsProxy(GenerationExecutor):
         self.worker_cls = worker_cls
 
         self.request_queue = IpcQueue(is_server=True)
-        # Return request id back to dispatcher
         self.request_error_queue = IpcQueue(is_server=True)
         self.result_queue = FusedIpcQueue(is_server=True, fuse_message=True)
         self.mp_stats_queue = FusedIpcQueue(is_server=True, fuse_message=True)
@@ -1364,15 +1413,19 @@ class ExecutorBindingsProxy(GenerationExecutor):
             mp_stats_queue.put(None)
 
         # Error handling in the Worker/MPI process
-        #   1. During Executor initialization, the errors will be captured by MPIPoolExecutor, and propagate to the
-        #      future.done_callback in the Python main process.
-        #   2. After Executor initialization, the errors will be captured by ManagedThreads, and propagate to the
-        #      error_queue in the Python main process by IPC queue of result_queue in await_response_task.
+        #   1. During Executor initialization, the errors will be captured and send back via request_error_queue.
+        #   2. During execution, the errors will be captured by ManagedThreads
+        #      a) For per-request error, the error will be send back via result_queue, and eventually raised in
+        #         handle_response() in the main thread.
+        #      b) For system error, the error will be raised in the MPI process and handled by future.done_callback,
+        #         that will propagate the error to the error_queue in the main thread.
 
         try:
             executor = worker_cls(engine, executor_config)
         except Exception as e:
-            raise CppExecutorError(f"Failed to initialize executor: {e}") from e
+            if mpi_rank() == 0:
+                request_error_queue.put(e)
+            return
 
         with executor:
             try:
@@ -1509,8 +1562,10 @@ class ExecutorBindingsProxy(GenerationExecutor):
 
         while not self.request_error_queue.poll(1):
             self._handle_background_error()
+
         ready_signal = self.request_error_queue.get()
-        assert ready_signal == ExecutorBindingsProxy.READY_SIGNAL
+        if ready_signal != ExecutorBindingsProxy.READY_SIGNAL:
+            raise ready_signal
 
     def shutdown(self):
         if enable_llm_debug():

@@ -14,7 +14,9 @@
 # limitations under the License.
 import math
 
-from ..._utils import fp32_array
+import tensorrt as trt
+
+from ..._utils import fp16_array, fp32_array
 from ...functional import concat, constant, cos, exp, silu, sin
 from ...layers import Linear
 from ...module import Module
@@ -25,7 +27,8 @@ def get_timestep_embedding(timesteps,
                            flip_sin_to_cos=False,
                            downscale_freq_shift=1.0,
                            scale=1.0,
-                           max_period=10000):
+                           max_period=10000,
+                           dtype=None):
     """
     This matches the implementation in Denoising Diffusion Probabilistic Models: Create sinusoidal timestep embeddings.
     :param timesteps: a 1-D Tensor of N indices, one per batch element.
@@ -42,7 +45,10 @@ def get_timestep_embedding(timesteps,
         for i in range(half_dim)
     ]
 
-    emb = exp(constant(fp32_array(exponent)))
+    if dtype == trt.DataType.HALF:
+        emb = exp(constant(fp16_array(exponent)))
+    else:
+        emb = exp(constant(fp32_array(exponent)))
 
     ts_shape = list(timesteps.size())
     ts_shape.append(1)
@@ -69,14 +75,14 @@ def get_timestep_embedding(timesteps,
 
 class TimestepEmbedding(Module):
 
-    def __init__(self, channel, time_embed_dim, act_fn="silu"):
+    def __init__(self, channel, time_embed_dim, act_fn="silu", dtype=None):
         super().__init__()
 
-        self.linear_1 = Linear(channel, time_embed_dim)
+        self.linear_1 = Linear(channel, time_embed_dim, dtype=dtype)
         self.act = None
         if act_fn == "silu":
             self.act = silu
-        self.linear_2 = Linear(time_embed_dim, time_embed_dim)
+        self.linear_2 = Linear(time_embed_dim, time_embed_dim, dtype=dtype)
 
     def forward(self, sample):
         sample = self.linear_1(sample)
@@ -90,11 +96,16 @@ class TimestepEmbedding(Module):
 
 class Timesteps(Module):
 
-    def __init__(self, num_channels, flip_sin_to_cos, downscale_freq_shift):
+    def __init__(self,
+                 num_channels,
+                 flip_sin_to_cos,
+                 downscale_freq_shift,
+                 dtype=None):
         super().__init__()
         self.num_channels = num_channels
         self.flip_sin_to_cos = flip_sin_to_cos
         self.downscale_freq_shift = downscale_freq_shift
+        self.dtype = dtype
 
     def forward(self, timesteps):
         t_emb = get_timestep_embedding(
@@ -102,5 +113,5 @@ class Timesteps(Module):
             self.num_channels,
             flip_sin_to_cos=self.flip_sin_to_cos,
             downscale_freq_shift=self.downscale_freq_shift,
-        )
+            dtype=self.dtype)
         return t_emb

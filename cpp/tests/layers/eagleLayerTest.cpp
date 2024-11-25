@@ -672,6 +672,9 @@ void EagleDecodingLayerTest<T>::allocateBuffers()
     mInputAcceptedPathIds
         = BufferManager::pinnedPool(ITensor::makeShape({mSamplingParams.getBatchSize()}), nvinfer1::DataType::kINT32);
 
+    mChunkedContextNextTokens
+        = BufferManager::pinnedPool(ITensor::makeShape({mSamplingParams.getBatchSize()}), nvinfer1::DataType::kINT32);
+
     mDecodingWorkspace = std::make_shared<tensorrt_llm::runtime::DecodingLayerWorkspace>(mBufferManager, decodingDomain,
         TRTDataType<float>::value, mSamplingParams.getMaxBatchSize() * sizeof(curandState_t));
 }
@@ -698,6 +701,7 @@ void EagleDecodingLayerTest<T>::setup()
     trk::invokeFill(*mRandomDataValidation, float{0}, *mStream);
     trk::invokeFill(*mOutputTemperatures, float{0}, *mStream);
     trk::invokeFill(*mOutputNextDraftPaths, SizeType32{0}, *mStream);
+    trk::invokeFill(*mChunkedContextNextTokens, SizeType32{-1}, *mStream);
 
     std::mt19937 gen(42);
 
@@ -798,9 +802,10 @@ void EagleDecodingLayerTest<T>::setup()
 template <typename T>
 std::shared_ptr<EagleInputs> EagleDecodingLayerTest<T>::createInputTensors()
 {
-    auto forwardParams = std::make_shared<EagleInputs>(mEndIds, mBatchSlots, mSamplingParams.getBatchSize(),
-        mInputNextDraftTokens, mInputNextDraftLens, mInputNextDraftPaths, mInputLastDraftTokens, mInputLastDraftLens,
-        mInputLastDraftPaths, mInputAcceptedTokens, mInputAcceptedLens, mInputAcceptedPathIds, mBatchSlots);
+    auto forwardParams
+        = std::make_shared<EagleInputs>(mEndIds, mBatchSlots, mSamplingParams.getBatchSize(), mInputNextDraftTokens,
+            mInputNextDraftLens, mInputNextDraftPaths, mInputLastDraftTokens, mInputLastDraftLens, mInputLastDraftPaths,
+            mInputAcceptedTokens, mInputAcceptedLens, mInputAcceptedPathIds, mChunkedContextNextTokens, mBatchSlots);
 
     return forwardParams;
 }

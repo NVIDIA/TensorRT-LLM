@@ -523,7 +523,10 @@ void InitBindings(pybind11::module_& m)
         .def_property_readonly("result", &tle::Response::getResult);
 
     auto dynamicBatchConfigGetstate = [](tle::DynamicBatchConfig const& self)
-    { return py::make_tuple(self.getEnableBatchSizeTuning(), self.getDynamicBatchMovingAverageWindow()); };
+    {
+        return py::make_tuple(self.getEnableBatchSizeTuning(), self.getEnableMaxNumTokensTuning(),
+            self.getDynamicBatchMovingAverageWindow());
+    };
 
     auto dynamicBatchConfigSetstate = [](py::tuple state)
     {
@@ -531,13 +534,14 @@ void InitBindings(pybind11::module_& m)
         {
             throw std::runtime_error("Invalid state!");
         }
-        return tle::DynamicBatchConfig(state[0].cast<bool>(), state[1].cast<SizeType32>());
+        return tle::DynamicBatchConfig(state[0].cast<bool>(), state[1].cast<bool>(), state[2].cast<SizeType32>());
     };
 
     py::class_<tle::DynamicBatchConfig>(m, "DynamicBatchConfig")
-        .def(py::init<bool, SizeType32>(), py::arg("enable_batch_size_tuning"),
-            py::arg("dynamic_batch_moving_average_window"))
+        .def(py::init<bool, bool, SizeType32>(), py::arg("enable_batch_size_tuning"),
+            py::arg("enable_max_num_tokens_tuning"), py::arg("dynamic_batch_moving_average_window"))
         .def_property_readonly("enable_batch_size_tuning", &tle::DynamicBatchConfig::getEnableBatchSizeTuning)
+        .def_property_readonly("enable_max_num_tokens_tuning", &tle::DynamicBatchConfig::getEnableMaxNumTokensTuning)
         .def_property_readonly(
             "dynamic_batch_moving_average_window", &tle::DynamicBatchConfig::getDynamicBatchMovingAverageWindow)
         .def(py::pickle(dynamicBatchConfigGetstate, dynamicBatchConfigSetstate));

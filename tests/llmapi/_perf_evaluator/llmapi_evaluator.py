@@ -127,7 +127,7 @@ def benchmark_main(model_path: str,
                 os.path.dirname(__file__),
                 "../../../cpp/build/benchmarks/gptManagerBenchmark")
 
-        command = f"{cpp_executable_path} --engine_dir {engine_output_dir} --type IFB --dataset {samples_path} --warm_up {warmup} --output_csv {report_path_prefix}.cpp.csv --api executor"
+        command = f"{cpp_executable_path} --engine_dir {engine_output_dir} --type IFB --dataset {samples_path} --warm_up {warmup} --output_csv {report_path_prefix}.cpp.csv --api executor --enable_chunked_context"
         if streaming:
             command = f"{command} --streaming"
         if concurrency:

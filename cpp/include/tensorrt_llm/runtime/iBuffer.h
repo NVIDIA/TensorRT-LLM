@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/kvCacheIndex.h"
+#include "tensorrt_llm/runtime/common.h"
 
 #include <NvInferRuntime.h>
 
@@ -328,6 +329,12 @@ template <>
 struct TRTDataType<kernels::FinishedState>
 {
     static constexpr auto value = TRTDataType<kernels::FinishedState::UnderlyingType>::value;
+};
+
+template <>
+struct TRTDataType<runtime::RequestType>
+{
+    static constexpr auto value = TRTDataType<std::underlying_type_t<runtime::RequestType>>::value;
 };
 
 template <>

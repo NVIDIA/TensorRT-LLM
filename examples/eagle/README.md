@@ -14,7 +14,6 @@ For more info about EAGLE, refer to [speculative decoding documentation](https:/
   * Only greedy decoding and greedy acceptance are supported.
   * EAGLE-2 is not supported.
   * All EAGLE choices have to have exactly the same depth as `num_eagle_layers` of the engine.
-  * Chunked context is not supported.
   * Pipeline parallelism is not supported.
 
 ## Support Matrix

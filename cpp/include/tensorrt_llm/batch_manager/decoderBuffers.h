@@ -47,6 +47,9 @@ public:
 
     ~DecoderStepAsyncSend();
 
+    static auto constexpr kMpiTagOffset = 0;
+    static auto constexpr kMpiTagUpperBound = kMpiTagOffset + 9;
+
 private:
     std::shared_ptr<mpi::MpiRequest> mRequest1;
     std::shared_ptr<mpi::MpiRequest> mRequest2;
@@ -69,6 +72,10 @@ public:
         bool returnLogProbs, int peer);
 
     ~DecoderSlotAsyncSend();
+
+    static auto constexpr kMpiTagOffset = 9;
+    static auto constexpr kMpiTagUpperBound = kMpiTagOffset + 4;
+    static_assert(kMpiTagOffset >= DecoderStepAsyncSend::kMpiTagUpperBound);
 
 private:
     std::shared_ptr<mpi::MpiRequest> mRequest1;

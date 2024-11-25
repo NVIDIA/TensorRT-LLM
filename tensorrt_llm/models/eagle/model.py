@@ -237,11 +237,12 @@ def eagle_draft_decoder_plugin(layer_idx: int, top_k_sampling: bool,
 def eagle_prepare_drafter_inputs_plugin(
         layer_idx: int, num_layers: int, max_non_leaves_per_layer: int,
         attention_params: AttentionParams, input_ids: Tensor,
-        accepted_token_ids: Tensor, accepted_lens: Tensor,
-        accepted_path_ids: Tensor, next_draft_tokens: Tensor,
-        next_draft_lens: Tensor, next_draft_paths: Tensor,
-        prev_draft_lens: Tensor, prev_draft_paths: Tensor,
-        hidden_size_batch_level_starts: Tensor, input_gen_tokens: Tensor,
+        chunked_context_next_tokens: Tensor, accepted_token_ids: Tensor,
+        accepted_lens: Tensor, accepted_path_ids: Tensor,
+        next_draft_tokens: Tensor, next_draft_lens: Tensor,
+        next_draft_paths: Tensor, prev_draft_lens: Tensor,
+        prev_draft_paths: Tensor, hidden_size_batch_level_starts: Tensor,
+        input_gen_tokens: Tensor,
         input_spec_decoding_generation_lengths: Tensor):
     '''
     Prepares inputs for the EagleNet inference.
@@ -264,6 +265,11 @@ def eagle_prepare_drafter_inputs_plugin(
         input_ids : Tensor
             [num_tokens]
             Tokens ids, inputs to the base model.
+
+        chunked_context_next_tokens : Tensor
+            [batch_size]
+            The first token of the next chunk in chunked context.
+            -1 if current chunk is the last chunk or requests is in the gen phase.
 
         accepted_token_ids : Tensor
             [batch_size, max_path_len]
@@ -399,9 +405,10 @@ def eagle_prepare_drafter_inputs_plugin(
 
     plug_inputs = [
         attention_params.sequence_length, attention_params.context_lengths,
-        input_ids, accepted_token_ids, accepted_lens, accepted_path_ids,
-        next_draft_tokens, next_draft_lens, next_draft_paths, prev_draft_lens,
-        prev_draft_paths, hidden_size_batch_level_starts, input_gen_tokens,
+        input_ids, chunked_context_next_tokens, accepted_token_ids,
+        accepted_lens, accepted_path_ids, next_draft_tokens, next_draft_lens,
+        next_draft_paths, prev_draft_lens, prev_draft_paths,
+        hidden_size_batch_level_starts, input_gen_tokens,
         input_spec_decoding_generation_lengths
     ]
 
@@ -510,10 +517,11 @@ class EagleForCausalLM(LLaMAForCausalLM):
         self.max_draft_len = config.max_draft_len
 
     def _prepare_drafter_inputs(
-            self, layer_idx, input_ids, accepted_token_ids, accepted_lens,
-            accepted_path_ids, next_draft_tokens, next_draft_lens,
-            next_draft_paths, prev_draft_lens, prev_draft_paths,
-            input_attention_params, input_kv_cache_params, hidden_states,
+            self, layer_idx, input_ids, chunked_context_next_tokens,
+            accepted_token_ids, accepted_lens, accepted_path_ids,
+            next_draft_tokens, next_draft_lens, next_draft_paths,
+            prev_draft_lens, prev_draft_paths, input_attention_params,
+            input_kv_cache_params, hidden_states,
             host_ctx_eagle_net_request_types,
             host_ctx_eagle_net_context_lengths,
             host_ctx_eagle_net_past_key_value_lengths,
@@ -525,11 +533,11 @@ class EagleForCausalLM(LLaMAForCausalLM):
 
         drafter_inputs = eagle_prepare_drafter_inputs_plugin(
             layer_idx, self.num_eagle_layers, self.max_non_leaves_per_layer,
-            input_attention_params, input_ids, accepted_token_ids,
-            accepted_lens, accepted_path_ids, next_draft_tokens,
-            next_draft_lens, next_draft_paths, prev_draft_lens,
-            prev_draft_paths, hidden_size_batch_level_starts, input_gen_tokens,
-            input_spec_decoding_generation_lengths)
+            input_attention_params, input_ids, chunked_context_next_tokens,
+            accepted_token_ids, accepted_lens, accepted_path_ids,
+            next_draft_tokens, next_draft_lens, next_draft_paths,
+            prev_draft_lens, prev_draft_paths, hidden_size_batch_level_starts,
+            input_gen_tokens, input_spec_decoding_generation_lengths)
 
         sequence_length, context_lengths, \
             spec_decoding_generation_lengths, spec_decoding_position_offsets, \
@@ -659,6 +667,7 @@ class EagleForCausalLM(LLaMAForCausalLM):
         rand_data_validation = kwargs['rand_data_validation']
         rand_data_sample = kwargs['rand_data_sample']
         input_ids = kwargs['input_ids']
+        chunked_context_next_tokens = kwargs['chunked_context_next_tokens']
         host_ctx_eagle_net_request_types = kwargs[
             'host_ctx_eagle_net_request_types']
         host_ctx_eagle_net_context_lengths = kwargs[
@@ -697,6 +706,7 @@ class EagleForCausalLM(LLaMAForCausalLM):
             eagle_net_inputs, hidden_size_batch_level_starts, num_last_token_indices = self._prepare_drafter_inputs(
                 layer_idx=li,
                 input_ids=input_ids,
+                chunked_context_next_tokens=chunked_context_next_tokens,
                 accepted_token_ids=accepted_tokens,
                 accepted_lens=num_accepted_tokens,
                 accepted_path_ids=accepted_paths,
@@ -778,7 +788,8 @@ class EagleForCausalLM(LLaMAForCausalLM):
             "host_ctx_eagle_net_past_key_value_lengths",
             "host_gen_eagle_net_request_types",
             "host_gen_eagle_net_context_lengths",
-            "host_gen_eagle_net_past_key_value_lengths", "input_gen_tokens"
+            "host_gen_eagle_net_past_key_value_lengths", "input_gen_tokens",
+            "chunked_context_next_tokens"
         ]
 
         base_kwargs = {k: v for k, v in kwargs.items() if k not in extra_args}
@@ -959,6 +970,12 @@ class EagleForCausalLM(LLaMAForCausalLM):
                                   dim_range=OrderedDict([
                                       ('gen_tokens', gen_tokens_range),
                                   ]))
+        chunked_context_next_tokens = Tensor(name='chunked_context_next_tokens',
+                                             dtype=trt.int32,
+                                             shape=[-1],
+                                             dim_range=OrderedDict([
+                                                 ('batch_size', bb_range),
+                                             ]))
 
         tree_params = TreeParams(paths=draft_paths)
 
@@ -981,4 +998,5 @@ class EagleForCausalLM(LLaMAForCausalLM):
         inputs[
             'host_gen_eagle_net_past_key_value_lengths'] = host_gen_eagle_net_past_key_value_lengths
         inputs['input_gen_tokens'] = input_gen_tokens
+        inputs['chunked_context_next_tokens'] = chunked_context_next_tokens
         return inputs

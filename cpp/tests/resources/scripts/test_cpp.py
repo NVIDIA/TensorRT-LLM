@@ -239,10 +239,6 @@ def run_tests(build_dir: _pl.Path,
             cwd=root_dir,
             env=_os.environ,
             timeout=300)
-        run_command([python_exe, "-m", "pip", "install", "jaxtyping<=0.2.34"],
-                    cwd=root_dir,
-                    env=_os.environ,
-                    timeout=300)
 
     build_dir = build_dir if build_dir.is_absolute() else root_dir / build_dir
     resources_dir = _pl.Path("cpp") / "tests" / "resources"

@@ -99,10 +99,10 @@ template <int BLOCK_SIZE>
 __global__ void prepareCtxEagleNetInputsKernel(SizeType32* eagleNetSequenceLengths, SizeType32* eagleNetContextLengths,
     TokenIdType* outputIds, SizeType32* positionIds, SizeType32* hiddenStatesIndices, SizeType32* lastTokenIndices,
     SizeType32* numLastTokenIndices, SizeType32* hiddenSizeBatchLevelStarts, TokenIdType const* inputIds,
-    SizeType32 const* baseNetSequenceLengths, SizeType32 const* baseNetContextLengths,
-    TokenIdType const* acceptedTokens, SizeType32 const* acceptedLens, SizeType32 const* prevDraftLens,
-    SizeType32 const* prevPaths, SizeType32 const* bestPathIds, SizeType32 batchSize, SizeType32 maxPathLen,
-    SizeType32 maxDecodingTokens, SizeType32 maxNonLeavesPerLayer)
+    TokenIdType const* chunkedContextNextTokens, SizeType32 const* baseNetSequenceLengths,
+    SizeType32 const* baseNetContextLengths, TokenIdType const* acceptedTokens, SizeType32 const* acceptedLens,
+    SizeType32 const* prevDraftLens, SizeType32 const* prevPaths, SizeType32 const* bestPathIds, SizeType32 batchSize,
+    SizeType32 maxPathLen, SizeType32 maxDecodingTokens, SizeType32 maxNonLeavesPerLayer)
 {
     typedef cub::BlockScan<SizeType32, BLOCK_SIZE> BlockScan;
     __shared__ typename BlockScan::TempStorage tempStorage;
@@ -157,6 +157,9 @@ __global__ void prepareCtxEagleNetInputsKernel(SizeType32* eagleNetSequenceLengt
     // if valid request
     if (isValid)
     {
+        // Get next token of the chunk if not the last chunk in chunked context. Otherwise, -1.
+        auto const chunkedContextNextToken = chunkedContextNextTokens[bid];
+
         // Sequence length of the base model (without draft len for gen requests and all prompt tokens for ctx request)
         auto const oldSequenceLength = baseNetSequenceLengths[bid] - numInputTokens;
         for (SizeType32 ti = 0; ti < numDecodingTokens; ++ti)
@@ -166,8 +169,17 @@ __global__ void prepareCtxEagleNetInputsKernel(SizeType32* eagleNetSequenceLengt
             {
                 if (ti == numDecodingTokens - 1)
                 {
-                    // Last token is newly sampled token
-                    token = acceptedTokens[bid * maxPathLen + 0];
+                    if (chunkedContextNextToken >= 0)
+                    {
+                        // Last token is not newly predicted token, but the first token from the next chunk in the
+                        // prompt.
+                        token = chunkedContextNextToken;
+                    }
+                    else
+                    {
+                        // Last token is newly sampled token
+                        token = acceptedTokens[bid * maxPathLen + 0];
+                    }
                 }
                 else
                 {
@@ -232,18 +244,18 @@ __global__ void prepareCtxEagleNetInputsKernel(SizeType32* eagleNetSequenceLengt
 void invokePrepareCtxEagleNetInputs(SizeType32* eagleNetSequenceLengths, SizeType32* eagleNetContextLengths,
     TokenIdType* outputIds, SizeType32* positionIds, SizeType32* hiddenStatesIndices, SizeType32* lastTokenIndices,
     SizeType32* numLastTokenIndices, SizeType32* hiddenSizeBatchLevelStarts, TokenIdType const* inputIds,
-    SizeType32 const* baseNetSequenceLengths, SizeType32 const* baseNetContextLengths,
-    TokenIdType const* acceptedTokens, SizeType32 const* acceptedLens, SizeType32 const* prevDraftLens,
-    SizeType32 const* prevPaths, SizeType32 const* bestPathIds, SizeType32 batchSize, SizeType32 maxPathLen,
-    SizeType32 maxDecodingTokens, SizeType32 maxNonLeavesPerLayer, cudaStream_t stream)
+    TokenIdType const* chunkedContextNextTokens, SizeType32 const* baseNetSequenceLengths,
+    SizeType32 const* baseNetContextLengths, TokenIdType const* acceptedTokens, SizeType32 const* acceptedLens,
+    SizeType32 const* prevDraftLens, SizeType32 const* prevPaths, SizeType32 const* bestPathIds, SizeType32 batchSize,
+    SizeType32 maxPathLen, SizeType32 maxDecodingTokens, SizeType32 maxNonLeavesPerLayer, cudaStream_t stream)
 {
     SizeType32 constexpr BLOCK_SIZE = 512;
     TLLM_CHECK_WITH_INFO(
         batchSize <= BLOCK_SIZE, "Batch size larger than %d is not supported for EAGLE yet", batchSize);
     prepareCtxEagleNetInputsKernel<BLOCK_SIZE><<<1, BLOCK_SIZE, 0, stream>>>(eagleNetSequenceLengths,
         eagleNetContextLengths, outputIds, positionIds, hiddenStatesIndices, lastTokenIndices, numLastTokenIndices,
-        hiddenSizeBatchLevelStarts, inputIds, baseNetSequenceLengths, baseNetContextLengths, acceptedTokens,
-        acceptedLens, prevDraftLens, prevPaths, bestPathIds, batchSize, maxPathLen, maxDecodingTokens,
+        hiddenSizeBatchLevelStarts, inputIds, chunkedContextNextTokens, baseNetSequenceLengths, baseNetContextLengths,
+        acceptedTokens, acceptedLens, prevDraftLens, prevPaths, bestPathIds, batchSize, maxPathLen, maxDecodingTokens,
         maxNonLeavesPerLayer);
 }
 
@@ -684,6 +696,11 @@ __global__ void getPackedMaskFromPath(SizeType32* __restrict__ packedMask, SizeT
     // The request Id that this block process
     auto const batchIdx = static_cast<SizeType32>(blockIdx.x);
     auto const batchSlot = batchSlots[batchIdx];
+
+    if (batchSlot < 0)
+    {
+        return;
+    }
 
     // Initialize
     for (auto tix = static_cast<SizeType32>(threadIdx.x); tix < maxDecodingTokens * maxDecodingTokens;
@@ -1186,6 +1203,11 @@ __global__ void unpackEagleData(UnpackEagleDataParams params)
     auto const bid = static_cast<SizeType32>(blockIdx.x);
     auto const batchSlot = params.batchSlots[bid];
 
+    if (batchSlot < 0)
+    {
+        return;
+    }
+
     auto const currentSequenceLength = params.outputSequenceLengths[batchSlot];
     auto const acceptedLength = params.inputAcceptedLens[bid];
 
@@ -1320,6 +1342,54 @@ void invokeGetPackedMaskFromPath(int32_t* specDecodingPackedMasks, SizeType32 co
         specDecodingPackedMasks, batchSlots, nextDraftPaths, maxDecodingTokens, maxPathLen);
 
     sync_check_cuda_error();
+}
+
+namespace
+{
+template <int BLOCK_SIZE>
+__global__ void augmentBatchSlotsKernel(SizeType32* augmentedSeqSlots, SizeType32* augmentedBatchSlots,
+    SizeType32 const* chunkedContextNextTokens, SizeType32 const* lastDraftLens, SizeType32 const* seqSlots,
+    SizeType32 const* batchSlots, SizeType32 actualBatchSize)
+{
+    typedef cub::BlockScan<SizeType32, BLOCK_SIZE> BlockScan;
+    __shared__ typename BlockScan::TempStorage tempStorage;
+
+    auto const batchIdx = static_cast<SizeType32>(threadIdx.x);
+    auto const valid = batchIdx < actualBatchSize;
+
+    bool needDecoding{false};
+    if (valid)
+    {
+        auto const draftLen = lastDraftLens[batchIdx];
+        needDecoding = (draftLen == 0 && chunkedContextNextTokens[batchIdx] == -1) || (draftLen > 0);
+    }
+
+    SizeType32 originalIndex{0};
+    BlockScan(tempStorage).ExclusiveSum(needDecoding, originalIndex);
+
+    if (needDecoding)
+    {
+        augmentedSeqSlots[batchIdx] = seqSlots[batchIdx];
+        augmentedBatchSlots[batchIdx] = batchSlots[originalIndex];
+    }
+    else if (valid)
+    {
+        augmentedSeqSlots[batchIdx] = -1;
+        augmentedBatchSlots[batchIdx] = -1;
+    }
+}
+} // namespace
+
+void invokeAugmentBatchSlots(SizeType32* augmentedSeqSlots, SizeType32* augmentedBatchSlots,
+    runtime::SizeType32 const* chunkedContextNextTokens, runtime::SizeType32 const* lastDraftLens,
+    SizeType32 const* seqSlots, SizeType32 const* batchSlots, SizeType32 actualBatchSize, SizeType32 batchSize,
+    cudaStream_t stream)
+{
+    SizeType32 constexpr BLOCK_SIZE = 512;
+    TLLM_CHECK_WITH_INFO(
+        actualBatchSize <= BLOCK_SIZE, "Batch size larger than %d is not supported for EAGLE yet", batchSize);
+    augmentBatchSlotsKernel<BLOCK_SIZE><<<1, BLOCK_SIZE, 0, stream>>>(augmentedSeqSlots, augmentedBatchSlots,
+        chunkedContextNextTokens, lastDraftLens, seqSlots, batchSlots, actualBatchSize);
 }
 
 } // namespace tensorrt_llm::kernels::speculative_decoding

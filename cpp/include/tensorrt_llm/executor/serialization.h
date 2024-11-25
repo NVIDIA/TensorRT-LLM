@@ -124,6 +124,11 @@ public:
     static void serialize(KvCacheConfig const& kvCacheConfig, std::ostream& os);
     static size_t serializedSize(KvCacheConfig const& kvCacheConfig);
 
+    // DynamicBatchConfig
+    static DynamicBatchConfig deserializeDynamicBatchConfig(std::istream& is);
+    static void serialize(DynamicBatchConfig const& dynamicBatchConfig, std::ostream& os);
+    static size_t serializedSize(DynamicBatchConfig const& dynamicBatchConfig);
+
     // SchedulerConfig
     static SchedulerConfig deserializeSchedulerConfig(std::istream& is);
     static void serialize(SchedulerConfig const& schedulerConfig, std::ostream& os);

@@ -52,6 +52,11 @@ __global__ void cudaCoreGemm(InputType const* __restrict__ act, InputType const*
     act += tileIdM * k;
     weight += tileIdN * k;
     output += tileIdM * n + tileIdN;
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
+
     for (SizeType32 idxK = tid * kStepK; idxK < k; idxK += kTileK)
     {
         for (SizeType32 i = 0; i < TILE_N; ++i)
@@ -118,6 +123,10 @@ __global__ void cudaCoreGemm(InputType const* __restrict__ act, InputType const*
         }
         output[mid * n + nid] = static_cast<OutputType>(val * alpha);
     }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 template <typename InputType, typename OutputType, SizeType32 TILE_M, SizeType32 TILE_N, SizeType32 BLOCK_SIZE>
@@ -125,9 +134,33 @@ void cudaCoreGemmKernel(Params const& params, cudaStream_t stream)
 {
     dim3 block(BLOCK_SIZE);
     dim3 grid(params.m / TILE_M, params.n / TILE_N);
-    cudaCoreGemm<InputType, OutputType, TILE_M, TILE_N, BLOCK_SIZE><<<grid, block, 0, stream>>>(
-        reinterpret_cast<InputType const*>(params.act), reinterpret_cast<InputType const*>(params.weight), params.alpha,
-        reinterpret_cast<OutputType*>(params.output), params.m, params.n, params.k);
+
+    if (tensorrt_llm::common::getEnvEnablePDL())
+    {
+        TLLM_LOG_DEBUG("Enable PDL in fp8_gemm_plugin");
+        cudaLaunchConfig_t kernelConfig = {0};
+        kernelConfig.gridDim = grid;
+        kernelConfig.blockDim = block;
+        kernelConfig.dynamicSmemBytes = 0;
+        kernelConfig.stream = stream;
+
+        cudaLaunchAttribute attribute[1];
+        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attribute[0].val.programmaticStreamSerializationAllowed = 1;
+        kernelConfig.attrs = attribute;
+        kernelConfig.numAttrs = 1;
+
+        TLLM_CUDA_CHECK(
+            cudaLaunchKernelEx(&kernelConfig, cudaCoreGemm<InputType, OutputType, TILE_M, TILE_N, BLOCK_SIZE>,
+                reinterpret_cast<InputType const*>(params.act), reinterpret_cast<InputType const*>(params.weight),
+                params.alpha, reinterpret_cast<OutputType*>(params.output), params.m, params.n, params.k));
+    }
+    else
+    {
+        cudaCoreGemm<InputType, OutputType, TILE_M, TILE_N, BLOCK_SIZE><<<grid, block, 0, stream>>>(
+            reinterpret_cast<InputType const*>(params.act), reinterpret_cast<InputType const*>(params.weight),
+            params.alpha, reinterpret_cast<OutputType*>(params.output), params.m, params.n, params.k);
+    }
 }
 
 template <typename InputType, typename OutputType, int TILE_M, int TILE_N, int BLOCK_SIZE>

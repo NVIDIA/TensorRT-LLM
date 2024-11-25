@@ -135,8 +135,8 @@ __device__ __forceinline__ void dequantize(void* w, void* quantized_w, void* sca
         Type2 vec_scale, vec_zero;
         if constexpr (ApplyAlphaInAdvance)
         {
-            vec_scale = MathWrapper<typename Details::TypeDetailsA>::to_vec2(
-                reinterpret_cast<Type*>(scales)[n] * static_cast<Type>(alpha));
+            Type scales_ = static_cast<float>(reinterpret_cast<half*>(scales)[n]) * alpha;
+            vec_scale = MathWrapper<typename Details::TypeDetailsA>::to_vec2(scales_);
             vec_zero = MathWrapper<typename Details::TypeDetailsA>::to_vec2(static_cast<Type>(0.f));
             if constexpr (EnableZero)
             {

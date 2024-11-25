@@ -35,7 +35,8 @@ from ..module import Module, ModuleList
 from ..parameter import Parameter
 from ..plugin import init_all_reduce_helper
 from ..quantization import QuantMode
-from ..quantization.layers import (Fp8RowwiseFusedGatedMLP, Fp8RowwiseGatedMLP,
+from ..quantization.layers import (FP8Linear, Fp8RowwiseFusedGatedMLP,
+                                   Fp8RowwiseGatedMLP,
                                    WeightOnlyGroupwiseQuantLinear,
                                    WeightOnlyGroupwiseQuantRowLinear,
                                    WeightOnlyQuantLinear,
@@ -1383,6 +1384,7 @@ def optimize_model(
     use_lora: bool = False,
     max_lora_rank: Optional[int] = None,
     use_fp8_context_fmha: bool = False,
+    use_optimize_cross_qkv: bool = False,
 ) -> PretrainedModel:
     """
     Run optimization passes on model.
@@ -1414,6 +1416,87 @@ def optimize_model(
         model = add_lora(model, max_lora_rank)
     if use_fp8_context_fmha:
         model = set_fp8_context_fhma(model)
+    if not use_lora and use_optimize_cross_qkv is True:
+        # This optimization is not supported when we use lora
+        model = optimize_cross_qkv(model)
+
+    return model
+
+
+def optimize_cross_qkv(model):
+    """
+    For cross attention layer, we can skip computing the query of encoder_output.
+    So, add a new attribute 'kv' in the cross_attention layer. This might lead to
+    additional memory cost on model size, but save the memory usage on runtime.
+
+    Currently, this function only detect the ColumnLinear and FP8Linear. It does not supports
+    other quantization now.
+    """
+    for name, attn, layer in model.named_modules_with_parent():
+        if isinstance(attn, Attention) and attn.cross_attention and \
+        (type(attn.qkv) == ColumnLinear or type(attn.qkv) == FP8Linear):
+            old_qkv = attn.qkv
+            linear_class = type(old_qkv)
+            new_kv = linear_class(in_features=attn.hidden_size,
+                                  out_features=2 * attn.tp_size *
+                                  attn.num_attention_kv_heads *
+                                  attn.attention_head_size,
+                                  bias=old_qkv.bias,
+                                  dtype=old_qkv.dtype,
+                                  tp_group=old_qkv.tp_group,
+                                  tp_size=old_qkv.tp_size,
+                                  gather_output=old_qkv.gather_output,
+                                  is_qkv=False)
+
+            old_qkv_weight_value = old_qkv.weight.raw_value
+            if (old_qkv_weight_value.shape == np.asarray([
+                (attn.num_attention_heads + 2 * attn.num_attention_kv_heads) *
+                    attn.attention_head_size, attn.hidden_size
+            ])).all():
+
+                q_weight, kv_weight = np.array_split(
+                    old_qkv_weight_value.reshape(
+                        attn.num_attention_heads +
+                        2 * attn.num_attention_kv_heads,
+                        attn.attention_head_size, attn.hidden_size),
+                    [attn.num_attention_heads],
+                    axis=0)
+                new_kv.weight.value = kv_weight.reshape([
+                    2 * attn.num_attention_kv_heads * attn.attention_head_size,
+                    attn.hidden_size
+                ])
+            elif (old_qkv_weight_value.shape == np.asarray([
+                    attn.hidden_size,
+                (attn.num_attention_heads + 2 * attn.num_attention_kv_heads) *
+                    attn.attention_head_size
+            ])).all():
+                q_weight, kv_weight = np.array_split(
+                    old_qkv_weight_value.reshape(
+                        attn.hidden_size, attn.num_attention_heads +
+                        2 * attn.num_attention_kv_heads,
+                        attn.attention_head_size), [attn.num_attention_heads],
+                    axis=1)
+                new_kv.weight.value = kv_weight.reshape([
+                    attn.hidden_size,
+                    2 * attn.num_attention_kv_heads * attn.attention_head_size
+                ])
+            else:
+                assert False
+
+            if isinstance(attn.qkv, FP8Linear):
+                new_kv.activation_scaling_factor.value = old_qkv.activation_scaling_factor.raw_value
+                new_kv.weights_scaling_factor.value = old_qkv.weights_scaling_factor.raw_value
+
+            if old_qkv.bias:
+                q_bias, kv_bias = np.array_split(old_qkv.bias.raw_value.reshape(
+                    attn.num_attention_heads + 2 * attn.num_attention_kv_heads,
+                    attn.attention_head_size), [attn.num_attention_heads],
+                                                 axis=0)
+                new_kv.bias.value = kv_bias.reshape([
+                    2 * attn.num_attention_kv_heads * attn.attention_head_size
+                ])
+            setattr(attn, "kv", new_kv)
+
     return model
 
 
@@ -1461,6 +1544,8 @@ def preprocess_perlayer_weights(weights,
                         name.replace('weights_scaling_factor',
                                      'weights_scaling_factor_2'))
                     weights[name] /= weights_scaling_factor_2
+                    weights[name] = weights[name].to(torch.float16).view(
+                        str_dtype_to_torch(model_config.dtype))
                     weights[name.replace(
                         'weights_scaling_factor',
                         'prequant_scaling_factor')] /= activation_scaling_factor

@@ -154,8 +154,6 @@ __device__ inline void global_to_share_one_stage_A(int8_t const* src, int8_t* ds
     constexpr int total_global_iters = (CTA_M * CTA_K) / PACK_SIZE / CTA_SIZE;
     constexpr int partial_global_iters = total_global_iters / SHARED_K_ITERS;
     constexpr int cta_step_m_or_n = (CTA_SIZE * PACK_SIZE) / CTA_K;
-    constexpr int warp_step_m_or_n = (WARP_SIZE * PACK_SIZE) / CTA_K;
-    constexpr int threads_per_row = CTA_K / PACK_SIZE;
     constexpr int kSmemCol = CTA_K + SMEM_PAD_A;
     int8_t* dst_hoisted = dst;
     int8_t const* src_hoisted = src + global_iter_k * CTA_K;
@@ -288,14 +286,11 @@ __global__ void dense_kernel0(int8_t const* __restrict__ A, int8_t const* __rest
     half const* __restrict__ a_ssums, half* __restrict__ C, int M, int64_t N, int64_t K)
 {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
-    constexpr int SPLITK = 1;
     constexpr int NUM_WARPS_MN = CTA_M / WARP_M * CTA_N / WARP_N;
     constexpr int NUM_WARPS = NUM_WARPS_MN * CTA_K / WARP_K;
     constexpr int CTA_SIZE = NUM_WARPS * WARP_SIZE;
     constexpr int CTA_SIZE_MN = NUM_WARPS_MN * WARP_SIZE;
     constexpr int SLICES = CTA_K / WARP_K;
-    int num_blocks_n = (N + CTA_N - 1) / CTA_N;
-    int num_blocks_m = (M + CTA_M - 1) / CTA_M;
 
     int blockIdx_n = blockIdx.x;
     int blockIdx_m = blockIdx.y;
@@ -312,8 +307,6 @@ __global__ void dense_kernel0(int8_t const* __restrict__ A, int8_t const* __rest
     constexpr int kSmemSizeA = kSmemSizeAPerStage * STAGES;
     constexpr int kSmemSizeB = kSmemSizeBPerStage * STAGES;
 
-    constexpr int scales_load_interval = G >= CTA_K ? G / CTA_K : 1;
-    constexpr int scales_per_load = G < CTA_K ? CTA_K / G : 1;
     constexpr int kSmemSizeScales = CTA_N * STAGES;
 
     extern __shared__ int8_t mem_shared[];
@@ -326,13 +319,11 @@ __global__ void dense_kernel0(int8_t const* __restrict__ A, int8_t const* __rest
     int8_t A_shared_warp_[2][WARP_M * WARP_K / WARP_SIZE];
     int8_t B_shared_warp_[2][WARP_N * WARP_K / WARP_SIZE];
     constexpr int A_total_global_iters = (CTA_M * CTA_K) / PACK_SIZE / CTA_SIZE;
-    constexpr int B_total_global_iters = (CTA_N * CTA_K) / PACK_SIZE / CTA_SIZE;
     constexpr int A_src_step_m = (CTA_SIZE * PACK_SIZE) / CTA_K;
     constexpr int A_warp_step_m = (WARP_SIZE * PACK_SIZE) / CTA_K;
     constexpr int A_threads_per_row = CTA_K / PACK_SIZE;
 
     constexpr int B_warps_per_row = CTA_K / 32;
-    constexpr int B_src_step_n = NUM_WARPS / B_warps_per_row;
 
     int cta_offset_m = blockIdx_m * CTA_M;
     int cta_offset_n = blockIdx_n * CTA_N;

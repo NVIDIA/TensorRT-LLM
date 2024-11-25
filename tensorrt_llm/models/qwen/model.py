@@ -340,9 +340,9 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                     "transformer": "language_model.model",
                     "lm_head": "language_model.lm_head",
                 }
+            if config.tie_word_embeddings:
+                config.share_embedding_table = True
             loader = ModelWeightsLoader(hf_model_dir, custom_dict)
-            if config.share_embedding_table:
-                config.share_embedding_table = loader.check_share_embedding()
             model = cls(config)
 
             if config.qwen_type == "qwen" and model.config.mapping.has_tp():

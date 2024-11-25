@@ -5,7 +5,7 @@ import click
 from tensorrt_llm.bench.benchmark.low_latency import latency_command
 from tensorrt_llm.bench.benchmark.throughput import throughput_command
 from tensorrt_llm.bench.build.build import build_command
-from tensorrt_llm.bench.dataclasses import BenchmarkEnvironment
+from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 
 
 @click.group(name="trtllm-bench", context_settings={'show_default': True})

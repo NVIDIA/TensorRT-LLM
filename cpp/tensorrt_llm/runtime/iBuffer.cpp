@@ -89,6 +89,10 @@ std::ostream& tensorrt_llm::runtime::operator<<(std::ostream& output, IBuffer co
 
 char const* IBuffer::getDataTypeName() const
 {
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wswitch"
+#endif
     switch (getDataType())
     {
     case nvinfer1::DataType::kINT64: return DataTypeTraits<nvinfer1::DataType::kINT64>::name;
@@ -102,6 +106,9 @@ char const* IBuffer::getDataTypeName() const
     case nvinfer1::DataType::kFP8: return DataTypeTraits<nvinfer1::DataType::kFP8>::name;
     case nvinfer1::DataType::kINT4: /* do nothing */;
     }
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
     TLLM_THROW("Unknown data type");
 }
 

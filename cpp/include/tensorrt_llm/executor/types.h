@@ -319,6 +319,12 @@ struct IterationStats
     SizeType32 maxBatchSizeTunerRecommended;
     /// @brife The min of maxBatchSizeStatic and maxBatchSizeRuntimeUpperbound
     SizeType32 maxBatchSizeRuntime;
+    /// @brife Static max num tokens passed to the executor
+    SizeType32 maxNumTokensStatic;
+    /// @brife Max num tokens produced by dynamic tuner based on input stats
+    SizeType32 maxNumTokensTunerRecommended;
+    /// @brife The runtime max num tokens
+    SizeType32 maxNumTokensRuntime;
     /// @brief GPU memory usage in bytes
     size_t gpuMemUsage;
     /// @brief CPU memory usage in bytes

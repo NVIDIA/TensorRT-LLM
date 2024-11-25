@@ -80,6 +80,8 @@ private:
         CONTEXT_LENGTHS,
         //! [num_tokens]
         INPUT_IDS,
+        //! [batch_size]
+        CHUNKED_CONTEXT_NEXT_TOKENS,
         //! [batch_size, max_path_len]
         ACCEPTED_TOKENS,
         //! [batch_size]

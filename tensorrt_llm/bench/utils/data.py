@@ -4,7 +4,8 @@ from typing import List, TextIO, Tuple
 
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
-from tensorrt_llm.bench.dataclasses import DatasetMetadata, InferenceRequest
+from tensorrt_llm.bench.dataclasses.general import (DatasetMetadata,
+                                                    InferenceRequest)
 
 
 def initialize_tokenizer(model_name: str) -> PreTrainedTokenizer:

@@ -96,6 +96,7 @@ class MoeConfig:
 
 def _moe_plugin(moe_config,
                 hidden_states,
+                hidden_states_raw,
                 routing,
                 finished,
                 expert_weights_1,
@@ -308,6 +309,9 @@ def _moe_plugin(moe_config,
 
         if default_net().plugin_config.remove_input_padding:
             plugin_inputs += [lora_params.host_context_lengths]
+
+    if side_stream_id != SideStreamIDType.disable:
+        plugin_inputs += [hidden_states_raw]
 
     plugin_inputs = [i.trt_tensor for i in plugin_inputs]
     layer = default_trtnet().add_plugin_v2(plugin_inputs, moe_plugin)
@@ -618,6 +622,7 @@ class MixtureOfExperts(Module):
             scale_5 = None
         output = _moe_plugin(self.moe_config,
                              hidden_states_quant,
+                             hidden_states,
                              routing,
                              expert_weights_1=self.fc.weight.value,
                              expert_weights_2=self.proj.weight.value,

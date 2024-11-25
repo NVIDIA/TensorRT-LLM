@@ -18,6 +18,7 @@
 #include "penaltyLayer.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/penaltyKernels.h"
+#include "tensorrt_llm/kernels/penaltyTypes.h"
 #include "tensorrt_llm/layers/defaultDecodingParams.h"
 #include "tensorrt_llm/layers/layerUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
@@ -293,6 +294,9 @@ void PenaltyLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& b
     penaltyParams.batchSlots = workspace->getDeviceBatchSlotsPtr();
     penaltyParams.maxTokensPerStep = mDecoderDomain.getMaxDecodingTokens();
     penaltyParams.tokensPerStep = tokensPerStep;
+    penaltyParams.finished = (params->finished)
+        ? reinterpret_cast<FinishedState const*>(bufferCast<FinishedState::UnderlyingType>(*params->finished.value()))
+        : nullptr;
     penaltyParams.stream = getStream();
 
     if (penaltyParams.beamWidth > 1)

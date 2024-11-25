@@ -29,7 +29,7 @@ namespace mmha
 
 // Forward declaration of the kernel launcher to avoid including decoderMaskedMultiheadAttentionLaunch.h
 template <typename T, typename KVCacheBuffer, typename T_PARAMS, int Dh, bool BLOCK_SPARSE_ATTN,
-    bool IMPLICIT_REL_ATTN_BIAS, bool QK_TANH_SCALE>
+    bool IMPLICIT_REL_ATTN_BIAS, bool ATTN_LOGIT_SOFTCAPPING>
 void mmha_launch_kernel(const T_PARAMS& params, KVCacheBuffer const& kv_cache_buffer,
     KVLinearBuffer const& shift_k_cache, cudaStream_t const& stream);
 
@@ -62,7 +62,7 @@ namespace
         mmha::mmha_launch_kernel<T, KVCacheBuffer, KERNEL_PARAMS_TYPE, Dh, false, true, false>(                        \
             params, kv_cache_buffer, shift_k_cache, stream);                                                           \
     }                                                                                                                  \
-    else if (has_qk_tanh_scale)                                                                                        \
+    else if (enable_attn_logit_softcapping)                                                                            \
     {                                                                                                                  \
         mmha::mmha_launch_kernel<T, KVCacheBuffer, KERNEL_PARAMS_TYPE, Dh, false, false, true>(                        \
             params, kv_cache_buffer, shift_k_cache, stream);                                                           \
@@ -80,7 +80,7 @@ namespace
     break;
 
 #define MMHA_LAUNCH_KERNE_EX3(Dh)                                                                                      \
-    if (has_qk_tanh_scale)                                                                                             \
+    if (enable_attn_logit_softcapping)                                                                                 \
     {                                                                                                                  \
         mmha::mmha_launch_kernel<T, KVCacheBuffer, KERNEL_PARAMS_TYPE, Dh, false, false, true>(                        \
             params, kv_cache_buffer, shift_k_cache, stream);                                                           \
@@ -97,14 +97,15 @@ void multihead_attention_(const KERNEL_PARAMS_TYPE& params, KVCacheBuffer const&
     KVLinearBuffer const& shift_k_cache, cudaStream_t const& stream)
 {
     bool const has_implicit_rel_attn_bias = params.max_distance > 0 && params.relative_attention_bias != nullptr;
-    bool const has_qk_tanh_scale = params.qk_tanh_scale > 0.f;
+    bool const enable_attn_logit_softcapping = params.attn_logit_softcapping_scale > 0.f;
     int const head_size = params.hidden_size_per_head;
     TLLM_CHECK_WITH_INFO(!has_implicit_rel_attn_bias || head_size == 32 || head_size == 64 || head_size == 128,
         "MMHA kernels haven't instantiate implicit_relative_attention_bias paths for head size %d.", head_size);
-    TLLM_CHECK_WITH_INFO(!has_qk_tanh_scale || head_size == 128 || head_size == 256,
-        "MMHA kernels haven't instantiate qk_tanh_scale paths for head size %d.", head_size);
-    TLLM_CHECK_WITH_INFO(!(has_qk_tanh_scale && has_implicit_rel_attn_bias),
-        "MMHA kernels haven't instantiate implicit_relative_attention_bias + qk_tanh_scale paths for head size %d.",
+    TLLM_CHECK_WITH_INFO(!enable_attn_logit_softcapping || head_size == 128 || head_size == 256,
+        "MMHA kernels haven't instantiate attn_logit_softcapping_scale paths for head size %d.", head_size);
+    TLLM_CHECK_WITH_INFO(!(enable_attn_logit_softcapping && has_implicit_rel_attn_bias),
+        "MMHA kernels haven't instantiate implicit_relative_attention_bias + attn_logit_softcapping_scale paths for "
+        "head size %d.",
         head_size);
 
     bool const has_block_sparse_attn = params.block_sparse_attention;

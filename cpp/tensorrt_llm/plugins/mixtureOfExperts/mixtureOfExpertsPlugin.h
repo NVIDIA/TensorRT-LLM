@@ -390,9 +390,14 @@ private:
         return getHostRequestTypeIndex() + (mRemoveInputPadding && hasLora());
     }
 
+    IndexType getInputDummyTensorIndex() const
+    {
+        return getHostContextLengthIndex() + useSideStream();
+    }
+
     IndexType getNbInputs() const
     {
-        return getHostContextLengthIndex() + 1;
+        return getInputDummyTensorIndex() + 1;
     }
 
     // Outputs

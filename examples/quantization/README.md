@@ -65,8 +65,8 @@ Checkpoint saved in `output_dir` can be directly passed to `trtllm-build`.
     - int8_wo: Actually nothing is applied to weights. Weights are quantized to INT8 channel wise when TRTLLM building the engine.
     - int4_wo: Same as int8_wo but in INT4.
     - full_prec: No quantization.
-- autoq_format: Specific quantization algorithms will be searched in auto quantization. The algorithm must in ['fp8', 'int4_awq', 'w4a8_awq', 'int8_sq'] and you can use ',' to separate more than one quantization algorithms(e.g. --autoq_format fp8,int4_awq,w4a8_awq). Note: 'int8_sq' can't be used together with 'fp8' now.
-- auto_quantize_bits: Effective bits constraint for auto quantization. If not set, regular quantization without auto quantization search will be applied. Note: it must be set within correct range otherwise it will be set by lowest value if possible. For example, the weights of LLMs have 16 bits defaultly and there will be 40% weight compression if we set `auto_quantize_bits` to 9.6 (9.6 / 16 = 0.6), which means the average bits of the weights are 9.6 but not 16. However, which format to choose is determined by solving an optimization problem, so you should generate the according checkpoint manually if you want to customize your checkpoint formats. The format of mixed precision checkpoint will be described in detail below.
+- autoq_format: Specific quantization algorithms are searched in auto quantization. The algorithm must in ['fp8', 'int4_awq', 'w4a8_awq', 'int8_sq'] and you can use ',' to separate more than one quantization algorithms, such as `--autoq_format fp8,int4_awq,w4a8_awq`. Please attention that using int8_sq and fp8 together is not supported.
+- auto_quantize_bits: Effective bits constraint for auto quantization. If not set, regular quantization without auto quantization search is applied. Note: it must be set within correct range otherwise it will be set by lowest value if possible. For example, the weights of LLMs have 16 bits defaultly and it results in a weight compression rate of 40% if we set `auto_quantize_bits` to 9.6 (9.6 / 16 = 0.6), which means the average bits of the weights are 9.6 but not 16. However, which format to choose is determined by solving an optimization problem, so you need to generate the according checkpoint manually if you want to customize your checkpoint formats. The format of mixed precision checkpoint is described in detail below.
 - output_dir: Path to save the quantized checkpoint.
 - dtype: Specify data type of model when loading from Hugging Face.
 - kv_cache_dtype: Specify kv cache data type.
@@ -126,9 +126,13 @@ FP_O * output_scale = FP8_O
 
 ### Format of Mixed Precision Checkpoints
 
-Currently, ModelOpt can help to produce a mixed precision TensorRT-LLM checkpoint. After getting the according checkpoint, we can build engine directly by trtllm-build command. If you have some special needs about the model weights(e.g. int4 for MLP and int8 for the rest), you may need to generate the checkpoint and config files by yourself.
+ModelOpt can produce a mixed precision TensorRT-LLM checkpoint. After producing the quantized checkpoint, you can build engine directly by `trtllm-build` command:
+```bash
+trtllm-build --checkpoint_dir <mixed-precision-checkpoint> --output_dir $OUTPUT_PATH
+```
+If you have some special needs about the model weights, such as int4 for MLP and int8 for the rest, you need to generate the checkpoint and config files by yourself.
 
-The model weights should keep same as TensorRT-LLM checkpoint formats, but have different quantization method for every linear. What's more, the `quantization` field in `config.json` will be like this:
+The `trtllm-build` command consumes the same format of weights, which is presented in [TensorRT-LLM checkpoint formats](https://nvidia.github.io/TensorRT-LLM/architecture/checkpoint.html), but has different quantization method for every linear. Therefore, each layer, such as layer30.mlp.fc, layer30.attention.dense, and so on, keeps the same model weights according to the quantization formats in TensorRT-LLM checkpoint. What's more, the `quantization` field in `config.json` will be like this:
 ```
     "quantization": {
         "quant_algo": "MIXED_PRECISION",

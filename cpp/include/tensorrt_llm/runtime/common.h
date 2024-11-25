@@ -32,6 +32,12 @@ namespace tensorrt_llm::runtime
 using SizeType32 = std::int32_t;
 using SizeType64 = std::int64_t;
 
+enum class RequestType : std::int32_t
+{
+    kCONTEXT = 0,
+    kGENERATION = 1
+};
+
 // Token ID type
 using TokenIdType = std::int32_t;
 

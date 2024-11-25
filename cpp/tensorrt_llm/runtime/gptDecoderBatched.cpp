@@ -546,7 +546,14 @@ void GptDecoderBatched::newRequest(SizeType32 batchSlot, decoder_batch::Request 
         TensorPtr finishedStepsView = ITensor::slice(mFinishedSteps, ti, 1);
         finishedStepsView->squeeze(0);
         TensorPtr finishedSteps = ITensor::slice(finishedStepsView, batchSlot, 1);
-        manager.setZero(*finishedSteps);
+        if (ti < numDecodingEngineTokens)
+        {
+            manager.setZero(*finishedSteps);
+        }
+        else
+        {
+            kernels::invokeFill(*finishedSteps, tk::FinishedState::skipDecoding().toUnderlying(), *stream);
+        }
     }
 
     // cumLogProb is mandatory for beamWidth > 1
@@ -847,7 +854,7 @@ void GptDecoderBatched::setEagleInputs(decoder_batch::Input const& input)
     auto eagleInputs = DecodingInput::EagleInputs(input.eagleInputs->nextDraftTokens, input.eagleInputs->nextDraftLens,
         input.eagleInputs->nextDraftPaths, input.eagleLastInputs->draftTokens, input.eagleLastInputs->draftLens,
         input.eagleLastInputs->draftPaths, input.eagleInputs->acceptedTokens, input.eagleInputs->acceptedLens,
-        input.eagleInputs->acceptedPaths, input.seqSlots);
+        input.eagleInputs->acceptedPaths, input.eagleInputs->chunkedContextNextTokens, input.seqSlots);
 
     mJointDecodingInput->eagleInputs = eagleInputs;
 

@@ -50,14 +50,13 @@ public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
     using ContextChunkingPolicy = tensorrt_llm::executor::ContextChunkingPolicy;
 
-    explicit MicroBatchScheduler(std::optional<SizeType32> maxNumTokens = std::nullopt,
-        std::optional<batch_scheduler::ContextChunkingConfig> ctxChunkConfig = std::nullopt,
+    explicit MicroBatchScheduler(std::optional<batch_scheduler::ContextChunkingConfig> ctxChunkConfig = std::nullopt,
         std::optional<SizeType32> maxContextLength = std::nullopt,
         LlmRequestState noScheduleUntilState = LlmRequestState::kCONTEXT_INIT,
         LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE);
 
-    std::tuple<RequestVector, RequestVector> operator()(
-        RequestVector& activeRequests, ReqIdsSet const& inflightReqIds, SizeType32 maxBatchSizeRuntime) const;
+    std::tuple<RequestVector, RequestVector> operator()(RequestVector& activeRequests, ReqIdsSet const& inflightReqIds,
+        SizeType32 maxBatchSizeRuntime, std::optional<SizeType32> maxNumTokensRuntime) const;
 
     static void setCtxRequestsChunkSize(RequestVector& contextsToBeChunked, ContextChunkingPolicy ctxChunkPolicy,
         std::optional<SizeType32> ctxTokensCapacity, SizeType32 chunkUnitSize,
@@ -72,9 +71,6 @@ private:
     /// any draft tokens that don't fit.
     static void fitDraftTokens(RequestVector& contextsToBeChunked, std::optional<SizeType32> ctxTokensCapacity,
         SizeType32 chunkUnitSize, std::optional<SizeType32> const& maxContextLength);
-
-    /// The maximum number of tokens to include in a batch
-    std::optional<SizeType32> mMaxNumTokens;
 
     /// The maximum length of the context. If the context exceeds this length,
     /// it must be chunked, otherwise it cannot be processed. Therefore, it

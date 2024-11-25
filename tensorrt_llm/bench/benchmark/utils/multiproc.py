@@ -8,9 +8,8 @@ from time import monotonic_ns, sleep
 from typing import Generator, List, Tuple
 
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm.bench.benchmark.dataclasses import RuntimeConfig
-from tensorrt_llm.bench.benchmark.utils.reporting import (ResponseTuple,
-                                                          StatsKeeper)
+from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
+from tensorrt_llm.bench.dataclasses.reporting import ResponseTuple, StatsKeeper
 from tensorrt_llm.logger import logger
 
 

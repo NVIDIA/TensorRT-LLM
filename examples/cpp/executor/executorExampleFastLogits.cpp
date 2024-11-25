@@ -108,7 +108,7 @@ int main(int argc, char* argv[])
         parallelConfig.setParticipantIds({2});
         parallelConfig.setDeviceIds({1});
         executorConfig.setParallelConfig(parallelConfig);
-        draftExecutor
+        targetExecutor
             = std::make_unique<tle::Executor>(runtimeOpts.trtEnginePath, tle::ModelType::kDECODER_ONLY, executorConfig);
         ;
     }

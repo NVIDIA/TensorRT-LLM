@@ -29,7 +29,7 @@ auto constexpr kSizePerHead = 256;
 namespace mmha
 {
 
-INSTANTIATE_MMHA_LAUNCHERS_WITH_QK_TANH_SCALE(float, kSizePerHead)
+INSTANTIATE_MMHA_LAUNCHERS_WITH_ATTN_LOGIT_SOFTCAPPING_SCALE(float, kSizePerHead)
 
 } // namespace mmha
 

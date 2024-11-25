@@ -87,6 +87,8 @@ void invokeAssembleDraftLogitsOffsets(T const** logitsPtrs, T const* logits, run
 //! Exclusive sum of the hidden states produced per batch per level.
 //! For EagleNet0 it is just cum sum of 1s for batchSize.
 //! \param inputIds input buffer [numTokens], input ids (inputs of the Base model)
+//! \param chunkedContextNextTokens input buffer [batchSize], first token from the next chunk in the chunked context
+//! or -1 if current chunk is the last chunk (or not context phase).
 //! \param baseNetSequenceLengths input buffer [batchSize] sequence lengths (inputs of the Base model).
 //! \param baseNetContextLengths input buffer [batchSize], context lengths (inputs of the Base model).
 //! \param acceptedTokens input buffer [batchSize, maxPathLen], ids of the accepted tokens.
@@ -105,12 +107,12 @@ void invokePrepareCtxEagleNetInputs(runtime::SizeType32* eagleNetSequenceLengths
     runtime::SizeType32* eagleNetContextLengths, runtime::TokenIdType* outputIds, runtime::SizeType32* positionIds,
     runtime::SizeType32* hiddenStatesIndices, runtime::SizeType32* lastTokenIndices,
     runtime::SizeType32* numLastTokenIndices, runtime::SizeType32* hiddenSizeBatchLevelStarts,
-    runtime::TokenIdType const* inputIds, runtime::SizeType32 const* baseNetSequenceLengths,
-    runtime::SizeType32 const* baseNetContextLengths, runtime::TokenIdType const* acceptedTokens,
-    runtime::SizeType32 const* acceptedLens, runtime::SizeType32 const* prevDraftLens,
-    runtime::SizeType32 const* prevPaths, runtime::SizeType32 const* bestPathIds, runtime::SizeType32 batchSize,
-    runtime::SizeType32 maxPathLen, runtime::SizeType32 maxDecodingTokens, runtime::SizeType32 maxNonLeavesPerLayer,
-    cudaStream_t stream);
+    runtime::TokenIdType const* inputIds, runtime::TokenIdType const* chunkedContextNextTokens,
+    runtime::SizeType32 const* baseNetSequenceLengths, runtime::SizeType32 const* baseNetContextLengths,
+    runtime::TokenIdType const* acceptedTokens, runtime::SizeType32 const* acceptedLens,
+    runtime::SizeType32 const* prevDraftLens, runtime::SizeType32 const* prevPaths,
+    runtime::SizeType32 const* bestPathIds, runtime::SizeType32 batchSize, runtime::SizeType32 maxPathLen,
+    runtime::SizeType32 maxDecodingTokens, runtime::SizeType32 maxNonLeavesPerLayer, cudaStream_t stream);
 
 struct PrepareGenEagleNetInputsParams
 {
@@ -545,5 +547,29 @@ void invokeCopyOutputTokensIds(runtime::TokenIdType** tmpOutputIdsPtrs, runtime:
     runtime::TokenIdType* pluginOutputDraftIdsPtrs, runtime::SizeType32* pluginOutputDraftLens,
     runtime::SizeType32 layerId, runtime::SizeType32 batchSize, runtime::SizeType32 maxDecodingDraftTokens,
     cudaStream_t stream);
+
+//! \brief Augment seq slots and batch slots from batchSize size to engineBatchSize size.
+//! For seqSlot sets -1 for non-last chunks (chunkedContextNextTokens != -1).
+//! For batchSlots sets -1 for non-last chunks. Copies actual batch slots to the last chunk or gen requests
+//! positions.
+//!
+//! \param augmentedSeqSlots output buffer [engineBatchSize]
+//! \param augmentedBatchSlots output buffer [engineBatchSize]
+//! \param chunkedContextNextTokens input buffer [engineBatchSize], indicator of the not last chunk of the ctx
+//! requests. -1 for gen requests and last chunk, != -1 otherwise.
+//! \param lastDraftLens input buffer [engineBatchSize], number of draft tokens input to the current iteration.
+//! 0 for ctx requests and > 0 for gen requests.
+//! \param seqSlots input buffer [engineBatchSize], address map from local index to global index [0, batchSize]
+//! -> [0, maxBatchSize]
+//! \param batchSlots input buffer [engineBatchSize], address map from local index to global index [0, batchSize]
+//! -> [0, maxBatchSize]
+//! \param engineBatchSize number of sequences processed in the engine.
+//! Includes chunked context reqs that are not in the last chunk.
+//! \param batchSize the number of sequences to be decoded
+//! \param stream cuda stream.
+void invokeAugmentBatchSlots(runtime::SizeType32* augmentedSeqSlots, runtime::SizeType32* augmentedBatchSlots,
+    runtime::SizeType32 const* chunkedContextNextTokens, runtime::SizeType32 const* lastDraftLens,
+    runtime::SizeType32 const* seqSlots, runtime::SizeType32 const* batchSlots, runtime::SizeType32 engineBatchSize,
+    runtime::SizeType32 batchSize, cudaStream_t stream);
 
 } // namespace tensorrt_llm::kernels::speculative_decoding

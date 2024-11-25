@@ -111,8 +111,8 @@ struct MHARunnerFixedParams
     int headSizeV = 0;
     // The scaling applied to bmm1_scale.
     float qScaling;
-    // The tanh scale after bmm1 (used in Grok models).
-    float qkTanhScale;
+    // The attention logit softcapping scale.
+    float attnLogitSoftcappingScale;
     // Do we apply alibi ?
     bool hasAlibi;
     // Scale the alibi bias or not ?
@@ -159,9 +159,9 @@ struct MHARunnerFixedParams
         // Alibi.
         output += ", alibi = ";
         output += (hasAlibi ? "true" : "false");
-        // QK tanh scale.
-        output += ", qk_tanh_scale = ";
-        output += (qkTanhScale != 0.f ? "true" : "false");
+        // Attention logit softcapping scale.
+        output += ", attn_logit_softcapping_scale = ";
+        output += (attnLogitSoftcappingScale != 0.f ? "true" : "false");
 
         return output;
     }
@@ -302,7 +302,7 @@ struct Fused_multihead_attention_params_v2
     // Only pay attention to [max(0, query_idx - sliding_window_size), query_idx].
     int sliding_window_size = INT_MAX;
     // The scaling factors for the kernel.
-    uint32_t scale_bmm1, tanh_scale_bmm1, scale_softmax, scale_bmm2;
+    uint32_t scale_bmm1, softcapping_scale_bmm1, scale_softmax, scale_bmm2;
 
     // The scaling factors in the device memory.
     uint32_t const* scale_bmm1_d;
@@ -376,8 +376,8 @@ struct Launch_params
     // enable exp2 optimization (which helps improve performance).
     // note that this is not compatible with alibi bias due to the accuracy issues.
     bool useBase2ExpTrick = false;
-    // enable scale + tanh for qk products.
-    bool enableQKTanhScale = false;
+    // enable attention logit softcapping scale.
+    bool enableAttnLogitSoftcapping = false;
     // harward properties to determine how to launch blocks
     int multi_processor_count = 0;
     int device_l2_cache_size = 0;

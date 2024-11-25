@@ -494,6 +494,12 @@ class Tensor(object):
         '''
         return split(self, split_size_or_sections, dim)
 
+    def select(self, dim, index):
+        '''
+        See functional.select.
+        '''
+        return select(self, dim, index)
+
     def unbind(self, dim=0):
         '''
         See functional.unbind.
@@ -1169,7 +1175,8 @@ def slice(input: Tensor,
           starts: Union[Tensor, Sequence[int]],
           sizes: Union[Tensor, Sequence[int]],
           strides: Union[Tensor, Sequence[int]] = None,
-          mode: trt.SampleMode = None) -> Tensor:
+          mode: trt.SampleMode = None,
+          fill_value: Union[float, Tensor] = None) -> Tensor:
     '''
     Add an operation to extract a slice from a tensor.
 
@@ -1244,6 +1251,9 @@ def slice(input: Tensor,
     if isinstance(strides, Tensor) or strides is None:
         trt_strides = [1 for _ in range(input_ndim)]
 
+    if fill_value is not None and isinstance(fill_value, float):
+        fill_value = constant(fp32_array(fill_value))
+
     layer = default_trtnet().add_slice(input.trt_tensor,
                                        start=trt_starts,
                                        shape=trt_sizes,
@@ -1259,6 +1269,9 @@ def slice(input: Tensor,
 
     if isinstance(strides, Tensor):
         layer.set_input(3, strides.trt_tensor)
+
+    if mode is trt.SampleMode.FILL and isinstance(fill_value, Tensor):
+        layer.set_input(4, fill_value.trt_tensor)
 
     return _create_tensor(layer.get_output(0), layer)
 
@@ -3023,7 +3036,7 @@ def log_softmax(input: Tensor, dim: int) -> Tensor:
 
 def reduce(input: Tensor,
            op: trt.ReduceOperation,
-           dim: int,
+           dim: Union[int, Tuple[int]],
            keepdim: bool = False) -> Tensor:
     '''
     Add an reduction operation to do along a dimension.
@@ -3062,7 +3075,9 @@ prod = partial(reduce, op=trt.ReduceOperation.PROD)
 min = partial(reduce, op=trt.ReduceOperation.MIN)
 
 
-def mean(input: Tensor, dim: int, keepdim: bool = False) -> Tensor:
+def mean(input: Tensor,
+         dim: Union[int, Tuple[int]],
+         keepdim: bool = False) -> Tensor:
     '''
     Add an operation to compute the mean along a dimension.
 
@@ -3300,15 +3315,19 @@ def group_norm(input: Tensor,
     ] + [input.size(i) for i in range(2, ndim)])
     x = input.view(new_shape)
 
-    reduce_dim = tuple(range(2, ndim + 1))
-    ux = x.mean(dim=reduce_dim, keepdim=True)
-    numerator = x - ux
-    varx = numerator * numerator
-    varx = varx.mean(dim=reduce_dim, keepdim=True)
-
-    denom = varx + eps
-    denom = denom.sqrt()
-    y = numerator / denom
+    # instance norm
+    w_shape = [1, num_groups] + [1 for i in range(ndim - 1)]
+    instance_weight = constant(np.ones(w_shape, dtype=trt_dtype_to_np(x.dtype)))
+    instance_bias = constant(np.zeros(w_shape, dtype=trt_dtype_to_np(x.dtype)))
+    axes_mask = 0
+    for i in range(2, x.ndim()):
+        axes_mask |= 1 << i
+    layer = default_trtnet().add_normalization(x.trt_tensor,
+                                               instance_weight.trt_tensor,
+                                               instance_bias.trt_tensor,
+                                               axes_mask)
+    layer.epsilon = eps
+    y = _create_tensor(layer.get_output(0), layer)
     y = y.view(old_shape)
 
     new_shape = concat([num_channels] + [1 for _ in range(2, ndim)])
@@ -3449,7 +3468,9 @@ def conv2d(input: Tensor,
            stride: Tuple[int, int] = (1, 1),
            padding: Tuple[int, int] = (0, 0),
            dilation: Tuple[int, int] = (1, 1),
-           groups: int = 1) -> Tensor:
+           groups: int = 1,
+           pre_padding: Optional[Tuple[int, int]] = None,
+           post_padding: Optional[Tuple[int, int]] = None) -> Tensor:
     ##
     ## TODO: Document that function!
     ##
@@ -3477,6 +3498,10 @@ def conv2d(input: Tensor,
     layer.dilation_nd = dilation
     layer.num_groups = groups
     layer.dilation_nd = dilation
+    if pre_padding:
+        layer.pre_padding = pre_padding
+    if post_padding:
+        layer.post_padding = post_padding
 
     if not is_weight_constant:
         layer.set_input(1, weight.trt_tensor)
@@ -4700,7 +4725,7 @@ def gpt_attention(
     num_kv_heads: int,
     hidden_size_per_head: int,
     q_scaling: float,
-    qk_tanh_scale: float = 0.0,
+    attn_logit_softcapping_scale: float = 0.0,
     rotary_embedding_dim: int = 0,
     rotary_embedding_base: float = 10000.0,
     rotary_embedding_scale_type: RotaryScalingType = RotaryScalingType.none,
@@ -4836,9 +4861,9 @@ def gpt_attention(
             The value used to compute the scaling factor applied to the output
             of the Q*K^T product. See Scaling Factors in docs/source/advanced/gpt-attention.md,
 
-        qk_tanh_scale: float
+        attn_logit_softcapping_scale: float
             The scale * tanh(value / scale) used to compute the scaling factor applied to the output
-            of the Q*K^T product. Note this is only used by grok models.
+            of the Q*K^T product.
 
         rotary_embedding_dim: int
             The dimension to compute RoPE. Use 0 when position_embedding_type is not RoPE.
@@ -5074,9 +5099,10 @@ def gpt_attention(
     q_scaling = trt.PluginField("q_scaling",
                                 np.array(q_scaling, dtype=np.float32),
                                 trt.PluginFieldType.FLOAT32)
-    qk_tanh_scale = trt.PluginField("qk_tanh_scale",
-                                    np.array(qk_tanh_scale, dtype=np.float32),
-                                    trt.PluginFieldType.FLOAT32)
+    attn_logit_softcapping_scale = trt.PluginField(
+        "attn_logit_softcapping_scale",
+        np.array(attn_logit_softcapping_scale, dtype=np.float32),
+        trt.PluginFieldType.FLOAT32)
     rotary_embedding_dim = trt.PluginField(
         "rotary_embedding_dim", np.array(rotary_embedding_dim, dtype=np.int32),
         trt.PluginFieldType.INT32)
@@ -5247,12 +5273,12 @@ def gpt_attention(
     pfc = trt.PluginFieldCollection([
         layer_idx, nheads, vision_start, vision_length, num_kv_heads,
         layer_idx_in_cache_pool, head_size, unidirectional, q_scaling,
-        qk_tanh_scale, position_embedding_type, rotary_embedding_dim,
-        rotary_embedding_base, rotary_embedding_scale_type,
-        rotary_embedding_scale, rotary_embedding_short_m_scale,
-        rotary_embedding_long_m_scale, rotary_embedding_max_positions,
-        rotary_embedding_original_max_positions, tp_size, tp_rank,
-        unfuse_qkv_gemm, context_fmha_type, enable_xqa,
+        attn_logit_softcapping_scale, position_embedding_type,
+        rotary_embedding_dim, rotary_embedding_base,
+        rotary_embedding_scale_type, rotary_embedding_scale,
+        rotary_embedding_short_m_scale, rotary_embedding_long_m_scale,
+        rotary_embedding_max_positions, rotary_embedding_original_max_positions,
+        tp_size, tp_rank, unfuse_qkv_gemm, context_fmha_type, enable_xqa,
         kv_cache_quant_mode_field, remove_input_padding, mask_type_filed,
         block_sparse_block_size, block_sparse_homo_head_pattern,
         block_sparse_num_local_blocks, block_sparse_vertical_stride,
