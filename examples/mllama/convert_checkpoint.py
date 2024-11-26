@@ -368,7 +368,7 @@ def convert_and_save_hf(args):
     model_dir = args.model_dir
     load_by_shard = args.load_by_shard
     world_size = args.tp_size * args.pp_size
-    # Need to convert the cli args to the kay-value pairs and override them in the generate config dict.
+    # Need to convert the cli args to the key-value pairs and override them in the generate config dict.
     # Ideally these fields will be moved out of the config and pass them into build API, keep them here for compatibility purpose for now,
     # before the refactor is done.
     override_fields = {}

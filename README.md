@@ -17,12 +17,14 @@ TensorRT-LLM
 <div align="left">
 
 ## Latest News
+* [2024/11/19] Llama 3.2 Full-Stack Optimizations Unlock High Performance on NVIDIA GPUs
+[➡️ link](https://developer.nvidia.com/blog/llama-3-2-full-stack-optimizations-unlock-high-performance-on-nvidia-gpus/?ncid=so-link-721194)
+<div align="center">
+<img src="https://developer-blogs.nvidia.com/wp-content/uploads/2024/11/three-llamas-holding-number-10-signs-1.jpg" width="50%">
+<div align="left">
 
 * [2024/11/09] 🚀🚀🚀 3x Faster AllReduce with NVSwitch and TensorRT-LLM MultiShot
 [➡️ link](https://developer.nvidia.com/blog/3x-faster-allreduce-with-nvswitch-and-tensorrt-llm-multishot/)
-<div align="center">
-<img src="https://developer-blogs.nvidia.com/wp-content/uploads/2024/08/HGX-H200-tech-blog-1920x1080-1.jpg" width="50%">
-<div align="left">
 
 * [2024/11/09] ✨ NVIDIA advances the AI ecosystem with the AI model of LG AI Research 🙌
 [➡️ link](https://blogs.nvidia.co.kr/blog/nvidia-lg-ai-research/)

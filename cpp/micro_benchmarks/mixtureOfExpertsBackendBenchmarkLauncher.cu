@@ -573,8 +573,11 @@ void doCleanup()
 
 void help()
 {
-    std::cout << "Usage: mixtureOfExpertsBackendBenchmark [--input_file <file>] [benchmark options]\n";
+    std::cout << "Usage: mixtureOfExpertsBackendBenchmark [--disable_cuda_graphs] [--input_file <file>] [benchmark "
+                 "options]\n";
     std::cout
+        << "--disable_cuda_graphs\t\tPrevent the benchmark from using cuda graphs. Useful for getting the performance "
+           "of specific kernels\n"
         << "--input_file\t\tA JSON file describing the benchmark configurations\n\n"
         << "File schema\n"
            "[\n"
@@ -693,6 +696,11 @@ int parseArgsAndRunBench(int argc, char** argv)
                     return -2;
                 }
                 shift += 2;
+            }
+            else if (strcmp("--disable_cuda_graphs", argv[i]) == 0)
+            {
+                useCudaGraph = false;
+                shift++;
             }
             else if (strcmp("--help", argv[i]) == 0 || strcmp("-h", argv[i]) == 0)
             {

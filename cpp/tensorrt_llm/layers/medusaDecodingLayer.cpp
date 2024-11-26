@@ -467,7 +467,7 @@ void MedusaDecodingLayer<T>::packAcceptedPaths(SpeculativeDecodingOutputs const&
     TLLM_CHECK_WITH_INFO(numNewTokensCumSum != nullptr, "numNewTokensCumSum must be provided for MedusaDecoding");
     TLLM_CHECK_WITH_INFO(pathsOffsets != nullptr, "pathsOffsets must be provided for MedusaDecoding");
     invokePackAcceptedPaths(numNewTokensCumSum, pathsOffsets, numNewTokens, bestPathIdsDevicePtr, paths, batchSlots,
-        batchSize, mDecoderDomain.getMaxDecodingTokens(),
+        batchSize, batchSize, mDecoderDomain.getMaxDecodingTokens(),
         mDecoderDomain.getSpeculativeDecodingModule()->getMaxPathLen(), false, getStream());
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);

@@ -84,6 +84,13 @@ __global__ void maskTargetLogitsKernel(T* targetLogits, SizeType32 const* batchS
     }
 
     __syncthreads();
+    if (tid == 0 && tokensToMask == 0)
+    {
+        // all tokens are selected if topK == 0 && topP ~= 1.0f
+        // in this case tokensToMask = vocabSize
+        tokensToMask = vocabSize;
+    }
+    __syncthreads();
 
     if (!useDraftLogits && tid == 0)
     {
@@ -160,25 +167,16 @@ __global__ void acceptDraftTokensKernel(T const* draftProbs, T* targetProbs, Siz
                 float threshold = randomThreshold ? curand_uniform(curandState + batchSlot) : constantThreshold;
                 auto const targetProb = static_cast<float>(targetProbsBatch[draftOutputTokenId]);
                 auto const draftProb = static_cast<float>(draftProbsBatch[draftOutputTokenId]);
-                auto rateQP = targetProb / draftProb;
-                if (rateQP < threshold)
-                {
-                    isAccepted = false;
-                    finishedOutput[batchSlot].setSkipDecoding();
-                }
-                else
-                {
-                    isAccepted = true;
-                }
+                isAccepted = targetProb > threshold * draftProb;
             }
             else
             {
                 // Check if draft tokens are the same as target tokens
                 isAccepted = targetOutputIds[batchSlot] == draftOutputTokenId;
-                if (!isAccepted)
-                {
-                    finishedOutput[batchSlot].setSkipDecoding();
-                }
+            }
+            if (!isAccepted)
+            {
+                finishedOutput[batchSlot].setSkipDecoding();
             }
         }
         else

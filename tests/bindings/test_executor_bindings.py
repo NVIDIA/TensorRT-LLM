@@ -1053,13 +1053,14 @@ def test_scheduler_config():
     assert config.capacity_scheduler_policy == capacity_scheduler_policy
     assert config.context_chunking_policy == context_chunking_policy
 
-    dynamic_batch_config = trtllm.DynamicBatchConfig(True, 128)
+    dynamic_batch_config = trtllm.DynamicBatchConfig(True, True, 128)
     config = trtllm.SchedulerConfig(capacity_scheduler_policy,
                                     context_chunking_policy,
                                     dynamic_batch_config)
     assert config.capacity_scheduler_policy == capacity_scheduler_policy
     assert config.context_chunking_policy == context_chunking_policy
     assert config.dynamic_batch_config.enable_batch_size_tuning == True
+    assert config.dynamic_batch_config.enable_max_num_tokens_tuning == True
     assert config.dynamic_batch_config.dynamic_batch_moving_average_window == 128
 
 

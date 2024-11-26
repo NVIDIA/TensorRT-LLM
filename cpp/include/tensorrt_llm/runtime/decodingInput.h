@@ -152,7 +152,7 @@ public:
         EagleInputs(TensorConstPtr nextDraftTokens, TensorConstPtr nextDraftLens, TensorConstPtr nextDraftPaths,
             TensorConstPtr lastDraftTokens, TensorConstPtr lastDraftLens, TensorConstPtr lastDraftPaths,
             TensorConstPtr acceptedTokens, TensorConstPtr acceptedLens, TensorConstPtr acceptedPathIds,
-            TensorConstPtr seqSlots)
+            TensorConstPtr chunkedContextNextTokens, TensorConstPtr seqSlots)
             : nextDraftTokens(nextDraftTokens)
             , nextDraftLens(nextDraftLens)
             , nextDraftPaths(nextDraftPaths)
@@ -162,21 +162,23 @@ public:
             , acceptedTokens(acceptedTokens)
             , acceptedLens(acceptedLens)
             , acceptedPathIds(acceptedPathIds)
+            , chunkedContextNextTokens(chunkedContextNextTokens)
             , seqSlots(seqSlots)
         {
         }
 
-        TensorConstPtr nextDraftTokens; //!< [batchSize, maxDecodingDraftTokens]
-        TensorConstPtr nextDraftLens;   //!< [batchSize]
-        TensorConstPtr nextDraftPaths;  //!< [batchSize, maxDecodingTokens, maxPathLen]
-        TensorConstPtr lastDraftTokens; //!< [batchSize, maxNumPaths, maxPathLen]
-        TensorConstPtr lastDraftLens;   //!< [batchSize]
-        TensorConstPtr lastDraftPaths;  //!< [batchSize, maxDecodingTokens, maxPathLen]
+        TensorConstPtr nextDraftTokens;          //!< [batchSize, maxDecodingDraftTokens]
+        TensorConstPtr nextDraftLens;            //!< [batchSize]
+        TensorConstPtr nextDraftPaths;           //!< [batchSize, maxDecodingTokens, maxPathLen]
+        TensorConstPtr lastDraftTokens;          //!< [batchSize, maxNumPaths, maxPathLen]
+        TensorConstPtr lastDraftLens;            //!< [batchSize]
+        TensorConstPtr lastDraftPaths;           //!< [batchSize, maxDecodingTokens, maxPathLen]
 
-        TensorConstPtr acceptedTokens;  //!< [batchSize, maxPathLen]
-        TensorConstPtr acceptedLens;    //!< [batchSize]
-        TensorConstPtr acceptedPathIds; //!< [batchSize]
-        TensorConstPtr seqSlots;        //!< [batchSize]
+        TensorConstPtr acceptedTokens;           //!< [batchSize, maxPathLen]
+        TensorConstPtr acceptedLens;             //!< [batchSize]
+        TensorConstPtr acceptedPathIds;          //!< [batchSize]
+        TensorConstPtr chunkedContextNextTokens; //!< [batchSize]
+        TensorConstPtr seqSlots;                 //!< [batchSize]
     };
 
     std::optional<MedusaInputs> medusaInputs;

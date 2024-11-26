@@ -348,6 +348,7 @@ void prepareEagleInput(DecodingInput const& inputs, std::shared_ptr<tl::Decoding
     inputParams->acceptedTokens = eagleInputs->acceptedTokens;
     inputParams->acceptedLens = eagleInputs->acceptedLens;
     inputParams->acceptedPathIds = eagleInputs->acceptedPathIds;
+    inputParams->chunkedContextNextTokens = eagleInputs->chunkedContextNextTokens;
     inputParams->seqSlots = eagleInputs->seqSlots;
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -399,7 +400,7 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
             eagleInputs->nextDraftTokens, eagleInputs->nextDraftLens, eagleInputs->nextDraftPaths,
             eagleInputs->lastDraftTokens, eagleInputs->lastDraftLens, eagleInputs->lastDraftPaths,
             eagleInputs->acceptedTokens, eagleInputs->acceptedLens, eagleInputs->acceptedPathIds,
-            eagleInputs->seqSlots);
+            eagleInputs->chunkedContextNextTokens, eagleInputs->seqSlots);
     }
 
     // No logits for explicit draft tokens and eagle

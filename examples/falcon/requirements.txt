@@ -1,4 +1,4 @@
-tensorrt_llm==0.16.0.dev2024111900
+tensorrt_llm==0.16.0.dev2024112600
 transformers>=4.31.0
 datasets~=2.14.5
 evaluate~=0.4.1

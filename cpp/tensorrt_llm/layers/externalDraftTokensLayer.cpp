@@ -64,15 +64,12 @@ void ExternalDraftTokensLayer<T>::allocateBuffer(SizeType32 batchSize)
     // top k workspace size
     auto workspaceSize = getTopKWorkspaceSize<T>(batchSize, 1, TOP_K_MAX, mDecoderDomain.getVocabSizePadded());
     mWorkspaceSize = std::max(workspaceSize, mWorkspaceSize);
-    // top p and multinomial (top p == 1) workspace size
-    if (!mIsAirTopP)
-    {
-        workspaceSize = getTopPWorkspaceSize<T>(batchSize, mDecoderDomain.getVocabSizePadded());
-    }
-    else
-    {
-        workspaceSize = getAirTopPWorkspaceSize<T>(batchSize, mDecoderDomain.getVocabSizePadded(), mIsDeterministic);
-    }
+    // top p workspace size
+    workspaceSize = getTopPWorkspaceSize<T>(batchSize, mDecoderDomain.getVocabSizePadded());
+    mWorkspaceSize = std::max(workspaceSize, mWorkspaceSize);
+
+    // multinomial (top p == 1) workspace size
+    workspaceSize = getAirTopPWorkspaceSize<T>(batchSize, mDecoderDomain.getVocabSizePadded(), mIsDeterministic);
     mWorkspaceSize = std::max(workspaceSize, mWorkspaceSize);
 
     // batchsize here is maxBatchSize
@@ -227,16 +224,16 @@ void ExternalDraftTokensLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutpu
 
     // Fill the buffer for selected ids from sampling with zero. -1 will be set as a boundary if topP kernel is required
     auto& outputIdsAfterSamplingTensor = const_cast<ITensor&>(*mOutputIdsAfterSampling);
-    tensorrt_llm::runtime::kernels::invokeFill(outputIdsAfterSamplingTensor, 0, mBufferManager->getStream());
+    mBufferManager->setZero(outputIdsAfterSamplingTensor);
 
     // The logits from target engine should go through samplings first.
     // gptDecoderBatched.cpp is calling dynamic decoder step by step, in this step, dynamic Decoder already forwarded
     // PenaltyLayer, BanWordsLayer. For (TopK > 0) && (TopK == 0 && TopP == 0), we invoke TopK sampling kernel. The same
     // logic is implemented in SamplingLayer.cpp
-    getAllTopKs(outputs, baseInputs, workspace);
+    getAllTopKs(baseInputs, workspace);
 
     // Only for (TopK == 0 && TopP > 0), we invoke TopP sampling
-    getAllTopPs(outputs, baseInputs, workspace);
+    getAllTopPs(baseInputs, workspace);
 
     // After all selected tokens are filled in mOutputIdsAfterSampling by topK, topP kernels, token acceptance logics
     // starts. First we mask the logits of unselected token id to -inf as HF's TopK, TopP implementation. We compute the
@@ -369,8 +366,7 @@ void ExternalDraftTokensLayer<T>::multinomialSampling(std::shared_ptr<BaseDecodi
 }
 
 template <typename T>
-void ExternalDraftTokensLayer<T>::getAllTopKs(std::shared_ptr<BaseDecodingOutputs> const& outputs,
-    std::shared_ptr<BaseDecodingInputs> const& baseInputs,
+void ExternalDraftTokensLayer<T>::getAllTopKs(std::shared_ptr<BaseDecodingInputs> const& baseInputs,
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -378,7 +374,7 @@ void ExternalDraftTokensLayer<T>::getAllTopKs(std::shared_ptr<BaseDecodingOutput
 
     auto logits = bufferCastOrNull<T>(inputs->logits);
 
-    auto const batchSize = inputs->logits.value()->getDimension<0>();
+    auto const batchSize = static_cast<SizeType32>(inputs->logits.value()->getDimension<0>());
 
     auto const* batchSlotsHost = bufferCast<SizeType32>(*inputs->batchSlots);
     auto const* skipDecodeHostPtr = bufferCastOrNull<bool>(mSkipTopKDecodeHost);
@@ -398,7 +394,7 @@ void ExternalDraftTokensLayer<T>::getAllTopKs(std::shared_ptr<BaseDecodingOutput
     params.logProbs = logits;
     params.outputIds = bufferCastOrNull<TokenIdType>(mOutputIdsAfterSampling);
     params.workspace = workspace->getRawWorkspaceDevicePtr();
-    params.maxTopP = 1.0f;
+    params.maxTopP = 1.0F;
     params.topPs = bufferCastOrNull<float>(mRuntimeTopPDevice);
     params.maxTopK = maxOfBatchSlots(batchSlotsHost, runtimeTopKHostPtr, batchSize);
     params.topKs = bufferCastOrNull<SizeType32>(mRuntimeTopKDevice);
@@ -419,8 +415,7 @@ void ExternalDraftTokensLayer<T>::getAllTopKs(std::shared_ptr<BaseDecodingOutput
 }
 
 template <typename T>
-void ExternalDraftTokensLayer<T>::getAllTopPs(std::shared_ptr<BaseDecodingOutputs> const& outputs,
-    std::shared_ptr<BaseDecodingInputs> const& baseInputs,
+void ExternalDraftTokensLayer<T>::getAllTopPs(std::shared_ptr<BaseDecodingInputs> const& baseInputs,
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -457,16 +452,7 @@ void ExternalDraftTokensLayer<T>::getAllTopPs(std::shared_ptr<BaseDecodingOutput
     params.returnAllSelectedTokens = true;
     params.maxSeqLen = mDecoderDomain.getVocabSizePadded();
 
-    if (!mIsAirTopP)
-    {
-        invokeBatchTopPSampling<T>(params, getStream());
-    }
-    else
-    {
-        params.blockNum = mAirTopPBlockNum;
-        params.isDeterministic = mIsDeterministic;
-        invokeBatchAirTopPSampling<T>(params, getStream());
-    }
+    invokeBatchTopPSampling<T>(params, getStream());
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

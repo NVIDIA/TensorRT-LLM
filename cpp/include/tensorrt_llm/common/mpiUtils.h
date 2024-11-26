@@ -27,9 +27,13 @@
 #include <cuda_bf16.h>
 #endif
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
+#include <thread>
 
 #if ENABLE_MULTI_DEVICE
 #include <mpi.h>
@@ -421,6 +425,28 @@ private:
 std::vector<int> getWorldRanks(MpiComm const& comm);
 
 void initialize(MpiThreadSupport threadMode = MpiThreadSupport::THREAD_MULTIPLE, bool forwardAbortToParent = false);
+
+class MpiWaitThread
+{
+public:
+    explicit MpiWaitThread(std::unique_ptr<std::thread> thread);
+    ~MpiWaitThread();
+    void exit();
+    [[nodiscard]] bool shouldExit() const;
+
+    void waitStart();
+    void waitStop();
+
+    void notifyStart();
+    void notifyStop();
+
+private:
+    std::unique_ptr<std::thread> mThread;
+    std::mutex mMutex;
+    std::condition_variable mCondVar;
+    bool mRunning{false};
+    std::atomic<bool> mShouldExit{false};
+};
 
 } // namespace tensorrt_llm::mpi
 

@@ -7,7 +7,7 @@ from click_option_group import AllOptionGroup, optgroup, RequiredMutuallyExclusi
 from transformers import PretrainedConfig as HFPretrainedConfig
 import yaml
 
-from tensorrt_llm.bench.dataclasses import BenchmarkEnvironment
+from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.utils.data import create_dataset_from_stream, initialize_tokenizer
 from tensorrt_llm.bench.utils import (VALID_QUANT_ALGOS, VALID_COMPUTE_DTYPES)
 from tensorrt_llm.builder import BuildConfig

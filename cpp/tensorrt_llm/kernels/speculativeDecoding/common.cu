@@ -36,19 +36,21 @@ namespace tensorrt_llm::kernels::speculative_decoding
 template <int32_t BLOCK_SIZE>
 __global__ void packAcceptedPaths(SizeType32* acceptedLengthsCumSum, SizeType32* pathsOffsets,
     SizeType32 const* acceptedLengths, SizeType32 const* bestPathIds, SizeType32 const* paths,
-    SizeType32 const* batchSlots, SizeType32 batchSize, SizeType32 numPaths, SizeType32 maxPathLen,
-    bool isPathsLinearBatchIdx)
+    SizeType32 const* batchSlots, SizeType32 batchSize, SizeType32 engineBatchSize, SizeType32 numPaths,
+    SizeType32 maxPathLen, bool isPathsLinearBatchIdx)
 {
     // Specialize BlockScan for a 1D block of 128 threads of type int
     typedef cub::BlockScan<SizeType32, BLOCK_SIZE> BlockScan;
 
     // Allocate shared memory for BlockScan
     __shared__ typename BlockScan::TempStorage tempStorage;
-    auto const batchSizeRounded = ((batchSize + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
+    auto const batchSizeRounded = ((engineBatchSize + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
     __shared__ SizeType32 currentCumSum;
+    __shared__ SizeType32 currentValidIdx;
     if (threadIdx.x == 0)
     {
         currentCumSum = 0;
+        currentValidIdx = 0;
     }
 
     __syncthreads();
@@ -56,20 +58,28 @@ __global__ void packAcceptedPaths(SizeType32* acceptedLengthsCumSum, SizeType32*
     for (auto bi = static_cast<SizeType32>(threadIdx.x); bi < batchSizeRounded;
          bi += static_cast<SizeType32>(blockDim.x))
     {
-        auto const valid = bi < batchSize;
+        auto valid = bi < engineBatchSize;
         auto const batchSlot = valid ? batchSlots[bi] : 0;
+        if (batchSlot < 0)
+        {
+            valid = false;
+        }
         auto const acceptedLen = valid ? acceptedLengths[batchSlot] - 1 : 0;
         SizeType32 cumSum;
         BlockScan(tempStorage).ExclusiveSum(acceptedLen + currentCumSum, cumSum);
+        __syncthreads();
+        SizeType32 validIndex;
+        BlockScan(tempStorage).ExclusiveSum(static_cast<SizeType32>(valid) + currentValidIdx, validIndex);
         if (threadIdx.x == blockDim.x - 1)
         {
             currentCumSum = cumSum;
+            currentValidIdx = validIndex;
         }
         __syncthreads();
 
         if (valid)
         {
-            acceptedLengthsCumSum[bi] = cumSum;
+            acceptedLengthsCumSum[validIndex] = cumSum;
             auto const pathBatchIdx = isPathsLinearBatchIdx ? bi : batchSlot;
             auto const bestPathIdx = bestPathIds[pathBatchIdx];
             auto const pathIdx = flat_index3(pathBatchIdx, bestPathIdx, 0, numPaths, maxPathLen);
@@ -87,12 +97,12 @@ __global__ void packAcceptedPaths(SizeType32* acceptedLengthsCumSum, SizeType32*
 
 void invokePackAcceptedPaths(SizeType32* acceptedLengthsCumSum, SizeType32* pathsOffsets,
     SizeType32 const* acceptedLengths, SizeType32 const* bestPathIds, SizeType32 const* paths,
-    SizeType32 const* batchSlots, SizeType32 batchSize, SizeType32 numPaths, SizeType32 maxPathLen,
-    bool isPathsLinearBatchIdx, cudaStream_t stream)
+    SizeType32 const* batchSlots, SizeType32 batchSize, SizeType32 engineBatchSize, SizeType32 numPaths,
+    SizeType32 maxPathLen, bool isPathsLinearBatchIdx, cudaStream_t stream)
 {
     constexpr SizeType32 BLOCK_SIZE = 1024;
     packAcceptedPaths<BLOCK_SIZE><<<1, BLOCK_SIZE, 0, stream>>>(acceptedLengthsCumSum, pathsOffsets, acceptedLengths,
-        bestPathIds, paths, batchSlots, batchSize, numPaths, maxPathLen, isPathsLinearBatchIdx);
+        bestPathIds, paths, batchSlots, batchSize, engineBatchSize, numPaths, maxPathLen, isPathsLinearBatchIdx);
 }
 
 namespace

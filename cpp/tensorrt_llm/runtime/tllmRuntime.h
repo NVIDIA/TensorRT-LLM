@@ -158,6 +158,10 @@ private:
 
     static std::string dataTypeToString(nvinfer1::DataType type)
     {
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wswitch"
+#endif
         switch (type)
         {
         case nvinfer1::DataType::kINT64: return "INT64";
@@ -172,6 +176,9 @@ private:
         case nvinfer1::DataType::kINT4: return "INT4";
         default: return "UNKNOWN";
         }
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
         return "";
     }
 

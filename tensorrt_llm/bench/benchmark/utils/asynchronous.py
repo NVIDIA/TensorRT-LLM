@@ -1,20 +1,17 @@
 from __future__ import annotations
 
 import asyncio
-import multiprocessing as mp
 import time
 from itertools import chain
-from multiprocessing.synchronize import Event as MpEvent
 from typing import List, Set
 
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm import LLM
-from tensorrt_llm.bench.benchmark.dataclasses import RuntimeConfig
-from tensorrt_llm.bench.benchmark.utils.reporting import (NewRequestTuple,
-                                                          ResponseTuple,
-                                                          StatsKeeper,
-                                                          report_statistics)
-from tensorrt_llm.bench.dataclasses import InferenceRequest
+from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
+from tensorrt_llm.bench.dataclasses.general import InferenceRequest
+from tensorrt_llm.bench.dataclasses.reporting import (NewRequestPerfItemTuple,
+                                                      StatsKeeper,
+                                                      report_statistics)
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.llmapi.llm_utils import LlmArgs
 from tensorrt_llm.llmapi.utils import SamplingParams
@@ -55,19 +52,19 @@ class LlmManager:
         else:
             # Wait for the response to return to us.
             response: RequestOutput = await output.aresult()
-        # Register the new request in the outbound queue for statistics keeping
-        await self._outbox.put(
-            NewRequestTuple(request_start_timestamp, response.request_id,
-                            len(request.input_ids)))
 
         # Mark that the response returned. Construct a record to send to statistics.
         tokens = list(chain(*[beam.token_ids for beam in response.outputs]))
-        end_time = time.perf_counter_ns()
-        response_record = ResponseTuple(end_time, response.request_id,
-                                        response.finished, False, tokens,
-                                        len(tokens), time_on_first_token)
-        # Push the record to the outbound queue.
-        await self._outbox.put(response_record)
+        response_end_timestamp = time.perf_counter_ns()
+        request_perf_item = NewRequestPerfItemTuple(request_start_timestamp,
+                                                    response_end_timestamp,
+                                                    response.request_id,
+                                                    len(request.input_ids),
+                                                    response.finished, False,
+                                                    tokens, len(tokens),
+                                                    time_on_first_token)
+        # Register the new request perf items in the outbound queue for statistics keeping
+        await self._outbox.put(request_perf_item)
 
     async def worker(self) -> None:
         while not self._stop.is_set():
@@ -84,16 +81,15 @@ class LlmManager:
         for task in self._tasks:
             task.cancel()
         logger.info("All tasks cancelled.")
-        self.backend.cancel()
+        self._backend_task.cancel()
         logger.info("LLM Backend stopped.")
 
     @property
     def busy(self) -> bool:
         return bool(self._tasks)
 
-    async def run(self) -> None:
-        self.backend = asyncio.create_task(self.worker())
-        await self.backend
+    def run(self) -> None:
+        self._backend_task = asyncio.create_task(self.worker())
 
     async def enqueue(self, request: InferenceRequest,
                       sampling_params: SamplingParams) -> None:
@@ -103,7 +99,7 @@ class LlmManager:
 async def enqueue_messages(backend: LlmManager,
                            requests: List[InferenceRequest],
                            sampling_params: SamplingParams,
-                           submit_finished: MpEvent) -> None:
+                           submit_finished: asyncio.Event) -> None:
     num_requests = 0
     submit_start = time.perf_counter_ns()
     for request in requests:
@@ -123,7 +119,7 @@ async def async_benchmark(runtime_config: RuntimeConfig,
     outbox = asyncio.Queue()
     sampling_params = SamplingParams(end_id=-1, pad_id=-1, beam_width=1)
     statistics = StatsKeeper()
-    submit_finished = mp.Event()
+    submit_finished = asyncio.Event()
 
     try:
         logger.info("Setting up throughput benchmark.")
@@ -138,14 +134,16 @@ async def async_benchmark(runtime_config: RuntimeConfig,
             kv_cache_config=runtime_config.settings_config.get_kvcache_config(),
             decoding_config=runtime_config.decoding_config.get_decoding_config(
             ),
+            enable_chunked_prefill=True,
             batching_type=trtllm.BatchingType.INFLIGHT,
+            enable_processes_for_single_gpu=True,
         )
 
         llm = LLM(**llm_args.to_dict())
 
         backend = LlmManager(llm, outbox, streaming)
         logger.info("Creating backend and request enqueue tasks.")
-        asyncio.create_task(backend.run())
+        backend.run()
         enqueue_task = asyncio.create_task(
             enqueue_messages(backend, requests, sampling_params,
                              submit_finished))
@@ -155,20 +153,7 @@ async def async_benchmark(runtime_config: RuntimeConfig,
         ):
             try:
                 item = await asyncio.wait_for(outbox.get(), timeout=1.0)
-                if isinstance(item, NewRequestTuple):
-                    statistics.register_request(item.request_id, item.timestamp,
-                                                item.input_length)
-                elif isinstance(item, ResponseTuple):
-                    statistics.register_response(item.request_id,
-                                                 item.timestamp, item.final,
-                                                 item.error,
-                                                 item.decoding_iteration,
-                                                 item.tokens,
-                                                 item.time_on_first_token)
-                else:
-                    raise TypeError(
-                        f"Encountered unexpected type '{type(item)}' when "
-                        "processing responses.")
+                statistics.register_request_perf_item(item)
             except asyncio.TimeoutError:
                 logger.debug("No items in queue. Continuing.")
         logger.info("Benchmark complete.")

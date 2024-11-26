@@ -44,8 +44,8 @@ struct MaskedSoftmaxParam
     int num_heads = 0;
     T qk_scale = T(0.0f);
     // always float compute data type.
-    float qk_tanh_scale = 0.f;
-    float qk_tanh_inverse_scale = 0.f;
+    float attn_logit_softcapping_scale = 0.f;
+    float attn_logit_softcapping_inverse_scale = 0.f;
     bool block_sparse_attn = false;
     BlockSparseParams block_sparse_params;
     int const* q_seq_lengths = nullptr; // (batch_size)

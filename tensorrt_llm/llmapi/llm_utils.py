@@ -284,6 +284,9 @@ LLMARGS_DOCSTRING = r"""
 
         normalize_log_probs (bool): Whether to normalize log probabilities for the model. Defaults to False.
 
+        enable_processes_for_single_gpu (bool): Whether to enable processes for single GPU, Defaults to False.
+            This helps to improve the streaming generation performance.
+
 """
 
 
@@ -386,6 +389,9 @@ class LlmArgs:
     normalize_log_probs: bool = False
 
     use_runtime_defaults: bool = True
+
+    # TODO[chunweiy]: Enable this by default and remove the option in the future
+    enable_processes_for_single_gpu: bool = False
 
     def __post_init__(self):
         # TODO[chunweiy]: Enable this option in the future

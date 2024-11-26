@@ -731,13 +731,15 @@ public:
     /// batch size and max num tokens
     static SizeType32 const kDefaultDynamicBatchMovingAverageWindow = 128;
 
-    explicit DynamicBatchConfig(bool enableBatchSizeTuning = false,
+    explicit DynamicBatchConfig(bool enableBatchSizeTuning = false, bool enableMaxNumTokensTuning = false,
         SizeType32 dynamicBatchMovingAverageWindow = kDefaultDynamicBatchMovingAverageWindow,
         std::vector<std::pair<SizeType32, SizeType32>> batchSizeTable = kDefaultBatchSizeTable);
 
     [[nodiscard]] SizeType32 getDynamicBatchMovingAverageWindow() const;
 
     [[nodiscard]] bool getEnableBatchSizeTuning() const;
+
+    [[nodiscard]] bool getEnableMaxNumTokensTuning() const;
 
     [[nodiscard]] std::vector<std::pair<SizeType32, SizeType32>> getBatchSizeTable() const;
 
@@ -749,6 +751,9 @@ private:
 
     /// @brief Controls if the batch size should be tuned dynamically
     bool mEnableBatchSizeTuning;
+
+    /// @brief Controls if the max num tokens should be tuned dynamically
+    bool mEnableMaxNumTokensTuning;
 
     /// @brief The window size for moving average of input and output length which is used to calculate dynamic batch
     /// size and max num tokens

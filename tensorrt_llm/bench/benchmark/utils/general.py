@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Union
 
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm.bench.dataclasses import InferenceRequest
+from tensorrt_llm.bench.dataclasses.general import InferenceRequest
 
 
 def get_executor_requests(

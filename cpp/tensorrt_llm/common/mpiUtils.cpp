@@ -480,4 +480,71 @@ MpiComm& MpiComm::operator=(MpiComm&& comm) noexcept
     return *this;
 }
 
+MpiWaitThread::MpiWaitThread(std::unique_ptr<std::thread> thread)
+    : mThread{std::move(thread)}
+{
+}
+
+MpiWaitThread::~MpiWaitThread()
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    if (mThread)
+    {
+        exit();
+    }
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void MpiWaitThread::exit()
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    waitStop();
+    mShouldExit.store(true);
+    notifyStart();
+    mThread->join();
+    mThread.reset(nullptr);
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+bool MpiWaitThread::shouldExit() const
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    return mShouldExit.load();
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void MpiWaitThread::waitStart()
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    std::unique_lock<std::mutex> lock(mMutex);
+    mCondVar.wait(lock, [this] { return mRunning; });
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void MpiWaitThread::waitStop()
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    std::unique_lock<std::mutex> lock(mMutex);
+    mCondVar.wait(lock, [this] { return !mRunning; });
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void MpiWaitThread::notifyStart()
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    std::lock_guard<std::mutex> lock(mMutex);
+    mRunning = true;
+    mCondVar.notify_one();
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void MpiWaitThread::notifyStop()
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    std::lock_guard<std::mutex> lock(mMutex);
+    mRunning = false;
+    mCondVar.notify_one();
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
 } // namespace tensorrt_llm::mpi

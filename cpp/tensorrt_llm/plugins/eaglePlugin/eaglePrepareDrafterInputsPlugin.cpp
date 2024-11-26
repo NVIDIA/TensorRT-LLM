@@ -143,7 +143,7 @@ int32_t EaglePrepareDrafterInputsPlugin::getOutputShapes(nvinfer1::DimsExprs con
     nvinfer1::IExprBuilder& exprBuilder) noexcept
 {
     TLLM_CHECK(nbOutputs == 11);
-    TLLM_CHECK(nbInputs == 14);
+    TLLM_CHECK(nbInputs == 15);
     TLLM_CHECK(nbShapeInputs == 0);
     auto const numTokens = inputs[getIdx(InputIdxEntry::INPUT_IDS)].d[0];
     auto const batchSizeExpr = inputs[getIdx(InputIdxEntry::PREV_DRAFT_PATHS)].d[0];
@@ -301,6 +301,8 @@ void EaglePrepareDrafterInputsPlugin::prepareCtxEagleNetData(nvinfer1::PluginTen
         = reinterpret_cast<SizeType32*>(outputs[getIdx(OutputIdxEntry::HIDDEN_SIZE_BATCH_LEVEL_STARTS)]);
 
     auto inputIds = reinterpret_cast<TokenIdType const*>(inputs[getIdx(InputIdxEntry::INPUT_IDS)]);
+    auto chunkedContextNextTokens
+        = reinterpret_cast<TokenIdType const*>(inputs[getIdx(InputIdxEntry::CHUNKED_CONTEXT_NEXT_TOKENS)]);
     auto baseNetSequenceLengths = reinterpret_cast<SizeType32 const*>(inputs[getIdx(InputIdxEntry::SEQUENCE_LENGTHS)]);
     auto baseNetContextLengths = reinterpret_cast<SizeType32 const*>(inputs[getIdx(InputIdxEntry::CONTEXT_LENGTHS)]);
     auto acceptedTokens = reinterpret_cast<TokenIdType const*>(inputs[getIdx(InputIdxEntry::ACCEPTED_TOKENS)]);
@@ -315,8 +317,8 @@ void EaglePrepareDrafterInputsPlugin::prepareCtxEagleNetData(nvinfer1::PluginTen
 
     invokePrepareCtxEagleNetInputs(eagleNetSequenceLengths, eagleNetContextLengths, outputIds, positionIds,
         hiddenStatesIndices, lastTokenIndices, numLastTokenIndices, hiddenSizeBatchLevelStarts, inputIds,
-        baseNetSequenceLengths, baseNetContextLengths, acceptedTokens, acceptedLens, prevDraftLens, prevPaths,
-        bestPathIds, batchSize, maxPathLen, maxDecodingTokens, mMaxNonLeavesPerLayer, stream);
+        chunkedContextNextTokens, baseNetSequenceLengths, baseNetContextLengths, acceptedTokens, acceptedLens,
+        prevDraftLens, prevPaths, bestPathIds, batchSize, maxPathLen, maxDecodingTokens, mMaxNonLeavesPerLayer, stream);
 
     sync_check_cuda_error();
 

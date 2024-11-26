@@ -460,7 +460,7 @@ public:
         TensorConstPtr nextDraftTokens, TensorConstPtr nextDraftLens, TensorConstPtr nextDraftPaths,
         TensorConstPtr lastDraftTokens, TensorConstPtr lastDraftLens, TensorConstPtr lastDraftPaths,
         TensorConstPtr acceptedTokens, TensorConstPtr acceptedLens, TensorConstPtr acceptedPathIds,
-        TensorConstPtr seqSlots)
+        TensorConstPtr chunkedContextNextTokens, TensorConstPtr seqSlots)
         : DecodingInputs(std::move(endIds), std::move(batchSlots), 0, 0, batchSize)
         , nextDraftTokens(nextDraftTokens)
         , nextDraftLens(nextDraftLens)
@@ -471,6 +471,7 @@ public:
         , acceptedTokens(acceptedTokens)
         , acceptedLens(acceptedLens)
         , acceptedPathIds(acceptedPathIds)
+        , chunkedContextNextTokens(chunkedContextNextTokens)
         , seqSlots(seqSlots)
     {
     }
@@ -494,8 +495,10 @@ public:
     TensorConstPtr acceptedLens; // [forwardBatchSize]
     //! Ids of the accepted path.
     TensorConstPtr acceptedPathIds; // [forwardBatchSize]
+    //! Indicator whether the context request last chunk or not.
+    TensorConstPtr chunkedContextNextTokens; // [forwardBatchSize]
 
-    TensorConstPtr seqSlots;        // [forwardBatchSize], on gpu
+    TensorConstPtr seqSlots;                 // [forwardBatchSize], on gpu
 };
 
 class BaseDecodingOutputs

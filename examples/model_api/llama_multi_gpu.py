@@ -5,7 +5,6 @@ from cuda import cudart
 from mpi4py.futures import MPIPoolExecutor
 from transformers import AutoTokenizer
 
-import tensorrt_llm
 from tensorrt_llm import BuildConfig, Mapping, build, mpi_barrier
 from tensorrt_llm.executor import GenerationExecutor, SamplingParams
 from tensorrt_llm.models import LLaMAForCausalLM
@@ -20,7 +19,7 @@ def dataset():
 
 
 def build_and_run_llama(hf_model_dir, engine_dir, tp_size, rank):
-    tensorrt_llm.logger.set_level('verbose')
+    #tensorrt_llm.logger.set_level('verbose')
     status, = cudart.cudaSetDevice(rank)
     assert status == cudart.cudaError_t.cudaSuccess, f"cuda set device to {rank} errored: {status}"
 

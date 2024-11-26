@@ -16,16 +16,11 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/executor/types.h"
-#include "tensorrt_llm/runtime/common.h"
 #include <cstdint>
 #include <curand_kernel.h>
-#include <variant>
 
-namespace tensorrt_llm
-{
-namespace kernels
+namespace tensorrt_llm::kernels
 {
 
 class FinishedState
@@ -111,7 +106,7 @@ public:
         return anyBitSet(kSkipDecoding);
     }
 
-    executor::FinishReason toFinishReason() const
+    [[nodiscard]] constexpr executor::FinishReason toFinishReason() const
     {
         if (isFinishedEOS())
         {
@@ -129,6 +124,11 @@ public:
     }
 
     using UnderlyingType = uint8_t;
+
+    [[nodiscard]] constexpr UnderlyingType toUnderlying() const noexcept
+    {
+        return mState;
+    }
 
 private:
     // The default state is interpreted as not finished.
@@ -250,5 +250,4 @@ template <typename T>
 void invokeScatterDecodingParams(
     T const* src, T scalar, T* dst, int const* batchSlots, int batchSize, cudaStream_t stream);
 
-} // namespace kernels
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::kernels

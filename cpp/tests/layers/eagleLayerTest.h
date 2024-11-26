@@ -268,6 +268,7 @@ private:
     TensorPtr mInputAcceptedTokens;
     TensorPtr mInputAcceptedLens;
     TensorPtr mInputAcceptedPathIds;
+    TensorPtr mChunkedContextNextTokens;
 
     // Setup params
     std::vector<uint64_t> mRandomSeeds;

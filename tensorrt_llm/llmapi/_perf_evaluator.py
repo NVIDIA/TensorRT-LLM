@@ -277,7 +277,11 @@ class LLMPerfEvaluator:
                 **kvcache_extra_params) if kvcache_extra_params else None
             if kv_cache_config is not None:
                 kwargs['kv_cache_config'] = kv_cache_config
-            llm = LLM(model, skip_tokenizer_init=True, **kwargs)
+            llm = LLM(model,
+                      skip_tokenizer_init=True,
+                      enable_chunked_prefill=True,
+                      enable_processes_for_single_gpu=True,
+                      **kwargs)
         except Exception as e:
             logger.error(f"Failed to create LLM with {model} and {kwargs}")
             raise e

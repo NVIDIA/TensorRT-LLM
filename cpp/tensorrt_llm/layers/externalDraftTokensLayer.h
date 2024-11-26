@@ -88,11 +88,9 @@ private:
     void multinomialSampling(std::shared_ptr<BaseDecodingOutputs> const& outputs,
         std::shared_ptr<BaseDecodingInputs> const& baseInputs,
         std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace);
-    void getAllTopKs(std::shared_ptr<BaseDecodingOutputs> const& outputs,
-        std::shared_ptr<BaseDecodingInputs> const& baseInputs,
+    void getAllTopKs(std::shared_ptr<BaseDecodingInputs> const& baseInputs,
         std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace);
-    void getAllTopPs(std::shared_ptr<BaseDecodingOutputs> const& outputs,
-        std::shared_ptr<BaseDecodingInputs> const& baseInputs,
+    void getAllTopPs(std::shared_ptr<BaseDecodingInputs> const& baseInputs,
         std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace);
     void forwardAcceptedTokens(std::shared_ptr<BaseDecodingOutputs> const& outputs,
         std::shared_ptr<BaseDecodingInputs> const& baseInputs,

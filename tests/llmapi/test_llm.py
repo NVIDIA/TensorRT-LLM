@@ -355,6 +355,7 @@ def _test_llm_generate_async(model_name=default_model_name,
         tensor_parallel_size=tp_size,
         auto_parallel=use_auto_parallel,
         auto_parallel_world_size=world_size,
+        enable_processes_for_single_gpu=True,
     )
 
     sampling_params = SamplingParams(max_tokens=6)
@@ -1298,10 +1299,4 @@ def test_llm_chunked_prefill():
 
 
 if __name__ == '__main__':
-    #test_llm_get_stats()
-    #test_llm_get_stats_async()
-    #test_executor_pending_requests()
-    #test_llm_handling_per_requeust_error()
-    #test_llm_handling_per_requeust_error_async()
-    #test_llm_loading_from_hf()
     test_llm_chunked_prefill()

@@ -873,41 +873,61 @@ class Attention(Module):
             assert isinstance(encoder_output, Tensor)
 
             def compute_cross_kv(encoder_output):
-                cross_qkv = self.qkv(encoder_output, qkv_lora_params)
-                base_shape = shape(
-                    cross_qkv, 0) if cross_qkv.ndim() == 2 else concat(
-                        [shape(cross_qkv, 0),
-                         shape(cross_qkv, 1)])
+                if hasattr(self, 'kv'):
+                    # We optimize the graph by adding kv in the cross attention layer, preventing computing the
+                    # query of encoder_output.
+                    assert qkv_lora_params == None, "Not support LoRA when we only compute key/value in cross atteniton"
+                    # see optimization_model's optimize_cross_qkv
+                    cross_kv = self.kv(encoder_output, qkv_lora_params)
+                    base_shape = shape(
+                        cross_kv, 0) if cross_kv.ndim() == 2 else concat(
+                            [shape(cross_kv, 0),
+                             shape(cross_kv, 1)])
+                    if self.qk_layernorm:
+                        cross_kv = cross_kv.view(
+                            concat([
+                                base_shape, 2 * self.num_attention_kv_heads,
+                                self.attention_head_size
+                            ]))
 
-                cross_qkv = cross_qkv.view(
-                    concat([
-                        base_shape, self.num_attention_heads +
-                        2 * self.num_attention_kv_heads,
-                        self.attention_head_size
-                    ]))
+                        key, value = split(cross_kv, [
+                            self.num_attention_kv_heads,
+                            self.num_attention_kv_heads
+                        ],
+                                           dim=cross_kv.ndim() - 2)
 
-                if self.qk_layernorm:
-                    _, key, value = split(cross_qkv, [
-                        self.num_attention_heads, self.num_attention_kv_heads,
-                        self.num_attention_kv_heads
-                    ],
-                                          dim=cross_qkv.ndim() - 2)
+                        key = self.k_layernorm(key)
+                        cross_kv = concat([key, value], dim=key.ndim() - 2)
+                else:
+                    cross_qkv = self.qkv(encoder_output, qkv_lora_params)
+                    base_shape = shape(
+                        cross_qkv, 0) if cross_qkv.ndim() == 2 else concat(
+                            [shape(cross_qkv, 0),
+                             shape(cross_qkv, 1)])
 
-                    key = self.k_layernorm(key)
-                    key = key.view(
+                    cross_qkv = cross_qkv.view(
                         concat([
-                            base_shape, self.num_attention_kv_heads,
+                            base_shape, self.num_attention_heads +
+                            2 * self.num_attention_kv_heads,
                             self.attention_head_size
                         ]))
 
-                    cross_kv = concat([key, value], dim=key.ndim() - 2)
-                else:
-                    _, cross_kv = split(cross_qkv, [
-                        self.num_attention_heads,
-                        self.num_attention_kv_heads * 2
-                    ],
-                                        dim=cross_qkv.ndim() - 2)
+                    if self.qk_layernorm:
+                        _, key, value = split(cross_qkv, [
+                            self.num_attention_heads,
+                            self.num_attention_kv_heads,
+                            self.num_attention_kv_heads
+                        ],
+                                              dim=cross_qkv.ndim() - 2)
 
+                        key = self.k_layernorm(key)
+                        cross_kv = concat([key, value], dim=key.ndim() - 2)
+                    else:
+                        _, cross_kv = split(cross_qkv, [
+                            self.num_attention_heads,
+                            self.num_attention_kv_heads * 2
+                        ],
+                                            dim=cross_qkv.ndim() - 2)
                 cross_kv = cross_kv.view(
                     concat([
                         base_shape, 2 * self.num_attention_kv_heads *
@@ -1097,7 +1117,7 @@ class Attention(Module):
                 spec_decoding_packed_mask,
                 mrope_rotary_sin_cos=mrope_params.mrope_rotary_sin_cos,
                 mrope_position_deltas=mrope_params.mrope_position_deltas,
-                qk_tanh_scale=self.max_attn_value,
+                attn_logit_softcapping_scale=self.max_attn_value,
                 host_runtime_perf_knobs=attention_params.
                 host_runtime_perf_knobs,
                 host_context_progress=attention_params.host_context_progress,
@@ -2151,7 +2171,7 @@ class DeepseekV2Attention(Attention):
                 spec_decoding_position_offsets,
                 spec_decoding_packed_mask=spec_decoding_params.
                 spec_decoding_packed_mask,
-                qk_tanh_scale=self.max_attn_value,
+                attn_logit_softcapping_scale=self.max_attn_value,
                 host_runtime_perf_knobs=attention_params.
                 host_runtime_perf_knobs,
                 host_context_progress=attention_params.host_context_progress,

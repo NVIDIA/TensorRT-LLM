@@ -203,7 +203,7 @@ description of this benchmarking workflow, see the [benchmarking suite documenta
 | `$num_requests` | The number of requests to generate for dataset generation |
 | `$seq_len` | A sequence length of ISL + OSL |
 
-## Preparing a Dataset
+### Preparing a Dataset
 
 In order to prepare a dataset, you can use the provided [script](../../../benchmarks/cpp/prepare_dataset.py).
 To generate a synthetic dataset, run the following command:
@@ -236,7 +236,7 @@ remain in the system longer and therefore require less requests to achieve stead
 | 500          | 2000          | 2500       | 3000               |
 | 20000        | 2000          | 22000      | 1000               |
 
-## Engine Building
+### Engine Building
 
 All engines are built using the `trtllm-bench build` sub-command. The basic command for FP8 quantized engines is as follows:
 
@@ -262,7 +262,7 @@ ENGINE SAVED: /tmp/meta-llama/Llama-2-7b-hf/tp_1_pp_1
 ===========================================================
 ```
 
-## Running the Benchmark
+### Running the Benchmark
 
 To run the benchmark with the generated data set, simply use the `trtllm-bench throughput` sub-command. The benchmarker will
 run an offline maximum throughput scenario such that all requests are queued in rapid succession. You simply need to provide
@@ -312,3 +312,93 @@ Total Latency (seconds):        16.406100739
 > [!WARNING] In some cases, the benchmarker may not print anything at all. This behavior usually
 means that the benchmark has hit an out of memory issue. Try reducing the KV cache percentage
 using the `--kv_cache_free_gpu_mem_fraction` option to lower the percentage of used memory.
+
+## Online Serving Measurements
+
+The [TensorRT-LLM backend](https://github.com/triton-inference-server/tensorrtllm_backend) is used to measure the performance of TensorRT-LLM for online serving.
+
+The below table shows the throughput and latency under a serving scenario.
+
+**All data in the table below was generated using version 0.14.0, with 500 requests and BF16 precision.**
+
+|                 |                    |         |         |         |         |                  |                    |                    |                               |                         |
+| --------------- | -------------------| --------| --------| --------| --------|------------------| ------------------ | ------------------ | ----------------------------- |------------------------ |
+| **Model**       | **GPU**            | **TP**  | **Input Length** | **Output Length** | **QPS** | **Tput(req/s)**  | **Mean TTFT(ms)**  | **Mean ITL(ms)**   | **Total Token Tput (tok/s)**  | **Output Tput (tok/s)** |
+|LLaMA 3.1 70B|H100 80GB HBM3|4|467|256|2|2|62|21|1406|498||
+||||||4|4|68|24|2750|973|
+||||||8|7|92|32|5256|1860|
+||||||16|12|175|66|8941|3164|
+||||||32|16|1229|86|11537|4083|
+||||||INF|16|9123|85|11593|4103|
+||||467|16|2|2|53|18|844|28|
+||||||4|4|58|20|1908|63|
+||||||8|8|71|24|3795|126|
+||||||16|16|109|38|7492|248|
+||||||32|28|1197|482|13655|452|
+||||||INF|28|9126|548|13719|454|
+||||202|214|2|2|48|20|780|401|
+||||||4|4|51|22|1499|771|
+||||||8|7|57|25|2702|1390|
+||||||16|11|74|32|4364|2245|
+||||||32|14|116|42|5837|3003|
+||||||INF|16|4482|50|6725|3459|
+|LLaMA 3.1 8B||1|467|256|2|2|23|8|1423|504|
+||||||4|4|24|9|2624|929|
+||||||8|8|26|9|5535|1959|
+||||||16|15|30|11|10636|3765|
+||||||32|26|50|19|19138|6774|
+||||||INF|37|3335|39|26614|9420|
+||||467|16|2|2|19|7|956|32|
+||||||4|4|20|7|1910|63|
+||||||8|8|22|7|3808|126|
+||||||16|16|24|8|7567|251|
+||||||32|31|29|10|14894|493|
+||||||INF|79|3280|193|38319|1269|
+||||202|214|2|2|19|7|809|416|
+||||||4|4|20|8|1586|816|
+||||||8|7|21|9|3047|1568|
+||||||16|13|23|10|5597|2879|
+||||||32|23|27|11|9381|4825|
+||||||INF|39|1657|21|16117|8291|
+|LLaMA 3.1 70B|H200 131GB HBM3|4|467|256|2|2|58|18|1411|499|
+||||||4|4|63|20|2770|980|
+||||||8|7|84|27|5328|1886|
+||||||16|13|165|60|9224|3264|
+||||||32|16|1279|83|11800|4176|
+||||||INF|16|9222|83|11826|4185|
+||||467|16|2|2|50|15|956|32|
+||||||4|4|55|16|1909|63|
+||||||8|8|67|20|3799|126|
+||||||16|16|103|33|7499|248|
+||||||32|28|1259|485|13586|450|
+||||||INF|29|9074|546|13792|457|
+||||202|214|2|2|43|17|793|408|
+||||||4|4|46|18|1524|784|
+||||||8|7|51|21|2796|1438|
+||||||16|11|67|28|4639|2386|
+||||||32|15|112|39|6288|3235|
+||||||INF|17|4480|48|7230|3719|
+|LLaMA 3.1 8B|H200 131GB HBM3|1|467|256|2|2|21|6|1425|504|
+||||||4|4|23|7|2828|1001|
+||||||8|8|24|7|5567|1971|
+||||||16|15|27|9|10761|3809|
+||||||32|27|44|16|19848|7025|
+||||||INF|40|3237|36|28596|10121|
+||||467|16|2|2|18|5|956|32|
+||||||4|4|19|6|1910|63|
+||||||8|8|20|6|3810|126|
+||||||16|16|22|7|7567|250|
+||||||32|31|27|9|14927|494|
+||||||INF|81|3227|190|39007|1291|
+||||202|214|2|2|17|6|812|418|
+||||||4|4|18|6|1597|822|
+||||||8|7|19|7|3088|1589|
+||||||16|14|20|8|5771|2969|
+||||||32|24|24|9|9931|5109|
+||||||INF|43|1665|19|17861|9189|
+
+*TP stands for Tensor Parallelism*
+
+*TTFT stands for Time To First Token*
+
+*ITL stands for Inter Token Latency*

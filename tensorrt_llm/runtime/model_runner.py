@@ -130,6 +130,9 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
     max_medusa_token_len = builder_config.get('max_draft_len', 0)
     num_medusa_heads = builder_config.get('num_medusa_heads', 0)
 
+    skip_cross_attn_blocks = bool(config['pretrained_config'].get(
+        'skip_cross_attn_blocks', False))
+
     # ReDrafter
     redrafter_num_beams = config['pretrained_config'].get(
         'redrafter_num_beams', 0)
@@ -143,8 +146,6 @@ def _builder_to_model_config(config: dict) -> Tuple[ModelConfig, dict]:
     paged_state = plugin_config['paged_state']
     tokens_per_block = plugin_config['tokens_per_block']
     lora_plugin = plugin_config.get('lora_plugin')
-    skip_cross_attn_blocks = bool(
-        pretrained_config.get('skip_cross_attn_blocks', False))
 
     model_config = ModelConfig(
         max_batch_size=max_batch_size,

@@ -138,22 +138,23 @@ WeightOnlyGroupwiseQuantMatmulPlugin::WeightOnlyGroupwiseQuantMatmulPlugin(
         (int) length, (int) (d - a));
 }
 
-template <typename ActivationType, typename WeightType, typename OutputType, cutlass::WeightOnlyQuantOp QuantOp>
+template <typename ActivationType, typename WeightType, typename OutputType, typename ScaleZeroType,
+    cutlass::WeightOnlyQuantOp QuantOp>
 using GemmRunner = tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp,
-    OutputType, OutputType, OutputType>;
+    ScaleZeroType, OutputType, OutputType>;
 
-template <typename ActivationType, typename WeightType, typename OutputType>
+template <typename ActivationType, typename WeightType, typename OutputType, typename ScaleZeroType = OutputType>
 WeightOnlyGemmRunnerPtr selectGemmRunnerForZERO(int quant_algo)
 {
     if (quant_algo & ZERO)
     {
-        return std::make_shared<GemmRunner<ActivationType, WeightType, OutputType,
+        return std::make_shared<GemmRunner<ActivationType, WeightType, OutputType, ScaleZeroType,
             cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS>>();
     }
     else
     {
-        return std::make_shared<
-            GemmRunner<ActivationType, WeightType, OutputType, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY>>();
+        return std::make_shared<GemmRunner<ActivationType, WeightType, OutputType, ScaleZeroType,
+            cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY>>();
     }
 }
 
@@ -230,7 +231,16 @@ void WeightOnlyGroupwiseQuantMatmulPlugin::init(nvinfer1::DataType type, int qua
             {
                 TLLM_THROW("W4A(fp)8 kernel is unsupported on pre-Ada (sm<89) architectures!");
             }
-            TLLM_THROW("FP8 is unsupported on with BF16 scales and zero-points!");
+            else if (mArch < 90)
+            {
+                assert(!(quant_algo & INT8_WEIGHT) && "W4A(fp)8 kernel requires INT4 weight!");
+                m_weightOnlyGroupwiseGemmRunner
+                    = selectGemmRunnerForZERO<__nv_fp8_e4m3, cutlass::uint4b_t, __nv_bfloat16, half>(quant_algo);
+            }
+            else
+            {
+                TLLM_THROW("FP8 is unsupported on with BF16 scales and zero-points!");
+            }
         }
         else
         {

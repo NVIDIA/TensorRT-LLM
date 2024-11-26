@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import math
 from typing import Optional, OrderedDict, Union
 
 import numpy as np
@@ -23,11 +22,9 @@ import transformers
 from tensorrt_llm.models.modeling_utils import PretrainedModel
 
 from ..._common import default_net
-from ...functional import (ACT2FN, Tensor, bert_attention, cast, concat,
-                           constant, cumsum, expand, expand_mask, index_select,
-                           matmul, select, shape, slice, softmax, split,
-                           unsqueeze)
-from ...layers import MLP, ColumnLinear, Embedding, LayerNorm, Linear, RowLinear
+from ...functional import (ACT2FN, Tensor, concat, constant, cumsum, expand,
+                           index_select, select, shape, slice, unsqueeze)
+from ...layers import MLP, BertAttention, Embedding, LayerNorm, Linear
 from ...mapping import Mapping
 from ...module import Module, ModuleList
 from ..modeling_utils import QuantConfig
@@ -64,89 +61,6 @@ class BertEmbedding(Module):
         return x
 
 
-class BertAttention(Module):
-
-    def __init__(self,
-                 hidden_size,
-                 num_attention_heads,
-                 max_position_embeddings,
-                 dtype=None,
-                 tp_group=None,
-                 tp_size=1):
-        super().__init__()
-
-        self.attention_head_size = hidden_size // num_attention_heads
-        self.num_attention_heads = num_attention_heads // tp_size
-        self.hidden_size = hidden_size // tp_size
-        self.max_position_embeddings = max_position_embeddings
-        self.norm_factor = math.sqrt(self.attention_head_size)
-
-        self.qkv = ColumnLinear(hidden_size,
-                                hidden_size * 3,
-                                dtype=dtype,
-                                tp_group=tp_group,
-                                tp_size=tp_size,
-                                gather_output=False)
-        self.dense = RowLinear(hidden_size,
-                               hidden_size,
-                               dtype=dtype,
-                               tp_group=tp_group,
-                               tp_size=tp_size)
-
-    def forward(self,
-                hidden_states,
-                attention_mask=None,
-                input_lengths=None,
-                max_input_length=None):
-        qkv = self.qkv(hidden_states)
-
-        # attention
-        if default_net().plugin_config.bert_attention_plugin:
-            assert input_lengths is not None
-            context = bert_attention(qkv,
-                                     input_lengths,
-                                     self.num_attention_heads,
-                                     self.attention_head_size,
-                                     q_scaling=1.0,
-                                     max_input_length=max_input_length)
-        else:
-            assert not default_net().plugin_config.remove_input_padding, \
-                   "remove_input_padding requires bert_attention_plugin enabled"
-
-            def transpose_for_scores(x):
-                new_x_shape = concat([
-                    shape(x, 0),
-                    shape(x, 1), self.num_attention_heads,
-                    self.attention_head_size
-                ])
-                return x.view(new_x_shape).permute([0, 2, 1, 3])
-
-            query, key, value = split(qkv, self.hidden_size, dim=2)
-            query = transpose_for_scores(query)
-            key = transpose_for_scores(key)
-            value = transpose_for_scores(value)
-
-            key = key.permute([0, 1, 3, 2])
-            attention_scores = matmul(query, key)
-            attention_scores = attention_scores / self.norm_factor
-
-            if attention_mask is not None:
-                attention_mask = cast(attention_mask, attention_scores.dtype)
-                attention_scores = attention_scores + attention_mask
-
-            attention_probs = softmax(attention_scores, dim=-1)
-
-            context = matmul(attention_probs, value,
-                             use_fp32_acc=False).permute([0, 2, 1, 3])
-            context = context.view(
-                concat([shape(context, 0),
-                        shape(context, 1), self.hidden_size]))
-
-        context = self.dense(context)
-
-        return context
-
-
 class BertEncoderLayer(Module):
 
     def __init__(self,
@@ -161,12 +75,13 @@ class BertEncoderLayer(Module):
         self.input_layernorm = LayerNorm(normalized_shape=hidden_size,
                                          dtype=dtype)
 
-        self.attention = BertAttention(hidden_size,
-                                       num_attention_heads,
-                                       max_position_embeddings,
-                                       tp_group=tp_group,
-                                       tp_size=tp_size,
-                                       dtype=dtype)
+        self.attention = BertAttention(
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            max_position_embeddings=max_position_embeddings,
+            tp_group=tp_group,
+            tp_size=tp_size,
+            dtype=dtype)
         self.mlp = MLP(hidden_size=hidden_size,
                        ffn_hidden_size=hidden_size * 4,
                        hidden_act=hidden_act,
@@ -392,7 +307,7 @@ class BertModel(BertBase):
                 hidden_states=None,
                 max_input_length=None):
         # remove_input_padding requires these fields as explicit input
-        extended_attention_mask = None
+        mask = None
         if not default_net().plugin_config.remove_input_padding:
             seq_len_2d = concat([1, shape(input_ids, 1)])
 
@@ -422,10 +337,6 @@ class BertModel(BertBase):
                                          sizes=seq_len_2d)
                     position_ids = expand(position_ids, shape(input_ids))
 
-            # create extended_attention_mask as https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_utils.py
-            extended_attention_mask = expand_mask(mask,
-                                                  tgt_len=1)  # BxL -> Bx1x1xL
-
             # create token_type_ids
             if token_type_ids is None:
                 token_type_ids_buffer = constant(
@@ -443,7 +354,7 @@ class BertModel(BertBase):
         for idx, layer in enumerate(self.layers):
             hidden_states = layer(hidden_states=hidden_states,
                                   input_lengths=input_lengths,
-                                  attention_mask=extended_attention_mask,
+                                  attention_mask=mask,
                                   max_input_length=max_input_length)
             # keep the last layer output name as hidden_states
             if ((idx == (self.config.num_hidden_layers - 1)) and

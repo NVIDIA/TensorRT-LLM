@@ -140,9 +140,9 @@ struct Multihead_attention_params_base
     // The 1.f / sqrt(Dh). Computed on the host.
     float inv_sqrt_dh = 0.0f;
 
-    // The tanh scale factor. (only used by Grok).
-    float qk_tanh_scale = 0.0f;
-    float qk_tanh_inverse_scale = 0.0f;
+    // The attention logit softcapping scale.
+    float attn_logit_softcapping_scale = 0.0f;
+    float attn_logit_softcapping_inverse_scale = 0.0f;
 
     // The attention mask [batch_size, attention_mask_stride (i.e. max_kv_seqlen)]
     bool const* attention_mask = nullptr;

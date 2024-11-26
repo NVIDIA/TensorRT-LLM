@@ -14,7 +14,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 #include "gptAttentionPlugin.h"
+
 #include "tensorrt_llm/batch_manager/contextProgress.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention.h"
@@ -24,10 +26,10 @@
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include "tensorrt_llm/plugins/gptAttentionCommon/gptAttentionCommon.h"
 #include "tensorrt_llm/plugins/gptAttentionCommon/gptAttentionCommonImpl.h"
-#include "tensorrt_llm/runtime/bufferManager.h"
+#include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
-#include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/utils/debugUtils.h"
+
 #include <NvInferRuntimeBase.h>
 #include <algorithm>
 #include <cstdint>
@@ -45,7 +47,7 @@ static char const* GPT_ATTENTION_PLUGIN_NAME{"GPTAttention"};
 
 GPTAttentionPlugin::GPTAttentionPlugin(int layer_idx, int num_heads, int vision_start, int vision_length,
     int num_kv_heads, int layer_idx_in_cache_pool, int head_size, int unidirectional, float q_scaling,
-    float qk_tanh_scale, tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
+    float attn_logit_softcapping_scale, tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
     int rotary_embedding_dim, // for RoPE. 0 for non-RoPE
     float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
     float rotary_embedding_scale, float rotary_embedding_short_m_scale,
@@ -62,15 +64,15 @@ GPTAttentionPlugin::GPTAttentionPlugin(int layer_idx, int num_heads, int vision_
     bool spec_decoding_is_generation_length_variable, int spec_decoding_max_generation_length, bool is_mla_enabled,
     int q_lora_rank, int kv_lora_rank, int qk_nope_head_dim, int qk_rope_head_dim, int v_head_dim, bool skip_attn)
     : GPTAttentionPluginCommon(layer_idx, num_heads, vision_start, vision_length, num_kv_heads, layer_idx_in_cache_pool,
-        head_size, unidirectional, q_scaling, qk_tanh_scale, position_embedding_type, rotary_embedding_dim,
-        rotary_embedding_base, rotary_embedding_scale_type, rotary_embedding_scale, rotary_embedding_short_m_scale,
-        rotary_embedding_long_m_scale, rotary_embedding_max_positions, rotary_embedding_original_max_positions, tp_size,
-        tp_rank, unfuse_qkv_gemm, context_fmha_type, enable_xqa, kv_cache_quant_mode, remove_input_padding, mask_type,
-        block_sparse_params, paged_kv_cache, tokens_per_block, type, max_context_length, qkv_bias_enabled,
-        cross_attention, max_distance, pos_shift_enabled, dense_context_fmha, use_paged_context_fmha,
-        use_fp8_context_fmha, has_full_attention_mask, use_cache, is_spec_decoding_enabled,
-        spec_decoding_is_generation_length_variable, spec_decoding_max_generation_length, is_mla_enabled, q_lora_rank,
-        kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim, skip_attn)
+        head_size, unidirectional, q_scaling, attn_logit_softcapping_scale, position_embedding_type,
+        rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale_type, rotary_embedding_scale,
+        rotary_embedding_short_m_scale, rotary_embedding_long_m_scale, rotary_embedding_max_positions,
+        rotary_embedding_original_max_positions, tp_size, tp_rank, unfuse_qkv_gemm, context_fmha_type, enable_xqa,
+        kv_cache_quant_mode, remove_input_padding, mask_type, block_sparse_params, paged_kv_cache, tokens_per_block,
+        type, max_context_length, qkv_bias_enabled, cross_attention, max_distance, pos_shift_enabled,
+        dense_context_fmha, use_paged_context_fmha, use_fp8_context_fmha, has_full_attention_mask, use_cache,
+        is_spec_decoding_enabled, spec_decoding_is_generation_length_variable, spec_decoding_max_generation_length,
+        is_mla_enabled, q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim, skip_attn)
 {
     initEntryIdx();
 }
@@ -558,6 +560,9 @@ int GPTAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc,
     cudaStream_t stream)
 {
     TLLM_LOG_TRACE("Attention plugin start at layer %d", mLayerIdx);
+
+    using runtime::RequestType;
+
     int32_t const nbSeq = inputDesc[getIdx(IdxEntry::CONTEXT_LENGTHS)].dims.d[0];
     int32_t const beam_width = useKVCache() ? inputDesc[getIdx(IdxEntry::CACHE_INDIR)].dims.d[1] : 1;
     RequestType const* reqTypes = static_cast<RequestType const*>(inputs[getIdx(IdxEntry::REQUEST_TYPES)]);
@@ -672,7 +677,10 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
     //     cross_kv_length [int] max encoder input context length (optional in cross attention mode)
     //     encoder_input_lengths [batch_size] raw sequence lengths (optional in cross attention mode)
 
-    auto const reqTypeInBatchPtr = static_cast<RequestType const*>(inputs[getIdx(IdxEntry::REQUEST_TYPES)]) + seqIdxBeg;
+    using runtime::RequestType;
+
+    auto const* const reqTypeInBatchPtr
+        = static_cast<RequestType const*>(inputs[getIdx(IdxEntry::REQUEST_TYPES)]) + seqIdxBeg;
     bool const is_context = (reqTypeInBatchPtr[0] == RequestType::kCONTEXT);
 
     T const* attention_input = static_cast<T const*>(inputs[getIdx(IdxEntry::QKV_TENSOR)])
@@ -1231,7 +1239,7 @@ IPluginV2* GPTAttentionPluginCreator::createPlugin(char const* name, PluginField
             p.getScalar<int32_t>("vision_length").value(), p.getScalar<int32_t>("num_kv_heads").value(),
             p.getScalar<int32_t>("layer_idx_in_cache_pool").value(), p.getScalar<int32_t>("head_size").value(),
             p.getScalar<int32_t>("unidirectional").value(), p.getScalar<float>("q_scaling").value(),
-            p.getScalar<float>("qk_tanh_scale").value(),
+            p.getScalar<float>("attn_logit_softcapping_scale").value(),
             static_cast<PositionEmbeddingType>(p.getScalar<int8_t>("position_embedding_type").value()),
             p.getScalar<int32_t>("rotary_embedding_dim").value(), p.getScalar<float>("rotary_embedding_base").value(),
             static_cast<RotaryScalingType>(p.getScalar<int8_t>("rotary_embedding_scale_type").value()),

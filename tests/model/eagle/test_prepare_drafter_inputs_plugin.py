@@ -67,6 +67,9 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
         input_ids = torch.tensor([0, 1, 2, 3, 4],
                                  dtype=torch.int32,
                                  device="cuda")
+        chunked_context_next_tokens = torch.tensor([-1],
+                                                   dtype=torch.int32,
+                                                   device="cuda")
         accepted_token_ids = torch.tensor([[0, 1, 5, -1]],
                                           dtype=torch.int32,
                                           device="cuda")
@@ -136,12 +139,13 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
 
         test_cases += [[
             layer_idx, num_layers, max_non_leaves_per_layer, sequence_lengths,
-            context_lengths, input_ids, accepted_token_ids, accepted_lens,
-            accepted_path_ids, next_draft_tokens, next_draft_lens,
-            next_draft_paths, prev_draft_lens, prev_draft_paths,
-            hidden_size_batch_level_starts, input_gen_tokens,
-            input_spec_decoding_generation_lengths, ref_sequence_lengths,
-            ref_context_lengths, ref_spec_decoding_generation_lengths,
+            context_lengths, input_ids, chunked_context_next_tokens,
+            accepted_token_ids, accepted_lens, accepted_path_ids,
+            next_draft_tokens, next_draft_lens, next_draft_paths,
+            prev_draft_lens, prev_draft_paths, hidden_size_batch_level_starts,
+            input_gen_tokens, input_spec_decoding_generation_lengths,
+            ref_sequence_lengths, ref_context_lengths,
+            ref_spec_decoding_generation_lengths,
             ref_spec_decoding_position_offsets, ref_spec_decoding_packed_mask,
             ref_output_ids, ref_position_ids, ref_hidden_states_indices,
             ref_last_token_indices, ref_num_output_tokens,
@@ -155,6 +159,9 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
         sequence_lengths = torch.tensor([4], dtype=torch.int32, device="cuda")
         context_lengths = torch.tensor([4], dtype=torch.int32, device="cuda")
         input_ids = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device="cuda")
+        chunked_context_next_tokens = torch.tensor([-1],
+                                                   dtype=torch.int32,
+                                                   device="cuda")
         accepted_token_ids = torch.tensor([[4, -1, -1, -1]],
                                           dtype=torch.int32,
                                           device="cuda")
@@ -218,12 +225,13 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
 
         test_cases += [[
             layer_idx, num_layers, max_non_leaves_per_layer, sequence_lengths,
-            context_lengths, input_ids, accepted_token_ids, accepted_lens,
-            accepted_path_ids, next_draft_tokens, next_draft_lens,
-            next_draft_paths, prev_draft_lens, prev_draft_paths,
-            hidden_size_batch_level_starts, input_gen_tokens,
-            input_spec_decoding_generation_lengths, ref_sequence_lengths,
-            ref_context_lengths, ref_spec_decoding_generation_lengths,
+            context_lengths, input_ids, chunked_context_next_tokens,
+            accepted_token_ids, accepted_lens, accepted_path_ids,
+            next_draft_tokens, next_draft_lens, next_draft_paths,
+            prev_draft_lens, prev_draft_paths, hidden_size_batch_level_starts,
+            input_gen_tokens, input_spec_decoding_generation_lengths,
+            ref_sequence_lengths, ref_context_lengths,
+            ref_spec_decoding_generation_lengths,
             ref_spec_decoding_position_offsets, ref_spec_decoding_packed_mask,
             ref_output_ids, ref_position_ids, ref_hidden_states_indices,
             ref_last_token_indices, ref_num_output_tokens,
@@ -241,6 +249,9 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
         input_ids = torch.tensor([0, 1, 2, 10, 11, 12, 13],
                                  dtype=torch.int32,
                                  device="cuda")
+        chunked_context_next_tokens = torch.tensor([-1, -1],
+                                                   dtype=torch.int32,
+                                                   device="cuda")
         accepted_token_ids = torch.tensor([[0, 5, -1, -1], [10, 11, 20, -1]],
                                           dtype=torch.int32,
                                           device="cuda")
@@ -310,12 +321,13 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
 
         test_cases += [[
             layer_idx, num_layers, max_non_leaves_per_layer, sequence_lengths,
-            context_lengths, input_ids, accepted_token_ids, accepted_lens,
-            accepted_path_ids, next_draft_tokens, next_draft_lens,
-            next_draft_paths, prev_draft_lens, prev_draft_paths,
-            hidden_size_batch_level_starts, input_gen_tokens,
-            input_spec_decoding_generation_lengths, ref_sequence_lengths,
-            ref_context_lengths, ref_spec_decoding_generation_lengths,
+            context_lengths, input_ids, chunked_context_next_tokens,
+            accepted_token_ids, accepted_lens, accepted_path_ids,
+            next_draft_tokens, next_draft_lens, next_draft_paths,
+            prev_draft_lens, prev_draft_paths, hidden_size_batch_level_starts,
+            input_gen_tokens, input_spec_decoding_generation_lengths,
+            ref_sequence_lengths, ref_context_lengths,
+            ref_spec_decoding_generation_lengths,
             ref_spec_decoding_position_offsets, ref_spec_decoding_packed_mask,
             ref_output_ids, ref_position_ids, ref_hidden_states_indices,
             ref_last_token_indices, ref_num_output_tokens,
@@ -333,6 +345,9 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
         input_ids = torch.tensor([0, 1, 2, 10, 11, 12, 13],
                                  dtype=torch.int32,
                                  device="cuda")
+        chunked_context_next_tokens = torch.tensor([-1, -1],
+                                                   dtype=torch.int32,
+                                                   device="cuda")
         accepted_token_ids = torch.tensor([[3, -1, -1, -1], [10, 11, 20, -1]],
                                           dtype=torch.int32,
                                           device="cuda")
@@ -402,12 +417,13 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
 
         test_cases += [[
             layer_idx, num_layers, max_non_leaves_per_layer, sequence_lengths,
-            context_lengths, input_ids, accepted_token_ids, accepted_lens,
-            accepted_path_ids, next_draft_tokens, next_draft_lens,
-            next_draft_paths, prev_draft_lens, prev_draft_paths,
-            hidden_size_batch_level_starts, input_gen_tokens,
-            input_spec_decoding_generation_lengths, ref_sequence_lengths,
-            ref_context_lengths, ref_spec_decoding_generation_lengths,
+            context_lengths, input_ids, chunked_context_next_tokens,
+            accepted_token_ids, accepted_lens, accepted_path_ids,
+            next_draft_tokens, next_draft_lens, next_draft_paths,
+            prev_draft_lens, prev_draft_paths, hidden_size_batch_level_starts,
+            input_gen_tokens, input_spec_decoding_generation_lengths,
+            ref_sequence_lengths, ref_context_lengths,
+            ref_spec_decoding_generation_lengths,
             ref_spec_decoding_position_offsets, ref_spec_decoding_packed_mask,
             ref_output_ids, ref_position_ids, ref_hidden_states_indices,
             ref_last_token_indices, ref_num_output_tokens,
@@ -435,6 +451,9 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
         # Not relevant here
         input_ids = torch.tensor([0], dtype=torch.int32,
                                  device="cuda")  # Not relevant here
+        chunked_context_next_tokens = torch.tensor([-1],
+                                                   dtype=torch.int32,
+                                                   device="cuda")
         accepted_token_ids = torch.tensor([[3, -1, -1, -1]],
                                           dtype=torch.int32,
                                           device="cuda")  # Not relevant here
@@ -495,12 +514,13 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
 
         test_cases += [[
             layer_idx, num_layers, max_non_leaves_per_layer, sequence_lengths,
-            context_lengths, input_ids, accepted_token_ids, accepted_lens,
-            accepted_path_ids, next_draft_tokens, next_draft_lens,
-            next_draft_paths, prev_draft_lens, prev_draft_paths,
-            hidden_size_batch_level_starts, input_gen_tokens,
-            input_spec_decoding_generation_lengths, ref_sequence_lengths,
-            ref_context_lengths, ref_spec_decoding_generation_lengths,
+            context_lengths, input_ids, chunked_context_next_tokens,
+            accepted_token_ids, accepted_lens, accepted_path_ids,
+            next_draft_tokens, next_draft_lens, next_draft_paths,
+            prev_draft_lens, prev_draft_paths, hidden_size_batch_level_starts,
+            input_gen_tokens, input_spec_decoding_generation_lengths,
+            ref_sequence_lengths, ref_context_lengths,
+            ref_spec_decoding_generation_lengths,
             ref_spec_decoding_position_offsets, ref_spec_decoding_packed_mask,
             ref_output_ids, ref_position_ids, ref_hidden_states_indices,
             ref_last_token_indices, ref_num_output_tokens,
@@ -559,12 +579,13 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
 
         test_cases += [[
             layer_idx, num_layers, max_non_leaves_per_layer, sequence_lengths,
-            context_lengths, input_ids, accepted_token_ids, accepted_lens,
-            accepted_path_ids, next_draft_tokens, next_draft_lens,
-            next_draft_paths, prev_draft_lens, prev_draft_paths,
-            hidden_size_batch_level_starts, input_gen_tokens,
-            input_spec_decoding_generation_lengths, ref_sequence_lengths,
-            ref_context_lengths, ref_spec_decoding_generation_lengths,
+            context_lengths, input_ids, chunked_context_next_tokens,
+            accepted_token_ids, accepted_lens, accepted_path_ids,
+            next_draft_tokens, next_draft_lens, next_draft_paths,
+            prev_draft_lens, prev_draft_paths, hidden_size_batch_level_starts,
+            input_gen_tokens, input_spec_decoding_generation_lengths,
+            ref_sequence_lengths, ref_context_lengths,
+            ref_spec_decoding_generation_lengths,
             ref_spec_decoding_position_offsets, ref_spec_decoding_packed_mask,
             ref_output_ids, ref_position_ids, ref_hidden_states_indices,
             ref_last_token_indices, ref_num_output_tokens,
@@ -598,6 +619,9 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
         # Not relevant here
         input_ids = torch.tensor([0], dtype=torch.int32,
                                  device="cuda")  # Not relevant here
+        chunked_context_next_tokens = torch.tensor([-1, -1],
+                                                   dtype=torch.int32,
+                                                   device="cuda")
         accepted_token_ids = torch.tensor([[3, -1, -1, -1], [3, -1, -1, -1]],
                                           dtype=torch.int32,
                                           device="cuda")  # Not relevant here
@@ -666,12 +690,99 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
 
         test_cases += [[
             layer_idx, num_layers, max_non_leaves_per_layer, sequence_lengths,
-            context_lengths, input_ids, accepted_token_ids, accepted_lens,
-            accepted_path_ids, next_draft_tokens, next_draft_lens,
-            next_draft_paths, prev_draft_lens, prev_draft_paths,
-            hidden_size_batch_level_starts, input_gen_tokens,
-            input_spec_decoding_generation_lengths, ref_sequence_lengths,
-            ref_context_lengths, ref_spec_decoding_generation_lengths,
+            context_lengths, input_ids, chunked_context_next_tokens,
+            accepted_token_ids, accepted_lens, accepted_path_ids,
+            next_draft_tokens, next_draft_lens, next_draft_paths,
+            prev_draft_lens, prev_draft_paths, hidden_size_batch_level_starts,
+            input_gen_tokens, input_spec_decoding_generation_lengths,
+            ref_sequence_lengths, ref_context_lengths,
+            ref_spec_decoding_generation_lengths,
+            ref_spec_decoding_position_offsets, ref_spec_decoding_packed_mask,
+            ref_output_ids, ref_position_ids, ref_hidden_states_indices,
+            ref_last_token_indices, ref_num_output_tokens,
+            ref_num_last_token_indices, ref_out_hidden_size_batch_level_starts
+        ]]
+
+        ################# CASE 7 ##########################
+        # BS=1, layer_idx=0 (Ctx Eagle Net), chunked ctx request.
+        # EAGLE-1.
+        layer_idx = 0
+        sequence_lengths = torch.tensor([4], dtype=torch.int32, device="cuda")
+        context_lengths = torch.tensor([4], dtype=torch.int32, device="cuda")
+        input_ids = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device="cuda")
+        chunked_context_next_tokens = torch.tensor([5],
+                                                   dtype=torch.int32,
+                                                   device="cuda")
+        accepted_token_ids = torch.tensor([[4, -1, -1, -1]],
+                                          dtype=torch.int32,
+                                          device="cuda")
+        accepted_lens = torch.tensor([1], dtype=torch.int32, device="cuda")
+        accepted_path_ids = torch.tensor([0], dtype=torch.int32, device="cuda")
+        next_draft_tokens = torch.tensor([[0, 0, 0, 0]],
+                                         dtype=torch.int32,
+                                         device="cuda")
+        next_draft_lens = torch.tensor([0], dtype=torch.int32, device="cuda")
+        next_draft_paths = torch.tensor(
+            [[[0, 1, 3, -1], [0, 2, 4, -1], [-1, -1, -1, -1], [-1, -1, -1, -1],
+              [-1, -1, -1, -1]]],
+            dtype=torch.int32,
+            device="cuda")
+        prev_draft_lens = torch.tensor([0], dtype=torch.int32, device="cuda")
+        # Next path is the same as prev path.
+        prev_draft_paths = torch.tensor(
+            [[[0, 1, 3, -1], [0, 2, 4, -1], [-1, -1, -1, -1], [-1, -1, -1, -1],
+              [-1, -1, -1, -1]]],
+            dtype=torch.int32,
+            device="cuda")
+
+        # Content of these two tensors is irrelevant. Only shape
+        input_gen_tokens = torch.empty((0, ), dtype=torch.int32)
+
+        input_spec_decoding_generation_lengths = torch.empty((0, ),
+                                                             dtype=torch.int32)
+
+        # Refs
+        ref_sequence_lengths = torch.tensor([4],
+                                            dtype=torch.int32,
+                                            device="cuda")
+        ref_context_lengths = torch.tensor([4],
+                                           dtype=torch.int32,
+                                           device="cuda")
+        ref_output_ids = torch.tensor([1, 2, 3, 5],
+                                      dtype=torch.int32,
+                                      device="cuda")
+        ref_position_ids = torch.tensor([0, 1, 2, 3],
+                                        dtype=torch.int32,
+                                        device="cuda")
+        ref_hidden_states_indices = torch.tensor([0, 1, 2, 3],
+                                                 dtype=torch.int32,
+                                                 device="cuda")
+        ref_num_output_tokens = torch.tensor([4],
+                                             dtype=torch.int32,
+                                             device="cuda")
+        ref_num_last_token_indices = torch.tensor([1],
+                                                  dtype=torch.int32,
+                                                  device="cuda")
+        ref_last_token_indices = torch.tensor([4, 1],
+                                              dtype=torch.int32,
+                                              device="cuda")
+        ref_out_hidden_size_batch_level_starts = torch.tensor([0, 1],
+                                                              dtype=torch.int32,
+                                                              device="cuda")
+
+        ref_spec_decoding_generation_lengths = None
+        ref_spec_decoding_position_offsets = None
+        ref_spec_decoding_packed_mask = None
+
+        test_cases += [[
+            layer_idx, num_layers, max_non_leaves_per_layer, sequence_lengths,
+            context_lengths, input_ids, chunked_context_next_tokens,
+            accepted_token_ids, accepted_lens, accepted_path_ids,
+            next_draft_tokens, next_draft_lens, next_draft_paths,
+            prev_draft_lens, prev_draft_paths, hidden_size_batch_level_starts,
+            input_gen_tokens, input_spec_decoding_generation_lengths,
+            ref_sequence_lengths, ref_context_lengths,
+            ref_spec_decoding_generation_lengths,
             ref_spec_decoding_position_offsets, ref_spec_decoding_packed_mask,
             ref_output_ids, ref_position_ids, ref_hidden_states_indices,
             ref_last_token_indices, ref_num_output_tokens,
@@ -682,10 +793,11 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
     @parameterized.expand(load_test_cases, name_func=unittest_name_func)
     def test_sample_accept_draft_tokens_plugin(
             self, layer_idx, num_layers, max_non_leaves_per_layer,
-            sequence_lengths, context_lengths, input_ids, accepted_token_ids,
-            accepted_lens, accepted_path_ids, next_draft_tokens,
-            next_draft_lens, next_draft_paths, prev_draft_lens,
-            prev_draft_paths, hidden_size_batch_level_starts, input_gen_tokens,
+            sequence_lengths, context_lengths, input_ids,
+            chunked_context_next_tokens, accepted_token_ids, accepted_lens,
+            accepted_path_ids, next_draft_tokens, next_draft_lens,
+            next_draft_paths, prev_draft_lens, prev_draft_paths,
+            hidden_size_batch_level_starts, input_gen_tokens,
             input_spec_decoding_generation_lengths, ref_sequence_lengths,
             ref_context_lengths, ref_spec_decoding_generation_lengths,
             ref_spec_decoding_position_offsets, ref_spec_decoding_packed_mask,
@@ -704,6 +816,8 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
         assert sequence_lengths.shape[0] == batch_size
 
         assert context_lengths.shape[0] == batch_size
+
+        assert chunked_context_next_tokens.shape[0] == batch_size
 
         assert accepted_token_ids.shape[0] == batch_size
         assert accepted_token_ids.shape[1] == max_path_len
@@ -753,6 +867,10 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
             input_ids_t = Tensor(name='input_ids',
                                  dtype=trt.int32,
                                  shape=input_ids.shape)
+            chunked_context_next_tokens_t = Tensor(
+                name='chunked_context_next_tokens',
+                dtype=trt.int32,
+                shape=chunked_context_next_tokens.shape)
             accepted_token_ids_t = Tensor(name='accepted_token_ids',
                                           dtype=trt.int32,
                                           shape=accepted_token_ids.shape)
@@ -795,11 +913,12 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
 
             output = tensorrt_llm.models.eagle.model.eagle_prepare_drafter_inputs_plugin(
                 layer_idx, num_layers, max_non_leaves_per_layer,
-                attention_params, input_ids_t, accepted_token_ids_t,
-                accepted_lens_t, accepted_path_ids_t, next_draft_tokens_t,
-                next_draft_lens_t, next_draft_paths_t, prev_draft_lens_t,
-                prev_draft_paths_t, hidden_size_batch_level_starts_t,
-                input_gen_tokens_t, input_spec_decoding_generation_lengths_t)
+                attention_params, input_ids_t, chunked_context_next_tokens_t,
+                accepted_token_ids_t, accepted_lens_t, accepted_path_ids_t,
+                next_draft_tokens_t, next_draft_lens_t, next_draft_paths_t,
+                prev_draft_lens_t, prev_draft_paths_t,
+                hidden_size_batch_level_starts_t, input_gen_tokens_t,
+                input_spec_decoding_generation_lengths_t)
 
             output[0].mark_output('output_sequence_lengths')
             output[1].mark_output('output_context_lengths')
@@ -831,6 +950,7 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
             "sequence_lengths": sequence_lengths,
             "context_lengths": context_lengths,
             "input_ids": input_ids,
+            "chunked_context_next_tokens": chunked_context_next_tokens,
             "accepted_token_ids": accepted_token_ids,
             "accepted_lens": accepted_lens,
             "accepted_path_ids": accepted_path_ids,

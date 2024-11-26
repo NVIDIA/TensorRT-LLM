@@ -8,7 +8,6 @@ from pathlib import Path
 import click
 from click_option_group import optgroup
 
-from tensorrt_llm.bench.benchmark.dataclasses import RuntimeConfig
 from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
 
 # isort: off
@@ -17,9 +16,10 @@ from tensorrt_llm.bench.benchmark.utils.general import (get_executor_requests,
                                                         )
 # isort: on
 from tensorrt_llm.bench.benchmark.utils.multiproc import ThroughputBenchmark
-from tensorrt_llm.bench.benchmark.utils.reporting import report_statistics
-from tensorrt_llm.bench.dataclasses import BenchmarkEnvironment
-from tensorrt_llm.bench.enums import IFBSchedulingPolicy
+from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
+from tensorrt_llm.bench.dataclasses.enums import IFBSchedulingPolicy
+from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
+from tensorrt_llm.bench.dataclasses.reporting import report_statistics
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer)
 from tensorrt_llm.logger import logger
@@ -160,7 +160,6 @@ def throughput_command(
             "support this dataset.")
 
     if TRTLLM_BENCH_EXPERIMENTAL:
-        assert runtime_config.settings_config.max_num_tokens >= metadata.max_isl, "Max tokens is not large enough to handle max input length. Chunking currently not supported."
         asyncio.run(async_benchmark(runtime_config, requests, streaming))
     else:
         # Dataset Loading and Preparation

@@ -14,18 +14,18 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/kernels/decodingCommon.h"
+
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
-#include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/runtime/common.h"
-#include <stdio.h>
+
+#include <cstdint>
 
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
 
-namespace tensorrt_llm
-{
-namespace kernels
+namespace tensorrt_llm::kernels
 {
 
 __global__ void curandInitialize(curandState_t* state, int const* batchSlots, int const size, uint64_t const randomSeed)
@@ -157,7 +157,7 @@ void invokeAddBiasSoftMax(T* logits, T** logitsPtrs, T* probs, T const* bias, in
 
     dim3 grid(batchSize, beamWidth);
     auto const vocabRoundedToWarp = roundUp(vocabSize, 32);
-    dim3 block(min(vocabRoundedToWarp, 1024)); // vocabSize is usually larger than 1024
+    dim3 block(std::min(vocabRoundedToWarp, 1024)); // vocabSize is usually larger than 1024
     addBiasSoftMax<<<grid, block, 0, stream>>>(logits, logitsPtrs, probs, bias, endIds, finished, batchSlots,
         maxBatchSize, beamWidth, vocabSize, vocabSizePadded, skipSoftMax, batchSlotsLogits);
 
@@ -202,5 +202,4 @@ template void invokeScatterDecodingParams(
 template void invokeScatterDecodingParams(
     int32_t const* src, int32_t scalar, int32_t* dst, int const* batchSlots, int batchSize, cudaStream_t stream);
 
-} // namespace kernels
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::kernels
