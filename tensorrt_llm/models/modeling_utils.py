@@ -362,7 +362,7 @@ class PretrainedConfig:
             if (not use_parallel_embedding) or (use_parallel_embedding and
                                                 embedding_sharding_dim == 1):
                 raise NotImplementedError(
-                    "For tensor parallelism, sharing the embedding table must set" \
+                    "For tensor parallelism, sharing the embedding table must set " \
                         "use_parallel_embedding=True and embedding_sharding_dim=0"
                 )
         if share_embedding_table and mapping.pp_size > 1:
