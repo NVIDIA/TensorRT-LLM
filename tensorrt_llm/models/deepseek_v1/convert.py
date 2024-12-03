@@ -22,17 +22,17 @@ from tensorrt_llm.layers import MoeConfig
 
 from ..._utils import pad_vocab_size, release_gc
 from ...mapping import Mapping
+from ..convert_utils import infer_dtype
 
 
 ## Convert config parameters to dict
 def create_trt_config_from_hf(model_dir,
-                              dtype,
+                              dtype: str,
                               mapping: Mapping,
                               override_fields: dict = {}):
-    config = {}
     assert isinstance(model_dir, str)
     hf_config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
-    dtype = dtype
+    dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
     n_layer = hf_config.num_hidden_layers
     n_head = hf_config.num_attention_heads
     n_embd = hf_config.hidden_size
@@ -67,11 +67,13 @@ def create_trt_config_from_hf(model_dir,
         'rotary_base': rotary_base,
         'norm_epsilon': rms_norm_eps,
         'rotary_scaling': rotary_scaling,
-        'moe_num_experts': moe_num_experts,
-        'moe_top_k': moe_top_k,
-        'moe_renorm_mode': moe_renorm_mode,
-        'moe_num_shared_experts': moe_num_shared_experts,
-        'moe_inter_size': moe_inter_size,
+        'moe': {
+            'num_experts': moe_num_experts,
+            'top_k': moe_top_k,
+            'normalization_mode': moe_renorm_mode,
+            'num_shared_experts': moe_num_shared_experts,
+            'moe_intermediate_size': moe_inter_size,
+        },
         'mapping': {
             'world_size': mapping.tp_size * mapping.pp_size,
             'tp_size': mapping.tp_size,
@@ -82,11 +84,7 @@ def create_trt_config_from_hf(model_dir,
     }
     config.update(override_fields)
 
-    moe_config = MoeConfig(num_experts=config['moe_num_experts'],
-                           moe_intermediate_size=config['moe_inter_size'],
-                           num_shared_experts=config['moe_num_shared_experts'],
-                           top_k=config['moe_top_k'],
-                           normalization_mode=config['moe_renorm_mode'])
+    moe_config = MoeConfig.from_dict(config['moe'])
     moe_config.validate()
 
     return config
@@ -151,11 +149,7 @@ def convert_deepseek(hf_model,
     mapping.tp_size
     model_params = dict(hf_model.named_parameters())
     dtype = getattr(torch, dtype)
-    moe_config = MoeConfig(num_experts=config['moe_num_experts'],
-                           moe_intermediate_size=config['moe_inter_size'],
-                           num_shared_experts=config['moe_num_shared_experts'],
-                           top_k=config['moe_top_k'],
-                           normalization_mode=config['moe_renorm_mode'])
+    moe_config = MoeConfig.from_dict(config['moe'])
 
     layers_range = mapping.pp_layers(config['num_hidden_layers'])
 

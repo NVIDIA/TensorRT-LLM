@@ -164,6 +164,10 @@ struct cutlassTypeMapper
             return ss.str();                                                                                           \
         }                                                                                                              \
     };
+CUTLASS_TYPE_MAPPER_REGISTRY(wo::KernelType::FP16Int8Groupwise, "FP16Int8Groupwise", half, uint8_t, 8,
+    cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS);
+CUTLASS_TYPE_MAPPER_REGISTRY(wo::KernelType::BF16Int8Groupwise, "BF16Int8Groupwise", __nv_bfloat16, uint8_t, 8,
+    cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS);
 CUTLASS_TYPE_MAPPER_REGISTRY(wo::KernelType::FP16Int4Groupwise, "FP16Int4Groupwise", half, cutlass::uint4b_t, 4,
     cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS);
 CUTLASS_TYPE_MAPPER_REGISTRY(wo::KernelType::BF16Int4Groupwise, "BF16Int4Groupwise", __nv_bfloat16, cutlass::uint4b_t,
@@ -367,8 +371,8 @@ bool benchmark_and_verify(int m, int n, int k, int groupsize, int warmup, int it
     d_out.copy_to(h_out2.data());
     float quant_scale = 1.f / (1 << (WSizeInBits - 1));
     bool pass = compare<AType>(h_out1.data(), h_out2.data(), m * n, quant_scale);
-    printf(
-        "cuda kernel cost time %.6f, cutlass kernel cost time %.6f, cuda speedup %.3f\n", time1, time2, time2 / time1);
+    printf("cuda kernel cost time %.6f, cutlass kernel cost time %.6f, cuda speedup %.3f\n\n", time1, time2,
+        time2 / time1);
     return pass;
 }
 
@@ -392,6 +396,10 @@ TEST(Kernel, WeightOnly)
                 EXPECT_TRUE(pass);
                 if (arch >= 75)
                 {
+                    pass = benchmark_and_verify<wo::KernelType::FP16Int8Groupwise>(m, n, k, 64, warmup, iter);
+                    EXPECT_TRUE(pass);
+                    pass = benchmark_and_verify<wo::KernelType::FP16Int8Groupwise>(m, n, k, 128, warmup, iter);
+                    EXPECT_TRUE(pass);
                     pass = benchmark_and_verify<wo::KernelType::FP16Int4Groupwise>(m, n, k, 64, warmup, iter);
                     EXPECT_TRUE(pass);
                     pass = benchmark_and_verify<wo::KernelType::FP16Int4Groupwise>(m, n, k, 128, warmup, iter);
@@ -399,6 +407,10 @@ TEST(Kernel, WeightOnly)
 #if defined(ENABLE_BF16)
                     if (arch >= 80)
                     {
+                        pass = benchmark_and_verify<wo::KernelType::BF16Int8Groupwise>(m, n, k, 64, warmup, iter);
+                        EXPECT_TRUE(pass);
+                        pass = benchmark_and_verify<wo::KernelType::BF16Int8Groupwise>(m, n, k, 128, warmup, iter);
+                        EXPECT_TRUE(pass);
                         pass = benchmark_and_verify<wo::KernelType::BF16Int4Groupwise>(m, n, k, 64, warmup, iter);
                         EXPECT_TRUE(pass);
                         pass = benchmark_and_verify<wo::KernelType::BF16Int4Groupwise>(m, n, k, 128, warmup, iter);

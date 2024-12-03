@@ -14,13 +14,12 @@
 # limitations under the License.
 from typing import TYPE_CHECKING, Optional, Union
 
-import torch
 from typing_extensions import Literal
 
-from tensorrt_llm._utils import torch_dtype_to_str
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.convert_utils import infer_dtype
 from tensorrt_llm.models.modeling_utils import (Gemma2ConfigGroup,
                                                 PretrainedConfig, QuantConfig)
 
@@ -145,14 +144,8 @@ class GemmaConfig(PretrainedConfig):
             hf_config = transformers.GemmaConfig.from_pretrained(
                 hf_config_or_dir)
 
-        if dtype == "auto":
-            dtype = getattr(hf_config, "torch_dtype", None)
-            if dtype is None:
-                dtype = "float16"
-            if isinstance(dtype, torch.dtype):
-                dtype = torch_dtype_to_str(dtype)
-            if dtype == "float32":
-                dtype = "float16"
+        dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
+
         assert isinstance(quant_config, QuantConfig) or quant_config is None
         assert isinstance(mapping, Mapping) or mapping is None
         return cls(

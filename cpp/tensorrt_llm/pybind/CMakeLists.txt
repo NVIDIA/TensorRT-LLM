@@ -13,6 +13,7 @@ set(SRCS
     batch_manager/namedTensor.cpp
     executor/bindings.cpp
     executor/executor.cpp
+    runtime/bindings.cpp
     bindings.cpp)
 
 include_directories(${PROJECT_SOURCE_DIR}/include)
@@ -35,6 +36,8 @@ target_compile_definitions(
 if(NOT WIN32)
   set_target_properties(
     ${TRTLLM_PYBIND_MODULE}
-    PROPERTIES LINK_FLAGS
-               "-Wl,-rpath,'$ORIGIN/libs' ${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
+    PROPERTIES
+      LINK_FLAGS
+      "-Wl,-rpath,'$ORIGIN/libs' -Wl,-rpath,'$ORIGIN/../nvidia/nccl/lib' ${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}"
+  )
 endif()

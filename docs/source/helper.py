@@ -8,16 +8,11 @@ def underline(title: str, character: str = "=") -> str:
 
 
 def generate_title(filename: str) -> str:
-    # Turn filename into a title
-    title = filename.replace("_", " ").title()
-    # Underline title
-
-    title = ' '.join([
-        word.upper() if word.lower() == 'llm' else word
-        for word in title.split()
-    ])
-    title = underline(title)
-    return title
+    with open(filename) as f:
+        first_line = f.readline()
+        assert first_line.startswith("### ")
+        title = first_line[4:].strip()
+    return underline(title)
 
 
 def generate_examples():
@@ -45,7 +40,7 @@ def generate_examples():
 
         # Make script_path relative to doc_path and call it include_path
         include_path = '../../..' / script_path.relative_to(root_dir)
-        content = (f"{generate_title(doc_path.stem)}\n\n"
+        content = (f"{generate_title(script_path)}\n\n"
                    f"Source {script_url}.\n\n"
                    f".. literalinclude:: {include_path}\n"
                    "    :language: python\n"
@@ -93,13 +88,13 @@ def generate_llmapi():
     doc_dir.mkdir(exist_ok=True)
     doc_path = doc_dir / "reference.rst"
 
-    hlapi_all_file = root_dir / "tensorrt_llm/hlapi/__init__.py"
-    public_classes_names = extract_all_and_eval(hlapi_all_file)['__all__']
+    llmapi_all_file = root_dir / "tensorrt_llm/llmapi/__init__.py"
+    public_classes_names = extract_all_and_eval(llmapi_all_file)['__all__']
 
     content = underline("API Reference", "-") + "\n\n"
     for cls_name in public_classes_names:
         cls_name = cls_name.strip()
-        content += (f".. autoclass:: tensorrt_llm.hlapi.{cls_name}\n"
+        content += (f".. autoclass:: tensorrt_llm.llmapi.{cls_name}\n"
                     "    :members:\n"
                     "    :undoc-members:\n"
                     "    :special-members: __init__\n"

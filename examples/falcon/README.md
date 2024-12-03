@@ -67,6 +67,9 @@ git clone https://huggingface.co/tiiuae/falcon-40b-instruct falcon/40b-instruct
 
 # falcon-180b
 git clone https://huggingface.co/tiiuae/falcon-180B falcon/180b
+
+# falcon-11b (Falcon 2)
+git clone https://huggingface.co/tiiuae/falcon-11B falcon/11b
 ```
 
 ### 2. Convert weights from HF Transformers to TensorRT-LLM format
@@ -112,6 +115,11 @@ python3 convert_checkpoint.py --model_dir ./falcon/180b \
                 --pp_size 2 \
                 --load_by_shard \
                 --workers 8
+
+# falcon-11b (Falcon 2): single gpu, dtype bfloat16
+python3 convert_checkpoint.py --model_dir ./falcon/11b \
+                --dtype bfloat16 \
+                --output_dir ./falcon/11b/trt_ckpt/bf16/1-gpu/
 ```
 
 Note that in order to use N-way tensor parallelism, the number of attention heads must be a multiple of N.
@@ -162,6 +170,12 @@ trtllm-build --checkpoint_dir ./falcon/180b/trt_ckpt/bf16/tp4-pp2/ \
                 --gpt_attention_plugin bfloat16 \
                 --output_dir ./falcon/180b/trt_engines/bf16/tp4-pp2/ \
                 --workers 8
+
+# falcon-11b (Falcon 2)
+trtllm-build --checkpoint_dir ./falcon/11b/trt_ckpt/bf16/1-gpu/ \
+                --gemm_plugin bfloat16 \
+                --gpt_attention_plugin bfloat16 \
+                --output_dir ./falcon/11b/trt_engines/bf16/1-gpu/
 ```
 
 If the engines are built successfully, you will see output like (falcon-rw-1b as the example):
@@ -215,6 +229,11 @@ mpirun -n 8 --allow-run-as-root --oversubscribe \
     python ../summarize.py --test_trt_llm \
                            --hf_model_dir ./falcon/180b \
                            --engine_dir ./falcon/180b/trt_engines/bf16/tp4-pp2/
+
+# falcon-11b (Falcon 2)
+python ../summarize.py --test_trt_llm \
+                       --hf_model_dir ./falcon/11b \
+                       --engine_dir ./falcon/11b/trt_engines/bf16/1-gpu/
 ```
 
 If the engines are run successfully, you will see output like (falcon-rw-1b as the example):

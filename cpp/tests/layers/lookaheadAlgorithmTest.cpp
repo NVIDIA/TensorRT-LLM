@@ -116,7 +116,7 @@ TEST_P(LookaheadAlgorithmTest, predict)
     PRINT_TOKENS(sequence);
 
     tensorrt_llm::layers::LookaheadAlgorithm algo(W, N, G);
-    algo.setup(ITensor::slice(sequence, 0, sequenceLength), w, n, g);
+    algo.setup(ITensor::slice(sequence, 0, sequenceLength), w, n, g, 42);
 
     SizeType32 seqLen = oracle.size();
     std::vector<SizeType32> histogram(N + 1);

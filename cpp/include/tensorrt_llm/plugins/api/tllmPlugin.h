@@ -16,8 +16,22 @@
 
 #pragma once
 
-#include <NvInferRuntime.h>
+#include <cstdint>
 #include <mutex>
+
+// Forward declarations
+namespace nvinfer1
+{
+class ILoggerFinder;
+class ILogger;
+
+namespace v_1_0
+{
+class IPluginCreator;
+class IPluginCreatorInterface;
+} // namespace v_1_0
+
+} // namespace nvinfer1
 
 namespace tensorrt_llm::plugins::api
 {
@@ -54,6 +68,6 @@ extern "C"
     // The functions below are used by TensorRT to when loading a shared plugin library with automatic registering.
     // see https://docs.nvidia.com/deeplearning/tensorrt/developer-guide/index.html#generating-plugin-library
     [[maybe_unused]] void setLoggerFinder([[maybe_unused]] nvinfer1::ILoggerFinder* finder);
-    [[maybe_unused]] nvinfer1::IPluginCreator* const* getPluginCreators(int32_t& nbCreators);
-    [[maybe_unused]] nvinfer1::IPluginCreatorInterface* const* getCreators(std::int32_t& nbCreators);
+    [[maybe_unused]] nvinfer1::v_1_0::IPluginCreator* const* getPluginCreators(std::int32_t& nbCreators);
+    [[maybe_unused]] nvinfer1::v_1_0::IPluginCreatorInterface* const* getCreators(std::int32_t& nbCreators);
 }

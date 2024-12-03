@@ -174,6 +174,16 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
         externalDraftTokensParams->runtimeTopP = mSamplingConfig.topP;
         setupParams->decodingParams = std::move(externalDraftTokensParams);
     }
+    else if (mDecodingMode.isEagle())
+    {
+        TLLM_CHECK_WITH_INFO(output.has_value(), "Output tensors must be provided for Eagle");
+        auto eagleParams = std::make_shared<tl::EagleSetupParams>();
+        eagleParams->temperature = mSamplingConfig.temperature;
+        eagleParams->randomDataSample = output->eagleBuffers->randomDataSample;
+        eagleParams->temperatures = output->eagleBuffers->temperatures;
+
+        setupParams->decodingParams = eagleParams;
+    }
     setupParams->decodingParams->randomSeed = mSamplingConfig.randomSeed;
 
     mDecodingLayerWorkspace->setDeviceBatchSlots(batchSlots);
@@ -319,6 +329,30 @@ void prepareLookaheadInputs(
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
+void prepareEagleInput(DecodingInput const& inputs, std::shared_ptr<tl::DecodingInputs>& baseInputs)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    auto inputParams = std::dynamic_pointer_cast<tl::EagleInputs>(baseInputs);
+
+    auto& eagleInputs = inputs.eagleInputs;
+
+    TLLM_CHECK_WITH_INFO(eagleInputs.has_value(), "EagleInputs are not set");
+
+    inputParams->nextDraftTokens = eagleInputs->nextDraftTokens;
+    inputParams->nextDraftLens = eagleInputs->nextDraftLens;
+    inputParams->nextDraftPaths = eagleInputs->nextDraftPaths;
+    inputParams->lastDraftTokens = eagleInputs->lastDraftTokens;
+    inputParams->lastDraftLens = eagleInputs->lastDraftLens;
+    inputParams->lastDraftPaths = eagleInputs->lastDraftPaths;
+    inputParams->acceptedTokens = eagleInputs->acceptedTokens;
+    inputParams->acceptedLens = eagleInputs->acceptedLens;
+    inputParams->acceptedPathIds = eagleInputs->acceptedPathIds;
+    inputParams->seqSlots = eagleInputs->seqSlots;
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
 template <typename T>
 std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
     DecodingInput const& input, size_t maxBatchSize, tle::DecodingMode const& decodingMode)
@@ -355,9 +389,21 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
         forwardParams = std::make_shared<tl::ExternalDraftTokensInputs>(
             input.endIds, input.batchSlots, input.step, ite, input.batchSize);
     }
+    else if (decodingMode.isEagle())
+    {
+        auto& eagleInputs = input.eagleInputs;
 
-    // No logits for explicit draft tokens
-    if (!decodingMode.isExplicitDraftTokens())
+        TLLM_CHECK_WITH_INFO(eagleInputs.has_value(), "EagleInputs are not set");
+
+        forwardParams = std::make_shared<tl::EagleInputs>(input.endIds, input.batchSlots, input.batchSize,
+            eagleInputs->nextDraftTokens, eagleInputs->nextDraftLens, eagleInputs->nextDraftPaths,
+            eagleInputs->lastDraftTokens, eagleInputs->lastDraftLens, eagleInputs->lastDraftPaths,
+            eagleInputs->acceptedTokens, eagleInputs->acceptedLens, eagleInputs->acceptedPathIds,
+            eagleInputs->seqSlots);
+    }
+
+    // No logits for explicit draft tokens and eagle
+    if (!decodingMode.isExplicitDraftTokens() && !decodingMode.isEagle())
     {
         if (input.logitsVec)
         {
@@ -421,6 +467,11 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
     if (decodingMode.isExternalDraftTokens())
     {
         prepareExternalDraftTokensInputs(input, maxBatchSize, forwardParams);
+    }
+
+    if (decodingMode.isEagle())
+    {
+        prepareEagleInput(input, forwardParams);
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -517,7 +568,7 @@ void prepareSpeculativeDecodingOutputs(DecodingOutput& output, std::shared_ptr<t
         outputParams->generationLengthsHost = explicitDraftTokensBuffers->generationLengthsHost;
         outputParams->maxGenLengthHost = explicitDraftTokensBuffers->maxGenLengthHost;
     }
-    if (decodingMode.isLookahead())
+    else if (decodingMode.isLookahead())
     {
         TLLM_CHECK(output.lookaheadOutputs);
         auto outputParams = std::dynamic_pointer_cast<tl::LookaheadDecodingOutputs>(baseOutputs);
@@ -525,6 +576,29 @@ void prepareSpeculativeDecodingOutputs(DecodingOutput& output, std::shared_ptr<t
         outputParams->positionIds = output.lookaheadOutputs->positionIds;
         outputParams->positionOffsets = output.lookaheadOutputs->positionOffsets;
         outputParams->generationLengths = output.lookaheadOutputs->generationLengths;
+    }
+    else if (decodingMode.isEagle())
+    {
+        auto outputParams = std::dynamic_pointer_cast<tl::EagleOutputs>(baseOutputs);
+        auto const& eagleBuffers = output.eagleBuffers;
+        TLLM_CHECK_WITH_INFO(eagleBuffers.has_value(), "eagleBuffers is not set");
+
+        outputParams->temperatures = eagleBuffers->temperatures;
+        outputParams->unpackedNextDraftTokens = eagleBuffers->draftTokens;
+        outputParams->nextDraftPaths = eagleBuffers->draftPaths;
+        outputParams->generationLengths = eagleBuffers->specDecodingGenerationLengths;
+        outputParams->generationLengthsHost = eagleBuffers->specDecodingGenerationLengthsHost;
+        outputParams->nextDraftPosIds = eagleBuffers->specDecodingPositionOffsets;
+        outputParams->packedMasks = eagleBuffers->specDecodingPackedMasks;
+        outputParams->randomDataSample = eagleBuffers->randomDataSample;
+        outputParams->randomDataValidation = eagleBuffers->randomDataValidation;
+
+        outputParams->eagleNetCtxRequestTypesHost = eagleBuffers->eagleNetCtxRequestTypesHost;
+        outputParams->eagleNetCtxContextLengthsHost = eagleBuffers->eagleNetCtxContextLengthsHost;
+        outputParams->eagleNetCtxPastKeyValueLengthsHost = eagleBuffers->eagleNetCtxPastKeyValueLengthsHost;
+        outputParams->eagleNetGenRequestTypesHost = eagleBuffers->eagleNetGenRequestTypesHost;
+        outputParams->eagleNetGenContextLengthsHost = eagleBuffers->eagleNetGenContextLengthsHost;
+        outputParams->eagleNetGenPastKeyValueLengthsHost = eagleBuffers->eagleNetGenPastKeyValueLengthsHost;
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -550,6 +624,10 @@ std::shared_ptr<tl::BaseDecodingOutputs> prepareOutputs(DecodingOutput& output, 
     else if (decodingMode.isExplicitDraftTokens())
     {
         outputParams = std::make_shared<tl::ExplicitDraftTokensOutputs>(output.ids);
+    }
+    else if (decodingMode.isEagle())
+    {
+        outputParams = std::make_shared<tl::EagleOutputs>(output.ids);
     }
     else
     {
@@ -597,7 +675,8 @@ std::shared_ptr<tl::BaseDecodingOutputs> prepareOutputs(DecodingOutput& output, 
     }
 
     // Speculative decoding outputs
-    if (decodingMode.isMedusa() || decodingMode.isLookahead() || decodingMode.isExplicitDraftTokens())
+    if (decodingMode.isMedusa() || decodingMode.isLookahead() || decodingMode.isExplicitDraftTokens()
+        || decodingMode.isEagle())
     {
         prepareSpeculativeDecodingOutputs(output, outputParams, decodingMode);
     }

@@ -59,6 +59,7 @@ __global__ void maskTargetLogitsKernel(T* targetLogits, SizeType32 const* batchS
 
     auto* outputIdsAfterSamplingPtr = outputIdsAfterSampling + batchSlot * vocabSize;
     auto const useDraftLogits = batchUseDraftLogits[batchSlot];
+    auto* maskBufferBatch = maskBuffer + batchSlot * vocabSize;
 
     if (finishedState.isSkipDecoding() || finishedState.isFinished())
     {
@@ -79,9 +80,16 @@ __global__ void maskTargetLogitsKernel(T* targetLogits, SizeType32 const* batchS
         { // we need to find the -1 boundary from returnAllTopP outputIds if topK == 0 or number of topP indices < topK
             tokensToMask = vIdx;
         }
-        maskBuffer[vIdx] = false;
+        maskBufferBatch[vIdx] = false;
     }
 
+    __syncthreads();
+    if (tid == 0 && tokensToMask == 0)
+    {
+        // all tokens are selected if topK == 0 && topP ~= 1.0f
+        // in this case tokensToMask = vocabSize
+        tokensToMask = vocabSize;
+    }
     __syncthreads();
 
     if (!useDraftLogits && tid == 0)
@@ -92,14 +100,14 @@ __global__ void maskTargetLogitsKernel(T* targetLogits, SizeType32 const* batchS
     for (SizeType32 vIdx = tid; vIdx < tokensToMask; vIdx += static_cast<SizeType32>(blockDim.x))
     {
         auto tokenToMask = outputIdsAfterSamplingPtr[vIdx];
-        maskBuffer[tokenToMask] = true;
+        maskBufferBatch[tokenToMask] = true;
     }
 
     __syncthreads();
 
     for (SizeType32 vIdx = tid; vIdx < vocabSize; vIdx += static_cast<SizeType32>(blockDim.x))
     {
-        if (!maskBuffer[vIdx])
+        if (!maskBufferBatch[vIdx])
         {
             targetLogitsBatch[vIdx] = -MAX_T_VAL;
         }

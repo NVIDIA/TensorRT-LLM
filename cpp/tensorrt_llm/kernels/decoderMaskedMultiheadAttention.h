@@ -144,6 +144,10 @@ struct Multihead_attention_params_base
     float qk_tanh_scale = 0.0f;
     float qk_tanh_inverse_scale = 0.0f;
 
+    // The attention mask [batch_size, attention_mask_stride (i.e. max_kv_seqlen)]
+    bool const* attention_mask = nullptr;
+    int attention_mask_stride = 0;
+
     // If relative position embedding is used
     T const* relative_attention_bias = nullptr;
     int relative_attention_bias_stride = 0;

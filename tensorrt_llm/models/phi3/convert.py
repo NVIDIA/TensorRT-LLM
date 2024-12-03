@@ -99,6 +99,21 @@ def load_weights_from_hf_model(hf_model, config):
         dtype = torch.float if "router" in key else torch_dtype
         weights[key] = value.to(dtype).cpu()
 
+    #This is for InternVL-4B
+    if config.architecture == 'Phi3ForCausalLM':
+        keys_to_rename = [
+            key for key in weights.keys() if 'language_model.' in key
+        ]
+        keys_to_delete = [
+            key for key in weights.keys() if 'vision_model.' in key
+        ]
+        for key in keys_to_rename:
+            keys_rename = key.replace('language_model.', '')
+            weights[keys_rename] = weights[key]
+            del weights[key]
+        for key in keys_to_delete:
+            del weights[key]
+
     if config.architecture == 'Phi3SmallForCausalLM':
         weights['lm_head.weight'] = weights[
             'transformer.vocab_embedding.weight'].clone()

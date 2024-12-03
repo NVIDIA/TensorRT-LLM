@@ -14,11 +14,9 @@
 # limitations under the License.
 from typing import Optional, Union
 
-import torch
-
-from ..._utils import torch_dtype_to_str
 from ...layers import MoeConfig
 from ...mapping import Mapping
+from ..convert_utils import infer_dtype
 from ..modeling_utils import PretrainedConfig, QuantConfig
 
 
@@ -32,12 +30,14 @@ class QWenConfig(PretrainedConfig):
                  rotary_scaling: Optional[dict] = None,
                  disable_weight_only_quant_plugin: bool = False,
                  moe: Optional[Union[MoeConfig, dict]] = None,
+                 num_labels: int = 1,
                  **kwargs):
         self.mlp_bias = mlp_bias
         self.attn_bias = attn_bias
         self.rotary_base = rotary_base
         self.rotary_scaling = rotary_scaling
         self.disable_weight_only_quant_plugin = disable_weight_only_quant_plugin
+        self.num_labels = num_labels
         if moe is None:
             # Legacy MOE config fields
             moe = MoeConfig(num_experts=kwargs.pop('moe_num_experts', 0),
@@ -82,9 +82,22 @@ class QWenConfig(PretrainedConfig):
 
             hf_config = transformers.AutoConfig.from_pretrained(
                 hf_config_dir, trust_remote_code=trust_remote_code)
+        if hasattr(hf_config, 'llm_config'):
+            hf_config = hf_config.llm_config
 
         qwen_type = hf_config.model_type
-        valid_types = ('qwen', 'qwen2', 'qwen2_moe')
+        # lmms llava onevision qwen
+        if qwen_type == 'llava':
+            qwen_type = 'qwen2'
+        if hf_config.architectures and hf_config.architectures[
+                0] == 'LlavaQwenForCausalLM':
+            hf_config.architectures[0] = 'Qwen2ForCausalLM'
+        # hf llava onevision qwen
+        if qwen_type == 'llava_onevision':
+            hf_config = hf_config.text_config
+            qwen_type = f'{hf_config.model_type}_llava_onevision'
+
+        valid_types = ('qwen', 'qwen2', 'qwen2_moe', 'qwen2_llava_onevision')
         assert qwen_type in valid_types, f"Unsupported Qwen type: {qwen_type}, only {valid_types} are acceptable."
         num_key_value_heads = getattr(hf_config, "num_key_value_heads",
                                       hf_config.num_attention_heads)
@@ -104,6 +117,10 @@ class QWenConfig(PretrainedConfig):
             rms_norm_eps = hf_config.rms_norm_eps
             rotary_base = getattr(hf_config, "rope_theta", 100000.0)
 
+        num_labels = 1
+        if hf_config.architectures[0] == "Qwen2ForSequenceClassification":
+            num_labels = hf_config.num_labels
+
         moe_num_experts = getattr(hf_config, "num_experts", 0)
         moe_top_k = getattr(hf_config, "num_experts_per_tok", 0)
         moe_intermediate_size = getattr(hf_config, "moe_intermediate_size", 0)
@@ -115,14 +132,8 @@ class QWenConfig(PretrainedConfig):
                                normalization_mode=moe_normalization_mode)
         moe_config.validate()
 
-        if dtype == 'auto':
-            dtype = getattr(hf_config, 'torch_dtype', None)
-            if dtype is None:
-                dtype = 'float16'
-            if isinstance(dtype, torch.dtype):
-                dtype = torch_dtype_to_str(dtype)
-            if dtype == 'float32':
-                dtype = 'float16'
+        dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
+        tie_word_embeddings = getattr(hf_config, 'tie_word_embeddings', False)
 
         return cls(
             architecture=hf_config.architectures[0],
@@ -149,4 +160,6 @@ class QWenConfig(PretrainedConfig):
             moe=moe_config,
             mapping=mapping,
             quantization=quant_config,
+            num_labels=num_labels,
+            tie_word_embeddings=tie_word_embeddings,
             **kwargs)

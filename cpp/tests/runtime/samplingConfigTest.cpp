@@ -41,6 +41,28 @@ TEST(samplingConfigTest, validInputs)
         EXPECT_THAT(samplingCfg.draftAcceptanceThreshold.value(), testing::ElementsAre(0.5f));
     }
     {
+        texec::SamplingConfig execSamplingCfg(1);
+        execSamplingCfg.setNumReturnSequences(3);
+        tr::SamplingConfig samplingCfg(execSamplingCfg, std::nullopt);
+        EXPECT_EQ(samplingCfg.beamWidth, execSamplingCfg.getBeamWidth());
+        EXPECT_EQ(samplingCfg.beamWidth, execSamplingCfg.getNumReturnBeams());
+        EXPECT_EQ(samplingCfg.numReturnSequences, execSamplingCfg.getNumReturnSequences());
+    }
+    {
+        texec::SamplingConfig execSamplingCfg(4);
+        execSamplingCfg.setNumReturnSequences(3);
+        tr::SamplingConfig samplingCfg(execSamplingCfg, std::nullopt);
+        EXPECT_EQ(samplingCfg.beamWidth, execSamplingCfg.getBeamWidth());
+        EXPECT_EQ(samplingCfg.numReturnSequences, execSamplingCfg.getNumReturnBeams());
+        EXPECT_EQ(samplingCfg.numReturnSequences, execSamplingCfg.getNumReturnSequences());
+    }
+    {
+        texec::SamplingConfig execSamplingCfg(4);
+        tr::SamplingConfig samplingCfg(execSamplingCfg, std::nullopt);
+        EXPECT_EQ(samplingCfg.beamWidth, execSamplingCfg.getBeamWidth());
+        EXPECT_EQ(samplingCfg.beamWidth, execSamplingCfg.getNumReturnBeams());
+    }
+    {
         texec::SizeType32 topK = 1;
         texec::FloatType topP = 0.5;
         texec::FloatType topPMin = 0.1;

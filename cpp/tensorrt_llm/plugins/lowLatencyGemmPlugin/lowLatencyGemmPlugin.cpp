@@ -81,7 +81,8 @@ void LowLatencyGemmPluginProfiler::runTactic(int m, int n, int k, LowLatencyGemm
         = reinterpret_cast<FP8Type*>(nextWorkspacePtr(reinterpret_cast<int8_t*>(aTmp), m * k * sizeof(FP8Type)));
     void* cTmp = reinterpret_cast<void*>(nextWorkspacePtr(reinterpret_cast<int8_t*>(bTmp), n * k * sizeof(FP8Type)));
     size_t workspaceSize = mRunner->getWorkspaceSize(m, n, k);
-    char* workspaceTmp = reinterpret_cast<char*>(nextWorkspacePtr(reinterpret_cast<int8_t*>(cTmp), workspaceSize));
+    char* workspaceTmp = reinterpret_cast<char*>(nextWorkspacePtr(
+        reinterpret_cast<int8_t*>(cTmp), m * n * (mType == nvinfer1::DataType::kFLOAT ? sizeof(float) : sizeof(half))));
     mRunner->gemm(aTmp, bTmp, 1.0f, 0.0f, nullptr, cTmp, m, n, k, default_pdl_overlap_ratio, default_prefetch_ratio,
         tactic, workspaceTmp, workspaceSize, stream);
 }

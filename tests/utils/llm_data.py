@@ -17,3 +17,7 @@ def llm_models_root(check=False) -> Optional[Path]:
         "You shall set LLM_MODELS_ROOT env or be able to access /home/scratch.trt_llm_data to run this test"
 
     return root if root.exists() else None
+
+
+def llm_datasets_root() -> str:
+    return os.path.join(llm_models_root(check=True), "datasets")

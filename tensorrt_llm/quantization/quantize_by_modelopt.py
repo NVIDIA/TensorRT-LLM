@@ -32,7 +32,7 @@ from safetensors.torch import load_file, save_file
 from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-from .._utils import release_gc
+from .._utils import release_gc, str_dtype_to_torch
 from ..logger import logger
 from ..mapping import Mapping
 from .mode import QuantAlgo
@@ -93,12 +93,12 @@ KV_CACHE_CFG = {
 
 
 def quant_cfg_choices():
-    import modelopt.torch.quantization as atq
+    import modelopt.torch.quantization as mtq
     QUANT_CFG_CHOICES = {
-        "int8_sq": atq.INT8_SMOOTHQUANT_CFG,
-        "fp8": atq.FP8_DEFAULT_CFG,
-        "int4_awq": atq.INT4_AWQ_CFG,
-        "w4a8_awq": atq.W4A8_AWQ_BETA_CFG,
+        "int8_sq": mtq.INT8_SMOOTHQUANT_CFG,
+        "fp8": mtq.FP8_DEFAULT_CFG,
+        "int4_awq": mtq.INT4_AWQ_CFG,
+        "w4a8_awq": mtq.W4A8_AWQ_BETA_CFG,
         "int8_wo": EMPTY_CFG,
         "int4_wo": EMPTY_CFG,
         "full_prec": EMPTY_CFG,
@@ -119,15 +119,20 @@ MODEL_NAME_PATTERN_MAP = {
     "Bloom": "bloom",
     "ChatGLM": "chatglm",
     "QWen": "qwen",
+    "Gemma2": "gemma2",
     "Gemma": "gemma",
     "MixtralForCausalLM": "llama",
+    "NemotronForCausalLM": "nemotron",
+    "GPTBigCodeForCausalLM": "gpt_bigcode",
     "ArcticForCausalLM": "llama",
     "Phi3SmallForCausalLM": "phi3small",
     "Phi3ForCausalLM": "phi3",
     "Starcoder2ForCausalLM": "gptnext",
     "GPTBigCodeForCausalLM": "gptnext",
     "GLM": "glm",
+    "Exaone": "exaone",
     "DeciLMForCausalLM": "deci",
+    "DeepseekForCausalLM": "deepseek",
 }
 
 
@@ -138,7 +143,7 @@ class _CustomDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         item = {
-            key: torch.tensor(val[idx])
+            key: val[idx].clone().detach().requires_grad_(False)
             for key, val in self.encodings.items()
         }
         return item
@@ -180,25 +185,37 @@ def _get_vila_model(model_dir):
     return model.llm
 
 
-def get_model(ckpt_path, dtype="fp16", device="cuda"):
-    logger.info(f"Initializing model from {ckpt_path}")
-    if dtype == "bf16" or dtype == "bfloat16":
-        dtype = torch.bfloat16
-    elif dtype == "fp16" or dtype == "float16":
-        dtype = torch.float16
-    elif dtype == "fp32" or dtype == "float32":
-        dtype = torch.float32
-    else:
-        raise NotImplementedError(f"Unknown dtype {dtype}")
-
-    # Note: VILA model is not in public HF model zoo yet. We need to explicitly import from the git repo
+def get_hf_config(ckpt_path):
     if "mpt" in ckpt_path:
         # MPT-7B cannot get initialized from AutoConfig
         from transformers import MptConfig
-        hf_config = MptConfig.from_pretrained(ckpt_path)
+        return MptConfig.from_pretrained(ckpt_path)
     else:
-        hf_config = AutoConfig.from_pretrained(ckpt_path,
-                                               trust_remote_code=True)
+        return AutoConfig.from_pretrained(ckpt_path, trust_remote_code=True)
+
+
+def _get_llava_qwen_model(model_dir, dtype, device):
+    if "hf" in model_dir:
+        from transformers import LlavaOnevisionForConditionalGeneration
+        model = LlavaOnevisionForConditionalGeneration.from_pretrained(
+            model_dir, torch_dtype=dtype, device_map=device)
+        model = model.language_model
+    else:
+        from llava.model.builder import load_pretrained_model
+        _, model, _, _ = load_pretrained_model(model_dir,
+                                               None,
+                                               'llava_qwen',
+                                               torch_dtype=dtype,
+                                               device_map=device)
+    return model
+
+
+def get_model(ckpt_path: str, dtype: str = 'bfloat16', device: str = 'cuda'):
+    logger.info(f"Initializing model from {ckpt_path}")
+    # Note: VILA model is not in public HF model zoo yet. We need to explicitly import from the git repo
+    hf_config = get_hf_config(ckpt_path)
+    torch_dtype = str_dtype_to_torch(dtype)
+
     model_cls = AutoModelForCausalLM
     if hf_config.model_type == "llava":
         from transformers import LlavaForConditionalGeneration
@@ -208,11 +225,13 @@ def get_model(ckpt_path, dtype="fp16", device="cuda"):
         model_cls = MptForCausalLM
     if "vila" in ckpt_path:
         model = _get_vila_model(ckpt_path)
+    elif "llava-onevision-qwen2" in ckpt_path:
+        model = _get_llava_qwen_model(ckpt_path, dtype, device)
     elif hf_config.model_type == "glm":
         from transformers import AutoModelForSeq2SeqLM
         model = AutoModelForSeq2SeqLM.from_pretrained(ckpt_path,
                                                       device_map="cuda",
-                                                      torch_dtype=dtype,
+                                                      torch_dtype=torch_dtype,
                                                       trust_remote_code=True)
     else:
         model = model_cls.from_pretrained(
@@ -220,12 +239,12 @@ def get_model(ckpt_path, dtype="fp16", device="cuda"):
             device_map="auto" if device != "cpu" else "cpu",
             torch_dtype="auto",
             trust_remote_code=True)
-        if hf_config.model_type == "llava":
+        if hf_config.model_type in ["llava", "internvl_chat"]:
             model = model.language_model
     model.eval()
 
     model_dtype = next(model.parameters()).dtype
-    if dtype != model_dtype:
+    if torch_dtype != model_dtype:
         logger.info(
             f"[TensorRT-LLM][WARNING] The manually set model data type is {dtype}, "
             f"but the data type of the HuggingFace model is {model_dtype}.")
@@ -294,7 +313,8 @@ def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
         batch_encoded = _CustomDataset(batch_encoded)
     else:
         # For backward compatibility, if labels are not needed, we only return input_ids.
-        batch_encoded = batch_encoded["input_ids"]
+        batch_encoded = _CustomDataset(
+            {"input_ids": batch_encoded["input_ids"]})
 
     calib_dataloader = DataLoader(batch_encoded,
                                   batch_size=batch_size,
@@ -304,18 +324,45 @@ def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
 
 
 def quantize_model(model, quant_cfg, calib_dataloader, batch_size, qformat,
-                   weight_compression):
-    import modelopt.torch.quantization as atq
+                   auto_quantize_bits):
+    import modelopt.torch.quantization as mtq
+
+    # NOTE: for ModelOpt v0.19 release
+    # calibrate_loop = dataset_utils.create_forward_loop(
+    #     calib_dataloader, dataloader=calib_dataloader)
 
     def calibrate_loop():
         if calib_dataloader is None:
             return
-        """Adjusts weights and scaling factors based on selected algorithms."""
-        for idx, data in enumerate(calib_dataloader):
-            logger.debug(f"Calibrating batch {idx}")
-            # model might be mapped to different device because the device_map is auto
-            data = data.to(model.device)
-            model(data)
+        with torch.no_grad():
+            low_mem_mode = False
+            for _, data in enumerate(calib_dataloader):
+                batch_size = data[list(data.keys())[0]].shape[0]
+                if batch_size == 1:
+                    model(**data)
+                elif not low_mem_mode:
+                    # Try running the forward once.
+                    # If output memory, we try running inference with split input tensors
+                    try:
+                        model(**data)
+                    except torch.OutOfMemoryError:
+                        print(
+                            "Warning: torch.OutOfMemoryError detected, try reducing the batch size..."
+                        )
+                        low_mem_mode = True
+
+                if low_mem_mode:
+                    split_data_1 = {
+                        key: data[key][:batch_size // 2, ...]
+                        for key in data
+                    }
+                    model(**split_data_1)
+
+                    split_data_2 = {
+                        key: data[key][batch_size // 2:, ...]
+                        for key in data
+                    }
+                    model(**split_data_2)
 
     QUANT_CFG_CHOICES = {
         "int8": "INT8_DEFAULT_CFG",
@@ -327,26 +374,52 @@ def quantize_model(model, quant_cfg, calib_dataloader, batch_size, qformat,
 
     logger.info("Starting quantization...")
     start_time = time.time()
-    if weight_compression:
+    if auto_quantize_bits:
         logger.info("Starting mixed precision quantization...")
-        model, search_history = atq.auto_quantize(
+        model, search_history = mtq.auto_quantize(
             model,
             data_loader=calib_dataloader,
             loss_func=lambda output, batch: output.loss,
-            constraints={"weight_compression": weight_compression},
+            constraints={"effective_bits": auto_quantize_bits},
+            forward_step=lambda model, batch: model(**batch),
             quantization_formats=[
                 QUANT_CFG_CHOICES[item] for item in qformat.split(",")
             ] + [None],
-            collect_func=lambda x: x,
             num_calib_steps=len(calib_dataloader),
             num_score_steps=min(
                 len(calib_dataloader), 128 // batch_size
             ),  # Limit the number of score steps to avoid long calibration time
             verbose=True,
         )
-        atq.print_quant_summary(model)
+        mtq.print_quant_summary(model)
+
+        # We need to explicitly calibrate for kv cache quantization
+        enable_kv_cache_quantization = "int8" not in qformat
+        if enable_kv_cache_quantization:
+            mtq.set_quantizer_by_cfg(
+                model,
+                quant_cfg={
+                    "*output_quantizer": {
+                        "num_bits": (4, 3),
+                        "axis": None,
+                        "enable": True
+                    }
+                },
+            )
+            # Lets calibrate only the output quantizer this time. Let's disable all other quantizers.
+            with mtq.set_quantizer_by_cfg_context(model, {
+                    "*": {
+                        "enable": False
+                    },
+                    "*output_quantizer": {
+                        "enable": True
+                    }
+            }):
+                mtq.calibrate(model,
+                              algorithm="max",
+                              forward_loop=calibrate_loop)
     else:
-        atq.quantize(model, quant_cfg, forward_loop=calibrate_loop)
+        mtq.quantize(model, quant_cfg, forward_loop=calibrate_loop)
     end_time = time.time()
     logger.info(
         "Quantization done. Total time used: {:.2f} s.".format(end_time -
@@ -443,7 +516,7 @@ def quantize_and_export(*,
                         medusa_hidden_act=None,
                         medusa_model_dir=None,
                         quant_medusa_head=None,
-                        weight_compression=None):
+                        auto_quantize_bits=None):
     '''
         Load model from the model_dir, call Modelopt to quantize the model, and then export
         the quantized model as TRT-LLM checkpoint
@@ -458,11 +531,21 @@ def quantize_and_export(*,
 
     from modelopt.torch.export import export_tensorrt_llm_checkpoint
 
+    from tensorrt_llm.models.convert_utils import infer_dtype
+
     if not torch.cuda.is_available():
         raise EnvironmentError("GPU is required for inference.")
 
     random.seed(seed)
     np.random.seed(seed)
+
+    # Check that only one quantization format is provided for non auto_quant case
+    if not auto_quantize_bits:
+        assert (len(qformat.split(",")) == 1
+                ), "Quantization supports only one quantization format."
+
+    hf_config = get_hf_config(model_dir)
+    dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
 
     model = get_model(model_dir, dtype, device=device)
     model_type = get_model_type(model)
@@ -479,7 +562,7 @@ def quantize_and_export(*,
                    ] and kv_cache_dtype is None:
         logger.info(f"No quantization applied, export {dtype} model")
     else:
-        if any("awq" in item for item in qformat.split(",")):
+        if "awq" in qformat:
             if calib_size > 32:
                 logger.info(
                     f"AWQ calibration could take longer with calib_size = {calib_size}, Using"
@@ -491,23 +574,37 @@ def quantize_and_export(*,
                 " set by adding the argument --batch_size <batch_size> to the command line.\n"
             )
 
-        # Check if qformat provided is supported. qformat is list of one element for non auto_quant case.
-        if all(item in quant_cfg_choices() for item in qformat.split(",")):
-            quant_cfg = quant_cfg_choices()[qformat.split(",")[0]]
-        else:
-            raise ValueError(f"Unsupported quantization format: {qformat}")
+        quant_cfg = None
+        if not auto_quantize_bits:
+            if qformat in quant_cfg_choices():
+                quant_cfg = quant_cfg_choices()[qformat]
+            else:
+                raise ValueError(f"Unsupported quantization format: {qformat}")
 
-        # Auto quantize does not use quant_cfg
-        if not weight_compression and "awq" in qformat:
-            quant_cfg = copy.deepcopy(quant_cfg_choices()[qformat])
-            weight_quantizer = quant_cfg["quant_cfg"]["*weight_quantizer"]
-            if isinstance(weight_quantizer, list):
-                weight_quantizer = weight_quantizer[0]
-            weight_quantizer["block_sizes"][-1] = awq_block_size
+            if "awq" in qformat:
+                quant_cfg = copy.deepcopy(quant_cfg_choices()[qformat])
+                weight_quantizer = quant_cfg["quant_cfg"]["*weight_quantizer"]
+                if isinstance(weight_quantizer, list):
+                    weight_quantizer = weight_quantizer[0]
+                if awq_block_size:
+                    weight_quantizer["block_sizes"][-1] = awq_block_size
 
-            # Coarser optimal scale search seems to resolve the overflow in TRT-LLM for some models
-            if "w4a8_awq" == qformat and model_type in ["gemma", "mpt"]:
-                quant_cfg["algorithm"] = {"method": "awq_lite", "alpha_step": 1}
+                # Coarser optimal scale search seems to resolve the overflow in TRT-LLM for some models
+                if "w4a8_awq" == qformat and model_type in ["gemma", "mpt"]:
+                    quant_cfg["algorithm"] = {
+                        "method": "awq_lite",
+                        "alpha_step": 1
+                    }
+
+            if kv_cache_dtype is not None:
+                if kv_cache_dtype == "fp8":
+                    for value in KV_CACHE_CFG.values():
+                        value.update({"num_bits": (4, 3)})  # type: ignore
+                quant_cfg["quant_cfg"].update(KV_CACHE_CFG)  # type: ignore
+
+            # Gemma 7B has accuracy regression using alpha 1. We set 0.5 instead.
+            if model_type == "gemma" and "int8_sq" in qformat:
+                quant_cfg["algorithm"] = {"method": "smoothquant", "alpha": 0.5}
 
         calib_dataloader = get_calib_dataloader(
             dataset_name_or_dir=calib_dataset,
@@ -515,29 +612,12 @@ def quantize_and_export(*,
             batch_size=batch_size,
             calib_size=calib_size,
             block_size=calib_max_seq_length,
-            device=torch.device("cuda") if weight_compression else None,
-            include_labels=weight_compression is not None,
+            device=device,
+            include_labels=auto_quantize_bits is not None,
         )
-
-        # Always turn on FP8 kv cache to save memory footprint.
-        # For int8_sq, we do not quantize kv cache to preserve accuracy.
-        # We turn off FP8 kv cache for unified_hf checkpoint
-        enable_quant_kv_cache = "int8" not in qformat
-        print(
-            f'{"Enable" if enable_quant_kv_cache else "Disable"} KV cache quantization'
-        )
-        quant_cfg["quant_cfg"]["*output_quantizer"] = {
-            "num_bits": 8 if qformat == "int8_sq" else (4, 3),
-            "axis": None,
-            "enable": enable_quant_kv_cache,
-        }
-
-        # Gemma 7B has accuracy regression using alpha 1. We set 0.5 instead.
-        if model_type == "gemma" and "int8_sq" in qformat.split(","):
-            quant_cfg["algorithm"] = {"method": "smoothquant", "alpha": 0.5}
 
         model = quantize_model(model, quant_cfg, calib_dataloader, batch_size,
-                               qformat, weight_compression)
+                               qformat, auto_quantize_bits)
 
     with torch.inference_mode():
         if model_type is None:
@@ -560,29 +640,19 @@ def quantize_and_export(*,
             "w4a8_awq": "W4A8_AWQ",
         }
 
-        # workaround for old API version
-        if weight_compression:
-            export_tensorrt_llm_checkpoint(
-                model,
-                model_type,
-                getattr(torch, dtype),
-                export_dir=export_path,
-                inference_tensor_parallel=tp_size,
-                inference_pipeline_parallel=pp_size,
-                auto_quant=weight_compression is not None,
-            )
-        else:
-            export_tensorrt_llm_checkpoint(
-                model,
-                model_type,
-                getattr(torch, dtype),
-                export_dir=export_path,
-                inference_tensor_parallel=tp_size,
-                inference_pipeline_parallel=pp_size,
-            )
+        export_tensorrt_llm_checkpoint(
+            model,
+            model_type,
+            getattr(torch, dtype),
+            export_dir=export_path,
+            inference_tensor_parallel=tp_size,
+            inference_pipeline_parallel=pp_size,
+        )
 
         with open(f"{export_path}/config.json", "r") as f:
             tensorrt_llm_config = json.load(f)
+
+        tensorrt_llm_config["model_type"] = model_type
 
         # Workaround for wo quantization
         if qformat in ["int8_wo", "int4_wo", "full_prec"]:
@@ -631,6 +701,12 @@ def quantize_and_export(*,
                 tensorrt_llm_config = json.load(f)
             qwen_config = AutoConfig.from_pretrained(model_dir,
                                                      trust_remote_code=True)
+            try:
+                from transformers import LlavaOnevisionConfig
+                if isinstance(qwen_config, LlavaOnevisionConfig):
+                    qwen_config = qwen_config.text_config
+            except:
+                pass
             tensorrt_llm_config["qwen_type"] = qwen_config.model_type
             if qwen_config.model_type == "qwen2":
                 tensorrt_llm_config["norm_epsilon"] = qwen_config.rms_norm_eps
@@ -662,6 +738,15 @@ def quantize_and_export(*,
             tensorrt_llm_config['rotary_base'] = rotary_base
             tensorrt_llm_config['rotary_scaling'] = rotary_embedding_scaling
             tensorrt_llm_config['rotary_pct'] = 0.5
+            with open(f"{export_path}/config.json", "w") as f:
+                json.dump(tensorrt_llm_config, f, indent=4)
+
+        if model_type == 'gptnext':
+            with open(f"{export_path}/config.json", "r") as f:
+                tensorrt_llm_config = json.load(f)
+            if tensorrt_llm_config['max_position_embeddings'] is None:
+                tensorrt_llm_config['max_position_embeddings'] = getattr(
+                    model.config, "n_positions", None)
             with open(f"{export_path}/config.json", "w") as f:
                 json.dump(tensorrt_llm_config, f, indent=4)
 
@@ -756,7 +841,7 @@ def quantize_nemo_and_export(*, nemo_ckpt_path, decoder_type, calib_dataset,
         )
         raise e
 
-    import modelopt.torch.quantization as atq
+    import modelopt.torch.quantization as mtq
     from megatron.core import parallel_state
     from megatron.core.transformer.module import Float16Module
     from modelopt.torch.export import export_tensorrt_llm_checkpoint
@@ -777,13 +862,22 @@ def quantize_nemo_and_export(*, nemo_ckpt_path, decoder_type, calib_dataset,
     random.seed(seed)
     np.random.seed(seed)
 
-    # dtype is used for non-quantized layers
-    supported_dtype = ["float16", "bfloat16"]
-    assert (dtype in supported_dtype
-            ), f"{dtype} not supported. Supported dtypes are {supported_dtype}"
-    torch_dtype = getattr(torch, dtype)
-
     model_cfg = load_config(nemo_ckpt_path)
+
+    # dtype is used for non-quantized layers
+    supported_dtype = ["auto", "float16", "bfloat16"]
+    assert dtype in supported_dtype, f"{dtype} not supported. Supported dtypes are {supported_dtype}"
+
+    if dtype == 'auto':
+        dtype = model_cfg.get('precision', None)
+        if dtype is None:
+            dtype = 'float16'
+        elif 'bf16' in dtype or 'bfloat16' in dtype:
+            dtype = 'bfloat16'
+        else:
+            dtype = 'float16'
+        logger.info(f"Specified dtype 'auto'; inferred dtype {dtype!r}.")
+    torch_dtype = getattr(torch, dtype)
 
     with open_dict(model_cfg):
         model_cfg.activations_checkpoint_method = None
@@ -911,7 +1005,7 @@ def quantize_nemo_and_export(*, nemo_ckpt_path, decoder_type, calib_dataset,
                 model.predict_step(batch, i)
 
         start_time = time.time()
-        model = atq.quantize(model, quant_cfg,
+        model = mtq.quantize(model, quant_cfg,
                              forward_loop)  # type: ignore[arg-type]
         end_time = time.time()
         tot_time = end_time - start_time
@@ -929,12 +1023,12 @@ def quantize_nemo_and_export(*, nemo_ckpt_path, decoder_type, calib_dataset,
                 maxbound = 448
             elif qformat == "int8_sq":
                 maxbound = 127
-            model = atq.postprocess_amax(
+            model = mtq.postprocess_amax(
                 model, "*input_quantizer",
                 lambda amax: torch.clamp(amax, min=0.01 * maxbound))
 
         if torch.distributed.get_rank() == 0:
-            atq.print_quant_summary(model)
+            mtq.print_quant_summary(model)
 
     if model_cfg.megatron_amp_O2:
         model.model = unwrap_model(model.model, Float16Module)

@@ -48,7 +48,7 @@ __global__ void topKStage1(T const* __restrict logProbs, T const* const* __restr
     auto const tokenIdx = static_cast<SizeType32>(blockIdx.y);
 
     auto const batchId = bid / BLOCKS_PER_BEAM_; // row id for logProbs
-    auto const batchSlot = batchSlots[batchId];
+    auto const batchSlot = batchSlots == nullptr ? batchId : batchSlots[batchId];
     if (tokensPerStep != nullptr && tokenIdx >= tokensPerStep[batchSlot])
     {
         return;
@@ -63,7 +63,6 @@ __global__ void topKStage1(T const* __restrict logProbs, T const* const* __restr
     auto const logBufIndex = batchId * maxTokensPerStep * vocabSize + tokenIdx * vocabSize;
     auto logProbsSlot
         = logProbsPtrs == nullptr ? logProbs + logBufIndex : logProbsPtrs[batchId * maxTokensPerStep + tokenIdx];
-
     auto const blockLane = bid % BLOCKS_PER_BEAM_;                  // block id for a beam
     auto const k = (topKs != nullptr) ? topKs[batchSlot] : maxTopK; // batchId = batch index
 
@@ -142,7 +141,7 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
     auto const tid = static_cast<SizeType32>(threadIdx.x);
     auto const batchIdx = static_cast<SizeType32>(blockIdx.x);
     auto const tokenIdx = static_cast<SizeType32>(blockIdx.y);
-    auto const batchSlot = batchSlots[batchIdx];
+    auto const batchSlot = batchSlots == nullptr ? batchIdx : batchSlots[batchIdx];
     FinishedState const finishState = finishedInput != nullptr ? finishedInput[batchSlot] : FinishedState::empty();
     if ((skipDecode != nullptr && skipDecode[batchSlot]) || (finishState.isSkipDecoding()))
     {
@@ -216,7 +215,7 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
     if (tid == 0)
     {
         // if we want to return all top k indices, we should not do random sampling for probThreshold
-        auto randNum = returnAllSelectedTokens
+        auto randNum = (returnAllSelectedTokens || curandState == nullptr)
             ? static_cast<float>(probThreshold * sSum)
             : static_cast<float>(curand_uniform(curandState + batchSlot) * probThreshold * sSum);
         auto* outputIdsRequestPtr = idsPtrs == nullptr ? ids + batchSlot * maxSeqLen : idsPtrs[batchSlot];
@@ -232,6 +231,7 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
                 auto outputId = idx != -1
                     ? topKTmpIdBuf[(batchIdx * maxTokensPerStep + tokenIdx) * stride + idx] % vocabSize
                     : vocabSize - 1;
+                outputId = outputId == -1 ? vocabSize - 1 : outputId;
                 auto const curSeqLen = sequenceLengths == nullptr ? 0 : sequenceLengths[batchSlot];
                 auto const outIdx = returnAllSelectedTokens ? tokenIdx * maxTopK + ki : curSeqLen + tokenIdx;
                 outputIdsRequestPtr[outIdx] = outputId;
@@ -374,47 +374,65 @@ template void invokeBatchTopKSampling(TopKSamplingKernelParams<float> const& par
 
 template void invokeBatchTopKSampling(TopKSamplingKernelParams<half> const& params, cudaStream_t stream);
 
-__global__ void setupTopKRuntimeArgs(SizeType32 batchSize, SizeType32 topK, SizeType32* topKs, SizeType32 topKsSize,
-    float topP, float* topPs, SizeType32 topPsSize, bool* skipDecode, SizeType32 const* batchSlots)
+__global__ void setupTopKRuntimeArgs(SizeType32 batchSize, ScatterDecodingParamEntry<SizeType32> topK,
+    ScatterDecodingParamEntry<float> topP, SizeType32 const* batchSlots, bool* skipDecode)
 {
     auto const index = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
     for (auto bi = index; bi < batchSize; bi += static_cast<SizeType32>(gridDim.x * blockDim.x))
     {
-        auto const batchSlot = batchSlots[bi];
-        auto k = topKsSize > 1 ? topKs[batchSlot] : topK;
-        auto p = topPsSize > 1 ? topPs[batchSlot] : topP;
-
-        if (k == 0 && p == 0.0f)
-        {
-            // TensorRT-LLM's topp implementation does not support topp = 0.0f, but it
-            // equivalent to greedy search. So, we set the topk = 1 as an alternative
-            // solution.
-            k = 1;
-        }
-        if (k > 0 && p == 0.0f)
-        {
-            // This case corresponds to the old topk sampling, which is equivalent to
-            // the old topk_topp sampling with topp=1.0f. TopKSamplingLayer and
-            // TopKTopPSamplingLayer are now merged by TopKSamplingLayer. Thus, we
-            // replace the case topk>0 and topp=0.0f by topk>0 and topp=1.0f for the
-            // compatibility.
-            p = 1.0f;
-        }
-        topKs[batchSlot] = k;
-        topPs[batchSlot] = p;
-        skipDecode[batchSlot] = k == 0;
+        setupTopKTopPRuntimeArgOne(bi, topK, topP, batchSlots, skipDecode, nullptr, nullptr);
     }
 }
 
-void invokeSetupTopKRuntimeArgs(SizeType32 batchSize, SizeType32 topK, SizeType32* runtimeTopKDevicePtr,
-    SizeType32 runtimeTopKSize, float topP, float* runtimeTopPDevicePtr, SizeType32 runtimeTopPSize,
-    bool* skipDecodeDevicePtr, SizeType32 const* batchSlotsDevicePtr, cudaStream_t stream)
+void invokeSetupTopKRuntimeArgs(SizeType32 batchSize, ScatterDecodingParamEntry<SizeType32> topK,
+    ScatterDecodingParamEntry<float> topP, bool* skipDecodePtr, SizeType32 const* batchSlotsPtr, bool onDevice,
+    cudaStream_t stream)
 {
-    dim3 block(std::min(static_cast<uint32_t>(batchSize), 256u));
-    dim3 grid(divUp(static_cast<uint32_t>(batchSize), block.x));
-    // support topK up to TOP_K_MAX.
-    setupTopKRuntimeArgs<<<grid, block, 0, stream>>>(batchSize, topK, runtimeTopKDevicePtr, runtimeTopKSize, topP,
-        runtimeTopPDevicePtr, runtimeTopPSize, skipDecodeDevicePtr, batchSlotsDevicePtr);
+    if (onDevice)
+    {
+        dim3 block(std::min(static_cast<uint32_t>(batchSize), 256u));
+        dim3 grid(divUp(static_cast<uint32_t>(batchSize), block.x));
+        // support topK up to TOP_K_MAX.
+        setupTopKRuntimeArgs<<<grid, block, 0, stream>>>(batchSize, topK, topP, batchSlotsPtr, skipDecodePtr);
+    }
+    else
+    {
+        for (int bi = 0; bi < batchSize; ++bi)
+        {
+            setupTopKTopPRuntimeArgOne(bi, topK, topP, batchSlotsPtr, skipDecodePtr, nullptr, nullptr);
+        }
+    }
+}
+
+__global__ void setupTopKTopPRuntimeArgs(SizeType32 batchSize, ScatterDecodingParamEntry<SizeType32> topK,
+    ScatterDecodingParamEntry<float> topP, SizeType32 const* batchSlots, bool* skipDecodeTopK, bool* skipDecodeTopP)
+{
+    auto const index = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
+    for (auto bi = index; bi < batchSize; bi += static_cast<SizeType32>(gridDim.x * blockDim.x))
+    {
+        setupTopKTopPRuntimeArgOne(bi, topK, topP, batchSlots, skipDecodeTopK, skipDecodeTopP, nullptr);
+    }
+}
+
+void invokeSetupTopKTopPRuntimeArgs(SizeType32 batchSize, ScatterDecodingParamEntry<SizeType32> topK,
+    ScatterDecodingParamEntry<float> topP, bool* skipDecodeTopKPtr, bool* skipDecodeTopPPtr,
+    SizeType32 const* batchSlotsPtr, bool onDevice, cudaStream_t stream)
+{
+    if (onDevice)
+    {
+        dim3 block(std::min(static_cast<uint32_t>(batchSize), 256u));
+        dim3 grid(divUp(static_cast<uint32_t>(batchSize), block.x));
+        // support topK up to TOP_K_MAX.
+        setupTopKTopPRuntimeArgs<<<grid, block, 0, stream>>>(
+            batchSize, topK, topP, batchSlotsPtr, skipDecodeTopKPtr, skipDecodeTopPPtr);
+    }
+    else
+    {
+        for (int bi = 0; bi < batchSize; ++bi)
+        {
+            setupTopKTopPRuntimeArgOne(bi, topK, topP, batchSlotsPtr, skipDecodeTopKPtr, skipDecodeTopPPtr, nullptr);
+        }
+    }
 }
 
 } // namespace tensorrt_llm::kernels

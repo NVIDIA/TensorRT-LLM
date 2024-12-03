@@ -137,7 +137,6 @@
             "layernorm_quantization_plugin": null,
             "rmsnorm_quantization_plugin": null,
             "nccl_plugin": null,
-            "lookup_plugin": null,
             "lora_plugin": "auto",
             "weight_only_groupwise_quant_matmul_plugin": null,
             "weight_only_quant_matmul_plugin": null,

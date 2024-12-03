@@ -18,14 +18,11 @@ import unittest
 
 import numpy as np
 import pytest
-import tensorrt as trt
 import torch
-from polygraphy.backend.trt import CreateConfig, EngineFromNetwork, TrtRunner
 
 import tensorrt_llm
 from tensorrt_llm import Tensor
 from tensorrt_llm._utils import str_dtype_to_torch, str_dtype_to_trt
-from tensorrt_llm.functional import low_latency_gemm
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 # Monkey Patching for torch.float8_e4m3fn support
@@ -60,15 +57,16 @@ class TestLowLatencyGemm(unittest.TestCase):
         torch.random.manual_seed(42)
         shape_x = (m, k)
         shape_w = (n, k)
-        x = torch.randint(-2, 2, shape_x).to(str_dtype_to_torch('fp8'))
-        w = torch.randint(-2, 2, shape_w).to(str_dtype_to_torch('fp8'))
+        x = torch.randint(-2, 2, shape_x,
+                          device="cuda").to(str_dtype_to_torch('fp8'))
+        w = torch.randint(-2, 2, shape_w,
+                          device="cuda").to(str_dtype_to_torch('fp8'))
         # Create builder
         builder = tensorrt_llm.Builder()
         # Create empty network
         net = builder.create_network()
         net.plugin_config.low_latency_gemm_plugin = "fp8"
         with tensorrt_llm.net_guard(net):
-            network = tensorrt_llm.default_trtnet()
             # Init TensorRT-LLM tensor for x
             x_tensor = Tensor(name='x',
                               shape=x.shape,
@@ -78,28 +76,28 @@ class TestLowLatencyGemm(unittest.TestCase):
                               shape=w.shape,
                               dtype=str_dtype_to_trt('fp8'))
             # Get output tensor
-            output = low_latency_gemm(
-                x_tensor, w_tensor,
-                strict_dtype=str_dtype_to_trt(output_dtype)).trt_tensor
-
-            output.name = 'output'
-            network.mark_output(output)
-            output.dtype = str_dtype_to_trt(output_dtype)
-
-        engine = EngineFromNetwork(
-            (builder.trt_builder, net.trt_network),
-            config=CreateConfig(
-                fp8=True,
-                fp16=True,
-                memory_pool_limits={trt.MemoryPoolType.WORKSPACE: 33554432}))
+            output = tensorrt_llm.functional.low_latency_gemm(
+                x_tensor, w_tensor, strict_dtype=str_dtype_to_trt(output_dtype))
+            net._mark_output(output,
+                             'output',
+                             dtype=str_dtype_to_trt(output_dtype))
 
         feed_dict = {'x': x, "w": w}
-        with TrtRunner(engine) as runner:
-            outputs = runner.infer(feed_dict=feed_dict, check_inputs=False)
-
+        output_trt = torch.empty((m, n),
+                                 device="cuda",
+                                 dtype=str_dtype_to_torch(output_dtype))
+        outputs = {'output': output_trt}
+        stream = torch.cuda.current_stream()
+        builder_config = builder.create_builder_config(precision=output_dtype)
+        engine = builder.build_engine(net, builder_config)
+        session = tensorrt_llm.runtime.Session.from_serialized_engine(engine)
+        session.run(inputs=feed_dict,
+                    outputs=outputs,
+                    stream=stream.cuda_stream)
+        torch.cuda.synchronize()
         ref = self.reference_gemm_fp8(x, w, output_dtype)
         np.testing.assert_allclose(ref.float().cpu().numpy(),
-                                   outputs['output'].float())
+                                   outputs['output'].cpu().float())
 
     @pytest.mark.skipif(getSMVersion() != 90,
                         reason="LowLatencyGemm is only supported in SM90"

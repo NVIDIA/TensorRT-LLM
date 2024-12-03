@@ -465,11 +465,10 @@ class TestLayer(unittest.TestCase):
                                    outputs['output'].to(torch.float32).numpy(),
                                    atol=atols[dtype])
 
-    @parameterized.expand(list(product([True, False], [True, False])),
+    @parameterized.expand(list(product([True, False])),
                           name_func=unittest_name_func)
     @skip_pre_ampere  # Skip tests that are not supported in pre-ampere architecture
-    def test_prompt_tuning_embedding(self, enable_lookup_plugin,
-                                     remove_padding):
+    def test_prompt_tuning_embedding(self, remove_padding):
         torch.random.manual_seed(0)
         dtype = "bfloat16"
         trt_dtype = tensorrt_llm.str_dtype_to_trt(dtype)
@@ -510,9 +509,6 @@ class TestLayer(unittest.TestCase):
         builder = tensorrt_llm.Builder()
         builder.strongly_typed = False  # Test need to run in weekly typed mode
         net = builder.create_network()
-
-        if enable_lookup_plugin:
-            net.plugin_config.lookup_plugin = dtype
 
         with tensorrt_llm.net_guard(net):
             ids_tensor = Tensor(name='ids',
@@ -902,6 +898,9 @@ class TestLayer(unittest.TestCase):
                                                           perf_knob_tensor_size,
                                                           dtype=torch.int64,
                                                           device='cpu')
+            host_context_progress = torch.tensor([0],
+                                                 dtype=torch.int64,
+                                                 device='cpu')
 
         q_weight = torch.empty(size=[hidden_size, hidden_size],
                                dtype=torch_dtype)
@@ -967,6 +966,10 @@ class TestLayer(unittest.TestCase):
                     name='host_runtime_perf_knobs',
                     shape=[16],
                     dtype=tensorrt_llm.str_dtype_to_trt('int64'))
+                host_context_progress_tensor = Tensor(
+                    name='host_context_progress',
+                    shape=[1],
+                    dtype=tensorrt_llm.str_dtype_to_trt('int64'))
 
             mask_type = tensorrt_llm.layers.AttentionMaskType.padding
             if causal_mask:
@@ -1003,7 +1006,8 @@ class TestLayer(unittest.TestCase):
                         context_lengths=context_lengths_tensor,
                         host_request_types=host_request_types_tensor,
                         max_context_length=seq_len,
-                        host_runtime_perf_knobs=host_runtime_perf_knobs))
+                        host_runtime_perf_knobs=host_runtime_perf_knobs,
+                        host_context_progress=host_context_progress_tensor))
                 assert isinstance(output, Tensor)
                 output = output
                 present_key_value.mark_output(
@@ -1047,7 +1051,8 @@ class TestLayer(unittest.TestCase):
                 'context_lengths': context_lengths,
                 'host_request_types': host_request_types,
                 'cache_indirection': cache_indirection,
-                'host_runtime_perf_knobs': host_runtime_perf_knobs_tensor
+                'host_runtime_perf_knobs': host_runtime_perf_knobs_tensor,
+                'host_context_progress': host_context_progress
             }
             outputs = {
                 'output':

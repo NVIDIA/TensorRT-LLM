@@ -61,8 +61,6 @@ private:
     bool mForceXQA;
     int mSM;
 
-    jit::CubinObjRegistry mInitializedCubinObjRegistry;
-
     jit::CubinObjKey getCubinObjKeyFromXQAParams(XQAParams const& xqaParams) const;
 };
 

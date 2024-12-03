@@ -50,10 +50,19 @@ def parse_arguments():
     parser.add_argument('--check_accuracy',
                         action='store_true',
                         help='Check correctness of text output')
-    parser.add_argument('--video_path',
-                        type=str,
-                        default=None,
-                        help='Path to your local video file')
+    parser.add_argument(
+        '--video_path',
+        type=str,
+        default=None,
+        help=
+        'Path to your local video file, using \'llava-onevision-accuracy\' to check the Llava-OneVision model accuracy'
+    )
+    parser.add_argument(
+        '--video_num_frames',
+        type=int,
+        help=
+        "The number of frames sampled from the video in the Llava-OneVision model.",
+        default=None)
     parser.add_argument("--image_path",
                         type=str,
                         default=None,
@@ -66,11 +75,40 @@ def parse_arguments():
                         action='store_true',
                         default=None,
                         help="Enable FMHA runner FP32 accumulation.")
-    parser.add_argument('--use_py_session',
-                        default=False,
-                        action='store_true',
-                        help="Whether or not to use Python runtime session")
-
+    parser.add_argument(
+        '--enable_chunked_context',
+        action='store_true',
+        help='Enables chunked context (only available with cpp session).',
+    )
+    parser.add_argument(
+        '--use_py_session',
+        default=False,
+        action='store_true',
+        help=
+        "Whether or not to use Python runtime session. By default C++ runtime session is used for the LLM."
+    )
+    parser.add_argument(
+        '--kv_cache_free_gpu_memory_fraction',
+        default=0.9,
+        type=float,
+        help='Specify the free gpu memory fraction.',
+    )
+    parser.add_argument(
+        '--cross_kv_cache_fraction',
+        default=0.5,
+        type=float,
+        help=
+        'Specify the kv cache fraction reserved for cross attention. Only applicable for encoder-decoder models. By default 0.5 for self and 0.5 for cross.',
+    )
+    parser.add_argument(
+        '--multi_block_mode',
+        type=lambda s: s.lower() in
+        ("yes", "true", "t", "1"
+         ),  # custom boolean function to convert input string to boolean
+        default=True,
+        help=
+        "Distribute the work across multiple CUDA thread-blocks on the GPU for masked MHA kernel."
+    )
     return parser.parse_args()
 
 
@@ -89,9 +127,13 @@ def print_result(model, input_text, output_text, args):
     if args.check_accuracy:
         if model.model_type != 'nougat':
             if model.model_type == "vila":
-                if len(args.image_path.split(args.path_sep)) == 1:
-                    assert output_text[0][0].lower(
-                    ) == "the image captures a bustling city intersection teeming with life. from the perspective of a car's dashboard camera, we see"
+                for i in range(len(args.image_path.split(args.path_sep))):
+                    if i % 2 == 0:
+                        assert output_text[i][0].lower(
+                        ) == "the image captures a bustling city intersection teeming with life. from the perspective of a car's dashboard camera, we see"
+                    else:
+                        assert output_text[i][0].lower(
+                        ) == "the image captures the iconic merlion statue in singapore, a renowned worldwide landmark. the merlion, a mythical"
             elif model.model_type == 'fuyu':
                 assert output_text[0][0].lower() == '4'
             elif model.model_type == "pix2struct":
@@ -105,6 +147,19 @@ def print_result(model, input_text, output_text, args):
                 assert 'robot' in output_text[0][0].lower()
             elif model.model_type == 'kosmos-2':
                 assert 'snowman' in output_text[0][0].lower()
+            elif model.model_type == "mllama":
+                if "<|image|><|begin_of_text|>If I had to write a haiku for this one" in input_text:
+                    assert "it would be:.\\nPeter Rabbit is a rabbit.\\nHe lives in a" in output_text[
+                        0][0]
+                elif "The key to life is" in input_text:
+                    assert "to find your passion and pursue it with all your heart." in output_text[
+                        0][0]
+            elif model.model_type == 'llava_onevision':
+                if args.video_path is None:
+                    assert 'singapore' in output_text[0][0].lower()
+                else:
+                    assert 'the video is funny because the child\'s actions are' in output_text[
+                        0][0].lower()
             else:
                 assert output_text[0][0].lower() == 'singapore'
 

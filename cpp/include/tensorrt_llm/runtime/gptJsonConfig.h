@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
+#include "tensorrt_llm/runtime/runtimeDefaults.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <filesystem>
@@ -32,7 +33,8 @@ class GptJsonConfig
 {
 public:
     GptJsonConfig(std::string name, std::string version, std::string precision, SizeType32 tensorParallelism,
-        SizeType32 pipelineParallelism, SizeType32 gpusPerNode, ModelConfig modelConfig)
+        SizeType32 pipelineParallelism, SizeType32 gpusPerNode, ModelConfig modelConfig,
+        std::optional<RuntimeDefaults> runtimeDefaults = std::nullopt)
         : mName(std::move(name))
         , mVersion(std::move(version))
         , mPrecision(std::move(precision))
@@ -40,6 +42,7 @@ public:
         , mPipelineParallelism{pipelineParallelism}
         , mGpusPerNode{gpusPerNode}
         , mModelConfig(std::move(modelConfig))
+        , mRuntimeDefaults(std::move(runtimeDefaults))
     {
     }
 
@@ -94,6 +97,11 @@ public:
         return mTensorParallelism * mPipelineParallelism;
     }
 
+    [[nodiscard]] std::optional<RuntimeDefaults> getRuntimeDefaults() const
+    {
+        return mRuntimeDefaults;
+    }
+
     [[nodiscard]] std::string engineFilename(WorldConfig const& worldConfig, std::string const& model) const;
 
     [[nodiscard]] std::string engineFilename(WorldConfig const& worldConfig) const
@@ -109,6 +117,7 @@ private:
     SizeType32 const mPipelineParallelism;
     SizeType32 const mGpusPerNode;
     ModelConfig mModelConfig; // remove const qualifier because config has to mutable after json parsing
+    std::optional<RuntimeDefaults> mRuntimeDefaults;
 };
 
 } // namespace tensorrt_llm::runtime

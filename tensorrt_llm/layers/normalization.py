@@ -24,7 +24,9 @@ class LayerNorm(Module):
                  eps=1e-05,
                  elementwise_affine=True,
                  bias=True,
-                 dtype=None):
+                 dtype=None,
+                 tp_size=1,
+                 tp_dim=-1):
         super().__init__()
         if isinstance(normalized_shape, int):
             normalized_shape = (normalized_shape, )
@@ -42,11 +44,15 @@ class LayerNorm(Module):
 
         self.eps = eps
         self.dtype = dtype
+        self.tp_size = tp_size
+        self.tp_dim = tp_dim
 
-    def forward(self, x):
+    def forward(self, x, normalized_shape=None):
         weight = 1. if self.weight is None else self.weight.value
         bias = 0. if self.bias is None else self.bias.value
-        return layer_norm(x, self.normalized_shape, weight, bias, self.eps)
+        if normalized_shape is None:
+            normalized_shape = self.normalized_shape
+        return layer_norm(x, normalized_shape, weight, bias, self.eps)
 
 
 class RmsNorm(Module):
@@ -74,10 +80,11 @@ class RmsNorm(Module):
         self.eps = eps
         self.dtype = dtype
 
-    def forward(self, x):
+    def forward(self, x, normalized_shape=None):
         weight = None if self.weight is None else self.weight.value
-        return rms_norm(x, self.normalized_shape, self.num_groups, weight,
-                        self.eps)
+        if normalized_shape is None:
+            normalized_shape = self.normalized_shape
+        return rms_norm(x, normalized_shape, self.num_groups, weight, self.eps)
 
 
 class GroupNorm(Module):

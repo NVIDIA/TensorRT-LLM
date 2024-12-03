@@ -134,9 +134,10 @@ public:
     Resource(void const* buffer, size_t buffer_size);
     ~Resource() = default;
 
-    void merge(Resource const& other)
+    // When initialize is true, initialize cubins.
+    void merge(Resource const& other, bool initialize)
     {
-        getCubinObjRegistry()->merge(*other.getCubinObjRegistry());
+        getCubinObjRegistry()->merge(*other.getCubinObjRegistry(), initialize);
     }
 
     jit::CubinObjRegistry* getCubinObjRegistry()

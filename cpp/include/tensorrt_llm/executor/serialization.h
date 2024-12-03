@@ -119,6 +119,11 @@ public:
     static void serialize(KvCacheConfig const& kvCacheConfig, std::ostream& os);
     static size_t serializedSize(KvCacheConfig const& kvCacheConfig);
 
+    // DynamicBatchConfig
+    static DynamicBatchConfig deserializeDynamicBatchConfig(std::istream& is);
+    static void serialize(DynamicBatchConfig const& dynamicBatchConfig, std::ostream& os);
+    static size_t serializedSize(DynamicBatchConfig const& dynamicBatchConfig);
+
     // SchedulerConfig
     static SchedulerConfig deserializeSchedulerConfig(std::istream& is);
     static void serialize(SchedulerConfig const& schedulerConfig, std::ostream& os);
@@ -153,6 +158,22 @@ public:
     static LookaheadDecodingConfig deserializeLookaheadDecodingConfig(std::istream& is);
     static void serialize(LookaheadDecodingConfig const& lookaheadDecodingConfig, std::ostream& os);
     static size_t serializedSize(LookaheadDecodingConfig const& lookaheadDecodingConfig);
+
+    // EagleConfig
+    static EagleConfig deserializeEagleConfig(std::istream& is);
+    static void serialize(EagleConfig const& eagleConfig, std::ostream& os);
+    static size_t serializedSize(EagleConfig const& eagleConfig);
+
+    // KvCacheRetentionConfig
+    static KvCacheRetentionConfig deserializeKvCacheRetentionConfig(std::istream& is);
+    static void serialize(KvCacheRetentionConfig const& kvCacheRetentionConfig, std::ostream& os);
+    static size_t serializedSize(KvCacheRetentionConfig const& kvCacheRetentionConfig);
+
+    // TokenRangeRetentionConfig
+    static KvCacheRetentionConfig::TokenRangeRetentionConfig deserializeTokenRangeRetentionConfig(std::istream& is);
+    static void serialize(
+        KvCacheRetentionConfig::TokenRangeRetentionConfig const& tokenRangeRetentionConfig, std::ostream& os);
+    static size_t serializedSize(KvCacheRetentionConfig::TokenRangeRetentionConfig const& tokenRangeRetentionConfig);
 
     // DecodingConfig
     static DecodingConfig deserializeDecodingConfig(std::istream& is);

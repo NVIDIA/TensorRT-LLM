@@ -55,11 +55,13 @@ class Logger(metaclass=Singleton):
 
         self._min_severity = min_severity
         self._trt_logger = trt.Logger(severity_map[min_severity][0])
-        logging.basicConfig(level=severity_map[min_severity][1],
-                            format='[%(asctime)s] %(message)s',
-                            datefmt='%m/%d/%Y-%H:%M:%S',
-                            stream=sys.stdout)
         self._logger = logging.getLogger('TRT-LLM')
+        handler = logging.StreamHandler(stream=sys.stdout)
+        handler.setFormatter(
+            logging.Formatter(fmt='[%(asctime)s] %(message)s',
+                              datefmt='%m/%d/%Y-%H:%M:%S'))
+        self._logger.addHandler(handler)
+        self._logger.setLevel(severity_map[min_severity][1])
         self._polygraphy_logger = G_LOGGER
         if self._polygraphy_logger is not None:
             self._polygraphy_logger.module_severity = severity_map[

@@ -16,9 +16,12 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/executor/types.h"
+#include "tensorrt_llm/runtime/common.h"
 #include <cstdint>
 #include <curand_kernel.h>
+#include <variant>
 
 namespace tensorrt_llm
 {
@@ -161,6 +164,31 @@ static_assert(FinishedState::finishedEOS().isFinishedEOS());
 static_assert(FinishedState::finishedStopWords().isFinishedStopWords());
 static_assert(FinishedState::finishedMaxLength().isFinishedMaxLength());
 
+template <typename T>
+struct ScatterDecodingParamEntry
+{
+    // Contiguous values to scatter
+    T const* mVector;
+    // Value used to scatter if mVector is nullptr
+    T mScalar;
+    // Target base address to scatter
+    T* mTarget;
+
+    ScatterDecodingParamEntry() = default;
+
+    ScatterDecodingParamEntry(T const* vector, T scalar, T* target)
+        : mVector(vector)
+        , mScalar(scalar)
+        , mTarget(target)
+    {
+    }
+
+    ScatterDecodingParamEntry(void const* vector, T scalar, T* target)
+        : ScatterDecodingParamEntry(static_cast<T const*>(vector), scalar, target)
+    {
+    }
+};
+
 //! \brief Initialize batchSize curand states with given seed.
 //!
 //! \param state output buffer [maxBatchSize]. Curand states to be initialized
@@ -169,7 +197,7 @@ static_assert(FinishedState::finishedMaxLength().isFinishedMaxLength());
 //! \param randomSeed seed to initialize states
 //! \param stream stream
 void invokeCurandInitialize(
-    curandState_t* state, int const* batchSlots, const size_t batchSize, uint64_t randomSeed, cudaStream_t stream);
+    curandState_t* state, int const* batchSlots, size_t const batchSize, uint64_t randomSeed, cudaStream_t stream);
 
 //! \brief Initialize batchSize curand states with given seed per request.
 //!
@@ -178,7 +206,7 @@ void invokeCurandInitialize(
 //! \param batchSize number of states to initialize
 //! \param randomSeeds input buffer [maxBatchSize] with seeds
 //! \param stream stream
-void invokeCurandBatchInitialize(curandState_t* states, int const* batchSlots, const size_t batchSize,
+void invokeCurandBatchInitialize(curandState_t* states, int const* batchSlots, size_t const batchSize,
     uint64_t const* randomSeeds, cudaStream_t stream);
 
 //! \brief Applies mask, adds bias to logits and computes softmax values.
@@ -212,13 +240,15 @@ void invokeAddBiasSoftMax(T* logits, T** logitsPtrs, T* probs, T const* bias, in
 
 //! \brief Distributes values located in src to dst according to the indieces from batchSlots
 //!
-//! \param src input buffer [batchSize].
+//! \param src input buffer [batchSize], optional.
+//! \param scalar value used if src is nullptr.
 //! \param dst output buffer [maxBatchSize].
-//! \param batchSlots input buffer [batchSize], optional. Indices of rows of data in memory pool
+//! \param batchSlots input buffer [batchSize]. Indices of rows of data in memory pool
 //! \param batchSize batch size
 //! \param stream stream
 template <typename T>
-void invokeScatterDecodingParams(T const* src, T* dst, int const* batchSlots, int batchSize, cudaStream_t stream);
+void invokeScatterDecodingParams(
+    T const* src, T scalar, T* dst, int const* batchSlots, int batchSize, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm

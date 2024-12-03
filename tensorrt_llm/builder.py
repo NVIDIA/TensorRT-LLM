@@ -26,7 +26,8 @@ import numpy as np
 import tensorrt as trt
 
 from ._common import _is_building, check_max_num_tokens, serialize_engine
-from ._utils import np_bfloat16, np_float8, str_dtype_to_trt, to_json_file
+from ._utils import (np_bfloat16, np_float8, str_dtype_to_trt, to_json_file,
+                     trt_gte)
 from .auto_parallel import auto_parallel
 from .auto_parallel.config import AutoParallelConfig
 from .bindings import KVCacheType
@@ -223,6 +224,13 @@ class Builder():
         weight_sparsity = kwargs.get("weight_sparsity", False)
         if weight_sparsity:
             config.set_flag(trt.BuilderFlag.SPARSE_WEIGHTS)
+
+        # TODO(Junyi): remove this constraint after trt 10.6 is integrated
+        if trt_gte(10, 6):
+            # set monitor memory
+            monitor_memory = kwargs.get("monitor_memory", False)
+            if monitor_memory:
+                config.set_flag(trt.BuilderFlag.MONITOR_MEMORY)
 
         return BuilderConfig()._init(config,
                                      precision=precision,
@@ -463,12 +471,12 @@ class Builder():
 
 @dataclass
 class BuildConfig:
-    max_input_len: int = 256
-    max_seq_len: int = 512
+    max_input_len: int = 1024
+    max_seq_len: int = None
     opt_batch_size: int = 8
-    max_batch_size: int = 8
+    max_batch_size: int = 2048
     max_beam_width: int = 1
-    max_num_tokens: Optional[int] = None
+    max_num_tokens: int = 8192
     opt_num_tokens: Optional[int] = None
     max_prompt_embedding_table_size: int = 0
     kv_cache_type: KVCacheType = None
@@ -482,7 +490,7 @@ class BuildConfig:
     speculative_decoding_mode: SpeculativeDecodingMode = SpeculativeDecodingMode.NONE
     use_refit: bool = False
     input_timing_cache: str = None
-    output_timing_cache: str = None
+    output_timing_cache: str = 'model.cache'
     lora_config: LoraConfig = field(default_factory=LoraConfig)
     auto_parallel_config: AutoParallelConfig = field(
         default_factory=AutoParallelConfig)
@@ -490,10 +498,11 @@ class BuildConfig:
     weight_streaming: bool = False
     plugin_config: PluginConfig = field(default_factory=PluginConfig)
     use_strip_plan: bool = False
-    max_encoder_input_len: int = 1  # for enc-dec DecoderModel
-    use_fused_mlp: bool = False
+    max_encoder_input_len: int = 1024  # for enc-dec DecoderModel
+    use_fused_mlp: bool = True
     dry_run: bool = False
     visualize_network: bool = False
+    monitor_memory: bool = False
 
     # Since we have some overlapping between kv_cache_type, paged_kv_cache, and paged_state (later two will be deprecated in the future),
     # we need to handle it given model architecture.
@@ -553,7 +562,7 @@ class BuildConfig:
         max_beam_width = config.pop('max_beam_width')
         max_num_tokens = config.pop('max_num_tokens')
         opt_num_tokens = config.pop('opt_num_tokens')
-        opt_batch_size = config.pop('opt_batch_size', None)
+        opt_batch_size = config.pop('opt_batch_size', 8)
         max_prompt_embedding_table_size = config.pop(
             'max_prompt_embedding_table_size', 0)
 
@@ -588,6 +597,7 @@ class BuildConfig:
 
         dry_run = config.pop('dry_run', False)
         visualize_network = config.pop('visualize_network', False)
+        monitor_memory = config.pop('monitor_memory', False)
 
         return cls(
             max_input_len=max_input_len,
@@ -619,7 +629,8 @@ class BuildConfig:
             use_fused_mlp=use_fused_mlp,
             plugin_config=plugin_config,
             dry_run=dry_run,
-            visualize_network=visualize_network)
+            visualize_network=visualize_network,
+            monitor_memory=monitor_memory)
 
     @classmethod
     def from_json_file(cls, config_file, plugin_config=None):
@@ -660,10 +671,14 @@ class EngineConfig:
     @classmethod
     def from_json_file(cls, config_file):
         with open(config_file) as f:
-            config = json.load(f)
-            return cls(PretrainedConfig.from_dict(config['pretrained_config']),
-                       BuildConfig.from_dict(config['build_config']),
-                       config['version'])
+            return cls.from_json_str(f.read())
+
+    @classmethod
+    def from_json_str(cls, config_str):
+        config = json.loads(config_str)
+        return cls(PretrainedConfig.from_dict(config['pretrained_config']),
+                   BuildConfig.from_dict(config['build_config']),
+                   config['version'])
 
     def to_dict(self):
         build_config = self.build_config.to_dict()
@@ -770,6 +785,15 @@ class Engine:
 
         return cls(config, engine_buffer, managed_weights)
 
+    @classmethod
+    def from_buffer(cls,
+                    engine_buffer: Union[trt.IHostMemory, bytes],
+                    json_config_str: str,
+                    rank: int = 0):
+        config = EngineConfig.from_json_str(json_config_str)
+        config.pretrained_config.set_rank(rank)
+        return cls(config, engine_buffer)
+
 
 def get_engine_version(engine_dir: str) -> Union[None, str]:
     engine_dir = Path(engine_dir)
@@ -787,27 +811,37 @@ def optimize_model_with_config(model: PretrainedModel,
                                build_config: BuildConfig):
     use_auto_parallel = build_config.auto_parallel_config.enabled
     gemm_swiglu_plugin = build_config.plugin_config.gemm_swiglu_plugin
-    if gemm_swiglu_plugin:
+    low_latency_gemm_swiglu_plugin = build_config.plugin_config.low_latency_gemm_swiglu_plugin
+    if gemm_swiglu_plugin or low_latency_gemm_swiglu_plugin:
         if not build_config.use_fused_mlp:
             raise RuntimeError(
                 "GemmSwiGLU plugin requires --use_fused_mlp flag")
-        if gemm_swiglu_plugin not in ["fp8"]:
+        if gemm_swiglu_plugin not in [
+                "fp8"
+        ] and low_latency_gemm_swiglu_plugin not in ["fp8"]:
             raise RuntimeError(
                 f"GemmSwiGLU plugin currently has limited support: fp8 only, "
-                f"got: {gemm_swiglu_plugin}")
+                f"got: {gemm_swiglu_plugin}"
+                f"got: {low_latency_gemm_swiglu_plugin}")
 
     if build_config.plugin_config.lora_plugin is not None:
         model.use_lora(build_config.lora_config)
 
     is_enc_dec = model.config.architecture in ["EncoderModel", "DecoderModel"]
+    # FusedMLP does not support RecurrentGemma FP8 currently.
+    is_recurrent_gemma = model.config.architecture in [
+        "RecurrentGemmaForCausalLM"
+    ]
+    is_fp8 = model.config.quantization.quant_algo == QuantAlgo.FP8
     model = optimize_model(
         model,
         use_ootb_moe=build_config.plugin_config.moe_plugin is None,
         use_fused_mlp=(build_config.use_fused_mlp and not is_enc_dec
+                       and not (is_recurrent_gemma and is_fp8)
                        and not use_auto_parallel),
         gemm_swiglu_plugin_dtype=gemm_swiglu_plugin,
-        use_fused_rg_lru=model.config.architecture
-        in ["RecurrentGemmaForCausalLM"],
+        low_latency_gemm_swiglu_plugin_dtype=low_latency_gemm_swiglu_plugin,
+        use_fused_rg_lru=is_recurrent_gemma,
         use_unfused_qkv_gemm=use_auto_parallel,
         use_prompt_tuning=(build_config.max_prompt_embedding_table_size > 0),
         use_lora=build_config.plugin_config.lora_plugin is not None,
@@ -832,8 +866,9 @@ def _init_max_seq_len(model_config, build_config):
     if rotary_scaling is not None:
         rotary_type = rotary_scaling.get('type',
                                          rotary_scaling.get('rope_type'))
-        rotary_factor = rotary_scaling.get('factor',
-                                           1.0) if rotary_type != 'su' else 1
+        rotary_factor = rotary_scaling.get(
+            'factor', 1.0) if rotary_type not in ("su", "longrope",
+                                                  "llama3") else 1
     else:
         rotary_factor = 1
 
@@ -996,7 +1031,6 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
 
     if build_config.plugin_config.reduce_fusion and (
             model.config.mapping.tp_size == 1
-            or model.config.mapping.pp_size != 1
             or model.config.architecture != "LlamaForCausalLM"):
         logger.warning('Overriding reduce_fusion to False')
         build_config.plugin_config.reduce_fusion = False
@@ -1007,11 +1041,6 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
 
     if hasattr(model.config, 'max_draft_len'):
         build_config.max_draft_len = model.config.max_draft_len
-        if build_config.speculative_decoding_mode != SpeculativeDecodingMode.MEDUSA:
-            logger.warning(
-                'speculative_decoding_mode is not Medusa for Medusa model. Overwriting speculative_decoding_mode'
-            )
-        build_config.speculative_decoding_mode = SpeculativeDecodingMode.MEDUSA
 
     if hasattr(model.config, 'redrafter_num_beams') and hasattr(
             model.config, 'redrafter_draft_len_per_beam'):
@@ -1081,6 +1110,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
         use_strip_plan=build_config.use_strip_plan,
         weight_sparsity=build_config.weight_sparsity,
         weight_streaming=build_config.weight_streaming,
+        monitor_memory=build_config.monitor_memory,
     )
 
     network = builder.create_network()
@@ -1090,6 +1120,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
     use_weight_only = model.config.quant_mode.is_weight_only()
     per_group = model.config.quant_mode.has_per_group_scaling()
     use_smooth_quant = model.config.quant_mode.has_act_and_weight_quant()
+    use_qserve = model.config.quant_mode.is_qserve_w4a8()
     use_fp8_rowwise = model.config.quant_mode.has_fp8_rowwise()
     disable_weight_only_quant_plugin = model.config.disable_weight_only_quant_plugin if hasattr(
         model.config, 'disable_weight_only_quant_plugin') else False
@@ -1099,8 +1130,11 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
             network.plugin_config.weight_only_groupwise_quant_matmul_plugin = model.config.dtype
         else:
             network.plugin_config.weight_only_quant_matmul_plugin = model.config.dtype
-    if use_smooth_quant and model.config.quantization.use_plugin_sq:
+    if use_smooth_quant and model.config.quantization.use_plugin_sq and build_config.plugin_config.smooth_quant_plugins:
         network.plugin_config.set_smooth_quant_plugins(model.config.dtype)
+    if use_qserve:
+        network.plugin_config.set_qserve_plugins(model.config.dtype)
+
     if use_fp8_rowwise:
         network.plugin_config.set_fp8_rowwise_quant_plugins(model.config.dtype)
     nccl_plugin = model.config.dtype if model.config.mapping.world_size > 1 else None
@@ -1141,7 +1175,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
             build_config.lora_config.lora_target_modules
         }
 
-        if model.config.architecture == "DecoderModel":
+        if model.config.architecture == "DecoderModel" or model.config.architecture == "MllamaForConditionalGeneration":
             prepare_input_args["max_seq_len"] = build_config.max_seq_len
             prepare_input_args[
                 "max_decoder_input_len"] = build_config.max_input_len
@@ -1154,9 +1188,20 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
                 "max_batch_size": build_config.max_batch_size,
             }
 
+        if build_config.speculative_decoding_mode == SpeculativeDecodingMode.EAGLE:
+            prepare_input_args[
+                "spec_decoding_is_generation_length_variable"] = True
+            assert build_config.max_batch_size <= 512, "Max batch size > 512 is not supported for EAGLE"
+            assert build_config.max_draft_len <= 256, "Max draft len > 256 is not supported for EAGLE"
+
         if build_config.speculative_decoding_mode == SpeculativeDecodingMode.LOOKAHEAD_DECODING:
             prepare_input_args[
                 "spec_decoding_is_generation_length_variable"] = True
+
+        if build_config.speculative_decoding_mode == SpeculativeDecodingMode.EAGLE and not build_config.plugin_config.use_paged_context_fmha:
+            logger.warning(
+                "Paged Context FMHA is required for EAGLE. Turning it on")
+            build_config.plugin_config.use_paged_context_fmha = True
 
         inputs = model.prepare_inputs(**prepare_input_args)
         model(**inputs)
@@ -1179,7 +1224,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
 
     if build_config.visualize_network:
         with net_guard(network):
-            network.to_dot(f'rank{model.config.mapping.rank}.dot')
+            network.to_onnx(f'rank{model.config.mapping.rank}.onnx')
 
     # Network -> Engine
     logger.info(

@@ -1157,17 +1157,48 @@ INSTANTIATE_TRANSPOSE_ATTENTION_OUT_REMOVE_PADDING(__nv_bfloat16);
 #endif
 #undef INSTANTIATE_TRANSPOSE_ATTENTION_OUT_REMOVE_PADDING
 
+template <typename T>
+struct Vec_t
+{
+    static constexpr int size = 0;
+};
+
+template <>
+struct Vec_t<float>
+{
+    using Type = float2;
+    static constexpr int size = 2;
+};
+
+template <>
+struct Vec_t<half>
+{
+    using Type = uint32_t;
+    static constexpr int size = 2;
+};
+
+#ifdef ENABLE_BF16
+template <>
+struct Vec_t<__nv_bfloat16>
+{
+    using Type = __nv_bfloat162;
+    static constexpr int size = 2;
+};
+#endif
+
 template <typename T, bool ADD_BIAS>
 __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf, T* QKV, T const* __restrict qkv_bias,
     int const* seq_lens, int const* padding_offset, int const batch_size, int const seq_len, int const token_num,
     int const head_num, int const kv_head_num, int const size_per_head, float const* scale, int const int8_mode)
 {
     //   source input QKV may or may not have padding, but target output Q/K/V must be with padding in order to do
-    //   attention! QKV: [token_num, hidden + 2 * kv_head_num * size_per_head] (remove padding) or [batch * seq_len,
-    //   hidden + 2 * kv_head_num * size_per_head] (keep padding) qkv_bias: [hidden + 2 * kv_head_num * size_per_head]
-    //   q_buf: [batch, head_num, seq_len, size_per_head]
-    //   k_buf, v_buf: [batch, kv_head_num, seq_len, size_per_head]
-    // For cross attention where q/k/v buffer could be nullptr, writing to split buffer is suppressed when null
+    //   attention!
+    //   QKV: [token_num, head_num * size_per_head + 2 * kv_head_num * size_per_head] for remove padding. 1st dim could
+    //   be batch * seq_len if not remove padding. Last dim could be head_num * size_per_head if KV are nullptr or 2 *
+    //   kv_head_num * size_per_head if Q is nullptr qkv_bias: [head_num * size_per_head + 2 * kv_head_num *
+    //   size_per_head], same as last dim of QKV q_buf: [batch, head_num, seq_len, size_per_head] k_buf, v_buf: [batch,
+    //   kv_head_num, seq_len, size_per_head] For cross attention where q/k/v buffer could be nullptr, writing to split
+    //   buffer is suppressed when null
     T* qkv_ptr[3] = {q_buf, k_buf, v_buf};
     bool const remove_padding
         = padding_offset != nullptr; // remove padding mode will have padding_offset to indicate the padding length,
@@ -1191,10 +1222,10 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
         int qkv_id;
         int head_id;
         int size_id = index % size_per_head;
-        if (kv_head_num < head_num)
+        if (head_num == 0 || kv_head_num < head_num)
         {
-            // [token, h + 2*kv_head_num, d]
-            //  ^^^^^  ^^^^^^^^
+            // [token, head_num + 2*kv_head_num, d]
+            //  ^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^
             //    m       n
             // TODO: This block will also work for MHA but
             // would that be slower due to more branches?
@@ -1266,40 +1297,12 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
     }
 }
 
-template <typename T>
-struct Vec_t
-{
-    static constexpr int size = 0;
-};
-
-template <>
-struct Vec_t<float>
-{
-    using Type = float2;
-    static constexpr int size = 2;
-};
-
-template <>
-struct Vec_t<half>
-{
-    using Type = uint32_t;
-    static constexpr int size = 2;
-};
-
-#ifdef ENABLE_BF16
-template <>
-struct Vec_t<__nv_bfloat16>
-{
-    using Type = __nv_bfloat162;
-    static constexpr int size = 2;
-};
-#endif
-
 template <typename T, bool ADD_BIAS>
-__global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf, T* QKV, T const* __restrict qkv_bias,
-    int const* seq_lens, int const* padding_offset, int const batch_size, int const seq_len, int const head_num,
-    int const kv_head_num, int const size_per_head, int const rotary_embedding_dim, float rotary_embedding_base,
-    RotaryScalingType const rotary_scale_type, float rotary_embedding_scale, int const rotary_embedding_max_positions,
+__global__ void add_fusedQKV_bias_rope_transpose_kernel(T* q_buf, T* k_buf, T* v_buf, T* QKV,
+    T const* __restrict qkv_bias, int const* seq_lens, int const* padding_offset, int const batch_size,
+    int const seq_len, int const head_num, int const kv_head_num, int const size_per_head,
+    int const rotary_embedding_dim, float rotary_embedding_base, RotaryScalingType const rotary_scale_type,
+    float rotary_embedding_scale, int const rotary_embedding_max_positions,
     PositionEmbeddingType const position_embedding_type)
 {
     // This kernel add bias to QKV, which has shape [batch_size, seq_len, 3, head_num, size_per_head], and
@@ -1309,7 +1312,7 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
 
     // NOTE:
     // head_num == kv_head_num
-    //   QKV src shape (batch_size, seq_len, 3, head_num, size_per_head)
+    //   QKV src shape (batch_size, seq_len, 3, head_num * size_per_head)
     //                  ^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^
     //                           m                        n
     //   QKV dst shape (3, batch_size, head_num, seq_len, size_per_head)
@@ -1320,6 +1323,7 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
     //   Q dst shape: (batch_size, head_num, seq_len, size_per_head)
     //   KV dst shape: (batch_size, kv_head_num, seq_len, size_per_head)
     extern __shared__ __align__(sizeof(float2)) char smem_[]; // align on largest vector type
+    bool isCrossKV = q_buf == nullptr;                        // does not have query in qkv buffer (namely, only kv)
 
     constexpr int vec_size = Vec_t<T>::size;
     using Vec_t = typename Vec_t<T>::Type;
@@ -1342,16 +1346,15 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
     bool const is_head_size_masked = tidx * vec_size >= size_per_head;
     bool const is_masked = is_head_size_masked || is_seq_masked;
 
-    int const hidden_size = head_num * size_per_head;
     int const hidden_idx = head_idx * size_per_head + tidx * vec_size;
-    int const qheads_per_kv_head = head_num / kv_head_num;
+    int const qheads_per_kv_head = isCrossKV ? 1 : head_num / kv_head_num;
     int const kv_head_idx = head_idx / qheads_per_kv_head;
     int const hidden_idx_kv = kv_head_idx * size_per_head + tidx * vec_size;
-    int const n = (head_num + 2 * kv_head_num) * size_per_head;
+    int const n = (isCrossKV ? 0 : head_num + 2 * kv_head_num) * size_per_head;
 
     int const dst_kv_seq_idx = seq_idx;
-    int const src_k_offset = hidden_size;
-    int const src_v_offset = hidden_size + kv_head_num * size_per_head;
+    int const src_k_offset = isCrossKV ? 0 : head_num * size_per_head;
+    int const src_v_offset = src_k_offset + kv_head_num * size_per_head;
 
     // NOTE: q has seq len excluding prefix prompt
     // head_num == kv_head_num:
@@ -1493,7 +1496,7 @@ __global__ void add_fusedQKV_bias_transpose_kernel(T* q_buf, T* k_buf, T* v_buf,
         int8_mode);
 
 #define FUSED_QKV_BIAS_ROTARY_TRANSPOSE_LAUNCH(T, ADD_BIAS)                                                            \
-    add_fusedQKV_bias_transpose_kernel<T, ADD_BIAS><<<grid, block, smem_size, stream>>>(q_buf, k_buf, v_buf, QKV,      \
+    add_fusedQKV_bias_rope_transpose_kernel<T, ADD_BIAS><<<grid, block, smem_size, stream>>>(q_buf, k_buf, v_buf, QKV, \
         qkv_bias, seq_lens, padding_offset, batch_size, seq_len, head_num, kv_head_num, size_per_head,                 \
         rotary_embedding_dim, rotary_embedding_base, rotary_scale_type, rotary_embedding_scale,                        \
         rotary_embedding_max_positions, position_embedding_type);
@@ -1506,11 +1509,21 @@ void invokeAddFusedQKVBiasTranspose(T* q_buf, T* k_buf, T* v_buf, T* QKV, T cons
     int const rotary_embedding_max_positions, const PositionEmbeddingType position_embedding_type, float const* scale,
     int const int8_mode, cudaStream_t stream)
 {
-    // [bs, seq_len, 3, head, Dh]
+    // called by both self attention and cross attention in the non-FMHA path
+    // for self attn, (a) called once from QKV to Q/K/V (use higher head_num to launch kernels, which is the Q head_num,
+    // usually >= KV head_num ) for cross attn, (b) called 1st from Q to Q and (c) 2nd from KV to K/V (a) has both Q and
+    // KV head_num, (b) has KV head_num = 0, (c) has Q head_num = 0 Note: ROPE and non-ROPE kernels are two different
+    // code paths, and the kernel launch configs are also different
+    // TODO: in the ROPE kernel, we skip the Q or KV write in the cross attn 1st and 2nd call, but unnecessary KV or Q
+    // read is still there
+    TLLM_CHECK_WITH_INFO(
+        head_num != 0 || q_buf == nullptr, "Q head_num must be specified except for cross attention KV-only transpose");
+    TLLM_CHECK_WITH_INFO(kv_head_num != 0 || (k_buf == nullptr && v_buf == nullptr),
+        "KV head_num must be specified except for cross attention Q-only transpose");
     if (rotary_embedding_dim == 0)
     {
         int const m = token_num;
-        int const n = head_num * size_per_head;
+        int const n = std::max(head_num, kv_head_num) * size_per_head;
         dim3 block(384);
         dim3 grid((int) (ceil(1.0 * m * n / 384)));
 
@@ -1526,9 +1539,10 @@ void invokeAddFusedQKVBiasTranspose(T* q_buf, T* k_buf, T* v_buf, T* QKV, T cons
     else
     {
         TLLM_CHECK_WITH_INFO(int8_mode != 2, "w8a8 not yet implemented with RoPE"); // TODO
-        // To implement rotary embeddings, each thread processes two QKV elems:
+        // To implement rotary embeddings, each thread processes more than one QKV elems, e.g. 2 elems for
+        // fp16/bf16/fp32
         dim3 block((size_per_head / Vec_t<T>::size + 31) / 32 * 32);
-        dim3 grid(token_num, head_num);
+        dim3 grid(token_num, std::max(head_num, kv_head_num));
         size_t smem_size = (position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX
                     || position_embedding_type == PositionEmbeddingType::kLONG_ROPE
                 ? 2 * rotary_embedding_dim * sizeof(T)

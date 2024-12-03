@@ -240,6 +240,7 @@ class TestFunctional(unittest.TestCase):
                                  host_context_lengths,
                                  host_request_types,
                                  host_runtime_perf_knobs,
+                                 host_context_progress,
                                  use_fp8_context_fmha=False,
                                  atten_output_quant_scale=None):
             kv_cache_block_offsets = host_kv_cache_block_offsets.to('cuda')
@@ -309,6 +310,10 @@ class TestFunctional(unittest.TestCase):
                 host_runtime_perf_knobs_tensor = Tensor(
                     name='host_runtime_perf_knobs',
                     shape=[16],
+                    dtype=tensorrt_llm.str_dtype_to_trt('int64'))
+                host_context_progress_tensor = Tensor(
+                    name='host_context_progress',
+                    shape=[1],
                     dtype=tensorrt_llm.str_dtype_to_trt('int64'))
                 kv_quant_scale_tensor = None
                 kv_dequant_scale_tensor = None
@@ -435,7 +440,8 @@ class TestFunctional(unittest.TestCase):
                     host_kv_cache_pool_mapping=host_kv_cache_pool_mapping_tensor,
                     host_context_lengths=host_context_lengths_tensor,
                     qkv_bias=qkv_bias,
-                    host_runtime_perf_knobs=host_runtime_perf_knobs_tensor)
+                    host_runtime_perf_knobs=host_runtime_perf_knobs_tensor,
+                    host_context_progress=host_context_progress_tensor)
 
                 output_dtype = 'fp8' if use_fp8_context_fmha else dtype
 
@@ -458,7 +464,8 @@ class TestFunctional(unittest.TestCase):
                 'host_kv_cache_block_offsets': host_kv_cache_block_offsets,
                 'host_kv_cache_pool_pointers': host_kv_cache_pool_pointers,
                 'host_kv_cache_pool_mapping': host_kv_cache_pool_mapping,
-                'host_runtime_perf_knobs': host_runtime_perf_knobs
+                'host_runtime_perf_knobs': host_runtime_perf_knobs,
+                'host_context_progress': host_context_progress
             }
             if use_int8_kv_cache or use_fp8_kv_cache:
                 inputs['kv_quant_scale'] = kv_quant_scale
@@ -924,6 +931,10 @@ class TestFunctional(unittest.TestCase):
                 generation_host_runtime_perf_knobs[
                     1] = 1  # enable_context_fmha_fp32_acc
 
+            host_context_progress = torch.tensor([0],
+                                                 dtype=torch.int64,
+                                                 device='cpu')
+
             local_shape_dict = {
                 'input': (total_num_tokens, hidden_size),
                 'output': (total_num_tokens, hidden_size),
@@ -1060,7 +1071,8 @@ class TestFunctional(unittest.TestCase):
                 cache_indirection, num_heads, hidden_size, num_kv_heads, output,
                 dtype, kv_quant_scale, kv_dequant_scale, host_context_lengths,
                 host_request_types, generation_host_runtime_perf_knobs,
-                use_fp8_context_fmha, atten_output_quant_scale)
+                host_context_progress, use_fp8_context_fmha,
+                atten_output_quant_scale)
 
             del session
             session = None

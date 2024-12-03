@@ -375,8 +375,8 @@ int GemmPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::P
     {
         std::string const activationStr = "GEMM layer's activation before GEMM with " + mnkStr;
         TLLM_CHECK_DEBUG_WITH_INFO(
-            tensorrt_llm::runtime::utils::tensorHasNan(M, K, mType, inputs[0], stream, activationStr) == false,
-            "Found NaN in " + activationStr);
+            tensorrt_llm::runtime::utils::tensorHasInvalid(M, K, mType, inputs[0], stream, activationStr) == false,
+            "Found invalid number (NaN or Inf) in " + activationStr);
     }
 
     bool cudaKernelFinished = false;
@@ -408,8 +408,8 @@ int GemmPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::P
     {
         std::string const outputStr = "GEMM layer's output after GEMM with " + mnkStr;
         TLLM_CHECK_DEBUG_WITH_INFO(
-            tensorrt_llm::runtime::utils::tensorHasNan(M, N, mType, outputs[0], stream, outputStr) == false,
-            "Found NaN in " + outputStr);
+            tensorrt_llm::runtime::utils::tensorHasInvalid(M, N, mType, outputs[0], stream, outputStr) == false,
+            "Found invalid number (NaN or Inf) in " + outputStr);
     }
     return 0;
 }

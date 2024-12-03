@@ -14,9 +14,11 @@
 # limitations under the License.
 
 from ..llama.config import LLaMAConfig
+from ..qwen.config import QWenConfig
 
 
-class MedusaConfig(LLaMAConfig):
+# Medusa-specific config is stored and retrieved from GenericMedusaConfig.
+class MedusaConfig():
 
     def __init__(self,
                  *,
@@ -24,15 +26,29 @@ class MedusaConfig(LLaMAConfig):
                  num_medusa_layers: int = 1,
                  max_draft_len: int = 63,
                  **kwargs):
-        self.num_medusa_heads = num_medusa_heads
-        self.num_medusa_layers = num_medusa_layers
-        self.max_draft_len = max_draft_len
-        super().__init__(**kwargs)
+        GenericMedusaConfig = QWenConfig if "qwen" in kwargs[
+            'model_type'] else LLaMAConfig
+
+        self.config = GenericMedusaConfig(**kwargs)
+
+        # Add objects
+        self.config.num_medusa_heads = num_medusa_heads
+        self.config.num_medusa_layers = num_medusa_layers
+        self.config.max_draft_len = max_draft_len
 
     def to_dict(self):
-        output = super().to_dict()
-        # Serialize the fields added in MedusaConfig
-        output['num_medusa_heads'] = self.num_medusa_heads
-        output['num_medusa_layers'] = self.num_medusa_layers
-        output['max_draft_len'] = self.max_draft_len
+        output = self.config.to_dict()
+        output['num_medusa_heads'] = self.config.num_medusa_heads
+        output['num_medusa_layers'] = self.config.num_medusa_layers
+        output['max_draft_len'] = self.config.max_draft_len
         return output
+
+    # Specialization to redirect accesses to self.config
+    def __getattr__(self, name):
+        return getattr(self.config, name)
+
+    def __getstate__(self):
+        return self.__dict__
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)

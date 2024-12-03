@@ -18,6 +18,7 @@
 #include "tensorrt_llm/common/mathUtils.h"
 #include <cassert>
 #include <cstring>
+#include <cuda_runtime.h>
 #include <iostream>
 #include <math.h>
 #include <tuple>
@@ -87,6 +88,10 @@ FusedMHARunnerV2::FusedMHARunnerV2(MHARunnerFixedParams fixedParams)
         "Unsupported data type");
     xmmaKernel = getXMMAKernelsV2(mFixedParams.dataType, mSM);
 
+    if (mFixedParams.headSizeV == 0)
+    {
+        mFixedParams.headSizeV = mFixedParams.headSize;
+    }
     // Get device attributes.
     int device_id;
     cudaGetDevice(&device_id);
@@ -110,6 +115,7 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
     mKernelParams.sliding_window_size = runnerParams.slidingWindowSize;
     // Set the head size and number of heads.
     mKernelParams.d = mFixedParams.headSize;
+    mKernelParams.dv = mFixedParams.headSizeV;
     TLLM_CHECK_WITH_INFO(mFixedParams.numQHeads % mFixedParams.numKvHeads == 0,
         "number of Query heads should be multiple of KV heads !");
     mKernelParams.h = mFixedParams.numQHeads;
@@ -119,8 +125,9 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
     mKernelParams.is_s_padded = mFixedParams.isSPadded;
 
     // Packed QKV input layout.
-    mKernelParams.qkv_stride_in_bytes = get_size_in_bytes(
-        (mFixedParams.numQHeads + 2 * mFixedParams.numKvHeads) * mFixedParams.headSize, mFixedParams.dataType);
+    mKernelParams.qkv_stride_in_bytes = get_size_in_bytes(mFixedParams.numQHeads * mFixedParams.headSize
+            + mFixedParams.numKvHeads * mFixedParams.headSize + mFixedParams.numKvHeads * mFixedParams.headSizeV,
+        mFixedParams.dataType);
     // Contiguous Q input layout.
     mKernelParams.q_stride_in_bytes
         = get_size_in_bytes(mFixedParams.numQHeads * mFixedParams.headSize, mFixedParams.dataType);
@@ -130,6 +137,8 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
         // Paged kv cache layout.
         mKernelParams.kv_stride_in_bytes = get_size_in_bytes(
             runnerParams.pagedKvCache.mTokensPerBlock * mFixedParams.headSize, mFixedParams.dataType);
+        // Yuxin: only for deepseek
+        mKernelParams.v_stride_in_bytes = mKernelParams.kv_stride_in_bytes;
     }
     else if (mFixedParams.attentionInputLayout == AttentionInputLayout::Q_CONTIGUOUS_KV)
     {
@@ -138,7 +147,7 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
     }
     // Set the output buffer stride in bytes.
     mKernelParams.o_stride_in_bytes
-        = get_size_in_bytes(mFixedParams.numQHeads * mFixedParams.headSize, mFixedParams.dataType);
+        = get_size_in_bytes(mFixedParams.numQHeads * mFixedParams.headSizeV, mFixedParams.dataType);
     // Set the packed_mask_stride_in_bytes.
     if (mFixedParams.attentionMaskType == ContextAttentionMaskType::CUSTOM_MASK)
     {
@@ -355,6 +364,19 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
         //    - only hopper warp-specialized kernels have this optimization.
         //    - it doesn't work with scale * tanh(qk / scale) operation (from Grok).
         mLaunchParams.useBase2ExpTrick = !mLaunchParams.enableQKTanhScale;
+    }
+
+    // For Deepseek-v2(MLA), all of SM80, SM89 and SM90 kernels use tiled flash attention
+    // in both context (192/128 dimensions) and generation (576/512 dimensions)
+    if (mFixedParams.headSize == mFixedParams.headSizeV + 64)
+    {
+        mLaunchParams.flash_attention = true;
+        mLaunchParams.force_unroll = true;
+        mLaunchParams.kernel_s = 0;
+        mLaunchParams.granular_tiling = true;
+        // Even on SM90, we use ampere-style kernel, will be optimized later
+        mLaunchParams.warp_specialization = false;
+        mLaunchParams.useKernelWithoutAlibi = false;
     }
 }
 
@@ -613,7 +635,6 @@ void FusedMHARunnerV2::setSeparateQKvTmaDescriptors(MHARunnerParams runnerParams
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-
 void FusedMHARunnerV2::run(MHARunnerParams runnerParams)
 {
     // Note that we must set the launch params first.
@@ -632,7 +653,6 @@ void FusedMHARunnerV2::run(MHARunnerParams runnerParams)
         default: TLLM_CHECK_WITH_INFO(false, "Unsupported attention input layout.");
         }
     }
-
     // Select the kernel and run it.
     xmmaKernel->run(mKernelParams, mLaunchParams, runnerParams.stream);
 }

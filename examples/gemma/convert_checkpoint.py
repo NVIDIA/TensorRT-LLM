@@ -7,6 +7,7 @@ from typing import Dict, Optional, Type
 
 import tensorrt_llm
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.convert_utils import infer_dtype
 from tensorrt_llm.models.gemma.config import GEMMA_ARCHITECTURE, GemmaConfig
 from tensorrt_llm.models.gemma.convert import (HfParser, JAXParser, KerasParser,
                                                Parsers, QuantizeModifiers,
@@ -48,9 +49,15 @@ def parse_arguments() -> argparse.Namespace:
         help=
         "Use weight only on embedding table and lm_head. (Only supported on Hopper GPU)",
     )
-    parser.add_argument("--dtype",
-                        type=str,
-                        choices=["float32", "bfloat16", "float16"])
+    parser.add_argument(
+        '--dtype',
+        type=str,
+        default='auto',
+        choices=['auto', 'float16', 'bfloat16', 'float32'],
+        help=
+        "The data type for the model weights and activations if not quantized. "
+        "If 'auto', the data type is automatically inferred from the source model; "
+        "however, if the source dtype is float32, it is converted to float16.")
     parser.add_argument(
         "--enable_fp8",
         action="store_true",
@@ -214,7 +221,7 @@ def main() -> None:
 
         trt_llm_config = tensorrt_llm.models.GemmaConfig(
             architecture=GEMMA_ARCHITECTURE,
-            dtype=args.dtype or ckpt_params_dtype,
+            dtype=infer_dtype(args.dtype, ckpt_params_dtype),
             logits_dtype="float32",
             vocab_size=ckpt_config.num_embed,
             max_position_embeddings=8192,

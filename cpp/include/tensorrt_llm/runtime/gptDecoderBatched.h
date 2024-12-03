@@ -54,13 +54,15 @@ public:
 
     void setupExplicitDraftTokens(ExplicitDraftTokensBuffers::Inputs explicitDraftTokensBuffers) override;
 
+    void setupEagle(EagleBuffers::Inputs eagleBuffers) override;
+
     void setupLookahead(LookaheadDecodingBuffers lookaheadDecodingBuffers) override;
 
-    void newBatch(
-        GenerationInput const& inputs, GenerationOutput const& outputs, SamplingConfig const& samplingConfig) override;
+    void newBatch(GenerationInput const& inputs, GenerationOutput const& outputs, SamplingConfig const& samplingConfig,
+        ModelConfig const& modelConfig) override;
 
     void newRequests(std::vector<SizeType32> const& seqSlots, std::vector<decoder_batch::Request> const& requests,
-        std::vector<SamplingConfig> const& samplingConfigs) override;
+        std::vector<SamplingConfig> const& samplingConfigs, ModelConfig const& modelConfig) override;
 
     DecoderFinishedEventPtr forwardAsync(decoder_batch::Output& output, decoder_batch::Input const& input) override;
 
@@ -242,7 +244,8 @@ private:
         SizeType32 batchIdx, SamplingConfig const& samplingConfig, bool streaming) const;
 
     //! @brief Initialize the decoder at `batchSlot` with a new `request`.
-    void newRequest(SizeType32 batchSlot, decoder_batch::Request const& request, SamplingConfig const& samplingConfig);
+    void newRequest(SizeType32 batchSlot, decoder_batch::Request const& request, SamplingConfig const& samplingConfig,
+        ModelConfig const& modelConfig);
 
     //! @brief Allocate buffers for speculative decoding.
     void allocateSpeculativeDecodingBuffers(nvinfer1::DataType dtype);
@@ -254,8 +257,8 @@ private:
     void setupLookahead(ModelConfig const& modelConfig);
 
     //! @brief Setups decoder internal tensors for new speculative decoding request
-    void newRequestSpeculativeDecoding(
-        SizeType32 batchIdx, decoder_batch::Request const& request, SamplingConfig const& samplingConfig);
+    void newRequestSpeculativeDecoding(SizeType32 batchIdx, decoder_batch::Request const& request,
+        SamplingConfig const& samplingConfig, ModelConfig const& modelConfig);
 
     //! @brief Setups decoder internal tensors for new request in Draft model Sps mode
     void newRequestDraftTokensExternal(
@@ -270,11 +273,17 @@ private:
     //! @brief Setups decoder internal tensors for new Explicit draft tokens request
     void newRequestExplicitDraftTokens(SizeType32 batchIdx, decoder_batch::Request const& request);
 
+    //! @brief Setups decoder internal tensors for new Eagle request
+    void newRequestEagle(SizeType32 batchIdx, decoder_batch::Request const& request, ModelConfig const& modelConfig);
+
     //! @brief Updates finished state on host for all active requests
     void updateFinished(decoder_batch::DecoderFinishedEvent const& decoderFinishEvent);
 
     //! @brief Sets inputs for explicit draft tokens.
     void setExplicitDraftTokensInputs(decoder_batch::Input const& input);
+
+    //! @brief Sets inputs for eagle decoding.
+    void setEagleInputs(decoder_batch::Input const& input);
 
     //! @brief Calls decoders for tokens per engine step
     void forwardDispatch(decoder_batch::Output& output, decoder_batch::Input const& input, ForwardType forwardType);

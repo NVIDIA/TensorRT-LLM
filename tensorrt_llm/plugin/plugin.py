@@ -25,6 +25,7 @@ from typing import List, Optional, Tuple
 import tensorrt as trt
 
 from .._ipc_utils import IpcMemory, can_access_peer
+from ..bindings.internal.runtime import lamport_initialize_all
 from ..logger import logger
 from ..mapping import Mapping
 
@@ -82,6 +83,7 @@ PLUGIN_DTYPE_OPTIONS_MAP = {
     "gemm_plugin":
     ["auto", "float16", "float32", "bfloat16", "int32", "fp8", None],
     "low_latency_gemm_plugin": ["fp8", None],
+    "low_latency_gemm_swiglu_plugin": ["fp8", None],
 }
 
 
@@ -136,7 +138,7 @@ class PluginConfig(metaclass=PluginConfigMeta):
 
     There are two option categories:
     * Plugin options (typically with xxx_plugin naming). These options can be assigned with:
-        * "float16"/"bfloat16"/"float32"/"int32", which means the plugin is enabled with the specified precision; (Some plugins only support limited dtype, i.e., gemm_swiglu_plugin only supports fp8 now)
+        * "float16"/"bfloat16"/"float32"/"int32", which means the plugin is enabled with the specified precision; (Some plugins only support limited dtype, i.e., gemm_swiglu_plugin and low_latency_gemm_swiglu_plugin only supports fp8 now)
         * "auto", which means the plugin is enabled with the precision of `dtype` field (the `dtype` field must be same to model dtype, i.e., the one in PretrainedConfig);
         * None, which means the plugin is disabled.
     * Other features. These options can be assigned with boolean:
@@ -155,24 +157,28 @@ class PluginConfig(metaclass=PluginConfigMeta):
     _gemm_swiglu_plugin: Optional[str] = field(default=None, init=False)
     _fp8_rowwise_gemm_plugin: Optional[str] = field(default=None, init=False)
     _smooth_quant_gemm_plugin: Optional[str] = field(default=None, init=False)
+    _qserve_gemm_plugin: Optional[str] = field(default=None, init=False)
     _identity_plugin: Optional[str] = field(default=None, init=False)
     _layernorm_quantization_plugin: Optional[str] = field(default=None,
                                                           init=False)
     _rmsnorm_quantization_plugin: Optional[str] = field(default=None,
                                                         init=False)
     _nccl_plugin: Optional[str] = field(default="auto", init=False)
-    _lookup_plugin: Optional[str] = field(default=None, init=False)
     _lora_plugin: Optional[str] = field(default=None, init=False)
     _weight_only_groupwise_quant_matmul_plugin: Optional[str] = field(
         default=None, init=False)
     _weight_only_quant_matmul_plugin: Optional[str] = field(default=None,
                                                             init=False)
+    _smooth_quant_plugins: bool = field(
+        default=True,
+        init=False)  # Always enable smooth quant plugins for external users
     _quantize_per_token_plugin: bool = field(default=False, init=False)
     _quantize_tensor_plugin: bool = field(default=False, init=False)
     _moe_plugin: Optional[str] = field(default="auto", init=False)
     _mamba_conv1d_plugin: Optional[str] = field(default="auto", init=False)
     _low_latency_gemm_plugin: Optional[str] = field(default=None, init=False)
-
+    _low_latency_gemm_swiglu_plugin: Optional[str] = field(default=None,
+                                                           init=False)
     # Features
     _context_fmha: bool = field(default=True, init=False)
     _bert_context_fmha_fp32_acc: bool = field(
@@ -189,6 +195,7 @@ class PluginConfig(metaclass=PluginConfigMeta):
     _streamingllm: bool = field(default=False, init=False)
     _manage_weights: bool = field(default=False, init=False)
     _use_fused_mlp: bool = field(default=True, init=False)
+    _pp_reduce_scatter: bool = field(default=False, init=False)
 
     def update_from_dict(self, config: dict):
         for name in config.keys():
@@ -246,6 +253,9 @@ class PluginConfig(metaclass=PluginConfigMeta):
         else:
             return ContextFMHAType.disabled
 
+    def is_context_fmha_enabled(self):
+        return self.context_fmha_type != ContextFMHAType.disabled
+
     @context_fmha_type.setter
     def context_fmha_type(self, value):
         if value == ContextFMHAType.disabled:
@@ -264,6 +274,12 @@ class PluginConfig(metaclass=PluginConfigMeta):
         self.layernorm_quantization_plugin = dtype
         self.quantize_per_token_plugin = True
         self.quantize_tensor_plugin = True
+        return self
+
+    def set_qserve_plugins(self, dtype: str = "auto"):
+        self.qserve_gemm_plugin = dtype
+        self.rmsnorm_quantization_plugin = dtype
+        self.quantize_per_token_plugin = True
         return self
 
     def set_fp8_rowwise_quant_plugins(self, dtype: str = "auto"):
@@ -297,12 +313,12 @@ cli_plugin_args = [
     "gemm_plugin",
     "gemm_swiglu_plugin",
     "fp8_rowwise_gemm_plugin",
-    "lookup_plugin",
     "lora_plugin",
     "moe_plugin",
     "mamba_conv1d_plugin",
     "nccl_plugin",
     "low_latency_gemm_plugin",
+    "low_latency_gemm_swiglu_plugin",
 
     # Features
     "context_fmha",
@@ -317,6 +333,7 @@ cli_plugin_args = [
     "streamingllm",
     "reduce_fusion",
     "use_fused_mlp",
+    "pp_reduce_scatter",
 ]
 
 
@@ -369,6 +386,7 @@ class CustomAllReduceHelper:
               Then, each instance of allreduce will reference that tensor automatically.
     """
     POINTERS_PER_RANK = 7
+    POINTERS_OF_COUNTER = 2
 
     def __init__(self) -> None:
         self.workspace: Optional[Tensor] = None
@@ -377,7 +395,7 @@ class CustomAllReduceHelper:
                              mapping: Mapping,
                              num_profiles: Optional[int] = None):
         from ..functional import Tensor
-        workspace_size = self.POINTERS_PER_RANK * mapping.tp_size + 2
+        workspace_size = self.POINTERS_PER_RANK * mapping.tp_size + self.POINTERS_OF_COUNTER
 
         dim_range = None
         if num_profiles is not None:
@@ -418,6 +436,15 @@ class CustomAllReduceHelper:
                                       is_p2p_supported)
         lamport_buffers_2 = IpcMemory(mapping, size * mapping.tp_size,
                                       is_p2p_supported)
+        rank = mapping.rank
+        tp_rank = mapping.tp_rank
+        if rank == tp_rank and is_p2p_supported:
+            lamport_initialize_all(
+                lamport_buffers_0.local_ptr,
+                lamport_buffers_1.local_ptr,
+                lamport_buffers_2.local_ptr,
+                size * mapping.tp_size,
+            )
         buffers = [
             ipc_buffers_ping, ipc_buffers_pong, ipc_barriers_in,
             ipc_barriers_out, lamport_buffers_0, lamport_buffers_1,

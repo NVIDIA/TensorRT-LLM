@@ -17,6 +17,7 @@
  */
 #pragma once
 #include "decoderXQAConstants.h"
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -25,6 +26,7 @@
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 #include "xqaParams.h"
 #include <cstddef>
+#include <cstdint>
 #include <utility>
 
 namespace tensorrt_llm
@@ -216,8 +218,8 @@ struct XQALaunchParam
 
 // Setup launch params and ioScratch. ioScratch is for RoPE and output type conversion.
 template <typename KVCacheBuffer>
-void buildXQALaunchParams(XQALaunchParam<KVCacheBuffer>& launchParams, void*& ioScratch, XQAParams const& params,
-    KVCacheBuffer kv_cache_buffer)
+void buildXQALaunchParams(XQALaunchParam<KVCacheBuffer>& launchParams, void*& inputScratch, bool hasOutputScratch,
+    XQAParams const& params, KVCacheBuffer kv_cache_buffer)
 {
     TLLM_CHECK_WITH_INFO(
         params.data_type == DATA_TYPE_FP16 || params.data_type == DATA_TYPE_BF16, "Only fp16 or bf16 supported now.");
@@ -232,9 +234,15 @@ void buildXQALaunchParams(XQALaunchParam<KVCacheBuffer>& launchParams, void*& io
     // Workspace.
     size_t offset = 0;
     int8_t* workspace = reinterpret_cast<int8_t*>(params.workspaces);
-    ioScratch = workspace;
+    inputScratch = workspace;
     workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(
         workspace, 2 * params.head_size * params.num_q_heads * params.total_num_input_tokens);
+    if (hasOutputScratch)
+    {
+        launchParams.output = workspace;
+        workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(
+            workspace, 2 * params.head_size * params.num_q_heads * params.total_num_input_tokens);
+    }
     unsigned int batch_beam_size = params.batch_size * params.beam_width;
     const size_t cu_seqlens_size = sizeof(int) * (batch_beam_size + 1);
     const size_t rotary_inv_freq_size = sizeof(float) * batch_beam_size * params.rotary_embedding_dim / 2;
@@ -283,7 +291,7 @@ std::optional<T> getGlobalVar(std::shared_ptr<tensorrt_llm::common::CUDADriverWr
             return std::nullopt;
         }
         [[fallthrough]];
-    default: cuErrCheck(("Failed to retrieve global variable from cubin.", error), driver);
+    default: TLLM_THROW("Failed to retrieve global variable from cubin: error code %i.", static_cast<int32_t>(error));
     }
     return std::optional<T>{std::move(ret)};
 }

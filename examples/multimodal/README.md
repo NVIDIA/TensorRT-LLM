@@ -12,11 +12,12 @@ We first describe how to run each model on a single GPU. We then provide general
 - [Deplot](#deplot)
 - [Fuyu](#fuyu)
 - [Kosmos-2](#kosmos-2)
-- [LLaVA, LLaVa-NeXT and VILA](#llava-llava-next-and-vila)
+- [LLaVA, LLaVa-NeXT, LLaVA-OneVision and VILA](#llava-llava-next-llava-onevision-and-vila)
 - [NeVA](#neva)
 - [Nougat](#nougat)
 - [Phi-3-vision](#phi-3-vision)
 - [Video NeVA](#video-neva)
+- [InternVL2](#internvl2)
 - [Enabling tensor parallelism for multi-GPU](#enabling-tensor-parallelism-for-multi-gpu)
 
 ## BLIP2
@@ -359,9 +360,9 @@ Currently, CogVLM only support bfloat16 precision.
         --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu
     ```
 
-## LLaVA, LLaVa-NeXT and VILA
+## LLaVA, LLaVa-NeXT, LLaVA-OneVision and VILA
 
-[LLaVA](https://github.com/haotian-liu/LLaVA) and [VILA](https://github.com/Efficient-Large-Model/VILA) are both visual language models (VLM) that can be deployed in TensorRT-LLM with many quantization options. [LLaVA-NeXT](https://huggingface.co/collections/llava-hf/llava-next-65f75c4afac77fd37dbbe6cf) is an extension of LLaVA. TRT-LLM currently supports [Mistral-7b](https://huggingface.co/llava-hf/llava-v1.6-mistral-7b-hf) and [ Nous-Hermes-2-Yi-34B](https://huggingface.co/llava-hf/llava-v1.6-34b-hf) variant of LLaVA-NeXT.
+[LLaVA](https://github.com/haotian-liu/LLaVA) and [VILA](https://github.com/Efficient-Large-Model/VILA) are both visual language models (VLM) that can be deployed in TensorRT-LLM with many quantization options. [LLaVA-NeXT](https://huggingface.co/collections/llava-hf/llava-next-65f75c4afac77fd37dbbe6cf) is an extension of LLaVA. TRT-LLM currently supports [Mistral-7b](https://huggingface.co/llava-hf/llava-v1.6-mistral-7b-hf) and [ Nous-Hermes-2-Yi-34B](https://huggingface.co/llava-hf/llava-v1.6-34b-hf) variant of LLaVA-NeXT. [LLaVA-OneVision](https://huggingface.co/collections/llava-hf/llava-onevision-66bb1e9ce8856e210a7ed1fe) is another extension of LLaVA.
 
 1. Download Huggingface model weights. These models have both visual and LLM components
    unlike BLIP2 example which downloads only LLM components from Huggingface.
@@ -376,6 +377,13 @@ Currently, CogVLM only support bfloat16 precision.
 
      ```bash
         export MODEL_NAME="llava-v1.6-mistral-7b-hf" #for 34b variant "llava-v1.6-34b-hf"
+        git clone https://huggingface.co/llava-hf/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
+    ```
+
+    For LLaVA-OneVision,
+
+    ```bash
+        export MODEL_NAME="llava-onevision-qwen2-7b-ov-hf" # also llava-onevision-qwen2-0.5b-ov-hf, llava-onevision-qwen2-72b-ov-hf, etc
         git clone https://huggingface.co/llava-hf/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
     ```
 
@@ -394,7 +402,7 @@ Currently, CogVLM only support bfloat16 precision.
         git clone https://huggingface.co/Efficient-Large-Model/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
     ```
 
-2. Generate TRT-LLM engine for LLaMA following example in `examples/llama/README.md`
+2. Generate TRT-LLM engine for LLaMA following example in `examples/llama/README.md` and `examples/qwen/README.md`
 
     ```bash
     python ../llama/convert_checkpoint.py \
@@ -423,7 +431,7 @@ Currently, CogVLM only support bfloat16 precision.
         --max_batch_size 1 \
         --max_input_len 4096 \
         --max_seq_len 5120 \
-        --max_num_tokens 4096 \  # 1 (max_batch_size) * 4096 (max_input_len)
+        --max_num_tokens 4096 \
         --max_multimodal_len 4096 # 1 (max_batch_size) * 4096 (max_input_len)
 
     # for VILA
@@ -436,6 +444,22 @@ Currently, CogVLM only support bfloat16 precision.
         --max_input_len 2048 \
         --max_seq_len 2560 \
         --max_multimodal_len 4096 # 1 (max_batch_size) * 4096 (num_visual_features)
+
+    # for LLaVA-OneVision
+    python ../qwen/convert_checkpoint.py \
+        --model_dir tmp/hf_models/${MODEL_NAME} \
+        --output_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu \
+        --dtype float16
+
+    trtllm-build \
+        --checkpoint_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu \
+        --output_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu \
+        --gemm_plugin float16 \
+        --use_fused_mlp=enable \
+        --max_batch_size 1 \
+        --max_input_len  7228 \
+        --max_seq_len  7328 \
+        --max_multimodal_len 7128 # max_batch_size * num_visual_features(depends on the image size or the specified video num frame)
     ```
 
 3. Build TensorRT engines for visual components
@@ -443,7 +467,9 @@ Currently, CogVLM only support bfloat16 precision.
     ```bash
     python build_visual_engine.py --model_path tmp/hf_models/${MODEL_NAME} --model_type llava # for LLaVA
 
-    python build_visual_engine.py --model_path tmp/hf_models/${MODEL_NAME} --model_type llava_next --model_path tmp/hf_models/${MODEL_NAME} --max_batch_size 5 # 1 (max_batch_size) * 5 (because LLAVA-NeXT visual encoder can have at most 5 patches)  # for LLaVA-NeXT
+    python build_visual_engine.py --model_path tmp/hf_models/${MODEL_NAME} --model_type llava_next --max_batch_size 5 # 1 (max_batch_size) * 5 (because LLAVA-NeXT visual encoder can have at most 5 patches)  # for LLaVA-NeXT
+
+    python build_visual_engine.py --model_path tmp/hf_models/${MODEL_NAME} --model_type llava_onevision --max_batch_size 32 # max_batch_size * patch for image or frame for video # for LLaVA-OneVision
 
     python build_visual_engine.py --model_path tmp/hf_models/${MODEL_NAME} --model_type vila --vila_path ${VILA_PATH} # for VILA
     ```
@@ -457,13 +483,33 @@ Currently, CogVLM only support bfloat16 precision.
         --input_text "Question: which city is this? Answer:" # for LLaVA and for LLaVA-NeXT
     ```
 
+    For LLaVA-OneVision, you can use either image or video as inputs.
+    ```bash
+    python run.py \
+        --max_new_tokens 30 \
+        --hf_model_dir tmp/hf_models/${MODEL_NAME} \
+        --visual_engine_dir tmp/trt_engines/${MODEL_NAME}/vision_encoder \
+        --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu \
+        --input_text "What is shown in this image?" \
+        --image_path image.png
+
+    python run.py \
+        --max_new_tokens 30 \
+        --hf_model_dir tmp/hf_models/${MODEL_NAME} \
+        --visual_engine_dir tmp/trt_engines/${MODEL_NAME}/vision_encoder \
+        --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu \
+        --input_text "Why is this video funny?" \
+        --video_path video.mp4
+        --video_num_frames 8 # sample uniformly 8 frames from the video, up to 32 frames
+    ```
+
     For VILA, you can use either local file or web url as input images.
     Suppose you have a local image `av.png` downloaded from `https://github.com/Efficient-Large-Model/VILA/blob/main/demo_trt_llm/av.png` and the url of `merlion.png`
     ```bash
     wget -O av.png https://raw.githubusercontent.com/Efficient-Large-Model/VILA/main/demo_images/av.png
 
     python run.py  \
-        --max_new_tokens 100 \
+        --max_new_tokens 30 \
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
         --visual_engine_dir tmp/trt_engines/${MODEL_NAME}/vision_encoder \
         --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu \
@@ -472,13 +518,14 @@ Currently, CogVLM only support bfloat16 precision.
         --batch_size=1 # for VILA mode 1
 
     python run.py  \
-        --max_new_tokens 100 \
+        --max_new_tokens 30 \
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
         --visual_engine_dir tmp/trt_engines/${MODEL_NAME}/vision_encoder \
         --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu \
         --image_path=av.png,https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png \
         --input_text="<image>\n Please elaborate what you see in the images?" \
-        --batch_size=2 # for VILA mode 2
+        --batch_size=2 \
+        --check_accuracy # for VILA mode 2
     ```
 
     Note that VILA can support different modes in terms of batching:
@@ -487,7 +534,7 @@ Currently, CogVLM only support bfloat16 precision.
 
     Note: use `--run_profiling` for performance measurement, use `--check_accuracy` for accuracy check.
 
-4. (Optional) Different quantization methods supported in LLaMA can be applied to LLaVA/VILA as well, such as INT4/INT8 weight-only, SmoothQuant, and INT4 Activation-Aware Quantization (AWQ). Detailed instructions can be found in LLaMA [README](../llama/README.md).
+4. (Optional) Different quantization methods supported in LLaMA and Qwen can be applied to LLaVA/VILA/LLaVA-OneVision as well, such as INT4/INT8 weight-only, SmoothQuant, and INT4 Activation-Aware Quantization (AWQ). Detailed instructions can be found in LLaMA [README](../llama/README.md) and Qwen [README](../qwen/README.md).
 
    For example,
 
@@ -700,6 +747,88 @@ Currently, CogVLM only support bfloat16 precision.
     ```
 
     Note: use `--run_profiling` for performance measurement, use `--check_accuracy` for accuracy check.
+
+## InternVL2
+
+[InternVL Family](https://github.com/OpenGVLab/InternVL): Closing the Gap to Commercial Multimodal Models with Open-Source Suites —— A Pioneering Open-Source Alternative to GPT-4o. Here we show how to deploy InternVL2‑1B/InternVL2‑2B/InternVL2‑4B/InternVL2‑8B/InternVL2‑26B in TensorRT-LLM.
+
+Firstly, please install transformers with 4.37.2
+```bash
+    pip install transformers==4.37.2
+```
+
+1. Download Huggingface weights
+    - For InternVL2-1B
+        ```bash
+        export MODEL_NAME="InternVL2-1B"
+        git clone https://huggingface.co/OpenGVLab/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
+        export LLM_MODEL_NAME="qwen"
+        ```
+
+    - For InternVL2-2B/InternVL2‑8B/InternVL2‑26B
+        ```bash
+        export MODEL_NAME="InternVL2-2B" # or InternVL2‑8B, InternVL2‑26B
+        git clone https://huggingface.co/OpenGVLab/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
+        export LLM_MODEL_NAME="internlm2"
+        ```
+
+    - For InternVL2-4B
+        ```bash
+        export MODEL_NAME="InternVL2-4B"
+        git clone https://huggingface.co/OpenGVLab/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
+        export LLM_MODEL_NAME="phi"
+        ```
+
+2. Convert Huggingface weights into TRT-LLM checkpoints
+    ```bash
+    python ../${LLM_MODEL_NAME}/convert_checkpoint.py \
+            --model_dir tmp/hf_models/${MODEL_NAME} \
+            --output_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu  \
+            --dtype float16
+    ```
+
+3. Build TRT engines
+    ```bash
+    trtllm-build \
+        --checkpoint_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu \
+        --output_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu \
+        --gemm_plugin auto \
+        --max_batch_size 1 \
+        --max_input_len 4096 \
+        --max_seq_len 4608 \
+        --max_multimodal_len 3328
+    ```
+
+4. Generate TensorRT engines for visual components and combine everything into final pipeline.
+    ```bash
+    python build_visual_engine.py --model_type internvl --model_path tmp/hf_models/${MODEL_NAME}
+    python run.py \
+        --hf_model_dir tmp/hf_models/${MODEL_NAME} \
+        --visual_engine_dir tmp/trt_engines/${MODEL_NAME}/vision_encoder \
+        --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu/ \
+        --image_path tmp/hf_models/${MODEL_NAME}/examples/image1.jpg
+    ```
+
+5. (Optional) FP8 and INT8 SmoothQuant quantization is supported for the InternVL2-4B variant (LLM model only).
+
+   ```bash
+   # FP8 quantization
+   python ../quantization/quantize.py \
+        --model_dir tmp/hf_models/${MODEL_NAME} \
+        --output_dir tmp/trt_models/${MODEL_NAME}/fp8/1-gpu \
+        --dtype bfloat16 \
+        --qformat fp8 \
+        --kv_cache_dtype fp8
+
+   # INT8 SmoothQuant quantization
+   python ../quantization/quantize.py \
+        --model_dir tmp/hf_models/${MODEL_NAME} \
+        --output_dir tmp/trt_models/${MODEL_NAME}/int8/1-gpu \
+        --dtype bfloat16 \
+        --qformat int8_sq
+   ```
+
+   Then follow the same `trtllm-build`, `build_visual_engine.py` and `run.py` steps as before.
 
 ## Enabling tensor parallelism for multi-GPU
 

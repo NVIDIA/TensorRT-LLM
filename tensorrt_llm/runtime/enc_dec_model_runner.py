@@ -52,7 +52,7 @@ def read_config(config_path: Path):
     num_kv_heads = (num_kv_heads + tp_size - 1) // tp_size
 
     cross_attention = pretrained_config["architecture"] == "DecoderModel"
-    skip_cross_qkv = pretrained_config.get('skip_cross_qkv', False)
+    skip_cross_kv = pretrained_config.get('skip_cross_kv', False)
     has_position_embedding = pretrained_config["has_position_embedding"]
     has_token_type_embedding = hasattr(pretrained_config, "type_vocab_size")
     dtype = pretrained_config["dtype"]
@@ -92,7 +92,7 @@ def read_config(config_path: Path):
         lora_target_modules=lora_config.get('lora_target_modules'),
         trtllm_modules_to_hf_modules=lora_config.get(
             'trtllm_modules_to_hf_modules'),
-        skip_cross_qkv=skip_cross_qkv,
+        skip_cross_kv=skip_cross_kv,
     )
 
     return model_config, tp_size, pp_size, gpus_per_node, dtype
@@ -474,7 +474,8 @@ class EncDecModelRunner:
         # `cross_attention_mask` in context phase [batch_size, query_len, encoder_input_len]
         # where query_len happens to be 1 in current cases, but not necessarily always, and
         # `cross_attention_mask` in generation phase [batch_size, 1, encoder_input_len] where
-        # the query_len is always 1 since we have kv cache.
+        # the query_len is always 1 since we have kv cache. But we use
+        # cross_attention_mask[:, step, :] during generation
         cross_attention_mask = None
         if attention_mask is not None:
             cross_attention_mask = torch.tensor(attention_mask,
@@ -482,6 +483,8 @@ class EncDecModelRunner:
                                                 device=self.device).reshape(
                                                     attention_mask.shape[0], 1,
                                                     attention_mask.shape[1])
+            cross_attention_mask = cross_attention_mask.repeat(
+                [1, decoder_max_input_length + max_new_tokens, 1])
 
         # generation config
         sampling_config = SamplingConfig(end_id=eos_token_id,

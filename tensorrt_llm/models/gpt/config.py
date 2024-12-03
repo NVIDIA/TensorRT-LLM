@@ -17,10 +17,10 @@ from typing import Optional, Union
 
 import torch
 
-from ..._utils import torch_dtype_to_str
 from ...layers import MoeConfig
 from ...logger import logger
 from ...mapping import Mapping
+from ..convert_utils import infer_dtype
 from ..modeling_utils import PretrainedConfig, QuantConfig
 
 
@@ -106,9 +106,9 @@ class GPTConfig(PretrainedConfig):
             logger.info("Inferring gpt variant from path...")
             for v in [
                     'starcoder2', 'starcoder', 'santacoder', 'gpt2',
-                    'persimmon', 'fuyu', 'kosmos-2', 'jais'
+                    'persimmon', 'fuyu', 'kosmos-2', 'jais', 'nemotron'
             ]:
-                if v in hf_config._name_or_path:
+                if v in hf_config._name_or_path or v == hf_config.model_type:
                     gpt_variant = v
                     break
         if gpt_variant == 'fuyu':
@@ -116,11 +116,11 @@ class GPTConfig(PretrainedConfig):
 
         assert gpt_variant in [
             'gpt2', 'santacoder', 'starcoder', 'starcoder2', 'persimmon',
-            'kosmos-2', 'jais'
+            'kosmos-2', 'jais', 'nemotron'
         ]
         logger.info(f"Gpt variant: {gpt_variant}")
 
-        if gpt_variant in ['starcoder2', 'persimmon']:
+        if gpt_variant in ['starcoder2', 'nemotron', 'persimmon']:
             hf_config.n_embd = hf_config.hidden_size
             hf_config.n_inner = hf_config.intermediate_size
             hf_config.n_head = hf_config.num_attention_heads
@@ -129,12 +129,15 @@ class GPTConfig(PretrainedConfig):
             hf_config.n_layer = hf_config.num_hidden_layers
             hf_config.n_positions = hf_config.max_position_embeddings
             hf_config.activation_function = 'gelu' if gpt_variant == 'starcoder2' else 'squared-relu'
+            if gpt_variant == "nemotron":
+                hf_config.layer_norm_eps = hf_config.norm_eps
             hf_config.layer_norm_epsilon = hf_config.norm_epsilon if gpt_variant == 'starcoder2' else hf_config.layer_norm_eps
-            hf_config.bias = hf_config.use_bias if gpt_variant == 'starcoder2' else True
+            hf_config.bias = hf_config.use_bias if gpt_variant == 'starcoder2' else gpt_variant != 'nemotron'
             hf_config.position_embedding_type = 'rope_gpt_neox'
             hf_config.rotary_base = hf_config.rope_theta
-            hf_config.rotary_pct = getattr(hf_config, 'partial_rotary_factor',
-                                           1.0)
+            hf_config.rotary_pct = getattr(
+                hf_config, 'partial_rotary_factor',
+                getattr(hf_config, 'rope_percent', 1.0))
             try:
                 # only for persimmon, not starcoder2
                 hf_config.vocab_size = hf_config.text_config.vocab_size
@@ -178,14 +181,7 @@ class GPTConfig(PretrainedConfig):
             if hf_config.text_config.scale_embedding:
                 hf_config.embeddings_scale = hf_config.n_embd**0.5
 
-        if dtype == 'auto':
-            dtype = getattr(hf_config, 'torch_dtype', None)
-            if dtype is None:
-                dtype = 'float16'
-            if isinstance(dtype, torch.dtype):
-                dtype = torch_dtype_to_str(dtype)
-            if dtype == 'float32':
-                dtype = 'float16'
+        dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
 
         return cls(architecture=hf_config.architectures[0],
                    dtype=dtype,
@@ -295,13 +291,14 @@ class GPTConfig(PretrainedConfig):
             }
 
         if dtype == 'auto':
-            dtype = nemo_model_config['precision']
+            dtype = nemo_model_config.get('precision', None)
             if dtype is None:
                 dtype = 'float16'
             elif 'bf16' in dtype or 'bfloat16' in dtype:
                 dtype = 'bfloat16'
             else:
                 dtype = 'float16'
+            logger.info(f"Specified dtype 'auto'; inferred dtype {dtype!r}.")
 
         return cls(architecture='GPTForCausalLM',
                    dtype=dtype,

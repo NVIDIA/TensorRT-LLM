@@ -29,13 +29,13 @@ namespace tensorrt_llm
 namespace kernels
 {
 
-__global__ void quantizedKernel(char4* dst, float4 const* src, const int64_t sizeDiv4, float const* scalePtr)
+__global__ void quantizedKernel(char4* dst, float4 const* src, int64_t const sizeDiv4, float const* scalePtr)
 {
     for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < sizeDiv4; idx += blockDim.x * gridDim.x)
     {
         float const scale = __ldg(scalePtr);
         char4 tmp;
-        const float4 floatTmp = __ldg(src + idx);
+        float4 const floatTmp = __ldg(src + idx);
         tmp.x = cuda_cast<int8_t>(floatTmp.x * scale);
         tmp.y = cuda_cast<int8_t>(floatTmp.y * scale);
         tmp.z = cuda_cast<int8_t>(floatTmp.z * scale);
@@ -44,7 +44,7 @@ __global__ void quantizedKernel(char4* dst, float4 const* src, const int64_t siz
     }
 }
 
-__global__ void quantizedKernel(char4* dst, half2 const* src, const int64_t sizeDiv4, float const* scalePtr)
+__global__ void quantizedKernel(char4* dst, half2 const* src, int64_t const sizeDiv4, float const* scalePtr)
 {
     for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < sizeDiv4; idx += blockDim.x * gridDim.x)
     {
@@ -52,10 +52,10 @@ __global__ void quantizedKernel(char4* dst, half2 const* src, const int64_t size
         char4 tmp;
         int srcId = idx << 1;
 
-        const uint2 h2 = __ldg(reinterpret_cast<uint2 const*>(src + srcId));
+        uint2 const h2 = __ldg(reinterpret_cast<uint2 const*>(src + srcId));
 
-        const half2 half2Tmp = reinterpret_cast<half2 const&>(h2.x);
-        const half2 half2Tmp2 = reinterpret_cast<half2 const&>(h2.y);
+        half2 const half2Tmp = reinterpret_cast<half2 const&>(h2.x);
+        half2 const half2Tmp2 = reinterpret_cast<half2 const&>(h2.y);
 
         tmp.x = cuda_cast<int8_t>(cuda_cast<float>(half2Tmp.x) * scale);
         tmp.y = cuda_cast<int8_t>(cuda_cast<float>(half2Tmp.y) * scale);
@@ -66,7 +66,7 @@ __global__ void quantizedKernel(char4* dst, half2 const* src, const int64_t size
 }
 
 #ifdef ENABLE_BF16
-__global__ void quantizedKernel(char4* dst, __nv_bfloat162 const* src, const int64_t sizeDiv4, float const* scalePtr)
+__global__ void quantizedKernel(char4* dst, __nv_bfloat162 const* src, int64_t const sizeDiv4, float const* scalePtr)
 {
     for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < sizeDiv4; idx += blockDim.x * gridDim.x)
     {
@@ -74,10 +74,10 @@ __global__ void quantizedKernel(char4* dst, __nv_bfloat162 const* src, const int
         char4 tmp;
         int srcId = idx << 1;
 
-        const uint2 h2 = __ldg(reinterpret_cast<uint2 const*>(src + srcId));
+        uint2 const h2 = __ldg(reinterpret_cast<uint2 const*>(src + srcId));
 
-        const __nv_bfloat162 bfloat162Tmp = reinterpret_cast<__nv_bfloat162 const&>(h2.x);
-        const __nv_bfloat162 bfloat162Tmp2 = reinterpret_cast<__nv_bfloat162 const&>(h2.y);
+        __nv_bfloat162 const bfloat162Tmp = reinterpret_cast<__nv_bfloat162 const&>(h2.x);
+        __nv_bfloat162 const bfloat162Tmp2 = reinterpret_cast<__nv_bfloat162 const&>(h2.y);
 
         tmp.x = cuda_cast<int8_t>(cuda_cast<float>(bfloat162Tmp.x) * scale);
         tmp.y = cuda_cast<int8_t>(cuda_cast<float>(bfloat162Tmp.y) * scale);
@@ -91,7 +91,7 @@ __global__ void quantizedKernel(char4* dst, __nv_bfloat162 const* src, const int
 
 template <typename T>
 void invokeQuantization(
-    int8_t* dst, T const* src, const int64_t size, float const* scalePtr, cudaStream_t stream, int maxGridSize)
+    int8_t* dst, T const* src, int64_t const size, float const* scalePtr, cudaStream_t stream, int maxGridSize)
 {
     TLLM_CHECK_WITH_INFO(size % 4 == 0, "[ERROR][invokeQuantization] size should be a multiple of 4.\n");
 
@@ -116,13 +116,13 @@ void invokeQuantization(
 }
 
 template void invokeQuantization<float>(
-    int8_t* dst, float const* src, const int64_t size, float const* scalePtr, cudaStream_t stream, int maxGridSize);
+    int8_t* dst, float const* src, int64_t const size, float const* scalePtr, cudaStream_t stream, int maxGridSize);
 
 template void invokeQuantization<half>(
-    int8_t* dst, half const* src, const int64_t size, float const* scalePtr, cudaStream_t stream, int maxGridSize);
+    int8_t* dst, half const* src, int64_t const size, float const* scalePtr, cudaStream_t stream, int maxGridSize);
 
 #ifdef ENABLE_BF16
-template void invokeQuantization<__nv_bfloat16>(int8_t* dst, __nv_bfloat16 const* src, const int64_t size,
+template void invokeQuantization<__nv_bfloat16>(int8_t* dst, __nv_bfloat16 const* src, int64_t const size,
     float const* scalePtr, cudaStream_t stream, int maxGridSize);
 #endif
 
@@ -220,8 +220,8 @@ inline __device__ void quantizeAndStore(
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename T, typename QuantT, bool USE_SMEM>
-__global__ void perTokenQuantization(QuantT* dst, T const* src, const int64_t numRows, const int64_t numCols,
-    float const* clampPtr, float* scalePtr, bool hasFp8MinScaling)
+__global__ void perTokenQuantization(QuantT* dst, T const* src, int64_t const numRows, int64_t const numCols,
+    float const* clampPtr, float* scalePtr, float* sumPtr, bool hasFp8MinScaling)
 {
     // Smem buffer.
     extern __shared__ uint4 smemBuffer[];
@@ -244,6 +244,8 @@ __global__ void perTokenQuantization(QuantT* dst, T const* src, const int64_t nu
 
     // The number of elements in the packed uint4 vec.
     static constexpr int NUM_ELTS_PER_VEC = sizeof(uint4) / sizeof(T);
+    static constexpr int NUM_ELTS2_PER_VEC = sizeof(uint4) / sizeof(T2);
+
     // The number of vectors in the column.
     int const numColVecs = numCols / NUM_ELTS_PER_VEC;
     // The vector pointers for src.
@@ -253,10 +255,25 @@ __global__ void perTokenQuantization(QuantT* dst, T const* src, const int64_t nu
     // T const* srcRow = src + blockIdx.x * numCols;
 
     T2 localMax2 = cuda_cast<T2, T>(T(1e-6f));
+    float2 localSum2 = {0.f, 0.f};
+
     for (int i = threadIdx.x; i < numColVecs; i += blockDim.x)
     {
         uint4 vec = srcVec[i];
-        clampAndAbsMax(localMax2, vec, clampMin2, clampMax2);
+
+#pragma unroll
+        for (int i = 0; i < NUM_ELTS2_PER_VEC; ++i)
+        {
+            T2& val2 = reinterpret_cast<T2*>(&vec)[i];
+            val2 = cuda_clamp(val2, clampMin2, clampMax2);
+            localMax2 = cuda_max(localMax2, cuda_abs(val2));
+            // TODO: template the version that requires sum to avoid dynamic branching.
+            if (sumPtr != nullptr)
+            {
+                localSum2.x += cuda_cast<float>(val2.x);
+                localSum2.y += cuda_cast<float>(val2.y);
+            }
+        }
         // Avoid reloading from global memory.
         if constexpr (USE_SMEM)
         {
@@ -264,11 +281,20 @@ __global__ void perTokenQuantization(QuantT* dst, T const* src, const int64_t nu
         }
     }
     float const rowMax = blockAllReduceMax(cuda_cast<float>(cuda_max<T, T2>(localMax2)));
-
     if (threadIdx.x == 0)
     {
         scalePtr[blockIdx.x]
             = hasFp8MinScaling ? cuda_max(rowMax / MAX_QUANT_VAL, MIN_SCALING_FACTOR) : (rowMax / MAX_QUANT_VAL);
+    }
+
+    if (sumPtr != nullptr)
+    {
+        float rowSum[1] = {cuda_sum<float>(localSum2)};
+        blockReduceSumV2<float, 1>(rowSum);
+        if (threadIdx.x == 0)
+        {
+            sumPtr[blockIdx.x] = rowSum[0];
+        }
     }
 
     float const scaleOrigQuant
@@ -283,12 +309,12 @@ __global__ void perTokenQuantization(QuantT* dst, T const* src, const int64_t nu
 
 // Do per-token (row) quantization from fp16/bf16/fp32 to int8/fp8_e4m3.
 template <typename T, typename QuantT>
-void invokePerTokenQuantization(QuantT* dst, T const* src, const int64_t numRows, const int64_t numCols,
-    float const* clampPtr, float* scalePtr, QuantMode quantMode, cudaStream_t stream)
+void invokePerTokenQuantization(QuantT* dst, T const* src, int64_t const numRows, int64_t const numCols,
+    float const* clampPtr, float* scalePtr, float* sumPtr, QuantMode quantMode, cudaStream_t stream)
 {
     // each block is responsible for a single row
-    const dim3 block(512);
-    const dim3 grid(numRows);
+    dim3 const block(512);
+    dim3 const grid(numRows);
 
     // The number of elements in the packed uint4 vec.
     static constexpr int NUM_ELTS_PER_VEC = sizeof(uint4) / sizeof(T);
@@ -311,19 +337,19 @@ void invokePerTokenQuantization(QuantT* dst, T const* src, const int64_t numRows
     // Do we use smem ?
     if (useSmem)
     {
-        perTokenQuantization<T, QuantT, true>
-            <<<grid, block, dynamicSmemSz, stream>>>(dst, src, numRows, numCols, clampPtr, scalePtr, hasFp8MinScaling);
+        perTokenQuantization<T, QuantT, true><<<grid, block, dynamicSmemSz, stream>>>(
+            dst, src, numRows, numCols, clampPtr, scalePtr, sumPtr, hasFp8MinScaling);
     }
     else
     {
         perTokenQuantization<T, QuantT, false>
-            <<<grid, block, 0, stream>>>(dst, src, numRows, numCols, clampPtr, scalePtr, hasFp8MinScaling);
+            <<<grid, block, 0, stream>>>(dst, src, numRows, numCols, clampPtr, scalePtr, sumPtr, hasFp8MinScaling);
     }
 }
 
 #define INSTANTIATE_INVOKE_PER_TOKEN_QUANTIZATION(T, QuantT)                                                           \
     template void invokePerTokenQuantization(QuantT* dst, const T* src, const int64_t numRows, const int64_t numCols,  \
-        float const* clampPtr, float* scalePtr, QuantMode quantMode, cudaStream_t stream)
+        float const* clampPtr, float* scalePtr, float* sumPtr, QuantMode quantMode, cudaStream_t stream)
 
 INSTANTIATE_INVOKE_PER_TOKEN_QUANTIZATION(float, int8_t);
 INSTANTIATE_INVOKE_PER_TOKEN_QUANTIZATION(half, int8_t);

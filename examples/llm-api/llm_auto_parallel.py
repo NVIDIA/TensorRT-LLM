@@ -8,7 +8,7 @@ def main():
 
         # Enable auto parallelism
         auto_parallel=True,
-        world_size=2)
+        auto_parallel_world_size=2)
 
     prompts = [
         "Hello, my name is",

@@ -4,6 +4,7 @@ import dataclasses
 import json
 import os
 import re
+from collections import Counter
 from enum import IntFlag, auto
 from functools import cached_property
 from pathlib import Path
@@ -19,6 +20,7 @@ from .._utils import (QuantModeWrapper, get_init_params, numpy_to_torch,
                       release_gc, str_dtype_to_torch, str_dtype_to_trt,
                       trt_dtype_to_torch)
 from ..bindings import KVCacheType
+from ..bindings.executor import RuntimeDefaults
 from ..functional import (PositionEmbeddingType, Tensor,
                           gather_last_token_logits, tanh)
 from ..layers import (MLP, AttentionParams, Embedding, FusedGatedMLP,
@@ -34,7 +36,8 @@ from ..module import Module, ModuleList
 from ..parameter import Parameter
 from ..plugin import init_all_reduce_helper
 from ..quantization import QuantMode
-from ..quantization.layers import (WeightOnlyGroupwiseQuantLinear,
+from ..quantization.layers import (Fp8RowwiseFusedGatedMLP, Fp8RowwiseGatedMLP,
+                                   WeightOnlyGroupwiseQuantLinear,
                                    WeightOnlyGroupwiseQuantRowLinear,
                                    WeightOnlyQuantLinear,
                                    WeightOnlyQuantRowLinear)
@@ -65,6 +68,8 @@ if TYPE_CHECKING:
     """Groupings of config where, if one of said properties exists, we assume all of the properties exist (even if they are `None`)"""
     CG = TypeVar("CG", bound=ConfigGroups)
 
+    RuntimeDefaultsIn = Optional[Union[RuntimeDefaults, dict]]
+
 
 class SpeculativeDecodingMode(IntFlag):
     # [WARNING] KEEP BELOW DEFINITION IN SYNC WITH cpp/tensorrt_llm/runtime/speculativeDecodingMode.h
@@ -73,6 +78,7 @@ class SpeculativeDecodingMode(IntFlag):
     MEDUSA = auto()
     LOOKAHEAD_DECODING = auto()
     EXPLICIT_DRAFT_TOKENS = auto()
+    EAGLE = auto()
 
     @staticmethod
     def from_arguments(args: argparse.Namespace):
@@ -86,6 +92,9 @@ class SpeculativeDecodingMode(IntFlag):
             return SpeculativeDecodingMode.LOOKAHEAD_DECODING
         elif args.speculative_decoding_mode == "explicit_draft_tokens":
             return SpeculativeDecodingMode.EXPLICIT_DRAFT_TOKENS
+        elif args.speculative_decoding_mode == "eagle":
+            logger.warning(f"EAGLE is not supported yet. Do not use it.")
+            return SpeculativeDecodingMode.EAGLE
         else:
             assert False, "Unknown speculative_decoding_mode " + args.speculative_decoding_mode
 
@@ -100,6 +109,7 @@ class QuantConfig:
     group_size: Optional[int] = 128
     smoothquant_val: float = 0.5
     clamp_val: Optional[List[float]] = None
+    use_meta_recipe: bool = False
     has_zero_point: Optional[bool] = False
     pre_quant_scale: Optional[bool] = False
     exclude_modules: Optional[List[str]] = None
@@ -299,6 +309,7 @@ class PretrainedConfig:
                  share_embedding_table: bool = False,
                  head_size: Optional[int] = None,
                  qk_layernorm: bool = False,
+                 runtime_defaults: "RuntimeDefaultsIn" = None,
                  **kwargs):
         self.architecture = architecture
         self.dtype = dtype
@@ -310,6 +321,8 @@ class PretrainedConfig:
 
         self.logits_dtype = logits_dtype
         self.norm_epsilon = norm_epsilon
+
+        self.runtime_defaults = self.create_runtime_defaults(runtime_defaults)
 
         if isinstance(position_embedding_type, str):
             position_embedding_type = PositionEmbeddingType.from_string(
@@ -373,6 +386,13 @@ class PretrainedConfig:
                 )
             except AttributeError as err:
                 raise err
+
+    @staticmethod
+    def create_runtime_defaults(
+            defaults: "RuntimeDefaultsIn" = None) -> Optional[RuntimeDefaults]:
+        if isinstance(defaults, dict):
+            return RuntimeDefaults(**defaults)
+        return defaults
 
     @property
     def kv_dtype(self):
@@ -510,12 +530,10 @@ class DecoderLayerList(ModuleList):
             if spec_decoding_params is not None:
                 kwargs['spec_decoding_params'] = spec_decoding_params
             if default_net().plugin_config.reduce_fusion:
-                if layer_idx < self.layer_list[-1]:
+                if layer_idx + self.layer_list[0] < self.layer_list[-1]:
                     kwargs['next_layer_input_layernorm_args'] = (
-                        self[layer_idx + 1 -
-                             self.layer_list[0]].input_layernorm.weight.value,
-                        self[layer_idx + 1 -
-                             self.layer_list[0]].input_layernorm.eps)
+                        self[layer_idx + 1].input_layernorm.weight.value,
+                        self[layer_idx + 1].input_layernorm.eps)
                 else:
                     kwargs['next_layer_input_layernorm_args'] = None
 
@@ -666,6 +684,18 @@ class PretrainedModel(Module,
             name: numpy_to_torch(param.raw_value)
             for name, param in self.named_parameters()
         }
+
+        # If there are some tensors share memory, this will lead to error when we call "save_file". So, for repeated tensors, we
+        # clone the tensors to prevent this issue.
+        weights_ptrs = [weights[key].data_ptr() for key in weights]
+        repeated_ptrs = [
+            key for key, value in dict(Counter(weights_ptrs)).items()
+            if value > 1
+        ]
+        for key in weights:
+            if weights[key].data_ptr() in repeated_ptrs:
+                weights[key] = weights[key].clone().detach()
+
         safetensors.torch.save_file(
             weights, os.path.join(output_dir, f'rank{rank}.safetensors'))
         if save_config:
@@ -688,7 +718,8 @@ class PretrainedModel(Module,
             gather_context_logits: bool = False,
             gather_generation_logits: bool = False,
             lora_target_modules: List[str] = None,
-            opt_batch_size: int = 0):
+            opt_batch_size: int = 0,
+            num_hidden_layers: int = None):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
 
@@ -705,6 +736,7 @@ class PretrainedModel(Module,
         use_lora_plugin = default_net().plugin_config.lora_plugin
         multiple_profiles = default_net().plugin_config.multiple_profiles
         streamingllm = default_net().plugin_config.streamingllm
+        pp_reduce_scatter = default_net().plugin_config.pp_reduce_scatter
 
         kv_cache_type = None
         if not use_cache:
@@ -723,7 +755,8 @@ class PretrainedModel(Module,
             hidden_size=self.config.hidden_size,
             num_kv_heads=self.config.num_key_value_heads,
             head_size=self.config.head_size,
-            num_layers=self.config.num_hidden_layers,
+            num_layers=num_hidden_layers
+            if num_hidden_layers is not None else self.config.num_hidden_layers,
             kv_dtype=str_dtype_to_trt(self.config.kv_dtype),
             remove_input_padding=remove_input_padding,
             use_gpt_attention_plugin=use_gpt_attention_plugin,
@@ -748,7 +781,8 @@ class PretrainedModel(Module,
             lora_target_modules=lora_target_modules,
             multiple_profiles=multiple_profiles,
             streamingllm=streamingllm,
-            opt_batch_size=opt_batch_size)
+            opt_batch_size=opt_batch_size,
+            pp_reduce_scatter=pp_reduce_scatter)
 
         result = {
             'input_ids':
@@ -785,7 +819,9 @@ class PretrainedModel(Module,
                 host_context_lengths=model_inputs['host_context_lengths'],
                 max_context_length=max_input_len,
                 host_request_types=model_inputs['host_request_types'],
-                host_runtime_perf_knobs=model_inputs['host_runtime_perf_knobs'])
+                host_runtime_perf_knobs=model_inputs['host_runtime_perf_knobs'],
+                host_context_progress=model_inputs['host_context_progress'],
+            )
         }
 
         if prompt_embedding_table_size > 0:
@@ -923,6 +959,7 @@ class DecoderModelForCausalLM(PretrainedModel):
             hidden_states, presents = hidden_states
 
         if self.config.mapping.is_last_pp_rank():
+            all_hidden_states = hidden_states
             hidden_states = gather_last_token_logits(
                 hidden_states, last_token_ids,
                 default_net().plugin_config.remove_input_padding)
@@ -954,13 +991,14 @@ class DecoderModelForCausalLM(PretrainedModel):
             return (hidden_states, presents)
         else:
             if self.config.mapping.is_last_pp_rank():
-                return lm_logits, hidden_states
+                return lm_logits, hidden_states, all_hidden_states
             return hidden_states
 
 
 def fuse_gate_mlp(
     model: PretrainedModel,
     gemm_swiglu_plugin_dtype: Optional[str] = None,
+    low_latency_gemm_swiglu_plugin_dtype: Optional[str] = None,
 ) -> PretrainedModel:
     from ..quantization.quantize import fp8_quantize
 
@@ -1024,7 +1062,7 @@ def fuse_gate_mlp(
                                     fused_weight_scaling_factor).to(
                                         torch.float8_e4m3fn)
 
-                if gemm_swiglu_plugin_dtype == 'fp8':
+                if gemm_swiglu_plugin_dtype == 'fp8' or low_latency_gemm_swiglu_plugin_dtype == 'fp8':
                     # gemm_swiglu_plugin needs (k, n) weights
                     # but weights should still be k-major for fp8
                     fused_layer.fused_fc.weight = Parameter(
@@ -1060,7 +1098,42 @@ def fuse_gate_mlp(
             fused_layer.proj = mlp.proj
             fused_layer.inner_layernorm = mlp.inner_layernorm
 
-            mlp_name = name.rsplit('.', 1)[-1]
+            _, mlp_name = name.rsplit('.', 1)
+            setattr(layer, mlp_name, fused_layer)
+
+        elif isinstance(mlp, Fp8RowwiseGatedMLP):
+            init_params = get_init_params(mlp)
+
+            hidden_act = init_params["hidden_act"]
+            if hidden_act not in ["silu", "gelu"]:
+                logger.warning(
+                    f"fuse_gate_mlp cannot be done for {name} due to unsupported activation {hidden_act}. Skipping."
+                )
+                continue
+
+            if mlp.clamp_val is not None:
+                init_params["clamp_val"] = mlp.clamp_val.raw_value.tolist()
+            fused_layer = Fp8RowwiseFusedGatedMLP(**init_params)
+            fused_layer.fused_fc.weight.value = np.concatenate(
+                [
+                    mlp.gate.weight.raw_value,
+                    mlp.fc.weight.raw_value,
+                ],
+                axis=0,
+            )
+            fused_layer.fused_fc.per_channel_scale.value = np.concatenate(
+                [
+                    mlp.gate.per_channel_scale.raw_value,
+                    mlp.fc.per_channel_scale.raw_value,
+                ],
+                axis=0,
+            )
+            if mlp.bias:
+                fused_layer.fused_fc.bias.value = np.concatenate(
+                    [mlp.gate.bias.raw_value, mlp.fc.bias.raw_value], axis=0)
+
+            fused_layer.proj = mlp.proj
+            _, mlp_name = name.rsplit('.', 1)
             setattr(layer, mlp_name, fused_layer)
 
     return model
@@ -1297,6 +1370,7 @@ def optimize_model(
     use_ootb_moe: bool = False,
     use_fused_mlp: bool = False,
     gemm_swiglu_plugin_dtype: Optional[str] = None,
+    low_latency_gemm_swiglu_plugin_dtype: Optional[str] = None,
     use_fused_rg_lru: bool = False,
     use_unfused_qkv_gemm: bool = False,
     use_prompt_tuning: bool = False,
@@ -1313,13 +1387,17 @@ def optimize_model(
     if use_parallel_embedding:
         model = parallelize_embedding(model)
     if share_embedding_table:
+        # if share_embedding_table is enabled, only one copy of the embedding table is store in converted ckpt
+        # this pass is required to make lm_head.weight and vocab_embedding.weight point to the same tensor
+        # however even if share_embedding_table is not enabled, trt would still only keep one copy of the table if the weights are identical
         model = share_embedding(model)
 
     # After weight loading
     if use_ootb_moe:
         model = to_ootb_moe(model)
     if use_fused_mlp:
-        model = fuse_gate_mlp(model, gemm_swiglu_plugin_dtype)
+        model = fuse_gate_mlp(model, gemm_swiglu_plugin_dtype,
+                              low_latency_gemm_swiglu_plugin_dtype)
     if use_fused_rg_lru:
         model = fuse_rg_lru(model)
     if use_unfused_qkv_gemm:

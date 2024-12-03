@@ -2195,7 +2195,8 @@ def parallelize(
     if not debug_mode:
         init_all_reduce_helper()
         tp_size = phy_mesh.size // config.graph_config.num_stages
-        shape = (CustomAllReduceHelper.POINTERS_PER_RANK * tp_size + 1, )
+        shape = (CustomAllReduceHelper.POINTERS_PER_RANK * tp_size +
+                 CustomAllReduceHelper.POINTERS_OF_COUNTER, )
         workspace = graph.as_trt().add_input(
             name="all_reduce_workspace",
             dtype=trt.int64,

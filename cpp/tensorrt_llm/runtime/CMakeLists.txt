@@ -18,9 +18,11 @@ set(SRCS
     utils/numpyUtils.cpp
     utils/sessionUtils.cpp
     utils/debugUtils.cu
+    utils/speculativeChoicesUtils.cpp
     bufferManager.cpp
     cudaMemPool.cpp
     decodingLayerWorkspace.cpp
+    eagleBuffers.cpp
     explicitDraftTokensBuffers.cpp
     lookaheadBuffers.cpp
     layerProfiler.cpp
@@ -38,7 +40,6 @@ set(SRCS
     iTensor.cpp
     ipcUtils.cpp
     memoryCounters.cpp
-    medusaModule.cpp
     ncclCommunicator.cpp
     promptTuningParams.cpp
     runtimeBuffers.cpp

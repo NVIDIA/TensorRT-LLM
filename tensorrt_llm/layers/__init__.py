@@ -13,8 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from .activation import Mish
-from .attention import (Attention, AttentionMaskType, AttentionParams,
-                        BertAttention, BlockSparseAttnParams, CogVLMAttention,
+from .attention import (Attention, AttentionMaskParams, AttentionMaskType,
+                        AttentionParams, BertAttention, BlockSparseAttnParams,
+                        CogVLMAttention, DeepseekV2Attention,
                         KeyValueCacheParams, PositionEmbeddingType,
                         SpecDecodingParams)
 from .cast import Cast
@@ -40,6 +41,7 @@ __all__ = [
     'Attention',
     'BertAttention',
     'CogVLMAttention',
+    'DeepseekV2Attention',
     'GroupNorm',
     'Embedding',
     'PromptTuningEmbedding',
@@ -53,6 +55,7 @@ __all__ = [
     'FusedGatedMLP',
     'Cast',
     'AttentionParams',
+    'AttentionMaskParams',
     'SpecDecodingParams',
     'KeyValueCacheParams',
     'BlockSparseAttnParams',

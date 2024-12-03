@@ -8,12 +8,14 @@ from pathlib import Path
 
 import safetensors
 import torch
-from transformers import LlamaConfig, LlamaForCausalLM, LlamaTokenizer
+from transformers import (LlamaConfig, LlamaForCausalLM, LlamaTokenizer,
+                          Qwen2Config)
 
 import tensorrt_llm
+from tensorrt_llm._utils import numpy_to_torch
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models import PretrainedConfig
+from tensorrt_llm.models import PretrainedConfig, QWenForCausalLM
 from tensorrt_llm.models.convert_utils import load_calib_dataset
 from tensorrt_llm.models.llama.convert import load_weights_from_hf_by_shard
 from tensorrt_llm.models.medusa.weight import (capture_activation_range,
@@ -174,6 +176,7 @@ def parse_arguments():
     parser.add_argument('--max_medusa_token_len', type=int, default=63)
     parser.add_argument('--medusa_hidden_act', type=str, default="silu")
     parser.add_argument('--medusa_model_dir', type=str, default=None)
+    parser.add_argument('--model_type', type=str, default="llama")
     args = parser.parse_args()
     return args
 
@@ -186,15 +189,17 @@ if __name__ == '__main__':
     # the op with PyTorch.
     print(tensorrt_llm.__version__)
     args = parse_arguments()
+    assert args.model_type in ["llama", "mixtral",
+                               "qwen2"], "Invalid model type"
     world_size = args.tp_size * args.pp_size
 
     tik = time.time()
 
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
-    hf_config = None
     if args.model_dir is not None:
-        hf_config = LlamaConfig.from_pretrained(args.model_dir)
+        config_cls = Qwen2Config if args.model_type == "qwen2" else LlamaConfig
+        hf_config = config_cls.from_pretrained(args.model_dir)
 
         args.model_type = hf_config.model_type
         args.n_head = hf_config.num_attention_heads
@@ -205,6 +210,7 @@ if __name__ == '__main__':
         args.rms_norm_eps = hf_config.rms_norm_eps
         args.vocab_size = hf_config.vocab_size
         args.n_positions = hf_config.max_position_embeddings
+        args.rotary_base = hf_config.rope_theta
 
     elif args.meta_ckpt_dir is not None:
 
@@ -266,8 +272,11 @@ if __name__ == '__main__':
         'share_embedding_table': args.use_embedding_sharing,
         'max_draft_len': args.max_medusa_token_len,
         'num_medusa_heads': args.num_medusa_heads,
-        'num_medusa_layers': args.num_medusa_layers
+        'num_medusa_layers': args.num_medusa_layers,
+        'model_type': args.model_type,
     }
+    if args.model_type == "qwen2":
+        config['qwen_type'] = args.model_type
 
     if args.use_weight_only:
         if args.weight_only_precision == 'int8':
@@ -315,13 +324,16 @@ if __name__ == '__main__':
     llama_smoother = {}
     model = None
     if args.model_dir is not None:
-        hf_model = LlamaForCausalLM if args.model_type != "mixtral" else MixtralForCausalLM
-
-        model = hf_model.from_pretrained(
-            args.model_dir,
-            torch_dtype='auto',
-            device_map='auto' if not args.load_model_on_cpu else 'cpu',
-            trust_remote_code=True)
+        if args.model_type == "qwen2":
+            model = QWenForCausalLM.from_hugging_face(args.model_dir,
+                                                      args.dtype)
+        else:
+            hf_model = LlamaForCausalLM if args.model_type != "mixtral" else MixtralForCausalLM
+            model = hf_model.from_pretrained(
+                args.model_dir,
+                torch_dtype='auto',
+                device_map='auto' if not args.load_model_on_cpu else 'cpu',
+                trust_remote_code=True)
 
         if args.smoothquant is not None or args.int8_kv_cache:
             os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get(
@@ -360,23 +372,31 @@ if __name__ == '__main__':
                     args.model_dir, PretrainedConfig.from_dict(config))
 
             else:
-                weights = convert_hf_llama(
-                    convert_args['hf_model'],
-                    mapping,
-                    rank,
-                    dtype=args.dtype,
-                    use_weight_only=args.use_weight_only,
-                    plugin_weight_only_quant_type=plugin_weight_only_quant_type,
-                    use_parallel_embedding=args.use_parallel_embedding,
-                    sharding_dim=args.embedding_sharding_dim,
-                    share_embedding_table=args.use_embedding_sharing,
-                    use_smooth_quant=args.smoothquant,
-                    per_channel=args.per_channel,
-                    per_token=args.per_token,
-                    int8_kv_cache=args.int8_kv_cache,
-                    act_range=convert_args['act_range'],
-                    qkv_para=convert_args['llama_qkv_para'],
-                    smoother=convert_args['llama_smoother'])
+                if args.model_type == "qwen2":
+                    weights = {
+                        name: numpy_to_torch(param.raw_value)
+                        for name, param in
+                        convert_args['hf_model'].named_parameters()
+                    }
+                else:
+                    weights = convert_hf_llama(
+                        convert_args['hf_model'],
+                        mapping,
+                        rank,
+                        dtype=args.dtype,
+                        use_weight_only=args.use_weight_only,
+                        plugin_weight_only_quant_type=
+                        plugin_weight_only_quant_type,
+                        use_parallel_embedding=args.use_parallel_embedding,
+                        sharding_dim=args.embedding_sharding_dim,
+                        share_embedding_table=args.use_embedding_sharing,
+                        use_smooth_quant=args.smoothquant,
+                        per_channel=args.per_channel,
+                        per_token=args.per_token,
+                        int8_kv_cache=args.int8_kv_cache,
+                        act_range=convert_args['act_range'],
+                        qkv_para=convert_args['llama_qkv_para'],
+                        smoother=convert_args['llama_smoother'])
 
                 if args.medusa_model_dir is not None:
                     config_file = Path(args.medusa_model_dir) / "config.json"

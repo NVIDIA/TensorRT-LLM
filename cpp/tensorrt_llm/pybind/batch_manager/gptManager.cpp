@@ -21,8 +21,6 @@
 #include "tensorrt_llm/batch_manager/callbacks.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/pybind/utils/pathCaster.h"
-
 #include <pybind11/functional.h>
 #include <pybind11/stl.h>
 #include <torch/extension.h>
@@ -95,33 +93,6 @@ tb::SendResponseCallback callbackAdapter(SendResponseCallback const& callback)
         }
         callback(id, pythonList, isOk, errMsg);
     };
-}
-
-void GptManager::initBindings(py::module_& m)
-{
-    py::class_<GptManager>(m, "GptManager")
-        .def(py::init(
-                 [](std::filesystem::path const& trtEnginePath, tb::TrtGptModelType modelType,
-                     GetInferenceRequestsCallback const& getInferenceRequestsCb,
-                     SendResponseCallback const& sendResponseCb, tb::PollStopSignalCallback const& pollStopSignalCb,
-                     tb::ReturnBatchManagerStatsCallback const& returnBatchManagerStatsCb,
-                     tb::TrtGptModelOptionalParams const& optionalParams, std::optional<uint64_t> terminateReqId)
-                 {
-                     PyErr_WarnEx(
-                         PyExc_DeprecationWarning, "GptManager is deprecated use the executor API instead.", 1);
-
-                     return GptManager(trtEnginePath, modelType, getInferenceRequestsCb, sendResponseCb,
-                         pollStopSignalCb, returnBatchManagerStatsCb, optionalParams, terminateReqId);
-                 }),
-            py::arg("trt_engine_path"), py::arg("model_type"), py::arg("get_inference_requests_cb"),
-            py::arg("send_response_cb"), py::arg("poll_stop_signal_cb") = nullptr,
-            py::arg("return_batch_manager_stats_cb") = nullptr,
-            py::arg_v("optional_params", tb::TrtGptModelOptionalParams(), "TrtGptModelOptionalParams"),
-            py::arg("terminate_req_id") = std::nullopt)
-
-        .def("shutdown", &GptManager::shutdown)
-        .def("__enter__", &GptManager::enter)
-        .def("__exit__", &GptManager::exit);
 }
 
 } // namespace tensorrt_llm::pybind::batch_manager

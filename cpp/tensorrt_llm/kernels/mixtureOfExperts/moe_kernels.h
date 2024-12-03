@@ -59,9 +59,25 @@ enum class MOEExpertScaleNormalizationMode : int
     NONE = 0,     //!< Run the softmax on all scales and select the topk
     RENORMALIZE,  //!< Renormalize the selected scales so they sum to one. This is equivalent to only running softmax on
                   //!< the topk selected experts
-    SPARSE_MIXER, //!< Uses the sparse mixer algorithm for selecting the routing probabilities @link
+    SPARSE_MIXER, //!< Use the sparse mixer algorithm for selecting the routing probabilities @link
                   //!< https://arxiv.org/abs/2310.00811
+    DEVICE_LIMITED, //!< Use the device-limited routing mechanism (without renormalization) adopted by DeepSeek-V2 @link
+                    //!< https://arxiv.org/abs/2405.04434
+    DEVICE_LIMITED_RENORM, //!< Use the device-limited routing mechanism (with renormalization) adopted by DeepSeek-V2
+                           //!< @link https://arxiv.org/abs/2405.04434
 };
+
+constexpr __host__ __device__ bool moeRoutingNeedsSoftmax(MOEExpertScaleNormalizationMode norm_mode)
+{
+    return norm_mode != MOEExpertScaleNormalizationMode::DEVICE_LIMITED
+        && norm_mode != MOEExpertScaleNormalizationMode::DEVICE_LIMITED_RENORM;
+}
+
+constexpr __host__ __device__ bool moeRoutingNeedsRenorm(MOEExpertScaleNormalizationMode norm_mode)
+{
+    return norm_mode == MOEExpertScaleNormalizationMode::RENORMALIZE
+        || norm_mode == MOEExpertScaleNormalizationMode::DEVICE_LIMITED_RENORM;
+}
 
 /**
  * \brief Describes what parallelism mode the MoE is using

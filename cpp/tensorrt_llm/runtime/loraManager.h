@@ -41,8 +41,8 @@ public:
     using LoraConfigTensorPtr = TensorPtr;
     using LoraReqTensors = std::tuple<LoraWeightsTensorPtr, LoraConfigTensorPtr>;
     using TaskIdType = std::int64_t;
-    using PeftValues = std::shared_ptr<std::vector<runtime::LoraCache::TaskLayerModuleConfig>> const;
-    using PeftTable = std::map<uint64_t, std::shared_ptr<std::vector<runtime::LoraCache::TaskLayerModuleConfig>>>;
+    using PeftValues = std::vector<runtime::LoraCache::TaskLayerModuleConfig>;
+    using PeftTable = std::map<uint64_t, std::vector<runtime::LoraCache::TaskLayerModuleConfig>>;
 
     explicit LoraManager() {}
 
@@ -73,7 +73,7 @@ public:
      * \param[in] modelConfig: a ModelConfig
      * \param[in] worldConfig: a WorldConfig
      */
-    void fillInputTensors(TensorPtr weightsPtrs, TensorPtr adapterSizes, PeftValues const peftValues,
+    void fillInputTensors(TensorPtr weightsPtrs, TensorPtr adapterSizes, PeftValues const& peftValues,
         SizeType32 batchIdx, SizeType32 beamWidth, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
     /**

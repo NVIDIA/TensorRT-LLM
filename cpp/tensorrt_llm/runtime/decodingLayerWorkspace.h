@@ -74,16 +74,21 @@ public:
     TensorPtr getWorkspaceAsDeviceTensor(ITensor::Shape shape, nvinfer1::DataType type);
 
     /// @brief A convenience function to copy the content of a standard vector to a device workspace.
-    template <typename T>
-    static void copyToWorkspace(
-        runtime::BufferManager const& bufferManager, std::vector<T> const& src, runtime::IBuffer::SharedPtr workspace)
+    template <typename T, typename Alloc>
+    static void copyToWorkspace(runtime::BufferManager const& bufferManager, std::vector<T, Alloc> const& src,
+        runtime::IBuffer::SharedPtr workspace)
     {
         auto const sizeOfWorkspaceInBytes = workspace->getSizeInBytes();
         auto const sizeOfSrcInBytes = sizeof(T) * src.size();
         TLLM_CHECK_WITH_INFO(sizeOfSrcInBytes <= sizeOfWorkspaceInBytes,
-            "The size of the workspace (%lu bytes) is insufficient for the data (%lu bytes)", sizeOfWorkspaceInBytes,
+            "The size of the workspace (%zu bytes) is insufficient for the data (%zu bytes)", sizeOfWorkspaceInBytes,
             sizeOfSrcInBytes);
-        runtime::IBuffer::SharedPtr workspaceSlice = runtime::IBuffer::slice(workspace, 0, sizeOfSrcInBytes);
+        auto const sizePerWorkspaceElement = BufferDataType(workspace->getDataType()).getSize();
+        TLLM_CHECK_WITH_INFO(sizePerWorkspaceElement == 1 || sizePerWorkspaceElement == sizeof(T),
+            "Copy to typed workspace, but element size mismatched (src: %zu, workspace: %zu)", sizeof(T),
+            sizePerWorkspaceElement);
+        runtime::IBuffer::SharedPtr workspaceSlice
+            = runtime::IBuffer::slice(workspace, 0, sizeOfSrcInBytes / sizePerWorkspaceElement);
         bufferManager.copy(src.data(), *workspaceSlice, runtime::MemoryType::kCPU);
     }
 

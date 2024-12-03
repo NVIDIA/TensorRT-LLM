@@ -92,7 +92,7 @@ template <
     typename Policy_,
     /// Number of stages,
     int Stages,
-    /// Converter for B matrix applited immediately after the LDS
+    /// Converter for B matrix applied immediately after the LDS
     typename TransformBAfterLDS_,
     /// The quantization operator being used
     WeightOnlyQuantOp QuantOp_,

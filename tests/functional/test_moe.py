@@ -61,13 +61,17 @@ def make_tuple(num_experts=4,
                dtype='float16',
                weight_dtype=None,
                norm_mode=MoeConfig.ExpertScaleNormalizationMode.NONE,
-               use_plugin=True):
+               use_plugin=True,
+               device_limited_n_group=0,
+               device_limited_topk_group=0,
+               device_limited_routed_scaling_factor=1.0):
     if weight_dtype is None:
         weight_dtype = dtype
     if hidden_size is None:
         hidden_size = default_hidden_size[weight_dtype]
     return (num_experts, topk, hidden_size, actfn, bias, dtype, weight_dtype,
-            norm_mode, use_plugin)
+            norm_mode, use_plugin, device_limited_n_group,
+            device_limited_topk_group, device_limited_routed_scaling_factor)
 
 
 def config_is_allowed(config):
@@ -306,6 +310,36 @@ class TestMoE(unittest.TestCase):
                 use_plugin=False),
         ]
 
+        # Test device-limited routing
+        params += [
+            make_tuple(
+                num_experts=80,
+                topk=3,
+                hidden_size=1280,
+                actfn='swiglu',
+                bias=True,
+                dtype='float16',
+                weight_dtype='float16',
+                norm_mode=MoeConfig.ExpertScaleNormalizationMode.DEVICE_LIMITED,
+                use_plugin=True,
+                device_limited_n_group=8,
+                device_limited_topk_group=3,
+                device_limited_routed_scaling_factor=16.0),
+            make_tuple(num_experts=80,
+                       topk=3,
+                       hidden_size=1280,
+                       actfn='swiglu',
+                       bias=True,
+                       dtype='float16',
+                       weight_dtype='float16',
+                       norm_mode=MoeConfig.ExpertScaleNormalizationMode.
+                       DEVICE_LIMITED_RENORM,
+                       use_plugin=True,
+                       device_limited_n_group=8,
+                       device_limited_topk_group=3,
+                       device_limited_routed_scaling_factor=16.0),
+        ]
+
         # Default configuration for mixtral
         params += [
             make_tuple(
@@ -520,7 +554,9 @@ class TestMoE(unittest.TestCase):
     @parameterized.expand(get_params(), name_func=unittest_name_func)
     def test_mixture_of_experts(self, num_experts, top_k, hidden_size, actfn,
                                 bias, dtype_str, weight_dtype_str, norm_mode,
-                                use_plugin):
+                                use_plugin, device_limited_n_group,
+                                device_limited_topk_group,
+                                device_limited_routed_scaling_factor):
         """ This test compares the MOE result to a simple reference implementation using torch """
 
         # Build time is also proportional to the size of these (more plugin profiler runs) so dont make them too big
@@ -561,7 +597,9 @@ class TestMoE(unittest.TestCase):
 
         for i, input in enumerate(inputs):
             result, act2_quant_values = self.generate_reference(
-                input, top_k, actfn, weight_dtype, quant_mode, norm_mode)
+                input, top_k, actfn, weight_dtype, quant_mode, norm_mode,
+                device_limited_n_group, device_limited_topk_group,
+                device_limited_routed_scaling_factor)
             reference_values.append(result)
             act_2_quant = max(act_2_quant, act2_quant_values)
 
@@ -581,7 +619,11 @@ class TestMoE(unittest.TestCase):
             quant_mode=quant_mode,
             norm_mode=norm_mode,
             use_plugin=use_plugin,
-            max_sizes=[max_num_seq, max_seq_len, hidden_size])
+            max_sizes=[max_num_seq, max_seq_len, hidden_size],
+            device_limited_n_group=device_limited_n_group,
+            device_limited_topk_group=device_limited_topk_group,
+            device_limited_routed_scaling_factor=
+            device_limited_routed_scaling_factor)
 
         for input, ref in zip(inputs, reference_values):
             # run trt output
@@ -938,6 +980,9 @@ class TestMoE(unittest.TestCase):
         use_plugin=True,
         max_sizes=None,
         use_lora=False,
+        device_limited_n_group=0,
+        device_limited_topk_group=0,
+        device_limited_routed_scaling_factor=1.0,
     ):
         builder = tensorrt_llm.Builder()
         network = builder.create_network()
@@ -966,9 +1011,14 @@ class TestMoE(unittest.TestCase):
                 self.create_lora_params(input_shape[0])
                 lora_params = self.lora_params
 
-            moe_config = MoeConfig(num_experts=num_experts,
-                                   top_k=top_k,
-                                   normalization_mode=norm_mode)
+            moe_config = MoeConfig(
+                num_experts=num_experts,
+                top_k=top_k,
+                normalization_mode=norm_mode,
+                device_limited_n_group=device_limited_n_group,
+                device_limited_topk_group=device_limited_topk_group,
+                device_limited_routed_scaling_factor=
+                device_limited_routed_scaling_factor)
 
             moe = tensorrt_llm.layers.MOE(moe_config=moe_config,
                                           hidden_size=hidden_size,
@@ -1026,7 +1076,8 @@ class TestMoE(unittest.TestCase):
         return session
 
     def generate_reference(self, inputs, k, actfn, weight_dtype, quant_mode,
-                           norm_mode):
+                           norm_mode, n_group, topk_group,
+                           routed_scaling_factor):
         # Always run the ref implementation at full precision TODO is this a good choice?
         inputs = inputs.cuda().float()
         inputs_merged = inputs.view(-1, inputs.shape[-1])
@@ -1036,11 +1087,41 @@ class TestMoE(unittest.TestCase):
         router_probs = torch.softmax(routing, 1, dtype=inputs.dtype)
         assert routing.shape == router_probs.shape
 
-        topk = torch.topk(router_probs, k)
-        assert topk.indices.shape == (router_probs.shape[0], k)
+        if norm_mode not in [
+                MoeConfig.ExpertScaleNormalizationMode.DEVICE_LIMITED,
+                MoeConfig.ExpertScaleNormalizationMode.DEVICE_LIMITED_RENORM
+        ]:
+            topk_values, topk_indices = torch.topk(router_probs, k)
+        else:
+            scores = router_probs
+            group_scores = (scores.view(scores.shape[0], n_group,
+                                        -1).max(dim=-1).values)  # [n, n_group]
+            group_idx = torch.topk(group_scores,
+                                   k=topk_group,
+                                   dim=-1,
+                                   sorted=False)[1]  # [n, top_k_group]
+            group_mask = torch.zeros_like(group_scores)  # [n, n_group]
+            group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
+            score_mask = (group_mask.unsqueeze(-1).expand(
+                group_mask.shape[0], n_group,
+                self.router_weights.shape[0] // n_group).reshape(
+                    group_mask.shape[0], -1))  # [n, e]
+            scores = scores.masked_fill(~score_mask.bool(), 0.0)  # [n, e]
+            topk_values, topk_indices = torch.topk(scores,
+                                                   k=k,
+                                                   dim=-1,
+                                                   sorted=False)
+
+            if k > 1 and norm_mode == MoeConfig.ExpertScaleNormalizationMode.DEVICE_LIMITED_RENORM:
+                denominator = topk_values.sum(dim=-1, keepdim=True) + 1e-20
+                topk_values = topk_values / denominator
+            else:
+                topk_values = topk_values * routed_scaling_factor
+
+        assert topk_indices.shape == (router_probs.shape[0], k)
         max_act_2 = 0.0
         results = torch.zeros_like(inputs_merged)
-        for i, (scales, experts) in enumerate(zip(topk.values, topk.indices)):
+        for i, (scales, experts) in enumerate(zip(topk_values, topk_indices)):
             if norm_mode == MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE:
                 scales /= sum(scales)
             input = inputs_merged[i, :]

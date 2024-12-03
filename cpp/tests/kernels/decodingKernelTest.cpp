@@ -426,6 +426,10 @@ public:
         TensorPtr inputLengths{ITensor::slice(constPointerCast(decodingInput->lengths), 0, 1)};
         mBufferManager->copy(len.data(),*inputLengths);
 
+        std::vector<SizeType32> eid = {0};
+        TensorPtr endIds{ITensor::slice(constPointerCast(decodingInput->endIds), 0, 1)};
+        mBufferManager->copy(eid.data(),*endIds);
+
         std::vector<std::vector<float>> logProbs =
         {
             {-2.96689, -1.63675, -2.31329, -0.0377979, -2.2442, -1.57552, -0.310524, -0.696636, -2.41985},
@@ -554,6 +558,10 @@ public:
         std::vector<SizeType32> len = {3, 3, 3, 3, 3};
         TensorPtr inputLengths{ITensor::slice(constPointerCast(decodingInput->lengths), 0, 1)};
         mBufferManager->copy(len.data(),*inputLengths);
+
+        std::vector<SizeType32> eid = {0};
+        TensorPtr endIds{ITensor::slice(constPointerCast(decodingInput->endIds), 0, 1)};
+        mBufferManager->copy(eid.data(),*endIds);
 
         std::vector<std::vector<float> >logProbs =
         {
@@ -1326,16 +1334,34 @@ public:
 
     void callAcceptByIdsWithPaths()
     {
-        tksp::acceptDraftTokensByIdsWithPaths(bufferCast<SizeType32>(*mOutputTokens),
-            bufferCast<SizeType32>(*mDraftTokens), bufferCast<SizeType32>(*mTargetTokens),
-            bufferCast<SizeType32>(*mSequenceLengths), bufferCast<SizeType32>(*mAcceptedLengths),
-            reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*mFinishedFinal)),
-            bufferCast<SizeType32>(*mBatchSlots), bufferCast<SizeType32>(*mPaths), bufferCast<SizeType32>(*mEndIds),
-            reinterpret_cast<T const**>(bufferCast<int64_t>(*mMedusaInputLogitsPtrs)),
-            reinterpret_cast<T const**>(bufferCast<int64_t>(*mMedusaLogitsPtrs)),
-            bufferCast<SizeType32>(*mTokensPerStep), bufferCast<SizeType32>(*mTokensPerStep),
-            bufferCast<SizeType32>(*mBestPaths), mBatchSize, mMaxBatchSize, mVocabSize, mMaxSeqLen, mMaxNumHeads,
-            mMaxDraftSeqPerStep, mStream->get());
+        tksp::AcceptDraftTokensByIdsWithPathsParams<T> params;
+
+        params.outputIds = bufferCast<SizeType32>(*mOutputTokens);
+        params.draftIds = bufferCast<SizeType32>(*mDraftTokens);
+        params.targetIds = bufferCast<SizeType32>(*mTargetTokens);
+        params.sequenceLengths = bufferCast<SizeType32>(*mSequenceLengths);
+        params.acceptedLengths = bufferCast<SizeType32>(*mAcceptedLengths);
+        params.finishedFinal
+            = reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*mFinishedFinal));
+        params.batchSlots = bufferCast<SizeType32>(*mBatchSlots);
+        params.paths = bufferCast<SizeType32>(*mPaths);
+        params.endIds = bufferCast<SizeType32>(*mEndIds);
+        params.medusaLogits = reinterpret_cast<T const**>(bufferCast<int64_t>(*mMedusaInputLogitsPtrs));
+        params.logitsPtrs = reinterpret_cast<T const**>(bufferCast<int64_t>(*mMedusaLogitsPtrs));
+        params.curTokensPerStep = bufferCast<SizeType32>(*mTokensPerStep);
+        params.targetTokensPerStep = bufferCast<SizeType32>(*mTokensPerStep);
+        params.bestPathIds = bufferCast<SizeType32>(*mBestPaths);
+        params.batchSize = mBatchSize;
+        params.maxBatchSize = mMaxBatchSize;
+        params.vocabSize = mVocabSize;
+        params.maxSeqLen = mMaxSeqLen;
+        params.maxDraftPathLen = mMaxNumHeads;
+        params.maxDecodingTokens = mMaxDraftSeqPerStep;
+        params.stream = mStream->get();
+
+        params.checkParams();
+
+        tksp::acceptDraftTokensByIdsWithPaths(params);
     }
 
     void callTestedKernel()

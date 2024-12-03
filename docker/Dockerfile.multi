@@ -1,6 +1,6 @@
 # Multi-stage Dockerfile
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
-ARG BASE_TAG=24.07-py3
+ARG BASE_TAG=24.10-py3
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE}:${BASE_TAG} as base
@@ -80,7 +80,7 @@ RUN mkdir -p /root/.cache/pip
 WORKDIR /app/tensorrt_llm
 COPY --from=wheel /src/tensorrt_llm/build/tensorrt_llm*.whl .
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install tensorrt_llm*.whl --extra-index-url https://pypi.nvidia.com && \
+    pip install tensorrt_llm*.whl && \
     rm tensorrt_llm*.whl
 COPY README.md ./
 COPY docs docs

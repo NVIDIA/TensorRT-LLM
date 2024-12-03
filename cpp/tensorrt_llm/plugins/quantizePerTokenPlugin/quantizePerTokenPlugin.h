@@ -30,8 +30,8 @@ namespace tensorrt_llm::plugins
 class QuantizePerTokenPlugin : public BasePlugin
 {
 public:
-    QuantizePerTokenPlugin(
-        nvinfer1::DataType outputType, tensorrt_llm::common::QuantMode quantMode, bool clampValEnabled);
+    QuantizePerTokenPlugin(nvinfer1::DataType outputType, tensorrt_llm::common::QuantMode quantMode,
+        bool clampValEnabled, bool sumPerToken);
 
     QuantizePerTokenPlugin(void const* data, size_t length);
 
@@ -51,8 +51,8 @@ public:
         void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept override;
 
     template <typename T, typename QuantT>
-    void dispatchDataType(void* output, void const* input, void const* clampValPtr, void* scalePtr, int dim0, int dim1,
-        cudaStream_t stream) noexcept;
+    void dispatchDataType(void* output, void const* input, void const* clampValPtr, void* scalePtr, void* sumPtr,
+        int dim0, int dim1, cudaStream_t stream) noexcept;
 
     // IPluginV2Ext Methods
     nvinfer1::DataType getOutputDataType(
@@ -76,6 +76,8 @@ private:
     tensorrt_llm::common::QuantMode mQuantMode;
     // Do we clamp the input tensor ?
     bool mClampValEnabled;
+    // Do we output the per-token sum?
+    bool mSumPerToken;
 };
 
 class QuantizePerTokenPluginCreator : public BaseCreator

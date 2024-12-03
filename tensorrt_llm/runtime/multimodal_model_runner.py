@@ -9,14 +9,19 @@ import requests
 import torch
 import numpy as np
 # isort: on
+import math
+
 from huggingface_hub import hf_hub_download
 from PIL import Image
 from safetensors import safe_open
-from transformers import AutoConfig, AutoProcessor, AutoTokenizer
+from torch import nn
+from transformers import (AutoConfig, AutoModelForCausalLM, AutoProcessor,
+                          AutoTokenizer)
 
 from .. import profiler
 from .._utils import (mpi_rank, str_dtype_to_torch, str_dtype_to_trt,
-                      supports_inflight_batching, trt_dtype_to_torch)
+                      supports_inflight_batching, torch_dtype_to_trt,
+                      trt_dtype_to_torch)
 from ..logger import logger
 from .enc_dec_model_runner import EncDecModelRunner
 from .model_runner import ModelRunner
@@ -70,7 +75,9 @@ class LlavaNextUtils:
         return best_fit
 
     @staticmethod
-    def get_anyres_image_grid_shape(image_size, patch_size):
+    def get_anyres_image_grid_shape(image_size,
+                                    patch_size,
+                                    image_grid_pinpoints=None):
         """
             Calculate the shape of the image patch grid after the preprocessing for images of any resolution.
 
@@ -81,10 +88,11 @@ class LlavaNextUtils:
             Returns:
                 tuple: The shape of the image patch grid in the format (width, height).
             """
-        IMAGE_GRID_PINPOINTS = [[336, 672], [672, 336], [672, 672], [1008, 336],
-                                [336, 1008]]
+        if image_grid_pinpoints is None:
+            image_grid_pinpoints = [[336, 672], [672, 336], [672, 672],
+                                    [1008, 336], [336, 1008]]
         width, height = LlavaNextUtils.select_best_resolution(
-            image_size, IMAGE_GRID_PINPOINTS)
+            image_size, image_grid_pinpoints)
         return width // patch_size, height // patch_size
 
     @staticmethod
@@ -156,6 +164,118 @@ class LlavaNextUtils:
         return image_feature
 
 
+class LlavaOnevisionUtils:
+    # https://github.com/huggingface/transformers/blob/main/src/transformers/models/llava_onevision/modeling_llava_onevision.py
+
+    @staticmethod
+    def pack_image_features(image_features, image_sizes, image_newline):
+        """
+        Reshape, unpad and then pack each image_feature into a single image_features tensor containing all visual vectors.
+
+        Args:
+            image_features (`torch.Tensor` of shape `(num_images, num_patches, image_length, embed_dim)`)
+                Image feature tensor, each contains all the visual feature of all patches.
+            image_sizes (`torch.Tensor` of shape `(num_images, 2)`)
+                Actual image size of each images (H, W).
+            image_newline (`torch.Tensor` of shape `(embed_dim)`)
+                New line embedding vector.
+        Returns:
+            image_features (`torch.Tensor` of shape `(all_feat_len, embed_dim)`)
+        """
+
+        IMAGE_SIZE = 384
+        PATCH_SIZE = 14
+        MAX_NUM_PATCHES = 9
+
+        new_image_features = []
+        for image_idx, image_feature in enumerate(image_features):
+            if image_feature.shape[0] > 1:
+                base_image_feature = image_feature[0]
+                image_feature = image_feature[1:]
+                height = width = IMAGE_SIZE // PATCH_SIZE
+                if height * width != base_image_feature.shape[0]:
+                    raise ValueError(
+                        "The number of patches is not consistent with the image size."
+                    )
+
+                IMAGE_GRID_PINPOINTS = [[384, 384], [384, 768], [384, 1152],
+                                        [384, 1536], [384, 1920], [384, 2304],
+                                        [768, 384], [768, 768], [768, 1152],
+                                        [768, 1536], [768, 1920], [768, 2304],
+                                        [1152, 384], [1152, 768], [1152, 1152],
+                                        [1152, 1536],
+                                        [1152, 1920], [1152, 2304], [1536, 384],
+                                        [1536, 768], [1536, 1152], [1536, 1536],
+                                        [1536, 1920], [1536, 2304], [1920, 384],
+                                        [1920, 768], [1920, 1152], [1920, 1536],
+                                        [1920, 1920], [1920, 2304], [2304, 384],
+                                        [2304, 768], [2304, 1152], [2304, 1536],
+                                        [2304, 1920], [2304, 2304]]
+                num_patch_width, num_patch_height = LlavaNextUtils.get_anyres_image_grid_shape(
+                    image_sizes[image_idx][[1, 0]].tolist(), IMAGE_SIZE,
+                    IMAGE_GRID_PINPOINTS)
+                image_feature = image_feature.view(num_patch_height,
+                                                   num_patch_width, height,
+                                                   width, -1)
+                image_feature = image_feature.permute(4, 0, 2, 1,
+                                                      3).contiguous()
+                image_feature = image_feature.flatten(1, 2).flatten(2, 3)
+                image_feature = LlavaNextUtils.unpad_image(
+                    image_feature, image_sizes[image_idx][[1, 0]])
+
+                channels, curr_height, curr_width = image_feature.shape
+                ratio = math.sqrt(curr_height * curr_width /
+                                  (MAX_NUM_PATCHES * height**2))
+                if ratio > 1.1:
+                    image_feature = image_feature[None]
+                    image_feature = nn.functional.interpolate(
+                        image_feature,
+                        [int(curr_height // ratio),
+                         int(curr_width // ratio)],
+                        mode="bilinear")[0]
+
+                image_feature = torch.cat(
+                    (
+                        image_feature,
+                        image_newline[:, None, None].expand(
+                            *image_feature.shape[:-1], 1).to(
+                                image_feature.device, image_feature.dtype),
+                    ),
+                    dim=-1,
+                )
+                image_feature = image_feature.flatten(1, 2).transpose(0, 1)
+                image_feature = torch.cat((base_image_feature, image_feature),
+                                          dim=0)
+            else:
+                image_feature = image_feature[0]
+                if image_newline is not None:
+                    image_feature = torch.cat(
+                        (image_feature, image_newline[None].to(image_feature)),
+                        dim=0)
+            new_image_features.append(image_feature)
+        image_features = torch.stack(new_image_features)
+        return image_features
+
+    @staticmethod
+    def apply_pooling(image_features):
+        IMAGE_SIZE = 384
+        PATCH_SIZE = 14
+        height = width = IMAGE_SIZE // PATCH_SIZE
+        batch_frames, seq_len, dim = image_features.shape
+        image_features = image_features.view(batch_frames, height, width, -1)
+        image_features = image_features.permute(0, 3, 1, 2).contiguous()
+
+        height, width = image_features.shape[2:]
+        scaled_shape = [math.ceil(height / 2), math.ceil(width / 2)]
+        image_features = nn.functional.interpolate(image_features,
+                                                   size=scaled_shape,
+                                                   mode="bilinear")
+
+        image_features = image_features.permute(0, 2, 3, 1)
+        image_features = image_features.view(batch_frames, -1, dim)
+        return image_features
+
+
 class MultimodalModelRunner:
 
     def __init__(self, args):
@@ -187,6 +307,24 @@ class MultimodalModelRunner:
         if self.model_type == "llava_next":
             self.llm_name = AutoConfig.from_pretrained(
                 self.args.hf_model_dir).text_config._name_or_path
+        if self.model_type == 'llava_onevision':
+            self.num_frames = self.args.video_num_frames
+            if self.num_frames is None:
+                self.num_frames = 8
+            assert self.args.video_path is None or self.args.image_path is None
+
+        if self.model_type == "mllama":
+            self.vision_input_names = [
+                "pixel_values",
+                "aspect_ratio_ids",
+                "aspect_ratio_mask",
+            ]
+            self.vision_output_names = [
+                "output",
+            ]
+        else:
+            self.vision_input_names = ["input"]
+            self.vision_output_names = ["output"]
 
         if self.decoder_llm:
             if not supports_inflight_batching(self.args.llm_engine_dir):
@@ -205,12 +343,6 @@ class MultimodalModelRunner:
             if args.debug_mode and not self.args.use_py_session:
                 logger.warning(
                     "Debug mode is not supported in C++ session for now, fallback to Python session."
-                )
-                self.args.use_py_session = True
-
-            if self.model_type != 'cogvlm' and not self.args.use_py_session:
-                logger.warning(
-                    "Only the cogvlm is supported in C++ session for now, fallback to Python session."
                 )
                 self.args.use_py_session = True
 
@@ -273,13 +405,35 @@ class MultimodalModelRunner:
                 use_fast=False,
                 use_legacy=False)
         else:
-            use_fast = False if self.model_type != "phi-3-vision" else True
+            use_fast = self.model_type in ["phi-3-vision", "internvl"]
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.args.hf_model_dir, use_fast=use_fast, use_legacy=False)
 
         self.tokenizer.padding_side = "right"
 
     def init_image_encoder(self):
+        if self.model_type == "phi-3-vision":
+            model = AutoModelForCausalLM.from_pretrained(
+                self.args.hf_model_dir,
+                torch_dtype=torch.float16,
+                trust_remote_code=True,
+                device_map='cpu')
+            self.vision_model = model.model.vision_embed_tokens.to(
+                self.device).eval()
+
+            # Test run vision_model.get_img_features to pre-allocate memory for flash attention
+            processor = AutoProcessor.from_pretrained(self.args.hf_model_dir,
+                                                      trust_remote_code=True)
+            image = processor(text="<|image_1|>",
+                              images=Image.new('RGB', [10, 10]),
+                              return_tensors="pt")['pixel_values']
+            image = image.flatten(0, 1)
+            image = torch.rand(image.shape,
+                               dtype=str_dtype_to_torch(self.vision_precision),
+                               device=self.device)
+            self.vision_model.get_img_features(image)
+            return
+
         vision_encoder_path = os.path.join(self.args.visual_engine_dir,
                                            self.args.visual_engine_name)
         logger.info(f'Loading engine from {vision_encoder_path}')
@@ -288,7 +442,7 @@ class MultimodalModelRunner:
         logger.info(f'Creating session from engine {vision_encoder_path}')
         self.visual_encoder_session = Session.from_serialized_engine(
             engine_buffer)
-        if self.model_type in ["phi-3-vision", "llava_next"]:
+        if self.model_type in ["llava_next", "llava_onevision"]:
             self.image_newlines = {}
             image_newlines_path = os.path.join(self.args.visual_engine_dir,
                                                'image_newlines.safetensors')
@@ -300,22 +454,35 @@ class MultimodalModelRunner:
 
     def init_llm(self):
         if self.decoder_llm:
+            cross_kv_cache_fraction = None
+            if self.model_type == 'mllama':
+                cross_kv_cache_fraction = self.args.cross_kv_cache_fraction
             if self.use_py_session:
+                logger.info(f'Running LLM with Python runner')
                 self.model = ModelRunner.from_dir(
                     self.args.llm_engine_dir,
                     rank=tensorrt_llm.mpi_rank(),
                     debug_mode=False,
                     stream=self.stream,
                     enable_context_fmha_fp32_acc=self.args.
-                    enable_context_fmha_fp32_acc)
+                    enable_context_fmha_fp32_acc,
+                    multi_block_mode=self.args.multi_block_mode,
+                )
                 self.model_config = self.model.session._model_config
             else:
+                logger.info(f'Running LLM with C++ runner')
                 self.model = ModelRunnerCpp.from_dir(
                     self.args.llm_engine_dir,
                     rank=tensorrt_llm.mpi_rank(),
                     debug_mode=False,
+                    enable_chunked_context=self.args.enable_chunked_context,
                     enable_context_fmha_fp32_acc=self.args.
-                    enable_context_fmha_fp32_acc)
+                    enable_context_fmha_fp32_acc,
+                    kv_cache_free_gpu_memory_fraction=self.args.
+                    kv_cache_free_gpu_memory_fraction,
+                    cross_kv_cache_fraction=cross_kv_cache_fraction,
+                    multi_block_mode=self.args.multi_block_mode,
+                )
                 self.model_config = self.model.model_config
             self.runtime_mapping = self.model.mapping
         else:
@@ -369,7 +536,8 @@ class MultimodalModelRunner:
             self.vision_precision))  # [num_frames, 3, H, W]
         return media_tensors.unsqueeze(0)  #[1, num_frames, 3, H, W]
 
-    def preprocess(self, warmup, pre_prompt, post_prompt, image):
+    def preprocess(self, warmup, pre_prompt, post_prompt, image,
+                   other_vision_inputs):
         if self.model_type == 'kosmos-2':
             input_ids = image['input_ids'].clone()
             image_mask = image["image_embeds_position_mask"]
@@ -381,21 +549,40 @@ class MultimodalModelRunner:
         elif self.model_type == 'phi-3-vision':
             input = image
             image = input['pixel_values']
-            bs = image.shape[0]
             image = image.flatten(0, 1)
         elif self.model_type == 'llava_next':
             input = image
             image = input['pixel_values']
-            bs = image.shape[0]
             image = image[0]
             image_size = input['image_sizes'][0].cpu()
+        elif self.model_type == 'llava_onevision':
+            input = image
+            if self.args.video_path is None:
+                image = input['pixel_values']
+                image = image[0].repeat(self.args.batch_size, 1, 1, 1)
+                image_size = input['image_sizes'][0]
+                image_size = image_size.repeat(self.args.batch_size, 1).cpu()
+            else:
+                image = input['pixel_values_videos']
+                _, _, c, h, w = image.shape
+                image = image.repeat(self.args.batch_size, 1, 1, 1, 1)
+                image = image.view(-1, c, h, w)
 
         if not warmup:
             profiler.start("Vision")
 
-        visual_features, visual_atts = self.get_visual_features(
-            torch.stack(image['image_patches'], dim=0) if self.model_type ==
-            'fuyu' else image)
+        if image is not None:
+            if self.model_type == "phi-3-vision":
+                visual_features = self.vision_model.get_img_features(
+                    image).reshape(1, image.shape[0], -1,
+                                   self.vision_model.image_dim_out)
+                visual_atts = None
+            else:
+                visual_features, visual_atts = self.get_visual_features(
+                    torch.stack(image['image_patches'], dim=0) if
+                    self.model_type == 'fuyu' else image, other_vision_inputs)
+        else:
+            visual_features, visual_atts = None, None
 
         if not warmup:
             profiler.stop("Vision")
@@ -440,45 +627,17 @@ class MultimodalModelRunner:
                 first_batch_split_prompts, input_lengths)
             return input_ids, input_lengths, ptuning_args, visual_features
         elif self.model_type == 'phi-3-vision':
+            image_sizes = input["image_sizes"]
+            visual_features = self.vision_model.hd_feature_transform(
+                visual_features, image_sizes)
             input_ids = input["input_ids"].clone()
-            glb_GN = torch.squeeze(self.image_newlines["glb_GN"].clone(), dim=0)
-            sub_GN = self.image_newlines["sub_GN"].clone()
-
-            H = visual_features.shape[1]
-            C = visual_features.shape[-1]
-            #bs*17*12*12*3072
-            visual_features = visual_features.view(bs, -1, H, H, C)
-            global_img_feature = visual_features[:, 0]  #bs*12*12*3072
-            temp_glb_GN = sub_GN.repeat(bs, H, 1, 1)  #bs*12*1*3072
-            global_img_feature = torch.cat([global_img_feature, temp_glb_GN],
-                                           dim=2).reshape(bs, -1, C)
-
-            crop_visual_features = visual_features[:, 1:]
-            patch_sizes = [
-                image_size // image.shape[-1]
-                for image_size in input["image_sizes"]
-            ]
-            visual_features = []
-            for global_img_feature, crop_visual_feature, patch_size in zip(
-                    global_img_feature, crop_visual_features, patch_sizes):
-                crop_visual_feature = \
-                    crop_visual_feature[:patch_size[0]*patch_size[1]].view(patch_size[0], patch_size[1], H, H, C).permute(0, 2, 1, 3, 4).reshape(patch_size[0]*H, patch_size[1]*H, C)
-                temp_sub_GN = torch.squeeze(sub_GN.repeat(
-                    1, patch_size[0] * H, 1, 1),
-                                            dim=0)
-                crop_visual_feature = torch.cat(
-                    [crop_visual_feature, temp_sub_GN], dim=1).reshape(-1, C)
-                visual_features.append(
-                    torch.cat([crop_visual_feature, glb_GN, global_img_feature],
-                              dim=0))
-
-            num_img_tokens = [elem.size(0) for elem in visual_features]
-
-            visual_features = torch.cat(visual_features, dim=0)
             input_ids = input_ids.expand(self.args.batch_size,
                                          *input_ids.shape[1:])
+            num_img_tokens = [visual_features.shape[0]]
             input_ids = self.ptuning_setup_phi3(visual_features, input_ids,
                                                 num_img_tokens)
+            visual_features = visual_features.unsqueeze(0).repeat(
+                self.args.batch_size, 1, 1)
             length = input_ids.shape[1]
         elif self.model_type == 'llava_next':
             visual_features = LlavaNextUtils.rearrange_image_features(
@@ -487,6 +646,43 @@ class MultimodalModelRunner:
             input_ids = self.ptuning_setup_llava_next(visual_features,
                                                       pre_prompt, post_prompt)
             length = input_ids.shape[1]
+        elif self.model_type == 'mllama':
+            pre_input_ids = self.tokenizer(pre_prompt,
+                                           return_tensors="pt",
+                                           padding=True).input_ids
+            length = pre_input_ids.shape[1]
+            post_input_ids = None
+        elif self.model_type == 'llava_onevision':
+            if self.args.video_path is None:
+                visual_features = torch.split(visual_features,
+                                              visual_features.shape[0] //
+                                              self.args.batch_size,
+                                              dim=0)
+                visual_features = LlavaOnevisionUtils.pack_image_features(
+                    visual_features,
+                    image_size,
+                    image_newline=self.image_newlines["image_newline"],
+                )
+            else:
+                visual_features = LlavaOnevisionUtils.apply_pooling(
+                    visual_features)
+                visual_features = visual_features.reshape(
+                    self.args.batch_size,
+                    self.num_frames * visual_features.shape[1], -1)
+                image_newline = self.image_newlines["image_newline"][
+                    None, None, :].repeat(self.args.batch_size, 1,
+                                          1).to(visual_features.device)
+                visual_features = torch.cat((visual_features, image_newline),
+                                            dim=1)
+
+            pre_input_ids = self.tokenizer(pre_prompt,
+                                           return_tensors="pt",
+                                           padding=True).input_ids
+            post_input_ids = self.tokenizer(post_prompt,
+                                            return_tensors="pt",
+                                            padding=True).input_ids
+            length = pre_input_ids.shape[1] + visual_features.shape[
+                1] + post_input_ids.shape[1]
         else:
             pre_input_ids = self.tokenizer(pre_prompt,
                                            return_tensors="pt",
@@ -498,6 +694,9 @@ class MultimodalModelRunner:
                 if self.model_type == 'video-neva':
                     length = pre_input_ids.shape[1] + post_input_ids.shape[
                         1] + visual_atts.shape[2] * visual_atts.shape[1]
+                elif self.model_type == 'internvl':
+                    length = pre_input_ids.shape[1] + post_input_ids.shape[
+                        1] + visual_atts.shape[0] * visual_atts.shape[1]
                 else:
                     length = pre_input_ids.shape[1] + post_input_ids.shape[
                         1] + visual_atts.shape[1]
@@ -588,16 +787,23 @@ class MultimodalModelRunner:
                  image,
                  decoder_input_ids,
                  max_new_tokens,
-                 warmup=False):
+                 warmup=False,
+                 other_vision_inputs={},
+                 other_decoder_inputs={}):
         if not warmup:
             profiler.start("Generate")
 
         input_ids, input_lengths, ptuning_args, visual_features = self.preprocess(
-            warmup, pre_prompt, post_prompt, image)
+            warmup, pre_prompt, post_prompt, image, other_vision_inputs)
         if warmup: return None
 
+        # use prompt tuning to pass multimodal features
+        # model.generate() expects the following params (see layers/embedding.py):
+        # args[0]: prompt embedding table, [batch_size, multimodal_len, hidden_size], later flattened to [batch_size * multimodal_len, hidden_size]
+        # args[1]: prompt task ids, [batch_size]. in multimodal case, arange(batch_size), i.e. in VILA batching mode 2, each image is treated separately in the batch instead of concated together (although the prompt embedding table has to be concated)
+        # args[2]: prompt task vocab size, [1]. assuming all table has the same length, which in multimodal case equals to multimodal_len
         profiler.start("LLM")
-        if self.decoder_llm:
+        if self.decoder_llm and self.model_type != "mllama":
             end_id = self.tokenizer.eos_token_id
             if 'opt' in self.model_type and 'blip2' in self.model_type:
                 # For BLIP2-OPT, model outputs a "\n" at the end.
@@ -605,23 +811,24 @@ class MultimodalModelRunner:
                 end_id = self.tokenizer.encode("\n",
                                                add_special_tokens=False)[0]
 
-            ptuning_args[0] = torch.stack([ptuning_args[0]])
             if self.model_type == 'cogvlm':
                 input_position_ids = self.prepare_position_ids_for_cogvlm(
                     input_ids)
-                batch_size = len(input_ids)
-                if not self.use_py_session:
-                    prompt_tasks = ",".join(np.arange(batch_size).astype(str))
-                    ptuning_args[0] = ptuning_args[0].view(
-                        batch_size, ptuning_args[2].cpu().item(), -1)
+
+            batch_size = len(input_ids)
+            prompt_tasks = ",".join(
+                np.arange(batch_size, dtype=np.int32).astype(str))
+            prompt_table = torch.stack([ptuning_args[0]])
+            prompt_table = prompt_table.view(batch_size, -1,
+                                             prompt_table.shape[-1])
 
             output_ids = self.model.generate(
                 input_ids,
                 input_position_ids=input_position_ids
                 if self.model_type == 'cogvlm' else None,
                 sampling_config=None,
-                prompt_table=ptuning_args[0],
-                prompt_tasks=prompt_tasks if not self.use_py_session else None,
+                prompt_table=prompt_table,
+                prompt_tasks=prompt_tasks,
                 max_new_tokens=max_new_tokens,
                 end_id=end_id,
                 pad_id=self.tokenizer.pad_token_id
@@ -634,6 +841,110 @@ class MultimodalModelRunner:
                 num_beams=self.args.num_beams,
                 output_sequence_lengths=False,
                 return_dict=False)
+        elif self.model_type == "mllama":
+            # When image is passed:
+            # the shape of visual_features is [bs, 1, 4, 1025, hidden_size]
+            # the shape of cross_attention_mask is [bs, decode_input_len, 1, 4]
+            # When image is None, create dummy visual_features and cross_attention_mask
+            if visual_features is None:
+                visual_features = torch.zeros([
+                    self.args.batch_size, 1, 4, 1,
+                    self.model_config.hidden_size * self.runtime_mapping.tp_size
+                ],
+                                              dtype=self.model.dtype,
+                                              device=self.device)
+                dummy_cross_attention_mask = torch.zeros(
+                    [self.args.batch_size, input_ids.shape[1], 1, 4],
+                    dtype=bool,
+                    device=self.device)
+                skip_cross_attn_blocks = torch.ones([1],
+                                                    dtype=torch.bool,
+                                                    device='cpu')
+            else:
+                skip_cross_attn_blocks = torch.zeros([1],
+                                                     dtype=torch.bool,
+                                                     device='cpu')
+
+            visual_features = visual_features.to(self.model.dtype).chunk(
+                self.args.batch_size, dim=0)
+            encoder_input_features = []
+            cross_attention_masks = []
+            encoder_output_lengths = []
+            for batch_idx in range(self.args.batch_size):
+                visual_feature = visual_features[batch_idx]
+                num_vision_tokens = visual_feature.shape[3]
+                visual_feature = visual_feature.reshape(
+                    [-1, visual_feature.shape[-1]])
+                encoder_max_input_length = visual_feature.shape[0]
+                encoder_input_lengths = torch.IntTensor(
+                    [encoder_max_input_length]).to(visual_feature.device)
+
+                # prepare cross_attention_mask of context phase
+                if 'cross_attention_mask' in other_decoder_inputs:
+                    cross_attention_mask = other_decoder_inputs[
+                        'cross_attention_mask'][batch_idx]
+                else:
+                    cross_attention_mask = dummy_cross_attention_mask[batch_idx]
+                text_total_length, *_ = cross_attention_mask.shape
+                cross_attention_mask = cross_attention_mask.repeat_interleave(
+                    num_vision_tokens, dim=2)
+                cross_attention_mask = cross_attention_mask.view(
+                    text_total_length, -1)
+                cross_attention_mask = cross_attention_mask.unsqueeze(1)
+                cross_attention_mask = cross_attention_mask.to(
+                    visual_feature.device).to(torch.bool).reshape(
+                        [-1, cross_attention_mask.shape[-1]])
+
+                # prepare cross_attention_mask for generation phase and concat them
+                tmp_mask = [cross_attention_mask] + [
+                    cross_attention_mask[-1:, :] for _ in range(max_new_tokens)
+                ]
+                cross_attention_mask = torch.concat(tmp_mask)
+
+                encoder_input_features.append(visual_feature)
+                cross_attention_masks.append(cross_attention_mask)
+                encoder_output_lengths.append(encoder_input_lengths)
+
+            outputs = self.model.generate(
+                batch_input_ids=input_ids,
+                encoder_input_ids=None,
+                encoder_input_features=encoder_input_features,
+                encoder_output_lengths=encoder_output_lengths,
+                cross_attention_masks=cross_attention_masks,
+                max_new_tokens=max_new_tokens,
+                # max_attention_window_size=args.max_attention_window_size,
+                # sink_token_length=args.sink_token_length,
+                end_id=self.tokenizer.eos_token_id,
+                pad_id=self.tokenizer.pad_token_id,
+                temperature=self.args.temperature,
+                top_k=self.args.top_k,
+                top_p=self.args.top_p,
+                num_beams=self.args.num_beams,
+                # length_penalty=args.length_penalty,
+                # early_stopping=args.early_stopping,
+                repetition_penalty=self.args.repetition_penalty,
+                # presence_penalty=args.presence_penalty,
+                # frequency_penalty=args.frequency_penalty,
+                # stop_words_list=stop_words_list,
+                # bad_words_list=bad_words_list,
+                # output_cum_log_probs=(args.output_cum_log_probs_npy != None),
+                # output_log_probs=(args.output_log_probs_npy != None),
+                # random_seed=args.random_seed,
+                # lora_uids=args.lora_task_uids,
+                # prompt_table=args.prompt_table_path,
+                # prompt_tasks=args.prompt_tasks,
+                # streaming=args.streaming,
+                output_sequence_lengths=True,
+                # no_repeat_ngram_size=self.args.no_repeat_ngram_size,
+                return_dict=True,
+                # medusa_choices=args.medusa_choices,
+                # return_all_generated_tokens=args.return_all_generated_tokens,
+                # input_token_extra_ids=input_token_extra_ids,
+                encoder_max_input_length=encoder_max_input_length,
+                skip_cross_attn_blocks=skip_cross_attn_blocks,
+            )
+            if mpi_rank() == 0:
+                output_ids = outputs["output_ids"]
         else:
             if self.model_type in ['nougat', 'pix2struct']:
                 # Trim encoder input_ids to match visual features shape
@@ -680,14 +991,21 @@ class MultimodalModelRunner:
             profiler.stop("Generate")
             return None
 
-    def get_visual_features(self, image):
+    def get_visual_features(self, image, other_vision_inputs):
         visual_features = {
-            'input': image.to(str_dtype_to_torch(self.vision_precision))
+            self.vision_input_names[0]:
+            image.to(str_dtype_to_torch(self.vision_precision)),
         }
+        for key, tensor in other_vision_inputs.items():
+            visual_features.update({key: tensor})
+
         tensor_info = [
-            TensorInfo('input', str_dtype_to_trt(self.vision_precision),
-                       image.shape)
+            TensorInfo(self.vision_input_names[0],
+                       str_dtype_to_trt(self.vision_precision), image.shape),
         ]
+        for key, tensor in other_vision_inputs.items():
+            tensor_info.append(
+                TensorInfo(key, torch_dtype_to_trt(tensor.dtype), tensor.shape))
 
         visual_output_info = self.visual_encoder_session.infer_shapes(
             tensor_info)
@@ -704,7 +1022,7 @@ class MultimodalModelRunner:
         assert ok, "Runtime execution failed for vision encoder session"
         self.stream.synchronize()
 
-        image_embeds = visual_outputs['output']
+        image_embeds = visual_outputs[self.vision_output_names[0]]
         image_atts = torch.ones(image_embeds.size()[:-1],
                                 dtype=torch.long).to(image.device)
 
@@ -732,7 +1050,7 @@ class MultimodalModelRunner:
                 fake_prompt_counter += visual_feature.shape[0]
                 fake_prompt_id = fake_prompt_id.unsqueeze(0)
                 input_ids.append(fake_prompt_id)
-                # in case no post prompt
+                # in case no inter or post prompt
                 if len(split_input_ids) > idx + 1:
                     input_ids.append(split_input_ids[idx + 1])
 
@@ -743,7 +1061,6 @@ class MultimodalModelRunner:
                 fake_prompt_id = torch.arange(
                     fake_prompt_counter,
                     fake_prompt_counter + visual_feature.shape[0])
-                fake_prompt_counter += visual_feature.shape[0]
                 fake_prompt_id = fake_prompt_id.unsqueeze(0)
                 input_ids.append(fake_prompt_id)
                 if len(split_input_ids) > 1:
@@ -768,27 +1085,34 @@ class MultimodalModelRunner:
             visual_features = visual_features.view(visual_features.shape[0], -1,
                                                    visual_features.shape[-1])
 
-        if self.use_py_session:
-            # Non-IFB Mode(used in python session): All requests in a batch have their prompt_table concatenated in
-            # a shape of (bs*vision_embedding_len, vision_hidden). So only one fake_prompt_id is needed for the
-            # entire batch, with values from 0 to bs * vision_embedding_len-1.
-            fake_prompt_id = torch.arange(
-                self.model_config.vocab_size, self.model_config.vocab_size +
-                visual_features.shape[0] * visual_features.shape[1])
-            fake_prompt_id = fake_prompt_id.reshape(visual_features.shape[0],
-                                                    visual_features.shape[1])
-        else:
-            # IFB Mode(used in c++ session): Each request's prompt_table is independent and requires a fake_prompt_id
-            # for each request, with values ranging from 0 to vision_embedding_len-1.
-            fake_prompt_id = torch.arange(
-                self.model_config.vocab_size,
-                self.model_config.vocab_size + visual_features.shape[1])
-            fake_prompt_id = fake_prompt_id.repeat(visual_features.shape[0], 1)
+        if visual_features is not None:
+            if self.use_py_session:
+                # Non-IFB Mode(used in python session): All requests in a batch have their prompt_table concatenated in
+                # a shape of (bs*vision_embedding_len, vision_hidden). So only one fake_prompt_id is needed for the
+                # entire batch, with values from 0 to bs * vision_embedding_len-1.
+                fake_prompt_id = torch.arange(
+                    self.model_config.vocab_size, self.model_config.vocab_size +
+                    visual_features.shape[0] * visual_features.shape[1])
+                fake_prompt_id = fake_prompt_id.reshape(
+                    visual_features.shape[0], visual_features.shape[1])
+            else:
+                # IFB Mode(used in c++ session): Each request's prompt_table is independent and requires a fake_prompt_id
+                # for each request, with values ranging from 0 to vision_embedding_len-1.
+                fake_prompt_id = torch.arange(
+                    self.model_config.vocab_size,
+                    self.model_config.vocab_size + visual_features.shape[1])
+                fake_prompt_id = fake_prompt_id.repeat(visual_features.shape[0],
+                                                       1)
+
+        if 'internvl' in self.model_type:
+            fake_prompt_id = fake_prompt_id.reshape(1, -1)
 
         if 'cogvlm' in self.model_type:
             input_ids = torch.cat(
                 [pre_input_ids[:, 0:1], fake_prompt_id, pre_input_ids[:, 1:]],
                 dim=1).contiguous().to(torch.int32)
+        elif self.model_type == 'mllama':
+            input_ids = pre_input_ids.contiguous().to(torch.int32)
         else:
             if post_input_ids is not None:
                 input_ids = [pre_input_ids, fake_prompt_id, post_input_ids]
@@ -796,7 +1120,8 @@ class MultimodalModelRunner:
                 input_ids = [fake_prompt_id, pre_input_ids]
             input_ids = torch.cat(input_ids, dim=1).contiguous().to(torch.int32)
 
-        if self.decoder_llm or self.runtime_mapping.is_first_pp_rank():
+        if (self.decoder_llm or self.runtime_mapping.is_first_pp_rank()
+            ) and self.model_type != "mllama":
             ptuning_args = self.ptuning_setup(visual_features, input_ids,
                                               input_lengths)
         else:
@@ -843,7 +1168,7 @@ class MultimodalModelRunner:
         positions = torch.nonzero((input_ids < 0) & (input_ids > -MAX_INPUT_ID),
                                   as_tuple=False)
         idx = 0
-        for i, cnt in enumerate(num_img_tokens):
+        for _, cnt in enumerate(num_img_tokens):
             input_ids[positions[idx, 0], positions[idx, 1]:positions[idx, 1] +
                       cnt] = fake_prompt_id[idx:idx + cnt]
             idx += cnt
@@ -885,72 +1210,99 @@ class MultimodalModelRunner:
         return [prompt_table, tasks, task_vocab_size]
 
     def load_test_image(self):
+
+        def load_images(image_paths):
+            if isinstance(image_paths, str):
+                image_paths = [image_paths]
+            images = []
+            for image_path in image_paths:
+                if image_path.startswith("http") or image_path.startswith(
+                        "https"):
+                    logger.info(f"downloading image from url {image_path}")
+                    response = requests.get(image_path, timeout=5)
+                    image = Image.open(BytesIO(response.content)).convert("RGB")
+                else:
+                    image = Image.open(image_path).convert("RGB")
+                images.append(image)
+            return images if len(images) > 1 else images[0]
+
         if "vila" in self.model_type:
             if self.args.image_path is None:
-                img_url = 'https://github.com/Efficient-Large-Model/VILA/raw/main/demo_images/av.png'
-                self.args.image_path = img_url
-                image = Image.open(
-                    requests.get(img_url, stream=True,
-                                 timeout=5).raw).convert('RGB')
-                return [image] * self.args.batch_size
+                img_urls = [
+                    'https://github.com/Efficient-Large-Model/VILA/raw/main/demo_images/av.png',
+                    'https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png'
+                ] * 4
+                img_urls = img_urls[:self.args.batch_size]
+                self.args.image_path = ",".join(img_urls)
+                images = load_images(img_urls)
             else:
+                images = load_images(
+                    self.args.image_path.split(self.args.path_sep))
 
-                def load_image(image_path):
-                    if image_path.startswith("http") or image_path.startswith(
-                            "https"):
-                        logger.info(f"downloading image from url {image_path}")
-                        response = requests.get(image_path, timeout=5)
-                        image = Image.open(BytesIO(
-                            response.content)).convert("RGB")
-                    else:
-                        image = Image.open(image_path).convert("RGB")
-                    return image
-
-                out = []
-                image_paths = self.args.image_path.split(self.args.path_sep)
-                for image_path in image_paths:
-                    image = load_image(image_path)
-                    out.append(image)
-                return out
         elif "nougat" in self.model_type:
             filepath = hf_hub_download(
                 repo_id="hf-internal-testing/fixtures_docvqa",
                 filename="nougat_paper.png",
                 repo_type="dataset")
-            image = Image.open(filepath)
+            images = Image.open(filepath)
         elif "fuyu" in self.model_type:
             filepath = hf_hub_download(repo_id="adept/fuyu-8b",
                                        filename="skateboard.png",
                                        repo_type='model')
-            image = Image.open(filepath)
+            images = Image.open(filepath)
         elif "kosmos" in self.model_type:
-            img_url = 'https://huggingface.co/microsoft/kosmos-2-patch14-224/resolve/main/snowman.png'
-            image = Image.open(
-                requests.get(img_url, stream=True,
-                             timeout=5).raw).convert('RGB')
+            if self.args.image_path is None:
+                self.args.image_path = 'https://huggingface.co/microsoft/kosmos-2-patch14-224/resolve/main/snowman.png'
+            images = load_images(self.args.image_path)
         elif "pix2struct" in self.model_type:
-            img_url = 'https://raw.githubusercontent.com/vis-nlp/ChartQA/main/ChartQA%20Dataset/val/png/multi_col_40963.png'
-            image = Image.open(
-                requests.get(img_url, stream=True,
-                             timeout=5).raw).convert('RGB')
+            if self.args.image_path is None:
+                self.args.image_path = 'https://raw.githubusercontent.com/vis-nlp/ChartQA/main/ChartQA%20Dataset/val/png/multi_col_40963.png'
+            images = load_images(self.args.image_path)
         elif "video-neva" in self.model_type:
-            image = self.args.video_path
-        else:
-            img_url = self.args.image_path
-            if img_url is None:
-                img_url = 'https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png'
-
-            if img_url.startswith("http") or img_url.startswith("https"):
-                image = Image.open(
+            images = self.args.video_path
+        elif "internvl" in self.model_type:
+            if self.args.image_path is None:
+                img_url = 'https://huggingface.co/OpenGVLab/InternVL2-4B/blob/main/examples/image1.jpg'
+                images = Image.open(
                     requests.get(img_url, stream=True,
                                  timeout=5).raw).convert('RGB')
             else:
-                image = Image.open(img_url).convert("RGB")
-
-        return image
+                images = Image.open(self.args.image_path).convert('RGB')
+        elif "llava_onevision" in self.model_type and self.args.video_path is not None:
+            if self.args.video_path == 'llava-onevision-accuracy':
+                self.args.video_path = hf_hub_download(
+                    repo_id="raushan-testing-hf/videos-test",
+                    filename="sample_demo_1.mp4",
+                    repo_type="dataset")
+            import av
+            with av.open(self.args.video_path) as container:
+                total_frames = container.streams.video[0].frames
+                assert total_frames >= self.num_frames
+                indices = np.arange(0, total_frames,
+                                    total_frames / self.num_frames).astype(int)
+                frames = []
+                container.seek(0)
+                start_index = indices[0]
+                end_index = indices[-1]
+                for i, frame in enumerate(container.decode(video=0)):
+                    if i > end_index:
+                        break
+                    if i >= start_index and i in indices:
+                        frames.append(frame)
+                images = np.stack(
+                    [x.to_ndarray(format="rgb24") for x in frames])
+            images = torch.tensor(images)
+        else:
+            if self.args.image_path is None and self.model_type != 'mllama':
+                self.args.image_path = 'https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png'
+            images = load_images(self.args.image_path
+                                 ) if self.args.image_path is not None else None
+        return images
 
     def setup_inputs(self, input_text, raw_image):
         from torchvision import transforms
+        other_vision_inputs = {}
+        other_decoder_inputs = {}
         if 'blip2' in self.model_type:
             from transformers import Blip2Processor
             processor = Blip2Processor.from_pretrained(self.args.hf_model_dir)
@@ -1001,6 +1353,20 @@ class MultimodalModelRunner:
             image = processor(text=prompt,
                               images=raw_image,
                               return_tensors="pt")
+        elif 'internvl' in self.model_type:
+            pre_prompt = "<|system|>\n你是由上海人工智能实验室联合商汤科技开发的书生多模态大模型，英文名叫InternVL, 是一个有用无害的人工智能助手。<|end|><|user|>\n<image>\n"
+            if input_text is None:
+                input_text = "Please describe the image shortly."
+            post_prompt = input_text + "<|end|><|assistant|>\n"
+            prompt = pre_prompt + post_prompt
+
+            from transformers import CLIPImageProcessor
+
+            image_processor = CLIPImageProcessor.from_pretrained(
+                'OpenGVLab/InternViT-300M-448px'
+            )  # You can change the InternViT model type according to your InternVL type
+            image = image_processor(images=raw_image,
+                                    return_tensors='pt').pixel_values
         elif self.model_type == "pix2struct":
             image_processor = AutoProcessor.from_pretrained(
                 self.args.hf_model_dir)
@@ -1107,6 +1473,8 @@ class MultimodalModelRunner:
                 vision_tower = model.get_vision_tower()
                 image_processor = vision_tower.image_processor
                 from llava.mm_utils import process_images
+                if not isinstance(raw_image, list):
+                    raw_image = [raw_image]
                 image = process_images(raw_image, image_processor,
                                        model.config).to(model.device,
                                                         dtype=torch.float16)
@@ -1121,21 +1489,74 @@ class MultimodalModelRunner:
                     image = processor(text=input_text,
                                       images=raw_image,
                                       return_tensors="pt")['pixel_values']
+        elif self.model_type in ['mllama']:
+            processor = AutoProcessor.from_pretrained(self.args.hf_model_dir)
+            image = self.load_test_image()
+            if image is not None:
+                inputs = processor(images=image, return_tensors="pt")
+
+                other_vision_inputs = {
+                    "aspect_ratio_ids":
+                    inputs["aspect_ratio_ids"].to(self.device).expand(
+                        self.args.batch_size, -1).contiguous(),
+                    "aspect_ratio_mask":
+                    inputs["aspect_ratio_mask"].to(self.device).expand(
+                        self.args.batch_size, -1, -1).contiguous(),
+                }
+                cross_attention_mask = processor(
+                    image, input_text,
+                    return_tensors="pt")['cross_attention_mask']
+                cross_attention_mask = cross_attention_mask.expand(
+                    self.args.batch_size, -1, -1, -1).contiguous()
+                other_decoder_inputs = {
+                    "cross_attention_mask":
+                    cross_attention_mask.to(self.device),
+                }
+                pre_prompt = input_text
+                post_prompt = None
+                image = inputs["pixel_values"]
+            else:
+                pre_prompt = input_text
+                post_prompt = None
+                logger.warning(
+                    "image_path is None. Will not pass image as input, skipping the vision encoder."
+                )
+        elif self.model_type in ['llava_onevision']:
+            pre_prompt = "<|im_start|>user "
+            if input_text is None:
+                input_text = "Question: which city is this? Answer:" if self.args.video_path is None else "Why is this video funny?"
+            post_prompt = f"\n{input_text}<|im_end|><|im_start|>assistant\n"
+            prompt = pre_prompt + post_prompt
+
+            processor = AutoProcessor.from_pretrained(self.args.hf_model_dir)
+            if self.args.video_path is None:
+                image = processor(images=raw_image,
+                                  text=prompt,
+                                  return_tensors="pt")
+            else:
+                image = processor(videos=raw_image,
+                                  text=prompt,
+                                  return_tensors="pt")
 
         # Repeat inputs to match batch size
         pre_prompt = [pre_prompt] * self.args.batch_size
         post_prompt = [post_prompt] * self.args.batch_size
         if self.model_type not in [
                 'fuyu', 'pix2struct', 'kosmos-2', 'vila', 'phi-3-vision',
-                'llava_next'
+                'llava_next', 'internvl', 'llava_onevision'
         ]:
-            if image.dim() == 5:
-                image = image.expand(self.args.batch_size, -1, -1, -1,
-                                     -1).contiguous()
-            else:
-                image = image.expand(self.args.batch_size, -1, -1,
-                                     -1).contiguous()
-        image = image.to(self.device)
+            if image is not None:
+                if image.dim() == 5:
+                    image = image.expand(self.args.batch_size, -1, -1, -1,
+                                         -1).contiguous()
+                elif image.dim() == 6:
+                    image = image.expand(self.args.batch_size, -1, -1, -1, -1,
+                                         -1).contiguous()
+                else:
+                    image = image.expand(self.args.batch_size, -1, -1,
+                                         -1).contiguous()
+        if image is not None:
+            image = image.to(self.device)
         # Generate decoder_input_ids for enc-dec models
         # Custom prompts can be added as:
         # decoder_input_ids = model.tokenizer(decoder_prompt).input_ids
@@ -1154,17 +1575,18 @@ class MultimodalModelRunner:
             decoder_input_ids = decoder_input_ids.repeat(
                 (self.args.batch_size, 1))
 
-        return input_text, pre_prompt, post_prompt, image, decoder_input_ids
+        return input_text, pre_prompt, post_prompt, image, decoder_input_ids, other_vision_inputs, other_decoder_inputs
 
     def run(self, input_text, input_image, max_new_tokens):
-        input_text, pre_prompt, post_prompt, processed_image, decoder_input_ids = self.setup_inputs(
+        input_text, pre_prompt, post_prompt, processed_image, decoder_input_ids, other_vision_inputs, other_decoder_inputs = self.setup_inputs(
             input_text, input_image)
-
         output_text = self.generate(pre_prompt,
                                     post_prompt,
                                     processed_image,
                                     decoder_input_ids,
                                     max_new_tokens,
-                                    warmup=False)
+                                    warmup=False,
+                                    other_vision_inputs=other_vision_inputs,
+                                    other_decoder_inputs=other_decoder_inputs)
 
         return input_text, output_text

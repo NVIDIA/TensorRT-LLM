@@ -18,7 +18,7 @@
 #pragma once
 
 #include "tensorrt_llm/executor/types.h"
-#include "tensorrt_llm/pybind/common/opaqueBindings.h"
+#include "tensorrt_llm/pybind/common/customCasters.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include <pybind11/pybind11.h>
 

@@ -92,6 +92,16 @@ from tensorrt_llm.logger import logger
     default=False,
     help="Enable streaming mode for requests.",
 )
+@click.option(
+    "--iteration_log",
+    type=click.Path(dir_okay=False,
+                    writable=True,
+                    readable=False,
+                    path_type=Path,
+                    resolve_path=True),
+    required=False,
+    help="Path where iteration stats should be written to.",
+)
 @click.pass_obj
 def throughput_command(
     bench_env: BenchmarkEnvironment,
@@ -108,6 +118,8 @@ def throughput_command(
     num_requests: int = params.pop("num_requests")
     model: str = bench_env.model
     engine_dir: Path = params.pop("engine_dir")
+    iteration_log: Path = params.pop("iteration_log")
+
     # Engine configuration parsing
     exec_settings, build_cfg = get_settings_from_engine(engine_dir)
     exec_settings["model"] = model
@@ -138,6 +150,10 @@ def throughput_command(
     exec_settings["settings_config"]["beam_width"] = beam_width
     exec_settings["settings_config"][
         "scheduler_policy"] = IFBSchedulingPolicy.NO_EVICT
+
+    # Dynamic runtime features.
+    exec_settings["settings_config"]["dynamic_max_batch_size"] = True
+
     # Construct the runtime configuration dataclass.
     runtime_config = RuntimeConfig(**exec_settings)
 
@@ -175,6 +191,7 @@ def throughput_command(
         request_queue=new_request_queue,
         response_queue=response_queue,
         streaming=streaming,
+        iteration_log=iteration_log,
     )
 
     try:
@@ -182,6 +199,7 @@ def throughput_command(
         benchmark.start_benchmark()
         benchmark.wait()
         benchmark.stop_benchmark()
+        benchmark.dump_extra_stats()
         benchmark.report_statistics()
     except KeyboardInterrupt:
         benchmark.stop_benchmark()
@@ -192,14 +210,17 @@ def throughput_command(
 class ExecutorManager:
     """Utility class for managing a TRT-LLM Executor instance."""
 
-    def __init__(self, runtime_cfg: RuntimeConfig,
-                 response_queue: mp.Queue) -> None:
+    def __init__(self,
+                 runtime_cfg: RuntimeConfig,
+                 response_queue: mp.Queue,
+                 iteration_log: Path = None) -> None:
         """Initialize the ExecutorManager.
 
         Args:
             runtime_cfg (RuntimeConfig): Execution runtime configuration.
             response_queue (mp.Queue): Process-safe queue for passing request
             responses to main process.
+            iteration_log (Path): Path to iteration log stored at end of run.
         """
         logger.info("Initializing Executor.")
         # Runtime related properties.
@@ -209,10 +230,12 @@ class ExecutorManager:
         self._shutdown = Event()
         self.backend_ready = Event()
         self._resp_daemon_finished = Event()
-        self.executor = trtllm.Executor(
-            self.runtime_config.engine_dir,
-            trtllm.ModelType.DECODER_ONLY,
-            executor_config=self.runtime_config.get_config())
+        self.iteration_log = iteration_log
+        config = self.runtime_config.get_config()
+        config.iter_stats_max_iterations = 100000000 if self.iteration_log else 0
+        self.executor = trtllm.Executor(self.runtime_config.engine_dir,
+                                        trtllm.ModelType.DECODER_ONLY,
+                                        executor_config=config)
 
         logger.info("WAITING ON EXECUTOR...")
         while not self.executor.can_enqueue_requests():
@@ -248,6 +271,12 @@ class ExecutorManager:
         if self.executor is not None:
             logger.info("Shutting down ExecutorServer.")
             self.executor.shutdown()
+
+    def dump_extra_stats(self) -> None:
+        if self.iteration_log is not None:
+            with open(self.iteration_log, "w") as iter_log:
+                for iteration in self.executor.get_latest_iteration_stats():
+                    iter_log.write(f"{iteration.to_json_str()}\n")
 
     def response_daemon(self) -> None:
         """Daemon method for retrieving messages from the Executor."""
@@ -286,6 +315,7 @@ class ThroughputBenchmark:
         request_queue: mp.Queue,
         response_queue: mp.Queue,
         streaming: bool,
+        iteration_log: Path = None,
     ) -> None:
         """Initialize the throughput benchmark.
 
@@ -297,6 +327,8 @@ class ThroughputBenchmark:
             request_queue (mp.Queue): Process-safe queue of request identifiers
             response_queue (mp.Queue): Process-safe queue for passing request
             responses to main process.
+            streaming (bool): Enable/disable streaming mode.
+            iteration_log (Path): Path to iteration log stored at end of run.
         """
         logger.info(
             f"Initializing Throughput Benchmark. [rate={request_rate} req/s]")
@@ -310,6 +342,7 @@ class ThroughputBenchmark:
         self.runtime_config = deepcopy(runtime_cfg)
         self.streaming = streaming
         self.executor = None
+        self.iteration_log = iteration_log
 
         # Request and response reporting structures
         self.new_request_queue = request_queue
@@ -347,8 +380,11 @@ class ThroughputBenchmark:
     def start_benchmark(self) -> None:
         """Start the benchmark."""
         # Start the ExecutorManager for running the backend.
-        self.executor = ExecutorManager(self.runtime_config,
-                                        self.response_queue)
+        self.executor = ExecutorManager(
+            self.runtime_config,
+            self.response_queue,
+            iteration_log=self.iteration_log,
+        )
         logger.info("Executor started.")
         # Note the time we started the thread.
         self.start_time = monotonic_ns()
@@ -381,6 +417,10 @@ class ThroughputBenchmark:
             bool: Return whether the event is set.
         """
         return not self.parsing_complete.wait()
+
+    def dump_extra_stats(self) -> None:
+        """Write extended stats to a file."""
+        self.executor.dump_extra_stats()
 
     def collect_statistics(self) -> None:
         """Collect statistics (daemon method)."""
@@ -445,7 +485,6 @@ class ThroughputBenchmark:
             f"Dtype:\t\t\t{pretrain_cfg['dtype']}\n"
             f"KV Cache Dtype:\t\t{pretrain_cfg['quantization']['kv_cache_quant_algo']}\n"
             f"Quantization:\t\t{pretrain_cfg['quantization']['quant_algo']}\n"
-            f"Max Input Length:\t{build_cfg['max_input_len']}\n"
             f"Max Sequence Length:\t{build_cfg['max_seq_len']}\n"
             f"\n"
             "===========================================================\n"

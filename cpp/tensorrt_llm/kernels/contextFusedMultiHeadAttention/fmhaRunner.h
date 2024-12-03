@@ -55,6 +55,12 @@ public:
     // Check if any fmha kernel meets the requirements.
     bool isFmhaSupported();
 
+    // Does FMHA need a separate Q and Kv input ?
+    bool isSeparateQAndKvInput() const
+    {
+        return mFixedParams.attentionInputLayout != AttentionInputLayout::PACKED_QKV;
+    }
+
     // Run the fmha kernel.
     void run(MHARunnerParams runnerParams);
 

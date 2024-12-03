@@ -111,6 +111,10 @@ target_link_libraries(executorExampleBasic nvinfer_plugin_tensorrt_llm)
 add_executable(executorExampleDebug executorExampleDebug.cpp)
 target_link_libraries(executorExampleDebug nvinfer_plugin_tensorrt_llm)
 
+add_executable(executorExampleKvEvents executorExampleKvEvents.cpp)
+target_link_libraries(executorExampleKvEvents nvinfer_plugin_tensorrt_llm
+                      cxxopts::cxxopts)
+
 add_executable(executorExampleLogitsProcessor
                executorExampleLogitsProcessor.cpp)
 target_link_libraries(executorExampleLogitsProcessor
@@ -138,3 +142,8 @@ add_executable(executorExampleAdvancedMultiInstances
 target_link_libraries(
   executorExampleAdvancedMultiInstances nvinfer_plugin_tensorrt_llm
   cxxopts::cxxopts ${MPI_C_LIBRARIES})
+
+# FastLogits
+add_executable(executorExampleFastLogits executorExampleFastLogits.cpp)
+target_link_libraries(executorExampleFastLogits nvinfer_plugin_tensorrt_llm
+                      cxxopts::cxxopts ${MPI_C_LIBRARIES})

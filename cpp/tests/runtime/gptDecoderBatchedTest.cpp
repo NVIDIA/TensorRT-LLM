@@ -261,7 +261,7 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& sa
     {
         seqSlots.push_back(batchIdx);
     }
-    decoder.newRequests(seqSlots, requests, samplingConfigs);
+    decoder.newRequests(seqSlots, requests, samplingConfigs, modelConfig);
     cudaDeviceSynchronize();
 
     auto expectedLengths = tiledInputLengths;
@@ -298,7 +298,7 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& sa
     checkSequenceLengths(*outputs.sequenceLengths, expectedLengths, manager);
 
     std::vector<SamplingConfig> singleConfig = {samplingConfigs[0]};
-    decoder.newRequests({0}, {requests[0]}, singleConfig);
+    decoder.newRequests({0}, {requests[0]}, singleConfig, modelConfig);
     EXPECT_FALSE(decoder.getFinished()[0]);
 }
 
@@ -386,7 +386,7 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
     for (auto batchIdx = 0; batchIdx < batchSize; ++batchIdx)
     {
         std::vector<SamplingConfig> singleConfig = {samplingConfigs[batchIdx]};
-        decoder.newRequests({batchIdx}, {requests[batchIdx]}, singleConfig);
+        decoder.newRequests({batchIdx}, {requests[batchIdx]}, singleConfig, modelConfig);
 
         decoder.forward(outputs, inputs);
 
@@ -500,7 +500,7 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
     std::vector<SizeType32> seqSlots(batchSize);
     std::iota(seqSlots.begin(), seqSlots.end(), 0);
 
-    decoder.newRequests(seqSlots, requests, samplingConfigs);
+    decoder.newRequests(seqSlots, requests, samplingConfigs, modelConfig);
     cudaDeviceSynchronize();
 
     auto expectedLengths = tiledInputLengths;

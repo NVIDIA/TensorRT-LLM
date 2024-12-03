@@ -604,7 +604,9 @@ class RecurrentGemmaForCausalLM(PretrainedModel):
                 max_context_length=max_input_len,
                 host_request_types=attention_inputs['host_request_types'],
                 host_runtime_perf_knobs=attention_inputs[
-                    'host_runtime_perf_knobs']),
+                    'host_runtime_perf_knobs'],
+                host_context_progress=attention_inputs['host_context_progress'],
+            ),
             'conv_states':
             recurrent_inputs['conv_states'],
             'rnn_states':

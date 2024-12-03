@@ -96,6 +96,7 @@ class Mapping(object):
             world_size=1,
             rank=0,
             gpus_per_node=8,
+            *,
             cp_size=1,
             tp_size=1,
             pp_size=1,

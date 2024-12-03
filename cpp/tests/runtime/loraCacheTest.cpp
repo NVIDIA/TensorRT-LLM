@@ -284,7 +284,7 @@ TEST_F(LoraCacheTest, basicPutGet)
     mLoraCache->put(1234, loraReqWeights, loraReqKeys);
     EXPECT_TRUE(mLoraCache->has(1234));
     EXPECT_TRUE(mLoraCache->isLoaded(1234));
-    auto const& values = *mLoraCache->get(1234);
+    auto const& values = mLoraCache->get(1234);
 
     std::vector<LoraCache::TaskLayerModuleConfig> expectedValues{{0, 0, 128, 192, 0, 0, 8, 5},
         {0, 5, 128, 192, 0, 1, 8, 5}, {0, 10, 64, 32, 1, 0, 4, 2}, {0, 12, 64, 32, 1, 1, 4, 2},
@@ -337,7 +337,7 @@ TEST_F(LoraCacheTest, basicPutGet)
 
     mLoraCache->copyTask(1234, *mLoraCache2);
 
-    auto const& values2 = *mLoraCache2->get(1234);
+    auto const& values2 = mLoraCache2->get(1234);
     ASSERT_EQ(values.size(), values2.size());
     for (size_t i = 0; i < values.size(); ++i)
     {

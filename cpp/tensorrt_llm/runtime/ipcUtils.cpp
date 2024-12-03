@@ -156,8 +156,10 @@ AllReduceBuffers::AllReduceBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWi
         * std::min(
             static_cast<std::size_t>(maxBatchSize) * maxBeamWidth * maxSequenceLength * hiddenSize * sizeof(float),
             utils::customAllReduceUtils::getMaxRequiredWorkspaceSize(tpSize));
-    auto const lamportBufferSize
-        = tpSize * tensorrt_llm::kernels::reduce_fusion::details::kLamportTokenNumThreshold * hiddenSize * sizeof(half);
+    size_t realHiddenSize = tpSize * hiddenSize;
+    // PUSH_MODE need TP_SIZE times the activation tensor size
+    auto const lamportBufferSize = tpSize * tensorrt_llm::kernels::reduce_fusion::details::kLamportTokenNumThreshold
+        * realHiddenSize * sizeof(half);
     auto const flagsSize = IpcMemory::FLAGS_SIZE * tpSize * 2;
 
     for (auto size :
@@ -182,22 +184,26 @@ AllReduceBuffers::AllReduceBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWi
         std::copy(memCommPtrs.begin(), memCommPtrs.end(), commPtrs.begin() + memIdx * tpSize);
     }
 #if ENABLE_MULTI_DEVICE
-    auto rank = worldConfig.getRank();
     auto tp_rank = worldConfig.getTensorParallelRank();
     // When p2p is not supported all the mIpcMemoryHandles are
     // null
-    if (rank == tp_rank && isP2pSupported)
+    if (isP2pSupported)
     {
-        tensorrt_llm::kernels::lamportInitialize(
-            mIpcMemoryHandles[4].getCommPtrs()[rank], lamportBufferSize / sizeof(half), nvinfer1::DataType::kHALF, 0);
-        tensorrt_llm::kernels::lamportInitialize(
-            mIpcMemoryHandles[5].getCommPtrs()[rank], lamportBufferSize / sizeof(half), nvinfer1::DataType::kHALF, 0);
-        tensorrt_llm::kernels::lamportInitialize(
-            mIpcMemoryHandles[6].getCommPtrs()[rank], lamportBufferSize / sizeof(half), nvinfer1::DataType::kHALF, 0);
-        cudaDeviceSynchronize();
+        lamportInitializeAll(mIpcMemoryHandles[4].getCommPtrs()[tp_rank], mIpcMemoryHandles[5].getCommPtrs()[tp_rank],
+            mIpcMemoryHandles[6].getCommPtrs()[tp_rank], lamportBufferSize);
     }
 #endif
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void lamportInitializeAll(void* buffer_0, void* buffer_1, void* buffer_2, size_t size)
+{
+#if ENABLE_MULTI_DEVICE
+    tensorrt_llm::kernels::lamportInitialize(buffer_0, size / sizeof(half), nvinfer1::DataType::kHALF, 0);
+    tensorrt_llm::kernels::lamportInitialize(buffer_1, size / sizeof(half), nvinfer1::DataType::kHALF, 0);
+    tensorrt_llm::kernels::lamportInitialize(buffer_2, size / sizeof(half), nvinfer1::DataType::kHALF, 0);
+    cudaDeviceSynchronize();
+#endif
 }
 
 } // namespace tensorrt_llm::runtime

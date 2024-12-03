@@ -156,6 +156,18 @@ class GenerationMixin:
             position_ids_inlen_range = [[1, 1, max_input_len]] * num_profiles
         tokens_per_engine_step_range = [tokens_per_engine_step_range
                                         ] * num_profiles
+
+        position_ids_num_tokens_range = num_tokens_range
+        # If max_draft_len != 0, the input_ids may include draft tokens. And the length of position_ids may be not the same as input_ids.
+        # In extreme cases, input_ids may contain (max_draft_token + 1) * N, and the actual position_ids value is only 1 * N.
+        # Therefore, we need to adjust the min value in the ranges of position_ids.
+        if max_draft_len != 0:
+            position_ids_num_tokens_range = list(
+                map(
+                    lambda x:
+                    [math.ceil(x[0] / (max_draft_len + 1)), x[1], x[2]],
+                    num_tokens_range))
+
         ranges = {
             'bb_range': bb_range,
             'bbd_range': bbd_range,
@@ -163,6 +175,7 @@ class GenerationMixin:
             'position_ids_inlen_range': position_ids_inlen_range,
             'num_tokens_range': num_tokens_range,
             'tokens_per_engine_step_range': tokens_per_engine_step_range,
+            'position_ids_num_tokens_range': position_ids_num_tokens_range,
         }
         return num_profiles, ranges
 
@@ -382,6 +395,7 @@ class GenerationMixin:
         cache_indirection = None
         host_request_types = None
         runtime_perf_knobs = None
+        context_progress = None
 
         if use_gpt_attention_plugin:
             if kv_cache_type != KVCacheType.DISABLED:
@@ -420,6 +434,13 @@ class GenerationMixin:
                                             ('perf_knob_size',
                                              [16] * num_profiles)
                                         ]))
+            context_progress = Tensor(name='host_context_progress',
+                                      dtype=trt.int64,
+                                      shape=[1],
+                                      dim_range=OrderedDict([
+                                          ('context_progress_size',
+                                           [1] * num_profiles)
+                                      ]))
         else:
             attention_mask = Tensor(
                 name='attention_mask',
@@ -484,6 +505,7 @@ class GenerationMixin:
             'host_context_lengths': host_context_lengths,
             'host_request_types': host_request_types,
             'host_runtime_perf_knobs': runtime_perf_knobs,
+            'host_context_progress': context_progress,
         }
 
     def prepare_basic_inputs(
@@ -519,7 +541,8 @@ class GenerationMixin:
             max_draft_len=0,
             multiple_profiles: bool = False,
             streamingllm: bool = False,
-            opt_batch_size=None):
+            opt_batch_size=None,
+            pp_reduce_scatter: bool = False):
 
         enable_ctx_gen_opt_profiles = GenerationMixin.has_ctx_gen_opt_profiles(
             use_gpt_attention_plugin=use_gpt_attention_plugin,
@@ -544,7 +567,7 @@ class GenerationMixin:
         num_tokens_range = ranges['num_tokens_range']
         position_ids_inlen_range = ranges['position_ids_inlen_range']
         tokens_per_engine_step_range = ranges['tokens_per_engine_step_range']
-        position_ids_num_tokens_range = num_tokens_range
+        position_ids_num_tokens_range = ranges['position_ids_num_tokens_range']
 
         input_ids = None
         position_ids = None
@@ -581,13 +604,14 @@ class GenerationMixin:
             else:
                 assert dtype is not None
                 assert num_heads is not None
+                pp_hidden_size = hidden_size // mapping.tp_size if pp_reduce_scatter else hidden_size
                 hidden_states = Tensor(
                     name='hidden_states_input',
                     dtype=dtype,
-                    shape=[-1, hidden_size],
+                    shape=[-1, pp_hidden_size],
                     dim_range=OrderedDict([
                         ('num_tokens', num_tokens_range),
-                        ('hidden_size', [hidden_size] * num_profiles),
+                        ('hidden_size', [pp_hidden_size] * num_profiles),
                     ]),
                 )
 

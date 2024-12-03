@@ -30,14 +30,18 @@ class TestTopK(unittest.TestCase):
     def setUp(self):
         tensorrt_llm.logger.set_level('error')
 
-    @parameterized.expand([
-        ((3, 5), 1, 1, True),
-        ((3, 4, 6), 2, 0, True),
-        ((3, 5), 1, 1, False),
-        ((3, 4, 6), 2, 0, False),
-    ],
-                          name_func=unittest_name_func)
-    def test_topk(self, input_shape, k, d, largest):
+    @parameterized.expand(
+        [
+            t + (p, ) for t in [
+                ((3, 5), 1, 1, True),
+                ((3, 4, 6), 2, 0, True),
+                ((3, 5), 1, 1, False),
+                ((3, 4, 6), 2, 0, False),
+                ((3, 4, 5000), 10, 2, True),
+            ] for p in [False, True]  # prefer_plugin
+        ],
+        name_func=unittest_name_func)
+    def test_topk(self, input_shape, k, d, largest, prefer_plugin):
         value_dtype = 'float32'
         indices_dtype = 'int32'
         # construct trt network
@@ -50,7 +54,7 @@ class TestTopK(unittest.TestCase):
 
             m = tensorrt_llm.functional.constant(input_data.cpu().numpy())
             topk_values, topk_indices = tensorrt_llm.functional.topk(
-                m, k, d, largest=largest)
+                m, k, d, largest=largest, prefer_plugin=prefer_plugin)
             topk_values.mark_output('output_values', value_dtype)
             topk_indices.mark_output('topk_indices', indices_dtype)
 

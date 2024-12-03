@@ -85,8 +85,8 @@ public:
         = 0;
 
     //! @brief Initialize the decoder with new batch of inputs.
-    virtual void newBatch(
-        GenerationInput const& inputs, GenerationOutput const& outputs, SamplingConfig const& samplingConfig)
+    virtual void newBatch(GenerationInput const& inputs, GenerationOutput const& outputs,
+        SamplingConfig const& samplingConfig, ModelConfig const& modelConfig)
         = 0;
 
     //! @brief Run one step for all requests without blocking the host thread.

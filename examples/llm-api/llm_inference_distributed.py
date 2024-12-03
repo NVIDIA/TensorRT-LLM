@@ -10,6 +10,10 @@ def main():
         tensor_parallel_size=2
         # Enable 2-way pipeline parallelism if needed
         # pipeline_parallel_size=2
+        # Enable 2-way expert parallelism for MoE model's expert weights
+        # moe_expert_parallel_size=2
+        # Enable 2-way tensor parallelism for MoE model's expert weights
+        # moe_tensor_parallel_size=2
     )
 
     # Sample prompts.

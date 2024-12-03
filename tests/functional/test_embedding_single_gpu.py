@@ -32,21 +32,9 @@ class TestEmbedding(unittest.TestCase):
         torch.random.manual_seed(0)
         tensorrt_llm.logger.set_level('error')
 
-    @parameterized.expand([(
-        'float32',
-        True,
-    ), (
-        'float32',
-        False,
-    ), (
-        'float16',
-        True,
-    ), (
-        'float16',
-        False,
-    )],
+    @parameterized.expand([('float32', ), ('float16', )],
                           name_func=unittest_name_func)
-    def test_embedding(self, dtype, use_lookup_plugin):
+    def test_embedding(self, dtype):
 
         # meta data
         batch_size = 10
@@ -71,9 +59,6 @@ class TestEmbedding(unittest.TestCase):
         # construct trt network
         builder = tensorrt_llm.Builder()
         network = builder.create_network()
-
-        if use_lookup_plugin:
-            network.plugin_config.lookup_plugin = dtype
 
         with tensorrt_llm.net_guard(network):
             index = Tensor(name='index',

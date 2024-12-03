@@ -23,7 +23,7 @@
 namespace tensorrt_llm::common
 {
 
-static std::optional<int32_t> getIntEnv(char const* name)
+std::optional<int32_t> getIntEnv(char const* name)
 {
     char const* const env = std::getenv(name);
     if (env == nullptr)

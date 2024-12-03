@@ -22,6 +22,8 @@
 
 namespace tensorrt_llm::common
 {
+// Useful when you want to inject some debug code controllable with env var.
+std::optional<int32_t> getIntEnv(char const* name);
 
 // XQA kernels (optimized kernels for generation phase).
 bool forceXQAKernels();

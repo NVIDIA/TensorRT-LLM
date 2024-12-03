@@ -101,6 +101,9 @@ def add_parallel_info(report, parallel):
     document.write(report, encoding="UTF-8", xml_declaration=True)
 
 
+default_test_parallel = 2
+
+
 def parallel_run_ctest(
     command: _tp.Sequence[str],
     cwd: _pl.Path,
@@ -108,7 +111,7 @@ def parallel_run_ctest(
     shell=False,
     env=None,
     timeout=None,
-    parallel=2,
+    parallel=default_test_parallel,
 ) -> None:
     if parallel == 1:
         return run_command(command,
@@ -136,7 +139,8 @@ def parallel_run_ctest(
             # Some catastrophic fail happened that there's no report generated
             raise
 
-        parallel_report = 'parallel-' + report
+        # Avoid .xml extension to prevent CI from reading failures from it
+        parallel_report = 'parallel-' + report + ".intermediate"
         _os.rename(cwd / report, cwd / parallel_report)
 
         try:
@@ -150,7 +154,7 @@ def parallel_run_ctest(
                 # Use parallel result as final report
                 _os.rename(cwd / parallel_report, cwd / report)
             else:
-                retry_report = 'retry-' + report
+                retry_report = 'retry-' + report + ".intermediate"
                 _os.rename(cwd / report, cwd / retry_report)
                 merge_report(cwd / parallel_report, cwd / retry_report,
                              cwd / report)
@@ -169,6 +173,7 @@ def run_tests(build_dir: _pl.Path,
               run_llama=False,
               run_chatglm=False,
               run_medusa=False,
+              run_eagle=False,
               run_mamba=False,
               run_recurrentgemma=False,
               run_encoder=False,
@@ -193,17 +198,12 @@ def run_tests(build_dir: _pl.Path,
 
     if run_recurrentgemma:
         run_command([
-            "git", "clone",
-            "https://github.com/google-deepmind/recurrentgemma.git"
+            python_exe, "-m", "pip", "install", "-r",
+            "examples/recurrentgemma/requirements.txt"
         ],
                     cwd=root_dir,
                     env=_os.environ,
                     timeout=300)
-        run_command(
-            [python_exe, "-m", "pip", "install", "./recurrentgemma[full]"],
-            cwd=root_dir,
-            env=_os.environ,
-            timeout=300)
 
     build_dir = build_dir if build_dir.is_absolute() else root_dir / build_dir
     resources_dir = _pl.Path("cpp") / "tests" / "resources"
@@ -258,6 +258,7 @@ def run_tests(build_dir: _pl.Path,
                                 run_llama=run_llama,
                                 run_chatglm=run_chatglm,
                                 run_medusa=run_medusa,
+                                run_eagle=run_eagle,
                                 run_mamba=run_mamba,
                                 run_recurrentgemma=run_recurrentgemma,
                                 run_encoder=run_encoder,
@@ -275,6 +276,7 @@ def run_tests(build_dir: _pl.Path,
                              run_llama=run_llama,
                              run_chatglm=run_chatglm,
                              run_medusa=run_medusa,
+                             run_eagle=run_eagle,
                              run_mamba=run_mamba,
                              run_recurrentgemma=run_recurrentgemma,
                              run_encoder=run_encoder,
@@ -293,7 +295,7 @@ def run_tests(build_dir: _pl.Path,
                            model_cache=model_cache,
                            test_gpt_session_benchmark=True,
                            batching_types=["IFB", "V1"],
-                           api_types=["gptManager", "executor"])
+                           api_types=["executor"])
         elif run_t5:
             run_benchmarks(model_name="t5",
                            python_exe=python_exe,
@@ -338,6 +340,7 @@ def prepare_all_model_tests(python_exe: str,
                             run_llama=False,
                             run_chatglm=False,
                             run_medusa=False,
+                            run_eagle=False,
                             run_mamba=False,
                             run_recurrentgemma=False,
                             run_encoder=False,
@@ -399,6 +402,15 @@ def prepare_all_model_tests(python_exe: str,
                             model_cache_arg=model_cache_arg)
     else:
         _log.info("Skipping Medusa tests")
+
+    if run_eagle:
+        prepare_model_tests(model_name="eagle",
+                            python_exe=python_exe,
+                            root_dir=root_dir,
+                            resources_dir=resources_dir,
+                            model_cache_arg=model_cache_arg)
+    else:
+        _log.info("Skipping Eagle tests")
 
     if run_mamba:
         prepare_model_tests(model_name="mamba",
@@ -576,13 +588,38 @@ def run_unit_tests(build_dir: _pl.Path, timeout=1800):
     excluded_tests.append("Llama")
     excluded_tests.append("ChatGlm")
     excluded_tests.append("Medusa")
+    excluded_tests.append("Eagle")
     excluded_tests.append("ExplicitDraftTokensDecoding")
     excluded_tests.append("Mamba")
     excluded_tests.append("RecurrentGemma")
     excluded_tests.append("Encoder")
     excluded_tests.append("EncDec")
+    excluded_tests.append("SpeculativeDecoding")
     ctest.extend(["-E", "|".join(excluded_tests)])
-    parallel_run_ctest(ctest, cwd=build_dir, env=cpp_env, timeout=timeout)
+
+    parallel = default_test_parallel
+    if parallel_override := _os.environ.get("LLM_TEST_PARALLEL_OVERRIDE", None):
+        parallel = int(parallel_override)
+
+    parallel_run_ctest(ctest,
+                       cwd=build_dir,
+                       env=cpp_env,
+                       timeout=timeout,
+                       parallel=parallel)
+
+
+def run_spec_dec_tests(build_dir: _pl.Path):
+    xml_output_file = build_dir / "results-spec-dec-fast-logits.xml"
+    cpp_env = {**_os.environ}
+    tests_dir = build_dir / "tests"
+    trt_model_test = produce_mpirun_command(
+        global_commands=["mpirun", "--allow-run-as-root"],
+        nranks=3,
+        local_commands=[
+            "executor/executorTest", "--gtest_filter=*SpecDecFastLogits*"
+        ],
+        leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
+    run_command(trt_model_test, cwd=tests_dir, env=cpp_env, timeout=1500)
 
 
 def run_single_gpu_tests(build_dir: _pl.Path,
@@ -591,6 +628,7 @@ def run_single_gpu_tests(build_dir: _pl.Path,
                          run_llama,
                          run_chatglm,
                          run_medusa,
+                         run_eagle,
                          run_mamba,
                          run_recurrentgemma,
                          run_encoder,
@@ -602,45 +640,69 @@ def run_single_gpu_tests(build_dir: _pl.Path,
     build_tests(build_dir=build_dir)
 
     cpp_env = {**_os.environ}
-    ctest = [
-        "ctest", "--output-on-failure", "--output-junit",
-        "results-single-gpu.xml"
-    ]
-
+    resultFileName = "results-single-gpu"
     included_tests = []
     if run_gpt:
+        resultFileName = "-".join([resultFileName, "gpt"])
         included_tests.append("Gpt[^j]")
     if run_gptj:
+        resultFileName = "-".join([resultFileName, "gptj"])
         included_tests.append("Gptj")
     if run_llama:
+        resultFileName = "-".join([resultFileName, "llama"])
         included_tests.append("Llama")
     if run_chatglm:
+        resultFileName = "-".join([resultFileName, "chatglm"])
         included_tests.append("ChatGlm")
     if run_medusa:
+        resultFileName = "-".join([resultFileName, "medusa"])
         included_tests.append("Medusa")
+    if run_eagle:
+        included_tests.append("Eagle")
     if run_mamba:
+        resultFileName = "-".join([resultFileName, "mamba"])
         included_tests.append("Mamba")
     if run_recurrentgemma:
+        resultFileName = "-".join([resultFileName, "recurrentgemma"])
         included_tests.append("RecurrentGemma")
     if run_encoder:
+        resultFileName = "-".join([resultFileName, "encoder"])
         included_tests.append("EncoderModelTestSingleGPU")
     if run_bart:
+        resultFileName = "-".join([resultFileName, "bart"])
         included_tests.append("BartBasicTest")
     if run_t5:
+        resultFileName = "-".join([resultFileName, "t5"])
         included_tests.append("T5BasicTest")
         included_tests.append("T5Beam2Test")
     if run_redrafter:
+        resultFileName = "-".join([resultFileName, "redrafter"])
         included_tests.append("ExplicitDraftTokens")
 
     excluded_tests = []
     if not run_fp8:
         excluded_tests.append("FP8")
+    else:
+        resultFileName = "-".join([resultFileName, "fp8"])
+
+    resultFileName += ".xml"
+    ctest = ["ctest", "--output-on-failure", "--output-junit", resultFileName]
 
     if included_tests:
         ctest.extend(["-R", "|".join(included_tests)])
         if excluded_tests:
             ctest.extend(["-E", "|".join(excluded_tests)])
-        parallel_run_ctest(ctest, cwd=build_dir, env=cpp_env, timeout=timeout)
+
+        parallel = default_test_parallel
+        if parallel_override := _os.environ.get("LLM_TEST_PARALLEL_OVERRIDE",
+                                                None):
+            parallel = int(parallel_override)
+
+        parallel_run_ctest(ctest,
+                           cwd=build_dir,
+                           env=cpp_env,
+                           timeout=timeout,
+                           parallel=parallel)
     if run_gpt:
         xml_output_file = build_dir / "results-single-gpu-disagg-executor_gpt.xml"
         trt_model_test = produce_mpirun_command(
@@ -652,6 +714,8 @@ def run_single_gpu_tests(build_dir: _pl.Path,
             ],
             leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
         run_command(trt_model_test, cwd=build_dir, env=cpp_env, timeout=timeout)
+
+        run_spec_dec_tests(build_dir=build_dir)
 
 
 def produce_mpirun_command(*, global_commands, nranks, local_commands,
@@ -684,10 +748,22 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
         "-n",
         "2",
         "--allow-run-as-root",
-        "--oversubscribe",
         "batch_manager/cacheTransceiverTest",
     ]
     run_command(cache_trans_test, cwd=tests_dir, env=cpp_env, timeout=300)
+
+    # Cache transceiver tests
+    cache_trans_test_8_proc = [
+        "mpirun",
+        "-n",
+        "8",
+        "--allow-run-as-root",
+        "batch_manager/cacheTransceiverTest",
+    ]
+    run_command(cache_trans_test_8_proc,
+                cwd=tests_dir,
+                env=cpp_env,
+                timeout=600)
 
     # UCX transceiver tests, the test may not be built if ENABLE_UCX is 0
     if _os.path.exists(
@@ -841,6 +917,19 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
         leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
     run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
 
+    new_env = copy.copy(cpp_env)
+    new_env["RUN_LLAMA_MULTI_GPU"] = "true"
+    xml_output_file = build_dir / "results-multi-gpu-disagg-asymmetric-orchestrator-executor-7-process.xml"
+    trt_model_test = produce_mpirun_command(
+        global_commands=["mpirun", "--allow-run-as-root"],
+        nranks=7,
+        local_commands=[
+            "executor/executorTest",
+            "--gtest_filter=*DisaggOrchestratorParamsTest*"
+        ],
+        leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
+    run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
+
 
 def run_benchmarks(model_name: str, python_exe: str, root_dir: _pl.Path,
                    build_dir: _pl.Path, resources_dir: _pl.Path,
@@ -974,7 +1063,9 @@ def run_benchmarks(model_name: str, python_exe: str, root_dir: _pl.Path,
                     ]
 
                 run_command(benchmark, cwd=root_dir, timeout=600)
-                req_rate_benchmark = benchmark + ["--request_rate", "100"]
+                req_rate_benchmark = benchmark + [
+                    "--request_rate", "100", "--enable_exp_delays"
+                ]
                 run_command(req_rate_benchmark, cwd=root_dir, timeout=600)
                 concurrency_benchmark = benchmark + ["--concurrency", "30"]
                 run_command(concurrency_benchmark, cwd=root_dir, timeout=600)
@@ -985,34 +1076,6 @@ def run_benchmarks(model_name: str, python_exe: str, root_dir: _pl.Path,
                 str(benchmark_exe_dir / "gptManagerBenchmark"), "--engine_dir",
                 str(model_engine_path), "--type", "IFB", "--dataset",
                 str(data_dir / tokens_f), "--api", "executor", "--streaming"
-            ]
-            if model_name == "enc_dec":
-                benchmark += [
-                    "--encoder_engine_dir",
-                    str(encoder_model_engine_path)
-                ]
-            run_command(benchmark, cwd=root_dir, timeout=600)
-
-        if "IFB" in batching_type and "gptManager" in api_type:
-            # gptManager streaming test
-            benchmark = [
-                str(benchmark_exe_dir / "gptManagerBenchmark"), "--engine_dir",
-                str(model_engine_path), "--type", "IFB", "--dataset",
-                str(data_dir / tokens_f), "--api", "gptManager", "--streaming"
-            ]
-            if model_name == "enc_dec":
-                benchmark += [
-                    "--encoder_engine_dir",
-                    str(encoder_model_engine_path)
-                ]
-            run_command(benchmark, cwd=root_dir, timeout=600)
-
-            # gptManager streaming test with delay
-            benchmark = [
-                str(benchmark_exe_dir / "gptManagerBenchmark"), "--engine_dir",
-                str(model_engine_path), "--type", "IFB", "--dataset",
-                str(data_dir / tokens_f), "--api", "gptManager", "--streaming",
-                "request_rate", "100", "--enable_exp_delays"
             ]
             if model_name == "enc_dec":
                 benchmark += [
@@ -1066,6 +1129,9 @@ if __name__ == "__main__":
     tests_config_parser.add_argument("--run_medusa",
                                      action="store_true",
                                      help="Run the tests for Medusa")
+    tests_config_parser.add_argument("--run_eagle",
+                                     action="store_true",
+                                     help="Run the tests for Eagle")
     tests_config_parser.add_argument("--run_mamba",
                                      action="store_true",
                                      help="Run the tests for Mamba")
@@ -1135,6 +1201,7 @@ if __name__ == "__main__":
         test_args.run_bart = True
         test_args.run_t5 = True
         test_args.run_medusa = True
+        test_args.run_eagle = True
         test_args.run_redrafter = True
 
     del test_args.run_all_models

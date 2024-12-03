@@ -19,7 +19,7 @@
 
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
-#include "tensorrt_llm/pybind/common/opaqueBindings.h"
+#include "tensorrt_llm/pybind/common/customCasters.h"
 #include <pybind11/pybind11.h>
 
 namespace tle = tensorrt_llm::executor;
@@ -113,6 +113,11 @@ public:
     [[nodiscard]] bool canEnqueueRequests() const
     {
         return mExecutor->canEnqueueRequests();
+    }
+
+    [[nodiscard]] std::optional<std::shared_ptr<tle::KVCacheEventManager>> getKVCacheEventManager() const
+    {
+        return mExecutor->getKVCacheEventManager();
     }
 
     static void initBindings(pybind11::module_& m);

@@ -120,6 +120,7 @@ private:
     size_t dispatchToArch(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3 const* B, float alpha, float beta, void const* C,
         void* D, int m, int n, int k,float pdl_overlap_ratio,float prefetech_ratio, ConfigType gemmConfig, char* workspacePtr,
         size_t const workspaceBytes, cudaStream_t stream);
+        size_t getWorkspaceSizeImpl(int const m, int const n, int const k);
     int mSm;
 };
 

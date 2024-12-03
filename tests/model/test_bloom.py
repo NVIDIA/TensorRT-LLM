@@ -229,6 +229,8 @@ class TestBloom(unittest.TestCase):
         if context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
             context_runtime_perf_knobs[1] = 1  # enable_context_fmha_fp32_acc
 
+        host_context_progress = torch.tensor([0], dtype=torch.int64)
+
         cache_indirections = [
             torch.full((
                 batch_size,
@@ -267,6 +269,7 @@ class TestBloom(unittest.TestCase):
                 ctx_host_context_lengths = ctx_context_lengths.cpu()
                 ctx_buffer["host_context_lengths"] = ctx_host_context_lengths
             ctx_buffer['host_runtime_perf_knobs'] = context_runtime_perf_knobs
+            ctx_buffer['host_context_progress'] = host_context_progress
         else:
             ctx_buffer['attention_mask'] = ctx_attention_mask
 
