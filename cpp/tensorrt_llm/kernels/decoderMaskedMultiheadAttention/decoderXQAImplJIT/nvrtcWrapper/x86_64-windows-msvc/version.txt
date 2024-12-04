@@ -1,3 +1,3 @@
 c5f36e093e875c8ea84523fb1566d986 tensorrt_llm_nvrtc_wrapper.lib
 6ed8db839864ffdd8f22fff0d627ee9d tensorrt_llm_nvrtc_wrapper.dll
-434ab9ce85c90a73ad374d3ff2829dff494c7b44 commit
+efb18c1256f8c9c3d47b7d0c740b83e5d5ebe0ec commit

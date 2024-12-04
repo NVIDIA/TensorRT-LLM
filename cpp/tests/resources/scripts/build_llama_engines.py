@@ -88,27 +88,32 @@ def build_engines(model_cache: str, only_multi_gpu: bool):
     model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
     model_spec_obj.use_packed_input()
 
-    tp_pp_sizes = [(1, 1)]
+    tp_pp_cp_sizes = [(1, 1, 1)]
     if only_multi_gpu:
-        tp_pp_sizes = [(1, 4), (4, 1), (1, 2), (2, 2), (2, 1)]
-    for tp_size, pp_size in tp_pp_sizes:
-        tp_pp_dir = f"tp{tp_size}-pp{pp_size}-gpu"
-        print(f"\nBuilding fp16 tp{tp_size} pp{pp_size} engine")
+        tp_pp_cp_sizes = [(1, 4, 1), (4, 1, 1), (1, 2, 1), (2, 2, 1), (2, 1, 1),
+                          (1, 1, 2), (2, 1, 2)]
+    for tp_size, pp_size, cp_size in tp_pp_cp_sizes:
+        tp_pp_cp_dir = f"tp{tp_size}-pp{pp_size}-cp{cp_size}-gpu"
+        print(f"\nBuilding fp16 tp{tp_size} pp{pp_size} cp{cp_size} engine")
         model_spec_obj.use_tensor_parallelism(tp_size)
         model_spec_obj.use_pipeline_parallelism(pp_size)
+        model_spec_obj.use_context_parallelism(cp_size)
 
-        build_engine(hf_dir,
-                     engine_dir / model_spec_obj.get_model_path() / tp_pp_dir,
-                     [f'--tp_size={tp_size}', f'--pp_size={pp_size}'], [])
+        build_engine(
+            hf_dir, engine_dir / model_spec_obj.get_model_path() / tp_pp_cp_dir,
+            [
+                f'--tp_size={tp_size}', f'--pp_size={pp_size}',
+                f'--cp_size={cp_size}'
+            ], [])
 
     ## build lookahead engine
     model_spec_obj.use_lookahead_decoding()
-    build_engine(hf_dir,
-                 engine_dir / model_spec_obj.get_model_path() / 'tp1-pp1-gpu',
-                 [], [
-                     '--max_draft_len=39',
-                     '--speculative_decoding_mode=lookahead_decoding'
-                 ])
+    build_engine(
+        hf_dir,
+        engine_dir / model_spec_obj.get_model_path() / 'tp1-pp1-cp1-gpu', [], [
+            '--max_draft_len=39',
+            '--speculative_decoding_mode=lookahead_decoding'
+        ])
 
     print("Done.")
 

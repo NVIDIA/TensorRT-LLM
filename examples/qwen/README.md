@@ -36,22 +36,28 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 | Qwen-7B(-Chat)     |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
 | Qwen-14B(-Chat)    |     Y      |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
 | Qwen-72B(-Chat)    |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-0.5B(-Chat)|     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-1.8B(-Chat)|     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-4B(-Chat)  |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen1.5-0.5B(-Chat)|     Y      |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen1.5-1.8B(-Chat)|     Y      |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen1.5-4B(-Chat)  |     Y      |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
 | Qwen1.5-7B(-Chat)  |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
 | Qwen1.5-14B(-Chat) |     Y      |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
 | Qwen1.5-32B(-Chat) |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
 | Qwen1.5-72B(-Chat) |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
 | Qwen1.5-110B(-Chat)|     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
 | Qwen1.5-MoE-A2.7B(-Chat)|   Y   |   -   |   Y   |   -   |   -   |   -   |   Y   |   Y   | Ampere+ |
-| Qwen2-0.5B(-Instruct)|     Y    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen2-1.5B(-Instruct)|     Y    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen2-0.5B(-Instruct)|     Y    |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen2-1.5B(-Instruct)|     Y    |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
 | Qwen2-7B(-Instruct)|     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
 | Qwen2-57B-A14B(-Instruct)|  Y   |   -   |   Y   |   -   |   -   |   -   |   Y   |   Y   | Ampere+ |
-| Qwen2-72B(-Instruct)|     Y     |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen2-72B(-Instruct)|     Y     |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen2.5-0.5B(-Instruct)|     Y  |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen2.5-3B(-Instruct)|     Y    |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen2.5-1.5B(-Instruct)|     Y  |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen2.5-7B(-Instruct)|     Y    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen2.5-32B(-Instruct)|     Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen2.5-72B(-Instruct)|     Y   |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
 
-*Please note that these models supports AWQ only with single GPU.
+Please note that Y* sign means that the model does not support all the AWQ + TP combination.
 
 * Model Name: the name of the model, the same as the name on HuggingFace
 * WO: Weight Only Quantization (int8 / int4)
@@ -61,7 +67,7 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 * TP: Tensor Parallel
 * PP: Pipeline Parallel
 
-*Currently Qwen models does not support dynamic NTK and logn attention. Therefore, accuracy on long sequence input for the 7B and 14B model is not promised.
+Currently Qwen1 models does not support dynamic NTK and logn attention. Therefore, accuracy on long sequence input for the Qwen-7B and Qwen-14B model is not promised.
 
 ## Usage
 

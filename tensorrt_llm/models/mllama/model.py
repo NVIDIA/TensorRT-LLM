@@ -518,7 +518,7 @@ class MLLaMAModel(PretrainedModel):
         self.cross_attention_layers = self.config.cross_attention_layers
 
         if self.mapping.is_first_pp_rank():
-            self.embedding = Embedding(
+            self.vocab_embedding = Embedding(
                 self.config.embed_vocab_size,
                 self.config.hidden_size,
                 dtype=self._dtype,
@@ -635,7 +635,7 @@ class MLLaMAModel(PretrainedModel):
 
         # In PP, layer 0 has ids as inputs, all other layers have hidden_states as inputs
         if self.mapping.is_first_pp_rank():
-            hidden_states = self.embedding(decoder_input_ids)
+            hidden_states = self.vocab_embedding(decoder_input_ids)
             self.register_network_output('embedding_layer_output',
                                          hidden_states)
 
@@ -1482,7 +1482,7 @@ class MLLaMAModel(PretrainedModel):
             "decoder_layers": "language_model.model.layers",
             "self_attention": "self_attn",
             "cross_attention": "cross_attn",
-            "embedding": "language_model.model.embed_tokens",
+            "vocab_embedding": "language_model.model.embed_tokens",
             "gate_attn": "cross_attn_attn_gate",
             "gate_ffwd": "cross_attn_mlp_gate",
             "q_layernorm": "q_norm",

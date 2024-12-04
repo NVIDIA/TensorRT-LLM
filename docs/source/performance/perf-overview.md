@@ -209,7 +209,7 @@ In order to prepare a dataset, you can use the provided [script](../../../benchm
 To generate a synthetic dataset, run the following command:
 
 ```shell
-python benchmarks/cpp/prepare_dataset.py --output=$dataset_file --tokenizer=$model_name token-norm-dist --num-requests=$num_requests --input-mean=$isl --output-mean=$osl --input-stdev=0 --output-stdev=0 > $dataset_file
+python benchmarks/cpp/prepare_dataset.py --tokenizer=$model_name --stdout token-norm-dist --num-requests=$num_requests --input-mean=$isl --output-mean=$osl --input-stdev=0 --output-stdev=0 > $dataset_file
 ```
 
 The command will generate a text file located at the path specified `$dataset_file` where all requests are of the same
@@ -244,11 +244,16 @@ All engines are built using the `trtllm-bench build` sub-command. The basic comm
 trtllm-bench --model $model_name build --tp_size $tp_size --quantization FP8 --dataset $dataset_file
 ```
 
-or if you would like to build for a specific sequence length:
+When providing `--dataset` in the sub-command, `trtllm-bench build` uses high-level statistics of the dataset, i.e., average input and output lengths and max sequence length, and tuning heuristics to optimize engine build settings.
+
+
+Alternatively, if you would like to build with specific engine build settings:
 
 ```
-trtllm-bench --model $model_name build --tp_size $tp_size --quantization FP8 --max_seq_length $seq_len
+trtllm-bench --model $model_name build --tp_size $tp_size --quantization FP8 --max_seq_length $seq_len --max_batch_size $max_bs --max_num_tokens $max_token
 ```
+If not specified, `$max_bs` and `$max_token` are default to `2048` and `8192`, respectively.
+
 
 If you would like to build an FP16 engine without any quantization, simply remove the `--quantization FP8` option.
 

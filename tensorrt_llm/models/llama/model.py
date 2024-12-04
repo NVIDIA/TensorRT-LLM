@@ -19,10 +19,11 @@ import transformers
 
 from ..._common import default_net
 from ..._utils import pad_vocab_size
-from ...functional import (AllReduceFusionOp, AllReduceFusionParams, Tensor,
+from ...functional import (AllReduceFusionOp, AllReduceParams, Tensor,
                            allgather, concat, non_gated_version, recv, send)
 from ...layers import (MOE, Attention, AttentionMaskType, ColumnLinear,
-                       Embedding, GatedMLP, PositionEmbeddingType, RmsNorm)
+                       Embedding, FusedGatedMLP, GatedMLP,
+                       PositionEmbeddingType, RmsNorm)
 from ...lora_manager import LoraConfig, use_lora
 from ...mapping import Mapping
 from ...module import Module
@@ -31,10 +32,11 @@ from ..model_weights_loader import ModelWeightsLoader
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
                               QuantConfig, check_share_embedding)
 from .config import LLaMAConfig
-from .convert import (load_hf_llama, load_weights_from_gptq,
-                      load_weights_from_hf_by_shard, load_weights_from_hf_model,
+from .convert import (load_hf_llama, load_weights_from_deepcompressor,
+                      load_weights_from_gptq, load_weights_from_hf_by_shard,
+                      load_weights_from_hf_model,
                       load_weights_from_hf_safetensors,
-                      load_weights_from_lmquant, load_weights_from_meta_ckpt)
+                      load_weights_from_meta_ckpt)
 
 
 class LLaMADecoderLayer(Module):
@@ -71,7 +73,10 @@ class LLaMADecoderLayer(Module):
             tp_group=config.mapping.tp_group,
             tp_size=config.mapping.tp_size,
             tp_rank=config.mapping.tp_rank,
-            quant_mode=config.quant_mode)
+            quant_mode=config.quant_mode,
+            cp_group=config.mapping.cp_group,
+            cp_size=config.mapping.cp_size,
+            cp_rank=config.mapping.cp_rank)
 
         mlp_hidden_size = config.hidden_size * 4 if config.intermediate_size is None else config.intermediate_size
 
@@ -134,6 +139,11 @@ class LLaMADecoderLayer(Module):
         assert not (
             default_net().plugin_config.reduce_fusion and self.has_residual_mlp
         ), "Custom all reduce and residual mlp can't be enabled at the same time."
+        assert not (
+            default_net().plugin_config.reduce_fusion
+            and default_net().plugin_config.user_buffer
+            and default_net().plugin_config.pp_reduce_scatter
+        ), "User buffer reduce fusion enabled with PP reduce scatter is not supported now."
         if default_net(
         ).plugin_config.reduce_fusion and self.local_layer_idx > 0:
             hidden_states, residual = hidden_states
@@ -143,6 +153,13 @@ class LLaMADecoderLayer(Module):
                     and self.layer_idx == 0) or self.layer_idx > 0:
                 hidden_states = self.input_layernorm(hidden_states)
 
+        reduce_fusion_scale = None
+        if default_net().plugin_config.reduce_fusion and default_net(
+        ).plugin_config.user_buffer and self.config.quant_mode.has_fp8_qdq:
+            if isinstance(self.mlp, FusedGatedMLP):
+                reduce_fusion_scale = self.mlp.fused_fc.activation_scaling_factor.value
+            else:
+                reduce_fusion_scale = self.mlp.fc.activation_scaling_factor.value
         attention_output = self.attention(
             hidden_states,
             attention_mask=attention_mask,
@@ -151,12 +168,13 @@ class LLaMADecoderLayer(Module):
             kv_cache_params=kv_cache_params,
             attention_params=attention_params,
             lora_layer_params=lora_layer_params,
-            reduce_fusion_params=AllReduceFusionParams(
+            all_reduce_params=AllReduceParams(
                 fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM
                 if default_net().plugin_config.reduce_fusion else
                 AllReduceFusionOp.NONE,
                 residual=residual,
                 norm_weight=self.post_layernorm.weight.value,
+                scale=reduce_fusion_scale,
                 eps=self.post_layernorm.eps))
 
         if use_cache:
@@ -189,12 +207,13 @@ class LLaMADecoderLayer(Module):
                 hidden_states = self.mlp(
                     hidden_states,
                     lora_layer_params=lora_layer_params,
-                    reduce_fusion_params=AllReduceFusionParams(
+                    all_reduce_params=AllReduceParams(
                         fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM
                         if default_net().plugin_config.reduce_fusion else
                         AllReduceFusionOp.NONE,
                         residual=residual,
                         norm_weight=next_layer_input_layernorm_args[0],
+                        scale=next_layer_input_layernorm_args[2],
                         eps=next_layer_input_layernorm_args[1]))
             else:
                 if default_net(
@@ -205,8 +224,17 @@ class LLaMADecoderLayer(Module):
                         lora_layer_params=lora_layer_params,
                         last_local_layer_residual=residual)
                 else:
-                    hidden_states = self.mlp(
-                        hidden_states, lora_layer_params=lora_layer_params)
+                    if (default_net().plugin_config.reduce_fusion
+                            and default_net().plugin_config.user_buffer):
+                        hidden_states, residual = self.mlp(
+                            hidden_states,
+                            lora_layer_params=lora_layer_params,
+                            all_reduce_params=AllReduceParams(
+                                fusion_op=AllReduceFusionOp.LAST_PROCESS_FOR_UB,
+                                residual=residual))
+                    else:
+                        hidden_states = self.mlp(
+                            hidden_states, lora_layer_params=lora_layer_params)
                     hidden_states = residual + hidden_states
 
         if use_cache:
@@ -339,6 +367,7 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
         load_by_shard = kwargs.pop('load_by_shard', False)
         load_model_on_cpu = kwargs.pop('load_model_on_cpu', False)
         quant_ckpt_path = kwargs.pop('quant_ckpt_path', None)
+        use_autoawq = kwargs.pop('use_autoawq', None)
         if os.environ.get("TRTLLM_DISABLE_UNIFIED_CONVERTER"
                           ) is not None and not isinstance(
                               hf_model_or_dir, transformers.PreTrainedModel):
@@ -393,13 +422,17 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
                     "input_layernorm": "ln_1",
                     "post_layernorm": "ln_2",
                 }
+            elif config.tie_word_embeddings:
+                custom_dict = {"lm_head": "model.embed_tokens"}
+
             if quant_ckpt_path is not None:
                 hf_model_dir = quant_ckpt_path
+            arg_dict = {"use_autoawq": True} if use_autoawq else {}
 
             loader = ModelWeightsLoader(hf_model_dir, custom_dict)
             loader.check_share_embedding(config)
             model = cls(config)
-            loader.generate_tllm_weights(model)
+            loader.generate_tllm_weights(model, arg_dict)
         else:
             if use_preloading:
                 assert not load_by_shard
@@ -413,7 +446,8 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
                 if quant_config.quant_mode.is_int4_weight_only():
                     weights = load_weights_from_gptq(quant_ckpt_path, config)
                 elif quant_config.quant_mode.is_qserve_w4a8():
-                    weights = load_weights_from_lmquant(quant_ckpt_path, config)
+                    weights = load_weights_from_deepcompressor(
+                        quant_ckpt_path, config)
                 else:
                     raise ValueError(
                         "quant_ckpt_path should be specified only for GPTQ or QServe"

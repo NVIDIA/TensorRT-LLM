@@ -378,7 +378,8 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
             int const cache_seq_len = params.cache_seq_lens[batch_idx];
             int const actual_seq_len = variable_sequence_length ? params.seq_lens[batch_idx] : params.max_input_seq_len;
             // Chunked attention: takes past_kv_sequence_length into consideration.
-            int const token_idx_in_seq = (cache_seq_len - actual_seq_len) + local_token_idx;
+            int const past_seq_len = (cache_seq_len - actual_seq_len);
+            int const token_idx_in_seq = past_seq_len + local_token_idx;
             bool const valid_token = token_idx_in_seq < cache_seq_len;
 
             // NOTE: only spec decoding needs the position offsets.
@@ -386,7 +387,7 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
             int const rotary_position
                 = (params.spec_decoding_position_offsets != nullptr ? (
                        params.spec_decoding_position_offsets[local_token_idx + batch_idx * params.max_input_seq_len]
-                       + cache_seq_len - actual_seq_len)
+                       + past_seq_len)
                                                                     : token_idx_in_seq)
                 + (params.mrope_position_deltas != nullptr ? params.mrope_position_deltas[batch_idx] : 0);
 
@@ -491,10 +492,30 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
             auto const channelIdx{tidx};
             auto const tokenIdxLowerBound
                 = max(cache_seq_len - params.cyclic_kv_cache_len + params.sink_token_len, params.sink_token_len);
-            bool const valid_kv_cache_pos
-                = params.kv_cache_buffer.data != nullptr // In KV-cache-less mode. No need to store KV values
+            bool const useKVCache = params.kv_cache_buffer.data != nullptr;
+            bool valid_kv_cache_pos = useKVCache // In KV-cache-less mode. No need to store KV values
                 && (token_idx_in_seq >= tokenIdxLowerBound || token_idx_in_seq < params.sink_token_len);
-            auto const token_kv_idx = params.kv_cache_buffer.getKVTokenIdx(token_idx_in_seq);
+            auto token_idx_in_kv_cache = token_idx_in_seq;
+
+            // Additional kv cache blocks will be allocated if sliding window attention and paged kv context fmha
+            // (!STORE_QKV) are used together as the original kv cache cannot be overwritten. In this case, new tokens'
+            // kv will just be appended to the kv cache instead of overwriting it in a circular way. And the kv cache
+            // will be overwritten after FMHA kernels.
+            if constexpr (STORE_QKV)
+            {
+                // Write the new tokens' kv to the cyclic kv cache.
+                token_idx_in_kv_cache = params.kv_cache_buffer.getKVTokenIdx(token_idx_in_seq);
+            }
+            else
+            {
+                // Write the new tokens' kv to the temporary kv cache (write linearly to the cyclic kv cache first, then
+                // the temporary kv cache).
+                valid_kv_cache_pos = useKVCache;
+                if (past_seq_len >= params.cyclic_kv_cache_len)
+                {
+                    token_idx_in_kv_cache = params.cyclic_kv_cache_len + local_token_idx;
+                }
+            }
 
             // Make sure pairs of q or v vecs have been read before write.
             // One block will handle single head.
@@ -502,10 +523,12 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
 
             if (valid_head_dim_idx)
             {
-                auto kDst = reinterpret_cast<TDst*>(params.kv_cache_buffer.getKBlockPtr(batch_idx, token_kv_idx));
-                auto vDst = reinterpret_cast<TDst*>(params.kv_cache_buffer.getVBlockPtr(batch_idx, token_kv_idx));
-                int inBlockIdx
-                    = params.kv_cache_buffer.getKVLocalIdx(token_kv_idx, kv_head_idx, sizePerHeadDivX, channelIdx);
+                auto kDst
+                    = reinterpret_cast<TDst*>(params.kv_cache_buffer.getKBlockPtr(batch_idx, token_idx_in_kv_cache));
+                auto vDst
+                    = reinterpret_cast<TDst*>(params.kv_cache_buffer.getVBlockPtr(batch_idx, token_idx_in_kv_cache));
+                int inBlockIdx = params.kv_cache_buffer.getKVLocalIdx(
+                    token_idx_in_kv_cache, kv_head_idx, sizePerHeadDivX, channelIdx);
                 VecType k_to_cache = params.position_shift_enabled ? k_wo_pos : k;
 
                 auto const dst_q_idx = static_cast<size_t>(global_token_idx) * params.q_hidden_size + hidden_idx;
@@ -808,17 +831,37 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
         auto const tokenIdxLowerBound = max(cache_seq_len - params.cyclic_kv_cache_len, 0);
         bool const cyclic_kv_cache = cache_seq_len > params.cyclic_kv_cache_len;
         bool const useKVCache = params.kv_cache_buffer.data != nullptr;
-        bool const valid_kv_cache_pos = useKVCache // In KV-cache-less mode. No need to store KV values
+        bool valid_kv_cache_pos = useKVCache // In KV-cache-less mode. No need to store KV values
             && (token_idx_in_kv_cache >= tokenIdxLowerBound);
-        auto const token_kv_idx
-            = cyclic_kv_cache ? (token_idx_in_kv_cache % params.cyclic_kv_cache_len) : token_idx_in_kv_cache;
+        // Additional kv cache blocks will be allocated if sliding window attention and paged kv context fmha
+        // (!STORE_QKV) are used together as the original kv cache cannot be overwritten. In this case, new tokens' kv
+        // will just be appended to the kv cache instead of overwriting it in a circular way. And the kv cache will be
+        // overwritten after FMHA kernels.
+        if constexpr (STORE_QKV)
+        {
+            // Write the new tokens' kv to the cyclic kv cache.
+            token_idx_in_kv_cache
+                = cyclic_kv_cache ? (token_idx_in_kv_cache % params.cyclic_kv_cache_len) : token_idx_in_kv_cache;
+        }
+        else
+        {
+            // Write the new tokens' kv to the temporary kv cache (write linearly to the cyclic kv cache first, then the
+            // temporary kv cache).
+            valid_kv_cache_pos = useKVCache;
+            if (past_seq_len >= params.cyclic_kv_cache_len)
+            {
+                token_idx_in_kv_cache = params.cyclic_kv_cache_len + local_token_idx;
+            }
+        }
 
-        auto kDst = useKVCache ? reinterpret_cast<TCache*>(params.kv_cache_buffer.getKBlockPtr(batch_idx, token_kv_idx))
-                               : (TCache*) (nullptr);
-        auto vDst = useKVCache ? reinterpret_cast<TCache*>(params.kv_cache_buffer.getVBlockPtr(batch_idx, token_kv_idx))
-                               : (TCache*) (nullptr);
+        auto kDst = useKVCache
+            ? reinterpret_cast<TCache*>(params.kv_cache_buffer.getKBlockPtr(batch_idx, token_idx_in_kv_cache))
+            : (TCache*) (nullptr);
+        auto vDst = useKVCache
+            ? reinterpret_cast<TCache*>(params.kv_cache_buffer.getVBlockPtr(batch_idx, token_idx_in_kv_cache))
+            : (TCache*) (nullptr);
         auto inBlockIdx = useKVCache
-            ? params.kv_cache_buffer.getKVLocalIdx(token_kv_idx, kv_head_idx, VECS_PER_HEAD, channelIdx)
+            ? params.kv_cache_buffer.getKVLocalIdx(token_idx_in_kv_cache, kv_head_idx, VECS_PER_HEAD, channelIdx)
             : int32_t(0);
 
         // Make sure pairs of q or v vecs have been read before write.
@@ -1330,9 +1373,114 @@ void invokeApplyBiasRopeUpdateKVCacheDispatch(QKVPreprocessingParams<T, KVCacheB
     }
 }
 
-#define INSTANTIATE_ADDFUSEDQKVBIAS_TRANSPOSE(T, TCache, KVCacheBuffer)                                                \
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename T, typename TCache, typename KVCacheBuffer>
+__global__ __launch_bounds__(1024) void updateCyclicKvCacheAfterFmha(QKVPreprocessingParams<T, KVCacheBuffer> params)
+{
+    // The batch idx.
+    int batch_idx = blockIdx.z;
+    // The kv head idx.
+    int kv_head_idx = blockIdx.y;
+
+    // The number of 16B vectors per head size in the kv cache.
+    int num_vecs_per_head = (params.size_per_head * sizeof(TCache)) / 16;
+
+    // The current sequence length.
+    int seq_length = params.seq_lens[batch_idx];
+    // The cache sequence length.
+    int cache_seq_length = params.cache_seq_lens[batch_idx];
+    // The past cache sequence length.
+    int past_cache_seq_length = cache_seq_length - seq_length;
+    // Do we need to move the kv from the temporary kv cache to the cyclic kv cache (i.e. overwriting) ?
+    bool const write_to_cyclic_kv_cache = cache_seq_length > params.cyclic_kv_cache_len;
+    // The number of tokens in the temporary kv cache.
+    int num_tmp_kv_tokens = past_cache_seq_length < params.cyclic_kv_cache_len
+        ? (cache_seq_length - params.cyclic_kv_cache_len)
+        : seq_length;
+    // The kv sequence offset for the temporary kv tokens.
+    int tmp_kv_seq_offset = (cache_seq_length - num_tmp_kv_tokens);
+    // The first tmp kv cache idx that needs to be stored to the kv cache.
+    // Only the last params.cyclic_kv_cache_len tokens needs to be stored.
+    int tmp_kv_token_start_idx = max(num_tmp_kv_tokens - params.cyclic_kv_cache_len, 0);
+
+    // Early step if this sequence doesn't need to update cyclic kv cache.
+    if (!write_to_cyclic_kv_cache)
+    {
+        return;
+    }
+
+    // The kv cache buffer has the shape of [batch_size, 2, max_num_blocks_per_seq, [num_kv_heads, tokens_per_block,
+    // head_size]] All threads in block.y and grid.x will iterate over all the tokens.
+    int thread_token_idx = blockIdx.x * blockDim.y + threadIdx.y;
+    int num_tokens_per_loop = gridDim.x * blockDim.y;
+    // Iterate over new tokens' kv blocks.
+    for (int token_idx = tmp_kv_token_start_idx + thread_token_idx; token_idx < num_tmp_kv_tokens;
+         token_idx += num_tokens_per_loop)
+    {
+
+        // The token idx in the kv cache for loading and storing.
+        int load_token_idx_in_kv_cache = params.cyclic_kv_cache_len + token_idx;
+        int store_token_idx_in_kv_cache = (token_idx + tmp_kv_seq_offset) % params.cyclic_kv_cache_len;
+        // The block pointer.
+        auto load_k_block_ptr
+            = reinterpret_cast<uint4*>(params.kv_cache_buffer.getKBlockPtr(batch_idx, load_token_idx_in_kv_cache));
+        auto load_v_block_ptr
+            = reinterpret_cast<uint4*>(params.kv_cache_buffer.getVBlockPtr(batch_idx, load_token_idx_in_kv_cache));
+        auto store_k_block_ptr
+            = reinterpret_cast<uint4*>(params.kv_cache_buffer.getKBlockPtr(batch_idx, store_token_idx_in_kv_cache));
+        auto store_v_block_ptr
+            = reinterpret_cast<uint4*>(params.kv_cache_buffer.getVBlockPtr(batch_idx, store_token_idx_in_kv_cache));
+
+        // Iterate over new tokens' kv hidden states in one cache block.
+        int head_vec_idx = threadIdx.x;
+        if (head_vec_idx < num_vecs_per_head)
+        {
+            // The vector index inside the block.
+            auto load_vec_idx = params.kv_cache_buffer.getKVLocalIdx(
+                load_token_idx_in_kv_cache, kv_head_idx, num_vecs_per_head, head_vec_idx);
+            auto store_vec_idx = params.kv_cache_buffer.getKVLocalIdx(
+                store_token_idx_in_kv_cache, kv_head_idx, num_vecs_per_head, head_vec_idx);
+            // Load from the temporary cache and write it to the cyclic cache.
+            store_k_block_ptr[store_vec_idx] = load_k_block_ptr[load_vec_idx];
+            store_v_block_ptr[store_vec_idx] = load_v_block_ptr[load_vec_idx];
+        }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename T, typename TCache, typename KVCacheBuffer>
+void invokeUpdateCyclicKvCacheAfterFmha(QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStream_t stream)
+{
+    //
+    // This function processes at most params.cyclic_kv_cache_len kv cache as others will be overwritten anyway.
+    //
+
+    // Launch kernels for updating cyclic kv cache. It is only needed when sliding window attention and chunked context
+    // (i.e. paged kv context fmha) are used together.
+    dim3 block(32, 32);
+    dim3 grid(std::min(64, int(divUp(params.cyclic_kv_cache_len, block.y))), params.kv_head_num, params.batch_size);
+    // separate_q_kv_output = true means that paged kv context fmha might be used.
+    if (params.max_kv_seq_len > params.cyclic_kv_cache_len && params.separate_q_kv_output)
+    {
+        // Assume the bytes of head size is multiple of 16.
+        TLLM_CHECK_WITH_INFO(
+            (params.size_per_head * sizeof(TCache)) % 16 == 0 && (params.size_per_head * sizeof(TCache)) / 16 <= 32,
+            "Head size is not supported.");
+        updateCyclicKvCacheAfterFmha<T, TCache, KVCacheBuffer><<<grid, block, 0, stream>>>(params);
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#define INSTANTIATE_ATTENTION_INPUT_OUTPUT_PROCESSING(T, TCache, KVCacheBuffer)                                        \
     template void invokeApplyBiasRopeUpdateKVCacheDispatch<T, TCache, KVCacheBuffer>(                                  \
+        QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStream_t stream);                                         \
+    template void invokeUpdateCyclicKvCacheAfterFmha<T, TCache, KVCacheBuffer>(                                        \
         QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStream_t stream);
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 } // namespace kernels
 } // namespace tensorrt_llm

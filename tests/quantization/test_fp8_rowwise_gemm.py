@@ -62,6 +62,7 @@ class TestFp8RowwiseGemm(unittest.TestCase):
 
         # Create builder
         builder = tensorrt_llm.Builder()
+        builder.strongly_typed = False  # Test need to run in weekly typed mode
         # Create empty network
         network = builder.create_network()
         # Allow fp8_rowwise_gemm_plugin of dtype type
@@ -95,6 +96,7 @@ class TestFp8RowwiseGemm(unittest.TestCase):
             config=CreateConfig(
                 fp8=True,
                 fp16=(dtype == "float16"),
+                precision_constraints="obey",
                 memory_pool_limits={trt.MemoryPoolType.WORKSPACE: 33554432}))
         assert engine is not None, "Failed to build engine"
 

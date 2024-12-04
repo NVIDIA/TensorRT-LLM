@@ -35,12 +35,15 @@ from .llmapi.mpi_session import (MpiPoolSession, MpiSession,
                                  need_spawn_mpi_workers)
 from .llmapi.tracer import (VizTracer, enable_llm_tracer, get_tracer,
                             global_tracer, set_global_tracer)
-from .llmapi.utils import (AsyncQueue, ManagedThread, SamplingParams,
-                           _SyncQueue, enable_llm_debug, print_colored)
-from .logger import set_level
+from .llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
+                           enable_llm_debug, print_colored)
 from .lora_manager import LoraManager
 from .prompt_adapter_manager import PromptAdapterManager
+from .runtime import ModelConfig
 from .runtime.model_runner import _engine_config_to_model_config
+from .sampling_params import SamplingParams
+
+unblock_corountine = True
 
 if enable_llm_debug():
     # Mainly enable more detailed logging from cpp runtime.
@@ -733,22 +736,27 @@ class ExecutorBindingsWorker(GenerationExecutor):
         if isinstance(engine, list):
             engine = engine[self.rank]
 
-        if isinstance(engine, Engine):
-            self.engine = tllm.Executor(engine.engine,
-                                        json.dumps(engine.config.to_dict(),
-                                                   cls=ConfigEncoder),
-                                        tllm.ModelType.DECODER_ONLY,
-                                        executor_config=executor_config,
-                                        managed_weights=engine.managed_weights)
-        else:
-            self.engine = tllm.Executor(engine,
-                                        tllm.ModelType.DECODER_ONLY,
-                                        executor_config=executor_config)
+        def _create_engine():
+            if isinstance(engine, Engine):
+                return tllm.Executor(engine.engine,
+                                     json.dumps(engine.config.to_dict(),
+                                                cls=ConfigEncoder),
+                                     tllm.ModelType.DECODER_ONLY,
+                                     executor_config=executor_config,
+                                     managed_weights=engine.managed_weights)
+
+            use_default_executor = True
+            if use_default_executor:
+                return tllm.Executor(engine, tllm.ModelType.DECODER_ONLY,
+                                     executor_config)
+
+
+        self.engine = _create_engine()
 
         self._lora_manager: Optional[LoraManager] = None
         self._prompt_adapter_manager: Optional[PromptAdapterManager] = None
         self._runtime_model_config: Optional[ModelConfig] = None
-        if self.rank == 0:
+        if self.rank == 0 and isinstance(self.engine, tllm.Executor):
             if isinstance(engine, Engine):
                 engine_config = engine.config
             else:
@@ -974,6 +982,8 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 request.sampling_params.end_id,
                 pad_id=request.sampling_params.pad_id,
                 output_config=request.sampling_params._get_output_config(),
+                guided_decoding_params=request.sampling_params.
+                _get_guided_decoding_params(),
                 bad_words=request.sampling_params._get_bad_words(),
                 stop_words=request.sampling_params._get_stop_words(),
                 embedding_bias=request.sampling_params.embedding_bias,
@@ -1045,10 +1055,12 @@ class ExecutorBindingsWorker(GenerationExecutor):
 
     def block_subordinates(self):
         if self.rank != 0:
-            self.shutdown()
-            raise self.WorkerExit(
-                "block_subordinates() should be used in a `with ExecutorBindingsWorker() as ...:` block"
-            )
+            if isinstance(self.engine, tllm.Executor):
+                self.shutdown()
+                raise self.WorkerExit(
+                    "block_subordinates() should be used in a `with ExecutorBindingsWorker() as ...:` block"
+                )
+
 
     def __enter__(self):
         return self
@@ -1155,7 +1167,6 @@ class ZeroMqQueue:
                                               finish_reasons=obj.finish_reasons,
                                               is_final=obj.is_final,
                                               error=obj.error)
-
         return obj
 
     def close(self):
@@ -1612,6 +1623,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
         self.mp_stats_queue.close()
 
         self.workers_started = False
+        self.mpi_session.shutdown()
 
         # Process the errors in-case error during shutting down the threads
         self._handle_background_error()

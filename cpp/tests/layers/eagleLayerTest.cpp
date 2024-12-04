@@ -603,7 +603,8 @@ void EagleDecodingLayerTest<T>::allocateBuffers()
         ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), nvinfer1::DataType::kFLOAT);
 
     mRandomDataValidation = BufferManager::pinnedPool(
-        ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), nvinfer1::DataType::kFLOAT);
+        ITensor::makeShape({mSamplingParams.getMaxBatchSize(), mSamplingParams.getMaxDecodingTokens()}),
+        nvinfer1::DataType::kFLOAT);
 
     mOutputTemperatures = BufferManager::pinnedPool(
         ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), nvinfer1::DataType::kFLOAT);
@@ -884,18 +885,17 @@ void EagleDecodingLayerTest<T>::checkLayerResult()
     // Check generated random data
     {
         auto const randomDataSample = BufferRange<float>(*mRandomDataSample);
-        auto const randomDataValidation = BufferRange<float>(*mRandomDataValidation);
         for (SizeType32 bi = 0; bi < mSamplingParams.getBatchSize(); ++bi)
         {
             auto const batchSlot = batchSlots[bi];
             // Check that all fields are filled with non zero data
             EXPECT_NE(randomDataSample[batchSlot], float{0}) << " bi: " << bi;
-            EXPECT_NE(randomDataValidation[batchSlot], float{0}) << " bi: " << bi;
         }
     }
 
     // Check masks
     {
+        auto const randomDataValidation = BufferRange<float>(*mRandomDataValidation);
         auto const packedMasks = BufferRange<int32_t>(*mPackedMasks);
         auto masks = mNetwork.getNextMasks();
         for (SizeType32 bi = 0; bi < mSamplingParams.getBatchSize(); ++bi)
@@ -904,6 +904,10 @@ void EagleDecodingLayerTest<T>::checkLayerResult()
             {
                 auto const batchSlot = batchSlots[bi];
                 auto const bitmask = boolArrayToBitmask(masks[bi][ti].begin(), mSamplingParams.getMaxDecodingTokens());
+
+                EXPECT_NE(randomDataValidation[batchSlot * mSamplingParams.getMaxDecodingTokens() + ti], float{0})
+                    << " bi: " << bi;
+
                 for (SizeType32 mi = 0; mi < bitmask.size(); ++mi)
                 {
                     auto const packedMaskIdx = flat_index3(batchSlot, ti, mi, mSamplingParams.getMaxDecodingTokens(),

@@ -33,10 +33,11 @@ from ..._utils import pad_vocab_size, str_dtype_to_torch
 from ...logger import logger
 from ...mapping import Mapping
 from ...quantization import QuantAlgo
-from ..convert_utils import (dup_kv_weight, generate_int8, get_weight,
-                             get_weight_and_bias, load_calib_dataset,
-                             smooth_gemm, smooth_gemm_fc1_gate, split,
-                             split_matrix_tp, split_qkv_bias_tp, split_qkv_tp)
+from ..convert_utils import (dup_kv_bias, dup_kv_weight, generate_int8,
+                             get_weight, get_weight_and_bias,
+                             load_calib_dataset, smooth_gemm,
+                             smooth_gemm_fc1_gate, split, split_matrix_tp,
+                             split_qkv_bias_tp, split_qkv_tp)
 from .config import QWenConfig
 from .utils import get_qwen_key_list, make_context
 
@@ -528,10 +529,10 @@ def convert_hf_qwen(hf_model,
                                              tensor_parallel)
                     v_weight = dup_kv_weight(v_weight, num_key_value_heads,
                                              tensor_parallel)
-                    k_bias = dup_kv_weight(k_bias, num_key_value_heads,
-                                           tensor_parallel)
-                    v_bias = dup_kv_weight(v_bias, num_key_value_heads,
-                                           tensor_parallel)
+                    k_bias = dup_kv_bias(k_bias, num_key_value_heads,
+                                         tensor_parallel)
+                    v_bias = dup_kv_bias(v_bias, num_key_value_heads,
+                                         tensor_parallel)
                 assert (k_weight.shape[0] % (mapping.tp_size * head_size)) == 0
                 assert (v_weight.shape[0] % (mapping.tp_size * head_size)) == 0
                 assert (k_bias.shape[0] % (mapping.tp_size * head_size)) == 0

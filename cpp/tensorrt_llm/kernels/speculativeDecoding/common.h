@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/runtime/common.h"
 #include <cuda_fp16.h>
@@ -132,5 +133,76 @@ struct AcceptDraftTokensByIdsWithPathsParams
 //! to the next after the last accepted token.
 template <typename T>
 void acceptDraftTokensByIdsWithPaths(AcceptDraftTokensByIdsWithPathsParams<T> const&);
+
+template <typename T>
+struct TypicalAcceptanceSampling
+{
+    //! [maxBatchSize * maxDecodingTokens][vocabSizePadded]
+    //! Array of pointers to the logits
+    T** logitsPtrs{nullptr};
+
+    //! [batchSize], optional.
+    runtime::SizeType32 const* batchSlots{nullptr};
+
+    //! [maxBatchSize], number of draft tokens per request.
+    runtime::SizeType32 const* generationLengths{nullptr};
+    //! [maxBatchSize]
+    //! Sampling temperature per request.
+    float const* temperatures{nullptr};
+    //! [maxBatchSize]
+    float const* posteriorThresholds{nullptr};
+    //! [maxBatchSize]
+    float const* posteriorAlphas{nullptr};
+
+    runtime::TokenIdType* outputIds{nullptr};
+
+    //! Workspace for typical acceptance. Get the workspace size in bytes with getTypicalAcceptanceWorkspaceSize
+    int8_t* workspace{nullptr};
+
+    //! [batchSize * maxDecodingTokens], optional.
+    //! Curand states for sampling.
+    //! Either randomVals or curandStats should be specified.
+    curandState_t* curandStats{nullptr};
+    //! [batchSize * maxDecodingTokens], optional.
+    //! Random values for sampling.
+    //! Either randomVals or curandStats should be specified.
+    float const* randomVals{nullptr};
+
+    runtime::SizeType32 batchSize{0};
+    runtime::SizeType32 maxBatchSize{0};
+    runtime::SizeType32 maxDecodingTokens{0};
+    runtime::SizeType32 vocabSize{0};
+    runtime::SizeType32 smCnt{0};
+
+    void checkParams()
+    {
+        TLLM_CHECK(logitsPtrs);
+
+        TLLM_CHECK(generationLengths);
+        TLLM_CHECK(temperatures);
+        TLLM_CHECK(posteriorThresholds);
+        TLLM_CHECK(posteriorAlphas);
+        TLLM_CHECK(outputIds);
+        TLLM_CHECK(workspace);
+
+        TLLM_CHECK((curandStats != nullptr) || (randomVals != nullptr));
+        TLLM_CHECK(((curandStats != nullptr) & (randomVals != nullptr)) == 0);
+
+        TLLM_CHECK(batchSize > 0);
+        TLLM_CHECK(maxBatchSize > 0);
+        TLLM_CHECK(vocabSize > 0);
+        TLLM_CHECK(maxDecodingTokens > 0);
+        TLLM_CHECK(smCnt > 0);
+    }
+};
+
+//! \brief Performs multinomial sampling for typical acceptance.
+//! For more details check https://arxiv.org/pdf/2401.10774.
+template <typename T>
+void typicalAcceptanceSampling(TypicalAcceptanceSampling<T> const&, cudaStream_t);
+
+template <typename T>
+size_t getTypicalAcceptanceWorkspaceSize(
+    runtime::SizeType32 batchSize, runtime::SizeType32 maxDecodingTokens, runtime::SizeType32 vocabSizePadded);
 
 } // namespace tensorrt_llm::kernels::speculative_decoding

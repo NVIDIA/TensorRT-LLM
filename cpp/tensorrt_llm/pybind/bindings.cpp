@@ -38,6 +38,7 @@
 #include "tensorrt_llm/pybind/runtime/bindings.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
+#include "tensorrt_llm/runtime/ipcUtils.h"
 #include "tensorrt_llm/runtime/memoryCounters.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
 
@@ -47,6 +48,7 @@ namespace tbk = tensorrt_llm::batch_manager::kv_cache_manager;
 namespace tpb = tensorrt_llm::pybind::batch_manager;
 namespace tc = tensorrt_llm::common;
 namespace tr = tensorrt_llm::runtime;
+namespace tle = tensorrt_llm::executor;
 using SizeType32 = tr::SizeType32;
 using TokenIdType = tr::TokenIdType;
 template <typename T>
@@ -165,6 +167,10 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .value("DISABLED", tr::ModelConfig::KVCacheType::kDISABLED)
         .def(py::init(&tr::ModelConfig::KVCacheTypeFromString));
 
+    py::enum_<tr::ModelConfig::LayerType>(m, "LayerType")
+        .value("ATTENTION", tr::ModelConfig::LayerType::kATTENTION)
+        .value("RECURRENT", tr::ModelConfig::LayerType::kRECURRENT);
+
     py::class_<tc::QuantMode>(m, "QuantMode")
         .def_static("none", &tc::QuantMode::none)
         .def_static("int4_weights", &tc::QuantMode::int4Weights)
@@ -240,7 +246,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property("max_batch_size", &tr::ModelConfig::getMaxBatchSize, &tr::ModelConfig::setMaxBatchSize)
         .def_property("max_beam_width", &tr::ModelConfig::getMaxBeamWidth, &tr::ModelConfig::setMaxBeamWidth)
         .def_property("max_input_len", &tr::ModelConfig::getMaxInputLen, &tr::ModelConfig::setMaxInputLen)
-        .def_property("max_seq_len", &tr::ModelConfig::getMaxSequenceLen, &tr::ModelConfig::getMaxSequenceLen)
+        .def_property("max_seq_len", &tr::ModelConfig::getMaxSequenceLen, &tr::ModelConfig::setMaxSequenceLen)
         .def_property("max_num_tokens", &tr::ModelConfig::getMaxNumTokens, &tr::ModelConfig::setMaxNumTokens)
         .def_property("max_prompt_embedding_table_size", &tr::ModelConfig::getMaxPromptEmbeddingTableSize,
             &tr::ModelConfig::setMaxPromptEmbeddingTableSize)
@@ -248,6 +254,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property_readonly("use_mrope", &tr::ModelConfig::useMrope)
         .def_property("use_lora_plugin", py::overload_cast<>(&tr::ModelConfig::useLoraPlugin, py::const_),
             py::overload_cast<bool>(&tr::ModelConfig::useLoraPlugin))
+        .def_property("layer_types", &tr::ModelConfig::getLayerTypes, &tr::ModelConfig::setLayerTypes)
         .def_property("compute_context_logits", py::overload_cast<>(&tr::ModelConfig::computeContextLogits, py::const_),
             py::overload_cast<bool>(&tr::ModelConfig::computeContextLogits))
         .def_property("compute_generation_logits",
@@ -258,14 +265,18 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
             "use_cross_attention", &tr::ModelConfig::useCrossAttention, &tr::ModelConfig::setUseCrossAttention);
 
     py::class_<tr::WorldConfig>(m, "WorldConfig")
-        .def(py::init<SizeType32, SizeType32, SizeType32, SizeType32, std::optional<std::vector<SizeType32>> const&>(),
-            py::arg("tensor_parallelism") = 1, py::arg("pipeline_parallelism") = 1, py::arg("rank") = 0,
-            py::arg("gpus_per_node") = tr::WorldConfig::kDefaultGpusPerNode, py::arg("device_ids") = py::none())
+        .def(py::init<SizeType32, SizeType32, SizeType32, SizeType32, SizeType32,
+                 std::optional<std::vector<SizeType32>> const&>(),
+            py::arg("tensor_parallelism") = 1, py::arg("pipeline_parallelism") = 1, py::arg("context_parallelism") = 1,
+            py::arg("rank") = 0, py::arg("gpus_per_node") = tr::WorldConfig::kDefaultGpusPerNode,
+            py::arg("device_ids") = py::none())
         .def_property_readonly("size", &tr::WorldConfig::getSize)
         .def_property_readonly("tensor_parallelism", &tr::WorldConfig::getTensorParallelism)
         .def_property_readonly("pipeline_parallelism", &tr::WorldConfig::getPipelineParallelism)
+        .def_property_readonly("context_parallelism", &tr::WorldConfig::getContextParallelism)
         .def_property_readonly("is_tensor_parallel", &tr::WorldConfig::isTensorParallel)
         .def_property_readonly("is_pipeline_parallel", &tr::WorldConfig::isPipelineParallel)
+        .def_property_readonly("is_context_parallel", &tr::WorldConfig::isContextParallel)
         .def_property_readonly("rank", &tr::WorldConfig::getRank)
         .def_property_readonly("local_rank", &tr::WorldConfig::getLocalRank)
         .def_property_readonly("node_rank", &tr::WorldConfig::getNodeRank)
@@ -274,11 +285,13 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property_readonly("device", &tr::WorldConfig::getDevice)
         .def_property_readonly("pipeline_parallel_rank", &tr::WorldConfig::getPipelineParallelRank)
         .def_property_readonly("tensor_parallel_rank", &tr::WorldConfig::getTensorParallelRank)
+        .def_property_readonly("context_parallel_rank", &tr::WorldConfig::getContextParallelRank)
         .def_static("mpi",
             py::overload_cast<SizeType32, std::optional<SizeType32>, std::optional<SizeType32>,
-                std::optional<std::vector<SizeType32>> const&>(&tr::WorldConfig::mpi),
+                std::optional<SizeType32>, std::optional<std::vector<SizeType32>> const&>(&tr::WorldConfig::mpi),
             py::arg("gpus_per_node") = tr::WorldConfig::kDefaultGpusPerNode, py::arg("tensor_parallelism") = py::none(),
-            py::arg("pipeline_parallelism") = py::none(), py::arg("device_ids") = py::none());
+            py::arg("pipeline_parallelism") = py::none(), py::arg("context_parallelism") = py::none(),
+            py::arg("device_ids") = py::none());
 
     auto SamplingConfigGetState = [](tr::SamplingConfig const& config) -> py::tuple
     {
@@ -314,6 +327,8 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
 
     py::classh<tr::SamplingConfig>(m, "SamplingConfig")
         .def(py::init<SizeType32>(), py::arg("beam_width") = 1)
+        .def(py::init<tle::SamplingConfig, std::optional<tle::ExternalDraftTokensConfig>>(),
+            py::arg("executor_sample_config"), py::arg("external_draft_tokens_config") = std::nullopt)
         .def_readwrite("beam_width", &tr::SamplingConfig::beamWidth)
         .def_readwrite("temperature", &tr::SamplingConfig::temperature)
         .def_readwrite("min_length", &tr::SamplingConfig::minLength)
@@ -334,11 +349,11 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def("__eq__", &tr::SamplingConfig::operator==);
 
     py::class_<tr::GptJsonConfig>(m, "GptJsonConfig")
-        .def(py::init<std::string, std::string, std::string, SizeType32, SizeType32, SizeType32, tr::ModelConfig,
-                 std::optional<tr::RuntimeDefaults>>(),
+        .def(py::init<std::string, std::string, std::string, SizeType32, SizeType32, SizeType32, SizeType32,
+                 tr::ModelConfig, std::optional<tr::RuntimeDefaults>>(),
             py::arg("name"), py::arg("version"), py::arg("precision"), py::arg("tensor_parallelism"),
-            py::arg("pipeline_parallelism"), py::arg("gpus_per_node"), py::arg("model_config"),
-            py::arg("runtime_defaults") = py::none())
+            py::arg("pipeline_parallelism"), py::arg("context_parallelism"), py::arg("gpus_per_node"),
+            py::arg("model_config"), py::arg("runtime_defaults") = py::none())
         .def_static("parse", py::overload_cast<std::string const&>(&tr::GptJsonConfig::parse), py::arg("json"))
         .def_static(
             "parse_file", py::overload_cast<std::filesystem::path const&>(&tr::GptJsonConfig::parse), py::arg("path"))
@@ -348,6 +363,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property_readonly("precision", &tr::GptJsonConfig::getPrecision)
         .def_property_readonly("tensor_parallelism", &tr::GptJsonConfig::getTensorParallelism)
         .def_property_readonly("pipeline_parallelism", &tr::GptJsonConfig::getPipelineParallelism)
+        .def_property_readonly("context_parallelism", &tr::GptJsonConfig::getContextParallelism)
         .def_property_readonly("gpus_per_node", &tr::GptJsonConfig::getGpusPerNode)
         .def_property_readonly("world_size", &tr::GptJsonConfig::getWorldSize)
         .def_property_readonly("runtime_defaults", &tr::GptJsonConfig::getRuntimeDefaults)

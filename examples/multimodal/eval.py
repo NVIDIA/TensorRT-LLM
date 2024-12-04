@@ -22,6 +22,7 @@ import torch
 from transformers import AutoProcessor, MllamaForConditionalGeneration
 from utils import add_common_args
 
+import tensorrt_llm
 import tensorrt_llm.profiler as profiler
 from tensorrt_llm import logger
 from tensorrt_llm.runtime import MultimodalModelRunner
@@ -78,6 +79,8 @@ parser.add_argument(
 args = parser.parse_args()
 
 logger.set_level(args.log_level)
+
+runtime_rank = tensorrt_llm.mpi_rank()
 
 dataset = datasets.load_dataset(args.dataset_dir,
                                 storage_options={
@@ -146,23 +149,28 @@ if trtllm_model or hf_model:
             input_text, output_text = trtllm_model.run(prompts,
                                                        image,
                                                        max_new_tokens=1)
-            trtllm_result = output_text[0][0]
-            if answer == trtllm_result:
-                trtllm_correct += 1
+            if runtime_rank == 0:
+                trtllm_result = output_text[0][0]
+                if answer == trtllm_result:
+                    trtllm_correct += 1
             profiler.stop('tensorrt_llm')
 
-        logger.debug(f"prompts: {prompts}")
-        logger.debug(f"reference answer: {answer}")
-        if hf_result:
-            logger.debug(f"HF's answer: {hf_result}")
-        if trtllm_result:
-            logger.debug(f"TRT-LLM's answer: {trtllm_result}")
+        if runtime_rank == 0:
+            logger.debug(f"prompts: {prompts}")
+            logger.debug(f"reference answer: {answer}")
+            if hf_result:
+                logger.debug(f"HF's answer: {hf_result}")
+            if trtllm_result:
+                logger.debug(f"TRT-LLM's answer: {trtllm_result}")
 
-    logger.info(f"total iterations: {args.max_ite}")
-    if hf_correct is not None:
-        logger.info(f"HF's accuracy: {100 * hf_correct / args.max_ite:4.2f}%")
-    if trtllm_correct is not None:
-        logger.info(
-            f"TRT-LLM's accuracy: {100 * trtllm_correct / args.max_ite:4.2f}%")
+    if runtime_rank == 0:
+        logger.info(f"total iterations: {args.max_ite}")
+        if hf_correct is not None:
+            logger.info(
+                f"HF's accuracy: {100 * hf_correct / args.max_ite:4.2f}%")
+        if trtllm_correct is not None:
+            logger.info(
+                f"TRT-LLM's accuracy: {100 * trtllm_correct / args.max_ite:4.2f}%"
+            )
 else:
     logger.info("Neither enable test_trtllm nor enable test_hf")

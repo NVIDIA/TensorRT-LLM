@@ -38,8 +38,8 @@ namespace
 
 template <typename T>
 __global__ void maskTargetLogitsKernel(T* targetLogits, SizeType32 const* batchSlots, SizeType32 beamWidth,
-    SizeType32 vocabSize, FinishedState const* finishedInput, SizeType32 maxBatchSize, bool const* batchUseDraftLogits,
-    SizeType32* outputIdsAfterSampling, SizeType32* targetOutputIds, SizeType32* runtimeTopKDevicePtr, bool* maskBuffer)
+    SizeType32 vocabSize, FinishedState const* finishedInput, SizeType32 maxBatchSize,
+    SizeType32* outputIdsAfterSampling, SizeType32* runtimeTopKDevicePtr, bool* maskBuffer)
 {
     /**
      * @brief Masking the selected token to -inf as was done in Huggingface TopK/TopP Logits Warper
@@ -58,7 +58,6 @@ __global__ void maskTargetLogitsKernel(T* targetLogits, SizeType32 const* batchS
     auto& finishedState = finishedInput[batchSlot];
 
     auto* outputIdsAfterSamplingPtr = outputIdsAfterSampling + batchSlot * vocabSize;
-    auto const useDraftLogits = batchUseDraftLogits[batchSlot];
     auto* maskBufferBatch = maskBuffer + batchSlot * vocabSize;
 
     if (finishedState.isSkipDecoding() || finishedState.isFinished())
@@ -91,11 +90,6 @@ __global__ void maskTargetLogitsKernel(T* targetLogits, SizeType32 const* batchS
         tokensToMask = vocabSize;
     }
     __syncthreads();
-
-    if (!useDraftLogits && tid == 0)
-    {
-        targetOutputIds[batchSlot] = outputIdsAfterSamplingPtr[tokensToMask - 1];
-    }
 
     for (SizeType32 vIdx = tid; vIdx < tokensToMask; vIdx += static_cast<SizeType32>(blockDim.x))
     {
@@ -179,7 +173,7 @@ __global__ void acceptDraftTokensKernel(T const* draftProbs, T* targetProbs, Siz
                 finishedOutput[batchSlot].setSkipDecoding();
             }
         }
-        else
+        else // draftTokenIdx == numDraftTokens
         {
             isAccepted = false;
             finishedOutput[batchSlot].setSkipDecoding();
@@ -189,14 +183,14 @@ __global__ void acceptDraftTokensKernel(T const* draftProbs, T* targetProbs, Siz
 
     __syncthreads();
 
-    if (!isAccepted)
+    if (draftTokenIdx < numDraftTokens && useDraftLogits && !isAccepted)
     {
-        T const zeroVal = static_cast<T>(0.0f);
+        // correct target distribution
+        T const zeroVal = static_cast<T>(0.0F);
         T sumVal = zeroVal;
         for (SizeType32 vIdx = tid; vIdx < vocabSize; vIdx += static_cast<SizeType32>(blockDim.x))
         {
-            targetProbsBatch[vIdx]
-                -= (draftTokenIdx < numDraftTokens && useDraftLogits) ? draftProbsBatch[vIdx] : zeroVal;
+            targetProbsBatch[vIdx] -= draftProbsBatch[vIdx];
             targetProbsBatch[vIdx] = targetProbsBatch[vIdx] >= zeroVal ? targetProbsBatch[vIdx] : zeroVal;
             sumVal += targetProbsBatch[vIdx];
         }
@@ -251,8 +245,7 @@ __global__ void forwardAcceptedTokensKernel(SizeType32 batchSize, SizeType32 con
 template <typename T>
 void invokeMaskTargetLogits(SizeType32 batchSize, T* targetLogits, SizeType32 const* batchSlots, SizeType32 beamWidth,
     SizeType32 vocabSizePadded, FinishedState const* finishedInput, SizeType32 maxBatchSize,
-    bool const* batchUseDraftLogits, SizeType32* outputIdsAfterSampling, SizeType32* targetOutputIds,
-    SizeType32* runtimeTopKDevicePtr, bool* maskBuffer, cudaStream_t stream)
+    SizeType32* outputIdsAfterSampling, SizeType32* runtimeTopKDevicePtr, bool* maskBuffer, cudaStream_t stream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK(beamWidth == 1);
@@ -260,8 +253,7 @@ void invokeMaskTargetLogits(SizeType32 batchSize, T* targetLogits, SizeType32 co
         dim3 block(1024);
         dim3 grid(batchSize * beamWidth);
         maskTargetLogitsKernel<<<grid, block, 0, stream>>>(targetLogits, batchSlots, beamWidth, vocabSizePadded,
-            finishedInput, maxBatchSize, batchUseDraftLogits, outputIdsAfterSampling, targetOutputIds,
-            runtimeTopKDevicePtr, maskBuffer);
+            finishedInput, maxBatchSize, outputIdsAfterSampling, runtimeTopKDevicePtr, maskBuffer);
     }
     sync_check_cuda_error();
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -289,12 +281,10 @@ void invokeAcceptDraftTokens(SizeType32 batchSize, T* draftProbs, T* targetProbs
 
 template void invokeMaskTargetLogits(SizeType32 batchSize, float* targetLogits, SizeType32 const* batchSlots,
     SizeType32 beamWidth, SizeType32 vocabSizePadded, FinishedState const* finishedInput, SizeType32 maxBatchSize,
-    bool const* batchUseDraftLogits, SizeType32* outputIdsAfterSampling, SizeType32* targetOutputIds,
-    SizeType32* runtimeTopKDevicePtr, bool* maskBuffer, cudaStream_t stream);
+    SizeType32* outputIdsAfterSampling, SizeType32* runtimeTopKDevicePtr, bool* maskBuffer, cudaStream_t stream);
 template void invokeMaskTargetLogits(SizeType32 batchSize, half* targetLogits, SizeType32 const* batchSlots,
     SizeType32 beamWidth, SizeType32 vocabSizePadded, FinishedState const* finishedInput, SizeType32 maxBatchSize,
-    bool const* batchUseDraftLogits, SizeType32* outputIdsAfterSampling, SizeType32* targetOutputIds,
-    SizeType32* runtimeTopKDevicePtr, bool* maskBuffer, cudaStream_t stream);
+    SizeType32* outputIdsAfterSampling, SizeType32* runtimeTopKDevicePtr, bool* maskBuffer, cudaStream_t stream);
 
 template void invokeAcceptDraftTokens(SizeType32 batchSize, float* draftProbs, float* targetProbs,
     SizeType32 const* numsDraftTokens, bool const* batchUseDraftLogits, TokenIdType const* draftIds,

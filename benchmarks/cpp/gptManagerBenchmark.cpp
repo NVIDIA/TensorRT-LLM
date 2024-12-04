@@ -198,67 +198,23 @@ public:
         mRequestsQueueingLatencies.insert(mRequestsQueueingLatencies.end(), latencies.begin(), latencies.end());
     }
 
-    void recordStart(std::shared_ptr<InferenceRequest> request, uint64_t requestId)
-    {
-        auto const inputLength = request->getInputIds()->getSize();
-        auto const maxNewTokens = request->getMaxNewTokensNamed();
-        auto const& outputLengthTensor = maxNewTokens.tensor;
-        TLLM_CHECK_WITH_INFO(outputLengthTensor != nullptr && outputLengthTensor->getSize() > 0,
-            "Undefined scalar vector for %s", maxNewTokens.name.c_str());
-        auto const outputLength = *bufferCast<SizeType32>(*outputLengthTensor);
-        auto const start = std::chrono::steady_clock::now();
-        mRequestBenchInfos[requestId] = BenchInfo(inputLength, start);
-    }
-
     // number of output tokens not calculated from output sequence here, instead set to max_output_len
     //   - if eos_id == -1 (default behavior), this is correct since output seq will have max permissible length.
     //   - However, if eos_id != -1, the token size of output sequence may be less than max_output_len, and token
     //   throughput may be inaccurate
-    void recordStart(SizeType32 inputLength, SizeType32 maxNewTokens, uint64_t requestId,
-        std::chrono::time_point<std::chrono::steady_clock> const& start)
+    void recordStart(
+        SizeType32 inputLength, uint64_t requestId, std::chrono::time_point<std::chrono::steady_clock> const& start)
     {
+        TLLM_CHECK_WITH_INFO(mRequestBenchInfos.find(requestId) == mRequestBenchInfos.end(),
+            "Request %lu already exists in record before start, please report a bug to developers.", requestId);
+        const std::lock_guard<std::mutex> lock(mRequestBenchInfosMutex);
         mRequestBenchInfos[requestId] = BenchInfo(inputLength, start);
     }
 
-    void recordEnd(uint64_t requestId, bool hasError)
+    void recordToken(
+        texec::Response const& response, std::chrono::time_point<std::chrono::steady_clock> const& tokenTime)
     {
-        mRequestBenchInfos[requestId].end = std::chrono::steady_clock::now();
-        mRequestBenchInfos[requestId].hasError = hasError;
-    }
-
-    void recordToken(uint64_t requestId)
-    {
-        TLLM_CHECK(mStreaming);
-        TLLM_CHECK_WITH_INFO(mBeamWidth == 1, "gptManagerBenchmark streaming mode does not support beam > 1");
-
-        if (!mRequestBenchInfos[requestId].firstTokenSeen)
-        {
-            mRequestBenchInfos[requestId].firstTokenTs = std::chrono::steady_clock::now();
-            mRequestBenchInfos[requestId].firstTokenSeen = true;
-        }
-
-        mRequestBenchInfos[requestId].decodingIter += 1;
-    }
-
-    void recordToken(uint64_t requestId, std::list<NamedTensor> const& responseTensors)
-    {
-        int32_t outputLength = 1;
-        for (auto& tensor : responseTensors)
-        {
-            if (tensor.name == inference_request::kSequenceLengthTensorName)
-            {
-                // Tensor of shape nBeams, and we only need the first one
-                outputLength = *(bufferCast<int32_t>(*(tensor.tensor)));
-                break;
-            }
-        }
-
-        mRequestBenchInfos[requestId].outputLength += outputLength;
-        this->recordToken(requestId);
-    }
-
-    void recordToken(uint64_t requestId, texec::Response const& response)
-    {
+        auto const requestId = response.getRequestId();
         auto outputTokenIds = response.getResult().outputTokenIds;
 
         int32_t outputLength = 1;
@@ -267,46 +223,21 @@ public:
             outputLength = std::max(static_cast<int32_t>(beam.size()), outputLength);
         }
 
+        const std::lock_guard<std::mutex> lock(mRequestBenchInfosMutex);
         mRequestBenchInfos[requestId].outputLength += outputLength;
-        this->recordToken(requestId);
+
+        if (!mRequestBenchInfos[requestId].firstTokenSeen)
+        {
+            mRequestBenchInfos[requestId].firstTokenTs = tokenTime;
+            mRequestBenchInfos[requestId].firstTokenSeen = true;
+        }
+
+        mRequestBenchInfos[requestId].decodingIter += 1;
     }
 
-    void recordEnd(uint64_t requestId, std::list<NamedTensor> const& responseTensors, bool hasError)
+    void recordEnd(texec::Response const& response, std::chrono::time_point<std::chrono::steady_clock> const& end)
     {
-        this->recordEnd(requestId, hasError);
-
-        if (!mStreaming)
-        {
-            for (auto& tensor : responseTensors)
-            {
-                if (tensor.name == inference_request::kOutputIdsTensorName)
-                {
-                    mResponseTensors[requestId] = tensor.tensor;
-                }
-                else if (tensor.name == inference_request::kSequenceLengthTensorName)
-                {
-                    // Tensor of shape nBeams, and we only need the first one
-                    int32_t outputSeqLen = *(bufferCast<int32_t>(*(tensor.tensor)));
-                    if (mOutputHasInput)
-                    {
-                        int inputSeqLen = mRequestBenchInfos[requestId].inputLength;
-                        outputSeqLen -= inputSeqLen;
-                    }
-                    mRequestBenchInfos[requestId].outputLength = outputSeqLen;
-                }
-            }
-        }
-        else
-        {
-            this->recordToken(requestId, responseTensors);
-        }
-    }
-
-    void recordEnd(uint64_t requestId, texec::Response const& response)
-    {
-
-        this->recordEnd(requestId, response.hasError());
-
+        auto const requestId = response.getRequestId();
         // Get the actual output length
         if (!response.hasError())
         {
@@ -325,14 +256,20 @@ public:
                     int inputSeqLen = mRequestBenchInfos[requestId].inputLength;
                     outSeqLen -= inputSeqLen;
                 }
+                const std::lock_guard<std::mutex> lock(mRequestBenchInfosMutex);
                 mRequestBenchInfos[requestId].outputLength = outSeqLen;
                 mRequestBenchInfos[requestId].decodingIter = response.getResult().decodingIter;
             }
             else
             {
-                this->recordToken(requestId, response);
+                TLLM_CHECK_WITH_INFO(mBeamWidth == 1, "gptManagerBenchmark streaming mode does not support beam > 1");
+                this->recordToken(response, end);
             }
         }
+
+        const std::lock_guard<std::mutex> lock(mRequestBenchInfosMutex);
+        mRequestBenchInfos[requestId].end = end;
+        mRequestBenchInfos[requestId].hasError = response.hasError();
     }
 
     float calcPercentile(std::vector<float> const& latencies, int percentile)
@@ -617,6 +554,7 @@ private:
     std::string mRespJsonFile;
     std::unordered_map<uint64_t, TensorPtr> mResponseTensors;
     bool mOutputHasInput;
+    std::mutex mRequestBenchInfosMutex;
 
 }; // class Recorder
 
@@ -663,11 +601,22 @@ public:
             executorConfig.setMaxNumTokens(benchmarkParams.maxNumTokens.value());
         }
 
-        executorConfig.setDecodingConfig(
-            texec::DecodingConfig(benchmarkParams.medusaChoices.has_value() ? texec::DecodingMode::Medusa()
-                    : benchmarkParams.executorLookaheadConfig.has_value()   ? texec::DecodingMode::Lookahead()
-                                                                            : texec::DecodingMode::Auto(),
-                benchmarkParams.executorLookaheadConfig, benchmarkParams.medusaChoices));
+        auto decodingMode = texec::DecodingMode::Auto();
+        if (benchmarkParams.medusaChoices.has_value())
+        {
+            decodingMode = texec::DecodingMode::Medusa();
+        }
+        else if (benchmarkParams.executorLookaheadConfig.has_value())
+        {
+            decodingMode = texec::DecodingMode::Lookahead();
+        }
+        else if (benchmarkParams.eagleConfig.has_value())
+        {
+            decodingMode = texec::DecodingMode::Eagle();
+        }
+
+        executorConfig.setDecodingConfig(texec::DecodingConfig(decodingMode, benchmarkParams.executorLookaheadConfig,
+            benchmarkParams.medusaChoices, benchmarkParams.eagleConfig));
         executorConfig.setExtendedRuntimePerfKnobConfig(extendedRuntimePerfKnobConfig);
 
         if (executorModelType == texec::ModelType::kDECODER_ONLY)
@@ -712,11 +661,9 @@ public:
         try
         {
             std::vector<SizeType32> inputLengths;
-            std::vector<SizeType32> maxNewTokens;
             for (auto const& request : requests)
             {
                 inputLengths.push_back(request.getInputTokenIds().size());
-                maxNewTokens.push_back(request.getMaxTokens());
             }
             auto const start = std::chrono::steady_clock::now();
             auto reqIds = mExecutor->enqueueRequests(std::move(requests));
@@ -724,7 +671,7 @@ public:
             {
                 if (!warmup)
                 {
-                    mRecorder->recordStart(inputLengths.at(req), maxNewTokens.at(req), reqIds.at(req), start);
+                    mRecorder->recordStart(inputLengths.at(req), reqIds.at(req), start);
                 }
                 mActiveCount++;
             }
@@ -750,24 +697,23 @@ public:
         while (mActiveCount || (mNumFinished < numRequests))
         {
             auto responses = mExecutor->awaitResponses(mWaitSleep);
+            auto const tokenTime = std::chrono::steady_clock::now();
             for (auto const& response : responses)
             {
-                auto const reqId = response.getRequestId();
-                TLLM_LOG_DEBUG("response.getResult().isFinal");
                 if (response.getResult().isFinal)
                 {
                     mActiveCount--;
                     mNumFinished++;
                     if (!warmup)
                     {
-                        mRecorder->recordEnd(reqId, response);
+                        mRecorder->recordEnd(response, tokenTime);
                     }
                 }
                 else
                 {
                     if (!warmup && !response.hasError())
                     {
-                        mRecorder->recordToken(reqId, response);
+                        mRecorder->recordToken(response, tokenTime);
                     }
                 }
             }
@@ -819,9 +765,11 @@ texec::Request makeExecutorRequest(Sample const& sample, SizeType32 const& beamW
     bool const& returnContextLogits = false, bool const& returnGenerationLogits = false,
     std::optional<texec::LoraConfig> const& loraConfig = std::nullopt,
     std::optional<texec::LookaheadDecodingConfig> const& lookaheadConfig = std::nullopt,
-    std::optional<texec::VecTokens> encoderInputTokenIds = std::nullopt)
+    std::optional<texec::VecTokens> encoderInputTokenIds = std::nullopt,
+    std::optional<float> temperature = std::nullopt)
 {
     auto samplingConfig = texec::SamplingConfig{beamWidth};
+    samplingConfig.setTemperature(temperature);
     auto outputConfig = texec::OutputConfig{false, returnContextLogits, returnGenerationLogits, false};
     return texec::Request(sample.inputIds, sample.outputLen, streaming, samplingConfig, outputConfig, eosId, padId,
         std::nullopt,    // positionIds
@@ -955,7 +903,7 @@ void benchmarkExecutor(std::optional<std::filesystem::path> const& decoderEngine
                 {
                     requests.emplace_back(makeExecutorRequest(samples[0], beamWidth, eosId, padId,
                         benchmarkParams.streaming, returnContextLogits, returnGenerationLogits, std::nullopt,
-                        benchmarkParams.requestLookaheadConfig));
+                        benchmarkParams.requestLookaheadConfig, std::nullopt, benchmarkParams.temperature));
                 }
             }
             executorServer->enqueue(std::move(requests), true);
@@ -988,7 +936,7 @@ void benchmarkExecutor(std::optional<std::filesystem::path> const& decoderEngine
                 {
                     requests.emplace_back(makeExecutorRequest(samples[i], beamWidth, eosId, padId,
                         benchmarkParams.streaming, returnContextLogits, returnGenerationLogits, loraConfig,
-                        benchmarkParams.requestLookaheadConfig));
+                        benchmarkParams.requestLookaheadConfig, std::nullopt, benchmarkParams.temperature));
                 }
             }
 
@@ -1137,6 +1085,12 @@ int main(int argc, char* argv[])
         cxxopts::value<float>()->default_value("1.0"));
     options.add_options()(
         "medusa_choices", "Medusa choices in the format of [[0], [0, 1], [0, 0, 1]]", cxxopts::value<std::string>());
+    options.add_options()(
+        "eagle_choices", "Eagle choices in the format of [[0], [0, 1], [0, 0, 1]]", cxxopts::value<std::string>());
+    options.add_options()("eagle_posterior_threshold",
+        "Minimum token probability threshold for typical acceptance. Enables typical acceptance in Eagle",
+        cxxopts::value<float>());
+    options.add_options()("temperature", "Sampling temperature for each request", cxxopts::value<float>());
 
     options.add_options()("multi_block_mode",
         "Distribute the work across multiple CUDA thread-blocks on the GPU for masked MHA kernel",
@@ -1337,6 +1291,26 @@ int main(int argc, char* argv[])
     {
         benchmarkParams.medusaChoices = parseVectorOfVectors(result["medusa_choices"].as<std::string>());
     }
+    // Argument: Eagle choices for the Eagle speculative decoding.
+    if (result.count("eagle_choices") || result.count("eagle_posterior_threshold"))
+    {
+        std::optional<float> posteriorThreshold;
+        if (result.count("eagle_posterior_threshold"))
+        {
+            posteriorThreshold = result["eagle_posterior_threshold"].as<float>();
+        }
+        std::optional<texec::EagleChoices> choices;
+        if (result.count("eagle_choices"))
+        {
+            choices = parseVectorOfVectors(result["eagle_choices"].as<std::string>());
+        }
+        benchmarkParams.eagleConfig = texec::EagleConfig(choices, !posteriorThreshold.has_value(), posteriorThreshold);
+    }
+    if (result.count("temperature"))
+    {
+        benchmarkParams.temperature = result["temperature"].as<float>();
+    }
+
     if (result.count("executor_lookahead_config"))
     {
         benchmarkParams.executorLookaheadConfig

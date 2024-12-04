@@ -68,7 +68,7 @@ def test_completion_tp2(client: openai.OpenAI, model_name: str):
 
 
 @skip_single_gpu
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_chat_streaming_tp2(async_client: openai.AsyncOpenAI,
                                   model_name: str):
     messages = [{
@@ -93,7 +93,7 @@ async def test_chat_streaming_tp2(async_client: openai.AsyncOpenAI,
 
 
 @skip_single_gpu
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_completion_streaming_tp2(async_client: openai.AsyncOpenAI,
                                         model_name: str):
     completion = await async_client.completions.create(

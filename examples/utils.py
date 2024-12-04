@@ -16,6 +16,7 @@ import json
 import os
 import subprocess
 import sys
+from functools import partial
 from os.path import abspath, dirname
 from pathlib import Path
 from typing import List, Optional
@@ -24,7 +25,8 @@ import torch
 from transformers import AutoTokenizer, LlamaTokenizer, T5Tokenizer
 
 from tensorrt_llm._utils import supports_inflight_batching  # noqa
-from tensorrt_llm._utils import str_dtype_to_torch
+from tensorrt_llm._utils import (mpi_barrier, mpi_rank, mpi_world_size,
+                                 str_dtype_to_torch)
 from tensorrt_llm.builder import get_engine_version
 
 DEFAULT_HF_MODEL_DIRS = {
@@ -106,11 +108,12 @@ def throttle_generator(generator, stream_interval):
         yield out
 
 
-def load_tokenizer(tokenizer_dir: Optional[str] = None,
-                   vocab_file: Optional[str] = None,
-                   model_name: str = 'GPTForCausalLM',
-                   model_version: Optional[str] = None,
-                   tokenizer_type: Optional[str] = None):
+# Load tokenizer impl, it will be called in external wrapper to avoid loading tokenizer bug under MPI env.
+def _load_tokenizer(tokenizer_dir: Optional[str] = None,
+                    vocab_file: Optional[str] = None,
+                    model_name: str = 'GPTForCausalLM',
+                    model_version: Optional[str] = None,
+                    tokenizer_type: Optional[str] = None):
     if vocab_file is None:
         if 'whisper' in model_name.lower():
             tokenizer = AutoTokenizer.from_pretrained('openai/whisper-large-v3',
@@ -165,6 +168,22 @@ def load_tokenizer(tokenizer_dir: Optional[str] = None,
         end_id = tokenizer.eos_token_id
 
     return tokenizer, pad_id, end_id
+
+
+def load_tokenizer(tokenizer_dir: Optional[str] = None,
+                   vocab_file: Optional[str] = None,
+                   model_name: str = 'GPTForCausalLM',
+                   model_version: Optional[str] = None,
+                   tokenizer_type: Optional[str] = None):
+    func = partial(_load_tokenizer, tokenizer_dir, vocab_file, model_name,
+                   model_version, tokenizer_type)
+    if mpi_world_size() > 1:
+        # Under MPI env, load tokenizer will result in multiple processes to download the same file to the same folder.
+        # This will result some random bug. Force loading on rank0 to warmup the tokenizer to avoid this issue.
+        if mpi_rank() == 0:
+            func()
+        mpi_barrier()
+    return func()
 
 
 def prepare_enc_dec_inputs(batch_input_ids: List[torch.Tensor], model_name: str,
@@ -377,6 +396,13 @@ def add_common_args(parser):
         help="Configuration of Eagle-1 decoding."
         "   E.g.: [[0, 0, 0, 0], [0, 1, 0], [1, 0], [1, 1]] for 9 draft tokens."
     )
+    parser.add_argument(
+        '--eagle_posterior_threshold',
+        type=float,
+        default=None,
+        help="Minimum token probability threshold for typical acceptance. "
+        "Enables typical acceptance in Eagle. "
+        "Corresponds to epsilon in https://arxiv.org/pdf/2401.10774.")
     parser.add_argument(
         '--lookahead_config',
         type=str,

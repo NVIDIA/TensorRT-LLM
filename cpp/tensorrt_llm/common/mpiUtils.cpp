@@ -203,11 +203,47 @@ void MpiComm::barrier() const
 #endif // ENABLE_MULTI_DEVICE
 }
 
+#if ENABLE_MULTI_DEVICE
+template <typename TMpiFunc, typename TBase, typename... TArgs,
+    typename = std::enable_if_t<std::is_same_v<void, std::remove_const_t<TBase>>>>
+size_t invokeChunked(TMpiFunc func, TBase* buffer, size_t size, MPI_Datatype dtype, TArgs... args)
+{
+    constexpr auto maxP1 = static_cast<size_t>(std::numeric_limits<int>::max()) + 1;
+    if (TLLM_LIKELY(size < maxP1))
+    {
+        MPICHECK(func(buffer, size, dtype, args...));
+        return 1;
+    }
+
+    constexpr size_t alignment = 256;
+    int elementSize = 1;
+    MPICHECK(MPI_Type_size(dtype, &elementSize));
+    elementSize = std::min<int>(elementSize, alignment);
+
+    // We cap at max alignment-bytes chunks that can be sent at once.
+    auto const step = maxP1 - (alignment / elementSize);
+
+    using TCast = std::conditional_t<std::is_const_v<TBase>, uint8_t const, uint8_t>;
+    size_t count = 0;
+    while (size != 0)
+    {
+        auto currentStep = static_cast<int>(std::min(size, step));
+        MPICHECK(func(buffer, currentStep, dtype, args...));
+        size -= currentStep;
+        size_t diff = static_cast<size_t>(currentStep) * elementSize;
+        buffer = static_cast<TCast*>(buffer) + diff;
+        ++count;
+    }
+
+    return count;
+}
+#endif // ENABLE_MULTI_DEVICE
+
 std::shared_ptr<MpiRequest> MpiComm::bcastAsync(void* buffer, size_t size, MpiType dtype, int root) const
 {
     std::shared_ptr<MpiRequest> r = std::make_shared<MpiRequest>();
 #if ENABLE_MULTI_DEVICE
-    MPICHECK(MPI_Ibcast(buffer, size, getMpiDtype(dtype), root, mComm, &r->mRequest));
+    invokeChunked(MPI_Ibcast, buffer, size, getMpiDtype(dtype), root, mComm, &r->mRequest);
 #else
     TLLM_THROW("Multi device support is disabled.");
 #endif // ENABLE_MULTI_DEVICE
@@ -223,7 +259,7 @@ std::shared_ptr<MpiRequest> MpiComm::bcastAsync(runtime::IBuffer& buf, int root)
 void MpiComm::bcast(void* buffer, size_t size, MpiType dtype, int root) const
 {
 #if ENABLE_MULTI_DEVICE
-    MPICHECK(MPI_Bcast(buffer, size, getMpiDtype(dtype), root, mComm));
+    invokeChunked(MPI_Bcast, buffer, size, getMpiDtype(dtype), root, mComm);
 #else
     TLLM_THROW("Multi device support is disabled.");
 #endif // ENABLE_MULTI_DEVICE
@@ -239,7 +275,7 @@ std::shared_ptr<MpiRequest> MpiComm::sendAsync(void const* buffer, size_t size, 
     TLLM_LOG_DEBUG("start MPI_Isend with size %d", size);
     std::shared_ptr<MpiRequest> r = std::make_shared<MpiRequest>();
 #if ENABLE_MULTI_DEVICE
-    MPICHECK(MPI_Isend(buffer, size, getMpiDtype(dtype), dest, tag, mComm, &r->mRequest));
+    invokeChunked(MPI_Isend, buffer, size, getMpiDtype(dtype), dest, tag, mComm, &r->mRequest);
 #else
     TLLM_THROW("Multi device support is disabled.");
 #endif
@@ -256,7 +292,7 @@ void MpiComm::send(void const* buffer, size_t size, MpiType dtype, int dest, int
 {
     TLLM_LOG_DEBUG("start MPI_Send with size %d", size);
 #if ENABLE_MULTI_DEVICE
-    MPICHECK(MPI_Send(buffer, size, getMpiDtype(dtype), dest, tag, mComm));
+    invokeChunked(MPI_Send, buffer, size, getMpiDtype(dtype), dest, tag, mComm);
 #else
     TLLM_THROW("Multi device support is disabled.");
 #endif // ENABLE_MULTI_DEVICE
@@ -273,7 +309,7 @@ MPI_Status MpiComm::recv(void* buffer, size_t size, MpiType dtype, int source, i
     TLLM_LOG_DEBUG("start MPI_Recv with size %d", size);
     MPI_Status status{};
 #if ENABLE_MULTI_DEVICE
-    MPICHECK(MPI_Recv(buffer, size, getMpiDtype(dtype), source, tag, mComm, &status));
+    invokeChunked(MPI_Recv, buffer, size, getMpiDtype(dtype), source, tag, mComm, &status);
 #else
     TLLM_THROW("Multi device support is disabled.");
 #endif // ENABLE_MULTI_DEVICE

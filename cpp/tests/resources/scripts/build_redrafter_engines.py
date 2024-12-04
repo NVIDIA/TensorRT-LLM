@@ -102,7 +102,7 @@ def build_engines(model_cache: str):
     model_spec_obj.use_explicit_draft_tokens_decoding()
 
     full_engine_path = engine_dir / model_spec_obj.get_model_path(
-    ) / 'tp1-pp1-gpu'
+    ) / 'tp1-pp1-cp1-gpu'
     print(f"\nBuilding fp16 engine at {str(full_engine_path)}")
     build_engine(base_model_dir, drafter_model_dir, full_engine_path)
 

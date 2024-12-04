@@ -363,6 +363,7 @@ public:
     TensorPtr numDraftTokens;
     TensorPtr draftTokenIds;
     TensorPtr useDraftLogits;
+    TensorPtr useDraftLogitsHost;
     runtime::SizeType32 step;
     float constantThreshold;
     bool useRandomAcceptanceThreshold;

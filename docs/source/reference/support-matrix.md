@@ -87,9 +87,10 @@ In addition, older architectures can have limitations for newer software release
 * -
   - Hardware Compatibility
 * - Operating System
-  - TensorRT-LLM requires Linux x86_64 or Windows.
+  - TensorRT-LLM requires Linux x86_64, Linux aarch64 or Windows.
 * - GPU Model Architectures
   -
+    - [NVIDIA Grace Hopper Superchip](https://www.nvidia.com/en-us/data-center/grace-hopper-superchip/)
     - [NVIDIA Hopper Architecture](https://www.nvidia.com/en-us/data-center/technologies/hopper-architecture/)
     - [NVIDIA Ada Lovelace Architecture](https://www.nvidia.com/en-us/technologies/ada-architecture/)
     - [NVIDIA Ampere Architecture](https://www.nvidia.com/en-us/data-center/ampere-architecture/)

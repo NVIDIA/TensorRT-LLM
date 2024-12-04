@@ -50,7 +50,7 @@ struct TopPSamplingKernelParams
     //! input buffer [maxBatchSize], optional. EOS token ids per request
     runtime::TokenIdType const* endIds{nullptr};
     //! input buffer[batchSize], optional. Indices of rows of data in memory pool.
-    runtime::SizeType32 const* batchSlots;
+    runtime::SizeType32 const* batchSlots{nullptr};
 
     //! input buffer [maxBatchSize], optional. Exit early if true.
     FinishedState const* finishedInput{nullptr};
@@ -64,9 +64,12 @@ struct TopPSamplingKernelParams
     //! output buffer [maxBatchSize], optional. Log probs is the probability induced by the TopP sampling.
     //! I.e., log_prob = log P(i | i is in vocab).
     float* outputLogProbs{nullptr};
-    //! input buffer [maxBatchSize], required. Curand states properly initialized using
-    //! invokeCurandInitialize per request.
+    //! input buffer [maxBatchSize], optional. Curand states properly initialized using
+    //! invokeCurandInitialize per request. Either curandState or randomVals should be specified.
     curandState_t* curandState{nullptr};
+    //! input buffer [maxBatchSize], optional. Precomputed random values per request.
+    //! Either curandState or randomVals should be specified.
+    float const* randomVals{nullptr};
 
     //! The appropriate block configuration calculated based on the number of multiprocessors, occupancy,
     //! batchSize and vocabSizePadded. Required for AirTopP
@@ -82,6 +85,13 @@ struct TopPSamplingKernelParams
 
     bool returnAllSelectedTokens{false};
 
+    //! output buffer [maxBatchSize], optional.
+    //! Store the multinomial sampled target token id in TopK/TopP sampled tokens when returnAllSelectedTokens==True.
+    //! Only return when skipOutputIdCurrentStep != nullptr && skipOutputIdCurrentStep == False
+    runtime::TokenIdType* outputIdCurrentStep{nullptr};
+    //! input buffer [maxBatchSize]. Determine if multinomial sampling is required when returnAllSelectedTokens==True.
+    bool const* skipOutputIdCurrentStep{nullptr};
+
     void checkParams() const
     {
         TLLM_CHECK(batchSize > 0);
@@ -91,8 +101,8 @@ struct TopPSamplingKernelParams
         TLLM_CHECK(probs);
         TLLM_CHECK(outputIds || outputIdsPtrs);
         TLLM_CHECK(workspace);
-        TLLM_CHECK((sequenceLength != nullptr) || returnAllSelectedTokens);
-        TLLM_CHECK(curandState);
+        TLLM_CHECK((curandState != nullptr) || (randomVals != nullptr));
+        TLLM_CHECK(((curandState != nullptr) & (randomVals != nullptr)) == 0);
         TLLM_CHECK(topPs);
 
         if (outputIds)
@@ -101,6 +111,8 @@ struct TopPSamplingKernelParams
         }
 
         TLLM_CHECK(((finishedOutput == nullptr) ^ (endIds == nullptr)) == 0);
+        TLLM_CHECK((skipOutputIdCurrentStep && outputIdCurrentStep && returnAllSelectedTokens)
+            || (skipOutputIdCurrentStep == nullptr && outputIdCurrentStep == nullptr));
     }
 };
 

@@ -27,7 +27,7 @@ namespace tensorrt_llm::kernels::speculative_decoding
 {
 
 //! \brief Sets pointers to logits in logitsPtrs according to the draftDecodingTokens.
-//! \param logitsPtrs [batchSize][vocabSizePadded]
+//! \param logitsPtrs [batchSize * maxDecodingTokens][vocabSizePadded]
 //! \param decodingTokens [batchSize], on GPU. draftDecodingTokens + 1.
 //! \param logits [numTokens, vocabSizePadded], on GPU. Continuous logits in memory.
 //! \param draftDecodingTokens [batchSize], on GPU. 0 for context requests, and actual draft len for gen requests
@@ -271,7 +271,7 @@ struct PackEagleParams
     float const* inputTemperatures{nullptr};
     //! [maxBatchSize]
     float const* inputRandomDataSample{nullptr};
-    //! [maxBatchSize]
+    //! [maxBatchSize, maxDecodingTokens]
     float const* inputRandomDataValidation{nullptr};
     //! [maxBatchSize, maxDecodingDraftTokens]
     runtime::TokenIdType const* inputNextDraftTokens{nullptr};
@@ -289,7 +289,7 @@ struct PackEagleParams
     float* outputTemperatures{nullptr};
     //! [batchSize]
     float* outputRandomDataSample{nullptr};
-    //! [batchSize]
+    //! [batchSize, maxDecodingTokens]
     float* outputRandomDataValidation{nullptr};
     //! [batchSize, maxDecodingDraftTokens]
     runtime::TokenIdType* outputNextDraftTokens{nullptr};
@@ -395,7 +395,7 @@ struct UnpackEagleDataParams
 
     //! [maxBatchSize]
     float* outputRandDataSample{nullptr};
-    //! [maxBatchSize]
+    //! [maxBatchSize, maxDecodingTokens]
     float* outputRandDataVerification{nullptr};
     //! [maxBatchSize]
     float* outputTemperatures{nullptr};

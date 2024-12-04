@@ -91,7 +91,7 @@ def latency_command(
     bench_env: BenchmarkEnvironment,
     **params,
 ) -> None:
-    """Run a throughput test on a TRT-LLM engine."""
+    """Run a latency test on a TRT-LLM engine."""
 
     logger.set_level("info")
     logger.info("Preparing to run latency benchmark...")

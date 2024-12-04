@@ -133,7 +133,7 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
     float const* topPs, curandState_t* curandState, TokenIdType const* endIds, SizeType32 vocabSize,
     bool const* skipDecode, SizeType32 const* batchSlots, SizeType32 maxBatchSize, bool normalizeLogProbs,
     bool logitHasProbs, SizeType32 const* tokensPerStep, SizeType32 maxTokensPerStep, SizeType32 maxSeqLen,
-    bool returnAllSelectedTokens)
+    bool returnAllSelectedTokens, TokenIdType* outputIdCurrentStep, bool const* skipOutputIdCurrentStep)
 {
     bool const IS_FP16 = std::is_same<T, half>::value;
     T const MAX_T_VAL = (IS_FP16) ? HALF_FLT_MAX : FLT_MAX;
@@ -156,6 +156,8 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
     auto const probThreshold = (topPs != nullptr) ? topPs[batchSlot] : topP;
     auto const size = k * BLOCKS_PER_BEAM_;
     auto const stride = maxTopK * BLOCKS_PER_BEAM_;
+    bool const sampleTokenInSelected = returnAllSelectedTokens && outputIdCurrentStep && curandState
+        && skipOutputIdCurrentStep && !skipOutputIdCurrentStep[batchSlot];
 
     typedef cub::BlockReduce<TopK_2<float>, BLOCK_SIZE_> BlockReduce;
     __shared__ typename BlockReduce::TempStorage tempStorage;
@@ -218,11 +220,19 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
         auto randNum = (returnAllSelectedTokens || curandState == nullptr)
             ? static_cast<float>(probThreshold * sSum)
             : static_cast<float>(curand_uniform(curandState + batchSlot) * probThreshold * sSum);
+        // when a token must still be multinomial sampled when returnAllSelectedTokens == True.
+        auto randNum2 = sampleTokenInSelected
+            ? static_cast<float>(curand_uniform(curandState + batchSlot) * probThreshold * sSum)
+            : 0.0f;
         auto* outputIdsRequestPtr = idsPtrs == nullptr ? ids + batchSlot * maxSeqLen : idsPtrs[batchSlot];
         for (SizeType32 ki = 0; ki < k; ki++)
         {
             auto expLogit = sVal2[ki];
             randNum = randNum - expLogit;
+            if (sampleTokenInSelected)
+            {
+                randNum2 = randNum2 - expLogit;
+            }
             if (randNum <= 0.0f || ki == k - 1 || returnAllSelectedTokens)
             {
                 auto idx = sId[ki];
@@ -268,6 +278,13 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
                         }
                     }
                     break;
+                }
+
+                if (sampleTokenInSelected && randNum2 <= 0.0f)
+                {
+                    // record the multinomial sampled token when returnAllSelectedTokens == True.
+                    randNum2 = MAX_T_VAL;
+                    outputIdCurrentStep[batchSlot] = outputId;
                 }
 
                 if (returnAllSelectedTokens && randNum <= 0.0f)
@@ -320,7 +337,8 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
                     params.maxTopK, params.topKs, params.maxTopP, params.topPs, params.curandState, params.endIds,     \
                     params.vocabSizePadded, params.skipDecode, params.batchSlots, params.maxBatchSize,                 \
                     params.normalizeLogProbs, params.logitsHasProbs, params.tokensPerStep, params.maxTokensPerStep,    \
-                    params.maxSeqLen, params.returnAllSelectedTokens);                                                 \
+                    params.maxSeqLen, params.returnAllSelectedTokens, params.outputIdCurrentStep,                      \
+                    params.skipOutputIdCurrentStep);                                                                   \
         }                                                                                                              \
     } while (0)
 

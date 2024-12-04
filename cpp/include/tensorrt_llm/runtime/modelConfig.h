@@ -498,16 +498,6 @@ public:
         return mPagedContextFMHA;
     }
 
-    void constexpr useXQA(bool useXQA) noexcept
-    {
-        mUseXQA = useXQA;
-    }
-
-    [[nodiscard]] bool constexpr useXQA() const noexcept
-    {
-        return mUseXQA;
-    }
-
     void constexpr setPpReduceScatter(bool ppReduceScatter) noexcept
     {
         mPpReduceScatter = ppReduceScatter;

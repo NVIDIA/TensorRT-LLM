@@ -44,16 +44,15 @@ def eagle_sample_and_accept_draft_plugin(lm_logits: Tensor = None,
                                          draft_lens: Tensor = None,
                                          eagle_temperature: Tensor = None,
                                          rand_data_validation: Tensor = None,
+                                         posterior_alpha: Tensor = None,
+                                         posterior_threshold: Tensor = None,
                                          tree_params: TreeParams = None,
-                                         greedy_sampling: bool = True):
+                                         greedy_sampling: Tensor = None):
     '''
     Takes input logits and samples golden token + predictions from draft tokens.
     Runs acceptance algorithm to accept draft tokens.
     When greedy_sampling is True, all decoding is done using Top1 and token equality is used
-    for acceptance. Otherwise, speculative decoding multi-round sampling and multinomial
-    samplings are used.
-
-    Non-greedy sampling is not supported yet.
+    for acceptance. Otherwise, typical acceptance and multinomial samplings are used.
 
     Visit tests/model/eagle/test_sample_accept_draft_tokens.py for input/output examples.
 
@@ -75,13 +74,22 @@ def eagle_sample_and_accept_draft_plugin(lm_logits: Tensor = None,
             Temperature of the decoding.
 
         rand_data_validation : Tensor
-            [batch_size]
+            [batch_size, max_decoding_tokens]
             Random data for multinomial sampling.
+
+        posterior_alpha : Tensor
+            [batch_size]
+            Delta in typical acceptance in https://arxiv.org/pdf/2401.10774.
+
+        posterior_threshold : Tensor
+            [batch_size]
+            Minimum probability threshold.
+            Epsilon in typical acceptance in https://arxiv.org/pdf/2401.10774.
 
         tree_params : TreeParams
             Tree params of the input draft tokens.
 
-        greedy_sampling : bool
+        greedy_sampling : Tensor
             Whether to do greedy or non-greedy sampling.
 
     Return:
@@ -114,8 +122,6 @@ def eagle_sample_and_accept_draft_plugin(lm_logits: Tensor = None,
             Empty tensor used to allocate space for eagle_prepare_drafter_inputs_plugin.
     '''
 
-    assert greedy_sampling, "Non-greedy sampling is not supported yet"
-
     plg_creator = trt.get_plugin_registry().get_plugin_creator(
         'EagleSampleAndAcceptDraftTokens', '1', TRT_LLM_PLUGIN_NAMESPACE)
     assert plg_creator is not None
@@ -124,18 +130,14 @@ def eagle_sample_and_accept_draft_plugin(lm_logits: Tensor = None,
                               np.array([int(lm_logits.dtype)], np.int32),
                               trt.PluginFieldType.INT32)
 
-    greedy_sampling = 1 if greedy_sampling else 0
-    greedy_sampling = trt.PluginField("greedy_sampling",
-                                      np.array(greedy_sampling, dtype=np.int32),
-                                      trt.PluginFieldType.INT32)
-
-    pfc = trt.PluginFieldCollection([pf_type, greedy_sampling])
+    pfc = trt.PluginFieldCollection([pf_type])
     plugin = plg_creator.create_plugin("eagle_sample_and_accept_draft_plugin",
                                        pfc)
 
     plug_inputs = [
         lm_logits, draft_tokens, draft_lens, eagle_temperature,
-        rand_data_validation, tree_params.paths
+        rand_data_validation, posterior_alpha, posterior_threshold,
+        tree_params.paths, greedy_sampling
     ]
 
     plug_inputs = [i.trt_tensor for i in plug_inputs]
@@ -665,6 +667,8 @@ class EagleForCausalLM(LLaMAForCausalLM):
         draft_lens = kwargs['draft_lens']
         eagle_temperature = kwargs['eagle_temperature']
         rand_data_validation = kwargs['rand_data_validation']
+        posterior_alpha = kwargs['posterior_alpha']
+        posterior_threshold = kwargs['posterior_threshold']
         rand_data_sample = kwargs['rand_data_sample']
         input_ids = kwargs['input_ids']
         chunked_context_next_tokens = kwargs['chunked_context_next_tokens']
@@ -681,16 +685,16 @@ class EagleForCausalLM(LLaMAForCausalLM):
         host_gen_eagle_net_past_key_value_lengths = kwargs[
             'host_gen_eagle_net_past_key_value_lengths']
         input_gen_tokens = kwargs["input_gen_tokens"]
+        greedy_sampling = kwargs["greedy_sampling"]
 
         # Sample target tokens and accept them
         # next_draft_tokens, next_draft_lens, hidden_size_batch_level_starts are outputted here just to
         # reserve the tensor with max size, which eagle_draft_decoder_plugin and
         # eagle_prepare_drafter_inputs_plugin are going to directly write to
-        output = eagle_sample_and_accept_draft_plugin(lm_logits, draft_tokens,
-                                                      draft_lens,
-                                                      eagle_temperature,
-                                                      rand_data_validation,
-                                                      input_tree_params)
+        output = eagle_sample_and_accept_draft_plugin(
+            lm_logits, draft_tokens, draft_lens, eagle_temperature,
+            rand_data_validation, posterior_alpha, posterior_threshold,
+            input_tree_params, greedy_sampling)
         accepted_tokens, num_accepted_tokens, accepted_paths, next_draft_tokens, \
             next_draft_lens, next_draft_paths, hidden_size_batch_level_starts = output
 
@@ -789,7 +793,8 @@ class EagleForCausalLM(LLaMAForCausalLM):
             "host_gen_eagle_net_request_types",
             "host_gen_eagle_net_context_lengths",
             "host_gen_eagle_net_past_key_value_lengths", "input_gen_tokens",
-            "chunked_context_next_tokens"
+            "chunked_context_next_tokens", "posterior_alpha",
+            "posterior_threshold", "greedy_sampling"
         ]
 
         base_kwargs = {k: v for k, v in kwargs.items() if k not in extra_args}
@@ -901,9 +906,10 @@ class EagleForCausalLM(LLaMAForCausalLM):
                                    ]))
         rand_data_validation = Tensor(name='rand_data_validation',
                                       dtype=trt.float32,
-                                      shape=[-1],
+                                      shape=[-1, self.max_draft_len + 1],
                                       dim_range=OrderedDict([
                                           ('batch_size', bb_range),
+                                          ('decoding_len', decoding_len_range),
                                       ]))
         rand_data_sample = Tensor(name='rand_data_sample',
                                   dtype=trt.float32,
@@ -911,6 +917,18 @@ class EagleForCausalLM(LLaMAForCausalLM):
                                   dim_range=OrderedDict([
                                       ('batch_size', bb_range),
                                   ]))
+        posterior_alpha = Tensor(name='posterior_alpha',
+                                 dtype=trt.float32,
+                                 shape=[-1],
+                                 dim_range=OrderedDict([
+                                     ("batch_size", bb_range),
+                                 ]))
+        posterior_threshold = Tensor(name='posterior_threshold',
+                                     dtype=trt.float32,
+                                     shape=[-1],
+                                     dim_range=OrderedDict([
+                                         ("batch_size", bb_range),
+                                     ]))
         draft_paths = Tensor(
             name='draft_paths',
             dtype=trt.int32,
@@ -976,12 +994,20 @@ class EagleForCausalLM(LLaMAForCausalLM):
                                              dim_range=OrderedDict([
                                                  ('batch_size', bb_range),
                                              ]))
+        greedy_sampling = Tensor(name='greedy_sampling',
+                                 dtype=trt.int32,
+                                 shape=[1],
+                                 dim_range=OrderedDict([
+                                     ('greedy_sampling_flag', [1]),
+                                 ]))
 
         tree_params = TreeParams(paths=draft_paths)
 
         inputs['draft_tokens'] = draft_tokens
         inputs['draft_lens'] = draft_lens
         inputs['eagle_temperature'] = eagle_temperature
+        inputs['posterior_alpha'] = posterior_alpha
+        inputs['posterior_threshold'] = posterior_threshold
         inputs['rand_data_validation'] = rand_data_validation
         inputs['rand_data_sample'] = rand_data_sample
         inputs['tree_params'] = tree_params
@@ -999,4 +1025,5 @@ class EagleForCausalLM(LLaMAForCausalLM):
             'host_gen_eagle_net_past_key_value_lengths'] = host_gen_eagle_net_past_key_value_lengths
         inputs['input_gen_tokens'] = input_gen_tokens
         inputs['chunked_context_next_tokens'] = chunked_context_next_tokens
+        inputs['greedy_sampling'] = greedy_sampling
         return inputs

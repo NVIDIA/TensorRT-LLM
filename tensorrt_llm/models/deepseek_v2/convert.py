@@ -170,31 +170,30 @@ def load_hf_deepseek(model_dir, load_model_on_cpu=False):
                                                      torch_dtype='auto',
                                                      trust_remote_code=True)
     else:
-        #Deepseek-v2 236B parameters with FP16 dtype need at least 472G GPU memory
-        #(official suggest at least 8x80G GPUs, see https://huggingface.co/deepseek-ai/DeepSeek-V2)
-        #'max_memory' should be set based on memory property of GPUs
-        if torch.cuda.get_device_properties(
-                0
-        ).total_memory > 80000000000 and torch.cuda.get_device_properties(
-                0).total_memory < 90000000000:
+        # Deepseek-v2 236B parameters with FP16 dtype need at least 472G GPU memory
+        # (official suggest at least 8x80G GPUs, see https://huggingface.co/deepseek-ai/DeepSeek-V2)
+
+        max_memory = None
+        device_map = 'auto'
+
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory
+        gpu_count = torch.cuda.device_count()
+
+        if gpu_memory < 90_000_000_000 and gpu_count == 8:
+            # WAR OOM loading on 8*80G GPUs
             max_memory = {i: "76GB" for i in range(8)}
-            model = AutoModelForCausalLM.from_pretrained(
-                model_dir,
-                config=hf_config,
-                device_map='sequential',
-                max_memory=max_memory,
-                torch_dtype='auto',
-                trust_remote_code=True)
-        elif torch.cuda.get_device_properties(0).total_memory >= 90000000000:
-            model = AutoModelForCausalLM.from_pretrained(model_dir,
-                                                         config=hf_config,
-                                                         device_map='auto',
-                                                         torch_dtype='auto',
-                                                         trust_remote_code=True)
-        else:
-            assert torch.cuda.get_device_properties(
-                0
-            ).total_memory >= 80000000000, "deepseek v2 loading requires per GPU memory above 80G"
+            device_map = 'sequential'
+        elif gpu_memory < 180_000_000_000 and gpu_count == 4:
+            # WAR OOM loading on 4*141G GPUs
+            max_memory = {i: "128GB" for i in range(4)}
+            device_map = 'sequential'
+
+        model = AutoModelForCausalLM.from_pretrained(model_dir,
+                                                     config=hf_config,
+                                                     device_map=device_map,
+                                                     max_memory=max_memory,
+                                                     torch_dtype='auto',
+                                                     trust_remote_code=True)
 
     return model
 
@@ -236,7 +235,6 @@ def convert_deepseekv2(hf_model,
 
     weights = {}
     tik = time.time()
-    mapping.tp_size
     model_params = dict(hf_model.named_parameters())
     dtype = getattr(torch, dtype)
     moe_config = MoeConfig(
@@ -254,7 +252,6 @@ def convert_deepseekv2(hf_model,
 
     def convert_layer(l):
         prefix = f'model.layers.{l}.'
-        print(prefix)
         trtllm_prex = f'transformer.layers.{l - layers_range[0]}.'
         # Fuse matrices for compression
         # Split matrices for decompression

@@ -149,7 +149,8 @@ template <typename T>
 class SamplingUtilsTypedKernelTest : public SamplingKernelTest<T>
 {
 public:
-    void testAddBiasEndMaskSoftmax(bool hasBias, bool computeSoftmax, bool useLogitsPtrs, SizeType32 beamWidth)
+    void testAddBiasEndMaskSoftmax(bool hasBias, bool computeSoftmax, bool useLogitsPtrs, bool computeEntropy,
+        bool hasTemperature, SizeType32 maxBeamWidth)
     {
         auto const dataType = TRTDataType<T>::value;
         auto const ptrType = TRTDataType<T*>::value;
@@ -159,45 +160,70 @@ public:
         int32_t const vocabSize = 51000;
         int32_t const vocabSizePadded = tc::divUp(vocabSize, 256) * 256;
 
-        auto logitsHost
-            = this->mBufferManager->pinnedPool(ITensor::makeShape({batchSize, beamWidth, vocabSizePadded}), dataType);
+        if (computeEntropy)
+        {
+            computeSoftmax = true;
+        }
+
+        auto logitsHost = this->mBufferManager->pinnedPool(
+            ITensor::makeShape({batchSize, maxBeamWidth, vocabSizePadded}), dataType);
         ITensor::SharedPtr logitsHostPtrs = this->mBufferManager->pinnedPool(ITensor::makeShape({batchSize}), ptrType);
         auto refLogitsHost = this->mBufferManager->pinnedPool(
-            ITensor::makeShape({batchSize, beamWidth, vocabSizePadded}), nvinfer1::DataType::kFLOAT);
+            ITensor::makeShape({batchSize, maxBeamWidth, vocabSizePadded}), nvinfer1::DataType::kFLOAT);
+        auto refEntropyHost = this->mBufferManager->pinnedPool(
+            ITensor::makeShape({maxBatchSize, maxBeamWidth}), nvinfer1::DataType::kFLOAT);
+        auto entropyDevice
+            = this->mBufferManager->gpu(ITensor::makeShape({maxBatchSize, maxBeamWidth}), nvinfer1::DataType::kFLOAT);
+
         auto biasHost = this->mBufferManager->pinnedPool(ITensor::makeShape({vocabSize}), dataType);
+        auto temperatureHost
+            = this->mBufferManager->pinnedPool(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+
         auto endIdsHost
             = this->mBufferManager->pinnedPool(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
+        auto beamWidthsHost
+            = this->mBufferManager->pinnedPool(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
+
         ITensor::SharedPtr finishedHost = this->mBufferManager->pinnedPool(
-            ITensor::makeShape({beamWidth, maxBatchSize}), TRTDataType<tk::FinishedState::UnderlyingType>::value);
+            ITensor::makeShape({maxBeamWidth, maxBatchSize}), TRTDataType<tk::FinishedState::UnderlyingType>::value);
 
         auto batchSlots = this->mBufferManager->pinnedPool(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
 
         auto batchSlotsPtr = bufferCast<int32_t>(*batchSlots);
+        auto beamWidthsHostPtr = bufferCast<SizeType32>(*beamWidthsHost);
+
+        std::mt19937 gen(42);
+        std::uniform_int_distribution<> beamWidthDistr(1, maxBeamWidth);
         for (SizeType32 bi = 0; bi < batchSize; ++bi)
         {
             batchSlotsPtr[bi] = 2 * bi;
+            beamWidthsHostPtr[batchSlotsPtr[bi]] = beamWidthDistr(gen);
         }
 
         auto logitsHostPtr = bufferCast<T>(*logitsHost);
         auto refLogitsHostPtr = bufferCast<float>(*refLogitsHost);
+        auto refEntropyHostPtr = bufferCast<float>(*refEntropyHost);
         auto biasHostPtr = bufferCast<T>(*biasHost);
-        initRandom(logitsHostPtr, batchSize * beamWidth * vocabSizePadded, -3.0f, 3.0f);
+        auto temperatureHostPtr = bufferCast<float>(*temperatureHost);
+        initRandom(logitsHostPtr, batchSize * maxBeamWidth * vocabSizePadded, -3.0f, 3.0f);
         initRandom(biasHostPtr, vocabSize, -3.0f, 3.0f);
+        initRandom(temperatureHostPtr, maxBatchSize, 0.8f, 2.0f);
 
         auto logitsHostPtrsData = reinterpret_cast<T**>(bufferCast<int64_t>(*logitsHostPtrs));
-        for (SizeType32 bi = 0; bi < batchSize; ++bi)
-        {
-            logitsHostPtrsData[bi] = logitsHostPtr + bi * beamWidth * vocabSizePadded;
-        }
 
         auto logitsDevice = this->mBufferManager->copyFrom(*logitsHost, MemoryType::kGPU);
+        for (SizeType32 bi = 0; bi < batchSize; ++bi)
+        {
+            auto logitsDevicePtr = bufferCast<T>(*logitsDevice);
+            logitsHostPtrsData[bi] = logitsDevicePtr + bi * maxBeamWidth * vocabSizePadded;
+        }
         auto biasDevice = this->mBufferManager->copyFrom(*biasHost, MemoryType::kGPU);
+        auto temperatureDevice = this->mBufferManager->copyFrom(*temperatureHost, MemoryType::kGPU);
 
         auto endIdsHostPtr = bufferCast<int32_t>(*endIdsHost);
         auto finishedHostPtr
             = reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*finishedHost));
 
-        std::mt19937 gen(42);
         std::uniform_int_distribution<> endIdsDistr(
             0, vocabSize - 1); // -1 because uniform_int_distribution generates closed interval
         std::uniform_real_distribution<> finishedDist(0, 1); // uniform distribution between 0 and 1
@@ -205,7 +231,7 @@ public:
         for (SizeType32 bi = 0; bi < maxBatchSize; ++bi)
         {
             endIdsHostPtr[bi] = endIdsDistr(gen);
-            for (SizeType32 bwi = 0; bwi < beamWidth; ++bwi)
+            for (SizeType32 bwi = 0; bwi < maxBeamWidth; ++bwi)
             {
                 finishedHostPtr[bwi * maxBatchSize + bi]
                     = finishedDist(gen) < 0.3 ? tk::FinishedState::finished() : tk::FinishedState::empty();
@@ -214,33 +240,69 @@ public:
 
         auto endIdsDevice = this->mBufferManager->copyFrom(*endIdsHost, MemoryType::kGPU);
         auto finishedDevice = this->mBufferManager->copyFrom(*finishedHost, MemoryType::kGPU);
+        auto beamWidthsDevice = this->mBufferManager->copyFrom(*beamWidthsHost, MemoryType::kGPU);
 
+        auto const beamWidthsPtr = maxBeamWidth == 1 ? nullptr : bufferCast<SizeType32>(*beamWidthsDevice);
         auto const biasDevicePtr = hasBias ? bufferCast<T>(*biasDevice) : nullptr;
+
+        auto const temperatureDevicePtr = hasTemperature ? bufferCast<float>(*temperatureDevice) : nullptr;
+        auto const entropyDevicePtr = computeEntropy ? bufferCast<float>(*entropyDevice) : nullptr;
+
         auto const logitsDevicePtr = useLogitsPtrs ? (T*) nullptr : bufferCast<T>(*logitsDevice);
         auto const logitsPtrsDevicePtr = useLogitsPtrs ? logitsHostPtrsData : (T**) nullptr;
-        tk::invokeAddBiasSoftMax(logitsDevicePtr, logitsPtrsDevicePtr, bufferCast<T>(*logitsDevice), biasDevicePtr,
-            bufferCast<int32_t>(*endIdsDevice),
-            reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*finishedDevice)),
-            batchSlotsPtr, batchSize, maxBatchSize, beamWidth, vocabSize, vocabSizePadded, !computeSoftmax, false,
-            this->mStream->get());
 
-        this->mStream->synchronize();
+        tk::BiasSoftmaxParams<T> biasSoftmaxParams;
+        biasSoftmaxParams.logits = logitsDevicePtr;
+        biasSoftmaxParams.logitsPtrs = logitsPtrsDevicePtr;
+        biasSoftmaxParams.probs = bufferCast<T>(*logitsDevice);
+        biasSoftmaxParams.outputEntropy = entropyDevicePtr;
+        biasSoftmaxParams.bias = biasDevicePtr;
+        biasSoftmaxParams.temperatures = temperatureDevicePtr;
+        biasSoftmaxParams.endIds = bufferCast<int32_t>(*endIdsDevice);
+        biasSoftmaxParams.finished
+            = reinterpret_cast<tk::FinishedState*>(bufferCast<tk::FinishedState::UnderlyingType>(*finishedDevice));
+        biasSoftmaxParams.beamWidths = beamWidthsPtr;
+        biasSoftmaxParams.batchSlots = batchSlotsPtr;
+        biasSoftmaxParams.batchSize = batchSize;
+        biasSoftmaxParams.maxBatchSize = maxBatchSize;
+        biasSoftmaxParams.maxBeamWidth = maxBeamWidth;
+        biasSoftmaxParams.vocabSize = vocabSize;
+        biasSoftmaxParams.vocabSizePadded = vocabSizePadded;
+        biasSoftmaxParams.skipSoftMax = !computeSoftmax;
+        biasSoftmaxParams.batchSlotsLogits = false;
+        biasSoftmaxParams.checkParams();
+        tk::invokeAddBiasSoftMax(biasSoftmaxParams, this->mStream->get());
 
         auto const outLogitsHost = this->mBufferManager->copyFrom(*logitsDevice, MemoryType::kCPU);
         auto const outLogitsHostPtr = bufferCast<T>(*outLogitsHost);
 
+        float* outEntropyHostPtr{nullptr};
+        ITensor::SharedPtr outputEntropyHost{nullptr};
+        if (computeEntropy)
+        {
+            outputEntropyHost = this->mBufferManager->copyFrom(*entropyDevice, MemoryType::kCPU);
+            outEntropyHostPtr = bufferCast<float>(*outputEntropyHost);
+        }
+
+        this->mStream->synchronize();
+
         bool const IS_FP16 = std::is_same<T, half>::value;
         T const MAX_T_VAL = (IS_FP16) ? HALF_FLT_MAX : FLT_MAX;
+        float const EPSILON = (IS_FP16) ? 1e-3f : 1e-6f;
         for (SizeType32 bi = 0; bi < batchSize; ++bi)
         {
             auto const batchSlot = batchSlotsPtr[bi];
-            for (SizeType32 bwi = 0; bwi < beamWidth; ++bwi)
+            for (SizeType32 bwi = 0; bwi < beamWidthsHostPtr[batchSlot]; ++bwi)
             {
                 float maxLogit = -1 * FLT_MAX;
                 for (SizeType32 vi = 0; vi < vocabSizePadded; ++vi)
                 {
-                    auto const idx = (bi * beamWidth + bwi) * vocabSizePadded + vi;
+                    auto const idx = (bi * maxBeamWidth + bwi) * vocabSizePadded + vi;
                     auto refLogit = logitsHostPtr[idx];
+                    if (hasTemperature)
+                    {
+                        refLogit *= (1.f / (temperatureHostPtr[batchSlot] + EPSILON));
+                    }
                     if (vi >= vocabSize)
                     {
                         refLogit = -MAX_T_VAL;
@@ -261,30 +323,53 @@ public:
                     float sumExp = 0.f;
                     for (SizeType32 vi = 0; vi < vocabSizePadded; ++vi)
                     {
-                        auto const idx = (bi * beamWidth + bwi) * vocabSizePadded + vi;
+                        auto const idx = (bi * maxBeamWidth + bwi) * vocabSizePadded + vi;
                         float refLogit = refLogitsHostPtr[idx];
                         refLogitsHostPtr[idx] = std::exp(refLogit - maxLogit);
                         sumExp += static_cast<float>(refLogitsHostPtr[idx]);
                     }
                     for (SizeType32 vi = 0; vi < vocabSizePadded; ++vi)
                     {
-                        auto const idx = (bi * beamWidth + bwi) * vocabSizePadded + vi;
+                        auto const idx = (bi * maxBeamWidth + bwi) * vocabSizePadded + vi;
                         float refLogit = refLogitsHostPtr[idx];
-                        refLogitsHostPtr[idx] = refLogit / (sumExp + 1e-6f);
+                        refLogitsHostPtr[idx] = refLogit / (sumExp + EPSILON);
                     }
+                }
+                if (computeEntropy)
+                {
+                    float entropy{0.f};
+                    for (SizeType32 vi = 0; vi < vocabSizePadded; ++vi)
+                    {
+                        auto const idx = (bi * maxBeamWidth + bwi) * vocabSizePadded + vi;
+                        auto const prob = refLogitsHostPtr[idx];
+
+                        entropy += prob * logf(prob + EPSILON);
+                    }
+                    refEntropyHostPtr[bi * maxBeamWidth + bwi] = -entropy;
                 }
             }
         }
         for (SizeType32 bi = 0; bi < batchSize; ++bi)
         {
-            for (SizeType32 bwi = 0; bwi < beamWidth; ++bwi)
+            auto const batchSlot = batchSlotsPtr[bi];
+            for (SizeType32 bwi = 0; bwi < beamWidthsHostPtr[batchSlot]; ++bwi)
             {
                 for (SizeType32 vi = 0; vi < vocabSizePadded; ++vi)
                 {
-                    auto const idx = (bi * beamWidth + bwi) * vocabSizePadded + vi;
+                    auto const idx = (bi * maxBeamWidth + bwi) * vocabSizePadded + vi;
                     auto refLogit = refLogitsHostPtr[idx];
                     auto outLogit = outLogitsHostPtr[idx];
-                    ASSERT_TRUE(almostEqual(outLogit, refLogit)) << "bi: " << bi << " beam: " << bwi << " vi: " << vi;
+                    ASSERT_TRUE(almostEqual(outLogit, refLogit, /* atol */ 1e-3f))
+                        << "bi: " << bi << " beam: " << bwi << " vi: " << vi;
+                }
+                if (computeEntropy)
+                {
+                    auto const idxLocal = bi * maxBeamWidth + bwi;
+                    auto const idxGlobal = batchSlot * maxBeamWidth + bwi;
+                    auto refEntropy = refEntropyHostPtr[idxLocal];
+                    auto outEntropy = outEntropyHostPtr[idxGlobal];
+                    ASSERT_TRUE(almostEqual(outEntropy, refEntropy, /* atol */ 1e-3f))
+                        << "bi: " << bi << " beam: " << bwi;
                 }
             }
         }
@@ -295,31 +380,61 @@ TYPED_TEST_SUITE(SamplingUtilsTypedKernelTest, FloatAndHalfTypes);
 
 TYPED_TEST(SamplingUtilsTypedKernelTest, AddBiasEndMaskWithBias)
 {
-    this->testAddBiasEndMaskSoftmax(true, false, false, 1);
+    this->testAddBiasEndMaskSoftmax(/* hasBias */ true, /* computeSoftmax */ false, /* useLogitsPtrs */ false,
+        /* computeEntropy */ false, /* hasTemperature */ false, 1);
+}
+
+TYPED_TEST(SamplingUtilsTypedKernelTest, AddBiasEndMaskWithTemperature)
+{
+    this->testAddBiasEndMaskSoftmax(/* hasBias */ false, /* computeSoftmax */ false, /* useLogitsPtrs */ false,
+        /* computeEntropy */ false, /* hasTemperature */ true, 1);
 }
 
 TYPED_TEST(SamplingUtilsTypedKernelTest, AddBiasEndMaskWithoutBias)
 {
-    this->testAddBiasEndMaskSoftmax(false, false, false, 1);
+    this->testAddBiasEndMaskSoftmax(/* hasBias */ false, /* computeSoftmax */ false, /* useLogitsPtrs */ false,
+        /* computeEntropy */ false, /* hasTemperature */ false, 1);
 }
 
 TYPED_TEST(SamplingUtilsTypedKernelTest, AddBiasEndMaskSoftmaxWithBias)
 {
-    this->testAddBiasEndMaskSoftmax(true, true, false, 1);
+    this->testAddBiasEndMaskSoftmax(/* hasBias */ true, /* computeSoftmax */ true, /* useLogitsPtrs */ false,
+        /* computeEntropy */ false, /* hasTemperature */ false, 1);
 }
 
 TYPED_TEST(SamplingUtilsTypedKernelTest, AddBiasEndMaskSoftmaxWithoutBias)
 {
-    this->testAddBiasEndMaskSoftmax(false, true, false, 1);
+    this->testAddBiasEndMaskSoftmax(/* hasBias */ false, /* computeSoftmax */ true, /* useLogitsPtrs */ false,
+        /* computeEntropy */ false, /* hasTemperature */ false, 1);
 }
 
 TYPED_TEST(SamplingUtilsTypedKernelTest, AddBiasEndMaskSoftmaxLogitsPtrsBw1)
 {
-    this->testAddBiasEndMaskSoftmax(false, true, true, 1);
+    this->testAddBiasEndMaskSoftmax(/* hasBias */ false, /* computeSoftmax */ true, /* useLogitsPtrs */ true,
+        /* computeEntropy */ false, /* hasTemperature */ false, 1);
+}
+
+TYPED_TEST(SamplingUtilsTypedKernelTest, AddBiasEndMaskSoftmaxLogitsPtrsEntropyBw1)
+{
+    this->testAddBiasEndMaskSoftmax(/* hasBias */ false, /* computeSoftmax */ true, /* useLogitsPtrs */ true,
+        /* computeEntropy */ true, /* hasTemperature */ false, 1);
+}
+
+TYPED_TEST(SamplingUtilsTypedKernelTest, AddBiasEndMaskSoftmaxLogitsPtrsTemperatureEntropyBw1)
+{
+    this->testAddBiasEndMaskSoftmax(/* hasBias */ false, /* computeSoftmax */ true, /* useLogitsPtrs */ true,
+        /* computeEntropy */ true, /* hasTemperature */ true, 1);
+}
+
+TYPED_TEST(SamplingUtilsTypedKernelTest, AddBiasEndMaskSoftmaxLogitsPtrsTemperatureEntropyBw16)
+{
+    this->testAddBiasEndMaskSoftmax(/* hasBias */ false, /* computeSoftmax */ true, /* useLogitsPtrs */ true,
+        /* computeEntropy */ true, /* hasTemperature */ true, 16);
 }
 
 TYPED_TEST(SamplingUtilsTypedKernelTest, AddBiasEndMaskSoftmaxLogitsPtrsBw2)
 {
-    this->testAddBiasEndMaskSoftmax(false, true, true, 2);
+    this->testAddBiasEndMaskSoftmax(/* hasBias */ false, /* computeSoftmax */ true, /* useLogitsPtrs */ true,
+        /* computeEntropy */ false, /* hasTemperature */ false, 2);
 }
 } // end of namespace

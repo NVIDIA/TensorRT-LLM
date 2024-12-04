@@ -146,9 +146,24 @@ void SamplingLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& 
         auto logitsPtrsPtr = static_cast<T**>(nullptr);
         auto biasPtr = static_cast<T*>(nullptr);
         auto const* batchSlotsPtr = workspace->getDeviceBatchSlotsPtr();
-        invokeAddBiasSoftMax(runtimeLogitsPtr, logitsPtrsPtr, runtimeLogitsPtr, biasPtr, endIds, finishedInput,
-            batchSlotsPtr, batchSize, mDecoderDomain.getBatchSize(), /* bw */ 1, mDecoderDomain.getVocabSize(),
-            mDecoderDomain.getVocabSizePadded(), skipSoftMax, /* batchSlotLogits */ false, getStream());
+
+        BiasSoftmaxParams<T> biasSoftmaxParams;
+        biasSoftmaxParams.logits = runtimeLogitsPtr;
+        biasSoftmaxParams.logitsPtrs = logitsPtrsPtr;
+        biasSoftmaxParams.probs = runtimeLogitsPtr;
+        biasSoftmaxParams.bias = biasPtr;
+        biasSoftmaxParams.endIds = endIds;
+        biasSoftmaxParams.finished = finishedInput;
+        biasSoftmaxParams.batchSlots = batchSlotsPtr;
+        biasSoftmaxParams.batchSize = batchSize;
+        biasSoftmaxParams.maxBatchSize = mDecoderDomain.getBatchSize();
+        biasSoftmaxParams.maxBeamWidth = 1;
+        biasSoftmaxParams.vocabSize = mDecoderDomain.getVocabSize();
+        biasSoftmaxParams.vocabSizePadded = mDecoderDomain.getVocabSizePadded();
+        biasSoftmaxParams.skipSoftMax = skipSoftMax;
+        biasSoftmaxParams.batchSlotsLogits = false;
+        biasSoftmaxParams.checkParams();
+        invokeAddBiasSoftMax(biasSoftmaxParams, getStream());
         sync_check_cuda_error();
     }
 

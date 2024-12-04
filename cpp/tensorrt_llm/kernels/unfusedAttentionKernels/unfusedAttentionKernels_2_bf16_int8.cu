@@ -23,8 +23,8 @@ namespace kernels
 {
 
 #ifdef ENABLE_BF16
-INSTANTIATE_ADDFUSEDQKVBIAS_TRANSPOSE(__nv_bfloat16, int8_t, KVBlockArray);
-INSTANTIATE_ADDFUSEDQKVBIAS_TRANSPOSE(__nv_bfloat16, int8_t, KVLinearBuffer);
+INSTANTIATE_ATTENTION_INPUT_OUTPUT_PROCESSING(__nv_bfloat16, int8_t, KVBlockArray);
+INSTANTIATE_ATTENTION_INPUT_OUTPUT_PROCESSING(__nv_bfloat16, int8_t, KVLinearBuffer);
 #endif
 
 } // namespace kernels

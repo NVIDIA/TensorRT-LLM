@@ -92,6 +92,9 @@ class ChatGLMDecoderLayer(Module):
             relative_attention=False,
             max_distance=0,
             num_buckets=0,
+            cp_rank=config.mapping.cp_rank,
+            cp_size=config.mapping.cp_size,
+            cp_group=config.mapping.cp_group,
         )
 
         mlp_hidden_size = hidden_size * 4 if config.intermediate_size is None else config.intermediate_size

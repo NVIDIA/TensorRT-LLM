@@ -47,16 +47,6 @@ struct LayoutDetailsB
 {
 };
 
-// Volta specialiations. Volta will dequantize before STS, so we need a different operator
-template <typename TypeA, typename TypeB>
-struct LayoutDetailsB<TypeA, TypeB, arch::Sm70>
-{
-    static constexpr int ThreadblockK = 128 * 8 / cutlass::sizeof_bits<TypeA>::value;
-    using Layout = layout::ColumnMajor;
-    static constexpr int ElementsPerAccess = 8;
-    using Operator = cutlass::arch::OpMultiplyAdd;
-};
-
 // Specializations for Turing+ when B is FP16. These are currently only used for MoE networks.
 // TODO - Switch this to column major for weights since gemms should be more performant.
 template <typename TypeA, typename Arch>
@@ -97,9 +87,7 @@ public:
 // Specializations for Turing+ when B is quantized. These can use the operator OpMultiplyAddDequantizeInterleavedBToA,
 // which signals that we want to dequantize after loading from smem.
 template <typename TypeA, typename Arch>
-    struct LayoutDetailsB < TypeA,
-    uint8_t, Arch,
-    typename platform::enable_if<Arch::kMinComputeCapability >= 75 && Arch::kMinComputeCapability<90>::type>
+struct LayoutDetailsB<TypeA, uint8_t, Arch, typename platform::enable_if<Arch::kMinComputeCapability >= 75>::type>
 {
     static constexpr int ThreadblockK = 128 * 8 / cutlass::sizeof_bits<TypeA>::value;
 
@@ -114,9 +102,7 @@ public:
 };
 
 template <typename TypeA, typename Arch>
-    struct LayoutDetailsB < TypeA,
-    uint4b_t, Arch,
-    typename platform::enable_if<Arch::kMinComputeCapability >= 75 && Arch::kMinComputeCapability<90>::type>
+struct LayoutDetailsB<TypeA, uint4b_t, Arch, typename platform::enable_if<Arch::kMinComputeCapability >= 75>::type>
 {
     static constexpr int ThreadblockK = 128 * 8 / cutlass::sizeof_bits<TypeA>::value;
 
@@ -128,24 +114,6 @@ public:
     using Layout = layout::ColumnMajorTileInterleave<ThreadblockK, ColumnsInterleaved>;
     static constexpr int ElementsPerAccess = 128 / cutlass::sizeof_bits<uint4b_t>::value;
     using Operator = cutlass::arch::OpMultiplyAddDequantizeInterleavedBToA;
-};
-
-template <typename TypeA, typename Arch>
-struct LayoutDetailsB<TypeA, uint8_t, Arch, typename platform::enable_if<Arch::kMinComputeCapability >= 90>::type>
-{
-    static constexpr int ThreadblockK = 128 * 8 / cutlass::sizeof_bits<TypeA>::value;
-    using Layout = layout::ColumnMajor;
-    static constexpr int ElementsPerAccess = 128 / cutlass::sizeof_bits<half_t>::value;
-    using Operator = cutlass::arch::OpMultiplyAdd;
-};
-
-template <typename TypeA, typename Arch>
-struct LayoutDetailsB<TypeA, uint4b_t, Arch, typename platform::enable_if<Arch::kMinComputeCapability >= 90>::type>
-{
-    static constexpr int ThreadblockK = 128 * 8 / cutlass::sizeof_bits<TypeA>::value;
-    using Layout = layout::ColumnMajor;
-    static constexpr int ElementsPerAccess = 128 / cutlass::sizeof_bits<half_t>::value;
-    using Operator = cutlass::arch::OpMultiplyAdd;
 };
 
 } // namespace kernel

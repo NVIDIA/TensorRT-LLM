@@ -164,8 +164,8 @@ struct BlockPrefixCallbackOp
 
 template <typename T>
 __device__ void epilogue(SizeType32 batchId, SizeType32 currentStep, SizeType32 offset, TokenIdType** ids,
-    TokenIdType* sortedIdVals, T* sortedProbs, float* cumLogProbs, float* outputLogProbs, TokenIdType const* endIds,
-    SizeType32* sequenceLengths, FinishedState* finishedOutput, SizeType32 maxBatchSize)
+    TokenIdType const* sortedIdVals, T const* sortedProbs, float* cumLogProbs, float* outputLogProbs,
+    TokenIdType const* endIds, SizeType32* sequenceLengths, FinishedState* finishedOutput, SizeType32 maxBatchSize)
 {
     ids[batchId][currentStep] = sortedIdVals[offset];
 
@@ -197,11 +197,13 @@ __device__ void epilogue(SizeType32 batchId, SizeType32 currentStep, SizeType32 
 }
 
 template <typename T, int blockSize>
-__global__ void topPSsampling(T* sortedProbs, TokenIdType* sortedIdVals, TokenIdType* ids, TokenIdType** idsPtrs,
-    SizeType32* sequenceLength, FinishedState const* finishedInput, FinishedState* finishedOutput, float* cumLogProbs,
-    float* outputLogProbs, SizeType32 const* beginOffsetBuf, SizeType32 const* offsetBuf, SizeType32 vocabSize,
-    curandState_t* curandState, float const* topPs, TokenIdType const* endIds, SizeType32 maxBatchSize,
-    bool const* skipDecode, SizeType32 const* batchSlots, bool returnAllSelectedTokens, SizeType32 maxSeqLen)
+__global__ void topPSsampling(T const* sortedProbs, TokenIdType const* sortedIdVals, TokenIdType* ids,
+    TokenIdType** idsPtrs, SizeType32* sequenceLength, FinishedState const* finishedInput,
+    FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs, SizeType32 const* beginOffsetBuf,
+    SizeType32 const* offsetBuf, SizeType32 vocabSize, curandState_t* curandState, float const* randomVals,
+    float const* topPs, TokenIdType const* endIds, SizeType32 maxBatchSize, bool const* skipDecode,
+    SizeType32 const* batchSlots, bool returnAllSelectedTokens, SizeType32 maxSeqLen, TokenIdType* outputIdCurrentStep,
+    bool const* skipOutputIdCurrentStep)
 {
     /**
      * Each block processes one request row sorted in descending order by probabilities.
@@ -211,6 +213,7 @@ __global__ void topPSsampling(T* sortedProbs, TokenIdType* sortedIdVals, TokenId
      */
 
     __shared__ float randNumS;
+    __shared__ float randNumS2;
 
     auto const tid = static_cast<SizeType32>(threadIdx.x);
     auto const batchId = static_cast<SizeType32>(blockIdx.x);
@@ -238,6 +241,8 @@ __global__ void topPSsampling(T* sortedProbs, TokenIdType* sortedIdVals, TokenId
     auto const probThreshold = topPs[batchSlot];
     auto const currentStep = sequenceLength == nullptr ? 0 : sequenceLength[batchSlot];
     auto* outputIdsRequestPtr = idsPtrs == nullptr ? ids + batchSlot * maxSeqLen : idsPtrs[batchSlot];
+    bool const sampleTokenInSelected = returnAllSelectedTokens && outputIdCurrentStep && curandState
+        && skipOutputIdCurrentStep && !skipOutputIdCurrentStep[batchSlot];
 
     // With P in (0.0; 1.0] we draw a random number P' in range (0.0; P]
     // We will sum all probs moving from the largest probability to the smallest and
@@ -245,7 +250,9 @@ __global__ void topPSsampling(T* sortedProbs, TokenIdType* sortedIdVals, TokenId
     if (threadIdx.x == 0)
     {
         // if we want to return all top p indices, we should not do random sampling for probThreshold
-        randNumS = returnAllSelectedTokens ? probThreshold : curand_uniform(curandState + blockIdx.x) * probThreshold;
+        auto const randomNumber = randomVals ? randomVals[batchSlot] : curand_uniform(curandState + batchSlot);
+        randNumS = returnAllSelectedTokens ? probThreshold : randomNumber * probThreshold;
+        randNumS2 = sampleTokenInSelected ? curand_uniform(curandState + batchSlot) * probThreshold : 0.0f;
     }
 
     // if beginOffsetBuf and offsetBuf of sorting have same value,
@@ -283,21 +290,36 @@ __global__ void topPSsampling(T* sortedProbs, TokenIdType* sortedIdVals, TokenId
     // Cumulative sum
     float threadOffset = 0;
     SizeType32 count = 0;
+    // For sampleTokenInSelected == True
+    SizeType32 selectedTokenId2 = 0;
+    SizeType32 count2 = 0;
     for (int vi = tid; vi < end; vi += blockSize)
     {
         auto threadProb = (vi < vocabSize) ? static_cast<float>(sortedProbs[offset + vi]) : 0.f;
         BlockScan(tempStorage).InclusiveSum(threadProb, threadOffset, prefixOp);
         count = __syncthreads_count(randNumS <= threadOffset);
         selectedTokenId = vi;
+        if (sampleTokenInSelected && count2 == 0)
+        {
+            count2 = __syncthreads_count(randNumS2 <= threadOffset);
+            selectedTokenId2 = vi;
+        }
         if (count != 0)
         {
             break;
         }
     }
 
+    selectedTokenId = min(selectedTokenId, vocabSize - 1);
+
     if (returnAllSelectedTokens)
     {
         __shared__ SizeType32 sharedSelectedTokenId;
+        if (sampleTokenInSelected && (threadIdx.x == min(blockDim.x - count2, blockDim.x - 1)))
+        {
+            selectedTokenId2 = min(selectedTokenId2, vocabSize - 1);
+            outputIdCurrentStep[batchSlot] = sortedIdVals[offset + selectedTokenId2];
+        }
         if (threadIdx.x == min(blockDim.x - count, blockDim.x - 1))
         {
             sharedSelectedTokenId = selectedTokenId;
@@ -416,8 +438,9 @@ void invokeBatchTopPSampling(TopPSamplingKernelParams<T> const& params, cudaStre
     topPSsampling<T, SAMPLING_BLOCK_SIZE><<<grid, SAMPLING_BLOCK_SIZE, 0, stream>>>(sortedProbs, sortedIdVals,
         params.outputIds, params.outputIdsPtrs, params.sequenceLength, params.finishedInput, params.finishedOutput,
         params.cumLogProbs, params.outputLogProbs, beginOffsetBuf, offsetBuf + 1, params.vocabSizePadded,
-        params.curandState, params.topPs, params.endIds, params.maxBatchSize, params.skipDecode, params.batchSlots,
-        params.returnAllSelectedTokens, params.maxSeqLen);
+        params.curandState, params.randomVals, params.topPs, params.endIds, params.maxBatchSize, params.skipDecode,
+        params.batchSlots, params.returnAllSelectedTokens, params.maxSeqLen, params.outputIdCurrentStep,
+        params.skipOutputIdCurrentStep);
     sync_check_cuda_error();
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);

@@ -22,7 +22,7 @@ import torch
 from .._common import default_net, precision
 from .._utils import (fp32_array, int32_array, is_same_dtype, set_obj_attrs,
                       trt_dtype_to_np, trt_dtype_to_str)
-from ..functional import (ACT2FN, AllReduceFusionParams, AttentionMaskType,
+from ..functional import (ACT2FN, AllReduceParams, AttentionMaskType,
                           Conditional, LayerNormType, PositionEmbeddingType,
                           RopeEmbeddingUtils, RotaryScalingType, Tensor,
                           allgather, arange, bert_attention, cast, clip, concat,
@@ -386,7 +386,10 @@ class Attention(Module):
                  use_implicit_relative_attention=False,
                  reorder=False,
                  layer_idx_in_cache_pool=None,
-                 enable_qkv=True):
+                 enable_qkv=True,
+                 cp_group=[0],
+                 cp_size=1,
+                 cp_rank=0):
         super().__init__()
 
         self.local_layer_idx = local_layer_idx
@@ -413,6 +416,9 @@ class Attention(Module):
         self.dense_bias = dense_bias
         if dense_bias is None:
             self.dense_bias = bias
+        self.cp_group = cp_group
+        self.cp_size = cp_size
+        self.cp_rank = cp_rank
 
         self.num_layers = num_layers
         self.apply_query_key_layer_scaling = apply_query_key_layer_scaling
@@ -705,10 +711,10 @@ class Attention(Module):
         lora_layer_params=None,
         cross_kv_cache_gen: Optional[Tensor] = None,
         cross_kv_reuse: Optional[Tensor] = None,
-        reduce_fusion_params: Optional[AllReduceFusionParams] = None,
+        all_reduce_params: Optional[AllReduceParams] = None,
         skip_attn=None,
     ):
-
+        attention_input = hidden_states
         assert isinstance(hidden_states, Tensor)
 
         spec_decoding_params = SpecDecodingParams(
@@ -1122,7 +1128,9 @@ class Attention(Module):
                 host_runtime_perf_knobs,
                 host_context_progress=attention_params.host_context_progress,
                 skip_attn=skip_attn,
-            )
+                cp_size=self.cp_size,
+                cp_rank=self.cp_rank,
+                cp_group=self.cp_group)
 
         else:
             # plain TensorRT mode
@@ -1465,14 +1473,14 @@ class Attention(Module):
             # and set skip_attn as True during runtime
 
             dense_conditional = Conditional(skip_attn)
-            skip_case = dense_conditional.add_input(context)
+            skip_case = dense_conditional.add_input(attention_input)
             context = dense_conditional.add_input(context)
 
         if self.inner_layernorm is not None:
             context = self.inner_layernorm(context)
         context = self.dense(context,
                              lora_runtime_params=dense_lora_params,
-                             reduce_fusion_params=reduce_fusion_params)
+                             all_reduce_params=all_reduce_params)
 
         if skip_attn is not None:
             context = dense_conditional.add_output(skip_case, context)
@@ -1492,8 +1500,10 @@ class Attention(Module):
     def postprocess(self, tllm_key, weights, **kwargs):
         if tllm_key.endswith("kv_cache_scaling_factor") and weights is None:
             return {tllm_key: torch.ones(1, )}
-        else:
+        elif isinstance(weights, torch.Tensor):
             return {tllm_key: weights}
+        else:
+            return {tllm_key: max(weights)}
 
 
 class BertAttention(Module):

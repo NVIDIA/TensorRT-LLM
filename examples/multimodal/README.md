@@ -18,6 +18,7 @@ We first describe how to run each model on a single GPU. We then provide general
 - [Phi-3-vision](#phi-3-vision)
 - [Video NeVA](#video-neva)
 - [InternVL2](#internvl2)
+- [Qwen2-VL](#qwen2-vl)
 - [Enabling tensor parallelism for multi-GPU](#enabling-tensor-parallelism-for-multi-gpu)
 
 ## BLIP2
@@ -71,7 +72,6 @@ This BLIP section covers both BLIP2-OPT and BLIP2-T5, with minor changes needed 
         --output_dir tmp/trt_engines/${MODEL_NAME}/bfloat16/encoder \
         --paged_kv_cache disable \
         --moe_plugin disable \
-        --enable_xqa disable \
         --gemm_plugin bfloat16 \
         --bert_attention_plugin bfloat16 \
         --gpt_attention_plugin bfloat16 \
@@ -86,7 +86,6 @@ This BLIP section covers both BLIP2-OPT and BLIP2-T5, with minor changes needed 
         --output_dir tmp/trt_engines/${MODEL_NAME}/bfloat16/decoder \
         --paged_kv_cache disable \
         --moe_plugin disable \
-        --enable_xqa disable \
         --gemm_plugin bfloat16 \
         --bert_attention_plugin bfloat16 \
         --gpt_attention_plugin bfloat16 \
@@ -194,7 +193,6 @@ Currently, CogVLM only support bfloat16 precision.
     --max_input_len 2048 \
     --max_seq_len 3076 \
     --paged_kv_cache enable \
-    --enable_xqa disable \
     --bert_attention_plugin disable \
     --moe_plugin disable \
     --max_multimodal_len 61440 # 48 (max_batch_size) * 1280 (max_num_visual_features)
@@ -245,7 +243,6 @@ Currently, CogVLM only support bfloat16 precision.
         --output_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/float16/decoder \
         --paged_kv_cache disable \
         --moe_plugin disable \
-        --enable_xqa disable \
         --gemm_plugin float16 \
         --bert_attention_plugin float16 \
         --gpt_attention_plugin float16 \
@@ -637,7 +634,6 @@ Currently, CogVLM only support bfloat16 precision.
         --output_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/bfloat16/decoder \
         --paged_kv_cache disable \
         --moe_plugin disable \
-        --enable_xqa disable \
         --gemm_plugin bfloat16 \
         --bert_attention_plugin bfloat16 \
         --gpt_attention_plugin bfloat16 \

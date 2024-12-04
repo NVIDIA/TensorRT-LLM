@@ -38,6 +38,10 @@ def parse_arguments():
         help=
         'N-way tensor parallelism size for MOE, default is tp_size, which will do tp-only for MoE'
     )
+    parser.add_argument('--cp_size',
+                        type=int,
+                        default=1,
+                        help='N-way context parallelism size')
     parser.add_argument(
         '--moe_ep_size',
         type=int,
@@ -337,7 +341,8 @@ def args_to_quant_config(args: argparse.Namespace) -> QuantConfig:
     return quant_config
 
 
-def update_quant_config_from_hf(quant_config, hf_config) -> QuantConfig:
+def update_quant_config_from_hf(quant_config, hf_config,
+                                override_fields) -> tuple[QuantConfig, dict]:
     hf_config_dict = hf_config.to_dict()
     if hf_config_dict.get('quantization_config'):
         # update the quant_algo, and clamp_val.
@@ -349,7 +354,29 @@ def update_quant_config_from_hf(quant_config, hf_config) -> QuantConfig:
             activation_scale_ub = hf_config_dict['quantization_config'].get(
                 'activation_scale_ub', 1200.0)
             quant_config.clamp_val = [-activation_scale_ub, activation_scale_ub]
-    return quant_config
+        elif hf_config_dict['quantization_config'].get('quant_method') == 'awq':
+            logger.info(
+                "Load quantization configs from huggingface model_config.")
+            quant_config.quant_algo = QuantAlgo.W4A16_GPTQ
+            quant_config.group_size = hf_config_dict['quantization_config'].get(
+                'group_size', 128)
+            quant_config.has_zero_point = hf_config_dict[
+                'quantization_config'].get('zero_point', False)
+            override_fields.update({"use_autoawq": True})
+        elif hf_config_dict['quantization_config'].get(
+                'quant_method') == 'gptq':
+            logger.info(
+                "Load quantization configs from huggingface model_config.")
+            desc_act = hf_config_dict['quantization_config'].get(
+                'desc_act', False)
+            if desc_act:
+                raise ValueError("GPTQ with desc_act=True is not implemented!")
+            quant_config.quant_algo = QuantAlgo.W4A16_GPTQ
+            quant_config.group_size = hf_config_dict['quantization_config'].get(
+                'group_size', 128)
+            quant_config.has_zero_point = hf_config_dict[
+                'quantization_config'].get('sym', False)
+    return quant_config, override_fields
 
 
 def convert_and_save_meta(args, rank):
@@ -366,6 +393,8 @@ def convert_and_save_meta(args, rank):
         mapping=mapping,
         use_parallel_embedding=args.use_parallel_embedding,
         embedding_sharding_dim=args.embedding_sharding_dim)
+    llama.config.mapping.cp_size = args.cp_size
+    llama.config.mapping.world_size *= args.cp_size
     llama.save_checkpoint(args.output_dir, save_config=(rank == 0))
 
 
@@ -407,11 +436,12 @@ def from_cli_args(args):
             'normalization_mode': args.moe_renorm_mode,
         },
         'mapping': {
-            'world_size': args.tp_size * args.pp_size,
+            'world_size': args.tp_size * args.pp_size * args.cp_size,
             'tp_size': args.tp_size,
             'pp_size': args.pp_size,
             'moe_tp_size': args.moe_tp_size,
             'moe_ep_size': args.moe_ep_size,
+            'cp_size': args.cp_size,
         },
         'quantization': args_to_quant_config(args).to_dict()
     }
@@ -434,7 +464,8 @@ def convert_and_save_hf(args):
     try:
         hf_config = AutoConfig.from_pretrained(model_dir,
                                                trust_remote_code=True)
-        quant_config = update_quant_config_from_hf(quant_config, hf_config)
+        quant_config, override_fields = update_quant_config_from_hf(
+            quant_config, hf_config, override_fields)
     except:
         # llava_llama needs its own defined config.
         logger.warning("AutoConfig cannot load the huggingface config.")
@@ -445,7 +476,8 @@ def convert_and_save_hf(args):
                           tp_size=args.tp_size,
                           pp_size=args.pp_size,
                           moe_tp_size=args.moe_tp_size,
-                          moe_ep_size=args.moe_ep_size)
+                          moe_ep_size=args.moe_ep_size,
+                          cp_size=args.cp_size)
         # TODO: support moe quantization for tp + ep
         LLaMAForCausalLM.quantize(
             args.model_dir,
@@ -480,6 +512,8 @@ def convert_and_save_hf(args):
             print(
                 f'Total time of reading and converting: {time.time()-tik:.3f} s'
             )
+            llama.config.mapping.cp_size = args.cp_size
+            llama.config.mapping.world_size *= args.cp_size
             tik = time.time()
             llama.save_checkpoint(args.output_dir, save_config=(rank == 0))
             del llama
@@ -513,7 +547,7 @@ def main():
     args = parse_arguments()
     logger.set_level(args.log_level)
 
-    world_size = args.tp_size * args.pp_size
+    world_size = args.tp_size * args.pp_size * args.cp_size
     if (args.moe_tp_size == -1 and args.moe_ep_size == -1):
         # moe default to tp-only
         args.moe_tp_size = args.tp_size

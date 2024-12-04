@@ -17,12 +17,15 @@
 #include "eagleSampleAndAcceptDraftTokensPlugin.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
+#include "tensorrt_llm/kernels/speculativeDecoding/common.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/eagleDecodingKernels.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/medusaDecodingKernels.h"
 #include "tensorrt_llm/runtime/common.h"
+#include "tensorrt_llm/runtime/iTensor.h"
 
 using namespace nvinfer1;
 using tensorrt_llm::plugins::EagleSampleAndAcceptDraftTokensPluginCreator;
@@ -37,12 +40,9 @@ static char const* EAGLE_SAMPLE_AND_ACCEPT_DRAFT_TOKENS_PLUGIN_NAME{"EagleSample
 PluginFieldCollection EagleSampleAndAcceptDraftTokensPluginCreator::mFC{};
 std::vector<nvinfer1::PluginField> EagleSampleAndAcceptDraftTokensPluginCreator::mPluginAttributes;
 
-EagleSampleAndAcceptDraftTokensPlugin::EagleSampleAndAcceptDraftTokensPlugin(
-    nvinfer1::DataType type, bool greedySampling)
+EagleSampleAndAcceptDraftTokensPlugin::EagleSampleAndAcceptDraftTokensPlugin(nvinfer1::DataType type)
     : mDtype(type)
-    , mGreedySampling(greedySampling)
 {
-    TLLM_CHECK_WITH_INFO(mGreedySampling, "Non-greedy sampling is not supported yet.");
 }
 
 // Parameterized constructor
@@ -50,7 +50,6 @@ EagleSampleAndAcceptDraftTokensPlugin::EagleSampleAndAcceptDraftTokensPlugin(voi
 {
     char const *d = reinterpret_cast<char const*>(data), *a = d;
     read(d, mDtype);
-    read(d, mGreedySampling);
     TLLM_CHECK_WITH_INFO(d == a + length,
         "Expected length (%d) != real length (%d). This is often "
         "caused by using different TensorRT-LLM version to build "
@@ -69,7 +68,7 @@ nvinfer1::IPluginV2DynamicExt* EagleSampleAndAcceptDraftTokensPlugin::clone() co
 nvinfer1::DimsExprs EagleSampleAndAcceptDraftTokensPlugin::getOutputDimensions(
     int outputIndex, nvinfer1::DimsExprs const* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
 {
-    TLLM_CHECK(nbInputs == 6);
+    TLLM_CHECK(nbInputs == 9);
     TLLM_CHECK(outputIndex < 7);
     auto const batchSizeExpr = inputs[getIdx(InputIdxEntry::PATHS)].d[0];
     auto const maxDecodingDraftTokensExpr = inputs[getIdx(InputIdxEntry::DRAFT_TOKEN_IDS)].d[1];
@@ -129,8 +128,9 @@ bool EagleSampleAndAcceptDraftTokensPlugin::supportsFormatCombination(
     {
         return (inOut[pos].type == mDtype) && (inOut[pos].format == TensorFormat::kLINEAR);
     }
-    else if (pos == getIdx(InputIdxEntry::TEMPERATURE)
-        || pos == getIdx(InputIdxEntry::RAND_VALIDATION)) // temperature, rand_validation
+    else if (pos == getIdx(InputIdxEntry::TEMPERATURE) || pos == getIdx(InputIdxEntry::RAND_VALIDATION)
+        || pos == getIdx(InputIdxEntry::POSTERIOR_ALPHA)
+        || pos == getIdx(InputIdxEntry::POSTERIOR_THRESHOLD)) // temperature, rand_validation
     {
         return (inOut[pos].type == nvinfer1::DataType::kFLOAT) && (inOut[pos].format == TensorFormat::kLINEAR);
     }
@@ -156,24 +156,27 @@ size_t EagleSampleAndAcceptDraftTokensPlugin::getWorkspaceSizeType(nvinfer1::Plu
     auto const maxDecodingTokens = inputs[getIdx(InputIdxEntry::PATHS)].dims.d[1];
 
     // Greedy sampling
-    {
-        // Top1 sampling workspace
-        auto const primarySamplingWorkspaceSize
-            = getTopKWorkspaceSize<T>(batchSize, maxDecodingTokens, /* maxTopK */ 1, vocabSizePadded);
+    // Top1 sampling workspace
+    auto const greedySamplingWorkspaceSize
+        = getTopKWorkspaceSize<T>(batchSize, maxDecodingTokens, /* maxTopK */ 1, vocabSizePadded);
 
-        // Target output ids
-        auto const targetOutputIdsSize = batchSize * maxDecodingTokens * sizeof(TokenIdType);
+    // Multinomial sampling
+    auto const typicalSamplingWorkspaceSize
+        = getTypicalAcceptanceWorkspaceSize<T>(batchSize, maxDecodingTokens, vocabSizePadded);
 
-        // Logits ptrs
-        auto const logitsPtrsSize = batchSize * maxDecodingTokens * sizeof(T*);
-        SizeType32 constexpr NUM_BUFFERS{4};
-        size_t workspaces[NUM_BUFFERS];
-        workspaces[0] = primarySamplingWorkspaceSize;
-        workspaces[1] = targetOutputIdsSize;
-        workspaces[2] = logitsPtrsSize;
-        workspaces[3] = batchSize * sizeof(SizeType32);
-        workspaceSize = tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
-    }
+    auto const primarySamplingWorkspaceSize = std::max(greedySamplingWorkspaceSize, typicalSamplingWorkspaceSize);
+
+    // Target output ids
+    auto const targetOutputIdsSize = batchSize * maxDecodingTokens * sizeof(TokenIdType);
+    // Logits ptrs
+    auto const logitsPtrsSize = batchSize * maxDecodingTokens * sizeof(T*);
+    SizeType32 constexpr NUM_BUFFERS{4};
+    size_t workspaces[NUM_BUFFERS];
+    workspaces[0] = targetOutputIdsSize;
+    workspaces[1] = primarySamplingWorkspaceSize;
+    workspaces[2] = logitsPtrsSize;
+    workspaces[3] = batchSize * sizeof(SizeType32);
+    workspaceSize = tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
 
     return workspaceSize;
 }
@@ -218,10 +221,10 @@ void EagleSampleAndAcceptDraftTokensPlugin::samplePrimeHeadTokens(nvinfer1::Plug
     auto const samplingWorkspaceSize
         = getTopKWorkspaceSize<T>(batchSize, maxDecodingTokens, /* maxTopK */ 1, vocabSizePadded);
 
-    void* workspaceSampling
-        = reinterpret_cast<void*>(tc::nextWorkspacePtr(workspaceBytePtr, offset, samplingWorkspaceSize));
     TokenIdType* outputIds = reinterpret_cast<TokenIdType*>(
         tc::nextWorkspacePtr(workspaceBytePtr, offset, batchSize * maxDecodingTokens * sizeof(TokenIdType)));
+    void* workspaceSampling
+        = reinterpret_cast<void*>(tc::nextWorkspacePtr(workspaceBytePtr, offset, samplingWorkspaceSize));
     T const** logitsPtrs = reinterpret_cast<T const**>(
         tc::nextWorkspacePtr(workspaceBytePtr, offset, batchSize * maxDecodingTokens * sizeof(T*)));
     SizeType32* decodingTokens
@@ -253,6 +256,79 @@ void EagleSampleAndAcceptDraftTokensPlugin::samplePrimeHeadTokens(nvinfer1::Plug
 }
 
 template <typename T>
+void EagleSampleAndAcceptDraftTokensPlugin::doTypicalAcceptance(nvinfer1::PluginTensorDesc const* inputDesc,
+    nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
+    cudaStream_t stream) noexcept
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    auto const maxNumTokens = inputDesc[getIdx(InputIdxEntry::LOGITS)].dims.d[0];
+    auto const vocabSizePadded = inputDesc[getIdx(InputIdxEntry::LOGITS)].dims.d[1];
+
+    auto const batchSize = inputDesc[getIdx(InputIdxEntry::PATHS)].dims.d[0];
+    auto const maxDecodingTokens = inputDesc[getIdx(InputIdxEntry::PATHS)].dims.d[1];
+    auto const maxPathLen = inputDesc[getIdx(InputIdxEntry::PATHS)].dims.d[2];
+    auto const maxDraftPathLen = maxPathLen - 1;
+
+    auto logits = static_cast<T const*>(inputs[getIdx(InputIdxEntry::LOGITS)]);
+    auto prevDraftLens = reinterpret_cast<SizeType32 const*>(inputs[getIdx(InputIdxEntry::DRAFT_LENS)]);
+
+    int8_t* workspaceBytePtr = reinterpret_cast<int8_t*>(workspace);
+    size_t offset{0};
+
+    // Multinomial sampling
+    auto const primarySamplingWorkspaceSize
+        = getTypicalAcceptanceWorkspaceSize<T>(batchSize, maxDecodingTokens, vocabSizePadded);
+
+    TokenIdType* outputIds = reinterpret_cast<TokenIdType*>(
+        tc::nextWorkspacePtr(workspaceBytePtr, offset, batchSize * maxDecodingTokens * sizeof(TokenIdType)));
+    void* workspaceSampling
+        = reinterpret_cast<void*>(tc::nextWorkspacePtr(workspaceBytePtr, offset, primarySamplingWorkspaceSize));
+    T** logitsPtrs = reinterpret_cast<T**>(
+        tc::nextWorkspacePtr(workspaceBytePtr, offset, batchSize * maxDecodingTokens * sizeof(T*)));
+    SizeType32* decodingTokens
+        = reinterpret_cast<SizeType32*>(tc::nextWorkspacePtr(workspaceBytePtr, offset, batchSize * sizeof(SizeType32)));
+
+    // Assemble pointers to logits
+    invokeAssembleTargetLogitsOffsets(const_cast<T const**>(logitsPtrs), decodingTokens, logits, prevDraftLens,
+        batchSize, maxDecodingTokens, vocabSizePadded, stream);
+
+    sync_check_cuda_error();
+
+    TypicalAcceptanceSampling<T> params;
+    params.logitsPtrs = logitsPtrs;
+    params.generationLengths = decodingTokens;
+    params.temperatures = reinterpret_cast<float const*>(inputs[getIdx(InputIdxEntry::TEMPERATURE)]);
+    params.posteriorThresholds = reinterpret_cast<float const*>(inputs[getIdx(InputIdxEntry::POSTERIOR_THRESHOLD)]);
+    params.posteriorAlphas = reinterpret_cast<float const*>(inputs[getIdx(InputIdxEntry::POSTERIOR_ALPHA)]);
+    params.outputIds = outputIds;
+    params.workspace = reinterpret_cast<int8_t*>(workspaceSampling);
+    params.randomVals = reinterpret_cast<float const*>(inputs[getIdx(InputIdxEntry::RAND_VALIDATION)]);
+
+    params.batchSize = batchSize;
+    params.maxBatchSize = batchSize;
+    params.maxDecodingTokens = maxDecodingTokens;
+    params.vocabSize = vocabSizePadded;
+
+    if (mSmCnt <= 0)
+    {
+        auto const deviceId = tensorrt_llm::common::getDevice();
+        cudaDeviceProp prop{};
+        TLLM_CUDA_CHECK(cudaGetDeviceProperties(&prop, deviceId));
+        mSmCnt = prop.multiProcessorCount;
+    }
+    params.smCnt = mSmCnt;
+
+    params.checkParams();
+
+    typicalAcceptanceSampling(params, stream);
+
+    sync_check_cuda_error();
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+template <typename T>
 void EagleSampleAndAcceptDraftTokensPlugin::acceptDraftTokens(nvinfer1::PluginTensorDesc const* inputDesc,
     nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
     cudaStream_t stream) noexcept
@@ -273,8 +349,6 @@ void EagleSampleAndAcceptDraftTokensPlugin::acceptDraftTokens(nvinfer1::PluginTe
     auto const samplingWorkspaceSize
         = getTopKWorkspaceSize<T>(batchSize, maxDecodingTokens, /* maxTopK */ 1, vocabSizePadded);
 
-    void* workspaceSampling
-        = reinterpret_cast<void*>(tc::nextWorkspacePtr(workspaceBytePtr, offset, samplingWorkspaceSize));
     TokenIdType* outputIds = reinterpret_cast<TokenIdType*>(
         tc::nextWorkspacePtr(workspaceBytePtr, offset, batchSize * maxDecodingTokens * sizeof(TokenIdType)));
 
@@ -307,38 +381,27 @@ void EagleSampleAndAcceptDraftTokensPlugin::acceptDraftTokens(nvinfer1::PluginTe
 }
 
 template <typename T>
-void EagleSampleAndAcceptDraftTokensPlugin::doGreedy(nvinfer1::PluginTensorDesc const* inputDesc,
-    nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
-    cudaStream_t stream) noexcept
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-
-    // Sample all main head tokens with Top-1.
-    samplePrimeHeadTokens<T>(inputDesc, outputDesc, inputs, outputs, workspace, stream);
-
-    // Greedy accept tokens based on token ids, write the best path and best token id.
-    acceptDraftTokens<T>(inputDesc, outputDesc, inputs, outputs, workspace, stream);
-
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
-
-template <typename T>
 void EagleSampleAndAcceptDraftTokensPlugin::enqueueType(nvinfer1::PluginTensorDesc const* inputDesc,
     nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
     cudaStream_t stream) noexcept
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
+    auto const greedySampling = reinterpret_cast<SizeType32 const*>(inputs[getIdx(InputIdxEntry::GREEDY_SAMPLING)])[0];
     // TODO split batch into greedy and non-greedy and execute both paths
-    if (mGreedySampling)
+    if (greedySampling)
     {
-        doGreedy<T>(inputDesc, outputDesc, inputs, outputs, workspace, stream);
+        // Sample all main head tokens with Top-1.
+        samplePrimeHeadTokens<T>(inputDesc, outputDesc, inputs, outputs, workspace, stream);
     }
     else
     {
-        // TODO fill me
-        TLLM_CHECK_WITH_INFO(false, "Non-greedy sampling is not supported yet");
+        // Typical sampling for typical acceptance.
+        doTypicalAcceptance<T>(inputDesc, outputDesc, inputs, outputs, workspace, stream);
     }
+
+    // Accept tokens based on token ids, write the best path and best token id.
+    acceptDraftTokens<T>(inputDesc, outputDesc, inputs, outputs, workspace, stream);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -399,14 +462,13 @@ void EagleSampleAndAcceptDraftTokensPlugin::terminate() noexcept {}
 
 size_t EagleSampleAndAcceptDraftTokensPlugin::getSerializationSize() const noexcept
 {
-    return sizeof(mDtype) + sizeof(mGreedySampling);
+    return sizeof(mDtype);
 }
 
 void EagleSampleAndAcceptDraftTokensPlugin::serialize(void* buffer) const noexcept
 {
     char *d = static_cast<char*>(buffer), *a = d;
     write(d, mDtype);
-    write(d, mGreedySampling);
     assert(d == a + getSerializationSize());
 }
 
@@ -423,7 +485,6 @@ EagleSampleAndAcceptDraftTokensPluginCreator::EagleSampleAndAcceptDraftTokensPlu
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
     mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("greedy_sampling", nullptr, PluginFieldType::kINT32, 1));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }
@@ -448,7 +509,6 @@ IPluginV2* EagleSampleAndAcceptDraftTokensPluginCreator::createPlugin(
 {
     PluginField const* fields = fc->fields;
     nvinfer1::DataType type;
-    bool greedySampling;
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {
@@ -458,16 +518,11 @@ IPluginV2* EagleSampleAndAcceptDraftTokensPluginCreator::createPlugin(
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             type = static_cast<nvinfer1::DataType>(*(static_cast<nvinfer1::DataType const*>(fields[i].data)));
         }
-        else if (!strcmp(attrName, "greedy_sampling"))
-        {
-            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
-            greedySampling = static_cast<bool>(*static_cast<int32_t const*>(fields[i].data));
-        }
     }
 
     try
     {
-        auto* obj = new EagleSampleAndAcceptDraftTokensPlugin(type, greedySampling);
+        auto* obj = new EagleSampleAndAcceptDraftTokensPlugin(type);
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }

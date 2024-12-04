@@ -38,270 +38,171 @@ namespace kernels
 
 #pragma nv_diag_suppress static_var_with_dynamic_init
 
-struct __align__(8) MD
+template <typename T, int PBM, int BLOCK_SIZE>
+__launch_bounds__(BLOCK_SIZE) __global__ void beamStage1Kernel(T const* __restrict logProbs, T const* __restrict bias,
+    float* __restrict pStage3, int const* __restrict endIds, FinishedState const* __restrict finished, int const nV,
+    runtime::SizeType32 const* batchSlots)
 {
-    float m;
-    float d;
-};
-
-__device__ __forceinline__ MD reduce_md_op(MD a, MD b)
-{
-    bool const isABigger = a.m > b.m;
-    MD const bigger = isABigger ? a : b;
-    MD const smaller = isABigger ? b : a;
-    MD res{bigger.m, bigger.d + smaller.d * __expf(smaller.m - bigger.m)};
-    return res;
-}
-
-template <typename T, int PAD_K, int THREADBLOCK_SIZE>
-__launch_bounds__(THREADBLOCK_SIZE) __global__
-    void beamStage1Kernel(T const* __restrict logits, T const* __restrict bias, float* __restrict pTemp,
-        int const* __restrict endIds, FinishedState const* __restrict finished, int const nV, int const nVLocal,
-        runtime::SizeType32 const* batchSlots, int dyn_smem_size)
-{
-    constexpr auto PACKED_TOP_KMD_SIZE = PAD_K * 4 + 2;
     int const nBM = gridDim.y;
     int const tid = threadIdx.x;
     int const slot = batchSlots[blockIdx.x];
-    int const section_start = nVLocal * blockIdx.z;
-    int const section_end = std::min(section_start + nVLocal, nV);
-    auto const nVOffset = (blockIdx.x * nBM + blockIdx.y) * nV;
-    int const valid_smem_length = section_end - section_start;
+    int const nVLocal = (nV + gridDim.z - 1) / gridDim.z;
+    int const indexLeft = nVLocal * blockIdx.z;
+    int const indexRight = std::min(indexLeft + nVLocal, nV);
+    int const nVOffset = (blockIdx.x * nBM + blockIdx.y) * nV;
+    int const nVChunk = indexRight - indexLeft;
     T const MAX_T_VAL = std::is_same_v<T, half> ? HALF_FLT_MAX : FLT_MAX;
 
-    // Load element from logits to smemLogProbs, doing reduce_md and argmax meanwhile
-    // Each thread is responsible for `nVLocal / THREADBLOCK_SIZE` elements
+    using KVPair = cub::KeyValuePair<int, T>;
+    using BlockReduceTopK = cub::BlockReduce<KVPair, BLOCK_SIZE>;
+    cub::ArgMax argmax;
+
+    __shared__ float smemOutput[PBM * 4];
+    __shared__ int threadToUpdate;
+    __shared__ typename BlockReduceTopK::TempStorage smemReduceBuffer;
     extern __shared__ char smem[];
     T* smemLogProbs = reinterpret_cast<T*>(smem);
 
-    MD partial_md{-MAX_T_VAL, 0.0f};
-    using KVPair = cub::KeyValuePair<int, T>;
-    KVPair topKVPairPartial{-1, -MAX_T_VAL};
-    cub::ArgMax argmax;
-
-    if (finished[slot * nBM + blockIdx.y].isFinished())
+    // Load element from logProbs to smemLogProbs and do argmax meanwhile
+    // Each thread is responsible for `nVLocal / BLOCK_SIZE` elements
+    // Dynamic shared memory size: sizeof(T) * (nV + nVPart - 1) / nVPart
+    KVPair kvLocal{-1, -MAX_T_VAL};
+    for (int i = indexLeft + tid; i < indexRight; i += BLOCK_SIZE)
     {
-        for (int i = section_start + tid; i < section_end; i += THREADBLOCK_SIZE)
-        {
-            float const val = (i == endIds[slot]) ? MAX_T_VAL : -MAX_T_VAL;
-            int const smem_index = i - section_start;
-            smemLogProbs[smem_index] = val;
-            MD const new_elem_md{val, 1.0F};
-            partial_md = reduce_md_op(partial_md, new_elem_md);
-            KVPair const new_elem_topk{smem_index, val};
-            topKVPairPartial = argmax(topKVPairPartial, new_elem_topk);
-        }
+        T const b{bias == nullptr ? (T) 0.0f : bias[i]};
+        int const index = i - indexLeft;
+        T const value = (finished[slot * nBM + blockIdx.y].isFinished()) ? (i == endIds[slot] ? MAX_T_VAL : -MAX_T_VAL)
+                                                                         : (logProbs[nVOffset + i] + b);
+        smemLogProbs[index] = value;
+        kvLocal = argmax(kvLocal, {index, value});
     }
-    else
-    {
-        for (int i = section_start + tid; i < section_end; i += THREADBLOCK_SIZE)
-        {
-            T const b = bias == nullptr ? (T) 0.0f : bias[i];
-            T const val = logits[nVOffset + i] + b;
-            int const smem_index = i - section_start;
-            smemLogProbs[smem_index] = val;
-            MD new_elem_md{val, 1.0F};
-            partial_md = reduce_md_op(partial_md, new_elem_md);
-            KVPair new_elem_topk{smem_index, val};
-            topKVPairPartial = argmax(topKVPairPartial, new_elem_topk);
-        }
-    }
-
     __syncthreads();
 
     // Search the top 2K elements among `nVLocal` elements of this ThreadBlock and write into smemOutput
-    __shared__ float smemOutput[PACKED_TOP_KMD_SIZE];
-    __shared__ int threadToUpdate;
-
-    using BlockReduceMD = cub::BlockReduce<MD, THREADBLOCK_SIZE>;
-    using BlockReduceTopK = cub::BlockReduce<KVPair, THREADBLOCK_SIZE>;
-
-    __shared__ union
-    {
-        typename BlockReduceTopK::TempStorage topk;
-        typename BlockReduceMD::TempStorage md;
-    } smemReduceBuffer;
-
     for (int i = 0; i < 2 * nBM; ++i)
     {
         // Pop the element with largest value to "smemOutput" per iteration
-        KVPair topKVPair = BlockReduceTopK(smemReduceBuffer.topk).Reduce(topKVPairPartial, argmax);
+        KVPair kv = BlockReduceTopK(smemReduceBuffer).Reduce(kvLocal, argmax);
         if (tid == 0)
         {
-            int const index = nVOffset + section_start + topKVPair.key;
+            int const index = nVOffset + indexLeft + kv.key;
             reinterpret_cast<int*>(smemOutput)[i] = index;
-            smemOutput[PAD_K * 2 + i] = topKVPair.value;
-            smemLogProbs[topKVPair.key] = -MAX_T_VAL; // pollute the value of the popped element
-            threadToUpdate = topKVPair.key % THREADBLOCK_SIZE;
+            smemOutput[PBM * 2 + i] = kv.value;
+            smemLogProbs[kv.key] = -MAX_T_VAL; // Invalidate the value of the popped element
+            threadToUpdate = kv.key % BLOCK_SIZE;
         }
         __syncthreads();
 
         if (tid == threadToUpdate && i < 2 * nBM - 1)
         {
-            // The thread popped the element need to update its topKVPairPartial
+            // The thread popped the element need to update its kvLocal
             // No need to do this in the last iteration
-            topKVPairPartial.key = nV - 1;
-            topKVPairPartial.value = -MAX_T_VAL;
-            for (int index = tid; index < valid_smem_length; index += THREADBLOCK_SIZE)
+            kvLocal.key = nV - 1;
+            kvLocal.value = -MAX_T_VAL;
+            for (int index = tid; index < nVChunk; index += BLOCK_SIZE)
             {
-                topKVPairPartial = argmax(topKVPairPartial, {index, smemLogProbs[index]});
+                kvLocal = argmax(kvLocal, {index, smemLogProbs[index]});
             }
         }
-
-        // Sync due to threadToUpdate RAW dependency
         __syncthreads();
     }
-
-    // Do reduce_md among the top 2K elements in the smemOutput and write into tail of smemOutput
-    MD total_md = BlockReduceMD(smemReduceBuffer.md).Reduce(partial_md, reduce_md_op);
-    if (tid == 0)
+    // Write the smemOutput into pStage3
+    pStage3 += (blockIdx.x * nBM + blockIdx.y) * gridDim.z * PBM * 4 + blockIdx.z * PBM * 4;
+    for (int i = tid; i < PBM * 4; i += BLOCK_SIZE)
     {
-        smemOutput[PAD_K * 4] = total_md.d;
-        smemOutput[PAD_K * 4 + 1] = total_md.m;
-    }
-    __syncthreads();
-
-    // Write the smemOutput into pTemp
-    float* local_temp_buffer
-        = pTemp + (blockIdx.x * nBM + blockIdx.y) * PACKED_TOP_KMD_SIZE * gridDim.z + blockIdx.z * PACKED_TOP_KMD_SIZE;
-    for (int i = tid; i < PACKED_TOP_KMD_SIZE; i += THREADBLOCK_SIZE)
-    {
-        local_temp_buffer[i] = smemOutput[i];
+        pStage3[i] = smemOutput[i];
     }
 }
 
-template <typename T, int PAD_K, int THREADBLOCK_SIZE, bool IS_FAST_KERNEL>
-__launch_bounds__(THREADBLOCK_SIZE) __global__
-    void beamStage2Kernel(int* __restrict pTempId, T* __restrict pTempVal, float* __restrict pTemp,
+template <typename T, int PBM, int BLOCK_SIZE, bool IS_FAST>
+__launch_bounds__(BLOCK_SIZE) __global__
+    void beamStage2Kernel(int* __restrict pStage2Ids, T* __restrict pStage2LogProbs, float* __restrict pStage3,
         float const* __restrict cumLogProbs, runtime::SizeType32 const* batchSlots, int const nV, int const nVPart)
 {
-    constexpr int PACKED_TOP_KMD_SIZE = PAD_K * 4 + 2;
-    auto const nBM = gridDim.y;
-    auto const gbid = blockIdx.x * gridDim.y + blockIdx.y;
+    int const nBM = gridDim.y;
+    int const gbid = blockIdx.x * gridDim.y + blockIdx.y;
     int const tid = threadIdx.x;
-    auto const slot = batchSlots[blockIdx.x];
+    int const slot = batchSlots[blockIdx.x];
     T const MAX_T_VAL = std::is_same_v<T, half> ? HALF_FLT_MAX : FLT_MAX;
 
     using KVPair = cub::KeyValuePair<int, T>;
-    using BlockReduceTopK = cub::BlockReduce<KVPair, THREADBLOCK_SIZE>;
-    using BlockReduceMD = cub::BlockReduce<MD, THREADBLOCK_SIZE>;
-
-    __shared__ KVPair buf_smem_kv[PAD_K * 2];
-
-    __shared__ union
-    {
-        typename BlockReduceTopK::TempStorage topk;
-        typename BlockReduceMD::TempStorage md;
-
-    } smemReduceBuffer;
-
+    using BlockReduceTopK = cub::BlockReduce<KVPair, BLOCK_SIZE>;
     cub::ArgMax argmax;
-    MD partial_md{-MAX_T_VAL, 0.0f};
-    KVPair topKVPair{nV - 1, -MAX_T_VAL};
 
-    // Load and unpack into registers through smem
-    float* localTempBuffer = pTemp + PACKED_TOP_KMD_SIZE * gbid * nVPart;
-    if constexpr (IS_FAST_KERNEL) // Use share memory instead of global memory
+    __shared__ KVPair smemOutput[PBM * 2];
+    __shared__ typename BlockReduceTopK::TempStorage smemReduceBuffer;
+
+    // Load data from stage 1
+    float* pStage2Temp = pStage3 + PBM * 4 * gbid * nVPart;
+    if constexpr (IS_FAST)
     {
+        // Use shared memory instead of global memory
         extern __shared__ char smem[];
         float* smemVal = reinterpret_cast<float*>(smem);
-        for (int idx = tid; idx < PACKED_TOP_KMD_SIZE * nVPart; idx += THREADBLOCK_SIZE)
+        for (int idx = tid; idx < PBM * 4 * nVPart; idx += BLOCK_SIZE)
         {
-            smemVal[idx] = localTempBuffer[idx];
+            smemVal[idx] = pStage2Temp[idx];
         }
-        localTempBuffer = smemVal;
+        pStage2Temp = smemVal;
         __syncthreads();
     }
 
     // Find the top 2K across all nVPart
     for (int k = 0; k < 2 * nBM; ++k)
     {
-        KVPair topKVPairPartial{nV - 1, -MAX_T_VAL};
-        // Only threads responsible for a chunk will do the computation
+        KVPair kvLocal{nV - 1, -MAX_T_VAL};
         if (tid < nVPart)
         {
             for (int i = 0; i < 2 * nBM; ++i)
             {
-                int const current_index = tid * PACKED_TOP_KMD_SIZE + i;
-                T topValue = localTempBuffer[current_index + PAD_K * 2];
-                topKVPairPartial = argmax(topKVPairPartial, {current_index, topValue});
+                int const index = tid * PBM * 4 + i;
+                T const topValue = pStage2Temp[index + PBM * 2];
+                kvLocal = argmax(kvLocal, {index, topValue});
             }
         }
-
-        KVPair topKVPair = BlockReduceTopK(smemReduceBuffer.topk).Reduce(topKVPairPartial, argmax);
-        __syncthreads();
-
+        KVPair kv = BlockReduceTopK(smemReduceBuffer).Reduce(kvLocal, argmax);
         if (tid == 0)
         {
-            // Store kv pairs in shared mem buffer
-            int temp_offset = topKVPair.key;
-            int global_offset = reinterpret_cast<int*>(localTempBuffer)[temp_offset];
-            topKVPair.key = global_offset;
-            buf_smem_kv[k] = topKVPair;
-
+            // Replace local offset into global offset and store kv pairs in shared memory
+            int const offsetLocal = kv.key;
+            kv.key = reinterpret_cast<int*>(pStage2Temp)[offsetLocal];
+            smemOutput[k] = kv;
             // Invalidate the maximum value within the chunk
-            reinterpret_cast<int*>(localTempBuffer)[temp_offset] = nV - 1; // id in share memory
-            localTempBuffer[temp_offset + PAD_K * 2] = -MAX_T_VAL;         // value in share memory
+            reinterpret_cast<int*>(pStage2Temp)[offsetLocal] = nV - 1; // id in shared memory
+            pStage2Temp[offsetLocal + PBM * 2] = -MAX_T_VAL;           // value in shared memory
         }
         __syncthreads();
     }
-
-    // Extract and reduce MD values across the chunks
-    if (tid < nVPart)
-    {
-        partial_md.d = localTempBuffer[tid * PACKED_TOP_KMD_SIZE + PAD_K * 4];
-        partial_md.m = localTempBuffer[tid * PACKED_TOP_KMD_SIZE + PAD_K * 4 + 1];
-    }
-    __syncthreads();
-
-    MD total_md = BlockReduceMD(smemReduceBuffer.md).Reduce(partial_md, reduce_md_op);
-
     if (tid == 0)
     {
-        float d_total_log = logf(total_md.d);
-        auto const cumLogProbsValue = cumLogProbs[slot * nBM + blockIdx.y];
-
+        auto const cumLogProb = cumLogProbs[slot * nBM + blockIdx.y];
         for (int i = 0; i < 2 * nBM; ++i)
         {
-            float val = (float) buf_smem_kv[i].value;
-            // Old version (do softmax in `beamStage*Kernel`) is below
-            // We reserve this because we do not know whether HF will unify its workflow as simpling
-            // float val = (float) buf_smem_kv[i].value - total_md.m - d_total_log;
-            pTempId[gbid * 2 * nBM + i] = buf_smem_kv[i].key;
-            pTempVal[gbid * 2 * nBM + i] = val + cumLogProbsValue;
+            pStage2Ids[gbid * 2 * nBM + i] = smemOutput[i].key;
+            pStage2LogProbs[gbid * 2 * nBM + i] = (float) smemOutput[i].value + cumLogProb;
         }
     }
 }
 
-template <typename T, int PAD_K, int THREADBLOCK_SIZE, bool IS_FAST_KERNEL>
-__launch_bounds__(THREADBLOCK_SIZE) __global__ void beamStage3Kernel(
-    int const* __restrict pTempId, T const* __restrict pTempVal, float* __restrict pTemp, BeamHypotheses bh)
+template <typename T, int PBM, int BLOCK_SIZE, bool IS_FAST, bool IS_V2>
+__launch_bounds__(BLOCK_SIZE) __global__ void beamStage3Kernel(
+    int const* __restrict pStage2Ids, T const* __restrict pStage2LogProbs, float* __restrict pStage3, BeamHypotheses bh)
 {
+    T const MAX_T_VAL = std::is_same_v<T, half> ? HALF_FLT_MAX : FLT_MAX;
     int const bid = blockIdx.x; // Index of Batch
     int const tid = threadIdx.x;
-    auto const slot = bh.batchSlots[bid];
-    int const nMBS{bh.nMaxBatchSize};    // Only for bh.logProbsTiled
-    int const nBM{bh.nBeamWidth};
-    int const nCandidate{nBM * nBM * 2}; // Keep top 2K candidates from each beam output
-    int const nV{bh.nVocabSize};
+    int const slot = bh.batchSlots[bid];
+    size_t const nMBS{bh.nMaxBatchSize}; // Only for bh.logProbsTiled
+    size_t const nBM{bh.nBeamWidth};
+    size_t const nV{bh.nVocabSize};
     float const diversityRate{bh.diversityRates[slot]};
     float const lengthPenalty{bh.lengthPenalties[slot]};
     int const earlyStopping{bh.earlyStoppings[slot]};
 
-    T const MAX_T_VAL = std::is_same_v<T, half> ? HALF_FLT_MAX : FLT_MAX;
-
-    __shared__ int nBeamForNextStep; // Only used by thread of tid == 0
-    __shared__ float smemCumLogProbs[PAD_K];
-
-    if (tid == 0)
-    {
-        nBeamForNextStep = 0;
-    }
-    if (tid < nBM)
-    {
-        smemCumLogProbs[tid] = bh.cumLogProbs[slot * nBM + tid];
-    }
-    __syncthreads();
+    using KVPair = cub::KeyValuePair<int, T>;
+    __shared__ float smemCumLogProbs[PBM];
+    __shared__ int smemSeqLen[PBM];
+    __shared__ KVPair smemTopKV[(IS_V2) ? 1 : PBM * 2]; // Just a placeholder in V2 workflow
 
     if (bh.numBeamsCBA != nullptr)
     {
@@ -323,77 +224,103 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void beamStage3Kernel(
         }
     }
 
-    // Get top 2K tokens from candidates
-    pTempId += bid * nCandidate;
-    pTempVal += bid * nCandidate;
-
-    using KVPair = cub::KeyValuePair<int, T>;
-    KVPair topKVPairPartial{nCandidate - 1, -MAX_T_VAL};
-    cub::ArgMax argmax;
-    extern __shared__ char smem[];
-    T* smemVal = nullptr;
-    if constexpr (IS_FAST_KERNEL)
+    // Skip this TopK in V2 workflow.
+    if constexpr (IS_V2)
     {
-        smemVal = reinterpret_cast<T*>(smem);
+        pStage2Ids += bid * nBM * 2;
+        pStage2LogProbs += bid * nBM * 2;
     }
     else
     {
-        smemVal = reinterpret_cast<T*>(pTemp);
-    }
-
-    for (int i = tid; i < nCandidate; i += THREADBLOCK_SIZE)
-    {
-        int const index = bh.numBeamsCBA == nullptr ? i % nBM : i / 2 / nBM;
-        T const val = pTempVal[i] + static_cast<T>(diversityRate * index);
-        topKVPairPartial = argmax(topKVPairPartial, {i, val});
-        smemVal[i] = val;
-    }
-    __syncthreads();
-
-    using BlockReduce = cub::BlockReduce<KVPair, THREADBLOCK_SIZE>;
-    __shared__ typename BlockReduce::TempStorage smemReduceBuffer;
-    __shared__ KVPair smemTopKV[PAD_K * 2];
-    __shared__ int threadToUpdate;
-
-    for (int i = 0; i < 2 * nBM; ++i)
-    {
-        KVPair topKVPair = BlockReduce(smemReduceBuffer).Reduce(topKVPairPartial, argmax);
-        if (tid == 0)
+        int const nCandidate = nBM * nBM * 2;
+        pStage2Ids += bid * nCandidate;
+        pStage2LogProbs += bid * nCandidate;
+        KVPair kvLocal{nCandidate - 1, -MAX_T_VAL};
+        cub::ArgMax argmax;
+        extern __shared__ char smem[];
+        T* smemVal = nullptr;
+        if constexpr (IS_FAST)
         {
-            smemTopKV[i] = topKVPair;
-            smemVal[topKVPair.key] = -MAX_T_VAL;
-            threadToUpdate = topKVPair.key % THREADBLOCK_SIZE;
+            smemVal = reinterpret_cast<T*>(smem);
+        }
+        else
+        {
+            smemVal = reinterpret_cast<T*>(pStage3);
+        }
+
+        for (int i = tid; i < nCandidate; i += BLOCK_SIZE)
+        {
+            int const index = bh.numBeamsCBA == nullptr ? i % nBM : i / 2 / nBM;
+            T const value = pStage2LogProbs[i] + static_cast<T>(diversityRate * index);
+            kvLocal = argmax(kvLocal, {i, value});
+            smemVal[i] = value;
         }
         __syncthreads();
-        // Only one thread needs to update the old partial before the next block reduce.
-        // No need to do this in the last iteration.
-        if (tid == threadToUpdate && i < 2 * nBM - 1)
+
+        using BlockReduce = cub::BlockReduce<KVPair, BLOCK_SIZE>;
+        __shared__ typename BlockReduce::TempStorage smemReduceBuffer;
+        __shared__ int threadToUpdate;
+
+        for (int i = 0; i < 2 * nBM; ++i)
         {
-            topKVPairPartial.key = nCandidate - 1;
-            topKVPairPartial.value = -MAX_T_VAL;
-            for (int index = tid; index < nCandidate; index += THREADBLOCK_SIZE)
+            KVPair kv = BlockReduce(smemReduceBuffer).Reduce(kvLocal, argmax);
+            if (tid == 0)
             {
-                topKVPairPartial = argmax(topKVPairPartial, {index, smemVal[index]});
+                smemTopKV[i] = kv;
+                smemVal[kv.key] = -MAX_T_VAL;
+                threadToUpdate = kv.key % BLOCK_SIZE;
+            }
+            __syncthreads();
+            // Only one thread needs to update the old partial before the next block reduce.
+            // No need to do this in the last iteration.
+            if (tid == threadToUpdate && i < 2 * nBM - 1)
+            {
+                kvLocal.key = nCandidate - 1;
+                kvLocal.value = -MAX_T_VAL;
+                for (int index = tid; index < nCandidate; index += BLOCK_SIZE)
+                {
+                    kvLocal = argmax(kvLocal, {index, smemVal[index]});
+                }
             }
         }
     }
 
+    if (tid < nBM) // Prepare cumLogProbs for later use
+    {
+        smemCumLogProbs[tid] = bh.cumLogProbs[slot * nBM + tid];
+    }
+    __syncthreads();
+
     if (tid == 0)
     {
+        int nBeamForNextStep{0};
         // Select finished beams into CBA or select tokens for next step sequentially
         // Reference (might be changed along HF in the future):
         // https://github.com/huggingface/transformers/blob/main/src/transformers/generation/beam_search.py#L272
         for (int i = 0; i < 2 * nBM; ++i)
         {
-            int const topKey = smemTopKV[i].key;
-            T const topValue = smemTopKV[i].value;
-            bool const isEndToken = pTempId[topKey] % nV == bh.endIds[slot];
+            int topId;
+            T topLogProb;
+            if constexpr (IS_V2)
+            {
+                // Get top token and correspongding logProb sequentially from pStage2Ids / pStage2LogProbs
+                topId = pStage2Ids[i];
+                topLogProb = pStage2LogProbs[i];
+            }
+            else
+            {
+                // Get top token and correspongding logProb by index of smemTopKV
+                int const key = smemTopKV[i].key;
+                topId = pStage2Ids[key];
+                topLogProb = pStage2LogProbs[key];
+            }
+            bool const isEndToken = (topId % nV == bh.endIds[slot]);
             if (i < nBM && bh.numBeamsCBA != nullptr && isEndToken)
             {
                 // Condition of this branch
                 // This token is end-token and belongs to top nBM range in Beam search mode
                 int const nSeqLen = bh.sequenceLengths[slot * nBM + i] + 1 - bh.inputLengths[slot * nBM + i];
-                float const score = applyLengthPenalty(topValue, nSeqLen, lengthPenalty);
+                float const score = applyLengthPenalty(topLogProb, nSeqLen, lengthPenalty);
                 int nCBA = bh.numBeamsCBA[slot];
                 if (nCBA == nBM)
                 {
@@ -436,14 +363,13 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void beamStage3Kernel(
                 }
                 // Copy finished beam from work tree to CBA
                 // The last token
-                int indexPrev = (pTempId[topKey] / nV) % nBM;
+                int indexPrev = (topId / nV) % nBM;
                 int const step = bh.sequenceLengths[slot * nBM + indexPrev];
                 int const offsetCBA = (slot * nBM * 2 + nCBA) * bh.nMaxSeqLen;
                 bh.outputIdsCBA[offsetCBA + step] = bh.endIds[slot];
                 if (bh.logProbsCBA != nullptr)
                 {
-                    bh.logProbsCBA[offsetCBA + step]
-                        = (float) pTempVal[topKey] - smemCumLogProbs[(pTempId[topKey] / nV) % nBM];
+                    bh.logProbsCBA[offsetCBA + step] = (float) topLogProb - smemCumLogProbs[(topId / nV) % nBM];
                 }
                 // Previous tokens
                 for (int j = step - 1; j >= 0; j--)
@@ -453,7 +379,7 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void beamStage3Kernel(
                 }
                 if (bh.logProbsCBA != nullptr && bh.logProbsTiled != nullptr)
                 {
-                    indexPrev = (pTempId[topKey] / nV) % nBM;
+                    indexPrev = (topId / nV) % nBM;
                     for (int j = step - 1; j >= 0; j--)
                     {
                         int const index = (j * nMBS + slot) * nBM + indexPrev;
@@ -467,7 +393,7 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void beamStage3Kernel(
                 bh.normedScoresCBA[index] = score;
                 bh.minNormedScoresCBA[slot] = min(bh.minNormedScoresCBA[slot], bh.normedScoresCBA[index]);
                 bh.numBeamsCBA[slot]++;
-                bh.cumLogProbsCBA[index] = (float) pTempVal[topKey];
+                bh.cumLogProbsCBA[index] = (float) topLogProb;
             }
             else if (i < nBM || bh.numBeamsCBA != nullptr && !isEndToken)
             {
@@ -477,14 +403,14 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void beamStage3Kernel(
                 // 3. bh.numBeamsCBA != nullptr && i >= nBM && isEndToken == false, i.e., add token at the end
                 int const step = bh.sequenceLengths[slot * nBM + nBeamForNextStep];
                 // Copy the selected token to work tree
-                bh.outputIdsPtr[slot][nBeamForNextStep * bh.nMaxSeqLen + step] = pTempId[topKey];
+                bh.outputIdsPtr[slot][nBeamForNextStep * bh.nMaxSeqLen + step] = topId;
                 if (bh.logProbsTiled != nullptr)
                 {
                     int const index = step * nMBS * nBM + slot * nBM + nBeamForNextStep;
-                    int const indexBeam = pTempId[topKey] / nV % nBM;
-                    bh.logProbsTiled[index] = (float) pTempVal[topKey] - smemCumLogProbs[indexBeam];
+                    int const indexBeam = topId / nV % nBM;
+                    bh.logProbsTiled[index] = (float) topLogProb - smemCumLogProbs[indexBeam];
                 }
-                bh.cumLogProbs[slot * nBM + nBeamForNextStep] = (float) pTempVal[topKey];
+                bh.cumLogProbs[slot * nBM + nBeamForNextStep] = (float) topLogProb;
                 nBeamForNextStep++;
             }
             else
@@ -524,7 +450,7 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void beamStage3Kernel(
         {
             // enough beams in NonEarlyStopping mode
             int nSeqLen = bh.sequenceLengths[slot * nBM] + 1 - bh.inputLengths[slot * nBM];
-            float const bestCumLogProbs = smemTopKV[0].value;
+            float const bestCumLogProbs = (IS_V2) ? pStage2LogProbs[0] : smemTopKV[0].value;
             // According to semantics of HF, smemTopKV[0].value is used as bestCumLogProbs
             // But maybe bh.cumLogProbs[slot * nBM + i] is more suitable?
             // https://github.com/huggingface/transformers/blob/main/src/transformers/generation/beam_search.py#L307
@@ -540,7 +466,6 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void beamStage3Kernel(
     __syncthreads();
 
     // Update sequenceLengths, parentIdsPtr, outputIdsPtr and finished
-    __shared__ int smemSeqLen[PAD_K];
     if (tid < nBM)
     {
         smemSeqLen[tid] = bh.sequenceLengths[slot * nBM + tid];
@@ -575,179 +500,204 @@ __launch_bounds__(THREADBLOCK_SIZE) __global__ void beamStage3Kernel(
     }
 }
 
-#define BEAM_STAGE2_KERNEL(N_VOCAB_PART, IS_FAST_KERNEL)                                                               \
+#define BEAM_STAGE2_KERNEL(N_VOCAB_PART, IS_FAST)                                                                      \
     {                                                                                                                  \
-        if (IS_FAST_KERNEL && nShareMemory > (48 << 10))                                                               \
+        if (IS_FAST && nByteRuntimeSharedMemory > (48 << 10))                                                          \
         {                                                                                                              \
-            TLLM_CUDA_CHECK(cudaFuncSetAttribute(beamStage2Kernel<T, PAD_K, N_VOCAB_PART, IS_FAST_KERNEL>,             \
-                cudaFuncAttributeMaxDynamicSharedMemorySize, nShareMemory));                                           \
+            TLLM_CUDA_CHECK(cudaFuncSetAttribute(beamStage2Kernel<T, PBM, N_VOCAB_PART, IS_FAST>,                      \
+                cudaFuncAttributeMaxDynamicSharedMemorySize, nByteRuntimeSharedMemory));                               \
         }                                                                                                              \
-        beamStage2Kernel<T, PAD_K, N_VOCAB_PART, IS_FAST_KERNEL>                                                       \
-            <<<dim3(nBS, nBM), N_VOCAB_PART, IS_FAST_KERNEL * nShareMemory, stream>>>(                                 \
-                pTempId, pTempVal, pTemp, bh.cumLogProbs, batchSlots, nV, nVPart);                                     \
+        beamStage2Kernel<T, PBM, N_VOCAB_PART, IS_FAST>                                                                \
+            <<<dim3(nBS, nBM), N_VOCAB_PART, IS_FAST * nByteRuntimeSharedMemory, stream>>>(                            \
+                pStage2Ids, pStage2LogProbs, pStage3, bh.cumLogProbs, bh.batchSlots, nV, nVPart);                      \
     }
 
-template <typename T, int PAD_K>
-void topKSoftMaxKernelLauncher(T const* logits, T const* bias, void* workspace, BeamHypotheses& bh, cudaStream_t stream)
+template <typename T, int PBM, bool IS_V2>
+void beamSearchKernelLauncher(
+    T const* logProbs, T const* bias, void* workspace, BeamHypotheses& bh, cudaStream_t stream)
 {
-    // Workflow of this function (reference: https://github.com/NVIDIA/online-softmax)
-    // Using batch_size (BS) = 2, beam_width (BM) = 5, vocab_size (V) = vocan_size_padded (VP) = 32000 as an example:
-    // nPaddedBeamWidth (PAD_K) = 2 ^ ceil(log(BM)) = 8
-    // logits.shape = [BS, BM, V]
-    // nBlockSize = 128, nVPart = 13, nVocabChunk = 2462 = ceil(32000/13)
+    // clang-format off
+    //
+    // V1 Workflow (reference: https://github.com/NVIDIA/online-softmax):
+    // logProbs.shape = [nBS, nBM, nV]
+    //          nV               |<- nVChunk ->|<- nVChunk ->| <- ... ->|          |<- nBM*4 ->|<- nBM*4 ->|<- ... ->|*
+    //     ┏━━━━━━━━━━┓          ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓          ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+    //     ┃nBM       ┃          ┃nBM                                   ┃          ┃nBM                              ┃
+    //     ┣━━━━━━━━━━┫          ┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫  A       ┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫
+    // nBS ┃nBM       ┃ ---> nBS ┃nBM                                   ┃ ---> nBS ┃nBM                              ┃
+    //     ┣━━━━━━━━━━┫          ┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫          ┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫
+    //     ┃nBM       ┃          ┃nBM                                   ┃          ┃nBM                              ┃
+    //     ┗━━━━━━━━━━┛          ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛          ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+    //       logProbs            divide `nV` elements into `nVPart` parts          pStage3 with `nVPart` tiles per row
+    //
+    //          |<- nBm*2 ->|  |<- nBm*2 ->|
+    //          ┏━━━━━━━━━━━┓  ┏━━━━━━━━━━━┓
+    //          ┃nBM        ┃  ┃nBM        ┃
+    //  B       ┣━━━━━━━━━━━┫  ┣━━━━━━━━━━━┫  C
+    // ---> nBS ┃nBM        ┃  ┃nBM        ┃ --->
+    //          ┣━━━━━━━━━━━┫  ┣━━━━━━━━━━━┫
+    //          ┃nBM        ┃  ┃nBM        ┃
+    //          ┗━━━━━━━━━━━┛  ┗━━━━━━━━━━━┛
+    //            pStage2Ids  pStage2LogProbs
+    //
+    // *: Each "tile" in pStage3 with shape [`nBM*4`] contains `nBM*2` top ids and corresponding `nBM*2` log probs.
+    //     |<- nBm*2 ->|<- nBm*2 ->|
+    //     ┏━━━━━━━━━━━━━━━━━━━━━━━┓
+    //   1 ┃  top ids  | log probs ┃
+    //     ┗━━━━━━━━━━━━━━━━━━━━━━━┛
 
-    // The content of workspace (length aligned to 4):
-    //             | allocated size                         | used size                         | data type |
-    // ┏━━━━━━━━━━┓ -----------------------------------------------------------------------------------------
-    // ┃ pTempId  ┃ BS * PAD_K * PAD_K * 2                  | BS * BM * BM * 2                  |    int    |
-    // ┣━━━━━━━━━━┫ -----------------------------------------------------------------------------------------
-    // ┃ pTempVal ┃ BS * PAD_K * PAD_K * 2                  | BS * BM * BM * 2                  |   float   |
-    // ┣━━━━━━━━━━┫ -----------------------------------------------------------------------------------------
-    // ┃ pTemp    ┃ BS * PAD_K * VP * (2 * (PAD_K * 2) + 2) | BS * BM * VP * (2 * (BM * 2) + 2) |   float   |
-    // ┗━━━━━━━━━━┛ -----------------------------------------------------------------------------------------
+    // A: beamStage1Kernel: gridDim(BS,BM,nVPart), blockDim(nThreadStage1,1,1)
+    //                      Each Block takes `nVChunk` contiguous elements from `logProbs`, does TopK and writes output to `pStage3`
+    // B: beamStage2Kernel: gridDim(BS,BM,1), blockDim(32/64/128,1,1)
+    //                      Each Block takes `nVPart` contiguous tiles from pStage3, add `cumLogProbs`, does TopK` and writes output to `pStage2Ids` and `pStage2LogProbs`
+    // C: beamStage3Kernel: gridDim(BS,1,1), blockDim(128,1,1)
+    //                      Main logic of Beam-Search, each Block is responsible for one batch, doing work below:
+    //                          + moves one beam into candidate-beam-array if it is finished (gemerated end_id in this step).
+    //                          + selects BM elements for the next generation step if not.
+    //                          + maintains related score array, min_normed_score / batchDones / finished, etc..
+    //
+    // ===================================================================================================================================
+    //
+    // V2 Workflow (use Air-TopK for better performance, https://dl.acm.org/doi/pdf/10.1145/3581784.3607062)
+    // logProbs.shape = [nBS, nBM, nV]
+    //     |<- nV ->|          |<- nBM*2 ->|  |<- nBM*2 ->|          |<- nBM*2 ->|          |<- nBM*2 ->|          |<- nBM*2 ->|
+    //     ┏━━━━━━━━┓          ┏━━━━━━━━━━━┓  ┏━━━━━━━━━━━┓          ┏━━━━━━━━━━━┓          ┏━━━━━━━━━━━┓  D       ┏━━━━━━━━━━━┓
+    //     ┃nBM     ┃          ┃nBM        ┃  ┃nBM        ┃          ┃nBM        ┃      nBS ┃           ┃ ---> nBS ┃           ┃ ---\
+    //     ┣━━━━━━━━┫  A       ┣━━━━━━━━━━━┫  ┣━━━━━━━━━━━┫  B       ┣━━━━━━━━━━━┫  C       ┗━━━━━━━━━━━┛          ┗━━━━━━━━━━━┛    | E
+    // nBS ┃nBM     ┃ ---> nBS ┃nBM        ┃  ┃nBM        ┃ ---> nBS ┃nBM        ┃ --->       pStage2Id              pStage2Id      |--->
+    //     ┣━━━━━━━━┫          ┣━━━━━━━━━━━┫  ┣━━━━━━━━━━━┫          ┣━━━━━━━━━━━┫          ┏━━━━━━━━━━━┓                           |
+    //     ┃nBM     ┃          ┃nBM        ┃  ┃nBM        ┃          ┃nBM        ┃      nBS ┃           ┃ --------------------------/
+    //     ┗━━━━━━━━┛          ┗━━━━━━━━━━━┛  ┗━━━━━━━━━━━┛          ┗━━━━━━━━━━━┛          ┗━━━━━━━━━━━┛
+    //      logProbs             pStage1Id     pStage1Probs           pStage1Probs           pStage2Probs
+    //
+    // A: TopK            : Get top `nBM*2` elements in `nBS*nBM` groups (`nV` elements per group)
+    // B: addCumLogProbs  : Add `cumLogProbs` to the elements in each beam
+    // C: TopK            : Get top `nBM*2` elements in `nBS` group (`nBM*nBM*2` elements per group)
+    // D: gatherIds       : Combine stage1Id and stage2Id to get ids of the top `nBM*2` elements in input logProbs
+    // E: beamStage3Kernel: Main logic of Beam-Search, each Block is responsible for one batch, doing work below:
+    //                          + moves one beam into candidate-beam-array if it is finished (gemerated end_id in this step).
+    //                          + selects BM elements for the next generation step if not.
+    //                          + maintains related score array, min_normed_score / batchDones / finished, etc..
+    //
+    // clang-format on
 
-    // Stage 1 (beamStage1Kernel): gridDim(BS,BM,nVPart), blockDim(nBlockSize,1,1)
-    // Each ThreadBlock takes `nVocabChunk` contiguous elements in logits to do TopK and reduce_md,
-    //   then writes output into pTemp.
-    // At end of this kernel, each ThreadBlock holds the indices and values of the top 2*BM elements,
-    //   as well as the m(x) and l(x) of those elements (see paper of Flash Attention, arXiv:2205.14135)
-    // pTemp.shape = [BS * BM, nVPart, PAD_K * 4 + 2]
+    size_t const nBS{bh.nBatchSize};
+    size_t const nBM{bh.nBeamWidth};
+    size_t const nV{bh.nVocabSize};
+    size_t const nVPart{bh.nVPart};
+    size_t const nByteMaxSharedMemoryPerBlock{bh.nByteMaxSharedMemoryPerBlock};
+    int* pStage2Ids{nullptr};
+    T* pStage2LogProbs{nullptr};
+    float* pStage3{nullptr};
 
-    // The content of the last dimension of pTemp (updated by each ThreadBlock, we call it "Tile"):
-    //             | allocated size | used size | data type |
-    // ┏━━━━━━━━━━┓ -----------------------------------------
-    // ┃ topk_id  ┃ PAD_K * 2       | BM * 2    |    int    |
-    // ┣━━━━━━━━━━┫ -----------------------------------------
-    // ┃ topk_val ┃ PAD_K * 2       | BM * 2    |   float   |
-    // ┣━━━━━━━━━━┫ -----------------------------------------
-    // ┃    md    ┃ 2               | 2         |   float   |
-    // ┗━━━━━━━━━━┛ -----------------------------------------
-
-    // Stage 2 (beamStage2Kernel): gridDim(BS,BM,1), blockDim(32/64/128,1,1)
-    // Each TheadBlock takes `nVPart` contiguous Tiles in pTemp to do reduce_topk and reduce_md,
-    //   writes output topk_id into in pTempId, writes topk_value + cumLogProbs into pTempVal.
-
-    // Stage 3 (beamStage3Kernel): gridDim(BS,1,1), blockDim(128,1,1)
-    // Each TheadBlock is responsible for one batch, doing work below:
-    //   + moves one beam into candidate-beam-array if it is finished (gemerated end_id in this step).
-    //   + selects BM elements for the next generation step if not.
-    //   + maintains related score array, min_normed_score / batchDones / finished, etc..
-
-    int constexpr nBlockSize = (PAD_K < 16) ? ((PAD_K < 8) ? nBlockSizeForSmallBeamWidth : 128) : 64;
-    int const nBS{bh.nBatchSize};
-    int const nBM{bh.nBeamWidth};
-    int const nV{bh.nVocabSize};
-    int const* endIds{bh.endIds};
-    runtime::SizeType32 const* batchSlots{bh.batchSlots};
-    FinishedState const* finished{bh.finished};
-
-    int const offset = roundUp(nBS * nBM * nBM * 2, 4);
-    int* pTempId = reinterpret_cast<int*>(workspace);
-    T* pTempVal = reinterpret_cast<T*>(pTempId + offset);
-    float* pTemp = reinterpret_cast<float*>(pTempVal + offset); // Pure scratch workspace
-
-    // Upper limit count of ThreadBlock, gotten by using no share memory
-    int max_active_blocks = -1;
-    TLLM_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &max_active_blocks, beamStage1Kernel<T, 2 * PAD_K, nBlockSize>, nBlockSize, 0));
-
-    // Find the max smem on the device and use that to determine the vocab parts in the best case.
-    int max_smem_per_sm = -1;
-    int max_smem_per_block = -1;
-    int const device = tensorrt_llm::common::getDevice();
-    TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&max_smem_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device));
-    TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
-    cudaFuncAttributes attr;
-    TLLM_CUDA_CHECK(cudaFuncGetAttributes(&attr, beamStage1Kernel<T, 2 * PAD_K, nBlockSize>));
-
-    // One ThreadBlock must at least have share memory of `sizeof(T) * nV / nMaxVocabPartForStage1FastKernel` bytes
-    int const static_smem = attr.sharedSizeBytes;
-    int const max_dyn_smem_per_block = max_smem_per_block - static_smem;
-    TLLM_CHECK_WITH_INFO(sizeof(T) * nV <= max_dyn_smem_per_block * nMaxVocabPartForStage1FastKernel,
-        "Vocab size is too large for split-k TopK beam search fast path.");
-
-    // Find the maximum of ThreadBlock (maximum of nVPart, minimum of smem),
-    // satisfying nVPart <= nMaxVocabPartForStage1FastKernel && dyn_smem_size * nVPart >= sizeof(T) * nV
-    int const driver_smem_per_block = max_smem_per_sm - max_smem_per_block;
-    int const extra_smem = driver_smem_per_block + static_smem;
-
-    int nVPart = nMaxVocabPartForStage1FastKernel + 1;
-    for (int n_block = max_active_blocks - 1; n_block > 0 && nVPart > nMaxVocabPartForStage1FastKernel; --n_block)
+    if constexpr (IS_V2)
     {
-        int dyn_smem_size = max_smem_per_sm / n_block - extra_smem;
-        dyn_smem_size -= dyn_smem_size % sizeof(T);
-        nVPart = ceilDiv(sizeof(T) * nV, dyn_smem_size);
+        // see `BeamSearchLayer<T>::configureBeamSearchLayer()` for the workspace structure
+        size_t const offsetStage1 = roundUp(nBS * nBM * nBM * 2, 4);
+        size_t const offsetStage2 = roundUp(nBS * nBM * 2, 4);
+
+        pStage2Ids = reinterpret_cast<int*>(workspace);
+        int offset = sizeof(int) * offsetStage2;
+        pStage2LogProbs = reinterpret_cast<T*>(reinterpret_cast<char*>(workspace) + offset);
+        offset += sizeof(T) * offsetStage2;
+        int* pStage1Ids = reinterpret_cast<int*>(reinterpret_cast<char*>(workspace) + offset);
+        pStage3 = reinterpret_cast<float*>(reinterpret_cast<char*>(workspace) + offset);
+        offset += sizeof(int) * offsetStage1;
+        T* pStage1LogProbs = reinterpret_cast<T*>(reinterpret_cast<char*>(workspace) + offset);
+        offset += sizeof(T) * offsetStage1;
+        void* pTopK = reinterpret_cast<void*>(reinterpret_cast<char*>(workspace) + offset);
+
+        // Stage 1
+        invokeTopkLastDim<T>(nBS * nBM, nV, nBM * 2, true, logProbs, pStage1LogProbs, pStage1Ids, pTopK, stream);
+        sync_check_cuda_error();
+
+        int nThread = min(roundUp(nBM * nBM * 2, 32), 1024);
+        addCumLogProbs<<<nBS, nThread, 0, stream>>>(
+            pStage1LogProbs, bh.cumLogProbs, bh.finished, bh.endIds, bh.diversityRates, bh.batchSlots, nBS, nBM);
+        sync_check_cuda_error();
+
+        // Stage 2
+        invokeTopkLastDim<T>(
+            nBS, nBM * nBM * 2, nBM * 2, true, pStage1LogProbs, pStage2LogProbs, pStage2Ids, pTopK, stream);
+        sync_check_cuda_error();
+
+        nThread = min(roundUp(nBM * 2, 32), 1024);
+        gatherId<<<nBS, nThread, 0, stream>>>(pStage1Ids, pStage2Ids, nBS, nBM, nV);
+        sync_check_cuda_error();
     }
-
-    int const nVocabChunk = (nV + nVPart - 1) / nVPart;
-    int const dyn_smem_size = sizeof(T) * nVocabChunk;
-    if (dyn_smem_size >= (48 << 10))
+    else // V1
     {
-        TLLM_CUDA_CHECK(cudaFuncSetAttribute(
-            beamStage1Kernel<T, PAD_K, nBlockSize>, cudaFuncAttributeMaxDynamicSharedMemorySize, dyn_smem_size));
-    }
+        // see `BeamSearchLayer<T>::configureBeamSearchLayer()` for the workspace structure
+        int const offset = roundUp(nBS * nBM * nBM * 2, 4);
+        pStage2Ids = reinterpret_cast<int*>(workspace);
+        pStage2LogProbs = reinterpret_cast<T*>(pStage2Ids + offset);
+        pStage3 = reinterpret_cast<float*>(pStage2LogProbs + offset);
 
-    dim3 gridSize(nBS, nBM, nVPart);
-    beamStage1Kernel<T, PAD_K, nBlockSize><<<gridSize, nBlockSize, dyn_smem_size, stream>>>(
-        logits, bias, pTemp, endIds, finished, nV, nVocabChunk, batchSlots, dyn_smem_size);
-    sync_check_cuda_error();
+        // Stage 1
+        size_t constexpr nThreadStage1 = (PBM < 16) ? ((PBM < 8) ? nThreadForSmallBeamWidth : 128) : 64;
+        dim3 grid(nBS, nBM, bh.nVPart);
+        beamStage1Kernel<T, PBM, nThreadStage1><<<grid, nThreadStage1, bh.nByteSharedMemoryStage1, stream>>>(
+            logProbs, bias, pStage3, bh.endIds, bh.finished, nV, bh.batchSlots);
+        sync_check_cuda_error();
 
-    // Stage 2
-    {
+        // Stage 2
         // TODO: rewrite kernel to remove dependence of constant block size to reduce compilation time
-        size_t const nShareMemory
-            = sizeof(float) * nVPart * (PAD_K * 4 + 2) + sizeof(cub::KeyValuePair<int, T>) * PAD_K * 2;
-        // Use fast kernel if the required share memory is small
-        if (nShareMemory < max_smem_per_block && nVPart <= 32)
+        size_t nByteRuntimeSharedMemory
+            = sizeof(float) * nVPart * (PBM * 4) + sizeof(cub::KeyValuePair<int, T>) * PBM * 2;
+        if (nByteRuntimeSharedMemory <= nByteMaxSharedMemoryPerBlock && nVPart <= 32)
         {
             BEAM_STAGE2_KERNEL(32, true)
         }
-        else if (nShareMemory < max_smem_per_block && nVPart <= 64)
+        else if (nByteRuntimeSharedMemory <= nByteMaxSharedMemoryPerBlock && nVPart <= 64)
         {
             BEAM_STAGE2_KERNEL(64, true)
         }
-        else if (nShareMemory < max_smem_per_block)
+        else if (nByteRuntimeSharedMemory <= nByteMaxSharedMemoryPerBlock)
         {
             BEAM_STAGE2_KERNEL(128, true)
-            // No larger branch since nVPart <= nMaxVocabPartForStage1FastKernel
+            // No branch with larger `N_VOCAB_PART` since nVPart <= nMaxVPartStage1 == 128
         }
         else
         {
+            TLLM_LOG_TRACE("Use slow Beam Search stage 2 kernel due to large beam_width or vocab_size");
             BEAM_STAGE2_KERNEL(128, false)
         }
+        sync_check_cuda_error();
     }
-    sync_check_cuda_error();
 
-    // Stage 3
+    // Stage 3 in common
+    size_t constexpr nThreadStage3 = (PBM + 31) / 32 * 32;
+    size_t const nByteStaticSharedMemory = bh.nByteSharedMemoryStage3;
+    size_t const nByteDynamicSharedMemory = (IS_V2) ? 0 : sizeof(T) * nBM * nBM * 2;
+    size_t const nByteRuntimeSharedMemory = nByteStaticSharedMemory + nByteDynamicSharedMemory;
+    if (nByteRuntimeSharedMemory <= nByteMaxSharedMemoryPerBlock)
     {
-        // Keep top 2K candidates in case of k candidates finishes in one iteration
-        size_t constexpr nBlockSizeStage3 = (PAD_K + 31) / 32 * 32; // can not use `common::roundUp()`
-        size_t constexpr nByteStaticShareMemory = sizeof(float) * (4 + PAD_K * 2 * 3);
-        size_t const nByteDynamicShareMemory = sizeof(T) * nBM * nBM * 2;
-        size_t const nByteShareMemory = nByteStaticShareMemory + nByteDynamicShareMemory;
-        // Use fast kernel if the required share memory is small
-        if (nByteShareMemory <= max_smem_per_block)
+        if (nByteRuntimeSharedMemory > (48 << 10))
         {
-            if (nByteShareMemory > (48 << 10))
-            {
-                TLLM_CUDA_CHECK(cudaFuncSetAttribute(beamStage3Kernel<T, PAD_K, nBlockSizeStage3, true>,
-                    cudaFuncAttributeMaxDynamicSharedMemorySize, nByteShareMemory));
-            }
-            beamStage3Kernel<T, PAD_K, nBlockSizeStage3, true>
-                <<<nBS, nBlockSizeStage3, nByteShareMemory, stream>>>(pTempId, pTempVal, pTemp, bh);
+            TLLM_CUDA_CHECK(cudaFuncSetAttribute(beamStage3Kernel<T, PBM, nThreadStage3, true, IS_V2>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, nByteRuntimeSharedMemory));
         }
-        else
+        beamStage3Kernel<T, PBM, nThreadStage3, true, IS_V2>
+            <<<nBS, nThreadStage3, nByteDynamicSharedMemory, stream>>>(pStage2Ids, pStage2LogProbs, pStage3, bh);
+    }
+    else
+    {
+        if (nByteStaticSharedMemory > (48 << 10))
         {
-            beamStage3Kernel<T, PAD_K, nBlockSizeStage3, false>
-                <<<nBS, nBlockSizeStage3, nByteStaticShareMemory, stream>>>(pTempId, pTempVal, pTemp, bh);
+            TLLM_CUDA_CHECK(cudaFuncSetAttribute(beamStage3Kernel<T, PBM, nThreadStage3, false, IS_V2>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, nByteStaticSharedMemory));
         }
+        beamStage3Kernel<T, PBM, nThreadStage3, false, IS_V2>
+            <<<nBS, nThreadStage3, 0, stream>>>(pStage2Ids, pStage2LogProbs, pStage3, bh);
     }
     sync_check_cuda_error();
 }
 
-#define INSTANTIATE_BEAMSEARCH_K(T, PAD_K)                                                                             \
-    template void topKSoftMaxKernelLauncher<T, PAD_K>(                                                                 \
-        T const* logits, T const* bias, void* workspace, BeamHypotheses& bh, cudaStream_t stream);
+#undef BEAM_STAGE2_KERNEL
+
+#define INSTANTIATE_BEAM_SEARCH(T, PBM, IS_V2)                                                                         \
+    template void beamSearchKernelLauncher<T, PBM, IS_V2>(                                                             \
+        T const* logProbs, T const* bias, void* workspace, BeamHypotheses& bh, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm

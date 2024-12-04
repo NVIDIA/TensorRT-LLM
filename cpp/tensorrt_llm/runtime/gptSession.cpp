@@ -88,7 +88,12 @@ GptSession::GptSession(Config const& sessionConfig, ModelConfig const& modelConf
     TLLM_LOG_WARNING(
         "GptSession is deprecated and will be removed in a future release."
         " Please use the executor API instead (cpp/include/tensorrt_llm/executor).");
-
+    if (mWorldConfig.isTensorParallel())
+    {
+        mRuntime->initializeUserBuffer(mWorldConfig.getTensorParallelism(), mModelConfig.getMaxBatchSize(),
+            mModelConfig.getMaxBeamWidth(), mModelConfig.getMaxSequenceLen(), mModelConfig.getHiddenSize(),
+            mModelConfig.getMaxNumTokens());
+    }
     if (mWorldConfig.isPipelineParallel())
     {
         mPipelineComm = std::make_shared<NcclCommunicator>(mWorldConfig);
@@ -211,10 +216,6 @@ void GptSession::createKvCacheManager(SizeType32 maxBatchSize, SizeType32 maxBea
 
     auto const kvDtype = mModelConfig.getKvDataType();
 
-    // If maxBeamWidth > 1, use one more block for each sequence in the paged kv cache to avoid dropping the needed
-    // tokens, when enabling cyclic kv cache.
-    auto const useOneMoreBlock = maxBeamWidth > 1 && maxSequenceLength > maxAttentionWindow;
-
     auto [numKvHeadsPerLayerBegin, numKvHeadsPerLayerEnd] = mModelConfig.getNumKvHeadsPerLayerLocalRange(
         mWorldConfig.getPipelineParallelism(), mWorldConfig.getPipelineParallelRank());
     TLLM_CHECK_WITH_INFO(std::all_of(numKvHeadsPerLayerBegin, numKvHeadsPerLayerEnd,
@@ -241,8 +242,9 @@ void GptSession::createKvCacheManager(SizeType32 maxBatchSize, SizeType32 maxBea
         kvCacheConfig, kvDtype, mModelConfig, mWorldConfig, getBufferManager());
     mKvCacheManager = std::make_shared<bmkv::KVCacheManager>(
         std::vector<SizeType32>(numKvHeadsPerLayerBegin, numKvHeadsPerLayerEnd), sizePerHead, tokensPerBlock,
-        blocksInPrimaryPool, blocksInSecondaryPool, maxBatchSize, maxBeamWidth, maxAttentionWindow, sinkTokenLength,
-        useOneMoreBlock, mRuntime->getStreamPtr(), enableBlockReuse, kvCacheConfig.onboardBlocks);
+        blocksInPrimaryPool, blocksInSecondaryPool, maxBatchSize, maxBeamWidth, maxAttentionWindow,
+        /*temporaryAttentionWindow*/ 0, sinkTokenLength, mRuntime->getStreamPtr(), maxSequenceLength, enableBlockReuse,
+        kvCacheConfig.onboardBlocks);
 
     auto const maxBlocksPerSeq = mKvCacheManager->getMaxBlocksPerSeq();
 
@@ -272,8 +274,8 @@ void GptSession::createCustomAllReduceWorkspace(
     auto& manager = mRuntime->getBufferManager();
     auto const hiddenSize = mModelConfig.getHiddenSize();
 
-    mAllReduceBuffers = std::make_shared<AllReduceBuffers>(
-        maxBatchSize, maxBeamWidth, maxSequenceLength, hiddenSize, manager, mWorldConfig);
+    mAllReduceBuffers = std::make_shared<AllReduceBuffers>(maxBatchSize, maxBeamWidth, maxSequenceLength, hiddenSize,
+        manager, mWorldConfig, mRuntime->isUserBufferEnabled());
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -922,7 +924,7 @@ void GptSession::generateBatched(std::vector<GenerationOutput>& microBatchesOutp
 }
 
 void GptSession::executeContextStep(std::vector<GenerationInput> const& generationBatchesInputs,
-    std::vector<SizeType32> const& generationBatchesOffsets, KvCacheManager const* kvCacheManager)
+    std::vector<SizeType32> const& generationBatchesOffsets, BaseKVCacheManager const* kvCacheManager)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto& manager = mRuntime->getBufferManager();
@@ -996,7 +998,7 @@ void GptSession::executeContextStep(std::vector<GenerationInput> const& generati
 
 SizeType32 GptSession::executeGenerationStep(SizeType32 step, std::vector<GenerationInput> const& microBatchesInputs,
     std::vector<GenerationOutput>& microBatchesOutputs, std::vector<SizeType32> const& microBatchOffsets,
-    KvCacheManager* kvCacheManager, std::vector<bool>& microBatchesFinished)
+    BaseKVCacheManager* kvCacheManager, std::vector<bool>& microBatchesFinished)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     TLLM_CHECK(microBatchesInputs.size() == microBatchesOutputs.size());

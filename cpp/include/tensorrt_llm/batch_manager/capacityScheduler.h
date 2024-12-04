@@ -27,7 +27,7 @@ namespace tensorrt_llm::batch_manager
 {
 namespace kv_cache_manager
 {
-class KVCacheManager;
+class BaseKVCacheManager;
 }
 class BasePeftCacheManager;
 } // namespace tensorrt_llm::batch_manager
@@ -92,12 +92,13 @@ public:
         LlmRequestState noScheduleUntilState = LlmRequestState::kCONTEXT_INIT,
         LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE);
 
-    [[nodiscard]] std::tuple<RequestVector, RequestVector> operator()(kv_cache_manager::KVCacheManager& kvCacheManager,
-        OptionalRef<BasePeftCacheManager const> peftCacheManager, RequestList const& activeRequests) const;
+    [[nodiscard]] std::tuple<RequestVector, RequestVector> operator()(
+        kv_cache_manager::BaseKVCacheManager& kvCacheManager, OptionalRef<BasePeftCacheManager const> peftCacheManager,
+        RequestList const& activeRequests) const;
 
 private:
     /// @return {fitsKvCache, fitsPeft}
-    std::pair<bool, bool> trySchedulingRequestMaxUtilization(kv_cache_manager::KVCacheManager const& kvCacheManager,
+    std::pair<bool, bool> trySchedulingRequestMaxUtilization(kv_cache_manager::BaseKVCacheManager const& kvCacheManager,
         OptionalRef<BasePeftCacheManager const> peftCacheManager, std::shared_ptr<LlmRequest> const& req,
         RequestVector& scheduledRequests, SizeType32& numScheduledBlocks, SizeType32& numScheduledPeftPages,
         std::unordered_set<uint64_t>& seenTaskIds) const;
@@ -116,14 +117,15 @@ public:
         LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE);
 
     [[nodiscard]] std::tuple<RequestVector, RequestVector> operator()(
-        kv_cache_manager::KVCacheManager const& kvCacheManager,
-        OptionalRef<kv_cache_manager::KVCacheManager const> crossKvCacheManager,
+        kv_cache_manager::BaseKVCacheManager const& kvCacheManager,
+        OptionalRef<kv_cache_manager::BaseKVCacheManager const> crossKvCacheManager,
         OptionalRef<BasePeftCacheManager const> peftCacheManager, RequestList const& activeRequests) const;
 
 protected:
     template <bool StaticBatchScheduling>
-    [[nodiscard]] std::tuple<RequestVector, RequestVector> impl(kv_cache_manager::KVCacheManager const& kvCacheManager,
-        OptionalRef<kv_cache_manager::KVCacheManager const> crossKvCacheManager,
+    [[nodiscard]] std::tuple<RequestVector, RequestVector> impl(
+        kv_cache_manager::BaseKVCacheManager const& kvCacheManager,
+        OptionalRef<kv_cache_manager::BaseKVCacheManager const> crossKvCacheManager,
         OptionalRef<BasePeftCacheManager const> peftCacheManager, RequestList const& activeRequests) const;
 
 private:
@@ -139,8 +141,8 @@ public:
         LlmRequestState noScheduleAfterState = LlmRequestState::kGENERATION_COMPLETE);
 
     [[nodiscard]] std::tuple<RequestVector, RequestVector> operator()(
-        kv_cache_manager::KVCacheManager const& kvCacheManager,
-        OptionalRef<kv_cache_manager::KVCacheManager const> crossKvCacheManager,
+        kv_cache_manager::BaseKVCacheManager const& kvCacheManager,
+        OptionalRef<kv_cache_manager::BaseKVCacheManager const> crossKvCacheManager,
         OptionalRef<BasePeftCacheManager const> peftCacheManager, RequestList const& activeRequests) const;
 };
 
@@ -166,9 +168,9 @@ public:
      * @return std::tuple<RequestVector, RequestVector>, fittingRequests and pausedRequests respectively.
      */
     [[nodiscard]] std::tuple<RequestVector, RequestVector> operator()(RequestList const& activeRequests,
-        OptionalRef<kv_cache_manager::KVCacheManager> kvCacheManager = std::nullopt,
+        OptionalRef<kv_cache_manager::BaseKVCacheManager> kvCacheManager = std::nullopt,
         OptionalRef<BasePeftCacheManager const> peftCacheManager = std::nullopt,
-        OptionalRef<kv_cache_manager::KVCacheManager const> crossKvCacheManager = std::nullopt) const;
+        OptionalRef<kv_cache_manager::BaseKVCacheManager const> crossKvCacheManager = std::nullopt) const;
 
 private:
     std::variant<std::monostate, MaxRequestsScheduler, MaxUtilizationScheduler, GuaranteedNoEvictScheduler,

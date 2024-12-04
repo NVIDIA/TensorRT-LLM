@@ -61,6 +61,7 @@ void bindSet(py::module& m, std::string const& name)
         .def("size", &T::size)
         .def("insert", [](T& s, typename T::value_type const& value) { s.insert(value); })
         .def("erase", py::overload_cast<typename T::value_type const&>(&T::erase))
+        .def("__len__", [](T const& lst) { return lst.size(); })
         .def("__contains__", [](T const& s, typename T::value_type x) { return s.find(x) != s.end(); })
         .def(
             "__iter__", [](T& s) { return py::make_iterator(s.begin(), s.end()); }, py::keep_alive<0, 1>());

@@ -84,6 +84,9 @@ struct BenchmarkParams
     // Decoding params
     std::optional<std::vector<std::vector<SizeType32>>> medusaChoices;
 
+    std::optional<texec::EagleConfig> eagleConfig;
+    std::optional<float> temperature;
+
     std::optional<texec::LookaheadDecodingConfig> executorLookaheadConfig;
     std::optional<texec::LookaheadDecodingConfig> requestLookaheadConfig;
 

@@ -31,6 +31,8 @@ namespace tensorrt_llm::runtime
 class CudaStream
 {
 public:
+    friend class CudaStreamBindings;
+
     //! Creates a new cuda stream on the current device. The stream will be destroyed in the destructor.
     //!
     //! \param flags Flags for stream creation. See ::cudaStreamCreateWithFlags for a list of valid flags that can be

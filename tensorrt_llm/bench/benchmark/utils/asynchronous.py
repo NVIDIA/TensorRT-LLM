@@ -6,7 +6,7 @@ from itertools import chain
 from typing import List, Set
 
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm import LLM
+from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import InferenceRequest
 from tensorrt_llm.bench.dataclasses.reporting import (NewRequestPerfItemTuple,
@@ -14,7 +14,6 @@ from tensorrt_llm.bench.dataclasses.reporting import (NewRequestPerfItemTuple,
                                                       report_statistics)
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.llmapi.llm_utils import LlmArgs
-from tensorrt_llm.llmapi.utils import SamplingParams
 from tensorrt_llm.logger import logger
 
 

@@ -123,6 +123,10 @@ def main(*,
             error_msg += " Please run `pip install tensorrt` manually and relaunch build_wheel.py"
         raise RuntimeError(error_msg)
 
+    if cuda_architectures is not None:
+        if "70-real" in cuda_architectures:
+            raise RuntimeError("Volta architecture is deprecated support.")
+
     cmake_cuda_architectures = (
         f'"-DCMAKE_CUDA_ARCHITECTURES={cuda_architectures}"'
         if cuda_architectures is not None else "")

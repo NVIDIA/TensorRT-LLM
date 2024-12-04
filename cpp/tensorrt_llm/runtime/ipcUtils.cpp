@@ -95,8 +95,9 @@ void IpcMemory::allocateIpcMemory(std::size_t bufferSize, BufferManager const& m
     cudaIpcMemHandle_t localHandle;
     TLLM_CUDA_CHECK(cudaIpcGetMemHandle(&localHandle, bufferPtr));
 
-    auto const ppRank = worldConfig.getPipelineParallelRank();
-    auto const comm = COMM_SESSION.split(ppRank, mTpRank);
+    auto const tpGroupId = worldConfig.getContextParallelRank()
+        + worldConfig.getContextParallelism() * worldConfig.getPipelineParallelRank();
+    auto const comm = COMM_SESSION.split(tpGroupId, mTpRank);
     std::vector<char> serialHandles(CUDA_IPC_HANDLE_SIZE * worldConfig.getTensorParallelism(), 0);
     comm.allgather(&localHandle.reserved, serialHandles.data(), CUDA_IPC_HANDLE_SIZE, mpi::MpiType::kBYTE);
 
@@ -146,52 +147,63 @@ void IpcMemory::destroyIpcMemory()
 }
 
 AllReduceBuffers::AllReduceBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxSequenceLength,
-    SizeType32 hiddenSize, BufferManager const& manager, WorldConfig const& worldConfig)
+    SizeType32 hiddenSize, BufferManager const& manager, WorldConfig const& worldConfig, bool const fakeBuffers)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto const isP2pSupported = canAccessPeer(worldConfig);
-
-    auto const tpSize = worldConfig.getTensorParallelism();
-    auto const bufferSize = tpSize
-        * std::min(
-            static_cast<std::size_t>(maxBatchSize) * maxBeamWidth * maxSequenceLength * hiddenSize * sizeof(float),
-            utils::customAllReduceUtils::getMaxRequiredWorkspaceSize(tpSize));
-    auto const lamportBufferSize
-        = tpSize * tensorrt_llm::kernels::reduce_fusion::details::kLamportTokenNumThreshold * hiddenSize * sizeof(half);
-    auto const flagsSize = IpcMemory::FLAGS_SIZE * tpSize * 2;
-
-    for (auto size :
-        {bufferSize, bufferSize, flagsSize, flagsSize, lamportBufferSize, lamportBufferSize, lamportBufferSize})
+    if (fakeBuffers)
     {
-        mIpcMemoryHandles.emplace_back(size, manager, worldConfig, isP2pSupported);
+        auto const tpSize = worldConfig.getTensorParallelism();
+        mAllReduceCommPtrs = BufferManager::cpu(
+            ITensor::makeShape({static_cast<SizeType32>(7) * tpSize + 2}), nvinfer1::DataType::kINT64);
     }
-
-    mAllReduceCommPtrs
-        = BufferManager::cpu(ITensor::makeShape({static_cast<SizeType32>(mIpcMemoryHandles.size()) * tpSize + 2}),
-            nvinfer1::DataType::kINT64);
-    auto commPtrs = BufferRange<void*>(*mAllReduceCommPtrs);
-    auto const CustomARFlagPtr = static_cast<int64_t*>(mAllReduceCommPtrs->data(mAllReduceCommPtrs->getSize() - 1));
-    auto const LamportFlagPtr = static_cast<int64_t*>(mAllReduceCommPtrs->data(mAllReduceCommPtrs->getSize() - 2));
-    *CustomARFlagPtr = 0;
-    *LamportFlagPtr = 0;
-
-    for (std::size_t memIdx = 0; memIdx < mIpcMemoryHandles.size(); memIdx++)
+    else
     {
-        auto const& memCommPtrs = mIpcMemoryHandles[memIdx].getCommPtrs();
-        TLLM_CHECK(memCommPtrs.size() == static_cast<std::size_t>(tpSize));
-        std::copy(memCommPtrs.begin(), memCommPtrs.end(), commPtrs.begin() + memIdx * tpSize);
-    }
+        auto const isP2pSupported = canAccessPeer(worldConfig);
+
+        auto const tpSize = worldConfig.getTensorParallelism();
+        auto const bufferSize = tpSize
+            * std::min(
+                static_cast<std::size_t>(maxBatchSize) * maxBeamWidth * maxSequenceLength * hiddenSize * sizeof(float),
+                utils::customAllReduceUtils::getMaxRequiredWorkspaceSize(tpSize));
+        size_t realHiddenSize = tpSize * hiddenSize;
+        // PUSH_MODE need TP_SIZE times the activation tensor size
+        auto const lamportBufferSize = tpSize * tensorrt_llm::kernels::reduce_fusion::details::kLamportTokenNumThreshold
+            * realHiddenSize * sizeof(half);
+        auto const flagsSize = IpcMemory::FLAGS_SIZE * tpSize * 2;
+
+        for (auto size :
+            {bufferSize, bufferSize, flagsSize, flagsSize, lamportBufferSize, lamportBufferSize, lamportBufferSize})
+        {
+            mIpcMemoryHandles.emplace_back(size, manager, worldConfig, isP2pSupported);
+        }
+
+        mAllReduceCommPtrs
+            = BufferManager::cpu(ITensor::makeShape({static_cast<SizeType32>(mIpcMemoryHandles.size()) * tpSize + 2}),
+                nvinfer1::DataType::kINT64);
+        auto commPtrs = BufferRange<void*>(*mAllReduceCommPtrs);
+        auto const CustomARFlagPtr = static_cast<int64_t*>(mAllReduceCommPtrs->data(mAllReduceCommPtrs->getSize() - 1));
+        auto const LamportFlagPtr = static_cast<int64_t*>(mAllReduceCommPtrs->data(mAllReduceCommPtrs->getSize() - 2));
+        *CustomARFlagPtr = 0;
+        *LamportFlagPtr = 0;
+
+        for (std::size_t memIdx = 0; memIdx < mIpcMemoryHandles.size(); memIdx++)
+        {
+            auto const& memCommPtrs = mIpcMemoryHandles[memIdx].getCommPtrs();
+            TLLM_CHECK(memCommPtrs.size() == static_cast<std::size_t>(tpSize));
+            std::copy(memCommPtrs.begin(), memCommPtrs.end(), commPtrs.begin() + memIdx * tpSize);
+        }
 #if ENABLE_MULTI_DEVICE
-    auto rank = worldConfig.getRank();
-    auto tp_rank = worldConfig.getTensorParallelRank();
-    // When p2p is not supported all the mIpcMemoryHandles are
-    // null
-    if (rank == tp_rank && isP2pSupported)
-    {
-        lamportInitializeAll(mIpcMemoryHandles[4].getCommPtrs()[rank], mIpcMemoryHandles[5].getCommPtrs()[rank],
-            mIpcMemoryHandles[6].getCommPtrs()[rank], lamportBufferSize);
-    }
+        auto tp_rank = worldConfig.getTensorParallelRank();
+        // When p2p is not supported all the mIpcMemoryHandles are
+        // null
+        if (isP2pSupported)
+        {
+            lamportInitializeAll(mIpcMemoryHandles[4].getCommPtrs()[tp_rank],
+                mIpcMemoryHandles[5].getCommPtrs()[tp_rank], mIpcMemoryHandles[6].getCommPtrs()[tp_rank],
+                lamportBufferSize);
+        }
 #endif
+    }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 

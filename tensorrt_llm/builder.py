@@ -873,8 +873,9 @@ def _init_max_seq_len(model_config, build_config):
     if rotary_scaling is not None:
         rotary_type = rotary_scaling.get('type',
                                          rotary_scaling.get('rope_type'))
-        rotary_factor = rotary_scaling.get('factor',
-                                           1.0) if rotary_type != 'su' else 1
+        rotary_factor = rotary_scaling.get(
+            'factor', 1.0) if rotary_type not in ("su", "longrope",
+                                                  "llama3") else 1
     else:
         rotary_factor = 1
 
@@ -1038,11 +1039,14 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
     _init_max_seq_len(model.config, build_config)
 
     if build_config.plugin_config.reduce_fusion and (
-            model.config.mapping.tp_size == 1
-            or model.config.mapping.pp_size != 1
-            or model.config.architecture != "LlamaForCausalLM"):
+            model.config.mapping.tp_size == 1 or
+        (model.config.architecture != "LlamaForCausalLM"
+         and model.config.architecture != "MedusaForCausalLM")):
         logger.warning('Overriding reduce_fusion to False')
         build_config.plugin_config.reduce_fusion = False
+    if build_config.plugin_config.user_buffer and not build_config.plugin_config.reduce_fusion:
+        logger.warning('Overriding user_buffer to False')
+        build_config.plugin_config.user_buffer = False
 
     if model.config.quantization.quant_algo == QuantAlgo.FP8 or \
             model.config.quantization.kv_cache_quant_algo == QuantAlgo.FP8:

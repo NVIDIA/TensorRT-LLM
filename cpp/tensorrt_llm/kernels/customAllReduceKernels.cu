@@ -634,7 +634,7 @@ static __global__ void lamport_style_one_shot_all_reduce_norm_kernel(AllReducePa
 
     cg::cluster_group cluster = cg::this_cluster();
 
-    __shared__ float cluster_acc;
+    __shared__ float cluster_acc, cluster_acc_sum;
 
     int bid = blockIdx.x, tid = threadIdx.x;
     int cluster_id = bid / ClusterSize, cluster_block_rank = bid % ClusterSize;
@@ -691,12 +691,18 @@ static __global__ void lamport_style_one_shot_all_reduce_norm_kernel(AllReducePa
             cluster_acc = acc;
         }
         cluster.sync();
-        acc = 0.f;
-#pragma unroll
-        for (int ii = 0; ii < ClusterSize; ++ii)
+        if (threadIdx.x == 0)
         {
-            acc += *cluster.map_shared_rank(&cluster_acc, ii);
+            acc = 0.f;
+#pragma unroll
+            for (int ii = 0; ii < ClusterSize; ++ii)
+            {
+                acc += *cluster.map_shared_rank(&cluster_acc, ii);
+            }
+            cluster_acc_sum = acc;
         }
+        __syncthreads();
+        acc = cluster_acc_sum;
     }
 
     float denom = __fsqrt_rn(__fdividef(acc, params.fusion_params.hidden_size) + params.fusion_params.eps);

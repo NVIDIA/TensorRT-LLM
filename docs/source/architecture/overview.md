@@ -11,7 +11,7 @@ Equipped with the model definition and the weights, a user must use TensorRT-LLM
 
 Together with the Model Definition API to describe models, TensorRT-LLM provides users with components to create a runtime that executes the efficient TensorRT engine. Runtime components offer beam-search, along with extensive sampling functionalities such as top-K and top-P sampling. The exhaustive list can be found in the documentation of the {ref}`gpt-runtime`. The C++ runtime is the recommended runtime.
 
-TensorRT-LLM also includes Python and C++ backends for NVIDIA Triton Inference Server to assemble solutions for LLM online serving. The C++ backend implements in-flight batching as explained in the {ref}`batch-manager` documentation and is the recommended backend.
+TensorRT-LLM also includes Python and C++ backends for NVIDIA Triton Inference Server to assemble solutions for LLM online serving. The C++ backend implements in-flight batching as explained in the {ref}`executor` documentation and is the recommended backend.
 
 ## Model Weights
 

@@ -113,7 +113,7 @@ def build_engines(model_cache: str):
     model_spec_obj.use_packed_input()
 
     base_full_engine_path = base_engine_dir / model_spec_obj.get_model_path(
-    ) / 'tp1-pp1-gpu'
+    ) / 'tp1-pp1-cp1-gpu'
     print(f"\nBuilding fp16 engine at {str(base_full_engine_path)}")
     build_engine(base_model_dir,
                  eagle_model_dir,
@@ -126,7 +126,7 @@ def build_engines(model_cache: str):
     model_spec_obj.use_packed_input()
     model_spec_obj.use_eagle()
     eagle_full_engine_path = eagle_engine_dir / model_spec_obj.get_model_path(
-    ) / 'tp1-pp1-gpu'
+    ) / 'tp1-pp1-cp1-gpu'
     print(f"\nBuilding fp16 engine at {str(eagle_full_engine_path)}")
     build_engine(base_model_dir,
                  eagle_model_dir,

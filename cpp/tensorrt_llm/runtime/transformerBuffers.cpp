@@ -164,12 +164,12 @@ void TransformerBuffers::reshapeKvTensors(
     manager.setZero(*kvCacheBlockOffsetsDevice);
 }
 
-void TransformerBuffers::setKvPoolPointers(KvCacheManager const* kvCacheManager)
+void TransformerBuffers::setKvPoolPointers(BaseKVCacheManager const* kvCacheManager)
 {
     kvCacheBlockPoolPointers = kvCacheManager->getBlockPoolPointers();
 }
 
-void TransformerBuffers::setKvPoolMapping(KvCacheManager const* kvCacheManager)
+void TransformerBuffers::setKvPoolMapping(BaseKVCacheManager const* kvCacheManager)
 {
     kvCacheBlockPoolMapping = kvCacheManager->getLayerToPoolMapping();
 }
@@ -280,8 +280,8 @@ static std::vector<SizeType32> getPositionIdsContextPhaseGlm(SizeType32 const& b
 }
 
 void TransformerBuffers::prepareContextStep(RuntimeBuffers* runtimeBuffers, TensorPtr const& inputIds,
-    TokenIdType const padId, BufferManager& manager, KvCacheManager const* kvCacheManager, SizeType32 firstBatchSlotIdx,
-    ModelConfig const& modelConfig, WorldConfig const& worldConfig)
+    TokenIdType const padId, BufferManager& manager, BaseKVCacheManager const* kvCacheManager,
+    SizeType32 firstBatchSlotIdx, ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto& generationConfig = runtimeBuffers->generationConfig;
@@ -569,7 +569,7 @@ void TransformerBuffers::postContextStep(RuntimeBuffers* runtimeBuffers,
 }
 
 void TransformerBuffers::prepareNextStep(RuntimeBuffers* runtimeBuffers, SizeType32 const step, BufferManager& manager,
-    KvCacheManager* kvCacheManager, SizeType32 firstBatchSlotIdx, ModelConfig const& modelConfig,
+    BaseKVCacheManager* kvCacheManager, SizeType32 firstBatchSlotIdx, ModelConfig const& modelConfig,
     WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);

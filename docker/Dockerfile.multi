@@ -9,6 +9,9 @@ FROM ${BASE_IMAGE}:${BASE_TAG} as base
 # The default values come from `nvcr.io/nvidia/pytorch`
 ENV BASH_ENV=${BASH_ENV:-/etc/bash.bashrc}
 ENV ENV=${ENV:-/etc/shinit_v2}
+ARG GITHUB_MIRROR=""
+ENV GITHUB_MIRROR=$GITHUB_MIRROR
+RUN echo "Using GitHub mirror: $GITHUB_MIRROR"
 SHELL ["/bin/bash", "-c"]
 
 FROM base as devel

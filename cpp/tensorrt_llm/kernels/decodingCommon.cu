@@ -66,13 +66,19 @@ void invokeCurandBatchInitialize(curandState_t* states, SizeType32 const* batchS
 }
 
 template <typename T>
-__global__ void addBiasSoftMax(T* logits, T** logitsPtrs, T* probs, T const* bias, int32_t const* endIds,
-    FinishedState const* finished, int32_t const* batchSlots, int32_t maxBatchSize, int32_t beamWidth,
-    int32_t vocabSize, int32_t vocabSizePadded, bool skipSoftMax, bool batchSlotsLogits)
+__global__ void addBiasSoftMax(T* logits, T** logitsPtrs, T* probs, float* outputEntropy, T const* bias,
+    float const* temperatures, int32_t const* endIds, FinishedState const* finished, int32_t const* beamWidths,
+    int32_t const* batchSlots, int32_t maxBatchSize, int32_t maxBeamWidth, int32_t vocabSize, int32_t vocabSizePadded,
+    bool skipSoftMax, bool batchSlotsLogits, bool ptrsForBeams)
 {
     auto const batchIdx = blockIdx.x;
     auto const beamIdx = blockIdx.y;
-    auto const batchSlot = batchSlots[batchIdx];
+    auto const batchSlot = batchSlots ? batchSlots[batchIdx] : batchIdx;
+    if (beamWidths && beamIdx >= beamWidths[batchSlot])
+    {
+        return;
+    }
+
     auto const batchIdxLogits = batchSlotsLogits ? batchSlot : batchIdx;
     FinishedState const finishState
         = finished != nullptr ? finished[beamIdx * maxBatchSize + batchSlot] : FinishedState::empty();
@@ -82,16 +88,21 @@ __global__ void addBiasSoftMax(T* logits, T** logitsPtrs, T* probs, T const* bia
     }
     bool const finish = finishState.isFinished();
 
-    auto logitsPtr = logitsPtrs ? logitsPtrs[batchIdx] + beamIdx * vocabSizePadded
-                                : logits + (batchIdxLogits * beamWidth + beamIdx) * vocabSizePadded;
+    auto logitsPtr = logitsPtrs ? (ptrsForBeams ? logitsPtrs[batchIdx * maxBeamWidth + beamIdx]
+                                                : logitsPtrs[batchIdx] + beamIdx * vocabSizePadded)
+                                : logits + (batchIdxLogits * maxBeamWidth + beamIdx) * vocabSizePadded;
 
     T const MAX_T_VAL = (std::is_same<T, half>::value) ? HALF_FLT_MAX : FLT_MAX;
+    float const EPSILON = (std::is_same<T, half>::value) ? 1e-3f : 1e-6f;
     float maxVal = -FLT_MAX;
     __shared__ float sMaxVal, sSumVal;
+
+    auto const tempInv = temperatures ? T{1.f / (temperatures[batchSlot] + EPSILON)} : T{1.f};
 
     for (int tid = threadIdx.x; tid < vocabSizePadded; tid += blockDim.x)
     {
         auto logit = logitsPtr[tid];
+        logit = temperatures ? logit * tempInv : logit;
         if (tid < vocabSize)
         {
             if (finish && endIds != nullptr)
@@ -102,20 +113,20 @@ __global__ void addBiasSoftMax(T* logits, T** logitsPtrs, T* probs, T const* bia
             else
             {
                 // Compute biased logit if the request has not finished, or `endIds` is nullptr
-                logit += (bias != nullptr) ? bias[tid] : (T) 0.0f;
+                logit += (bias != nullptr) ? bias[tid] : T{0.0f};
             }
         }
         else
         {
             logit = -MAX_T_VAL;
         }
-        maxVal = max(maxVal, (float) logit);
+        maxVal = max(maxVal, static_cast<float>(logit));
         logitsPtr[tid] = logit; // Write back biased logits
     }
 
     if (!skipSoftMax)
     {
-        maxVal = blockReduceMax<float>((float) maxVal);
+        maxVal = blockReduceMax<float>(static_cast<float>(maxVal));
         if (threadIdx.x == 0)
         {
             sMaxVal = maxVal;
@@ -124,12 +135,13 @@ __global__ void addBiasSoftMax(T* logits, T** logitsPtrs, T* probs, T const* bia
 
         // `probs == nullptr` is specialization for Beam-Search, which needs log and writes output to`logitsPtrs`
         float sumVal = 0.0f;
-        int const offset = (probs != nullptr) ? ((batchIdxLogits * beamWidth + beamIdx) * vocabSizePadded) : 0;
+        int const offset = (probs != nullptr) ? ((batchIdxLogits * maxBeamWidth + beamIdx) * vocabSizePadded) : 0;
         T* dst = (probs != nullptr) ? probs : logitsPtr;
         for (int tid = threadIdx.x; tid < vocabSizePadded; tid += blockDim.x)
         {
-            dst[offset + tid] = __expf((float) logitsPtr[tid] - sMaxVal);
-            sumVal += (float) dst[offset + tid];
+            auto const value = __expf(static_cast<float>(logitsPtr[tid]) - sMaxVal);
+            dst[offset + tid] = value;
+            sumVal += value;
         }
 
         sumVal = blockReduceSum<float>(sumVal);
@@ -139,40 +151,48 @@ __global__ void addBiasSoftMax(T* logits, T** logitsPtrs, T* probs, T const* bia
         }
         __syncthreads();
 
+        float entropy{0.f};
         for (int tid = threadIdx.x; tid < vocabSizePadded; tid += blockDim.x)
         {
-            float softmax_value = (float) dst[offset + tid] / (sSumVal + 1e-6f);
-            dst[offset + tid] = (probs != nullptr) ? softmax_value : __logf(softmax_value);
+            auto const softmaxValue = static_cast<float>(dst[offset + tid]) / (sSumVal + EPSILON);
+            auto const probValue = (probs != nullptr) ? softmaxValue : __logf(softmaxValue);
+            if (outputEntropy)
+            {
+                entropy += probValue * __logf(probValue + EPSILON);
+            }
+            dst[offset + tid] = probValue;
+        }
+
+        if (outputEntropy)
+        {
+            entropy = blockReduceSum<float>(entropy);
+
+            if (threadIdx.x == 0)
+            {
+                outputEntropy[batchSlot * maxBeamWidth + beamIdx] = -entropy;
+            }
         }
     }
 }
 
 template <typename T>
-void invokeAddBiasSoftMax(T* logits, T** logitsPtrs, T* probs, T const* bias, int32_t const* endIds,
-    FinishedState const* finished, int32_t const* batchSlots, int32_t batchSize, int32_t maxBatchSize,
-    int32_t beamWidth, int32_t vocabSize, int32_t vocabSizePadded, bool skipSoftMax, bool batchSlotsLogits,
-    cudaStream_t stream)
+void invokeAddBiasSoftMax(BiasSoftmaxParams<T> const params, cudaStream_t stream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    dim3 grid(batchSize, beamWidth);
-    auto const vocabRoundedToWarp = roundUp(vocabSize, 32);
+    dim3 grid(params.batchSize, params.maxBeamWidth);
+    auto const vocabRoundedToWarp = roundUp(params.vocabSize, 32);
     dim3 block(std::min(vocabRoundedToWarp, 1024)); // vocabSize is usually larger than 1024
-    addBiasSoftMax<<<grid, block, 0, stream>>>(logits, logitsPtrs, probs, bias, endIds, finished, batchSlots,
-        maxBatchSize, beamWidth, vocabSize, vocabSizePadded, skipSoftMax, batchSlotsLogits);
+    addBiasSoftMax<<<grid, block, 0, stream>>>(params.logits, params.logitsPtrs, params.probs, params.outputEntropy,
+        params.bias, params.temperatures, params.endIds, params.finished, params.beamWidths, params.batchSlots,
+        params.maxBatchSize, params.maxBeamWidth, params.vocabSize, params.vocabSizePadded, params.skipSoftMax,
+        params.batchSlotsLogits, params.ptrsForBeams);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-template void invokeAddBiasSoftMax(float* logits, float** logitsPtrs, float* probs, float const* bias,
-    int32_t const* endIds, FinishedState const* finished, int32_t const* batchSlots, int32_t batchSize,
-    int32_t maxBatchSize, int32_t beamWidth, int32_t vocabSize, int32_t vocabSizePadded, bool skipSoftMax,
-    bool batchSlotsLogits, cudaStream_t stream);
-
-template void invokeAddBiasSoftMax(half* logits, half** logitsPtrs, half* probs, half const* bias,
-    int32_t const* endIds, FinishedState const* finished, int32_t const* batchSlots, int32_t batchSize,
-    int32_t maxBatchSize, int32_t beamWidth, int32_t vocabSize, int32_t vocabSizePadded, bool skipSoftMax,
-    bool batchSlotsLogits, cudaStream_t stream);
+template void invokeAddBiasSoftMax(BiasSoftmaxParams<float> const params, cudaStream_t stream);
+template void invokeAddBiasSoftMax(BiasSoftmaxParams<half> const params, cudaStream_t stream);
 
 template <typename T>
 __global__ void scatterDecodingParamsKernel(T const* src, T scalar, T* dst, int const* batchSlots, int batchSize)

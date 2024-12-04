@@ -19,6 +19,7 @@ import json
 import math
 import struct
 import weakref
+from contextlib import contextmanager
 from dataclasses import asdict
 from enum import EnumMeta
 from functools import partial
@@ -28,7 +29,7 @@ from typing import Any, Dict, List, Optional, Union
 import numpy as np
 from packaging import version
 
-from tensorrt_llm.bindings import GptJsonConfig
+from tensorrt_llm.bindings import DataType, GptJsonConfig
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 
 # isort: off
@@ -158,6 +159,24 @@ _str_to_torch_dtype_dict = dict(
 
 def str_dtype_to_torch(dtype):
     ret = _str_to_torch_dtype_dict.get(dtype)
+    assert ret is not None, f'Unsupported dtype: {dtype}'
+    return ret
+
+
+_str_to_binding_dtype_dict = dict(
+    bfloat16=DataType.BF16,
+    float16=DataType.HALF,
+    float32=DataType.FLOAT,
+    int64=DataType.INT64,
+    int32=DataType.INT32,
+    int8=DataType.INT8,
+    bool=DataType.BOOL,
+    fp8=DataType.FP8,
+)
+
+
+def str_dtype_to_binding(dtype):
+    ret = _str_to_binding_dtype_dict.get(dtype)
     assert ret is not None, f'Unsupported dtype: {dtype}'
     return ret
 
@@ -589,3 +608,12 @@ class QuantModeWrapper:
 
     def __getitem__(self, index):
         return self.objs[index]
+
+
+@contextmanager
+def nvtx_range(msg):
+    torch.cuda.nvtx.range_push(msg)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()

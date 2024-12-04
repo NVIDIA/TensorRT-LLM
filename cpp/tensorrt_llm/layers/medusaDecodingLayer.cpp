@@ -223,6 +223,7 @@ void MedusaDecodingLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> c
     auto inputs = std::dynamic_pointer_cast<MedusaDecodingInputs>(baseInputs);
     auto outputs = std::dynamic_pointer_cast<SpeculativeDecodingOutputs>(baseOutputs);
 
+    // TODO add typical acceptance similarly to EagleSampleAndAcceptDraftTokensPlugin::doTypicalAcceptance.
     samplePrimeHeadTokens(*outputs, *inputs, workspace);
 
     acceptDraftTokens(*outputs, *inputs, workspace);

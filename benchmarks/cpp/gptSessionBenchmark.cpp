@@ -75,8 +75,8 @@ void benchmarkGptSession(std::filesystem::path const& dataPath, std::vector<int>
     auto const json = GptJsonConfig::parse(jsonFileName);
     auto const modelConfig = json.getModelConfig();
     auto const inputPacked = modelConfig.usePackedInput();
-    auto const worldConfig
-        = WorldConfig::mpi(json.getGpusPerNode(), json.getTensorParallelism(), json.getPipelineParallelism());
+    auto const worldConfig = WorldConfig::mpi(json.getGpusPerNode(), json.getTensorParallelism(),
+        json.getPipelineParallelism(), json.getContextParallelism());
     auto& comm = COMM_SESSION;
     auto const enginePath = dataPath / json.engineFilename(worldConfig);
     auto const dtype = modelConfig.getDataType();

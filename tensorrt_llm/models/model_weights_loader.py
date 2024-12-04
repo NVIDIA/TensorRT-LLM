@@ -49,6 +49,7 @@ class ModelWeightsLoader:
         self.tllm_to_externel_key_dict = {
             "transformer": "model",
             "vocab_embedding": "embed_tokens",
+            "layers": "layers",
             "lm_head": "lm_head",
             "ln_f": "norm",
             "attention": "self_attn",
@@ -59,6 +60,7 @@ class ModelWeightsLoader:
             "fc": "gate_proj",
             "input_layernorm": "input_layernorm",
             "post_layernorm": "post_attention_layernorm",
+            "kv_cache_scaling_factor": ["k_proj.k_scale", "v_proj.v_scale"],
         }
         self.tllm_to_externel_key_dict.update(customized_key_dict)
 
@@ -87,33 +89,39 @@ class ModelWeightsLoader:
         Returns:
             hf_keys (str | list[str]) : Translated HF key(s).
         """
-        tllm_key_split = tllm_key.split(".")
-        hf_key_split = tllm_key_split.copy()
-
-        for i, tllm_word in enumerate(tllm_key_split):
-            if tllm_word in tllm_to_externel_key_dict:
-                hf_key_split[i] = tllm_to_externel_key_dict[tllm_word]
-            elif tllm_word in self.tllm_to_externel_key_dict:
-                hf_key_split[i] = self.tllm_to_externel_key_dict[tllm_word]
-
-        hf_keys = [""]
-        for hf_word in hf_key_split:
-            if isinstance(hf_word, list):
-                hf_keys = [
-                    item for item in hf_keys for _ in range(len(hf_word))
-                ]
-                hf_keys = [
-                    hf_key + hf_word[i % len(hf_word)]
-                    for i, hf_key in enumerate(hf_keys)
-                ]
-            else:
-                if hf_word == "":
+        tllm_keys = [tllm_key]
+        d = self.tllm_to_externel_key_dict.copy()
+        if len(tllm_to_externel_key_dict) > 0:
+            d.update(tllm_to_externel_key_dict)
+        for k, v in d.items():
+            if k in tllm_key:
+                # Ensure replacement happen when k covers several full sections in tllm_key
+                if not any([
+                    ('.' + k + '.') in tllm_key,
+                        k == tllm_key,
+                        tllm_key.startswith(k) and (k + '.') in tllm_key,
+                        tllm_key.endswith(k) and ('.' + k) in tllm_key,
+                ]):
                     continue
-                hf_keys = [hf_key + hf_word for hf_key in hf_keys]
-            hf_keys = [hf_key + "." for hf_key in hf_keys]
-        hf_keys = [hf_key[:-1] for hf_key in hf_keys]
+                if isinstance(v, list):
+                    tllm_keys = [t for t in tllm_keys for _ in range(len(v))]
+                    tllm_keys = [
+                        s.replace(k, v[idx % len(v)])
+                        for idx, s in enumerate(tllm_keys)
+                    ]
+                else:
+                    tllm_keys = [s.replace(k, v) for s in tllm_keys]
 
-        return hf_keys[0] if len(hf_keys) == 1 else hf_keys
+        for idx, k in enumerate(tllm_keys):
+            while ".." in k:
+                k = k.replace("..", ".")
+            if k.startswith("."):
+                k = k[1:]
+            if k.endswith("."):
+                k = k[:-1]
+            tllm_keys[idx] = k
+
+        return tllm_keys[0] if len(tllm_keys) == 1 else tllm_keys
 
     def detect_format(self):
         if os.path.isfile(self.model_dir):
@@ -269,7 +277,6 @@ class ModelWeightsLoader:
             tp_rank = self.model.config.mapping.moe_tp_rank
         external_key = self.translate_to_external_key(
             tllm_key, tllm_to_externel_key_dict)
-
         if isinstance(external_key, list):
             v = [
                 self.load_tensor(k, tp_size, tp_dim, tp_rank)
@@ -356,7 +363,8 @@ class ModelWeightsLoader:
         if config.mapping.has_pp():
             pp_layers = config.mapping.pp_layers(config.num_hidden_layers)
             self.tllm_to_externel_key_dict.update({
-                str(tllm_local_layer_idx): str(hf_global_layer_idx)
+                f"layers.{tllm_local_layer_idx}":
+                f"{self.tllm_to_externel_key_dict['layers']}.{hf_global_layer_idx}"
                 for tllm_local_layer_idx, hf_global_layer_idx in enumerate(
                     pp_layers)
             })

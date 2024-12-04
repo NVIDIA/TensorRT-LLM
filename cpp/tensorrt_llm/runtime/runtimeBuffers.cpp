@@ -361,7 +361,7 @@ void RuntimeBuffers::postContextStep(std::vector<RuntimeBuffers> const& contextB
 }
 
 void RuntimeBuffers::prepareContextStep(TensorPtr const& inputIds, TokenIdType const padId, BufferManager& manager,
-    batch_manager::kv_cache_manager::KVCacheManager const* kvCacheManager, SizeType32 firstBatchSlotIdx,
+    batch_manager::kv_cache_manager::BaseKVCacheManager const* kvCacheManager, SizeType32 firstBatchSlotIdx,
     ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -394,7 +394,7 @@ void RuntimeBuffers::prepareContextStep(TensorPtr const& inputIds, TokenIdType c
 }
 
 RuntimeBuffers::TensorPtr RuntimeBuffers::prepareNextStep(SizeType32 const step, BufferManager& manager,
-    batch_manager::kv_cache_manager::KVCacheManager* kvCacheManager, SizeType32 firstBatchSlotIdx,
+    batch_manager::kv_cache_manager::BaseKVCacheManager* kvCacheManager, SizeType32 firstBatchSlotIdx,
     ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);

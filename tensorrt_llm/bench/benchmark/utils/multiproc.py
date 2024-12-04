@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import multiprocessing as mp
 from copy import deepcopy
 from datetime import timedelta
+from pathlib import Path
 from threading import Event, Thread
 from time import monotonic_ns, sleep
 from typing import Generator, List, Tuple
@@ -10,20 +12,24 @@ from typing import Generator, List, Tuple
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.reporting import ResponseTuple, StatsKeeper
+from tensorrt_llm.bench.dataclasses.statistics import BenchmarkStatistics
 from tensorrt_llm.logger import logger
 
 
 class ExecutorManager:
     """Utility class for managing a TRT-LLM Executor instance."""
 
-    def __init__(self, runtime_cfg: RuntimeConfig,
-                 response_queue: mp.Queue) -> None:
+    def __init__(self,
+                 runtime_cfg: RuntimeConfig,
+                 response_queue: mp.Queue,
+                 iteration_log: Path = None) -> None:
         """Initialize the ExecutorManager.
 
         Args:
             runtime_cfg (RuntimeConfig): Execution runtime configuration.
             response_queue (mp.Queue): Process-safe queue for passing request
             responses to main process.
+            iteration_log (Path): Path to iteration log stored at end of run.
         """
         logger.info("Initializing Executor.")
         # Runtime related properties.
@@ -33,10 +39,13 @@ class ExecutorManager:
         self._shutdown = Event()
         self.backend_ready = Event()
         self._resp_daemon_finished = Event()
-        self.executor = trtllm.Executor(
-            self.runtime_config.engine_dir,
-            trtllm.ModelType.DECODER_ONLY,
-            executor_config=self.runtime_config.get_config())
+
+        config = self.runtime_config.get_config()
+        self.iteration_log = iteration_log
+        config.iter_stats_max_iterations = 100000000 if self.iteration_log else 0
+        self.executor = trtllm.Executor(self.runtime_config.engine_dir,
+                                        trtllm.ModelType.DECODER_ONLY,
+                                        executor_config=config)
 
         logger.info("WAITING ON EXECUTOR...")
         while not self.executor.can_enqueue_requests():
@@ -72,6 +81,12 @@ class ExecutorManager:
         if self.executor is not None:
             logger.info("Shutting down ExecutorServer.")
             self.executor.shutdown()
+
+    def dump_extra_stats(self) -> None:
+        if self.iteration_log is not None:
+            with open(self.iteration_log, "w") as iter_log:
+                for iteration in self.executor.get_latest_iteration_stats():
+                    iter_log.write(f"{iteration.to_json_str()}\n")
 
     def response_daemon(self) -> None:
         """Daemon method for retrieving messages from the Executor."""
@@ -111,6 +126,7 @@ class ThroughputBenchmark:
         request_queue: mp.Queue,
         response_queue: mp.Queue,
         streaming: bool,
+        iteration_log: Path = None,
     ) -> None:
         """Initialize the throughput benchmark.
 
@@ -122,6 +138,9 @@ class ThroughputBenchmark:
             request_queue (mp.Queue): Process-safe queue of request identifiers
             response_queue (mp.Queue): Process-safe queue for passing request
             responses to main process.
+            streaming (bool): Enable/disable streaming mode.
+            iteration_log (Path): Path to iteration log stored at end of run.
+
         """
         logger.info(
             f"Initializing Throughput Benchmark. [rate={request_rate} req/s]")
@@ -134,6 +153,7 @@ class ThroughputBenchmark:
         # Runtime configuration for Executor
         self.runtime_config = deepcopy(runtime_cfg)
         self.streaming = streaming
+        self.iteration_log = iteration_log
         self.executor = None
 
         # Request and response reporting structures
@@ -172,8 +192,12 @@ class ThroughputBenchmark:
     def start_benchmark(self) -> None:
         """Start the benchmark."""
         # Start the ExecutorManager for running the backend.
-        self.executor = ExecutorManager(self.runtime_config,
-                                        self.response_queue)
+        self.executor = ExecutorManager(
+            self.runtime_config,
+            self.response_queue,
+            iteration_log=self.iteration_log,
+        )
+
         logger.info("Executor started.")
         # Note the time we started the thread.
         self.start_time = monotonic_ns()
@@ -206,6 +230,10 @@ class ThroughputBenchmark:
             bool: Return whether the event is set.
         """
         return not self.parsing_complete.wait()
+
+    def dump_extra_stats(self) -> None:
+        """Write extended stats to a file."""
+        self.executor.dump_extra_stats()
 
     def collect_statistics(self) -> None:
         """Collect statistics (daemon method)."""
@@ -247,3 +275,68 @@ class ThroughputBenchmark:
         self.end_time = monotonic_ns()
         self.parsing_complete.set()
         logger.info("Ending statistics collection.")
+
+    def report_statistics(self) -> BenchmarkStatistics:
+        """Report internal statistics about benchmark."""
+
+        config_path = self.runtime_config.engine_dir / "config.json"
+        with open(config_path, "r") as config:
+            engine_config = json.load(config)
+
+        stats = self.statistics.generate_statistics_summary()
+        rt_cfg = self.runtime_config
+        build_cfg = engine_config["build_config"]
+        pretrain_cfg = engine_config["pretrained_config"]
+        total_latency_s = stats.total_latency_ns / 1.0e9
+
+        logging_info = (
+            "\n\n===========================================================\n"
+            "= ENGINE DETAILS\n"
+            "===========================================================\n"
+            f"Model:\t\t\t{rt_cfg.model}\n"
+            f"Engine Directory:\t{rt_cfg.engine_dir}\n"
+            f"TensorRT-LLM Version:\t{rt_cfg.sw_version}\n"
+            f"Dtype:\t\t\t{pretrain_cfg['dtype']}\n"
+            f"KV Cache Dtype:\t\t{pretrain_cfg['quantization']['kv_cache_quant_algo']}\n"
+            f"Quantization:\t\t{pretrain_cfg['quantization']['quant_algo']}\n"
+            f"Max Sequence Length:\t{build_cfg['max_seq_len']}\n"
+            f"\n"
+            "===========================================================\n"
+            "= WORLD + RUNTIME INFORMATION \n"
+            "===========================================================\n"
+            f"TP Size:\t\t{rt_cfg.world_config.tp_size}\n"
+            f"PP Size:\t\t{rt_cfg.world_config.pp_size}\n"
+            f"Max Runtime Batch Size:\t{rt_cfg.settings_config.max_batch_size}\n"
+            f"Max Runtime Tokens:\t{rt_cfg.settings_config.max_num_tokens}\n"
+            f"Scheduling Policy:\t{rt_cfg.settings_config.scheduler_policy.values[1]}\n"
+            f"KV Memory Percentage:\t{rt_cfg.settings_config.kv_cache_percent * 100.0:.2f}%\n"
+            f"Issue Rate (req/sec):\t{stats.issue_rate_ns * 1e9:.4E}\n"
+            f"\n"
+            "===========================================================\n"
+            "= PERFORMANCE OVERVIEW \n"
+            "===========================================================\n"
+            f"Number of requests:\t\t{stats.num_requests}\n"
+            f"Average Input Length (tokens):\t{stats.average_input_length:.4f}\n"
+            f"Average Output Length (tokens):\t{stats.average_output_length:.4f}\n"
+            f"Token Throughput (tokens/sec):\t{stats.total_output_tokens / total_latency_s:.4f}\n"
+            f"Request Throughput (req/sec):\t{stats.num_requests / total_latency_s:.4f}\n"
+            f"Total Latency (ms):\t\t{stats.total_latency_ns * 1.0e-6:.4f}\n")
+
+        if self.streaming:
+            logging_info = (
+                f"{logging_info}"
+                "\n"
+                "===========================================================\n"
+                "= STREAMING STATISTICS \n"
+                "===========================================================\n"
+                f"Average request latency (ms):\t\t{stats.request_latency_percentiles.average * 1.0e-6:.4f}\n"
+                f"Average time-to-first-token (ms):\t{stats.ttft_percentiles.average * 1.0e-6:.4f}\n"
+                f"Average inter-token latency (ms):\t{stats.itl_percentiles.average * 1.0e-6:.4f}\n"
+            )
+
+        logging_info = (
+            f"{logging_info}"
+            "\n===========================================================\n")
+
+        logger.info(logging_info)
+        return stats

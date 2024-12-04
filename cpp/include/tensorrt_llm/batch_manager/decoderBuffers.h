@@ -138,6 +138,9 @@ public:
 
     void recv(std::shared_ptr<mpi::MpiComm> const& commSession, bool returnLogProbs, SizeType32 maxBeamWidth,
         bool useMedusa, int peer);
+
+    void bcast(std::shared_ptr<mpi::MpiComm> const& commSession, bool returnLogProbs, SizeType32 maxBeamWidth,
+        bool useMedusa, int root);
 };
 
 class SlotDecoderBuffers

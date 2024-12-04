@@ -27,8 +27,11 @@ class InferenceRequest(BaseModel):
 
 
 class DatasetMetadata(BaseModel):
+    avg_isl: int
+    avg_osl: int
     max_isl: int
     max_osl: int
+    avg_sequence_length: int
     max_sequence_length: int
     num_requests: int
 
@@ -40,6 +43,8 @@ class DatasetMetadata(BaseModel):
             f"Max Input Sequence Length:\t{self.max_isl}\n"
             f"Max Output Sequence Length:\t{self.max_osl}\n"
             f"Max Sequence Length:\t{self.max_sequence_length}\n"
+            f"Target (Average) Input Sequence Length:\t{self.avg_isl}\n"
+            f"Target (Average) Output Sequence Length:\t{self.avg_osl}\n"
             f"Number of Sequences:\t{self.num_requests}\n"
             "===========================================================\n"
             f"\n")

@@ -68,7 +68,6 @@ def build_engine(checkpoint_dir: str, engine_dir: str, *args):
         "--context_fmha=disable",
         "--paged_kv_cache=disable",
         "--remove_input_padding=disable",
-        "--enable_xqa=disable",
     ]
     build_cmd = build_cmd + legacy_args + list(args)
     run_command(build_cmd)

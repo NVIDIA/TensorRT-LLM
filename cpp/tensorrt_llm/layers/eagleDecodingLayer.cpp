@@ -85,8 +85,12 @@ void EagleDecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, Te
     // Setup penalties.
     FillBuffers const fillBuffers{batchSize, mDecoderDomain.getBatchSize(), mBufferManager};
 
+    auto constexpr fltMax = std::numeric_limits<float>::max();
+    auto constexpr fltEpsilon = std::numeric_limits<float>::epsilon();
+
+    // Allow temp = 0 as it will be overwritten in Eagle's typical acceptance codes.
     fillBuffers(setupParams->temperature, DefaultDecodingParams::getTemperature(), mTemperature, mTemperatureDevice,
-        batchSlots, getLimitsPenalty(DecodingPenaltyType::Temperature), "temperature penalty");
+        batchSlots, std::make_pair(-fltEpsilon, fltMax), "temperature penalty");
 
     fillContextBuffers(batchSize, batchSlots, *setupParams, workspace);
 

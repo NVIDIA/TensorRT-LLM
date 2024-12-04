@@ -34,7 +34,7 @@ class LlmRequest;
 namespace kv_cache_manager
 {
 
-class KVCacheManager;
+class BaseKVCacheManager;
 
 }
 } // namespace tensorrt_llm::batch_manager
@@ -46,7 +46,7 @@ namespace tle = tensorrt_llm::executor;
 
 class PauseRequests : Algorithm
 {
-    using KVCacheManager = kv_cache_manager::KVCacheManager;
+    using BaseKVCacheManager = kv_cache_manager::BaseKVCacheManager;
 
     template <typename T>
     using OptionalRef = common::OptionalRef<T>;
@@ -63,8 +63,8 @@ public:
 
     void operator()(RequestVector& requestsToPause, ReqIdsSet& inflightReqIds, ReqIdsSet& reqIdsToPause,
         bool pauseFlagged, SequenceSlotManager& seqSlotManager,
-        OptionalRef<KVCacheManager> kvCacheManager = std::nullopt,
-        OptionalRef<KVCacheManager> crossKvCacheManager = std::nullopt,
+        OptionalRef<BaseKVCacheManager> kvCacheManager = std::nullopt,
+        OptionalRef<BaseKVCacheManager> crossKvCacheManager = std::nullopt,
         OptionalRef<BasePeftCacheManager> peftCacheManager = std::nullopt) const;
 
 private:

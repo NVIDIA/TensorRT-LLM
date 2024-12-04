@@ -2,28 +2,17 @@ import argparse
 import json
 import os
 import time
-import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import safetensors
-import torch
-from transformers import LlamaConfig, LlamaForCausalLM, LlamaTokenizer
+from tqdm import tqdm
+from transformers import LlamaConfig
 
 import tensorrt_llm
-from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models import PretrainedConfig
-from tensorrt_llm.models.convert_utils import load_calib_dataset
-from tensorrt_llm.models.eagle.weight import (capture_activation_range,
-                                              convert_hf_llama, load_eagle_hf)
-from tensorrt_llm.models.llama.convert import load_weights_from_hf_by_shard
+from tensorrt_llm.models.eagle.config import EagleConfig
+from tensorrt_llm.models.eagle.model import EagleForCausalLM
+from tensorrt_llm.models.model_weights_loader import ModelWeightsLoader
 from tensorrt_llm.quantization import QuantAlgo
-
-try:
-    from transformers import MixtralForCausalLM
-except ImportError:
-    MixtralForCausalLM = None
 
 
 def parse_arguments():
@@ -40,8 +29,8 @@ def parse_arguments():
                         help='N-way pipeline parallelism size')
     parser.add_argument('--dtype',
                         type=str,
-                        default='float16',
-                        choices=['float32', 'bfloat16', 'float16'])
+                        default='auto',
+                        choices=['auto', 'float16', 'bfloat16', 'float32'])
     parser.add_argument('--vocab_size', type=int, default=32000)
     parser.add_argument('--n_positions', type=int, default=2048)
     parser.add_argument('--n_layer', type=int, default=32)
@@ -187,6 +176,98 @@ def parse_arguments():
     return args
 
 
+def convert_and_save_hf(config, args):
+    world_size = args.tp_size * args.pp_size
+    tllm_config = EagleConfig.from_dict(config)
+    for rank in range(world_size):
+        tllm_config.mapping = Mapping(world_size=world_size,
+                                      rank=rank,
+                                      cp_size=1,
+                                      tp_size=args.tp_size,
+                                      pp_size=args.pp_size)
+
+        model = EagleForCausalLM(tllm_config)
+
+        def check_and_update(module, dict):
+            if hasattr(module, 'tllm_to_externel_key_dict'):
+                module.tllm_to_externel_key_dict.update(dict)
+            else:
+                module.tllm_to_externel_key_dict = dict
+
+        def copy(tensors):
+            if isinstance(tensors, list):
+                if None in tensors:
+                    return tensors
+                else:
+                    return [tensor.clone() for tensor in tensors]
+            elif tensors is None:
+                return tensors
+            else:
+                return tensors.clone()
+
+        shared_weight_prefixs = []
+        tllm_weights = {}
+        customized_dict = {"drafter": ""}
+        if args.eagle_model_dir is None:
+            # Single checkpoint for ModelOpt
+            for idx, eagle_net in enumerate(model.eagle_nets):
+                check_and_update(eagle_net.drafter.fc, {"fc": "fc"})
+                check_and_update(eagle_net.drafter.vocab_embedding,
+                                 {f"eagle_nets.{idx}": "model"})
+                check_and_update(eagle_net.lm_head, {f"eagle_nets.{idx}": ""})
+                shared_weight_prefixs.append(f"eagle_nets.{idx}")
+                customized_dict[f'eagle_nets.{idx}'] = 'eagle_module'
+            loader = ModelWeightsLoader(eagle_model_dir, customized_dict)
+            loader.update_key_mapping(model)
+            for tllm_key, _ in tqdm(model.named_parameters()):
+                if any([
+                        tllm_key.startswith(prefix)
+                        for prefix in shared_weight_prefixs
+                ]):
+                    tllm_weights.update(loader.load(tllm_key, preprocess=copy))
+                else:
+                    tllm_weights.update(loader.load(tllm_key))
+            loader.fill(tllm_weights)
+        else:
+            # Double checkpoint for HF
+            for idx, eagle_net in enumerate(model.eagle_nets):
+                check_and_update(eagle_net.drafter.fc, {"fc": "fc"})
+                check_and_update(eagle_net.drafter.vocab_embedding,
+                                 {f"eagle_nets.{idx}": ""})
+                check_and_update(eagle_net.lm_head, {f"eagle_nets.{idx}": ""})
+                shared_weight_prefixs.append(f"eagle_nets.{idx}")
+                customized_dict[f'eagle_nets.{idx}'] = ''
+
+            # Load base model
+            base_loader = ModelWeightsLoader(args.model_dir)
+            base_loader.update_key_mapping(model)
+            for tllm_key, _ in tqdm(model.transformer.named_parameters()):
+                tllm_weights.update(base_loader.load("transformer." + tllm_key))
+            tllm_weights.update(base_loader.load("lm_head.weight"))
+            for idx in range(args.num_eagle_layers):
+                tllm_weights.update(
+                    base_loader.load(f"eagle_nets.{idx}.lm_head.weight",
+                                     preprocess=copy))
+
+            # Load eagle model
+            eagle_loader = ModelWeightsLoader(eagle_model_dir, customized_dict)
+            eagle_loader.update_key_mapping(model)
+            for tllm_key, _ in tqdm(model.eagle_nets.named_parameters()):
+                if not tllm_key.endswith("lm_head.weight"):
+                    if any([
+                            tllm_key.startswith(prefix)
+                            for prefix in shared_weight_prefixs
+                    ]):
+                        tllm_weights.update(
+                            eagle_loader.load("eagle_nets." + tllm_key,
+                                              preprocess=copy))
+                    else:
+                        tllm_weights.update(
+                            eagle_loader.load("eagle_nets." + tllm_key))
+            base_loader.fill(tllm_weights)
+        model.save_checkpoint(args.output_dir, save_config=(rank == 0))
+
+
 if __name__ == '__main__':
     # TODO(qijun): Currently, the convert script depends on a torch op:
     # torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix,
@@ -204,6 +285,7 @@ if __name__ == '__main__':
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
     hf_config = None
+    eagle_model_dir = args.model_dir if args.eagle_model_dir is None else args.eagle_model_dir
     if args.model_dir is not None:
         hf_config = LlamaConfig.from_pretrained(args.model_dir)
 
@@ -216,15 +298,27 @@ if __name__ == '__main__':
         args.rms_norm_eps = hf_config.rms_norm_eps
         args.vocab_size = hf_config.vocab_size
         args.n_positions = hf_config.max_position_embeddings
+        args.dtype = str(
+            hf_config.torch_dtype)[6:] if args.dtype == 'auto' else args.dtype
 
-        hf_config_eagle = LlamaConfig.from_pretrained(args.eagle_model_dir)
-        args.n_head_eagle = hf_config_eagle.num_attention_heads
-        args.inter_size_eagle = hf_config_eagle.intermediate_size
-        args.n_layer_eagle = hf_config_eagle.num_hidden_layers
-        args.n_embd_eagle = hf_config_eagle.hidden_size
-        args.n_kv_head_eagle = hf_config_eagle.num_key_value_heads
-        args.rms_norm_eps_eagle = hf_config_eagle.rms_norm_eps
-        args.n_positions_eagle = hf_config_eagle.max_position_embeddings
+        if args.eagle_model_dir is None:
+            hf_config_eagle = hf_config.eagle
+            args.n_head_eagle = hf_config_eagle['num_attention_heads']
+            args.inter_size_eagle = hf_config_eagle['intermediate_size']
+            args.n_layer_eagle = hf_config_eagle['num_hidden_layers']
+            args.n_embd_eagle = hf_config_eagle['hidden_size']
+            args.n_kv_head_eagle = hf_config_eagle['num_key_value_heads']
+            args.rms_norm_eps_eagle = hf_config_eagle['rms_norm_eps']
+            args.n_positions_eagle = hf_config_eagle['max_position_embeddings']
+        else:
+            hf_config_eagle = LlamaConfig.from_pretrained(args.eagle_model_dir)
+            args.n_head_eagle = hf_config_eagle.num_attention_heads
+            args.inter_size_eagle = hf_config_eagle.intermediate_size
+            args.n_layer_eagle = hf_config_eagle.num_hidden_layers
+            args.n_embd_eagle = hf_config_eagle.hidden_size
+            args.n_kv_head_eagle = hf_config_eagle.num_key_value_heads
+            args.rms_norm_eps_eagle = hf_config_eagle.rms_norm_eps
+            args.n_positions_eagle = hf_config_eagle.max_position_embeddings
 
     elif args.meta_ckpt_dir is not None:
         assert False, "meta ckpt is not supported yet"
@@ -355,130 +449,23 @@ if __name__ == '__main__':
             'quant_algo': QuantAlgo.W4A16_GPTQ
         })
 
-    with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
-        json.dump(config, f, indent=4)
+    # Update quant config if hf_quant_config.json exists
+    quant_config = {}
+    try:
+        with open(eagle_model_dir + '/' + 'hf_quant_config.json') as f:
+            quant_config = json.load(f)
+            if "lm_head" in quant_config['quantization']['exclude_modules']:
+                quant_config['quantization']['exclude_modules'] += [
+                    f"eagle_nets.{i}.lm_head"
+                    for i in range(args.num_eagle_layers)
+                ]
+            config['quantization'].update(quant_config['quantization'])
+            config['eagle_net_config']['quantization'].update(
+                quant_config['quantization'])
+    except IOError:
+        pass
 
-    if args.weight_only_precision == 'int8':
-        plugin_weight_only_quant_type = torch.int8
-    elif args.weight_only_precision == 'int4':
-        plugin_weight_only_quant_type = torch.quint4x2
-
-    act_range = {}
-    llama_qkv_para = {}
-    # smoother for inputs of self_attn.o_proj and mlp.down_proj
-    llama_smoother = {}
-    base_model = None
-    eagle_model = None
-
-    def get_hf_model(model_dir):
-        hf_model = LlamaForCausalLM if args.model_type != "mixtral" else MixtralForCausalLM
-
-        model = hf_model.from_pretrained(
-            model_dir,
-            torch_dtype='auto',
-            device_map='auto' if not args.load_model_on_cpu else 'cpu',
-            trust_remote_code=True)
-
-        if args.smoothquant is not None or args.int8_kv_cache:
-            os.environ["TOKENIZERS_PARALLELISM"] = os.environ.get(
-                "TOKENIZERS_PARALLELISM", "false")
-            if args.load_model_on_cpu:
-                logger.warning(
-                    "Note that running capture_activation_range on cpu would be very slow."
-                )
-            tokenizer = LlamaTokenizer.from_pretrained(args.model_dir,
-                                                       padding_side='left')
-            dataset = load_calib_dataset(args.calib_dataset,
-                                         cache_dir=args.dataset_cache_dir)
-
-            act_range = capture_activation_range(model, tokenizer, dataset)
-            if args.smoothquant is not None:
-                smooth_llama_model(model, act_range, args.smoothquant,
-                                   llama_qkv_para, llama_smoother)
-        return model
-
-    if args.model_dir is not None:
-        base_model = get_hf_model(args.model_dir)
-    if args.eagle_model_dir is not None:
-        eagle_model = get_hf_model(args.eagle_model_dir)
-
-    convert_args = {
-        'hf_base_model': base_model,
-        'hf_eagle_model': eagle_model,
-        'act_range': act_range,
-        'llama_qkv_para': llama_qkv_para,
-        'llama_smoother': llama_smoother
-    }
-
-    def covert_and_save(rank, convert_args):
-        mapping = Mapping(world_size=world_size,
-                          rank=rank,
-                          tp_size=args.tp_size,
-                          pp_size=args.pp_size)
-
-        if args.use_weight_only and args.weight_only_precision == 'int4_gptq':
-            assert False, "Never supported"
-        else:
-            if args.load_by_shard:
-                weights = load_weights_from_hf_by_shard(
-                    args.model_dir, PretrainedConfig.from_dict(config))
-
-            else:
-                weights = convert_hf_llama(
-                    convert_args['hf_base_model'],
-                    mapping,
-                    rank,
-                    dtype=args.dtype,
-                    use_weight_only=args.use_weight_only,
-                    plugin_weight_only_quant_type=plugin_weight_only_quant_type,
-                    use_parallel_embedding=args.use_parallel_embedding,
-                    sharding_dim=args.embedding_sharding_dim,
-                    share_embedding_table=args.use_embedding_sharing,
-                    use_smooth_quant=args.smoothquant,
-                    per_channel=args.per_channel,
-                    per_token=args.per_token,
-                    int8_kv_cache=args.int8_kv_cache,
-                    act_range=convert_args['act_range'],
-                    qkv_para=convert_args['llama_qkv_para'],
-                    smoother=convert_args['llama_smoother'])
-
-                if mapping.is_last_pp_rank():
-                    eagle_mapping = Mapping(world_size=world_size,
-                                            rank=rank,
-                                            tp_size=world_size,
-                                            pp_size=1)
-                    eagle_weights = load_eagle_hf(
-                        eagle_model_dir=args.eagle_model_dir,
-                        eagle_model=convert_args['hf_eagle_model'],
-                        base_model=convert_args['hf_base_model'],
-                        num_eagle_layers=args.num_eagle_layers,
-                        mapping=eagle_mapping,
-                        rank=rank,
-                        dtype=args.dtype)
-                    weights.update(eagle_weights)
-
-        safetensors.torch.save_file(
-            weights, os.path.join(args.output_dir, f'rank{rank}.safetensors'))
-
-    if args.workers == 1:
-        for rank in range(world_size):
-            covert_and_save(rank, convert_args)
-    else:
-        with ThreadPoolExecutor(max_workers=args.workers) as p:
-            futures = [
-                p.submit(covert_and_save, rank, convert_args)
-                for rank in range(world_size)
-            ]
-            exceptions = []
-            for future in as_completed(futures):
-                try:
-                    future.result()
-                except Exception as e:
-                    traceback.print_exc()
-                    exceptions.append(e)
-            assert len(
-                exceptions
-            ) == 0, "Checkpoint conversion failed, please check error log."
+    convert_and_save_hf(config, args)
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))

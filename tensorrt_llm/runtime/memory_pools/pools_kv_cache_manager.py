@@ -9,16 +9,9 @@ from tensorrt_llm.runtime.memory_pools.pool import Pool
 
 class PoolsKVCacheManager(object):
 
-    def __init__(self,
-                 pools_metadata: List[Pool],
-                 max_blocks_per_seq,
-                 num_blocks,
-                 tokens_per_block,
-                 head_size,
-                 max_attention_window_size,
-                 beam_width,
-                 sink_token_len,
-                 use_one_more_block: bool = False) -> None:
+    def __init__(self, pools_metadata: List[Pool], max_blocks_per_seq,
+                 num_blocks, tokens_per_block, head_size,
+                 max_attention_window_size, beam_width, sink_token_len) -> None:
         self._num_pools = len(pools_metadata)
         self._kv_cache_managers = []
 
@@ -33,7 +26,6 @@ class PoolsKVCacheManager(object):
                     max_blocks_per_seq=max_blocks_per_seq,
                     max_attention_window_size=max_attention_window_size,
                     sink_token_len=sink_token_len,
-                    use_one_more_block=use_one_more_block,
                     beam_width=beam_width,
                 ))
 

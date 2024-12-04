@@ -100,7 +100,6 @@ Welcome to TensorRT-LLM's Documentation!
    advanced/gpt-runtime.md
    advanced/executor.md
    advanced/graph-rewriting.md
-   advanced/batch-manager.md
    advanced/inference-request.md
    advanced/lora.md
    advanced/expert-parallelism.md

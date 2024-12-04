@@ -28,6 +28,7 @@ class ILogger;
 namespace v_1_0
 {
 class IPluginCreator;
+class IPluginCreatorV3One;
 class IPluginCreatorInterface;
 } // namespace v_1_0
 
