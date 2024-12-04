@@ -1,3 +1,5 @@
+
+
 <!DOCTYPE html>
 <html class="writer-html5" lang="en" data-content_root="../">
 <head>
@@ -6,25 +8,21 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>LLM Examples Introduction &mdash; tensorrt_llm  documentation</title>
       <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=80d5e7a1" />
-      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=19f00094" />
+      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
 
   
-  <!--[if lt IE 9]>
-    <script src="../_static/js/html5shiv.min.js"></script>
-  <![endif]-->
-  
-        <script src="../_static/jquery.js?v=5d32c60e"></script>
-        <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-        <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="../_static/doctools.js?v=888ff710"></script>
-        <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
-        <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
-        <script src="../_static/copybutton.js?v=f281be69"></script>
+      <script src="../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="../_static/doctools.js?v=888ff710"></script>
+      <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+      <script src="../_static/copybutton.js?v=65e89d2a"></script>
     <script src="../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="Common Customizations" href="customization.html" />
+    <link rel="next" title="Generate text" href="llm_inference.html" />
     <link rel="prev" title="API Reference" href="../llm-api/reference.html" /> 
 </head>
 
@@ -60,6 +58,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/windows.html">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul>
@@ -69,12 +68,17 @@
 <p class="caption" role="heading"><span class="caption-text">LLM API Examples</span></p>
 <ul class="current">
 <li class="toctree-l1 current"><a class="current reference internal" href="#">LLM Examples Introduction</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_logits_processor.html">Control generated text using logits post processor</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#supported-models">Supported Models</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#model-preparation">Model Preparation</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="#hugging-face-hub">Hugging Face Hub</a><ul>
-<li class="toctree-l4"><a class="reference internal" href="#local-hugging-face-models">Local Hugging Face Models</a></li>
-</ul>
-</li>
+<li class="toctree-l3"><a class="reference internal" href="#hugging-face-hub">Hugging Face Hub</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#local-hugging-face-models">Local Hugging Face Models</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#from-tensorrt-llm-engine">From TensorRT-LLM Engine</a></li>
 </ul>
 </li>
@@ -100,6 +104,7 @@
 <p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-serve.html">trtllm-serve</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
@@ -118,14 +123,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/executor.html">Executor API</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html">Inference Request</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html#lookahead-decoding">Lookahead decoding</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul>
@@ -166,7 +169,7 @@
       <li><a href="../index.html" class="icon icon-home" aria-label="Home"></a></li>
       <li class="breadcrumb-item active">LLM Examples Introduction</li>
       <li class="wy-breadcrumbs-aside">
-            <a href="../_sources/llm-api-examples/index.md.txt" rel="nofollow"> View page source</a>
+            <a href="../_sources/llm-api-examples/index.rst.txt" rel="nofollow"> View page source</a>
       </li>
   </ul>
   <hr/>
@@ -199,23 +202,25 @@
 </pre></div>
 </div>
 <p>The LLM API can be used for both offline or online usage. See more examples of the LLM API here:</p>
+<div class="toctree-wrapper compound">
+<p class="caption" role="heading"><span class="caption-text">LLM API Examples</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="llm_inference.html">Generate text</a></li>
+<li class="toctree-l1"><a class="reference internal" href="llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l1"><a class="reference internal" href="llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l1"><a class="reference internal" href="llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="llm_logits_processor.html">Control generated text using logits post processor</a></li>
+</ul>
+</div>
+<p>For more details on how to fully utilize this API, check out:</p>
 <ul class="simple">
-<li><p><a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api-examples/llm_inference.html">LLM Inference</a></p></li>
-<li><p><a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api-examples/llm_inference_distributed.html">LLM Inference Distributed</a></p></li>
-<li><p><a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api-examples/llm_inference_async.html">LLM Inference Async</a></p></li>
-<li><p><a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api-examples/llm_inference_async_streaming.html">LLM Inference Async Streaming</a></p></li>
-<li><p><a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api-examples/llm_quantization.html">LLM Quantization</a></p></li>
-<li><p><a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api-examples/llm_auto_parallel.html">LLM Auto Parallel</a></p></li>
-<li><p><a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api-examples/llm_logits_processor.html">LLM Logits Processor</a></p></li>
-<li><p><a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api-examples/llm_auto_parallel.html">Automatic Parallelism</a> (in preview)</p></li>
-<li><p><a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api-examples/llm_inference_async.html">Generation Async</a></p></li>
-<li><p><a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api-examples/llm_inference_async_streaming.html">Generation Async Streamling</a>
-For more details on how to fully utilize this API, check out:</p></li>
-<li><p><a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api-examples/customization.html">Common customizations</a></p></li>
-<li><p><a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api/index.html">LLM API Reference</a></p></li>
+<li><p><a class="reference external" href="customization.html">Common customizations</a></p></li>
+<li><p><a class="reference external" href="../llm-api/index.html">LLM API Reference</a></p></li>
 </ul>
 <section id="supported-models">
-<h2>Supported Models<a class="headerlink" href="#supported-models" title="Link to this heading"></a></h2>
+<span id="id1"></span><h2>Supported Models<a class="headerlink" href="#supported-models" title="Link to this heading"></a></h2>
 <ul class="simple">
 <li><p>Llama (including variants Mistral, Mixtral, InternLM)</p></li>
 <li><p>GPT (including variants Starcoder-1/2, Santacoder)</p></li>
@@ -230,57 +235,61 @@ For more details on how to fully utilize this API, check out:</p></li>
 </ul>
 </section>
 <section id="model-preparation">
-<h2>Model Preparation<a class="headerlink" href="#model-preparation" title="Link to this heading"></a></h2>
-<p>The <code class="docutils literal notranslate"><span class="pre">LLM</span></code> class supports input from any of following:</p>
+<span id="id2"></span><h2>Model Preparation<a class="headerlink" href="#model-preparation" title="Link to this heading"></a></h2>
+<p>The <code class="docutils literal notranslate"><span class="pre">LLM</span></code> class supports input from any of the following:</p>
 <ol class="arabic simple">
-<li><p><strong>Hugging Face Hub</strong>: triggers a download from the Hugging Face model hub, such as <code class="docutils literal notranslate"><span class="pre">TinyLlama/TinyLlama-1.1B-Chat-v1.0</span></code>.</p></li>
-<li><p><strong>Local Hugging Face models</strong>: uses a locally stored Hugging Face model.</p></li>
-<li><p><strong>Local TensorRT-LLM engine</strong>: built by <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> tool or saved by the Python LLM API.</p></li>
+<li><p><strong>Hugging Face Hub</strong>: Triggers a download from the Hugging Face model hub, such as <code class="docutils literal notranslate"><span class="pre">TinyLlama/TinyLlama-1.1B-Chat-v1.0</span></code>.</p></li>
+<li><p><strong>Local Hugging Face models</strong>: Uses a locally stored Hugging Face model.</p></li>
+<li><p><strong>Local TensorRT-LLM engine</strong>: Built by <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> tool or saved by the Python LLM API.</p></li>
 </ol>
-<p>Any of these formats can be used interchangeably with the LLM(model=<any-model-path>) constructor.
-The following sections how to use get these different formats for the LLM API.</p>
+<p>Any of these formats can be used interchangeably with the <code class="docutils literal notranslate"><span class="pre">LLM(model=&lt;any-model-path&gt;)</span></code> constructor.</p>
+<p>The following sections show how to use these different formats for the LLM API.</p>
 <section id="hugging-face-hub">
-<h3>Hugging Face Hub<a class="headerlink" href="#hugging-face-hub" title="Link to this heading"></a></h3>
-<p>Using the hugging face hub is as simple as specifying the repo name in the LLM constructor</p>
+<span id="id3"></span><h3>Hugging Face Hub<a class="headerlink" href="#hugging-face-hub" title="Link to this heading"></a></h3>
+<p>Using the Hugging Face hub is as simple as specifying the repo name in the LLM constructor:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">)</span>
 </pre></div>
 </div>
+</section>
 <section id="local-hugging-face-models">
-<h4>Local Hugging Face Models<a class="headerlink" href="#local-hugging-face-models" title="Link to this heading"></a></h4>
+<h3>Local Hugging Face Models<a class="headerlink" href="#local-hugging-face-models" title="Link to this heading"></a></h3>
 <p>Given the popularity of the Hugging Face model hub, the API supports the Hugging Face format as one of the starting points.
 To use the API with Llama 3.1 models, download the model from the <a class="reference external" href="https://huggingface.co/meta-llama/Meta-Llama-3.1-8B">Meta Llama 3.1 8B model page</a> by using the following command:</p>
 <div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">git lfs install</span>
 <span class="go">git clone https://huggingface.co/meta-llama/Meta-Llama-3.1-8B</span>
 </pre></div>
 </div>
-<p>After the model downloading finished, we can load the model as below.</p>
+<p>After the model downloading finished, we can load the model as below:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=&lt;</span><span class="n">path_to_meta_llama_from_hf</span><span class="o">&gt;</span><span class="p">)</span>
 </pre></div>
 </div>
-<p>Note that using this model is subject to a <a class="reference external" href="https://ai.meta.com/resources/models-and-libraries/llama-downloads/">particular</a> license. Agree to the terms and <a class="reference external" href="https://huggingface.co/meta-llama/Meta-Llama-3-8B?clone=true">authenticate with HuggingFace</a> to begin the download.</p>
-</section>
+<dl class="simple">
+<dt>Note:</dt><dd><p>Using this model is subject to a <a class="reference external" href="https://ai.meta.com/resources/models-and-libraries/llama-downloads/">particular license</a>. Agree to the terms and <a class="reference external" href="https://huggingface.co/meta-llama/Meta-Llama-3-8B?clone=true">authenticate with HuggingFace</a> to begin the download.</p>
+</dd>
+</dl>
 </section>
 <section id="from-tensorrt-llm-engine">
-<h3>From TensorRT-LLM Engine<a class="headerlink" href="#from-tensorrt-llm-engine" title="Link to this heading"></a></h3>
+<span id="id4"></span><h3>From TensorRT-LLM Engine<a class="headerlink" href="#from-tensorrt-llm-engine" title="Link to this heading"></a></h3>
 <p>There are two ways to build the TensorRT-LLM engine:</p>
 <ol class="arabic">
-<li><p>You can build the TensorRT-LLM engine from the Hugging Face model directly with the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/setup.py#L126"><code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code></a> tool and then save the engine to disk for later use.
-Refer to the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama">README</a> in the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama"><code class="docutils literal notranslate"><span class="pre">examples/llama</span></code></a> repository on GitHub.</p>
-<p>After the engine building is finished, we can load the model as below.</p>
+<li><p><strong>Using the ``trtllm-build`` Tool</strong>: You can build the TensorRT-LLM engine from the Hugging Face model directly with the <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> tool and then save the engine to disk for later use.
+Refer to the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama">README</a> in the <code class="docutils literal notranslate"><span class="pre">examples/llama</span></code> repository on GitHub.</p>
+<p>After the engine building is finished, we can load the model as below:</p>
+</li>
+</ol>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=&lt;</span><span class="n">path_to_trt_engine</span><span class="o">&gt;</span><span class="p">)</span>
 </pre></div>
 </div>
-</li>
-<li><p>Use an <code class="docutils literal notranslate"><span class="pre">LLM</span></code> instance to create the engine and persist to local disk:</p>
+<ol class="arabic simple" start="2">
+<li><p><strong>Using an ``LLM`` Instance</strong>: Use an <code class="docutils literal notranslate"><span class="pre">LLM</span></code> instance to create the engine and persist to local disk:</p></li>
+</ol>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="o">&lt;</span><span class="n">model</span><span class="o">-</span><span class="n">path</span><span class="o">&gt;</span><span class="p">)</span>
 
 <span class="c1"># Save engine to local disk</span>
 <span class="n">llm</span><span class="o">.</span><span class="n">save</span><span class="p">(</span><span class="o">&lt;</span><span class="n">engine</span><span class="o">-</span><span class="nb">dir</span><span class="o">&gt;</span><span class="p">)</span>
 </pre></div>
 </div>
-</li>
-</ol>
-<p>The engine can be reloaded like above.</p>
+<p>The engine can be reloaded as above.</p>
 </section>
 </section>
 </section>
@@ -290,13 +299,13 @@ Refer to the <a class="reference external" href="https://github.com/NVIDIA/Tenso
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
         <a href="../llm-api/reference.html" class="btn btn-neutral float-left" title="API Reference" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
-        <a href="customization.html" class="btn btn-neutral float-right" title="Common Customizations" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+        <a href="llm_inference.html" class="btn btn-neutral float-right" title="Generate text" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fc13e321d80>
+<jinja2.runtime.BlockReference object at 0x7f9459657b30>
 
 <div class="footer">
     <p>

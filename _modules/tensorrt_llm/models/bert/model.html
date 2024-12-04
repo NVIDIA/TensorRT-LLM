@@ -1,3 +1,5 @@
+
+
 <!DOCTYPE html>
 <html class="writer-html5" lang="en" data-content_root="../../../../">
 <head>
@@ -5,21 +7,17 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>tensorrt_llm.models.bert.model &mdash; tensorrt_llm  documentation</title>
       <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css?v=80d5e7a1" />
-      <link rel="stylesheet" type="text/css" href="../../../../_static/css/theme.css?v=19f00094" />
+      <link rel="stylesheet" type="text/css" href="../../../../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../../../../_static/copybutton.css?v=76b2166b" />
 
   
-  <!--[if lt IE 9]>
-    <script src="../../../../_static/js/html5shiv.min.js"></script>
-  <![endif]-->
-  
-        <script src="../../../../_static/jquery.js?v=5d32c60e"></script>
-        <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-        <script src="../../../../_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="../../../../_static/doctools.js?v=888ff710"></script>
-        <script src="../../../../_static/sphinx_highlight.js?v=dc90522c"></script>
-        <script src="../../../../_static/clipboard.min.js?v=a7894cd8"></script>
-        <script src="../../../../_static/copybutton.js?v=f281be69"></script>
+      <script src="../../../../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../../../../_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="../../../../_static/doctools.js?v=888ff710"></script>
+      <script src="../../../../_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="../../../../_static/clipboard.min.js?v=a7894cd8"></script>
+      <script src="../../../../_static/copybutton.js?v=65e89d2a"></script>
     <script src="../../../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../../../genindex.html" />
     <link rel="search" title="Search" href="../../../../search.html" /> 
@@ -57,6 +55,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../installation/windows.html">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul>
@@ -86,6 +85,7 @@
 <p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../commands/trtllm-serve.html">trtllm-serve</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
@@ -104,14 +104,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../advanced/executor.html">Executor API</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../advanced/inference-request.html">Inference Request</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../advanced/inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/speculative-decoding.html#lookahead-decoding">Lookahead decoding</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul>
@@ -175,17 +173,25 @@
 <span class="c1"># WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.</span>
 <span class="c1"># See the License for the specific language governing permissions and</span>
 <span class="c1"># limitations under the License.</span>
-<span class="kn">import</span> <span class="nn">math</span>
+<span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">OrderedDict</span><span class="p">,</span> <span class="n">Union</span>
 
 <span class="kn">import</span> <span class="nn">numpy</span> <span class="k">as</span> <span class="nn">np</span>
+<span class="kn">import</span> <span class="nn">tensorrt</span> <span class="k">as</span> <span class="nn">trt</span>
+<span class="kn">import</span> <span class="nn">torch</span>
+<span class="kn">import</span> <span class="nn">transformers</span>
+
+<span class="kn">from</span> <span class="nn">tensorrt_llm.models.modeling_utils</span> <span class="kn">import</span> <span class="n">PretrainedModel</span>
 
 <span class="kn">from</span> <span class="nn">..._common</span> <span class="kn">import</span> <span class="n">default_net</span>
-<span class="kn">from</span> <span class="nn">...functional</span> <span class="kn">import</span> <span class="p">(</span><span class="n">ACT2FN</span><span class="p">,</span> <span class="n">bert_attention</span><span class="p">,</span> <span class="n">cast</span><span class="p">,</span> <span class="n">concat</span><span class="p">,</span> <span class="n">constant</span><span class="p">,</span>
-                           <span class="n">cumsum</span><span class="p">,</span> <span class="n">expand</span><span class="p">,</span> <span class="n">expand_mask</span><span class="p">,</span> <span class="n">index_select</span><span class="p">,</span> <span class="n">matmul</span><span class="p">,</span>
-                           <span class="n">select</span><span class="p">,</span> <span class="n">shape</span><span class="p">,</span> <span class="nb">slice</span><span class="p">,</span> <span class="n">softmax</span><span class="p">,</span> <span class="n">split</span><span class="p">,</span> <span class="n">unsqueeze</span><span class="p">)</span>
-<span class="kn">from</span> <span class="nn">...layers</span> <span class="kn">import</span> <span class="n">MLP</span><span class="p">,</span> <span class="n">ColumnLinear</span><span class="p">,</span> <span class="n">Embedding</span><span class="p">,</span> <span class="n">LayerNorm</span><span class="p">,</span> <span class="n">Linear</span><span class="p">,</span> <span class="n">RowLinear</span>
+<span class="kn">from</span> <span class="nn">...functional</span> <span class="kn">import</span> <span class="p">(</span><span class="n">ACT2FN</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">concat</span><span class="p">,</span> <span class="n">constant</span><span class="p">,</span> <span class="n">cumsum</span><span class="p">,</span> <span class="n">expand</span><span class="p">,</span>
+                           <span class="n">index_select</span><span class="p">,</span> <span class="n">select</span><span class="p">,</span> <span class="n">shape</span><span class="p">,</span> <span class="nb">slice</span><span class="p">,</span> <span class="n">unsqueeze</span><span class="p">)</span>
+<span class="kn">from</span> <span class="nn">...layers</span> <span class="kn">import</span> <span class="n">MLP</span><span class="p">,</span> <span class="n">BertAttention</span><span class="p">,</span> <span class="n">Embedding</span><span class="p">,</span> <span class="n">LayerNorm</span><span class="p">,</span> <span class="n">Linear</span>
 <span class="kn">from</span> <span class="nn">...mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
 <span class="kn">from</span> <span class="nn">...module</span> <span class="kn">import</span> <span class="n">Module</span><span class="p">,</span> <span class="n">ModuleList</span>
+<span class="kn">from</span> <span class="nn">..modeling_utils</span> <span class="kn">import</span> <span class="n">QuantConfig</span>
+<span class="kn">from</span> <span class="nn">.config</span> <span class="kn">import</span> <span class="n">BERTConfig</span>
+<span class="kn">from</span> <span class="nn">.convert</span> <span class="kn">import</span> <span class="p">(</span><span class="n">load_hf_bert_base</span><span class="p">,</span> <span class="n">load_hf_bert_cls</span><span class="p">,</span> <span class="n">load_hf_bert_qa</span><span class="p">,</span>
+                      <span class="n">load_weights_from_hf_model</span><span class="p">)</span>
 
 
 <span class="k">class</span> <span class="nc">BertEmbedding</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
@@ -216,89 +222,6 @@
         <span class="k">return</span> <span class="n">x</span>
 
 
-<span class="k">class</span> <span class="nc">BertAttention</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
-
-    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
-                 <span class="n">hidden_size</span><span class="p">,</span>
-                 <span class="n">num_attention_heads</span><span class="p">,</span>
-                 <span class="n">max_position_embeddings</span><span class="p">,</span>
-                 <span class="n">dtype</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                 <span class="n">tp_group</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                 <span class="n">tp_size</span><span class="o">=</span><span class="mi">1</span><span class="p">):</span>
-        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
-
-        <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span> <span class="o">=</span> <span class="n">hidden_size</span> <span class="o">//</span> <span class="n">num_attention_heads</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span> <span class="o">=</span> <span class="n">num_attention_heads</span> <span class="o">//</span> <span class="n">tp_size</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span> <span class="o">=</span> <span class="n">hidden_size</span> <span class="o">//</span> <span class="n">tp_size</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">max_position_embeddings</span> <span class="o">=</span> <span class="n">max_position_embeddings</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">norm_factor</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">sqrt</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span><span class="p">)</span>
-
-        <span class="bp">self</span><span class="o">.</span><span class="n">qkv</span> <span class="o">=</span> <span class="n">ColumnLinear</span><span class="p">(</span><span class="n">hidden_size</span><span class="p">,</span>
-                                <span class="n">hidden_size</span> <span class="o">*</span> <span class="mi">3</span><span class="p">,</span>
-                                <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
-                                <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
-                                <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
-                                <span class="n">gather_output</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">dense</span> <span class="o">=</span> <span class="n">RowLinear</span><span class="p">(</span><span class="n">hidden_size</span><span class="p">,</span>
-                               <span class="n">hidden_size</span><span class="p">,</span>
-                               <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
-                               <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
-                               <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">)</span>
-
-    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
-                <span class="n">hidden_states</span><span class="p">,</span>
-                <span class="n">attention_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">input_lengths</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">max_input_length</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
-        <span class="n">qkv</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">qkv</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
-
-        <span class="c1"># attention</span>
-        <span class="k">if</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">bert_attention_plugin</span><span class="p">:</span>
-            <span class="k">assert</span> <span class="n">input_lengths</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
-            <span class="n">context</span> <span class="o">=</span> <span class="n">bert_attention</span><span class="p">(</span><span class="n">qkv</span><span class="p">,</span>
-                                     <span class="n">input_lengths</span><span class="p">,</span>
-                                     <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">,</span>
-                                     <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span><span class="p">,</span>
-                                     <span class="n">q_scaling</span><span class="o">=</span><span class="mf">1.0</span><span class="p">,</span>
-                                     <span class="n">max_input_length</span><span class="o">=</span><span class="n">max_input_length</span><span class="p">)</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="k">assert</span> <span class="ow">not</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">remove_input_padding</span><span class="p">,</span> \
-                   <span class="s2">&quot;remove_input_padding requires bert_attention_plugin enabled&quot;</span>
-
-            <span class="k">def</span> <span class="nf">transpose_for_scores</span><span class="p">(</span><span class="n">x</span><span class="p">):</span>
-                <span class="n">new_x_shape</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span>
-                    <span class="n">shape</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span>
-                    <span class="n">shape</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">,</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span>
-                <span class="p">])</span>
-                <span class="k">return</span> <span class="n">x</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">new_x_shape</span><span class="p">)</span><span class="o">.</span><span class="n">permute</span><span class="p">([</span><span class="mi">0</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">3</span><span class="p">])</span>
-
-            <span class="n">query</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="o">=</span> <span class="n">split</span><span class="p">(</span><span class="n">qkv</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span>
-            <span class="n">query</span> <span class="o">=</span> <span class="n">transpose_for_scores</span><span class="p">(</span><span class="n">query</span><span class="p">)</span>
-            <span class="n">key</span> <span class="o">=</span> <span class="n">transpose_for_scores</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
-            <span class="n">value</span> <span class="o">=</span> <span class="n">transpose_for_scores</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
-
-            <span class="n">key</span> <span class="o">=</span> <span class="n">key</span><span class="o">.</span><span class="n">permute</span><span class="p">([</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">2</span><span class="p">])</span>
-            <span class="n">attention_scores</span> <span class="o">=</span> <span class="n">matmul</span><span class="p">(</span><span class="n">query</span><span class="p">,</span> <span class="n">key</span><span class="p">)</span>
-            <span class="n">attention_scores</span> <span class="o">=</span> <span class="n">attention_scores</span> <span class="o">/</span> <span class="bp">self</span><span class="o">.</span><span class="n">norm_factor</span>
-
-            <span class="k">if</span> <span class="n">attention_mask</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="n">attention_mask</span> <span class="o">=</span> <span class="n">cast</span><span class="p">(</span><span class="n">attention_mask</span><span class="p">,</span> <span class="n">attention_scores</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
-                <span class="n">attention_scores</span> <span class="o">=</span> <span class="n">attention_scores</span> <span class="o">+</span> <span class="n">attention_mask</span>
-
-            <span class="n">attention_probs</span> <span class="o">=</span> <span class="n">softmax</span><span class="p">(</span><span class="n">attention_scores</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
-
-            <span class="n">context</span> <span class="o">=</span> <span class="n">matmul</span><span class="p">(</span><span class="n">attention_probs</span><span class="p">,</span> <span class="n">value</span><span class="p">,</span>
-                             <span class="n">use_fp32_acc</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span><span class="o">.</span><span class="n">permute</span><span class="p">([</span><span class="mi">0</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">3</span><span class="p">])</span>
-            <span class="n">context</span> <span class="o">=</span> <span class="n">context</span><span class="o">.</span><span class="n">view</span><span class="p">(</span>
-                <span class="n">concat</span><span class="p">([</span><span class="n">shape</span><span class="p">(</span><span class="n">context</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span>
-                        <span class="n">shape</span><span class="p">(</span><span class="n">context</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span> <span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">]))</span>
-
-        <span class="n">context</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">dense</span><span class="p">(</span><span class="n">context</span><span class="p">)</span>
-
-        <span class="k">return</span> <span class="n">context</span>
-
-
 <span class="k">class</span> <span class="nc">BertEncoderLayer</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
     <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
@@ -313,12 +236,13 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">input_layernorm</span> <span class="o">=</span> <span class="n">LayerNorm</span><span class="p">(</span><span class="n">normalized_shape</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
                                          <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">attention</span> <span class="o">=</span> <span class="n">BertAttention</span><span class="p">(</span><span class="n">hidden_size</span><span class="p">,</span>
-                                       <span class="n">num_attention_heads</span><span class="p">,</span>
-                                       <span class="n">max_position_embeddings</span><span class="p">,</span>
-                                       <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
-                                       <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
-                                       <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">attention</span> <span class="o">=</span> <span class="n">BertAttention</span><span class="p">(</span>
+            <span class="n">hidden_size</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
+            <span class="n">num_attention_heads</span><span class="o">=</span><span class="n">num_attention_heads</span><span class="p">,</span>
+            <span class="n">max_position_embeddings</span><span class="o">=</span><span class="n">max_position_embeddings</span><span class="p">,</span>
+            <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
+            <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span> <span class="o">=</span> <span class="n">MLP</span><span class="p">(</span><span class="n">hidden_size</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
                        <span class="n">ffn_hidden_size</span><span class="o">=</span><span class="n">hidden_size</span> <span class="o">*</span> <span class="mi">4</span><span class="p">,</span>
                        <span class="n">hidden_act</span><span class="o">=</span><span class="n">hidden_act</span><span class="p">,</span>
@@ -355,42 +279,187 @@
         <span class="k">return</span> <span class="n">hidden_states</span>
 
 
+<span class="k">class</span> <span class="nc">BertBase</span><span class="p">(</span><span class="n">PretrainedModel</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&#39;&#39;&#39;</span>
+<span class="sd">    Base class that provides from_huggingface() and prepare_inputs() methods</span>
+<span class="sd">    &#39;&#39;&#39;</span>
+    <span class="n">config_class</span> <span class="o">=</span> <span class="n">BERTConfig</span>
+
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">BERTConfig</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
+
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span> <span class="nf">load_hf_bert</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">model_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">load_model_on_cpu</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
+                     <span class="n">dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        Use as the abstractmethod, load corresponding HF model.</span>
+<span class="sd">        Subclass must implement this method!</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+
+        <span class="k">assert</span> <span class="bp">cls</span><span class="o">.</span><span class="vm">__name__</span> <span class="o">!=</span> <span class="s2">&quot;BertBase&quot;</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;Never call from BertBase class!&quot;</span>
+
+        <span class="k">if</span> <span class="bp">cls</span><span class="o">.</span><span class="vm">__name__</span> <span class="o">==</span> <span class="s2">&quot;BertModel&quot;</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">load_hf_bert_base</span><span class="p">(</span><span class="n">model_dir</span><span class="p">,</span> <span class="n">load_model_on_cpu</span><span class="p">,</span> <span class="n">dtype</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="bp">cls</span><span class="o">.</span><span class="vm">__name__</span> <span class="o">==</span> <span class="s2">&quot;BertForQuestionAnswering&quot;</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">load_hf_bert_qa</span><span class="p">(</span><span class="n">model_dir</span><span class="p">,</span> <span class="n">load_model_on_cpu</span><span class="p">,</span> <span class="n">dtype</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="bp">cls</span><span class="o">.</span><span class="vm">__name__</span> <span class="o">==</span> <span class="s2">&quot;BertForSequenceClassification&quot;</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">load_hf_bert_cls</span><span class="p">(</span><span class="n">model_dir</span><span class="p">,</span> <span class="n">load_model_on_cpu</span><span class="p">,</span> <span class="n">dtype</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">assert</span> <span class="kc">False</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;Unknown class </span><span class="si">{</span><span class="bp">cls</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">!&quot;</span>
+
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span> <span class="nf">from_hugging_face</span><span class="p">(</span>
+            <span class="bp">cls</span><span class="p">,</span>
+            <span class="n">hf_model_or_dir</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="s1">&#39;transformers.PreTrainedModel&#39;</span><span class="p">],</span>
+            <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s1">&#39;float16&#39;</span><span class="p">,</span>
+            <span class="n">mapping</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Mapping</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="n">quant_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">QuantConfig</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        Create a BertModel object from give parameters</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="kn">import</span> <span class="nn">transformers</span>
+
+        <span class="k">assert</span> <span class="n">hf_model_or_dir</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+        <span class="n">use_preloading</span> <span class="o">=</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">hf_model_or_dir</span><span class="p">,</span>
+                                    <span class="n">transformers</span><span class="o">.</span><span class="n">PreTrainedModel</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">use_preloading</span><span class="p">:</span>
+            <span class="n">hf_model</span> <span class="o">=</span> <span class="n">hf_model_or_dir</span>
+            <span class="n">hf_config_or_dir</span> <span class="o">=</span> <span class="n">hf_model</span><span class="o">.</span><span class="n">config</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">hf_model_dir</span> <span class="o">=</span> <span class="n">hf_model_or_dir</span>
+            <span class="n">hf_config_or_dir</span> <span class="o">=</span> <span class="n">hf_model_or_dir</span>
+
+        <span class="n">load_model_on_cpu</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;load_model_on_cpu&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
+        <span class="n">tllm_config</span> <span class="o">=</span> <span class="n">BERTConfig</span><span class="o">.</span><span class="n">from_hugging_face</span><span class="p">(</span>
+            <span class="n">hf_config_or_dir</span><span class="o">=</span><span class="n">hf_config_or_dir</span><span class="p">,</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+            <span class="n">mapping</span><span class="o">=</span><span class="n">mapping</span><span class="p">,</span>
+            <span class="n">quant_config</span><span class="o">=</span><span class="n">quant_config</span><span class="p">,</span>
+            <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+        <span class="c1">#NOTE: override architecture info</span>
+        <span class="n">RobertaCls_mapping</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="s2">&quot;BertModel&quot;</span><span class="p">:</span> <span class="s2">&quot;RobertaModel&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;BertForQuestionAnswering&quot;</span><span class="p">:</span> <span class="s2">&quot;RobertaForQuestionAnswering&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;BertForSequenceClassification&quot;</span><span class="p">:</span> <span class="s2">&quot;RobertaForSequenceClassification&quot;</span><span class="p">,</span>
+        <span class="p">}</span>
+        <span class="k">if</span> <span class="n">tllm_config</span><span class="o">.</span><span class="n">is_roberta</span><span class="p">:</span>
+            <span class="nb">setattr</span><span class="p">(</span><span class="n">tllm_config</span><span class="p">,</span> <span class="s1">&#39;architecture&#39;</span><span class="p">,</span>
+                    <span class="n">RobertaCls_mapping</span><span class="p">[</span><span class="bp">cls</span><span class="o">.</span><span class="vm">__name__</span><span class="p">])</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="nb">setattr</span><span class="p">(</span><span class="n">tllm_config</span><span class="p">,</span> <span class="s1">&#39;architecture&#39;</span><span class="p">,</span> <span class="bp">cls</span><span class="o">.</span><span class="vm">__name__</span><span class="p">)</span>
+
+        <span class="n">torch_dtype</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">float16</span> <span class="k">if</span> <span class="n">dtype</span> <span class="o">==</span> <span class="s1">&#39;float16&#39;</span> <span class="k">else</span> <span class="n">torch</span><span class="o">.</span><span class="n">float32</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">use_preloading</span><span class="p">:</span>
+            <span class="n">hf_model</span> <span class="o">=</span> <span class="bp">cls</span><span class="o">.</span><span class="n">load_hf_bert</span><span class="p">(</span><span class="n">model_dir</span><span class="o">=</span><span class="n">hf_model_dir</span><span class="p">,</span>
+                                        <span class="n">load_model_on_cpu</span><span class="o">=</span><span class="n">load_model_on_cpu</span><span class="p">,</span>
+                                        <span class="n">dtype</span><span class="o">=</span><span class="n">torch_dtype</span><span class="p">)</span>
+        <span class="n">weights</span> <span class="o">=</span> <span class="n">load_weights_from_hf_model</span><span class="p">(</span><span class="n">hf_model</span><span class="o">=</span><span class="n">hf_model</span><span class="p">,</span>
+                                             <span class="n">config</span><span class="o">=</span><span class="n">tllm_config</span><span class="p">)</span>
+        <span class="n">model</span> <span class="o">=</span> <span class="bp">cls</span><span class="p">(</span><span class="n">tllm_config</span><span class="p">)</span>
+        <span class="n">model</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">weights</span><span class="p">)</span>
+
+        <span class="k">return</span> <span class="n">model</span>
+
+    <span class="c1"># Override the PretrainedModel&#39;s meothd, can unify in the future.</span>
+    <span class="k">def</span> <span class="nf">prepare_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">max_batch_size</span><span class="p">,</span> <span class="n">max_input_len</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+        <span class="n">remove_input_padding</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">remove_input_padding</span>
+        <span class="c1"># opt_shape is set to half of max batch_size and seq_len by default</span>
+        <span class="c1"># tune this according to real data distribution</span>
+        <span class="n">bs_range</span> <span class="o">=</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="p">(</span><span class="n">max_batch_size</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="mi">2</span><span class="p">,</span> <span class="n">max_batch_size</span><span class="p">]</span>
+        <span class="n">inlen_range</span> <span class="o">=</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="p">(</span><span class="n">max_input_len</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="mi">2</span><span class="p">,</span> <span class="n">max_input_len</span><span class="p">]</span>
+        <span class="n">num_tokens_range</span> <span class="o">=</span> <span class="p">[</span>
+            <span class="mi">1</span><span class="p">,</span>
+            <span class="p">(</span><span class="n">max_input_len</span> <span class="o">*</span> <span class="n">max_batch_size</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="mi">2</span><span class="p">,</span>
+            <span class="n">max_input_len</span> <span class="o">*</span> <span class="n">max_batch_size</span><span class="p">,</span>
+        <span class="p">]</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">remove_input_padding</span><span class="p">:</span>
+            <span class="n">input_ids</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
+                <span class="n">name</span><span class="o">=</span><span class="s1">&#39;input_ids&#39;</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;batch_size&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">bs_range</span><span class="p">]),</span>
+                                       <span class="p">(</span><span class="s1">&#39;input_len&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">inlen_range</span><span class="p">])]),</span>
+            <span class="p">)</span>
+            <span class="c1"># also called segment_ids</span>
+            <span class="n">token_type_ids</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
+                <span class="n">name</span><span class="o">=</span><span class="s1">&#39;token_type_ids&#39;</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;batch_size&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">bs_range</span><span class="p">]),</span>
+                                       <span class="p">(</span><span class="s1">&#39;input_len&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">inlen_range</span><span class="p">])]),</span>
+            <span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">input_ids</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
+                <span class="n">name</span><span class="o">=</span><span class="s2">&quot;input_ids&quot;</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s2">&quot;num_tokens&quot;</span><span class="p">,</span> <span class="p">[</span><span class="n">num_tokens_range</span><span class="p">])]),</span>
+            <span class="p">)</span>
+            <span class="n">token_type_ids</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
+                <span class="n">name</span><span class="o">=</span><span class="s1">&#39;token_type_ids&#39;</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;num_tokens&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">num_tokens_range</span><span class="p">])]),</span>
+            <span class="p">)</span>
+            <span class="n">position_ids</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
+                <span class="n">name</span><span class="o">=</span><span class="s1">&#39;position_ids&#39;</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;num_tokens&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">num_tokens_range</span><span class="p">])]),</span>
+            <span class="p">)</span>
+            <span class="n">max_input_length</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
+                <span class="n">name</span><span class="o">=</span><span class="s2">&quot;max_input_length&quot;</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s2">&quot;max_input_length&quot;</span><span class="p">,</span> <span class="p">[</span><span class="n">inlen_range</span><span class="p">])]),</span>
+            <span class="p">)</span>
+        <span class="n">input_lengths</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;input_lengths&#39;</span><span class="p">,</span>
+                               <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                               <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                               <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;batch_size&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">bs_range</span><span class="p">])</span>
+                                                      <span class="p">]))</span>
+
+        <span class="n">inputs</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="s1">&#39;input_ids&#39;</span><span class="p">:</span> <span class="n">input_ids</span><span class="p">,</span>
+            <span class="s1">&#39;input_lengths&#39;</span><span class="p">:</span> <span class="n">input_lengths</span><span class="p">,</span>
+            <span class="s1">&#39;token_type_ids&#39;</span><span class="p">:</span> <span class="n">token_type_ids</span><span class="p">,</span>
+        <span class="p">}</span>
+
+        <span class="k">if</span> <span class="n">remove_input_padding</span><span class="p">:</span>
+            <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;position_ids&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">position_ids</span>
+            <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;max_input_length&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">max_input_length</span>
+
+        <span class="k">return</span> <span class="n">inputs</span>
+
+
 <div class="viewcode-block" id="BertModel">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.BertModel">[docs]</a>
-<span class="k">class</span> <span class="nc">BertModel</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">BertModel</span><span class="p">(</span><span class="n">BertBase</span><span class="p">):</span>
 
-    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
-                 <span class="n">num_layers</span><span class="p">,</span>
-                 <span class="n">num_heads</span><span class="p">,</span>
-                 <span class="n">hidden_size</span><span class="p">,</span>
-                 <span class="n">vocab_size</span><span class="p">,</span>
-                 <span class="n">hidden_act</span><span class="p">,</span>
-                 <span class="n">max_position_embeddings</span><span class="p">,</span>
-                 <span class="n">type_vocab_size</span><span class="p">,</span>
-                 <span class="n">pad_token_id</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                 <span class="n">is_roberta</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                 <span class="n">mapping</span><span class="o">=</span><span class="n">Mapping</span><span class="p">(),</span>
-                 <span class="n">dtype</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
-        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">BERTConfig</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">max_position_embeddings</span> <span class="o">=</span> <span class="n">max_position_embeddings</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">padding_idx</span> <span class="o">=</span> <span class="n">pad_token_id</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">is_roberta</span> <span class="o">=</span> <span class="n">is_roberta</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">config</span> <span class="o">=</span> <span class="n">config</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">max_position_embeddings</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">max_position_embeddings</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">padding_idx</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pad_token_id</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">is_roberta</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">is_roberta</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">embedding</span> <span class="o">=</span> <span class="n">BertEmbedding</span><span class="p">(</span>
-            <span class="n">vocab_size</span><span class="o">=</span><span class="n">vocab_size</span><span class="p">,</span>
-            <span class="n">hidden_size</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
-            <span class="n">max_position_embeddings</span><span class="o">=</span><span class="n">max_position_embeddings</span><span class="p">,</span>
-            <span class="n">type_vocab_size</span><span class="o">=</span><span class="n">type_vocab_size</span><span class="p">,</span>
-            <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+            <span class="n">vocab_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span>
+            <span class="n">hidden_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+            <span class="n">max_position_embeddings</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">,</span>
+            <span class="n">type_vocab_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">type_vocab_size</span><span class="p">,</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">layers</span> <span class="o">=</span> <span class="n">ModuleList</span><span class="p">([</span>
-            <span class="n">BertEncoderLayer</span><span class="p">(</span><span class="n">hidden_size</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
-                             <span class="n">num_attention_heads</span><span class="o">=</span><span class="n">num_heads</span><span class="p">,</span>
-                             <span class="n">max_position_embeddings</span><span class="o">=</span><span class="n">max_position_embeddings</span><span class="p">,</span>
-                             <span class="n">hidden_act</span><span class="o">=</span><span class="n">hidden_act</span><span class="p">,</span>
-                             <span class="n">tp_group</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_group</span><span class="p">,</span>
-                             <span class="n">tp_size</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
-                             <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">num_layers</span><span class="p">)</span>
+            <span class="n">BertEncoderLayer</span><span class="p">(</span>
+                <span class="n">hidden_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+                <span class="n">num_attention_heads</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">,</span>
+                <span class="n">max_position_embeddings</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">,</span>
+                <span class="n">hidden_act</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_act</span><span class="p">,</span>
+                <span class="n">tp_group</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_group</span><span class="p">,</span>
+                <span class="n">tp_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">num_hidden_layers</span><span class="p">)</span>
         <span class="p">])</span>
 
 <div class="viewcode-block" id="BertModel.forward">
@@ -403,7 +472,7 @@
                 <span class="n">hidden_states</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">max_input_length</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
         <span class="c1"># remove_input_padding requires these fields as explicit input</span>
-        <span class="n">extended_attention_mask</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">mask</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">remove_input_padding</span><span class="p">:</span>
             <span class="n">seq_len_2d</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span><span class="mi">1</span><span class="p">,</span> <span class="n">shape</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="mi">1</span><span class="p">)])</span>
 
@@ -433,10 +502,6 @@
                                          <span class="n">sizes</span><span class="o">=</span><span class="n">seq_len_2d</span><span class="p">)</span>
                     <span class="n">position_ids</span> <span class="o">=</span> <span class="n">expand</span><span class="p">(</span><span class="n">position_ids</span><span class="p">,</span> <span class="n">shape</span><span class="p">(</span><span class="n">input_ids</span><span class="p">))</span>
 
-            <span class="c1"># create extended_attention_mask as https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_utils.py</span>
-            <span class="n">extended_attention_mask</span> <span class="o">=</span> <span class="n">expand_mask</span><span class="p">(</span><span class="n">mask</span><span class="p">,</span>
-                                                  <span class="n">tgt_len</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>  <span class="c1"># BxL -&gt; Bx1x1xL</span>
-
             <span class="c1"># create token_type_ids</span>
             <span class="k">if</span> <span class="n">token_type_ids</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="n">token_type_ids_buffer</span> <span class="o">=</span> <span class="n">constant</span><span class="p">(</span>
@@ -449,49 +514,40 @@
                 <span class="n">token_type_ids</span> <span class="o">=</span> <span class="n">expand</span><span class="p">(</span><span class="n">token_type_ids</span><span class="p">,</span> <span class="n">shape</span><span class="p">(</span><span class="n">input_ids</span><span class="p">))</span>
 
         <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">embedding</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="n">position_ids</span><span class="p">,</span> <span class="n">token_type_ids</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">register_network_output</span><span class="p">(</span><span class="s1">&#39;embedding_output&#39;</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">)</span>
 
-        <span class="k">for</span> <span class="n">layer</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">layers</span><span class="p">:</span>
+        <span class="k">for</span> <span class="n">idx</span><span class="p">,</span> <span class="n">layer</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">layers</span><span class="p">):</span>
             <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">layer</span><span class="p">(</span><span class="n">hidden_states</span><span class="o">=</span><span class="n">hidden_states</span><span class="p">,</span>
                                   <span class="n">input_lengths</span><span class="o">=</span><span class="n">input_lengths</span><span class="p">,</span>
-                                  <span class="n">attention_mask</span><span class="o">=</span><span class="n">extended_attention_mask</span><span class="p">,</span>
+                                  <span class="n">attention_mask</span><span class="o">=</span><span class="n">mask</span><span class="p">,</span>
                                   <span class="n">max_input_length</span><span class="o">=</span><span class="n">max_input_length</span><span class="p">)</span>
+            <span class="c1"># keep the last layer output name as hidden_states</span>
+            <span class="k">if</span> <span class="p">((</span><span class="n">idx</span> <span class="o">==</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">num_hidden_layers</span> <span class="o">-</span> <span class="mi">1</span><span class="p">))</span> <span class="ow">and</span>
+                <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">architecture</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;BertModel&quot;</span><span class="p">,</span> <span class="s2">&quot;RobertaModel&quot;</span><span class="p">])):</span>
+                <span class="n">hidden_states</span><span class="o">.</span><span class="n">mark_output</span><span class="p">(</span><span class="s1">&#39;hidden_states&#39;</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">register_network_output</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;layer_</span><span class="si">{</span><span class="n">idx</span><span class="si">}</span><span class="s2">_output&quot;</span><span class="p">,</span>
+                                             <span class="n">hidden_states</span><span class="p">)</span>
 
         <span class="k">return</span> <span class="n">hidden_states</span></div>
 </div>
 
 
 
+<span class="n">RobertaModel</span> <span class="o">=</span> <span class="n">BertModel</span>
+
+
 <div class="viewcode-block" id="BertForQuestionAnswering">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.BertForQuestionAnswering">[docs]</a>
-<span class="k">class</span> <span class="nc">BertForQuestionAnswering</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">BertForQuestionAnswering</span><span class="p">(</span><span class="n">BertBase</span><span class="p">):</span>
 
-    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
-                 <span class="n">num_layers</span><span class="p">,</span>
-                 <span class="n">num_heads</span><span class="p">,</span>
-                 <span class="n">hidden_size</span><span class="p">,</span>
-                 <span class="n">vocab_size</span><span class="p">,</span>
-                 <span class="n">hidden_act</span><span class="p">,</span>
-                 <span class="n">max_position_embeddings</span><span class="p">,</span>
-                 <span class="n">type_vocab_size</span><span class="p">,</span>
-                 <span class="n">pad_token_id</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                 <span class="n">is_roberta</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                 <span class="n">num_labels</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span>
-                 <span class="n">mapping</span><span class="o">=</span><span class="n">Mapping</span><span class="p">(),</span>
-                 <span class="n">dtype</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
-        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">bert</span> <span class="o">=</span> <span class="n">BertModel</span><span class="p">(</span><span class="n">num_layers</span><span class="o">=</span><span class="n">num_layers</span><span class="p">,</span>
-                              <span class="n">num_heads</span><span class="o">=</span><span class="n">num_heads</span><span class="p">,</span>
-                              <span class="n">hidden_size</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
-                              <span class="n">vocab_size</span><span class="o">=</span><span class="n">vocab_size</span><span class="p">,</span>
-                              <span class="n">hidden_act</span><span class="o">=</span><span class="n">hidden_act</span><span class="p">,</span>
-                              <span class="n">max_position_embeddings</span><span class="o">=</span><span class="n">max_position_embeddings</span><span class="p">,</span>
-                              <span class="n">type_vocab_size</span><span class="o">=</span><span class="n">type_vocab_size</span><span class="p">,</span>
-                              <span class="n">pad_token_id</span><span class="o">=</span><span class="n">pad_token_id</span><span class="p">,</span>
-                              <span class="n">is_roberta</span><span class="o">=</span><span class="n">is_roberta</span><span class="p">,</span>
-                              <span class="n">mapping</span><span class="o">=</span><span class="n">mapping</span><span class="p">,</span>
-                              <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">num_labels</span> <span class="o">=</span> <span class="n">num_labels</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">qa_outputs</span> <span class="o">=</span> <span class="n">Linear</span><span class="p">(</span><span class="n">hidden_size</span><span class="p">,</span> <span class="n">num_labels</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">BERTConfig</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">bert</span> <span class="o">=</span> <span class="n">BertModel</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">num_labels</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">num_labels</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">qa_outputs</span> <span class="o">=</span> <span class="n">Linear</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+                                 <span class="n">config</span><span class="o">.</span><span class="n">num_labels</span><span class="p">,</span>
+                                 <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
 
 <div class="viewcode-block" id="BertForQuestionAnswering.forward">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.BertForQuestionAnswering.forward">[docs]</a>
@@ -500,19 +556,32 @@
                 <span class="n">input_lengths</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">token_type_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">position_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">hidden_states</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+                <span class="n">hidden_states</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">max_input_length</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
 
+        <span class="n">remove_input_padding</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">remove_input_padding</span>
+        <span class="k">if</span> <span class="n">remove_input_padding</span><span class="p">:</span>
+            <span class="k">assert</span> <span class="n">token_type_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> \
+                   <span class="n">position_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> \
+                   <span class="n">max_input_length</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> \
+                   <span class="s2">&quot;token_type_ids, position_ids, max_input_length is required &quot;</span> \
+                   <span class="s2">&quot;in remove_input_padding mode&quot;</span>
         <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">bert</span><span class="o">.</span><span class="n">forward</span><span class="p">(</span><span class="n">input_ids</span><span class="o">=</span><span class="n">input_ids</span><span class="p">,</span>
                                           <span class="n">input_lengths</span><span class="o">=</span><span class="n">input_lengths</span><span class="p">,</span>
                                           <span class="n">token_type_ids</span><span class="o">=</span><span class="n">token_type_ids</span><span class="p">,</span>
                                           <span class="n">position_ids</span><span class="o">=</span><span class="n">position_ids</span><span class="p">,</span>
-                                          <span class="n">hidden_states</span><span class="o">=</span><span class="n">hidden_states</span><span class="p">)</span>
+                                          <span class="n">hidden_states</span><span class="o">=</span><span class="n">hidden_states</span><span class="p">,</span>
+                                          <span class="n">max_input_length</span><span class="o">=</span><span class="n">max_input_length</span><span class="p">)</span>
 
         <span class="n">logits</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">qa_outputs</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+        <span class="n">logits</span><span class="o">.</span><span class="n">mark_output</span><span class="p">(</span><span class="s1">&#39;logits&#39;</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">logits_dtype</span><span class="p">)</span>
 
         <span class="k">return</span> <span class="n">logits</span></div>
 </div>
 
+
+
+<span class="n">RobertaForQuestionAnswering</span> <span class="o">=</span> <span class="n">BertForQuestionAnswering</span>
 
 
 <span class="k">class</span> <span class="nc">BertPooler</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
@@ -557,9 +626,30 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">dense</span> <span class="o">=</span> <span class="n">Linear</span><span class="p">(</span><span class="n">hidden_size</span><span class="p">,</span> <span class="n">hidden_size</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">out_proj</span> <span class="o">=</span> <span class="n">Linear</span><span class="p">(</span><span class="n">hidden_size</span><span class="p">,</span> <span class="n">num_labels</span><span class="p">)</span>
 
-    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">features</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
-        <span class="n">x</span> <span class="o">=</span> <span class="n">select</span><span class="p">(</span><span class="n">features</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
-        <span class="n">x</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">dense</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">input_lengths</span><span class="p">,</span> <span class="n">remove_input_padding</span><span class="p">):</span>
+
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">remove_input_padding</span><span class="p">:</span>
+            <span class="c1"># We &quot;pool&quot; the model by simply taking the hidden state corresponding</span>
+            <span class="c1"># to the first token.</span>
+            <span class="n">first_token_tensor</span> <span class="o">=</span> <span class="n">select</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="c1"># when remove_input_padding is enabled, the shape of hidden_states is [num_tokens, hidden_size]</span>
+            <span class="c1"># We can take the first token of each sequence according to input_lengths,</span>
+            <span class="c1"># and then do pooling similar to padding mode.</span>
+            <span class="c1"># For example, if input_lengths is [8, 5, 6], then the indices of first tokens</span>
+            <span class="c1"># should be [0, 8, 13]</span>
+            <span class="n">first_token_indices</span> <span class="o">=</span> <span class="n">cumsum</span><span class="p">(</span>
+                <span class="n">concat</span><span class="p">([</span>
+                    <span class="mi">0</span><span class="p">,</span>
+                    <span class="nb">slice</span><span class="p">(</span><span class="n">input_lengths</span><span class="p">,</span>
+                          <span class="n">starts</span><span class="o">=</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span>
+                          <span class="n">sizes</span><span class="o">=</span><span class="p">(</span><span class="n">shape</span><span class="p">(</span><span class="n">input_lengths</span><span class="p">)</span> <span class="o">-</span>
+                                 <span class="n">constant</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">([</span><span class="mi">1</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">))))</span>
+                <span class="p">]),</span> <span class="mi">0</span><span class="p">)</span>
+            <span class="n">first_token_tensor</span> <span class="o">=</span> <span class="n">index_select</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span>
+                                              <span class="n">first_token_indices</span><span class="p">)</span>
+
+        <span class="n">x</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">dense</span><span class="p">(</span><span class="n">first_token_tensor</span><span class="p">)</span>
         <span class="n">x</span> <span class="o">=</span> <span class="n">ACT2FN</span><span class="p">[</span><span class="s1">&#39;tanh&#39;</span><span class="p">](</span><span class="n">x</span><span class="p">)</span>
         <span class="n">x</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">out_proj</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">x</span>
@@ -567,43 +657,27 @@
 
 <div class="viewcode-block" id="BertForSequenceClassification">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.BertForSequenceClassification">[docs]</a>
-<span class="k">class</span> <span class="nc">BertForSequenceClassification</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">BertForSequenceClassification</span><span class="p">(</span><span class="n">BertBase</span><span class="p">):</span>
 
-    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
-                 <span class="n">num_layers</span><span class="p">,</span>
-                 <span class="n">num_heads</span><span class="p">,</span>
-                 <span class="n">hidden_size</span><span class="p">,</span>
-                 <span class="n">vocab_size</span><span class="p">,</span>
-                 <span class="n">hidden_act</span><span class="p">,</span>
-                 <span class="n">max_position_embeddings</span><span class="p">,</span>
-                 <span class="n">type_vocab_size</span><span class="p">,</span>
-                 <span class="n">pad_token_id</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                 <span class="n">is_roberta</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                 <span class="n">num_labels</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span>
-                 <span class="n">mapping</span><span class="o">=</span><span class="n">Mapping</span><span class="p">(),</span>
-                 <span class="n">dtype</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
-        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">is_roberta</span> <span class="o">=</span> <span class="n">is_roberta</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">bert</span> <span class="o">=</span> <span class="n">BertModel</span><span class="p">(</span><span class="n">num_layers</span><span class="o">=</span><span class="n">num_layers</span><span class="p">,</span>
-                              <span class="n">num_heads</span><span class="o">=</span><span class="n">num_heads</span><span class="p">,</span>
-                              <span class="n">hidden_size</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
-                              <span class="n">vocab_size</span><span class="o">=</span><span class="n">vocab_size</span><span class="p">,</span>
-                              <span class="n">hidden_act</span><span class="o">=</span><span class="n">hidden_act</span><span class="p">,</span>
-                              <span class="n">max_position_embeddings</span><span class="o">=</span><span class="n">max_position_embeddings</span><span class="p">,</span>
-                              <span class="n">type_vocab_size</span><span class="o">=</span><span class="n">type_vocab_size</span><span class="p">,</span>
-                              <span class="n">pad_token_id</span><span class="o">=</span><span class="n">pad_token_id</span><span class="p">,</span>
-                              <span class="n">is_roberta</span><span class="o">=</span><span class="n">is_roberta</span><span class="p">,</span>
-                              <span class="n">mapping</span><span class="o">=</span><span class="n">mapping</span><span class="p">,</span>
-                              <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">num_labels</span> <span class="o">=</span> <span class="n">num_labels</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">BERTConfig</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
 
-        <span class="k">if</span> <span class="ow">not</span> <span class="n">is_roberta</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">pooler</span> <span class="o">=</span> <span class="n">BertPooler</span><span class="p">(</span><span class="n">hidden_size</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">classifier</span> <span class="o">=</span> <span class="n">Linear</span><span class="p">(</span><span class="n">hidden_size</span><span class="p">,</span> <span class="n">num_labels</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">config</span> <span class="o">=</span> <span class="n">config</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">is_roberta</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">is_roberta</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">bert</span> <span class="o">=</span> <span class="n">BertModel</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">num_labels</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">num_labels</span>
+
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">config</span><span class="o">.</span><span class="n">is_roberta</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">pooler</span> <span class="o">=</span> <span class="n">BertPooler</span><span class="p">(</span><span class="n">hidden_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+                                     <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">classifier</span> <span class="o">=</span> <span class="n">Linear</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+                                     <span class="n">config</span><span class="o">.</span><span class="n">num_labels</span><span class="p">,</span>
+                                     <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">classifier</span> <span class="o">=</span> <span class="n">RobertaClassificationHead</span><span class="p">(</span><span class="n">hidden_size</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
-                                                        <span class="n">num_labels</span><span class="o">=</span><span class="n">num_labels</span><span class="p">,</span>
-                                                        <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">classifier</span> <span class="o">=</span> <span class="n">RobertaClassificationHead</span><span class="p">(</span>
+                <span class="n">hidden_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+                <span class="n">num_labels</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">num_labels</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
 
 <div class="viewcode-block" id="BertForSequenceClassification.forward">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.BertForSequenceClassification.forward">[docs]</a>
@@ -640,11 +714,17 @@
                 <span class="n">remove_input_padding</span><span class="o">=</span><span class="n">remove_input_padding</span><span class="p">)</span>
             <span class="n">logits</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">classifier</span><span class="p">(</span><span class="n">pooled_output</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
-            <span class="n">logits</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">classifier</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+            <span class="n">logits</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">classifier</span><span class="p">(</span><span class="n">hidden_states</span><span class="o">=</span><span class="n">hidden_states</span><span class="p">,</span>
+                                     <span class="n">input_lengths</span><span class="o">=</span><span class="n">input_lengths</span><span class="p">,</span>
+                                     <span class="n">remove_input_padding</span><span class="o">=</span><span class="n">remove_input_padding</span><span class="p">)</span>
 
+        <span class="n">logits</span><span class="o">.</span><span class="n">mark_output</span><span class="p">(</span><span class="s1">&#39;logits&#39;</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">logits_dtype</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">logits</span></div>
 </div>
 
+
+
+<span class="n">RobertaForSequenceClassification</span> <span class="o">=</span> <span class="n">BertForSequenceClassification</span>
 </pre></div>
 
            </div>
@@ -654,7 +734,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fc13f6a3190>
+<jinja2.runtime.BlockReference object at 0x7f94690c8770>
 
 <div class="footer">
     <p>

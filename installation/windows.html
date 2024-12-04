@@ -1,3 +1,5 @@
+
+
 <!DOCTYPE html>
 <html class="writer-html5" lang="en" data-content_root="../">
 <head>
@@ -6,21 +8,17 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Installing on Windows &mdash; tensorrt_llm  documentation</title>
       <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=80d5e7a1" />
-      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=19f00094" />
+      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
 
   
-  <!--[if lt IE 9]>
-    <script src="../_static/js/html5shiv.min.js"></script>
-  <![endif]-->
-  
-        <script src="../_static/jquery.js?v=5d32c60e"></script>
-        <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-        <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="../_static/doctools.js?v=888ff710"></script>
-        <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
-        <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
-        <script src="../_static/copybutton.js?v=f281be69"></script>
+      <script src="../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="../_static/doctools.js?v=888ff710"></script>
+      <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+      <script src="../_static/copybutton.js?v=65e89d2a"></script>
     <script src="../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
@@ -60,6 +58,7 @@
 <li class="toctree-l1"><a class="reference internal" href="build-from-source-linux.html">Building from Source Code on Linux</a></li>
 <li class="toctree-l1 current"><a class="current reference internal" href="#">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="build-from-source-windows.html">Building from Source Code on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="grace-hopper.html">Installing on Grace Hopper</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul>
@@ -89,6 +88,7 @@
 <p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-serve.html">trtllm-serve</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
@@ -107,14 +107,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/executor.html">Executor API</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html">Inference Request</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html#lookahead-decoding">Lookahead decoding</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul>
@@ -168,7 +166,7 @@
 <div class="admonition note">
 <p class="admonition-title">Note</p>
 <p>The Windows release of TensorRT-LLM is currently in beta.
-We recommend checking out the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases/tag/v0.14.0">v0.14.0 tag</a> for the most stable experience.</p>
+We recommend checking out the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases/tag/v0.15.0">v0.15.0 tag</a> for the most stable experience.</p>
 </div>
 <p><strong>Prerequisites</strong></p>
 <ol class="arabic">
@@ -177,7 +175,7 @@ We recommend checking out the <a class="reference external" href="https://github
 <ol class="arabic">
 <li><p>Install all dependencies together.</p>
 <ol class="arabic simple">
-<li><p>Run the provided PowerShell script <code class="docutils literal notranslate"><span class="pre">setup_env.ps1</span></code> located under the <code class="docutils literal notranslate"><span class="pre">/windows/</span></code> folder which installs Python and CUDA 12.5.1 automatically with default settings. Run PowerShell as Administrator to use the script.</p></li>
+<li><p>Run the provided PowerShell script <code class="docutils literal notranslate"><span class="pre">setup_env.ps1</span></code> located under the <code class="docutils literal notranslate"><span class="pre">/windows/</span></code> folder which installs Python and CUDA 12.6.2 automatically with default settings. Run PowerShell as Administrator to use the script.</p></li>
 </ol>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>./setup_env.ps1<span class="w"> </span><span class="o">[</span>-skipCUDA<span class="o">]</span><span class="w"> </span><span class="o">[</span>-skipPython<span class="o">]</span>
 </pre></div>
@@ -194,7 +192,7 @@ We recommend checking out the <a class="reference external" href="https://github
 <li><p>Navigate to the installation path <code class="docutils literal notranslate"><span class="pre">%USERPROFILE%\AppData\Local\Programs\Python\Python310</span></code> (<code class="docutils literal notranslate"><span class="pre">AppData</span></code> is a hidden folder) and copy <code class="docutils literal notranslate"><span class="pre">python.exe</span></code> to <code class="docutils literal notranslate"><span class="pre">python3.exe</span></code>.</p></li>
 </ol>
 </li>
-<li><p>Install <a class="reference external" href="https://developer.nvidia.com/cuda-12-5-1-download-archive?target_os=Windows&amp;amp;target_arch=x86_64">CUDA 12.5.1 Toolkit</a>. Use the Express Installation option. Installation may require a restart.</p></li>
+<li><p>Install <a class="reference external" href="https://developer.nvidia.com/cuda-12-6-2-download-archive?target_os=Windows&amp;amp;target_arch=x86_64">CUDA 12.6.2 Toolkit</a>. Use the Express Installation option. Installation may require a restart.</p></li>
 </ol>
 </li>
 </ol>
@@ -215,7 +213,7 @@ pip<span class="w"> </span>uninstall<span class="w"> </span>-y<span class="w"> <
 </pre></div>
 </div>
 <p>before installing TensorRT-LLM with the following command.</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span><span class="nv">tensorrt_llm</span><span class="o">==</span><span class="m">0</span>.14.0<span class="w"> </span>--extra-index-url<span class="w"> </span>https://pypi.nvidia.com<span class="w"> </span>--extra-index-url<span class="w"> </span>https://download.pytorch.org/whl/
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span><span class="nv">tensorrt_llm</span><span class="o">==</span><span class="m">0</span>.15.0<span class="w"> </span>--extra-index-url<span class="w"> </span>https://download.pytorch.org/whl/
 </pre></div>
 </div>
 <p>Run the following command to verify that your TensorRT-LLM installation is working properly.</p>
@@ -233,6 +231,10 @@ pip<span class="w"> </span>uninstall<span class="w"> </span>-y<span class="w"> <
 <p>This may be caused by an outdated Microsoft Visual C++ Redistributable Version. Please install
 <a class="reference external" href="https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170#latest-microsoft-visual-c-redistributable-version">the latest MSVC</a>
 and retry. Check the system path to make sure the latest version installed in <code class="docutils literal notranslate"><span class="pre">System32</span></code> is searched first. Check dependencies to make sure no other packages are using an outdated version (e.g. package <code class="docutils literal notranslate"><span class="pre">pyarrow</span></code> might contain an outdated MSVC DLL).</p>
+<ol class="arabic simple" start="2">
+<li><p>OSError: [WinError 126] The specified module could not be found. Error loading “…\Lib\site-packages\torch\lib\fbgemm.dll” or one of its dependencies.</p></li>
+</ol>
+<p>Installing the latest [Build Tools for Visual Studio 2022] (https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022) will resolve the issue.</p>
 </section>
 
 
@@ -246,7 +248,7 @@ and retry. Check the system path to make sure the latest version installed in <c
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fc13e3356c0>
+<jinja2.runtime.BlockReference object at 0x7f94598ae0c0>
 
 <div class="footer">
     <p>

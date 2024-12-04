@@ -28,6 +28,7 @@ Welcome to TensorRT-LLM's Documentation!
    installation/build-from-source-linux.md
    installation/windows.md
    installation/build-from-source-windows.md
+   installation/grace-hopper.md
 
 
 .. toctree::
@@ -44,7 +45,7 @@ Welcome to TensorRT-LLM's Documentation!
    :caption: LLM API Examples
    :hidden:
 
-   llm-api-examples/index.md
+   llm-api-examples/index.rst
    llm-api-examples/customization.md
    llm-api-examples/llm_api_examples
 
@@ -77,6 +78,7 @@ Welcome to TensorRT-LLM's Documentation!
    :hidden:
 
    commands/trtllm-build.rst
+   commands/trtllm-serve.rst
 
 
 .. toctree::
@@ -99,7 +101,6 @@ Welcome to TensorRT-LLM's Documentation!
    advanced/gpt-runtime.md
    advanced/executor.md
    advanced/graph-rewriting.md
-   advanced/batch-manager.md
    advanced/inference-request.md
    advanced/lora.md
    advanced/expert-parallelism.md

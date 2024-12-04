@@ -1,3 +1,5 @@
+
+
 <!DOCTYPE html>
 <html class="writer-html5" lang="en" data-content_root="../">
 <head>
@@ -6,21 +8,17 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>TensorRT-LLM Benchmarking &mdash; tensorrt_llm  documentation</title>
       <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=80d5e7a1" />
-      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=19f00094" />
+      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
 
   
-  <!--[if lt IE 9]>
-    <script src="../_static/js/html5shiv.min.js"></script>
-  <![endif]-->
-  
-        <script src="../_static/jquery.js?v=5d32c60e"></script>
-        <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-        <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="../_static/doctools.js?v=888ff710"></script>
-        <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
-        <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
-        <script src="../_static/copybutton.js?v=f281be69"></script>
+      <script src="../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="../_static/doctools.js?v=888ff710"></script>
+      <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+      <script src="../_static/copybutton.js?v=65e89d2a"></script>
     <script src="../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
@@ -60,6 +58,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/windows.html">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul>
@@ -89,6 +88,7 @@
 <p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-serve.html">trtllm-serve</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
@@ -107,14 +107,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/executor.html">Executor API</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html">Inference Request</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html#lookahead-decoding">Lookahead decoding</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul class="current">
@@ -124,16 +122,21 @@
 <li class="toctree-l2"><a class="reference internal" href="#support-quantization-modes">Support Quantization Modes</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#inflight-benchmarking-with-a-dataset">Inflight Benchmarking with a Dataset</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="#quickstart">Quickstart</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#workflow">Workflow</a><ul>
-<li class="toctree-l4"><a class="reference internal" href="#preparing-a-dataset">Preparing a Dataset</a></li>
-<li class="toctree-l4"><a class="reference internal" href="#using-prepare-dataset-to-create-synthetic-datasets">Using <code class="docutils literal notranslate"><span class="pre">prepare_dataset</span></code> to Create Synthetic Datasets</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#workflow">Workflow</a></li>
 </ul>
 </li>
-<li class="toctree-l3"><a class="reference internal" href="#building-a-benchmark-engine">Building a Benchmark Engine</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#running-a-max-throughput-benchmark">Running a Max Throughput Benchmark</a><ul>
-<li class="toctree-l4"><a class="reference internal" href="#how-the-benchmarker-works">How the Benchmarker Works</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#preparing-a-dataset">Preparing a Dataset</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#using-prepare-dataset-py-to-create-synthetic-datasets">Using prepare_dataset.py to Create Synthetic Datasets</a></li>
 </ul>
 </li>
+<li class="toctree-l2"><a class="reference internal" href="#building-a-benchmark-engine">Building a Benchmark Engine</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#how-to-build-the-engine">How to Build the Engine</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#parallelism-mapping-support">Parallelism Mapping Support</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#example-of-build-subcommand-output">Example of Build Subcommand Output:</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#max-throughput-benchmark">Max Throughput Benchmark</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#how-the-benchmarker-works">How the Benchmarker Works</a></li>
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="#low-latency-benchmark">Low Latency Benchmark</a><ul>
@@ -217,6 +220,10 @@ Expect breaking API changes.</p>
 <li><p><a class="reference external" href="https://huggingface.co/meta-llama/Llama-3.1-405B-Instruct">meta-llama/Llama-3.1-405B-Instruct</a></p></li>
 <li><p><a class="reference external" href="https://huggingface.co/mistralai/Mixtral-8x7B-v0.1-Instruct">mistralai/Mixtral-8x7B-v0.1-Instruct</a></p></li>
 </ul>
+<blockquote>
+<div><p>The <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> CLI tool can automatically download the model from Hugging Face Model Hub.
+Export your token in the <code class="docutils literal notranslate"><span class="pre">HF_TOKEN</span></code> environment variable.</p>
+</div></blockquote>
 </section>
 <section id="support-quantization-modes">
 <h2>Support Quantization Modes<a class="headerlink" href="#support-quantization-modes" title="Link to this heading"></a></h2>
@@ -291,10 +298,12 @@ Total<span class="w"> </span>Latency<span class="w"> </span><span class="o">(</s
 <ol class="arabic simple">
 <li><p>Prepare a dataset to drive the inflight batching benchmark.</p></li>
 <li><p>Build a benchmark engine using <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">build</span></code> subcommand.</p></li>
-<li><p>Run the max throughput benchmark using the <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">throughput</span></code> subcommand.</p></li>
+<li><p>Run the max throughput benchmark using the <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">throughput</span></code> subcommand or low latency benchmark using the <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">latency</span></code> subcommand.</p></li>
 </ol>
+</section>
+</section>
 <section id="preparing-a-dataset">
-<h4>Preparing a Dataset<a class="headerlink" href="#preparing-a-dataset" title="Link to this heading"></a></h4>
+<h2>Preparing a Dataset<a class="headerlink" href="#preparing-a-dataset" title="Link to this heading"></a></h2>
 <p>The inflight benchmark utilizes a fixed JSON schema so that it is simple and
 straightforward to specify requests. The schema is defined as follows:</p>
 <table class="docutils align-default">
@@ -352,9 +361,8 @@ To simplify passing the data, a complete JSON entry is on each line so that the 
 can simply read a line and assume a complete entry. When creating a dataset, be sure that a complete
 JSON entry is on every line.</p>
 </div>
-</section>
-<section id="using-prepare-dataset-to-create-synthetic-datasets">
-<h4>Using <code class="docutils literal notranslate"><span class="pre">prepare_dataset</span></code> to Create Synthetic Datasets<a class="headerlink" href="#using-prepare-dataset-to-create-synthetic-datasets" title="Link to this heading"></a></h4>
+<section id="using-prepare-dataset-py-to-create-synthetic-datasets">
+<h3>Using prepare_dataset.py to Create Synthetic Datasets<a class="headerlink" href="#using-prepare-dataset-py-to-create-synthetic-datasets" title="Link to this heading"></a></h3>
 <p>In order to prepare a synthetic dataset, you can use the provided script in the <code class="docutils literal notranslate"><span class="pre">benchmarks/cpp</span></code>
 directory. For example, to generate a synthetic dataset of 1000 requests with a uniform ISL/OSL of
 128/128 for <a class="reference external" href="https://huggingface.co/meta-llama/Llama-2-7b">Llama-2-7b</a>, simply run:</p>
@@ -366,27 +374,47 @@ benchmark script (example below).</p>
 </section>
 </section>
 <section id="building-a-benchmark-engine">
-<h3>Building a Benchmark Engine<a class="headerlink" href="#building-a-benchmark-engine" title="Link to this heading"></a></h3>
-<p>The second thing you’ll need once you have a dataset is an engine to benchmark against. In order to
-build a pre-configured engine for one of the supported ISL:OSL combinations, you can run the following
-using the dataset you generated with <code class="docutils literal notranslate"><span class="pre">prepare_dataset.py</span></code> to build an FP8 quantized engine:</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-2-7b-hf<span class="w"> </span>build<span class="w"> </span>--dataset<span class="w"> </span>/tmp/synthetic_128_128.txt<span class="w"> </span>--quantization<span class="w"> </span>FP8
+<h2>Building a Benchmark Engine<a class="headerlink" href="#building-a-benchmark-engine" title="Link to this heading"></a></h2>
+<p>The <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> CLI tool provides the <code class="docutils literal notranslate"><span class="pre">build</span></code> subcommand to build the TRT-LLM engines for max throughput benchmark.</p>
+<section id="how-to-build-the-engine">
+<h3>How to Build the Engine<a class="headerlink" href="#how-to-build-the-engine" title="Link to this heading"></a></h3>
+<p>To build an engine for benchmarking, you can specify the dataset generated with <code class="docutils literal notranslate"><span class="pre">prepare_dataset.py</span></code> through <code class="docutils literal notranslate"><span class="pre">--dataset</span></code> option.
+The <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code>’s tuning heuristic uses the high-level statistics of the dataset (average ISL/OSL, max sequence length) to optimize engine build settings.
+The following command builds an FP8 quantized engine optimized using the dataset’s ISL/OSL.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-2-7b-hf<span class="w"> </span>build<span class="w"> </span>--quantization<span class="w"> </span>FP8<span class="w"> </span>--dataset<span class="w"> </span>/tmp/synthetic_128_128.txt
 </pre></div>
 </div>
-<p>or manually set a max sequence length that you plan to run with specifically:</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-2-7b-hf<span class="w"> </span>build<span class="w"> </span>--max_seq_len<span class="w"> </span><span class="m">256</span><span class="w"> </span>--quantization<span class="w"> </span>FP8
+<p>The build subcommand also provides other ways to build the engine where users have larger control over the tuning values.</p>
+<ul class="simple">
+<li><p>Build engine with self-defined tuning values:
+You specify the tuning values to build the engine with by setting <code class="docutils literal notranslate"><span class="pre">--max_batch_size</span></code> and <code class="docutils literal notranslate"><span class="pre">--max_num_tokens</span></code> directly.
+<code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> and <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code> control the maximum number of requests and tokens that can be scheduled in each iteration.
+If no value is specified, the default <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> and <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code> values of <code class="docutils literal notranslate"><span class="pre">2048</span></code> and <code class="docutils literal notranslate"><span class="pre">8192</span></code> are used.
+The following command builds an FP8 quantized engine by specifying the engine tuning values.</p></li>
+</ul>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-2-7b-hf<span class="w"> </span>build<span class="w"> </span>--quantization<span class="w"> </span>FP8<span class="w"> </span>--max_seq_len<span class="w"> </span><span class="m">4096</span><span class="w"> </span>--max_batch_size<span class="w"> </span><span class="m">1024</span><span class="w"> </span>--max_num_tokens<span class="w"> </span><span class="m">2048</span>
 </pre></div>
 </div>
-<blockquote>
-<div><p>[!NOTE] <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">build</span></code> reproduces benchmark engines for performance study. These engine
-configurations are not guaranteed to be optimal for all cases and should be viewed as reproducers
-for the benchmark data we provide on our <a class="reference internal" href="perf-overview.html"><span class="std std-doc">Performance Overview</span></a>.</p>
-</div></blockquote>
-<p>Looking a little closer, the <code class="docutils literal notranslate"><span class="pre">build</span></code> sub-command
-will perform a lookup and build an engine using those reference settings. The
-look up table directly corresponds to the performance table found in our
-<a class="reference internal" href="perf-overview.html#throughput-measurements"><span class="std std-ref">Performance Overview</span></a>. The
-output of the <code class="docutils literal notranslate"><span class="pre">build</span></code> sub-command looks similar to the snippet below (for <code class="docutils literal notranslate"><span class="pre">meta-llama/Llama-2-7b-hf</span></code>):</p>
+<ul class="simple">
+<li><p>[Experimental] Build engine with target ISL/OSL for optimization:
+In this experimental mode, you can provide hints to <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code>’s tuning heuristic to optimize the engine on specific ISL and OSL targets.
+Generally, the target ISL and OSL aligns with the average ISL and OSL of the dataset, but you can experiment with different values to optimize the engine using this mode.
+The following command builds an FP8 quantized engine and optmizes for ISL:OSL targets of 128:128.</p></li>
+</ul>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-2-7b-hf<span class="w"> </span>build<span class="w"> </span>--quantization<span class="w"> </span>FP8<span class="w"> </span>--max_seq_len<span class="w"> </span><span class="m">4096</span><span class="w"> </span>--target_isl<span class="w"> </span><span class="m">128</span><span class="w"> </span>--target_osl<span class="w"> </span><span class="m">128</span>
+</pre></div>
+</div>
+</section>
+<section id="parallelism-mapping-support">
+<h3>Parallelism Mapping Support<a class="headerlink" href="#parallelism-mapping-support" title="Link to this heading"></a></h3>
+<p>The <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">build</span></code> subcommand supports combinations of tensor-parallel (TP) and pipeline-parallel (PP) mappings as long as the world size (<code class="docutils literal notranslate"><span class="pre">tp_size</span> <span class="pre">x</span> <span class="pre">pp_size</span></code>) <code class="docutils literal notranslate"><span class="pre">&lt;=</span></code> <code class="docutils literal notranslate"><span class="pre">8</span></code>. The parallelism mapping in build subcommad is controlled by <code class="docutils literal notranslate"><span class="pre">--tp_size</span></code> and <code class="docutils literal notranslate"><span class="pre">--pp_size</span></code> options. The following command builds an engine with TP2-PP2 mapping.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-2-7b-hf<span class="w"> </span>build<span class="w"> </span>--quantization<span class="w"> </span>FP8<span class="w"> </span>--dataset<span class="w"> </span>/tmp/synthetic_128_128.txt<span class="w"> </span>--tp_size<span class="w"> </span><span class="m">2</span><span class="w"> </span>--pp_size<span class="w"> </span><span class="m">2</span>
+</pre></div>
+</div>
+</section>
+<section id="example-of-build-subcommand-output">
+<h3>Example of Build Subcommand Output:<a class="headerlink" href="#example-of-build-subcommand-output" title="Link to this heading"></a></h3>
+<p>The output of the <code class="docutils literal notranslate"><span class="pre">build</span></code> subcommand looks similar to the snippet below (for <code class="docutils literal notranslate"><span class="pre">meta-llama/Llama-2-7b-hf</span></code>):</p>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-2-7b-hf<span class="w"> </span>build<span class="w"> </span>--dataset<span class="w"> </span>/tmp/synthetic_128_128.txt<span class="w"> </span>--quantization<span class="w"> </span>FP8
 <span class="o">[</span>TensorRT-LLM<span class="o">]</span><span class="w"> </span>TensorRT-LLM<span class="w"> </span>version:<span class="w"> </span><span class="m">0</span>.12.0
 <span class="o">[</span><span class="m">08</span>/12/2024-19:13:06<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Found<span class="w"> </span>dataset.
@@ -444,13 +472,14 @@ ENGINE<span class="w"> </span>SAVED:<span class="w"> </span>/tmp/meta-llama/Llam
 </div>
 <p>The engine in this case will be written to <code class="docutils literal notranslate"><span class="pre">/tmp/meta-llama/Llama-2-7b-hf/tp_1_pp_1</span></code> (the end of the log).</p>
 </section>
-<section id="running-a-max-throughput-benchmark">
-<h3>Running a Max Throughput Benchmark<a class="headerlink" href="#running-a-max-throughput-benchmark" title="Link to this heading"></a></h3>
+</section>
+<section id="max-throughput-benchmark">
+<h2>Max Throughput Benchmark<a class="headerlink" href="#max-throughput-benchmark" title="Link to this heading"></a></h2>
 <p>The <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> command line tool provides a max throughput benchmark that is accessible via the
 <code class="docutils literal notranslate"><span class="pre">throughput</span></code> subcommand. This benchmark tests a TensorRT-LLM engine under maximum load to provide an
 upper bound throughput number.</p>
 <section id="how-the-benchmarker-works">
-<h4>How the Benchmarker Works<a class="headerlink" href="#how-the-benchmarker-works" title="Link to this heading"></a></h4>
+<h3>How the Benchmarker Works<a class="headerlink" href="#how-the-benchmarker-works" title="Link to this heading"></a></h3>
 <p>The benchmarker reads a data file where a single line contains
 a complete JSON request entry as specified in <a class="reference internal" href="#preparing-a-dataset"><span class="std std-ref">Preparing a Dataset</span></a>.
 The process that the benchmarker is as follows:</p>
@@ -532,10 +561,9 @@ Total<span class="w"> </span>Latency<span class="w"> </span><span class="o">(</s
 </div>
 </section>
 </section>
-</section>
 <section id="low-latency-benchmark">
 <h2>Low Latency Benchmark<a class="headerlink" href="#low-latency-benchmark" title="Link to this heading"></a></h2>
-<p>The low latency benchmark follows a similar workflow to the <a class="reference internal" href="#running-a-max-throughput-benchmark">throughput benchmark</a>
+<p>The low latency benchmark follows a similar workflow to the <a class="reference internal" href="#running-a-max-throughput-benchmark"><span class="xref myst">throughput benchmark</span></a>
 but requires building the engine separately from <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code>. Low latency benchmarks has the following modes:</p>
 <ul class="simple">
 <li><p>A single-request low-latency engine</p></li>
@@ -582,7 +610,7 @@ python<span class="w"> </span>../quantization/quantize.py<span class="w"> </span
 <span class="w">  </span><span class="nv">TRTLLM_MMHA_KERNEL_BLOCK_SIZE</span><span class="o">=</span><span class="m">256</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span><span class="nv">TRTLLM_MMHA_BLOCKS_PER_SEQUENCE</span><span class="o">=</span><span class="m">32</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span><span class="nv">FORCE_MULTI_BLOCK_MODE</span><span class="o">=</span>ON<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span><span class="nv">TRTLLM_ENABLE_FDL</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="nv">TRTLLM_ENABLE_PDL</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>meta-llama/Meta-Llama-3-70B<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>latency<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--dataset<span class="w"> </span><span class="nv">$DATASET_PATH</span><span class="w"> </span><span class="se">\</span>
@@ -597,13 +625,16 @@ NVIDIA provides TensorRT-LLM checkpoints on the <a class="reference external" hr
 The checkpoints are pre-quantized and can be directly built after downloading them with the
 <a class="reference external" href="https://huggingface.co/docs/huggingface_hub/en/guides/cli">huggingface-cli</a>.
 After you download the checkpoints, run the following command. Make sure to
-specify the <code class="docutils literal notranslate"><span class="pre">$tp_size</span></code> supported by your Medusa checkpoint and the path to its stored location <code class="docutils literal notranslate"><span class="pre">$checkpoint_dir</span></code>.</p>
+specify the <code class="docutils literal notranslate"><span class="pre">$tp_size</span></code> supported by your Medusa checkpoint and the path to its stored location <code class="docutils literal notranslate"><span class="pre">$checkpoint_dir</span></code>.
+Additionally, <code class="docutils literal notranslate"><span class="pre">$max_seq_len</span></code> should be set to the model’s maximum position embedding.</p>
 <p>Using Llama-3.1 70B as an example, for a tensor parallel 8 and bfloat16 dtype:</p>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nv">tp_size</span><span class="o">=</span><span class="m">8</span>
+<span class="nv">max_seq_len</span><span class="o">=</span><span class="m">131072</span>
 trtllm-build<span class="w"> </span>--checkpoint_dir<span class="w"> </span><span class="nv">$checkpoint_dir</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--speculative_decoding_mode<span class="w"> </span>medusa<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--max_batch_size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--gpt_attention_plugin<span class="w"> </span>bfloat16<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_seq_len<span class="w"> </span><span class="nv">$max_seq_len</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--output_dir<span class="w"> </span>/tmp/meta-llama/Meta-Llama-3.1-70B/medusa/engine<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--use_fused_mlp<span class="w"> </span><span class="nb">enable</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--paged_kv_cache<span class="w"> </span><span class="nb">enable</span><span class="w"> </span><span class="se">\</span>
@@ -715,7 +746,7 @@ The choices are specified with a YAML file like the following example (<code cla
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fc13e582a10>
+<jinja2.runtime.BlockReference object at 0x7f9459076de0>
 
 <div class="footer">
     <p>

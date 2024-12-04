@@ -1,3 +1,5 @@
+
+
 <!DOCTYPE html>
 <html class="writer-html5" lang="en" data-content_root="../../../../">
 <head>
@@ -5,21 +7,17 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>tensorrt_llm.models.eagle.model &mdash; tensorrt_llm  documentation</title>
       <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css?v=80d5e7a1" />
-      <link rel="stylesheet" type="text/css" href="../../../../_static/css/theme.css?v=19f00094" />
+      <link rel="stylesheet" type="text/css" href="../../../../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../../../../_static/copybutton.css?v=76b2166b" />
 
   
-  <!--[if lt IE 9]>
-    <script src="../../../../_static/js/html5shiv.min.js"></script>
-  <![endif]-->
-  
-        <script src="../../../../_static/jquery.js?v=5d32c60e"></script>
-        <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-        <script src="../../../../_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="../../../../_static/doctools.js?v=888ff710"></script>
-        <script src="../../../../_static/sphinx_highlight.js?v=dc90522c"></script>
-        <script src="../../../../_static/clipboard.min.js?v=a7894cd8"></script>
-        <script src="../../../../_static/copybutton.js?v=f281be69"></script>
+      <script src="../../../../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../../../../_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="../../../../_static/doctools.js?v=888ff710"></script>
+      <script src="../../../../_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="../../../../_static/clipboard.min.js?v=a7894cd8"></script>
+      <script src="../../../../_static/copybutton.js?v=65e89d2a"></script>
     <script src="../../../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../../../genindex.html" />
     <link rel="search" title="Search" href="../../../../search.html" /> 
@@ -57,6 +55,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../installation/windows.html">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul>
@@ -86,6 +85,7 @@
 <p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../commands/trtllm-serve.html">trtllm-serve</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
@@ -104,14 +104,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../advanced/executor.html">Executor API</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../advanced/inference-request.html">Inference Request</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../advanced/inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/speculative-decoding.html#lookahead-decoding">Lookahead decoding</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul>
@@ -181,6 +179,7 @@
 <span class="kn">import</span> <span class="nn">numpy</span> <span class="k">as</span> <span class="nn">np</span>
 <span class="kn">import</span> <span class="nn">tensorrt</span> <span class="k">as</span> <span class="nn">trt</span>
 
+<span class="kn">from</span> <span class="nn">tensorrt_llm.mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
 <span class="kn">from</span> <span class="nn">tensorrt_llm.models.generation_mixin</span> <span class="kn">import</span> <span class="n">GenerationMixin</span>
 <span class="kn">from</span> <span class="nn">tensorrt_llm.models.llama.model</span> <span class="kn">import</span> <span class="n">LLaMAForCausalLM</span><span class="p">,</span> <span class="n">LLaMAModel</span>
 
@@ -267,6 +266,10 @@
 <span class="sd">            [batch_size]</span>
 <span class="sd">            Empty tensor used to allocate space for lens of the next draft tokens.</span>
 
+<span class="sd">        next_draft_paths : Tensor</span>
+<span class="sd">            [batch_size, max_decoding_len, max_path_len]</span>
+<span class="sd">            For EAGLE-1 just a copy of input path.</span>
+
 <span class="sd">        hidden_size_batch_level_starts : Tensor</span>
 <span class="sd">            [max_draft_path_len * batch_size + 1]</span>
 <span class="sd">            Empty tensor used to allocate space for eagle_prepare_drafter_inputs_plugin.</span>
@@ -304,16 +307,17 @@
     <span class="n">accepted_paths</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">2</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
     <span class="n">next_draft_tokens</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">3</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
     <span class="n">next_draft_lens</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">4</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
-    <span class="n">hidden_size_batch_level_starts</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">5</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
+    <span class="n">next_draft_paths</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">5</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
+    <span class="n">hidden_size_batch_level_starts</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">6</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
     <span class="k">return</span> <span class="nb">tuple</span><span class="p">([</span>
         <span class="n">accepted_tokens</span><span class="p">,</span> <span class="n">num_accepted_tokens</span><span class="p">,</span> <span class="n">accepted_paths</span><span class="p">,</span> <span class="n">next_draft_tokens</span><span class="p">,</span>
-        <span class="n">next_draft_lens</span><span class="p">,</span> <span class="n">hidden_size_batch_level_starts</span>
+        <span class="n">next_draft_lens</span><span class="p">,</span> <span class="n">next_draft_paths</span><span class="p">,</span> <span class="n">hidden_size_batch_level_starts</span>
     <span class="p">])</span>
 
 
 <span class="k">def</span> <span class="nf">eagle_draft_decoder_plugin</span><span class="p">(</span><span class="n">layer_idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">top_k_sampling</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
-                               <span class="n">logits</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">rand_sample</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
-                               <span class="n">tree_params</span><span class="p">:</span> <span class="n">TreeParams</span><span class="p">,</span>
+                               <span class="n">logits</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">num_last_token_indices</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+                               <span class="n">rand_sample</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">tree_params</span><span class="p">:</span> <span class="n">TreeParams</span><span class="p">,</span>
                                <span class="n">input_draft_token_ids</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
                                <span class="n">input_draft_lens</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&#39;&#39;&#39;</span>
@@ -325,11 +329,15 @@
 <span class="sd">            Whether to use top K sampling. Otherwise, use multinomial sampling.</span>
 
 <span class="sd">        logits : Tensor</span>
-<span class="sd">            [num_input_logits, vocab_size]</span>
+<span class="sd">            [num_logits, vocab_size]</span>
 <span class="sd">            Input logits.</span>
 
+<span class="sd">        num_last_token_indices : Tensor</span>
+<span class="sd">            [1]</span>
+<span class="sd">            Number of valid logits in logits.</span>
+
 <span class="sd">        rand_sample : Tensor</span>
-<span class="sd">            [num_input_logits]</span>
+<span class="sd">            [batch_size]</span>
 <span class="sd">            Used by multinomial sampling.</span>
 
 <span class="sd">        tree_params : TreeParams</span>
@@ -375,8 +383,8 @@
     <span class="n">plugin</span> <span class="o">=</span> <span class="n">plg_creator</span><span class="o">.</span><span class="n">create_plugin</span><span class="p">(</span><span class="s2">&quot;eagle_draft_decoder_plugin&quot;</span><span class="p">,</span> <span class="n">pfc</span><span class="p">)</span>
 
     <span class="n">plug_inputs</span> <span class="o">=</span> <span class="p">[</span>
-        <span class="n">logits</span><span class="p">,</span> <span class="n">rand_sample</span><span class="p">,</span> <span class="n">tree_params</span><span class="o">.</span><span class="n">paths</span><span class="p">,</span> <span class="n">input_draft_token_ids</span><span class="p">,</span>
-        <span class="n">input_draft_lens</span>
+        <span class="n">logits</span><span class="p">,</span> <span class="n">rand_sample</span><span class="p">,</span> <span class="n">tree_params</span><span class="o">.</span><span class="n">paths</span><span class="p">,</span> <span class="n">num_last_token_indices</span><span class="p">,</span>
+        <span class="n">input_draft_token_ids</span><span class="p">,</span> <span class="n">input_draft_lens</span>
     <span class="p">]</span>
 
     <span class="n">plug_inputs</span> <span class="o">=</span> <span class="p">[</span><span class="n">i</span><span class="o">.</span><span class="n">trt_tensor</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">plug_inputs</span><span class="p">]</span>
@@ -388,12 +396,15 @@
 
 
 <span class="k">def</span> <span class="nf">eagle_prepare_drafter_inputs_plugin</span><span class="p">(</span>
-        <span class="n">layer_idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">attention_params</span><span class="p">:</span> <span class="n">AttentionParams</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
-        <span class="n">accepted_token_ids</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">accepted_lens</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
-        <span class="n">accepted_path_ids</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">next_draft_tokens</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
-        <span class="n">next_draft_lens</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">next_draft_paths</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
-        <span class="n">prev_draft_lens</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">prev_draft_paths</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
-        <span class="n">hidden_size_batch_level_starts</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">):</span>
+        <span class="n">layer_idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">num_layers</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">max_non_leaves_per_layer</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">attention_params</span><span class="p">:</span> <span class="n">AttentionParams</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">chunked_context_next_tokens</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">accepted_token_ids</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">accepted_lens</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">accepted_path_ids</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">next_draft_tokens</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">next_draft_lens</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">next_draft_paths</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">prev_draft_lens</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">prev_draft_paths</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">hidden_size_batch_level_starts</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">input_gen_tokens</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">input_spec_decoding_generation_lengths</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&#39;&#39;&#39;</span>
 <span class="sd">    Prepares inputs for the EagleNet inference.</span>
 
@@ -404,11 +415,22 @@
 <span class="sd">            Index of the EagleNet. 0 means context phase EagleNet or EagleNet0,</span>
 <span class="sd">            &gt; 0 means EagleNetX or generation phase of EagleNet</span>
 
+<span class="sd">        num_layers : int</span>
+<span class="sd">            Number of Eagle layers.</span>
+
+<span class="sd">        max_non_leaves_per_layer : int</span>
+<span class="sd">            Number of nodes that can be non leaf in the tree at each level of the tree.</span>
+
 <span class="sd">        attention_params : AttentionParams</span>
 
 <span class="sd">        input_ids : Tensor</span>
 <span class="sd">            [num_tokens]</span>
 <span class="sd">            Tokens ids, inputs to the base model.</span>
+
+<span class="sd">        chunked_context_next_tokens : Tensor</span>
+<span class="sd">            [batch_size]</span>
+<span class="sd">            The first token of the next chunk in chunked context.</span>
+<span class="sd">            -1 if current chunk is the last chunk or requests is in the gen phase.</span>
 
 <span class="sd">        accepted_token_ids : Tensor</span>
 <span class="sd">            [batch_size, max_path_len]</span>
@@ -450,6 +472,14 @@
 <span class="sd">            [max_draft_path_len, batch_size, num_output_tokens_i_j], where num_output_tokens_i_j</span>
 <span class="sd">            depends on the path of request j at level i.</span>
 
+<span class="sd">        input_gen_tokens : Tensor</span>
+<span class="sd">            [num_gen_tokens]</span>
+<span class="sd">            Only needed to infer number of generation tokens from its shape. The content is irrelevant</span>
+
+<span class="sd">        input_spec_decoding_generation_lengths : Tensor</span>
+<span class="sd">            [num_gen_requests]</span>
+<span class="sd">            Number of tokens for the base model. Only used to infer num_gen_requests from its shape, the content is irrelevant.</span>
+
 <span class="sd">    Return:</span>
 <span class="sd">        sequence_length : Tensor</span>
 <span class="sd">            [batch_size]</span>
@@ -480,39 +510,39 @@
 <span class="sd">            uint32_t packed masks.</span>
 
 <span class="sd">        output_ids : Tensor</span>
-<span class="sd">            [num_output_tokens]</span>
+<span class="sd">            [batch_size * max_non_leaves_per_layer * layer_idx] for layer_idx &gt; 0</span>
+<span class="sd">            [num_tokens - num_gen_tokens + num_gen_requests * (num_layers + 1)] for layer_idx == 0</span>
 <span class="sd">            Token ids selected for the EagleNet iteration.</span>
-<span class="sd">            Tensor&#39;s actual size is larger than num_output_tokens. Tensor has to be sliced.</span>
+<span class="sd">            Tensor&#39;s actual size is larger than num_output_tokens.</span>
 
 <span class="sd">        position_ids : Tensor</span>
-<span class="sd">            [num_output_tokens]</span>
+<span class="sd">            [batch_size] for layer_idx &gt; 0</span>
+<span class="sd">            [num_tokens - num_gen_tokens + num_gen_requests * (num_layers + 1)] for layer_idx == 0</span>
 <span class="sd">            Position ids of the tokens selected for the EagleNet iteration.</span>
-<span class="sd">            Tensor&#39;s actual size is larger than num_output_tokens. Tensor has to be sliced.</span>
+<span class="sd">            Tensor&#39;s actual size is larger than num_output_tokens.</span>
 
 <span class="sd">        hidden_states_indices : Tensor</span>
-<span class="sd">            [num_output_tokens]</span>
+<span class="sd">            [batch_size * max_non_leaves_per_layer * layer_idx] for layer_idx &gt; 0</span>
+<span class="sd">            [num_tokens - num_gen_tokens + num_gen_requests * (num_layers + 1)] for layer_idx == 0</span>
 <span class="sd">            Indices of the hidden states to be selected from aggregated hidden states for the next iteration.</span>
-<span class="sd">            Tensor&#39;s actual size is larger than num_output_tokens. Tensor has to be sliced.</span>
+<span class="sd">            Tensor&#39;s actual size is larger than num_output_tokens.</span>
 
 <span class="sd">        last_token_indices : Tensor</span>
-<span class="sd">            [num_last_token_indices]</span>
+<span class="sd">            [batch_size * max_non_leaves_per_layer]</span>
 <span class="sd">            Indices of the hidden states to be converted to logits after the next EagleNet iteration.</span>
-<span class="sd">            Tensor&#39;s actual size is larger than num_output_tokens. Tensor has to be sliced.</span>
-
-<span class="sd">        num_output_tokens : Tensor</span>
-<span class="sd">            [1]</span>
-<span class="sd">            Number of selected tokens for the next iteration.</span>
+<span class="sd">            Tensor&#39;s actual size is larger than num_output_tokens.</span>
 
 <span class="sd">        num_last_token_indices : Tensor</span>
-<span class="sd">            [1]</span>
+<span class="sd">            []</span>
 <span class="sd">            Number of logits selected after the next EagleNet iteration.</span>
+<span class="sd">            Tensors containing size of the outputs of V3 plugins. 0-D tensor.</span>
 
 <span class="sd">        out_hidden_size_batch_level_starts : Tensor</span>
 <span class="sd">            [max_draft_path_len * batch_size + 1]</span>
 <span class="sd">            Same as hidden_size_batch_level_starts, but with updated path lens for the next level.</span>
 <span class="sd">    &#39;&#39;&#39;</span>
 
-    <span class="n">plg_creator</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">get_plugin_registry</span><span class="p">()</span><span class="o">.</span><span class="n">get_plugin_creator</span><span class="p">(</span>
+    <span class="n">plg_creator</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">get_plugin_registry</span><span class="p">()</span><span class="o">.</span><span class="n">get_creator</span><span class="p">(</span>
         <span class="s1">&#39;EaglePrepareDrafterInputs&#39;</span><span class="p">,</span> <span class="s1">&#39;1&#39;</span><span class="p">,</span> <span class="n">TRT_LLM_PLUGIN_NAMESPACE</span><span class="p">)</span>
     <span class="k">assert</span> <span class="n">plg_creator</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
 
@@ -520,19 +550,32 @@
                                                       <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
                                 <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT32</span><span class="p">)</span>
 
-    <span class="n">pfc</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldCollection</span><span class="p">([</span><span class="n">layer_idx</span><span class="p">])</span>
+    <span class="n">num_layers</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span><span class="s2">&quot;num_layers&quot;</span><span class="p">,</span>
+                                 <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">num_layers</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
+                                 <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT32</span><span class="p">)</span>
+
+    <span class="n">max_non_leaves_per_layer</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span>
+        <span class="s2">&quot;max_non_leaves_per_layer&quot;</span><span class="p">,</span>
+        <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">max_non_leaves_per_layer</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
+        <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT32</span><span class="p">)</span>
+
+    <span class="n">pfc</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldCollection</span><span class="p">(</span>
+        <span class="p">[</span><span class="n">layer_idx</span><span class="p">,</span> <span class="n">num_layers</span><span class="p">,</span> <span class="n">max_non_leaves_per_layer</span><span class="p">])</span>
     <span class="n">plugin</span> <span class="o">=</span> <span class="n">plg_creator</span><span class="o">.</span><span class="n">create_plugin</span><span class="p">(</span><span class="s2">&quot;eagle_prepare_drafter_inputs_plugin&quot;</span><span class="p">,</span>
-                                       <span class="n">pfc</span><span class="p">)</span>
+                                       <span class="n">pfc</span><span class="p">,</span> <span class="n">trt</span><span class="o">.</span><span class="n">TensorRTPhase</span><span class="o">.</span><span class="n">BUILD</span><span class="p">)</span>
 
     <span class="n">plug_inputs</span> <span class="o">=</span> <span class="p">[</span>
         <span class="n">attention_params</span><span class="o">.</span><span class="n">sequence_length</span><span class="p">,</span> <span class="n">attention_params</span><span class="o">.</span><span class="n">context_lengths</span><span class="p">,</span>
-        <span class="n">input_ids</span><span class="p">,</span> <span class="n">accepted_token_ids</span><span class="p">,</span> <span class="n">accepted_lens</span><span class="p">,</span> <span class="n">accepted_path_ids</span><span class="p">,</span>
-        <span class="n">next_draft_tokens</span><span class="p">,</span> <span class="n">next_draft_lens</span><span class="p">,</span> <span class="n">next_draft_paths</span><span class="p">,</span> <span class="n">prev_draft_lens</span><span class="p">,</span>
-        <span class="n">prev_draft_paths</span><span class="p">,</span> <span class="n">hidden_size_batch_level_starts</span>
+        <span class="n">input_ids</span><span class="p">,</span> <span class="n">chunked_context_next_tokens</span><span class="p">,</span> <span class="n">accepted_token_ids</span><span class="p">,</span>
+        <span class="n">accepted_lens</span><span class="p">,</span> <span class="n">accepted_path_ids</span><span class="p">,</span> <span class="n">next_draft_tokens</span><span class="p">,</span> <span class="n">next_draft_lens</span><span class="p">,</span>
+        <span class="n">next_draft_paths</span><span class="p">,</span> <span class="n">prev_draft_lens</span><span class="p">,</span> <span class="n">prev_draft_paths</span><span class="p">,</span>
+        <span class="n">hidden_size_batch_level_starts</span><span class="p">,</span> <span class="n">input_gen_tokens</span><span class="p">,</span>
+        <span class="n">input_spec_decoding_generation_lengths</span>
     <span class="p">]</span>
 
     <span class="n">plug_inputs</span> <span class="o">=</span> <span class="p">[</span><span class="n">i</span><span class="o">.</span><span class="n">trt_tensor</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">plug_inputs</span><span class="p">]</span>
-    <span class="n">layer</span> <span class="o">=</span> <span class="n">default_trtnet</span><span class="p">()</span><span class="o">.</span><span class="n">add_plugin_v2</span><span class="p">(</span><span class="n">plug_inputs</span><span class="p">,</span> <span class="n">plugin</span><span class="p">)</span>
+    <span class="n">shape_inputs</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="n">layer</span> <span class="o">=</span> <span class="n">default_trtnet</span><span class="p">()</span><span class="o">.</span><span class="n">add_plugin_v3</span><span class="p">(</span><span class="n">plug_inputs</span><span class="p">,</span> <span class="n">shape_inputs</span><span class="p">,</span> <span class="n">plugin</span><span class="p">)</span>
 
     <span class="n">sequence_length</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
     <span class="n">context_length</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
@@ -544,18 +587,14 @@
     <span class="n">position_ids</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">6</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
     <span class="n">hidden_states_indices</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">7</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
     <span class="n">last_token_indices</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">8</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
-    <span class="c1"># TODO we can slice output_ids, position_ids and hidden_states_indices directly inside of the plugin:</span>
-    <span class="c1"># Similarly to https://github.com/NVIDIA/TensorRT/tree/release/10.5/samples/sampleNonZeroPlugin.</span>
-    <span class="n">num_output_tokens</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">9</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
-    <span class="n">num_last_token_indices</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">10</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
-    <span class="n">out_hidden_size_batch_level_starts</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">11</span><span class="p">),</span>
+    <span class="n">num_last_token_indices</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">9</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
+    <span class="n">out_hidden_size_batch_level_starts</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">10</span><span class="p">),</span>
                                                         <span class="n">layer</span><span class="p">)</span>
     <span class="k">return</span> <span class="nb">tuple</span><span class="p">([</span>
         <span class="n">sequence_length</span><span class="p">,</span> <span class="n">context_length</span><span class="p">,</span> <span class="n">spec_decoding_generation_lengths</span><span class="p">,</span>
         <span class="n">spec_decoding_position_offsets</span><span class="p">,</span> <span class="n">spec_decoding_packed_mask</span><span class="p">,</span> <span class="n">output_ids</span><span class="p">,</span>
         <span class="n">position_ids</span><span class="p">,</span> <span class="n">hidden_states_indices</span><span class="p">,</span> <span class="n">last_token_indices</span><span class="p">,</span>
-        <span class="n">num_output_tokens</span><span class="p">,</span> <span class="n">num_last_token_indices</span><span class="p">,</span>
-        <span class="n">out_hidden_size_batch_level_starts</span>
+        <span class="n">num_last_token_indices</span><span class="p">,</span> <span class="n">out_hidden_size_batch_level_starts</span>
     <span class="p">])</span>
 
 
@@ -582,9 +621,14 @@
         <span class="k">else</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">lm_head</span> <span class="o">=</span> <span class="kc">None</span>
 
-    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">,</span> <span class="n">position_ids</span><span class="p">,</span>
-                <span class="n">last_token_indices</span><span class="p">,</span> <span class="n">spec_decoding_params</span><span class="p">,</span> <span class="n">kv_cache_params</span><span class="p">,</span>
-                <span class="n">attention_params</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                <span class="n">input_ids</span><span class="p">,</span>
+                <span class="n">position_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">hidden_states</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">last_token_indices</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">spec_decoding_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">kv_cache_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">attention_params</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
         <span class="n">hidden_states</span><span class="p">,</span> <span class="n">cache</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">drafter</span><span class="p">(</span>
             <span class="n">input_ids</span><span class="p">,</span>
             <span class="n">position_ids</span><span class="o">=</span><span class="n">position_ids</span><span class="p">,</span>
@@ -612,42 +656,56 @@
 
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">num_eagle_layers</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">num_eagle_layers</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">max_non_leaves_per_layer</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">max_non_leaves_per_layer</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">vocab_size</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">vocab_size</span>
         <span class="n">vocab_size_padded</span> <span class="o">=</span> <span class="n">pad_vocab_size</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span>
                                            <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">)</span>
         <span class="n">eagle_net_config</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">eagle_net_config</span>
+        <span class="n">eagle_net_config</span><span class="o">.</span><span class="n">mapping</span> <span class="o">=</span> <span class="n">Mapping</span><span class="p">(</span><span class="n">world_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">world_size</span><span class="p">,</span>
+                                           <span class="n">rank</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">rank</span><span class="p">,</span>
+                                           <span class="n">cp_size</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+                                           <span class="n">tp_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">world_size</span><span class="p">,</span>
+                                           <span class="n">pp_size</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+
         <span class="n">eagle_net_config</span><span class="o">.</span><span class="n">fc_after_embed</span> <span class="o">=</span> <span class="kc">True</span>
         <span class="n">eagle_net_config</span><span class="o">.</span><span class="n">use_input_layernorm_in_first_layer</span> <span class="o">=</span> <span class="kc">False</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">eagle_nets</span> <span class="o">=</span> <span class="n">ModuleList</span><span class="p">([</span>
-            <span class="n">EagleNet</span><span class="p">(</span><span class="n">config</span><span class="o">=</span><span class="n">eagle_net_config</span><span class="p">)</span>
-            <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">num_eagle_layers</span><span class="p">)</span>
-        <span class="p">])</span>
+        <span class="n">eagle_net_config</span><span class="o">.</span><span class="n">use_last_layernorm</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="n">eagle_net_config</span><span class="o">.</span><span class="n">layer_idx_offset</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">num_hidden_layers</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_last_pp_rank</span><span class="p">():</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">eagle_nets</span> <span class="o">=</span> <span class="n">ModuleList</span><span class="p">([</span>
+                <span class="n">EagleNet</span><span class="p">(</span><span class="n">config</span><span class="o">=</span><span class="n">eagle_net_config</span><span class="p">)</span>
+                <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">num_eagle_layers</span><span class="p">)</span>
+            <span class="p">])</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">max_draft_len</span>
 
     <span class="k">def</span> <span class="nf">_prepare_drafter_inputs</span><span class="p">(</span>
-            <span class="bp">self</span><span class="p">,</span> <span class="n">layer_idx</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">,</span> <span class="n">accepted_token_ids</span><span class="p">,</span> <span class="n">accepted_lens</span><span class="p">,</span>
-            <span class="n">accepted_path_ids</span><span class="p">,</span> <span class="n">next_draft_tokens</span><span class="p">,</span> <span class="n">next_draft_lens</span><span class="p">,</span>
-            <span class="n">next_draft_paths</span><span class="p">,</span> <span class="n">prev_draft_lens</span><span class="p">,</span> <span class="n">prev_draft_paths</span><span class="p">,</span>
-            <span class="n">input_attention_params</span><span class="p">,</span> <span class="n">input_kv_cache_params</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span>
+            <span class="bp">self</span><span class="p">,</span> <span class="n">layer_idx</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">,</span> <span class="n">chunked_context_next_tokens</span><span class="p">,</span>
+            <span class="n">accepted_token_ids</span><span class="p">,</span> <span class="n">accepted_lens</span><span class="p">,</span> <span class="n">accepted_path_ids</span><span class="p">,</span>
+            <span class="n">next_draft_tokens</span><span class="p">,</span> <span class="n">next_draft_lens</span><span class="p">,</span> <span class="n">next_draft_paths</span><span class="p">,</span>
+            <span class="n">prev_draft_lens</span><span class="p">,</span> <span class="n">prev_draft_paths</span><span class="p">,</span> <span class="n">input_attention_params</span><span class="p">,</span>
+            <span class="n">input_kv_cache_params</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span>
             <span class="n">host_ctx_eagle_net_request_types</span><span class="p">,</span>
             <span class="n">host_ctx_eagle_net_context_lengths</span><span class="p">,</span>
             <span class="n">host_ctx_eagle_net_past_key_value_lengths</span><span class="p">,</span>
             <span class="n">host_gen_eagle_net_request_types</span><span class="p">,</span>
             <span class="n">host_gen_eagle_net_context_lengths</span><span class="p">,</span>
             <span class="n">host_gen_eagle_net_past_key_value_lengths</span><span class="p">,</span>
-            <span class="n">hidden_size_batch_level_starts</span><span class="p">):</span>
+            <span class="n">hidden_size_batch_level_starts</span><span class="p">,</span> <span class="n">input_gen_tokens</span><span class="p">,</span>
+            <span class="n">input_spec_decoding_generation_lengths</span><span class="p">):</span>
 
         <span class="n">drafter_inputs</span> <span class="o">=</span> <span class="n">eagle_prepare_drafter_inputs_plugin</span><span class="p">(</span>
-            <span class="n">layer_idx</span><span class="p">,</span> <span class="n">input_attention_params</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">,</span> <span class="n">accepted_token_ids</span><span class="p">,</span>
-            <span class="n">accepted_lens</span><span class="p">,</span> <span class="n">accepted_path_ids</span><span class="p">,</span> <span class="n">next_draft_tokens</span><span class="p">,</span>
-            <span class="n">next_draft_lens</span><span class="p">,</span> <span class="n">next_draft_paths</span><span class="p">,</span> <span class="n">prev_draft_lens</span><span class="p">,</span>
-            <span class="n">prev_draft_paths</span><span class="p">,</span> <span class="n">hidden_size_batch_level_starts</span><span class="p">)</span>
+            <span class="n">layer_idx</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_eagle_layers</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_non_leaves_per_layer</span><span class="p">,</span>
+            <span class="n">input_attention_params</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">,</span> <span class="n">chunked_context_next_tokens</span><span class="p">,</span>
+            <span class="n">accepted_token_ids</span><span class="p">,</span> <span class="n">accepted_lens</span><span class="p">,</span> <span class="n">accepted_path_ids</span><span class="p">,</span>
+            <span class="n">next_draft_tokens</span><span class="p">,</span> <span class="n">next_draft_lens</span><span class="p">,</span> <span class="n">next_draft_paths</span><span class="p">,</span>
+            <span class="n">prev_draft_lens</span><span class="p">,</span> <span class="n">prev_draft_paths</span><span class="p">,</span> <span class="n">hidden_size_batch_level_starts</span><span class="p">,</span>
+            <span class="n">input_gen_tokens</span><span class="p">,</span> <span class="n">input_spec_decoding_generation_lengths</span><span class="p">)</span>
 
         <span class="n">sequence_length</span><span class="p">,</span> <span class="n">context_lengths</span><span class="p">,</span> \
             <span class="n">spec_decoding_generation_lengths</span><span class="p">,</span> <span class="n">spec_decoding_position_offsets</span><span class="p">,</span> \
             <span class="n">spec_decoding_packed_mask</span><span class="p">,</span> <span class="n">output_ids</span><span class="p">,</span> <span class="n">position_ids</span><span class="p">,</span> <span class="n">hidden_states_indices</span><span class="p">,</span> \
-            <span class="n">last_token_indices</span><span class="p">,</span> <span class="n">num_output_tokens</span><span class="p">,</span> <span class="n">num_last_token_indices</span><span class="p">,</span> <span class="n">out_hidden_size_batch_level_starts</span> \
+            <span class="n">last_token_indices</span><span class="p">,</span> <span class="n">num_last_token_indices</span><span class="p">,</span> <span class="n">out_hidden_size_batch_level_starts</span> \
             <span class="o">=</span> <span class="n">drafter_inputs</span>
 
         <span class="n">attention_params</span> <span class="o">=</span> <span class="n">input_attention_params</span>
@@ -670,15 +728,9 @@
                 <span class="kc">True</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span><span class="p">,</span> <span class="n">spec_decoding_generation_lengths</span><span class="p">,</span>
                 <span class="n">spec_decoding_position_offsets</span><span class="p">,</span> <span class="n">spec_decoding_packed_mask</span><span class="p">)</span>
 
-        <span class="c1"># TODO uncomment, when the issue with shape inference is resolved.</span>
-        <span class="c1"># output_ids = slice(output_ids, starts=[0], sizes=num_output_tokens)</span>
-        <span class="c1"># position_ids = slice(position_ids, starts=[0], sizes=num_output_tokens)</span>
-        <span class="c1"># last_token_indices = slice(last_token_indices, starts=[0], sizes=num_last_token_indices)</span>
-
         <span class="c1"># Get hidden states for accepted ids</span>
         <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_slice_hidden_states</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span>
-                                                  <span class="n">hidden_states_indices</span><span class="p">,</span>
-                                                  <span class="n">num_output_tokens</span><span class="p">)</span>
+                                                  <span class="n">hidden_states_indices</span><span class="p">)</span>
 
         <span class="n">eagle_net_inputs</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="n">eagle_net_inputs</span><span class="p">[</span><span class="s2">&quot;input_ids&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">output_ids</span>
@@ -688,16 +740,14 @@
         <span class="n">eagle_net_inputs</span><span class="p">[</span><span class="s2">&quot;kv_cache_params&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">kv_cache_params</span>
         <span class="n">eagle_net_inputs</span><span class="p">[</span><span class="s2">&quot;spec_decoding_params&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">spec_decoding_params</span>
         <span class="n">eagle_net_inputs</span><span class="p">[</span><span class="s2">&quot;hidden_states&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">hidden_states</span>
-        <span class="k">return</span> <span class="n">eagle_net_inputs</span><span class="p">,</span> <span class="n">out_hidden_size_batch_level_starts</span>
+        <span class="k">return</span> <span class="n">eagle_net_inputs</span><span class="p">,</span> <span class="n">out_hidden_size_batch_level_starts</span><span class="p">,</span> <span class="n">num_last_token_indices</span>
 
-    <span class="k">def</span> <span class="nf">_slice_hidden_states</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">indices</span><span class="p">,</span> <span class="n">num_indices</span><span class="p">):</span>
-        <span class="c1"># TODO uncomment, when the issue with shape inference is resolved.</span>
-        <span class="c1"># indices = slice(indices, starts=[0], sizes=num_indices)</span>
+    <span class="k">def</span> <span class="nf">_slice_hidden_states</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">indices</span><span class="p">):</span>
         <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">index_select</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">indices</span><span class="p">)</span>
 
-        <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">hidden_states</span><span class="o">.</span><span class="n">view</span><span class="p">(</span>
-            <span class="n">concat</span><span class="p">([</span><span class="n">shape</span><span class="p">(</span><span class="n">indices</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span>
-                    <span class="n">shape</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="mi">1</span><span class="p">)]))</span>
+        <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">hidden_states</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">concat</span><span class="p">(</span>
+            <span class="p">[</span><span class="n">shape</span><span class="p">(</span><span class="n">indices</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span> <span class="n">shape</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="mi">1</span><span class="p">)]),</span>
+                                           <span class="n">zero_is_placeholder</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">hidden_states</span>
 
     <span class="k">def</span> <span class="nf">_eagle_fwd_helper</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">lm_logits</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
@@ -780,6 +830,7 @@
         <span class="n">rand_data_validation</span> <span class="o">=</span> <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;rand_data_validation&#39;</span><span class="p">]</span>
         <span class="n">rand_data_sample</span> <span class="o">=</span> <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;rand_data_sample&#39;</span><span class="p">]</span>
         <span class="n">input_ids</span> <span class="o">=</span> <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;input_ids&#39;</span><span class="p">]</span>
+        <span class="n">chunked_context_next_tokens</span> <span class="o">=</span> <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;chunked_context_next_tokens&#39;</span><span class="p">]</span>
         <span class="n">host_ctx_eagle_net_request_types</span> <span class="o">=</span> <span class="n">kwargs</span><span class="p">[</span>
             <span class="s1">&#39;host_ctx_eagle_net_request_types&#39;</span><span class="p">]</span>
         <span class="n">host_ctx_eagle_net_context_lengths</span> <span class="o">=</span> <span class="n">kwargs</span><span class="p">[</span>
@@ -792,6 +843,7 @@
             <span class="s1">&#39;host_gen_eagle_net_context_lengths&#39;</span><span class="p">]</span>
         <span class="n">host_gen_eagle_net_past_key_value_lengths</span> <span class="o">=</span> <span class="n">kwargs</span><span class="p">[</span>
             <span class="s1">&#39;host_gen_eagle_net_past_key_value_lengths&#39;</span><span class="p">]</span>
+        <span class="n">input_gen_tokens</span> <span class="o">=</span> <span class="n">kwargs</span><span class="p">[</span><span class="s2">&quot;input_gen_tokens&quot;</span><span class="p">]</span>
 
         <span class="c1"># Sample target tokens and accept them</span>
         <span class="c1"># next_draft_tokens, next_draft_lens, hidden_size_batch_level_starts are outputted here just to</span>
@@ -803,22 +855,21 @@
                                                       <span class="n">rand_data_validation</span><span class="p">,</span>
                                                       <span class="n">input_tree_params</span><span class="p">)</span>
         <span class="n">accepted_tokens</span><span class="p">,</span> <span class="n">num_accepted_tokens</span><span class="p">,</span> <span class="n">accepted_paths</span><span class="p">,</span> <span class="n">next_draft_tokens</span><span class="p">,</span> \
-            <span class="n">next_draft_lens</span><span class="p">,</span> <span class="n">hidden_size_batch_level_starts</span> <span class="o">=</span> <span class="n">output</span>
+            <span class="n">next_draft_lens</span><span class="p">,</span> <span class="n">next_draft_paths</span><span class="p">,</span> <span class="n">hidden_size_batch_level_starts</span> <span class="o">=</span> <span class="n">output</span>
 
         <span class="n">attention_params</span> <span class="o">=</span> <span class="n">kwargs</span><span class="p">[</span><span class="s2">&quot;attention_params&quot;</span><span class="p">]</span>
         <span class="n">kv_cache_params</span> <span class="o">=</span> <span class="n">kwargs</span><span class="p">[</span><span class="s2">&quot;kv_cache_params&quot;</span><span class="p">]</span>
+        <span class="n">spec_decoding_params</span> <span class="o">=</span> <span class="n">kwargs</span><span class="p">[</span><span class="s2">&quot;spec_decoding_params&quot;</span><span class="p">]</span>
 
         <span class="n">input_hidden_states</span> <span class="o">=</span> <span class="n">hidden_states</span>
-
-        <span class="c1"># NOTE EAGLE-1 output paths are the same as input path.</span>
-        <span class="n">next_draft_paths</span> <span class="o">=</span> <span class="n">input_tree_params</span><span class="o">.</span><span class="n">paths</span>
 
         <span class="c1"># Run EAGLE nets</span>
         <span class="k">for</span> <span class="n">li</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">num_eagle_layers</span><span class="p">):</span>
             <span class="c1"># Prepare EAGLE Net inputs.</span>
-            <span class="n">eagle_net_inputs</span><span class="p">,</span> <span class="n">hidden_size_batch_level_starts</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepare_drafter_inputs</span><span class="p">(</span>
+            <span class="n">eagle_net_inputs</span><span class="p">,</span> <span class="n">hidden_size_batch_level_starts</span><span class="p">,</span> <span class="n">num_last_token_indices</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepare_drafter_inputs</span><span class="p">(</span>
                 <span class="n">layer_idx</span><span class="o">=</span><span class="n">li</span><span class="p">,</span>
                 <span class="n">input_ids</span><span class="o">=</span><span class="n">input_ids</span><span class="p">,</span>
+                <span class="n">chunked_context_next_tokens</span><span class="o">=</span><span class="n">chunked_context_next_tokens</span><span class="p">,</span>
                 <span class="n">accepted_token_ids</span><span class="o">=</span><span class="n">accepted_tokens</span><span class="p">,</span>
                 <span class="n">accepted_lens</span><span class="o">=</span><span class="n">num_accepted_tokens</span><span class="p">,</span>
                 <span class="n">accepted_path_ids</span><span class="o">=</span><span class="n">accepted_paths</span><span class="p">,</span>
@@ -842,31 +893,44 @@
                 <span class="n">host_gen_eagle_net_context_lengths</span><span class="p">,</span>
                 <span class="n">host_gen_eagle_net_past_key_value_lengths</span><span class="o">=</span>
                 <span class="n">host_gen_eagle_net_past_key_value_lengths</span><span class="p">,</span>
-                <span class="n">hidden_size_batch_level_starts</span><span class="o">=</span><span class="n">hidden_size_batch_level_starts</span><span class="p">)</span>
+                <span class="n">hidden_size_batch_level_starts</span><span class="o">=</span><span class="n">hidden_size_batch_level_starts</span><span class="p">,</span>
+                <span class="n">input_gen_tokens</span><span class="o">=</span><span class="n">input_gen_tokens</span><span class="p">,</span>
+                <span class="n">input_spec_decoding_generation_lengths</span><span class="o">=</span><span class="n">spec_decoding_params</span><span class="o">.</span>
+                <span class="n">spec_decoding_generation_lengths</span><span class="p">)</span>
 
-            <span class="c1"># Run EAGLE Net</span>
-            <span class="c1"># TODO: handle base net kv cache and eagle net kv cache in the same tensors, but treat the differently here.</span>
-            <span class="n">logits</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">eagle_nets</span><span class="p">[</span><span class="n">li</span><span class="p">](</span><span class="o">**</span><span class="n">eagle_net_inputs</span><span class="p">)</span>
+            <span class="k">def</span> <span class="nf">single_eagle_net_iter</span><span class="p">(</span><span class="n">next_draft_tokens</span><span class="p">,</span> <span class="n">next_draft_lens</span><span class="p">):</span>
+                <span class="c1"># Run EAGLE Net</span>
+                <span class="c1"># NOTE: handle base net kv cache and eagle net kv cache are in the same tensor.</span>
+                <span class="c1"># EagleNet&#39;s kv cache is located starting at numBaseNetHiddenLayers in the kv tensor.</span>
+                <span class="n">logits</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">eagle_nets</span><span class="p">[</span><span class="n">li</span><span class="p">](</span>
+                    <span class="o">**</span><span class="n">eagle_net_inputs</span><span class="p">)</span>
 
-            <span class="c1"># Decode draft tokens</span>
-            <span class="c1"># FIXME We need to take top_k_sampling as an input</span>
-            <span class="n">top_k_sampling</span> <span class="o">=</span> <span class="kc">True</span>
-            <span class="n">next_draft_tokens</span><span class="p">,</span> <span class="n">next_draft_lens</span> <span class="o">=</span> <span class="n">eagle_draft_decoder_plugin</span><span class="p">(</span>
-                <span class="n">li</span><span class="p">,</span> <span class="n">top_k_sampling</span><span class="p">,</span> <span class="n">logits</span><span class="p">,</span> <span class="n">rand_data_sample</span><span class="p">,</span> <span class="n">input_tree_params</span><span class="p">,</span>
-                <span class="n">next_draft_tokens</span><span class="p">,</span> <span class="n">next_draft_lens</span><span class="p">)</span>
+                <span class="c1"># Decode draft tokens</span>
+                <span class="c1"># FIXME We need to take top_k_sampling as an input</span>
+                <span class="n">top_k_sampling</span> <span class="o">=</span> <span class="kc">True</span>
+                <span class="n">next_draft_tokens</span><span class="p">,</span> <span class="n">next_draft_lens</span> <span class="o">=</span> <span class="n">eagle_draft_decoder_plugin</span><span class="p">(</span>
+                    <span class="n">li</span><span class="p">,</span> <span class="n">top_k_sampling</span><span class="p">,</span> <span class="n">logits</span><span class="p">,</span> <span class="n">num_last_token_indices</span><span class="p">,</span>
+                    <span class="n">rand_data_sample</span><span class="p">,</span> <span class="n">input_tree_params</span><span class="p">,</span> <span class="n">next_draft_tokens</span><span class="p">,</span>
+                    <span class="n">next_draft_lens</span><span class="p">)</span>
+
+                <span class="k">return</span> <span class="n">next_draft_tokens</span><span class="p">,</span> <span class="n">next_draft_lens</span><span class="p">,</span> <span class="n">hidden_states</span>
+
+            <span class="n">next_draft_tokens</span><span class="p">,</span> <span class="n">next_draft_lens</span><span class="p">,</span> <span class="n">hidden_states</span> <span class="o">=</span> \
+                    <span class="n">single_eagle_net_iter</span><span class="p">(</span><span class="n">next_draft_tokens</span><span class="p">,</span> <span class="n">next_draft_lens</span><span class="p">)</span>
 
             <span class="c1"># Update params</span>
             <span class="k">if</span> <span class="n">li</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
-                <span class="n">eagle_net_0_attention_params</span> <span class="o">=</span> <span class="n">eagle_net_inputs</span><span class="p">[</span>
-                    <span class="s2">&quot;attention_params&quot;</span><span class="p">]</span>
+                <span class="n">eagle_net_0_sequence_length</span> <span class="o">=</span> <span class="n">eagle_net_inputs</span><span class="p">[</span>
+                    <span class="s2">&quot;attention_params&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">sequence_length</span>
                 <span class="n">input_hidden_states</span> <span class="o">=</span> <span class="n">hidden_states</span>
             <span class="k">else</span><span class="p">:</span>
-                <span class="n">attention_params</span> <span class="o">=</span> <span class="n">eagle_net_inputs</span><span class="p">[</span><span class="s2">&quot;attention_params&quot;</span><span class="p">]</span>
-                <span class="n">attention_params</span><span class="o">.</span><span class="n">context_lengths</span> <span class="o">=</span> <span class="n">eagle_net_0_attention_params</span><span class="o">.</span><span class="n">sequence_length</span>
-                <span class="n">attention_params</span><span class="o">.</span><span class="n">sequence_length</span> <span class="o">=</span> <span class="n">eagle_net_0_attention_params</span><span class="o">.</span><span class="n">sequence_length</span>
-                <span class="n">kv_cache_params</span> <span class="o">=</span> <span class="n">eagle_net_inputs</span><span class="p">[</span><span class="s2">&quot;kv_cache_params&quot;</span><span class="p">]</span>
                 <span class="n">input_hidden_states</span> <span class="o">=</span> <span class="n">concat</span><span class="p">(</span>
                     <span class="p">[</span><span class="n">input_hidden_states</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">])</span>
+
+            <span class="n">kv_cache_params</span> <span class="o">=</span> <span class="n">eagle_net_inputs</span><span class="p">[</span><span class="s2">&quot;kv_cache_params&quot;</span><span class="p">]</span>
+            <span class="n">attention_params</span> <span class="o">=</span> <span class="n">eagle_net_inputs</span><span class="p">[</span><span class="s2">&quot;attention_params&quot;</span><span class="p">]</span>
+            <span class="n">attention_params</span><span class="o">.</span><span class="n">context_lengths</span> <span class="o">=</span> <span class="n">eagle_net_0_sequence_length</span>
+            <span class="n">attention_params</span><span class="o">.</span><span class="n">sequence_length</span> <span class="o">=</span> <span class="n">eagle_net_0_sequence_length</span>
 
         <span class="c1"># Mark tensors as output</span>
         <span class="n">accepted_tokens</span><span class="o">.</span><span class="n">mark_output</span><span class="p">(</span><span class="s1">&#39;accepted_tokens&#39;</span><span class="p">)</span>
@@ -874,6 +938,7 @@
         <span class="n">accepted_paths</span><span class="o">.</span><span class="n">mark_output</span><span class="p">(</span><span class="s1">&#39;accepted_paths&#39;</span><span class="p">)</span>
         <span class="n">next_draft_tokens</span><span class="o">.</span><span class="n">mark_output</span><span class="p">(</span><span class="s1">&#39;next_draft_tokens&#39;</span><span class="p">)</span>
         <span class="n">next_draft_lens</span><span class="o">.</span><span class="n">mark_output</span><span class="p">(</span><span class="s1">&#39;next_draft_lens&#39;</span><span class="p">)</span>
+        <span class="n">next_draft_paths</span><span class="o">.</span><span class="n">mark_output</span><span class="p">(</span><span class="s1">&#39;next_draft_paths&#39;</span><span class="p">)</span>
 
         <span class="k">return</span> <span class="n">next_draft_tokens</span>
 
@@ -888,7 +953,8 @@
             <span class="s2">&quot;host_ctx_eagle_net_past_key_value_lengths&quot;</span><span class="p">,</span>
             <span class="s2">&quot;host_gen_eagle_net_request_types&quot;</span><span class="p">,</span>
             <span class="s2">&quot;host_gen_eagle_net_context_lengths&quot;</span><span class="p">,</span>
-            <span class="s2">&quot;host_gen_eagle_net_past_key_value_lengths&quot;</span>
+            <span class="s2">&quot;host_gen_eagle_net_past_key_value_lengths&quot;</span><span class="p">,</span> <span class="s2">&quot;input_gen_tokens&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;chunked_context_next_tokens&quot;</span>
         <span class="p">]</span>
 
         <span class="n">base_kwargs</span> <span class="o">=</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">v</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">k</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">extra_args</span><span class="p">}</span>
@@ -896,15 +962,19 @@
         <span class="c1"># Base model forward</span>
         <span class="n">hidden_states</span> <span class="o">=</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">forward</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">base_kwargs</span><span class="p">)</span>
 
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_last_pp_rank</span><span class="p">():</span>
+            <span class="n">extra_args</span> <span class="o">=</span> <span class="p">[</span><span class="s2">&quot;hidden_states&quot;</span><span class="p">]</span>
+            <span class="n">kwargs</span> <span class="o">=</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">v</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">k</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">extra_args</span><span class="p">}</span>
+
         <span class="k">assert</span> <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;use_cache&#39;</span><span class="p">]</span> <span class="ow">and</span> <span class="n">default_net</span><span class="p">(</span>
         <span class="p">)</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">paged_kv_cache</span>
 
-        <span class="n">lm_logits</span><span class="p">,</span> <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">hidden_states</span>
-
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_last_pp_rank</span><span class="p">():</span>
+            <span class="n">lm_logits</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">all_hidden_states</span> <span class="o">=</span> <span class="n">hidden_states</span>
             <span class="c1"># Call eagle logic to accept prev draft tokens and predict next draft tokens</span>
-            <span class="n">next_draft_tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_eagle_fwd_helper</span><span class="p">(</span><span class="n">lm_logits</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span>
-                                                       <span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+            <span class="n">next_draft_tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_eagle_fwd_helper</span><span class="p">(</span><span class="n">lm_logits</span><span class="p">,</span>
+                                                       <span class="n">all_hidden_states</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span>
+                                                       <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">hidden_states</span><span class="o">.</span><span class="n">mark_output</span><span class="p">(</span><span class="s1">&#39;hidden_states_output&#39;</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
 
@@ -942,10 +1012,15 @@
         <span class="k">assert</span> <span class="n">max_batch_size</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
         <span class="n">bb_range</span> <span class="o">=</span> <span class="n">default_range</span><span class="p">(</span><span class="n">max_batch_size</span><span class="p">)</span>
         <span class="n">bb0_range</span> <span class="o">=</span> <span class="n">default_range</span><span class="p">(</span><span class="n">max_batch_size</span><span class="p">,</span> <span class="n">min_range</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">opt_offset</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+        <span class="n">gt_range</span> <span class="o">=</span> <span class="n">default_range</span><span class="p">(</span><span class="n">max_batch_size</span> <span class="o">*</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">+</span> <span class="mi">1</span><span class="p">),</span>
+                                 <span class="n">min_range</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+                                 <span class="n">opt_offset</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
 
         <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;speculative_decoding_draft_tokens_external&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="kc">False</span>
         <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;max_draft_len&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span>
         <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;spec_decoding_is_generation_length_variable&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="kc">True</span>
+        <span class="n">kwargs</span><span class="p">[</span>
+            <span class="s1">&#39;num_hidden_layers&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">num_hidden_layers</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">eagle_net_config</span><span class="o">.</span><span class="n">num_hidden_layers</span>
 
         <span class="c1"># Call base class prepare inputs</span>
         <span class="n">inputs</span> <span class="o">=</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">prepare_inputs</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
@@ -962,12 +1037,16 @@
             <span class="n">bb_range</span> <span class="o">=</span> <span class="p">[</span><span class="n">bb_range</span><span class="p">,</span> <span class="n">bb_range</span><span class="p">]</span>
             <span class="n">bb0_range</span> <span class="o">=</span> <span class="p">[</span><span class="n">bb0_range</span><span class="p">,</span> <span class="n">bb0_range</span><span class="p">]</span>
             <span class="n">draft_len_range</span> <span class="o">=</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span><span class="p">]</span>
+            <span class="n">decoding_len_range</span> <span class="o">=</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">+</span> <span class="mi">1</span><span class="p">]</span>
             <span class="n">path_len_range</span> <span class="o">=</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">num_eagle_layers</span> <span class="o">+</span> <span class="mi">1</span><span class="p">]</span>
+            <span class="n">gen_tokens_range</span> <span class="o">=</span> <span class="p">[</span><span class="n">gt_range</span><span class="p">,</span> <span class="n">gt_range</span><span class="p">]</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">bb_range</span> <span class="o">=</span> <span class="p">[</span><span class="n">bb_range</span><span class="p">]</span>
             <span class="n">bb0_range</span> <span class="o">=</span> <span class="p">[</span><span class="n">bb0_range</span><span class="p">]</span>
             <span class="n">draft_len_range</span> <span class="o">=</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span><span class="p">]</span>
+            <span class="n">decoding_len_range</span> <span class="o">=</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">+</span> <span class="mi">1</span><span class="p">]</span>
             <span class="n">path_len_range</span> <span class="o">=</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">num_eagle_layers</span> <span class="o">+</span> <span class="mi">1</span><span class="p">]</span>
+            <span class="n">gen_tokens_range</span> <span class="o">=</span> <span class="p">[</span><span class="n">gt_range</span><span class="p">]</span>
 
         <span class="n">draft_tokens</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;draft_tokens&#39;</span><span class="p">,</span>
                               <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
@@ -990,10 +1069,9 @@
                                    <span class="p">]))</span>
         <span class="n">rand_data_validation</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;rand_data_validation&#39;</span><span class="p">,</span>
                                       <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">float32</span><span class="p">,</span>
-                                      <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span><span class="p">],</span>
+                                      <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
                                       <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
                                           <span class="p">(</span><span class="s1">&#39;batch_size&#39;</span><span class="p">,</span> <span class="n">bb_range</span><span class="p">),</span>
-                                          <span class="p">(</span><span class="s1">&#39;draft_len&#39;</span><span class="p">,</span> <span class="n">draft_len_range</span><span class="p">),</span>
                                       <span class="p">]))</span>
         <span class="n">rand_data_sample</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;rand_data_sample&#39;</span><span class="p">,</span>
                                   <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">float32</span><span class="p">,</span>
@@ -1001,14 +1079,13 @@
                                   <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
                                       <span class="p">(</span><span class="s1">&#39;batch_size&#39;</span><span class="p">,</span> <span class="n">bb_range</span><span class="p">),</span>
                                   <span class="p">]))</span>
-        <span class="n">tree_paths</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
-            <span class="n">name</span><span class="o">=</span><span class="s1">&#39;tree_paths&#39;</span><span class="p">,</span>
+        <span class="n">draft_paths</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
+            <span class="n">name</span><span class="o">=</span><span class="s1">&#39;draft_paths&#39;</span><span class="p">,</span>
             <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
-            <span class="c1"># FIXME max_accepted len is not necessary self.num_eagle_layers + 1. Only True for EAGLE-1</span>
-            <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_eagle_layers</span> <span class="o">+</span> <span class="mi">1</span><span class="p">],</span>
+            <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_eagle_layers</span> <span class="o">+</span> <span class="mi">1</span><span class="p">],</span>
             <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
                 <span class="p">(</span><span class="s1">&#39;batch_size&#39;</span><span class="p">,</span> <span class="n">bb_range</span><span class="p">),</span>
-                <span class="p">(</span><span class="s1">&#39;draft_len&#39;</span><span class="p">,</span> <span class="n">draft_len_range</span><span class="p">),</span>
+                <span class="p">(</span><span class="s1">&#39;decoding_len&#39;</span><span class="p">,</span> <span class="n">decoding_len_range</span><span class="p">),</span>
                 <span class="p">(</span><span class="s1">&#39;path_len&#39;</span><span class="p">,</span> <span class="n">path_len_range</span><span class="p">),</span>
             <span class="p">]))</span>
 
@@ -1055,7 +1132,20 @@
                 <span class="p">(</span><span class="s1">&#39;batch_size&#39;</span><span class="p">,</span> <span class="n">bb_range</span><span class="p">),</span>
             <span class="p">]))</span>
 
-        <span class="n">tree_params</span> <span class="o">=</span> <span class="n">TreeParams</span><span class="p">(</span><span class="n">paths</span><span class="o">=</span><span class="n">tree_paths</span><span class="p">)</span>
+        <span class="n">input_gen_tokens</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;input_gen_tokens&#39;</span><span class="p">,</span>
+                                  <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                                  <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                                  <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
+                                      <span class="p">(</span><span class="s1">&#39;gen_tokens&#39;</span><span class="p">,</span> <span class="n">gen_tokens_range</span><span class="p">),</span>
+                                  <span class="p">]))</span>
+        <span class="n">chunked_context_next_tokens</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;chunked_context_next_tokens&#39;</span><span class="p">,</span>
+                                             <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                                             <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                                             <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
+                                                 <span class="p">(</span><span class="s1">&#39;batch_size&#39;</span><span class="p">,</span> <span class="n">bb_range</span><span class="p">),</span>
+                                             <span class="p">]))</span>
+
+        <span class="n">tree_params</span> <span class="o">=</span> <span class="n">TreeParams</span><span class="p">(</span><span class="n">paths</span><span class="o">=</span><span class="n">draft_paths</span><span class="p">)</span>
 
         <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;draft_tokens&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">draft_tokens</span>
         <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;draft_lens&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">draft_lens</span>
@@ -1075,6 +1165,8 @@
             <span class="s1">&#39;host_gen_eagle_net_context_lengths&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">host_gen_eagle_net_context_lengths</span>
         <span class="n">inputs</span><span class="p">[</span>
             <span class="s1">&#39;host_gen_eagle_net_past_key_value_lengths&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">host_gen_eagle_net_past_key_value_lengths</span>
+        <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;input_gen_tokens&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">input_gen_tokens</span>
+        <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;chunked_context_next_tokens&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">chunked_context_next_tokens</span>
         <span class="k">return</span> <span class="n">inputs</span></div>
 </div>
 
@@ -1087,7 +1179,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fc13ef9b730>
+<jinja2.runtime.BlockReference object at 0x7f946e5927e0>
 
 <div class="footer">
     <p>

@@ -1,3 +1,5 @@
+
+
 <!DOCTYPE html>
 <html class="writer-html5" lang="en" data-content_root="../">
 <head>
@@ -6,21 +8,17 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Best Practices for Tuning the Performance of TensorRT-LLM &mdash; tensorrt_llm  documentation</title>
       <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=80d5e7a1" />
-      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=19f00094" />
+      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
 
   
-  <!--[if lt IE 9]>
-    <script src="../_static/js/html5shiv.min.js"></script>
-  <![endif]-->
-  
-        <script src="../_static/jquery.js?v=5d32c60e"></script>
-        <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-        <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="../_static/doctools.js?v=888ff710"></script>
-        <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
-        <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
-        <script src="../_static/copybutton.js?v=f281be69"></script>
+      <script src="../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="../_static/doctools.js?v=888ff710"></script>
+      <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+      <script src="../_static/copybutton.js?v=65e89d2a"></script>
     <script src="../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
@@ -60,6 +58,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/windows.html">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul>
@@ -89,6 +88,7 @@
 <p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-serve.html">trtllm-serve</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
@@ -107,14 +107,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/executor.html">Executor API</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html">Inference Request</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html#lookahead-decoding">Lookahead decoding</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul class="current">
@@ -129,32 +127,30 @@
 <li class="toctree-l4"><a class="reference internal" href="#max-num-tokens"><code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code></a></li>
 </ul>
 </li>
-<li class="toctree-l3"><a class="reference internal" href="#multiple-profiles">Multiple profiles</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#gpt-attention-plugin-and-context-fused-multi-head-attention">GPT Attention Plugin and Context Fused Multi-Head Attention</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#multiple-profiles">Multiple profiles</a><ul>
 <li class="toctree-l4"><a class="reference internal" href="#fp8-context-fused-multi-head-attention">FP8 Context Fused Multi-Head Attention</a></li>
 </ul>
 </li>
+<li class="toctree-l3"><a class="reference internal" href="#gpt-attention-plugin-and-context-fused-multi-head-attention">GPT Attention Plugin and Context Fused Multi-Head Attention</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#remove-input-padding">Remove Input Padding</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#paged-kv-cache">Paged KV Cache</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#in-flight-sequence-batching">In-flight Sequence Batching</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#reduce-norm-fusion">Reduce Norm Fusion</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#embedding-parallelism-embedding-sharing-and-look-up-plugin">Embedding Parallelism, Embedding Sharing, and Look-Up Plugin</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#horizontal-fusion-in-gated-mlp">Horizontal Fusion in Gated-MLP</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#gemm-swiglu-fusion-in-gated-mlp">GEMM + SwiGLU Fusion in Gated-MLP</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#gemm-plugin">GEMM Plugin</a><ul>
 <li class="toctree-l4"><a class="reference internal" href="#fp8-gemm-plugin-for-small-batch-size-performance-optimization">FP8 GEMM Plugin for Small Batch Size Performance Optimization</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#gemm-swiglu-fusion-in-gated-mlp">GEMM + SwiGLU Fusion in Gated-MLP</a></li>
 </ul>
 </li>
 <li class="toctree-l3"><a class="reference internal" href="#bert-attention-plugin-and-context-fused-multi-head-attention">BERT Attention Plugin and Context Fused Multi-Head Attention</a></li>
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="#runtime-options-to-optimize-the-performance-of-tensorrt-llm-models">Runtime Options to Optimize the Performance of TensorRT-LLM Models</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="#gpt-model-type">GPT Model Type</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#capacity-scheduler-policy">Capacity Scheduler Policy</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#context-chunking-policy">Context Chunking Policy</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#batching-type">Batching Type</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#max-tokens-in-paged-kv-cache-and-kv-cache-free-gpu-memory-fraction">Max Tokens in Paged KV Cache and KV Cache Free GPU Memory Fraction</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#batch-scheduler-policy">Batch Scheduler Policy</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#tensorrt-overlap">TensorRT Overlap</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#maximum-attention-window-size">Maximum Attention Window Size</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#chunked-context">Chunked Context</a></li>
 </ul>
 </li>
 </ul>
@@ -206,11 +202,9 @@
 <p>This document provides some best practices for tuning the performance of TensorRT-LLM.</p>
 <section id="how-to-measure-performance">
 <h2>How To Measure Performance?<a class="headerlink" href="#how-to-measure-performance" title="Link to this heading"></a></h2>
-<p>TensorRT-LLM can be benchmarked using the included
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/benchmarks/cpp/README.md">C++</a>
-and
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/benchmarks/python/README.md">Python</a> tools. However, it is <em>strongly</em>
-recommended to use the C++ benchmarking tool. For detailed performance data and
+<p>TensorRT-LLM can be benchmarked using the
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/benchmarks/cpp/README.md">C++</a> tools. We are actively developing <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> command, which is going to be the recommended way of benchmarking TensorRT-LLM.</p>
+<p>For detailed performance data and
 the steps to reproduce those results, see
 this <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/performance/perf-overview.html">Document</a>.
 The <a class="reference external" href="https://github.com/triton-inference-server/tensorrtllm_backend">TensorRT-LLM backend</a>
@@ -219,7 +213,8 @@ can also be used to measure the performance of TensorRT-LLM for online serving.<
 <section id="build-options-to-optimize-the-performance-of-tensorrt-llm-models">
 <h2>Build Options to Optimize the Performance of TensorRT-LLM Models<a class="headerlink" href="#build-options-to-optimize-the-performance-of-tensorrt-llm-models" title="Link to this heading"></a></h2>
 <p>This part summarizes how to build engines to enhance the performance of the
-runtime and, for some of them, decrease the engine build time.</p>
+runtime. The following options have reasonable default values but for some of them,
+it’s possible that tuning is needed to get the peak numbers.</p>
 <p><em><strong>Note that some of those features and how to enable them may change in the future.</strong></em></p>
 <section id="max-batch-size-max-seq-len-and-max-num-tokens">
 <h3><code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>, <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> and <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code><a class="headerlink" href="#max-batch-size-max-seq-len-and-max-num-tokens" title="Link to this heading"></a></h3>
@@ -269,7 +264,13 @@ total end-to-end latency.</p>
 built engines, it will benefits the performance especially when GEMM plugin is
 disabled, because more optimization profiles help TensorRT have more chances to
 select better kernels.</p>
-<p>However, this feature will increase the engine build time.</p>
+<p>Note: This feature increases engine build time but no other adverse effects are expected.</p>
+<section id="fp8-context-fused-multi-head-attention">
+<h4>FP8 Context Fused Multi-Head Attention<a class="headerlink" href="#fp8-context-fused-multi-head-attention" title="Link to this heading"></a></h4>
+<p><code class="docutils literal notranslate"><span class="pre">--use_fp8_context_fmha</span></code> enables FP8 Context fused multi-head attention. We
+recommend enabling this when fp8 quantization is used to improve the context phase
+attention performance. Note that only NVIDIA Hopper architecture is supported.</p>
+</section>
 </section>
 <section id="gpt-attention-plugin-and-context-fused-multi-head-attention">
 <h3>GPT Attention Plugin and Context Fused Multi-Head Attention<a class="headerlink" href="#gpt-attention-plugin-and-context-fused-multi-head-attention" title="Link to this heading"></a></h3>
@@ -283,12 +284,6 @@ implementation that uses the <code class="docutils literal notranslate"><span cl
 <p>Enabling the fused multi-head attention, during the context phase, will trigger
 a kernel that performs the MHA/MQA/GQA block using a single kernel, for more
 details, see this <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/advanced/gpt-attention.html#context-phase">Document</a>.</p>
-<section id="fp8-context-fused-multi-head-attention">
-<h4>FP8 Context Fused Multi-Head Attention<a class="headerlink" href="#fp8-context-fused-multi-head-attention" title="Link to this heading"></a></h4>
-<p><code class="docutils literal notranslate"><span class="pre">--use_fp8_context_fmha</span></code> enables FP8 Context fused multi-head attention, which
-is recommended to be enabled when fp8 quantization is used to improve the
-performance. Note that only NVIDIA Hopper architecture is supported.</p>
-</section>
 </section>
 <section id="remove-input-padding">
 <h3>Remove Input Padding<a class="headerlink" href="#remove-input-padding" title="Link to this heading"></a></h3>
@@ -296,7 +291,7 @@ performance. Note that only NVIDIA Hopper architecture is supported.</p>
 argument in <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> is used to control it.</p>
 <p>When input padding is removed, the different tokens are packed together. It
 reduces both the amount of computations and memory consumption. For more details, see
-this <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/advanced/gpt-attention.md#padded-and-packed-tensors">Document</a>.</p>
+this <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/advanced/gpt-attention.html#padded-and-packed-tensors">Document</a>.</p>
 </section>
 <section id="paged-kv-cache">
 <h3>Paged KV Cache<a class="headerlink" href="#paged-kv-cache" title="Link to this heading"></a></h3>
@@ -306,23 +301,16 @@ this <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/a
 this <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/advanced/gpt-attention.html#paged-kv-cache">Document</a>). It usually leads to an
 increase in the batch size and an improved efficiency.</p>
 </section>
-<section id="in-flight-sequence-batching">
-<h3>In-flight Sequence Batching<a class="headerlink" href="#in-flight-sequence-batching" title="Link to this heading"></a></h3>
-<p>In-flight sequence batching is enabled by default with <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code>,
-which requires that the GPT attention plugin, input padding removal and paged KV
-cache are all enabled together.</p>
-<p>In-flight sequence batching schedules sequences in context phase together with
-sequences in generation phase to increase efficiency and reduce latency, see
-this <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/advanced/gpt-attention.html#in-flight-batching">Document</a> for more details.</p>
-</section>
 <section id="reduce-norm-fusion">
 <h3>Reduce Norm Fusion<a class="headerlink" href="#reduce-norm-fusion" title="Link to this heading"></a></h3>
 <p>There is an experimental feature called “Reduce Norm Fusion”
 available to extend the custom AllReduce functionality. It can be enabled by
 using the <code class="docutils literal notranslate"><span class="pre">--reduce_fusion</span> <span class="pre">enable</span></code> argument with <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> when the
-custom AllReduce is already enabled. This feature aims to fuse the ResidualAdd
-and LayerNorm kernels after AllReduce into a single kernel, resulting in
-improved end-to-end performance. Please note that currently, this feature is
+custom AllReduce is already enabled.</p>
+<p>This feature aims to fuse the <code class="docutils literal notranslate"><span class="pre">ResidualAdd</span></code>
+and <code class="docutils literal notranslate"><span class="pre">LayerNorm</span></code> kernels after <code class="docutils literal notranslate"><span class="pre">AllReduce</span></code> into a single kernel, resulting in
+improved end-to-end performance.</p>
+<p>Please note that currently, this feature is
 only supported for the llama model. It is recommended to enable this feature when the batch size is small and the generation phase time is the dominant factor.</p>
 </section>
 <section id="embedding-parallelism-embedding-sharing-and-look-up-plugin">
@@ -330,43 +318,21 @@ only supported for the llama model. It is recommended to enable this feature whe
 <p>The embedding parallelism feature enables the sharding of the embedding table
 across multiple GPUs, so that the memory usage could be reduced and the
 throughput improved. The embedding sharing feature enables the sharing of the
-embedding table between <code class="docutils literal notranslate"><span class="pre">look_up</span></code> and <code class="docutils literal notranslate"><span class="pre">lm_head</span></code> layers.</p>
-<p>The look-up plugin implements the embedding sharing feature and is required to
-enable the aforementioned features for now (until TensorRT native layers
-support embedding sharing).</p>
-<p>It is recommended to enable the embedding parallelism and sharing features to
-improve throughput. However, the following conditions have to be satisfied:</p>
+embedding table between <code class="docutils literal notranslate"><span class="pre">look_up</span></code> and <code class="docutils literal notranslate"><span class="pre">lm_head</span></code> layers to reduced memory usage.</p>
+<p>It is recommended to enable embedding parallelism to improve throughput with <code class="docutils literal notranslate"><span class="pre">--use_parallel_embedding</span></code> and <code class="docutils literal notranslate"><span class="pre">--embedding_sharding_dim</span></code> in <code class="docutils literal notranslate"><span class="pre">convert_checkpoint.py</span></code>.</p>
+<p>Embedding sharing is by default enabled if following conditions are met:</p>
 <ol class="arabic simple">
-<li><p>The model shares the embedding table between <code class="docutils literal notranslate"><span class="pre">look_up</span></code> and <code class="docutils literal notranslate"><span class="pre">lm_head</span></code> layers,</p></li>
-<li><p>Both look_up plugin and gemm plugin are enabled,</p></li>
-<li><p>The sharding dimension of the embedding lookup table is set correctly.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">look_up</span></code> and <code class="docutils literal notranslate"><span class="pre">lm_head</span></code> layers have identical weights.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">--gemm_plugin</span></code> is not used when building the engine.</p></li>
+<li><p>For tensor parallelism cases, <code class="docutils literal notranslate"><span class="pre">-embedding_sharding_dim</span> <span class="pre">0</span></code> must be set. In other words, we must enable embedding parallelism along the vocab dimension,</p></li>
 </ol>
-<p>To enable the features, use the <code class="docutils literal notranslate"><span class="pre">--use_parallel_embedding</span></code>, <code class="docutils literal notranslate"><span class="pre">--embedding_sharding_dim</span></code> and
-<code class="docutils literal notranslate"><span class="pre">--use_embedding_sharing</span></code> arguments in <code class="docutils literal notranslate"><span class="pre">convert_checkpoint.py</span></code>, and use the
-<code class="docutils literal notranslate"><span class="pre">--lookup_plugin</span></code>, <code class="docutils literal notranslate"><span class="pre">--gemm_plugin</span></code> arguments in <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> command. See those
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt#embedding-parallelism-and-sharing">Examples</a>
-for details.</p>
+<p>See those <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt#embedding-parallelism">Examples</a> for details.</p>
 </section>
 <section id="horizontal-fusion-in-gated-mlp">
 <h3>Horizontal Fusion in Gated-MLP<a class="headerlink" href="#horizontal-fusion-in-gated-mlp" title="Link to this heading"></a></h3>
 <p>Horizontal fusion in Gated-MLP combines two Matmul operations into a single one
-followed by a separate SwiGLU kernel. It can effectively reduce latency.</p>
-<p>The feature is enabled by default. However, for FP8 PTQ, the downside is slight
-reduction of accuracy because one of the quantization scaling factors are discarded.
-If you’re using FP8 PTQ and the accuracy does not satisfy your requirement, you
-can try disable the feature by setting <code class="docutils literal notranslate"><span class="pre">--use_fused_mlp=disable</span></code> argument to <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code>.</p>
-</section>
-<section id="gemm-swiglu-fusion-in-gated-mlp">
-<h3>GEMM + SwiGLU Fusion in Gated-MLP<a class="headerlink" href="#gemm-swiglu-fusion-in-gated-mlp" title="Link to this heading"></a></h3>
-<p>GEMM + SwiGLU fusion in Gated-MLP combines two Matmul operations and one SwiGLU
-operation into a single kernel. It only supports FP8 on Hopper now. For FP8 PTQ,
-the downside is slight reduction of accuracy because one of the quantization
-scaling factors are discarded.</p>
-<p>If model is large and you are running it on Hopper with FP8 precision, it is
-recommended to enable the feature by using the <code class="docutils literal notranslate"><span class="pre">--use_fused_mlp=enable</span> <span class="pre">--gemm_swiglu_plugin</span> <span class="pre">fp8</span></code>
-argument with <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code>. When the workload is very small, or the accuracy
-after enabling it does not satisfy your requirement, it is not recommended to
-enable that feature.</p>
+followed by a separate SwiGLU kernel. It can effectively reduce latency.
+This feature is enabled by default.</p>
 </section>
 <section id="gemm-plugin">
 <h3>GEMM Plugin<a class="headerlink" href="#gemm-plugin" title="Link to this heading"></a></h3>
@@ -382,6 +348,17 @@ inferenced, the performance may decrease as batch size grows. Therefore, this
 feature is only recommended for latency reduction in small-batch-size scenarios
 currently.</p>
 </section>
+<section id="gemm-swiglu-fusion-in-gated-mlp">
+<h4>GEMM + SwiGLU Fusion in Gated-MLP<a class="headerlink" href="#gemm-swiglu-fusion-in-gated-mlp" title="Link to this heading"></a></h4>
+<p>The GEMM + SwiGLU fusion in Gated-MLP combines two Matmul operations and one SwiGLU operation into a single kernel. Currently this is only supported for FP8 precision on Hopper. While this fusion improves performance, it can slightly reduce accuracy in FP8 PTQ because one quantization scaling factor is discarded.</p>
+<p>We recommend enabling this feature for large models running on Hopper with FP8 precision. Use the following <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> arguments to enable it:</p>
+<ul class="simple">
+<li><p>For large models: <code class="docutils literal notranslate"><span class="pre">--use_fused_mlp=enable</span> <span class="pre">--gemm_swiglu_plugin=fp8</span></code></p></li>
+<li><p>For small batch sizes: <code class="docutils literal notranslate"><span class="pre">--use_fused_mlp=enable</span> <span class="pre">--low_latency_gemm_swiglu_plugin=fp8</span></code> to improve latency.</p></li>
+</ul>
+<p>We do not recommend enabling this feature for very small workloads or if the
+accuracy loss is unacceptable.</p>
+</section>
 </section>
 <section id="bert-attention-plugin-and-context-fused-multi-head-attention">
 <h3>BERT Attention Plugin and Context Fused Multi-Head Attention<a class="headerlink" href="#bert-attention-plugin-and-context-fused-multi-head-attention" title="Link to this heading"></a></h3>
@@ -396,14 +373,41 @@ recommended for the BERT model. They are enabled by default using the
 <p>This part summarizes the runtime configuration knobs that can be tweaked to
 enhance the performance of already built engines. Note that currently the
 configurations can be modified using the
-<a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/advanced/batch-manager.html#the-batch-manager-api">Batch Manager API</a>
+<a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/advanced/executor.html#executor-api">Executor API</a>
 as well as the
 <a class="reference external" href="https://github.com/triton-inference-server/tensorrtllm_backend">TensorRT-LLM backend</a>.</p>
-<section id="gpt-model-type">
-<h3>GPT Model Type<a class="headerlink" href="#gpt-model-type" title="Link to this heading"></a></h3>
-<p>The GPT model type can be set to <code class="docutils literal notranslate"><span class="pre">V1</span></code>, <code class="docutils literal notranslate"><span class="pre">inflight_batching</span></code> and
-<code class="docutils literal notranslate"><span class="pre">inflight_fused_batching</span></code>. It is recommended to use <code class="docutils literal notranslate"><span class="pre">inflight_fused_batching</span></code>
-to increase throughput and reduce latency.</p>
+<section id="capacity-scheduler-policy">
+<h3>Capacity Scheduler Policy<a class="headerlink" href="#capacity-scheduler-policy" title="Link to this heading"></a></h3>
+<p>There currently are three batch scheduler policies: <code class="docutils literal notranslate"><span class="pre">GUARANTEED_NO_EVICT</span></code> (default),
+<code class="docutils literal notranslate"><span class="pre">MAX_UTILIZATION</span></code> and <code class="docutils literal notranslate"><span class="pre">STATIC_BATCH</span></code>.</p>
+<p>The scheduling policy can be set to <code class="docutils literal notranslate"><span class="pre">MAX_UTILIZATION</span></code> to pack as many
+requests as possible at each iteration of the forward loop, when in-flight
+sequence batching is enabled. It maximizes the utilization of the GPUs by
+aggressively scheduling requests at the risk of having to pause requests if the
+KV cache size limit is reached.</p>
+<p>For a more conservative approach with respect to the KV cache limitations in
+terms of memory allocation, <code class="docutils literal notranslate"><span class="pre">CapacitySchedulerPolicy</span></code> should be set to
+<code class="docutils literal notranslate"><span class="pre">GUARANTEED_NO_EVICT</span></code> to guarantee that a started request is never paused.</p>
+<p>If the goal is to maximizes the throughput, users should try <code class="docutils literal notranslate"><span class="pre">MAX_UTILIZATION</span></code>.
+However, they need to keep in mind that it may have a negative impact on
+latency if requests have to be paused.</p>
+<p><code class="docutils literal notranslate"><span class="pre">STATIC_BATCH</span></code> is a legacy mode and is not recommended for production usage.</p>
+</section>
+<section id="context-chunking-policy">
+<h3>Context Chunking Policy<a class="headerlink" href="#context-chunking-policy" title="Link to this heading"></a></h3>
+<p>Context chunking will increase the chance of batch processing between
+the context and the generation phase, thereby balancing the calculation amount
+of each iteration and increasing throughput.</p>
+<p>There currently are two context chunking policies: <code class="docutils literal notranslate"><span class="pre">FIRST_COME_FIRST_SERVED</span></code> (default)
+and <code class="docutils literal notranslate"><span class="pre">EQUAL_PROGRESS</span></code>.</p>
+<p><code class="docutils literal notranslate"><span class="pre">FIRST_COME_FIRST_SERVED</span></code> should achieve overall better performance, while
+<code class="docutils literal notranslate"><span class="pre">EQUAL_PROGRESS</span></code> can be helpful in theory to make sure time to first token (TTFT)
+for most requests are relatively similar.</p>
+</section>
+<section id="batching-type">
+<h3>Batching Type<a class="headerlink" href="#batching-type" title="Link to this heading"></a></h3>
+<p>The batching type can be set to <code class="docutils literal notranslate"><span class="pre">INFLIGHT</span></code> (default) and <code class="docutils literal notranslate"><span class="pre">STATIC</span></code>.
+It is recommended to use <code class="docutils literal notranslate"><span class="pre">INFLIGHT</span></code> to increase throughput and reduce latency.</p>
 </section>
 <section id="max-tokens-in-paged-kv-cache-and-kv-cache-free-gpu-memory-fraction">
 <h3>Max Tokens in Paged KV Cache and KV Cache Free GPU Memory Fraction<a class="headerlink" href="#max-tokens-in-paged-kv-cache-and-kv-cache-free-gpu-memory-fraction" title="Link to this heading"></a></h3>
@@ -433,33 +437,6 @@ high throughput. Note that the <code class="docutils literal notranslate"><span 
 cannot be set to <code class="docutils literal notranslate"><span class="pre">1.0</span></code> because some amount of memory has to be reserved for
 inputs and outputs.</p>
 </section>
-<section id="batch-scheduler-policy">
-<h3>Batch Scheduler Policy<a class="headerlink" href="#batch-scheduler-policy" title="Link to this heading"></a></h3>
-<p>There currently are two batch scheduler policies: <code class="docutils literal notranslate"><span class="pre">MAX_UTILIZATION</span></code> and
-<code class="docutils literal notranslate"><span class="pre">GUARANTEED_NO_EVICT</span></code>.</p>
-<p>As explained in the <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/advanced/batch-manager.html#gptmanager-design">GPT Manager Design</a>
-section, the scheduling policy can be set to <code class="docutils literal notranslate"><span class="pre">MAX_UTILIZATION</span></code> to pack as many
-requests as possible at each iteration of the forward loop, when in-flight
-sequence batching is enabled. It maximizes the utilization of the GPUs by
-aggressively scheduling requests at the risk of having to pause requests if the
-KV cache size limit is reached.</p>
-<p>For a more conservative approach with respect to the KV cache limitations in
-terms of memory allocation, <code class="docutils literal notranslate"><span class="pre">CapacitySchedulerPolicy</span></code> should be set to
-<code class="docutils literal notranslate"><span class="pre">GUARANTEED_NO_EVICT</span></code> to guarantee that a started request is never paused.</p>
-<p>If the goal is to maximizes the throughput, users should try <code class="docutils literal notranslate"><span class="pre">MAX_UTILIZATION</span></code>.
-However, they need to keep in mind that it may have a negative impact on
-latency if requests have to be paused.</p>
-</section>
-<section id="tensorrt-overlap">
-<h3>TensorRT Overlap<a class="headerlink" href="#tensorrt-overlap" title="Link to this heading"></a></h3>
-<p><em><strong>Note that this option is now deprecated and only available with the GptManager API.</strong></em></p>
-<p>This option allowed to partition available requests into 2
-micro-batches that could be run concurrently and thereby allowed TensorRT-LLM to hide
-some exposed CPU runtime. However, optimization work has been done to reduce this
-exposed CPU runtime and it has been found that the concurrent execution
-of micro-batches did not provide additional benefits in terms of throughput,
-and in most cases, was hurting latency.</p>
-</section>
 <section id="maximum-attention-window-size">
 <h3>Maximum Attention Window Size<a class="headerlink" href="#maximum-attention-window-size" title="Link to this heading"></a></h3>
 <p>The <code class="docutils literal notranslate"><span class="pre">max_attention_window_size</span></code> flag sets the maximum number of tokens that are
@@ -467,25 +444,15 @@ attended to in order to generate one token when using techniques like sliding wi
 attention. See this
 <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/advanced/gpt-attention.md#sliding-window-attention-cyclic-rolling-buffer-kv-cache">Document</a>
 for more details. It defaults to the maximum sequence length
-(<code class="docutils literal notranslate"><span class="pre">max_input_length</span> <span class="pre">+</span> <span class="pre">max_output_length</span></code> when building the engine), which means
+(<code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> when building the engine), which means
 that the feature is disabled by default.</p>
-<p>When set to a smaller value than <code class="docutils literal notranslate"><span class="pre">max_input_length</span> <span class="pre">+</span> <span class="pre">max_output_length</span></code> (during
+<p>When set to a smaller value than <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> (during
 engine build), only the KV cache of the last <code class="docutils literal notranslate"><span class="pre">max_attention_window_size</span></code> tokens
 will be stored. If the input sequence length at runtime exceeds the
 <code class="docutils literal notranslate"><span class="pre">max_attention_window_size</span></code> value, the accuracy may start dropping, but the
 runtime performance will be better (due to the reduction in terms of
 computations and GPU memory allocation). Users can modify that value to
 increase runtime performance at the expense of reduced accuracy.</p>
-</section>
-<section id="chunked-context">
-<h3>Chunked Context<a class="headerlink" href="#chunked-context" title="Link to this heading"></a></h3>
-<p>Turning on context chunking by specifying <code class="docutils literal notranslate"><span class="pre">enable_chunked_context</span></code> in
-<code class="docutils literal notranslate"><span class="pre">TrtGptModelOptionalParams</span></code> will increase the chance of batch processing between
-the context and the generation phase, thereby balancing the calculation amount
-of each iteration and increasing throughput. When this function is turned on,
-different performance can be obtained by adjusting <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code>. Usually
-its recommended value is <code class="docutils literal notranslate"><span class="pre">N</span> <span class="pre">*</span> <span class="pre">tokens_per_block</span></code>, and <code class="docutils literal notranslate"><span class="pre">N</span></code> is an integer that is
-recommended to start from <code class="docutils literal notranslate"><span class="pre">1</span></code> and increase until the best performance is achieved.</p>
 </section>
 </section>
 </section>
@@ -501,7 +468,7 @@ recommended to start from <code class="docutils literal notranslate"><span class
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fc13e594100>
+<jinja2.runtime.BlockReference object at 0x7f94590e79b0>
 
 <div class="footer">
     <p>

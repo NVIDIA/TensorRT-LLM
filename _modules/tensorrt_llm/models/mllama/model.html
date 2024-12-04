@@ -1,3 +1,5 @@
+
+
 <!DOCTYPE html>
 <html class="writer-html5" lang="en" data-content_root="../../../../">
 <head>
@@ -5,21 +7,17 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>tensorrt_llm.models.mllama.model &mdash; tensorrt_llm  documentation</title>
       <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css?v=80d5e7a1" />
-      <link rel="stylesheet" type="text/css" href="../../../../_static/css/theme.css?v=19f00094" />
+      <link rel="stylesheet" type="text/css" href="../../../../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../../../../_static/copybutton.css?v=76b2166b" />
 
   
-  <!--[if lt IE 9]>
-    <script src="../../../../_static/js/html5shiv.min.js"></script>
-  <![endif]-->
-  
-        <script src="../../../../_static/jquery.js?v=5d32c60e"></script>
-        <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-        <script src="../../../../_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="../../../../_static/doctools.js?v=888ff710"></script>
-        <script src="../../../../_static/sphinx_highlight.js?v=dc90522c"></script>
-        <script src="../../../../_static/clipboard.min.js?v=a7894cd8"></script>
-        <script src="../../../../_static/copybutton.js?v=f281be69"></script>
+      <script src="../../../../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../../../../_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="../../../../_static/doctools.js?v=888ff710"></script>
+      <script src="../../../../_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="../../../../_static/clipboard.min.js?v=a7894cd8"></script>
+      <script src="../../../../_static/copybutton.js?v=65e89d2a"></script>
     <script src="../../../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../../../genindex.html" />
     <link rel="search" title="Search" href="../../../../search.html" /> 
@@ -57,6 +55,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../installation/windows.html">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul>
@@ -86,6 +85,7 @@
 <p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../commands/trtllm-serve.html">trtllm-serve</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
@@ -104,14 +104,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../advanced/executor.html">Executor API</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../advanced/inference-request.html">Inference Request</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../advanced/inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../advanced/speculative-decoding.html#lookahead-decoding">Lookahead decoding</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul>
@@ -185,11 +183,11 @@
 <span class="kn">from</span> <span class="nn">tensorrt_llm._common</span> <span class="kn">import</span> <span class="n">default_net</span>
 <span class="kn">from</span> <span class="nn">tensorrt_llm._utils</span> <span class="kn">import</span> <span class="n">numpy_to_torch</span><span class="p">,</span> <span class="n">str_dtype_to_torch</span>
 <span class="kn">from</span> <span class="nn">tensorrt_llm.bindings</span> <span class="kn">import</span> <span class="n">KVCacheType</span>
-<span class="kn">from</span> <span class="nn">tensorrt_llm.functional</span> <span class="kn">import</span> <span class="p">(</span><span class="n">LayerNormPositionType</span><span class="p">,</span> <span class="n">LayerNormType</span><span class="p">,</span>
-                                     <span class="n">MLPType</span><span class="p">,</span> <span class="n">PositionEmbeddingType</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span>
-                                     <span class="n">assertion</span><span class="p">,</span> <span class="n">gather_last_token_logits</span><span class="p">,</span>
-                                     <span class="n">maximum</span><span class="p">,</span> <span class="n">minimum</span><span class="p">,</span> <span class="n">recv</span><span class="p">,</span> <span class="n">reduce</span><span class="p">,</span> <span class="n">send</span><span class="p">,</span>
-                                     <span class="n">shape</span><span class="p">,</span> <span class="n">tanh</span><span class="p">)</span>
+<span class="kn">from</span> <span class="nn">tensorrt_llm.functional</span> <span class="kn">import</span> <span class="p">(</span><span class="n">Conditional</span><span class="p">,</span> <span class="n">LayerNormPositionType</span><span class="p">,</span>
+                                     <span class="n">LayerNormType</span><span class="p">,</span> <span class="n">MLPType</span><span class="p">,</span>
+                                     <span class="n">PositionEmbeddingType</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">assertion</span><span class="p">,</span>
+                                     <span class="n">gather_last_token_logits</span><span class="p">,</span> <span class="n">maximum</span><span class="p">,</span> <span class="n">minimum</span><span class="p">,</span>
+                                     <span class="n">recv</span><span class="p">,</span> <span class="n">reduce</span><span class="p">,</span> <span class="n">send</span><span class="p">,</span> <span class="n">shape</span><span class="p">,</span> <span class="n">tanh</span><span class="p">)</span>
 <span class="kn">from</span> <span class="nn">tensorrt_llm.layers</span> <span class="kn">import</span> <span class="p">(</span><span class="n">MLP</span><span class="p">,</span> <span class="n">Attention</span><span class="p">,</span> <span class="n">AttentionMaskParams</span><span class="p">,</span>
                                  <span class="n">AttentionMaskType</span><span class="p">,</span> <span class="n">AttentionParams</span><span class="p">,</span>
                                  <span class="n">ColumnLinear</span><span class="p">,</span> <span class="n">Embedding</span><span class="p">,</span> <span class="n">FusedGatedMLP</span><span class="p">,</span>
@@ -200,8 +198,7 @@
                                        <span class="n">use_lora</span><span class="p">)</span>
 <span class="kn">from</span> <span class="nn">tensorrt_llm.mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
 <span class="kn">from</span> <span class="nn">tensorrt_llm.models.model_weights_loader</span> <span class="kn">import</span> <span class="n">ModelWeightsLoader</span>
-<span class="kn">from</span> <span class="nn">tensorrt_llm.models.modeling_utils</span> <span class="kn">import</span> <span class="p">(</span><span class="n">PretrainedConfig</span><span class="p">,</span>
-                                                <span class="n">PretrainedModel</span><span class="p">,</span> <span class="n">QuantConfig</span><span class="p">)</span>
+<span class="kn">from</span> <span class="nn">tensorrt_llm.models.modeling_utils</span> <span class="kn">import</span> <span class="n">PretrainedModel</span><span class="p">,</span> <span class="n">QuantConfig</span>
 <span class="kn">from</span> <span class="nn">tensorrt_llm.module</span> <span class="kn">import</span> <span class="n">Module</span><span class="p">,</span> <span class="n">ModuleList</span>
 <span class="kn">from</span> <span class="nn">tensorrt_llm.parameter</span> <span class="kn">import</span> <span class="n">Parameter</span>
 
@@ -328,7 +325,9 @@
                 <span class="n">lora_layer_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">cross_kv_cache_gen</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                 <span class="n">cross_kv_reuse</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-                <span class="n">full_text_row_masked_out_mask</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+                <span class="n">full_text_row_masked_out_mask</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                <span class="n">skip_cross_attn_blocks</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+
         <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="n">encoder_output</span><span class="p">:</span>
@@ -341,7 +340,17 @@
         <span class="c1"># cross attention</span>
         <span class="n">residual</span> <span class="o">=</span> <span class="n">hidden_states</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">residual_scaling</span>
 
-        <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_layernorm</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+        <span class="c1"># skip input_layernorm</span>
+        <span class="k">if</span> <span class="n">skip_cross_attn_blocks</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">input_ln_conditional</span> <span class="o">=</span> <span class="n">Conditional</span><span class="p">(</span><span class="n">skip_cross_attn_blocks</span><span class="p">)</span>
+            <span class="n">skip_result</span> <span class="o">=</span> <span class="n">input_ln_conditional</span><span class="o">.</span><span class="n">add_input</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+            <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">input_ln_conditional</span><span class="o">.</span><span class="n">add_input</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+            <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_layernorm</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+            <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">input_ln_conditional</span><span class="o">.</span><span class="n">add_output</span><span class="p">(</span>
+                <span class="n">skip_result</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_layernorm</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+
         <span class="k">if</span> <span class="n">ADD_DEBUG_TENSOR</span><span class="p">:</span>
             <span class="n">hidden_states</span><span class="o">.</span><span class="n">mark_output</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s1">&#39;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">local_layer_idx</span><span class="si">:</span><span class="s1">2d</span><span class="si">}</span><span class="s1">/2.1: normed_input&#39;</span><span class="p">,</span>
@@ -358,7 +367,9 @@
             <span class="n">attention_params</span><span class="o">=</span><span class="n">attention_params</span><span class="p">,</span>
             <span class="n">lora_layer_params</span><span class="o">=</span><span class="n">lora_layer_params</span><span class="p">,</span>
             <span class="n">cross_kv_cache_gen</span><span class="o">=</span><span class="n">cross_kv_cache_gen</span><span class="p">,</span>
-            <span class="n">cross_kv_reuse</span><span class="o">=</span><span class="n">cross_kv_reuse</span><span class="p">)</span>
+            <span class="n">cross_kv_reuse</span><span class="o">=</span><span class="n">cross_kv_reuse</span><span class="p">,</span>
+            <span class="n">skip_attn</span><span class="o">=</span><span class="n">skip_cross_attn_blocks</span><span class="p">,</span>
+        <span class="p">)</span>
 
         <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
             <span class="n">attention_output</span><span class="p">,</span> <span class="n">presents_cross</span> <span class="o">=</span> <span class="n">attention_output</span>
@@ -370,7 +381,20 @@
 
         <span class="n">attn_residual_scale</span> <span class="o">=</span> <span class="n">tanh</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">gate_attn</span><span class="o">.</span><span class="n">value</span><span class="o">.</span><span class="n">cast</span><span class="p">(</span><span class="n">trt</span><span class="o">.</span><span class="n">float32</span><span class="p">))</span><span class="o">.</span><span class="n">cast</span><span class="p">(</span>
             <span class="n">attention_output</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+
+        <span class="n">attention_input</span> <span class="o">=</span> <span class="n">hidden_states</span>
         <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">residual</span> <span class="o">+</span> <span class="n">attn_residual_scale</span> <span class="o">*</span> <span class="n">attention_output</span>
+
+        <span class="c1"># use to skip attention_output with residual</span>
+        <span class="c1"># Since conditional does not work for gpt_attention_plugin, we replace the</span>
+        <span class="c1"># attention_output by hidden_states (input of attention) now.</span>
+        <span class="k">if</span> <span class="n">skip_cross_attn_blocks</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">attn_conditional</span> <span class="o">=</span> <span class="n">Conditional</span><span class="p">(</span><span class="n">skip_cross_attn_blocks</span><span class="p">)</span>
+            <span class="n">skip_result</span> <span class="o">=</span> <span class="n">attn_conditional</span><span class="o">.</span><span class="n">add_input</span><span class="p">(</span><span class="n">attention_input</span><span class="p">)</span>
+            <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">attn_conditional</span><span class="o">.</span><span class="n">add_input</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+            <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">attn_conditional</span><span class="o">.</span><span class="n">add_output</span><span class="p">(</span><span class="n">skip_result</span><span class="p">,</span>
+                                                        <span class="n">hidden_states</span><span class="p">)</span>
+
         <span class="k">if</span> <span class="n">ADD_DEBUG_TENSOR</span><span class="p">:</span>
             <span class="n">hidden_states</span><span class="o">.</span><span class="n">mark_output</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s1">&#39;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">local_layer_idx</span><span class="si">:</span><span class="s1">2d</span><span class="si">}</span><span class="s1">/3.2: cross_attn_output_with_residual&#39;</span><span class="p">,</span>
@@ -381,6 +405,12 @@
             <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">minimum</span><span class="p">(</span><span class="mf">64000.0</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">)</span>
 
         <span class="c1"># MLP</span>
+        <span class="c1"># skip post_layernorm and mlp</span>
+        <span class="k">if</span> <span class="n">skip_cross_attn_blocks</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">mlp_conditional</span> <span class="o">=</span> <span class="n">Conditional</span><span class="p">(</span><span class="n">skip_cross_attn_blocks</span><span class="p">)</span>
+            <span class="n">skip_case</span> <span class="o">=</span> <span class="n">mlp_conditional</span><span class="o">.</span><span class="n">add_input</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+            <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">mlp_conditional</span><span class="o">.</span><span class="n">add_input</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+
         <span class="n">residual</span> <span class="o">=</span> <span class="n">hidden_states</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">residual_scaling</span>
 
         <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">post_layernorm</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
@@ -402,6 +432,9 @@
         <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">residual</span> <span class="o">+</span> <span class="n">ffn_residual_scale</span> <span class="o">*</span> <span class="n">hidden_states</span> <span class="o">*</span> <span class="nb">float</span><span class="p">(</span>
             <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">no_ffn</span><span class="p">)</span>
 
+        <span class="k">if</span> <span class="n">skip_cross_attn_blocks</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">mlp_conditional</span><span class="o">.</span><span class="n">add_output</span><span class="p">(</span><span class="n">skip_case</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">)</span>
+
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">fp16_clamping</span><span class="p">:</span>
             <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">maximum</span><span class="p">(</span><span class="o">-</span><span class="mf">64000.0</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">)</span>
             <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">minimum</span><span class="p">(</span><span class="mf">64000.0</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">)</span>
@@ -410,6 +443,7 @@
             <span class="n">hidden_states</span><span class="o">.</span><span class="n">mark_output</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s1">&#39;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">local_layer_idx</span><span class="si">:</span><span class="s1">2d</span><span class="si">}</span><span class="s1">/4.4: transformer_out&#39;</span><span class="p">,</span>
                 <span class="n">hidden_states</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+
         <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
             <span class="k">return</span> <span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="n">presents_cross</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">hidden_states</span>
@@ -507,17 +541,18 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">fp16_clamping</span> <span class="o">=</span> <span class="n">fp16_clamping</span>
 
     <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span>
-            <span class="bp">self</span><span class="p">,</span>
-            <span class="n">hidden_states</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
-            <span class="n">encoder_output</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>  <span class="c1"># not used</span>
-            <span class="n">attention_mask_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-            <span class="n">use_cache</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-            <span class="n">kv_cache_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-            <span class="n">attention_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-            <span class="n">lora_layer_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-            <span class="n">cross_kv_cache_gen</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-            <span class="n">cross_kv_reuse</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-            <span class="n">full_text_row_masked_out_mask</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>  <span class="c1"># not used</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">hidden_states</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">encoder_output</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>  <span class="c1"># not used</span>
+        <span class="n">attention_mask_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">use_cache</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">kv_cache_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">attention_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">lora_layer_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">cross_kv_cache_gen</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">cross_kv_reuse</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">full_text_row_masked_out_mask</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>  <span class="c1"># not used</span>
+        <span class="n">skip_cross_attn_blocks</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">)</span>
 
@@ -595,10 +630,9 @@
 <div class="viewcode-block" id="MLLaMAModel">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.MLLaMAModel">[docs]</a>
 <span class="k">class</span> <span class="nc">MLLaMAModel</span><span class="p">(</span><span class="n">PretrainedModel</span><span class="p">):</span>
+    <span class="n">config_class</span> <span class="o">=</span> <span class="n">MLLaMAConfig</span>
 
-    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">):</span>
-        <span class="n">config</span> <span class="o">=</span> <span class="n">MLLaMAConfig</span><span class="p">(</span><span class="o">**</span><span class="n">config</span><span class="o">.</span><span class="n">to_dict</span><span class="p">())</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">check_config</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">MLLaMAConfig</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
         <span class="n">Attention</span><span class="o">.</span><span class="n">create_attention_const_params</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">position_embedding_type</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">position_embedding_type</span>
@@ -659,8 +693,6 @@
                 <span class="n">tp_rank</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_rank</span><span class="p">)</span>
 
         <span class="n">layers_range</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">pp_layers</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">total_num_layers</span><span class="p">)</span>
-        <span class="n">nheads_tp</span> <span class="o">=</span> <span class="p">(</span><span class="n">num_kv_heads</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">-</span>
-                     <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span>
         <span class="n">_layers</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="k">for</span> <span class="n">layer_idx</span> <span class="ow">in</span> <span class="n">layers_range</span><span class="p">:</span>
             <span class="n">local_layer_idx</span> <span class="o">=</span> <span class="n">layer_idx</span> <span class="o">-</span> <span class="n">layers_range</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
@@ -694,13 +726,13 @@
                         <span class="o">**</span><span class="n">args</span><span class="p">,</span>
                         <span class="n">layer_idx_in_cache_pool</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span>
                         <span class="n">num_kv_heads_per_cross_attn_layer</span><span class="p">[:</span><span class="n">local_layer_idx</span><span class="p">]</span><span class="o">.</span>
-                        <span class="n">count</span><span class="p">(</span><span class="n">nheads_tp</span><span class="p">)))</span>
+                        <span class="n">count</span><span class="p">(</span><span class="n">num_kv_heads</span><span class="p">)))</span>
             <span class="k">else</span><span class="p">:</span>
                 <span class="n">_layers</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
                     <span class="n">TransformerBlock</span><span class="p">(</span><span class="o">**</span><span class="n">args</span><span class="p">,</span>
                                      <span class="n">layer_idx_in_cache_pool</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span>
                                      <span class="n">num_kv_heads_per_layer</span><span class="p">[:</span><span class="n">local_layer_idx</span><span class="p">]</span><span class="o">.</span>
-                                     <span class="n">count</span><span class="p">(</span><span class="n">nheads_tp</span><span class="p">)))</span>
+                                     <span class="n">count</span><span class="p">(</span><span class="n">num_kv_heads</span><span class="p">)))</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">decoder_layers</span> <span class="o">=</span> <span class="n">ModuleList</span><span class="p">(</span><span class="n">_layers</span><span class="p">)</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_last_pp_rank</span><span class="p">():</span>
@@ -738,30 +770,6 @@
                        <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">num_buckets</span><span class="p">),</span>
                 <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_dtype</span><span class="p">)</span>
 
-<div class="viewcode-block" id="MLLaMAModel.check_config">
-<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.MLLaMAModel.check_config">[docs]</a>
-    <span class="k">def</span> <span class="nf">check_config</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">):</span>
-        <span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;has_position_embedding&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
-        <span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;type_vocab_size&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
-        <span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;rescale_before_lm_head&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
-        <span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;layernorm_type&#39;</span><span class="p">,</span> <span class="n">LayerNormType</span><span class="o">.</span><span class="n">RmsNorm</span><span class="p">)</span>
-        <span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;layernorm_position&#39;</span><span class="p">,</span>
-                                <span class="n">LayerNormPositionType</span><span class="o">.</span><span class="n">pre_layernorm</span><span class="p">)</span>
-        <span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;has_attention_qkvo_bias&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
-        <span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;has_mlp_bias&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
-        <span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;has_model_final_layernorm&#39;</span><span class="p">,</span> <span class="kc">True</span><span class="p">)</span>
-        <span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;model_type&#39;</span><span class="p">,</span> <span class="s1">&#39;MLLaMAModel&#39;</span><span class="p">)</span>
-        <span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;skip_cross_kv&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
-        <span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;mlp_type&#39;</span><span class="p">,</span> <span class="n">MLPType</span><span class="o">.</span><span class="n">GatedMLP</span><span class="p">)</span>
-        <span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;has_embedding_scale&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
-        <span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;residual_scaling&#39;</span><span class="p">,</span> <span class="mf">1.0</span><span class="p">)</span>
-        <span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;has_lm_head_bias&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
-        <span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;num_buckets&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
-        <span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;max_distance&#39;</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
-        <span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;relative_attention&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
-        <span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;residual_scaling&#39;</span><span class="p">,</span> <span class="mf">1.0</span><span class="p">)</span></div>
-
-
 <div class="viewcode-block" id="MLLaMAModel.forward">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.MLLaMAModel.forward">[docs]</a>
     <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span>
@@ -780,6 +788,7 @@
         <span class="n">prompt_embedding_table</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">prompt_tasks</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">prompt_vocab_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">skip_cross_attn_blocks</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_first_pp_rank</span><span class="p">():</span>
             <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">decoder_input_ids</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">)</span>
@@ -851,6 +860,8 @@
                     <span class="n">host_cross_kv_cache_pool_mapping</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
                     <span class="n">host_cross_kv_cache_pool_mapping</span><span class="p">,</span>
                 <span class="p">),</span>
+                <span class="n">skip_cross_attn_blocks</span><span class="o">=</span><span class="n">skip_cross_attn_blocks</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span>
+                    <span class="n">decoder_layer</span><span class="p">,</span> <span class="n">CrossAttentionTransformerBlock</span><span class="p">)</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
                 <span class="n">attention_params</span><span class="o">=</span><span class="n">attention_params</span><span class="p">,</span>
                 <span class="n">lora_layer_params</span><span class="o">=</span><span class="n">lora_layer_params</span><span class="p">,</span>
                 <span class="n">cross_kv_cache_gen</span><span class="o">=</span><span class="n">cross_kv_cache_gen</span><span class="p">,</span>
@@ -1501,6 +1512,15 @@
                     <span class="p">]),</span>
                 <span class="p">)</span>
 
+        <span class="n">skip_cross_attn_blocks</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">skip_cross_attn_blocks</span><span class="p">:</span>
+            <span class="n">skip_cross_attn_blocks</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;skip_cross_attn_blocks&#39;</span><span class="p">,</span>
+                                            <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">bool</span><span class="p">,</span>
+                                            <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span>
+                                            <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
+                                                <span class="p">(</span><span class="s1">&#39;boolean&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">1</span><span class="p">]),</span>
+                                            <span class="p">]))</span>
+
         <span class="n">prompt_embedding_table</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="n">tasks</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="n">prompt_vocab_size</span> <span class="o">=</span> <span class="kc">None</span>
@@ -1560,6 +1580,7 @@
             <span class="s1">&#39;prompt_embedding_table&#39;</span><span class="p">:</span> <span class="n">prompt_embedding_table</span><span class="p">,</span>
             <span class="s1">&#39;prompt_tasks&#39;</span><span class="p">:</span> <span class="n">tasks</span><span class="p">,</span>
             <span class="s1">&#39;prompt_vocab_size&#39;</span><span class="p">:</span> <span class="n">prompt_vocab_size</span><span class="p">,</span>
+            <span class="s1">&#39;skip_cross_attn_blocks&#39;</span><span class="p">:</span> <span class="n">skip_cross_attn_blocks</span><span class="p">,</span>
         <span class="p">}</span>
 
         <span class="k">return</span> <span class="n">result</span></div>
@@ -1632,7 +1653,6 @@
                                                 <span class="n">quant_config</span><span class="o">=</span><span class="n">quant_config</span><span class="p">,</span>
                                                 <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
 
-        <span class="n">custom_dict</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="n">custom_dict</span> <span class="o">=</span> <span class="p">{</span>
             <span class="s2">&quot;lm_head&quot;</span><span class="p">:</span> <span class="s2">&quot;language_model.lm_head&quot;</span><span class="p">,</span>
             <span class="s2">&quot;ln_f&quot;</span><span class="p">:</span> <span class="s2">&quot;language_model.model.norm&quot;</span><span class="p">,</span>
@@ -1666,7 +1686,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fc13fa759f0>
+<jinja2.runtime.BlockReference object at 0x7f946f3a3a40>
 
 <div class="footer">
     <p>

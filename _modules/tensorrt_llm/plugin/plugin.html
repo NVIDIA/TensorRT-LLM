@@ -1,3 +1,5 @@
+
+
 <!DOCTYPE html>
 <html class="writer-html5" lang="en" data-content_root="../../../">
 <head>
@@ -5,21 +7,17 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>tensorrt_llm.plugin.plugin &mdash; tensorrt_llm  documentation</title>
       <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=80d5e7a1" />
-      <link rel="stylesheet" type="text/css" href="../../../_static/css/theme.css?v=19f00094" />
+      <link rel="stylesheet" type="text/css" href="../../../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
 
   
-  <!--[if lt IE 9]>
-    <script src="../../../_static/js/html5shiv.min.js"></script>
-  <![endif]-->
-  
-        <script src="../../../_static/jquery.js?v=5d32c60e"></script>
-        <script src="../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-        <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="../../../_static/doctools.js?v=888ff710"></script>
-        <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
-        <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
-        <script src="../../../_static/copybutton.js?v=f281be69"></script>
+      <script src="../../../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="../../../_static/doctools.js?v=888ff710"></script>
+      <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
+      <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
     <script src="../../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../../genindex.html" />
     <link rel="search" title="Search" href="../../../search.html" /> 
@@ -57,6 +55,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../installation/windows.html">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul>
@@ -86,6 +85,7 @@
 <p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-serve.html">trtllm-serve</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
@@ -104,14 +104,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/executor.html">Executor API</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/inference-request.html">Inference Request</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../advanced/speculative-decoding.html#lookahead-decoding">Lookahead decoding</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul>
@@ -188,6 +186,7 @@
 <span class="kn">import</span> <span class="nn">tensorrt</span> <span class="k">as</span> <span class="nn">trt</span>
 
 <span class="kn">from</span> <span class="nn">.._ipc_utils</span> <span class="kn">import</span> <span class="n">IpcMemory</span><span class="p">,</span> <span class="n">can_access_peer</span>
+<span class="kn">from</span> <span class="nn">..bindings.internal.runtime</span> <span class="kn">import</span> <span class="n">lamport_initialize_all</span>
 <span class="kn">from</span> <span class="nn">..logger</span> <span class="kn">import</span> <span class="n">logger</span>
 <span class="kn">from</span> <span class="nn">..mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
 
@@ -245,6 +244,7 @@
     <span class="s2">&quot;gemm_plugin&quot;</span><span class="p">:</span>
     <span class="p">[</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span> <span class="s2">&quot;float16&quot;</span><span class="p">,</span> <span class="s2">&quot;float32&quot;</span><span class="p">,</span> <span class="s2">&quot;bfloat16&quot;</span><span class="p">,</span> <span class="s2">&quot;int32&quot;</span><span class="p">,</span> <span class="s2">&quot;fp8&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">],</span>
     <span class="s2">&quot;low_latency_gemm_plugin&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;fp8&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">],</span>
+    <span class="s2">&quot;low_latency_gemm_swiglu_plugin&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;fp8&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">],</span>
 <span class="p">}</span>
 
 
@@ -301,7 +301,7 @@
 
 <span class="sd">    There are two option categories:</span>
 <span class="sd">    * Plugin options (typically with xxx_plugin naming). These options can be assigned with:</span>
-<span class="sd">        * &quot;float16&quot;/&quot;bfloat16&quot;/&quot;float32&quot;/&quot;int32&quot;, which means the plugin is enabled with the specified precision; (Some plugins only support limited dtype, i.e., gemm_swiglu_plugin only supports fp8 now)</span>
+<span class="sd">        * &quot;float16&quot;/&quot;bfloat16&quot;/&quot;float32&quot;/&quot;int32&quot;, which means the plugin is enabled with the specified precision; (Some plugins only support limited dtype, i.e., gemm_swiglu_plugin and low_latency_gemm_swiglu_plugin only supports fp8 now)</span>
 <span class="sd">        * &quot;auto&quot;, which means the plugin is enabled with the precision of `dtype` field (the `dtype` field must be same to model dtype, i.e., the one in PretrainedConfig);</span>
 <span class="sd">        * None, which means the plugin is disabled.</span>
 <span class="sd">    * Other features. These options can be assigned with boolean:</span>
@@ -320,6 +320,7 @@
     <span class="n">_gemm_swiglu_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
     <span class="n">_fp8_rowwise_gemm_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
     <span class="n">_smooth_quant_gemm_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+    <span class="n">_qserve_gemm_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
     <span class="n">_identity_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
     <span class="n">_layernorm_quantization_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                                                           <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
@@ -339,6 +340,8 @@
     <span class="n">_moe_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
     <span class="n">_mamba_conv1d_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
     <span class="n">_low_latency_gemm_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+    <span class="n">_low_latency_gemm_swiglu_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                                                           <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
     <span class="c1"># Features</span>
     <span class="n">_context_fmha</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
     <span class="n">_bert_context_fmha_fp32_acc</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
@@ -439,6 +442,12 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">quantize_tensor_plugin</span> <span class="o">=</span> <span class="kc">True</span>
         <span class="k">return</span> <span class="bp">self</span>
 
+    <span class="k">def</span> <span class="nf">set_qserve_plugins</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;auto&quot;</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">qserve_gemm_plugin</span> <span class="o">=</span> <span class="n">dtype</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">rmsnorm_quantization_plugin</span> <span class="o">=</span> <span class="n">dtype</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">quantize_per_token_plugin</span> <span class="o">=</span> <span class="kc">True</span>
+        <span class="k">return</span> <span class="bp">self</span>
+
     <span class="k">def</span> <span class="nf">set_fp8_rowwise_quant_plugins</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;auto&quot;</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">fp8_rowwise_gemm_plugin</span> <span class="o">=</span> <span class="n">dtype</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">rmsnorm_quantization_plugin</span> <span class="o">=</span> <span class="n">dtype</span>
@@ -476,6 +485,7 @@
     <span class="s2">&quot;mamba_conv1d_plugin&quot;</span><span class="p">,</span>
     <span class="s2">&quot;nccl_plugin&quot;</span><span class="p">,</span>
     <span class="s2">&quot;low_latency_gemm_plugin&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;low_latency_gemm_swiglu_plugin&quot;</span><span class="p">,</span>
 
     <span class="c1"># Features</span>
     <span class="s2">&quot;context_fmha&quot;</span><span class="p">,</span>
@@ -543,6 +553,7 @@
 <span class="sd">              Then, each instance of allreduce will reference that tensor automatically.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
     <span class="n">POINTERS_PER_RANK</span> <span class="o">=</span> <span class="mi">7</span>
+    <span class="n">POINTERS_OF_COUNTER</span> <span class="o">=</span> <span class="mi">2</span>
 
     <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">workspace</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
@@ -551,7 +562,7 @@
                              <span class="n">mapping</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">,</span>
                              <span class="n">num_profiles</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
         <span class="kn">from</span> <span class="nn">..functional</span> <span class="kn">import</span> <span class="n">Tensor</span>
-        <span class="n">workspace_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">POINTERS_PER_RANK</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">+</span> <span class="mi">2</span>
+        <span class="n">workspace_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">POINTERS_PER_RANK</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">POINTERS_OF_COUNTER</span>
 
         <span class="n">dim_range</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="k">if</span> <span class="n">num_profiles</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
@@ -592,6 +603,15 @@
                                       <span class="n">is_p2p_supported</span><span class="p">)</span>
         <span class="n">lamport_buffers_2</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">size</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
                                       <span class="n">is_p2p_supported</span><span class="p">)</span>
+        <span class="n">rank</span> <span class="o">=</span> <span class="n">mapping</span><span class="o">.</span><span class="n">rank</span>
+        <span class="n">tp_rank</span> <span class="o">=</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_rank</span>
+        <span class="k">if</span> <span class="n">rank</span> <span class="o">==</span> <span class="n">tp_rank</span> <span class="ow">and</span> <span class="n">is_p2p_supported</span><span class="p">:</span>
+            <span class="n">lamport_initialize_all</span><span class="p">(</span>
+                <span class="n">lamport_buffers_0</span><span class="o">.</span><span class="n">local_ptr</span><span class="p">,</span>
+                <span class="n">lamport_buffers_1</span><span class="o">.</span><span class="n">local_ptr</span><span class="p">,</span>
+                <span class="n">lamport_buffers_2</span><span class="o">.</span><span class="n">local_ptr</span><span class="p">,</span>
+                <span class="n">size</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
+            <span class="p">)</span>
         <span class="n">buffers</span> <span class="o">=</span> <span class="p">[</span>
             <span class="n">ipc_buffers_ping</span><span class="p">,</span> <span class="n">ipc_buffers_pong</span><span class="p">,</span> <span class="n">ipc_barriers_in</span><span class="p">,</span>
             <span class="n">ipc_barriers_out</span><span class="p">,</span> <span class="n">lamport_buffers_0</span><span class="p">,</span> <span class="n">lamport_buffers_1</span><span class="p">,</span>
@@ -628,7 +648,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fc13d788310>
+<jinja2.runtime.BlockReference object at 0x7f9468e14920>
 
 <div class="footer">
     <p>

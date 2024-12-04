@@ -1,3 +1,5 @@
+
+
 <!DOCTYPE html>
 <html class="writer-html5" lang="en" data-content_root="../">
 <head>
@@ -6,21 +8,17 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Installing on Linux &mdash; tensorrt_llm  documentation</title>
       <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=80d5e7a1" />
-      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=19f00094" />
+      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
 
   
-  <!--[if lt IE 9]>
-    <script src="../_static/js/html5shiv.min.js"></script>
-  <![endif]-->
-  
-        <script src="../_static/jquery.js?v=5d32c60e"></script>
-        <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-        <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="../_static/doctools.js?v=888ff710"></script>
-        <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
-        <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
-        <script src="../_static/copybutton.js?v=f281be69"></script>
+      <script src="../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="../_static/doctools.js?v=888ff710"></script>
+      <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+      <script src="../_static/copybutton.js?v=65e89d2a"></script>
     <script src="../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
@@ -60,6 +58,7 @@
 <li class="toctree-l1"><a class="reference internal" href="build-from-source-linux.html">Building from Source Code on Linux</a></li>
 <li class="toctree-l1"><a class="reference internal" href="windows.html">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="build-from-source-windows.html">Building from Source Code on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="grace-hopper.html">Installing on Grace Hopper</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul>
@@ -89,6 +88,7 @@
 <p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-serve.html">trtllm-serve</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
@@ -107,14 +107,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/executor.html">Executor API</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html">Inference Request</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html#lookahead-decoding">Lookahead decoding</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul>
@@ -166,41 +164,35 @@
   <section id="installing-on-linux">
 <span id="linux"></span><h1>Installing on Linux<a class="headerlink" href="#installing-on-linux" title="Link to this heading"></a></h1>
 <ol class="arabic">
-<li><p>Retrieve and launch the docker container (optional).</p>
-<p>You can pre-install the environment using the <a class="reference external" href="https://docs.nvidia.com/datacenter/cloud-native/container-toolkit">NVIDIA Container Toolkit</a> to avoid manual environment configuration.</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Obtain and start the basic docker image environment (optional).</span>
-docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>--ipc<span class="o">=</span>host<span class="w"> </span>--runtime<span class="o">=</span>nvidia<span class="w"> </span>--gpus<span class="w"> </span>all<span class="w"> </span>--entrypoint<span class="w"> </span>/bin/bash<span class="w"> </span>-it<span class="w"> </span>nvidia/cuda:12.5.1-devel-ubuntu22.04
+<li><p>Install TensorRT-LLM (tested on Ubuntu 22.04).</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sudo<span class="w"> </span>apt-get<span class="w"> </span>-y<span class="w"> </span>install<span class="w"> </span>libopenmpi-dev<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>pip3<span class="w"> </span>install<span class="w"> </span>tensorrt_llm
 </pre></div>
 </div>
-<p>Note: please make sure to set <code class="docutils literal notranslate"><span class="pre">--ipc=host</span></code> as a docker run argument to avoid <code class="docutils literal notranslate"><span class="pre">Bus</span> <span class="pre">error</span> <span class="pre">(core</span> <span class="pre">dumped)</span></code>.</p>
 </li>
-<li><p>Install TensorRT-LLM.</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Install dependencies, TensorRT-LLM requires Python 3.10</span>
-apt-get<span class="w"> </span>update<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>apt-get<span class="w"> </span>-y<span class="w"> </span>install<span class="w"> </span>python3.10<span class="w"> </span>python3-pip<span class="w"> </span>openmpi-bin<span class="w"> </span>libopenmpi-dev<span class="w"> </span>git<span class="w"> </span>git-lfs
+<li><p>Sanity check the installation by running the following in Python (tested on Python 3.10):</p>
+<div class="highlight-python3 notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span> <span class="nn">tensorrt_llm</span> <span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
 
-<span class="c1"># Install the latest preview version (corresponding to the main branch) of TensorRT-LLM.</span>
-<span class="c1"># If you want to install the stable version (corresponding to the release branch), please</span>
-<span class="c1"># remove the `--pre` option.</span>
-pip3<span class="w"> </span>install<span class="w"> </span>tensorrt_llm<span class="w"> </span>-U<span class="w"> </span>--pre<span class="w"> </span>--extra-index-url<span class="w"> </span>https://pypi.nvidia.com
+<span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span>
+    <span class="s2">&quot;Hello, my name is&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;The president of the United States is&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;The capital of France is&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;The future of AI is&quot;</span><span class="p">,</span>
+<span class="p">]</span>
+<span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">temperature</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span> <span class="n">top_p</span><span class="o">=</span><span class="mf">0.95</span><span class="p">)</span>
 
-<span class="c1"># Check installation</span>
-python3<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;import tensorrt_llm&quot;</span>
-</pre></div>
-</div>
-<p>Please note that TensorRT-LLM depends on TensorRT. In earlier versions that include TensorRT 8,
-overwriting an upgraded to a new version may require explicitly running <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">uninstall</span> <span class="pre">tensorrt</span></code>
-to uninstall the old version.</p>
-</li>
-<li><p>Install the requirements for running the example.</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>git<span class="w"> </span>clone<span class="w"> </span>https://github.com/NVIDIA/TensorRT-LLM.git
-<span class="nb">cd</span><span class="w"> </span>TensorRT-LLM
-pip<span class="w"> </span>install<span class="w"> </span>-r<span class="w"> </span>examples/bloom/requirements.txt
-git<span class="w"> </span>lfs<span class="w"> </span>install
+<span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">)</span>
+
+<span class="n">outputs</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
+
+<span class="c1"># Print the outputs.</span>
+<span class="k">for</span> <span class="n">output</span> <span class="ow">in</span> <span class="n">outputs</span><span class="p">:</span>
+    <span class="n">prompt</span> <span class="o">=</span> <span class="n">output</span><span class="o">.</span><span class="n">prompt</span>
+    <span class="n">generated_text</span> <span class="o">=</span> <span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">, Generated text: </span><span class="si">{</span><span class="n">generated_text</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span>
 </pre></div>
 </div>
 </li>
 </ol>
-<p>Beyond the local execution, you can also use the NVIDIA Triton Inference Server to create a production-ready deployment of your LLM as described in this <a class="reference external" href="https://developer.nvidia.com/blog/optimizing-inference-on-llms-with-tensorrt-llm-now-publicly-available/">Optimizing Inference on Large Language Models with NVIDIA TensorRT-LLM</a> blog.</p>
 </section>
 
 
@@ -214,7 +206,7 @@ git<span class="w"> </span>lfs<span class="w"> </span>install
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fc13e2263b0>
+<jinja2.runtime.BlockReference object at 0x7f945978c8f0>
 
 <div class="footer">
     <p>

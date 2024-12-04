@@ -9,7 +9,8 @@ Examples
    llm_inference_async
    llm_inference_async_streaming
    llm_inference_customize
+   llm_quantization
    llm_inference_distributed
    llm_logits_processor
-   llm_quantization
+   llm_multilora
    llm_auto_parallel

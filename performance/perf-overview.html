@@ -1,3 +1,5 @@
+
+
 <!DOCTYPE html>
 <html class="writer-html5" lang="en" data-content_root="../">
 <head>
@@ -6,21 +8,17 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Overview &mdash; tensorrt_llm  documentation</title>
       <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=80d5e7a1" />
-      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=19f00094" />
+      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
 
   
-  <!--[if lt IE 9]>
-    <script src="../_static/js/html5shiv.min.js"></script>
-  <![endif]-->
-  
-        <script src="../_static/jquery.js?v=5d32c60e"></script>
-        <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-        <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="../_static/doctools.js?v=888ff710"></script>
-        <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
-        <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
-        <script src="../_static/copybutton.js?v=f281be69"></script>
+      <script src="../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="../_static/doctools.js?v=888ff710"></script>
+      <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+      <script src="../_static/copybutton.js?v=65e89d2a"></script>
     <script src="../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
@@ -60,6 +58,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/windows.html">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul>
@@ -89,6 +88,7 @@
 <p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-serve.html">trtllm-serve</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
@@ -107,31 +107,38 @@
 <li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/executor.html">Executor API</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html">Inference Request</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html#lookahead-decoding">Lookahead decoding</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul class="current">
 <li class="toctree-l1 current"><a class="current reference internal" href="#">Overview</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="#known-issues">Known Issues</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="#fused-matmul-gated-silu-llama">Fused Matmul + Gated-SiLU (LLaMA)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#trtllm-bench-has-known-issues-on-gh200">Trtllm-bench has known issues on GH200</a></li>
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="#throughput-measurements">Throughput Measurements</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#reproducing-benchmarked-results">Reproducing Benchmarked Results</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="#commands">Commands</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#commands">Commands</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#for-non-gh200-systems">For non GH200 systems</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#for-gh200-systems-only">For GH200 systems only</a></li>
+</ul>
+</li>
 <li class="toctree-l3"><a class="reference internal" href="#variables">Variables</a></li>
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="#preparing-a-dataset">Preparing a Dataset</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#engine-building">Engine Building</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#running-the-benchmark">Running the Benchmark</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#running-the-benchmark">Running the Benchmark</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#id1">For non GH200 systems</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#id2">For GH200 systems only</a></li>
+</ul>
+</li>
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="perf-benchmarking.html">Benchmarking</a></li>
@@ -187,7 +194,7 @@ releases.</p>
 <section id="overview">
 <h1>Overview<a class="headerlink" href="#overview" title="Link to this heading"></a></h1>
 <p>This document summarizes performance measurements of TensorRT-LLM on H100
-(Hopper), L40S (Ada) and A100 (Ampere) GPUs for a few key models.</p>
+(Hopper), GH200 (Grace + Hopper), L40S (Ada) and A100 (Ampere) GPUs for a few key models.</p>
 <p>The data in the following tables is provided as a reference point to help users
 validate observed performance. It should not be considered as the peak
 performance that can be delivered by TensorRT-LLM.</p>
@@ -202,13 +209,18 @@ efficient implementation that runs single Matmul + SwiGLU fused kernel for FP8 o
 (when <code class="docutils literal notranslate"><span class="pre">--use_fused_mlp=enable</span> <span class="pre">--gemm_swiglu_plugin</span> <span class="pre">fp8</span></code> is enabled). The gemm_swiglu_plugin
 will support more data types and GPU architectures in the future release.</p>
 </section>
+<section id="trtllm-bench-has-known-issues-on-gh200">
+<h3>Trtllm-bench has known issues on GH200<a class="headerlink" href="#trtllm-bench-has-known-issues-on-gh200" title="Link to this heading"></a></h3>
+<p>For release v0.15, on GH200 systems, we recommend using the legacy flow based on <em>gptManagerBenchmark</em> to measure performance.</p>
+</section>
 </section>
 <section id="throughput-measurements">
 <h2>Throughput Measurements<a class="headerlink" href="#throughput-measurements" title="Link to this heading"></a></h2>
 <p>The below table shows performance data where a local inference client is fed requests at an infinite rate (no delay between messages),
 and shows the throughput client-server scenario under maximum load.</p>
 <p>The performance numbers below were collected using the steps described in this document.</p>
-<p><strong>All data in the table below was generated using version 0.14.0 and presents token throughput in tokens/second.</strong></p>
+<p>Note that for GH200 tests, TRT-LLM engines were built using <em>trtllm-bench build</em> but benchmarked with <em>gptManagerBenchmark</em>.</p>
+<p><strong>All data in the table below was generated using version 0.15.0 and presents token throughput in tokens/second.</strong></p>
 <table class="docutils align-default">
 <thead>
 <tr class="row-odd"><th class="head"><p></p></th>
@@ -224,28 +236,28 @@ and shows the throughput client-server scenario under maximum load.</p>
 </thead>
 <tbody>
 <tr class="row-even"><td><p></p></td>
+<td><p>GPU</p></td>
 <td><p></p></td>
-<td><p><strong>GPU</strong></p></td>
-<td><p><strong>H200 141GB HBM3</strong></p></td>
-<td><p><strong>H100 80GB HBM3</strong></p></td>
-<td><p><strong>H100 80GB HBM3</strong></p></td>
-<td><p><strong>A100-SXM4-80GB</strong></p></td>
-<td><p><strong>A100-PCIE-80GB</strong></p></td>
-<td><p><strong>L40S</strong></p></td>
+<td><p>H100 80GB HBM3</p></td>
+<td><p></p></td>
+<td><p>A100-SXM4-80GB</p></td>
+<td><p>A100-PCIE-80GB</p></td>
+<td><p>L40S</p></td>
+<td><p>GH200 96GB HBM3 CG1</p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
+<td><p>Precision</p></td>
 <td><p></p></td>
-<td><p><strong>Precision</strong></p></td>
-<td><p><strong>FP8</strong></p></td>
-<td><p><strong>FP8</strong></p></td>
-<td><p><strong>FP16</strong></p></td>
-<td><p><strong>FP16</strong></p></td>
-<td><p><strong>FP16</strong></p></td>
-<td><p><strong>FP8</strong></p></td>
+<td><p>FP8</p></td>
+<td><p>Mixed</p></td>
+<td><p>Mixed</p></td>
+<td><p>Mixed</p></td>
+<td><p>FP8</p></td>
+<td><p>FP8</p></td>
 </tr>
-<tr class="row-even"><td><p><strong>Model</strong></p></td>
-<td><p><strong>Input/Output Lengths</strong></p></td>
-<td><p><strong>TP Size</strong></p></td>
+<tr class="row-even"><td><p>Model</p></td>
+<td><p>TP Size</p></td>
+<td><p>Runtime Input/Output Lengths</p></td>
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
@@ -254,1314 +266,1314 @@ and shows the throughput client-server scenario under maximum load.</p>
 <td><p></p></td>
 </tr>
 <tr class="row-odd"><td><p>LLaMA v3 70B</p></td>
-<td><p>1000/1000</p></td>
 <td><p>1</p></td>
-<td><p>2594.2199</p></td>
-<td><p>464.5243</p></td>
+<td><p>128, 128</p></td>
+<td><p>3197.73</p></td>
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
+<td><p>4023.31</p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
+<td><p>128, 2048</p></td>
+<td><p>826.72</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>1855.98</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>128, 4096</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>915.15</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>500, 2000</p></td>
+<td><p>658.87</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>1483.67</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>1000, 1000</p></td>
+<td><p>772.64</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>1587.16</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>2048, 128</p></td>
+<td><p>331.26</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>425.89</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>2048, 2048</p></td>
+<td><p>383.46</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>823.43</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>5000, 500</p></td>
+<td><p>217.12</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>391.38</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
 <td><p>2</p></td>
-<td><p>4574.1197</p></td>
-<td><p>4092.3267</p></td>
-<td><p>776.9965</p></td>
-<td><p>468.5805</p></td>
-<td><p>259.1155</p></td>
+<td><p>128, 128</p></td>
+<td><p>6529.47</p></td>
+<td><p>3137.86</p></td>
+<td><p>1316.68</p></td>
+<td><p>792.95</p></td>
 <td><p></p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
 <td><p></p></td>
-<td><p>4</p></td>
-<td><p>7612.2487</p></td>
-<td><p>6925.0844</p></td>
-<td><p>3730.2064</p></td>
-<td><p>1765.9123</p></td>
-<td><p>987.1971</p></td>
-<td><p>1159.357</p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
-<td><p>8</p></td>
-<td><p>13075.5194</p></td>
-<td><p>10733.0804</p></td>
-<td><p>5963.0914</p></td>
-<td><p>3054.8915</p></td>
-<td><p>960.3737</p></td>
-<td><p>1173.3517</p></td>
+<td><p>128, 2048</p></td>
+<td><p>6008.16</p></td>
+<td><p>783.76</p></td>
+<td><p>532.07</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
-<td><p>128/128</p></td>
+<td><p></p></td>
+<td><p>128, 4096</p></td>
+<td><p>3561.24</p></td>
+<td><p>404.23</p></td>
+<td><p>285.37</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>500, 2000</p></td>
+<td><p>4792.7</p></td>
+<td><p>658.7</p></td>
+<td><p>436.46</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>1000, 1000</p></td>
+<td><p>4221.4</p></td>
+<td><p>759.56</p></td>
+<td><p>484.59</p></td>
+<td><p>268.09</p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>2048, 128</p></td>
+<td><p>773.11</p></td>
+<td><p>318.58</p></td>
+<td><p>147.22</p></td>
+<td><p>96.65</p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>2048, 2048</p></td>
+<td><p>2648.62</p></td>
+<td><p>373.71</p></td>
+<td><p>255.21</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>5000, 500</p></td>
+<td><p>905.34</p></td>
+<td><p>224.99</p></td>
+<td><p>123.5</p></td>
+<td><p>75.54</p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p>4</p></td>
+<td><p>128, 128</p></td>
+<td><p>10848.71</p></td>
+<td><p>6387.29</p></td>
+<td><p>2713.51</p></td>
+<td><p>1347.36</p></td>
+<td><p>1474</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>128, 2048</p></td>
+<td><p>10973.67</p></td>
+<td><p>5767.81</p></td>
+<td><p>2684.63</p></td>
+<td><p>1414.31</p></td>
+<td><p>1912.29</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>128, 4096</p></td>
+<td><p>7426.74</p></td>
+<td><p>3421.36</p></td>
+<td><p>1914.57</p></td>
+<td><p>1140.75</p></td>
+<td><p>1357.84</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>500, 2000</p></td>
+<td><p>9575.94</p></td>
+<td><p>4311.78</p></td>
+<td><p>2181.56</p></td>
+<td><p>1276.59</p></td>
+<td><p>1602.99</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>1000, 1000</p></td>
+<td><p>7234.67</p></td>
+<td><p>4027.52</p></td>
+<td><p>1876.99</p></td>
+<td><p>927.93</p></td>
+<td><p>1193.23</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>2048, 128</p></td>
+<td><p>1318.11</p></td>
+<td><p>781.29</p></td>
+<td><p>319.91</p></td>
+<td><p>161.66</p></td>
+<td><p>174.02</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>2048, 2048</p></td>
+<td><p>5185.7</p></td>
+<td><p>2584.66</p></td>
+<td><p>1339.76</p></td>
+<td><p>872.31</p></td>
+<td><p>910.92</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>5000, 500</p></td>
+<td><p>1568.88</p></td>
+<td><p>855.16</p></td>
+<td><p>388.86</p></td>
+<td><p>216.5</p></td>
+<td><p>242.62</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p>8</p></td>
+<td><p>128, 128</p></td>
+<td><p>15440.55</p></td>
+<td><p>10966.81</p></td>
+<td><p>4647.93</p></td>
+<td><p>962.8</p></td>
+<td><p>1381.32</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>128, 2048</p></td>
+<td><p>16416.2</p></td>
+<td><p>10270.37</p></td>
+<td><p>5046.42</p></td>
+<td><p>1487.53</p></td>
+<td><p>2120.54</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>128, 4096</p></td>
+<td><p>12247.71</p></td>
+<td><p>6932.27</p></td>
+<td><p>3672.17</p></td>
+<td><p>1391.51</p></td>
+<td><p>1855.21</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>500, 2000</p></td>
+<td><p>14561.62</p></td>
+<td><p>8967.15</p></td>
+<td><p>4379.68</p></td>
+<td><p>1205.63</p></td>
+<td><p>1879.86</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>1000, 1000</p></td>
+<td><p>11226.01</p></td>
+<td><p>6973.77</p></td>
+<td><p>3236.83</p></td>
+<td><p>883.65</p></td>
+<td><p>1244.32</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>2048, 128</p></td>
+<td><p>2057.59</p></td>
+<td><p>1341.65</p></td>
+<td><p>558.45</p></td>
+<td><p>141.12</p></td>
+<td><p>164.34</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>2048, 2048</p></td>
+<td><p>7813.57</p></td>
+<td><p>4518.75</p></td>
+<td><p>2395.15</p></td>
+<td><p>769.53</p></td>
+<td><p>1091.57</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>5000, 500</p></td>
+<td><p>2564.74</p></td>
+<td><p>1612.14</p></td>
+<td><p>706.33</p></td>
+<td><p>217.62</p></td>
+<td><p>243.14</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p>LLaMA v3.1 8B</p></td>
 <td><p>1</p></td>
-<td><p>3904.1639</p></td>
-<td><p>2551.6384</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
+<td><p>128, 128</p></td>
+<td><p>27792.16</p></td>
+<td><p>16116.63</p></td>
+<td><p>6552.62</p></td>
+<td><p>5158.57</p></td>
+<td><p>8982.97</p></td>
+<td><p>30803.29</p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
-<td><p>2</p></td>
-<td><p>5343.8677</p></td>
-<td><p>5191.7428</p></td>
-<td><p>3183.9714</p></td>
-<td><p>1334.903</p></td>
-<td><p>806.1477</p></td>
-<td><p></p></td>
+<td><p>128, 2048</p></td>
+<td><p>19965.18</p></td>
+<td><p>9894.49</p></td>
+<td><p>5220.03</p></td>
+<td><p>4640.02</p></td>
+<td><p>5297.21</p></td>
+<td><p>20770.93</p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p></p></td>
-<td><p>4</p></td>
-<td><p>8829.1049</p></td>
-<td><p>8540.5362</p></td>
-<td><p>5837.9598</p></td>
-<td><p>2421.4383</p></td>
-<td><p>1275.5474</p></td>
-<td><p>1427.9115</p></td>
+<td><p>128, 4096</p></td>
+<td><p>13222.06</p></td>
+<td><p>5758.98</p></td>
+<td><p>3326.45</p></td>
+<td><p>2906.77</p></td>
+<td><p>2989.17</p></td>
+<td><p>12487.35</p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
-<td><p>8</p></td>
-<td><p>16359.1322</p></td>
-<td><p>15498.2004</p></td>
-<td><p>10597.6556</p></td>
-<td><p>4474.1621</p></td>
-<td><p>1223.1747</p></td>
-<td><p>1377.473</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p>128/2048</p></td>
-<td><p>1</p></td>
-<td><p>3613.7474</p></td>
-<td><p>418.3639</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p></p></td>
-<td><p>2</p></td>
-<td><p>7112.2959</p></td>
-<td><p>5852.0185</p></td>
-<td><p>817.52</p></td>
-<td><p>511.6257</p></td>
-<td><p></p></td>
-<td><p></p></td>
+<td><p>500, 2000</p></td>
+<td><p>15782.2</p></td>
+<td><p>7953.1</p></td>
+<td><p>4191.62</p></td>
+<td><p>3736.1</p></td>
+<td><p>4263.97</p></td>
+<td><p>19175.02</p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p></p></td>
-<td><p>4</p></td>
-<td><p>12772.8148</p></td>
-<td><p>8998.3742</p></td>
-<td><p>5072.0345</p></td>
-<td><p>2484.2018</p></td>
-<td><p>1471.9105</p></td>
-<td><p>1771.4437</p></td>
+<td><p>1000, 1000</p></td>
+<td><p>14797.28</p></td>
+<td><p>7721.07</p></td>
+<td><p>3753.46</p></td>
+<td><p>3328.02</p></td>
+<td><p>4013.95</p></td>
+<td><p>15955.43</p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
-<td><p>8</p></td>
-<td><p>19722.5974</p></td>
-<td><p>15099.0633</p></td>
-<td><p>7554.2141</p></td>
-<td><p>4463.6602</p></td>
-<td><p>1589.1759</p></td>
-<td><p>1953.7918</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p>128/4096</p></td>
-<td><p>1</p></td>
-<td><p>2409.6881</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p></p></td>
-<td><p>2</p></td>
-<td><p>5687.3482</p></td>
-<td><p>3513.0941</p></td>
-<td><p>413.3767</p></td>
-<td><p>273.5871</p></td>
-<td><p></p></td>
-<td><p></p></td>
+<td><p>2048, 128</p></td>
+<td><p>3496.41</p></td>
+<td><p>1972.07</p></td>
+<td><p>789.56</p></td>
+<td><p>630.86</p></td>
+<td><p>1055.55</p></td>
+<td><p>4011.99</p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p></p></td>
-<td><p>4</p></td>
-<td><p>8937.3115</p></td>
-<td><p>6718.5895</p></td>
-<td><p>3093.7358</p></td>
-<td><p>1688.0132</p></td>
-<td><p>1231.8104</p></td>
-<td><p>1279.2496</p></td>
+<td><p>2048, 2048</p></td>
+<td><p>8980.42</p></td>
+<td><p>4370.61</p></td>
+<td><p>2366.86</p></td>
+<td><p>2125.4</p></td>
+<td><p>2162.8</p></td>
+<td><p>9072.93</p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
-<td><p>8</p></td>
-<td><p>13976.1386</p></td>
-<td><p>9279.1013</p></td>
-<td><p>5001.2743</p></td>
-<td><p>2948.5374</p></td>
-<td><p>1350.794</p></td>
-<td><p>1494.0776</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p>2048/128</p></td>
-<td><p>1</p></td>
-<td><p>457.5772</p></td>
-<td><p>241.7561</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p></p></td>
-<td><p>2</p></td>
-<td><p>699.5582</p></td>
-<td><p>690.9961</p></td>
-<td><p>328.0399</p></td>
-<td><p>145.088</p></td>
-<td><p>91.1746</p></td>
-<td><p></p></td>
+<td><p>5000, 500</p></td>
+<td><p>3477.61</p></td>
+<td><p>1802.2</p></td>
+<td><p>816.09</p></td>
+<td><p>693.38</p></td>
+<td><p>972.2</p></td>
+<td><p>3957.15</p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p></p></td>
-<td><p>4</p></td>
-<td><p>1035.6523</p></td>
-<td><p>1008.8318</p></td>
-<td><p>670.6725</p></td>
-<td><p>278.5717</p></td>
-<td><p>150.2619</p></td>
-<td><p>168.7886</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p></p></td>
-<td><p>8</p></td>
-<td><p>2055.7245</p></td>
-<td><p>1996.2653</p></td>
-<td><p>1288.7599</p></td>
-<td><p>546.9599</p></td>
-<td><p>140.0144</p></td>
-<td><p>160.2741</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p>2048/2048</p></td>
-<td><p>1</p></td>
-<td><p>1802.1116</p></td>
-<td><p>204.0931</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p></p></td>
-<td><p>2</p></td>
-<td><p>3487.2497</p></td>
-<td><p>2444.6903</p></td>
-<td><p>165.6522</p></td>
-<td><p>126.1101</p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p></p></td>
-<td><p>4</p></td>
-<td><p>6126.7196</p></td>
-<td><p>4850.8285</p></td>
-<td><p>2386.6556</p></td>
-<td><p>1230.1833</p></td>
-<td><p>822.2269</p></td>
-<td><p>876.6085</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p></p></td>
-<td><p>8</p></td>
-<td><p>9784.0193</p></td>
-<td><p>7432.6659</p></td>
-<td><p>3991.2123</p></td>
-<td><p>2144.3042</p></td>
-<td><p>883.4809</p></td>
-<td><p>994.94</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p>500/2000</p></td>
-<td><p>1</p></td>
-<td><p>2822.7846</p></td>
-<td><p>389.8823</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p></p></td>
-<td><p>2</p></td>
-<td><p>6175.7623</p></td>
-<td><p>4601.857</p></td>
-<td><p>687.5386</p></td>
-<td><p>430.6093</p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p></p></td>
-<td><p>4</p></td>
-<td><p>10783.8925</p></td>
-<td><p>9018.9053</p></td>
-<td><p>3698.3674</p></td>
-<td><p>2113.3936</p></td>
-<td><p>1248.8319</p></td>
-<td><p>1468.7827</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p></p></td>
-<td><p>8</p></td>
-<td><p>17631.9756</p></td>
-<td><p>11375.9582</p></td>
-<td><p>6321.3679</p></td>
-<td><p>3673.5693</p></td>
-<td><p>1321.8541</p></td>
-<td><p>1636.4588</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p>5000/500</p></td>
-<td><p>1</p></td>
-<td><p>532.2603</p></td>
-<td><p>123.8543</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p></p></td>
-<td><p>2</p></td>
-<td><p>931.8255</p></td>
-<td><p>897.4263</p></td>
-<td><p>227.9005</p></td>
-<td><p>117.5698</p></td>
-<td><p>75.35</p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p></p></td>
-<td><p>4</p></td>
-<td><p>1399.7865</p></td>
-<td><p>1316.2865</p></td>
-<td><p>831.2804</p></td>
-<td><p>362.3465</p></td>
-<td><p>209.8052</p></td>
-<td><p>234.7343</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p></p></td>
-<td><p>8</p></td>
-<td><p>2725.1283</p></td>
-<td><p>2469.5585</p></td>
-<td><p>1446.3508</p></td>
-<td><p>662.5725</p></td>
-<td><p>202.0719</p></td>
-<td><p>231.9027</p></td>
-</tr>
-<tr class="row-odd"><td><p>LLaMA v3.1 405B</p></td>
-<td><p>1000/1000</p></td>
-<td><p>8</p></td>
-<td><p>3391.0372</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p>128/128</p></td>
-<td><p>8</p></td>
-<td><p>3766.2785</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p>128/2048</p></td>
-<td><p>8</p></td>
-<td><p>5952.1416</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p>128/4096</p></td>
-<td><p>8</p></td>
-<td><p>3944.117</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p>20000/2000</p></td>
-<td><p>8</p></td>
-<td><p>481.5732</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p>2048/128</p></td>
-<td><p>8</p></td>
-<td><p>444.5735</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p>2048/2048</p></td>
-<td><p>8</p></td>
-<td><p>2604.8557</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p>500/2000</p></td>
-<td><p>8</p></td>
-<td><p>4805.86</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p>5000/500</p></td>
-<td><p>8</p></td>
-<td><p>655.9754</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
+<td><p>20000, 2000</p></td>
+<td><p>1378.69</p></td>
+<td><p>621.58</p></td>
+<td><p>330.47</p></td>
+<td><p>298.79</p></td>
+<td><p>326.02</p></td>
+<td><p>1459.86</p></td>
 </tr>
 <tr class="row-even"><td><p>LLaMA v3.1 70B</p></td>
-<td><p>1000/1000</p></td>
 <td><p>1</p></td>
-<td><p>2585.0953</p></td>
-<td><p>410.286</p></td>
+<td><p>128, 128</p></td>
+<td><p>3173.65</p></td>
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
+<td><p>4108.23</p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p></p></td>
+<td><p>128, 2048</p></td>
+<td><p>804.73</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>1940.33</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>128, 4096</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>981.15</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>500, 2000</p></td>
+<td><p>652.24</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>1526.49</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>1000, 1000</p></td>
+<td><p>775.07</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>1575.4</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>2048, 128</p></td>
+<td><p>328.44</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>453.06</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>2048, 2048</p></td>
+<td><p>388.02</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>838.55</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>5000, 500</p></td>
+<td><p>217.98</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>383.32</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>20000, 2000</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>124.38</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
 <td><p>2</p></td>
-<td><p>4600.9616</p></td>
-<td><p>4116.4444</p></td>
-<td><p>785.4931</p></td>
-<td><p>468.6383</p></td>
-<td><p>257.972</p></td>
+<td><p>128, 128</p></td>
+<td><p>6399.24</p></td>
+<td><p>3143.32</p></td>
+<td><p>1330.41</p></td>
+<td><p>790.66</p></td>
+<td><p></p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
+<td><p>128, 2048</p></td>
+<td><p>5920.14</p></td>
+<td><p>784.73</p></td>
+<td><p>532.31</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>128, 4096</p></td>
+<td><p>3580.79</p></td>
+<td><p>418.75</p></td>
+<td><p>285.01</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>500, 2000</p></td>
+<td><p>4775.52</p></td>
+<td><p>660.68</p></td>
+<td><p>437.64</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>1000, 1000</p></td>
+<td><p>4247.38</p></td>
+<td><p>785.36</p></td>
+<td><p>483.87</p></td>
+<td><p>267.63</p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>2048, 128</p></td>
+<td><p>774.11</p></td>
+<td><p>315.43</p></td>
+<td><p>144.88</p></td>
+<td><p>94.83</p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>2048, 2048</p></td>
+<td><p>2667.23</p></td>
+<td><p>384.36</p></td>
+<td><p>259.65</p></td>
+<td><p>137.09</p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>5000, 500</p></td>
+<td><p>901.84</p></td>
+<td><p>210.7</p></td>
+<td><p>124.33</p></td>
+<td><p>76.77</p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>20000, 2000</p></td>
+<td><p>410.93</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
 <td><p>4</p></td>
-<td><p>7607.5304</p></td>
-<td><p>6932.8808</p></td>
-<td><p>3774.676</p></td>
-<td><p>1762.6831</p></td>
-<td><p>989.4082</p></td>
-<td><p>1161.4814</p></td>
+<td><p>128, 128</p></td>
+<td><p>10589.19</p></td>
+<td><p>6392.74</p></td>
+<td><p>2716.71</p></td>
+<td><p>1192.33</p></td>
+<td><p>1469.28</p></td>
+<td><p></p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p></p></td>
+<td><p>128, 2048</p></td>
+<td><p>11063.97</p></td>
+<td><p>5742.27</p></td>
+<td><p>2663.76</p></td>
+<td><p>1385.61</p></td>
+<td><p>1911.43</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>128, 4096</p></td>
+<td><p>7428.89</p></td>
+<td><p>3457.03</p></td>
+<td><p>1913.13</p></td>
+<td><p>1206.15</p></td>
+<td><p>1357.83</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>500, 2000</p></td>
+<td><p>9504.33</p></td>
+<td><p>4375.09</p></td>
+<td><p>2193.81</p></td>
+<td><p>1248.45</p></td>
+<td><p>1599.38</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>1000, 1000</p></td>
+<td><p>7306.35</p></td>
+<td><p>4075.52</p></td>
+<td><p>1889.72</p></td>
+<td><p>999.4</p></td>
+<td><p>1187.23</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>2048, 128</p></td>
+<td><p>1316.33</p></td>
+<td><p>779.81</p></td>
+<td><p>320.96</p></td>
+<td><p>162.09</p></td>
+<td><p>176.41</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>2048, 2048</p></td>
+<td><p>5166.41</p></td>
+<td><p>2609.39</p></td>
+<td><p>1341.99</p></td>
+<td><p>874.11</p></td>
+<td><p>909.3</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>5000, 500</p></td>
+<td><p>1566.63</p></td>
+<td><p>874.96</p></td>
+<td><p>389.99</p></td>
+<td><p>218.29</p></td>
+<td><p>242.95</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>20000, 2000</p></td>
+<td><p>915.06</p></td>
+<td><p>406.36</p></td>
+<td><p>209.39</p></td>
+<td><p>141.13</p></td>
+<td><p>158.35</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
 <td><p>8</p></td>
-<td><p>13081.434</p></td>
-<td><p>10730.156</p></td>
-<td><p>5978.4573</p></td>
-<td><p>3190.0211</p></td>
-<td><p>959.8463</p></td>
-<td><p>1188.1193</p></td>
+<td><p>128, 128</p></td>
+<td><p>15427.05</p></td>
+<td><p>10959.63</p></td>
+<td><p>4595.66</p></td>
+<td><p>943.87</p></td>
+<td><p>1381.25</p></td>
+<td><p></p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
-<td><p>128/128</p></td>
+<td><p></p></td>
+<td><p>128, 2048</p></td>
+<td><p>16533.07</p></td>
+<td><p>10252.11</p></td>
+<td><p>4967.17</p></td>
+<td><p>1605.66</p></td>
+<td><p>2157.58</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>128, 4096</p></td>
+<td><p>12008.26</p></td>
+<td><p>6915.81</p></td>
+<td><p>3594.1</p></td>
+<td><p>1449.32</p></td>
+<td><p>1895.68</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>500, 2000</p></td>
+<td><p>14508.43</p></td>
+<td><p>8942.09</p></td>
+<td><p>4349.21</p></td>
+<td><p>1238.68</p></td>
+<td><p>1877.86</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>1000, 1000</p></td>
+<td><p>11086.68</p></td>
+<td><p>6983.63</p></td>
+<td><p>3285.33</p></td>
+<td><p>907.21</p></td>
+<td><p>1242.34</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>2048, 128</p></td>
+<td><p>2064.53</p></td>
+<td><p>1351.25</p></td>
+<td><p>556.48</p></td>
+<td><p>140.49</p></td>
+<td><p>163.53</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>2048, 2048</p></td>
+<td><p>7768.15</p></td>
+<td><p>4515.31</p></td>
+<td><p>2464.13</p></td>
+<td><p>811.88</p></td>
+<td><p>1092.72</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>5000, 500</p></td>
+<td><p>2533.55</p></td>
+<td><p>1589.18</p></td>
+<td><p>700.7</p></td>
+<td><p>212.07</p></td>
+<td><p>242.61</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>20000, 2000</p></td>
+<td><p>1447.5</p></td>
+<td><p>847.42</p></td>
+<td><p>399.8</p></td>
+<td><p>140.86</p></td>
+<td><p>198.77</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p>Mistral 7B</p></td>
 <td><p>1</p></td>
-<td><p>3897.2623</p></td>
-<td><p>2459.6003</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
+<td><p>128, 128</p></td>
+<td><p>30177.4</p></td>
+<td><p>17025.15</p></td>
+<td><p>6968.4</p></td>
+<td><p>5444.55</p></td>
+<td><p>9526.7</p></td>
+<td><p>33795.78</p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p></p></td>
-<td><p>2</p></td>
-<td><p>5357.0227</p></td>
-<td><p>5194.8171</p></td>
-<td><p>3207.2866</p></td>
-<td><p>1346.9692</p></td>
-<td><p>806.7215</p></td>
-<td><p></p></td>
+<td><p>128, 2048</p></td>
+<td><p>22060.45</p></td>
+<td><p>10324.05</p></td>
+<td><p>5556.98</p></td>
+<td><p>4960.48</p></td>
+<td><p>5669.19</p></td>
+<td><p>22724.8</p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
-<td><p>4</p></td>
-<td><p>8826.9618</p></td>
-<td><p>8542.3012</p></td>
-<td><p>5846.8413</p></td>
-<td><p>2420.8665</p></td>
-<td><p>1272.6755</p></td>
-<td><p>1438.0446</p></td>
+<td><p>128, 4096</p></td>
+<td><p>13773.03</p></td>
+<td><p>6205.41</p></td>
+<td><p>3430.11</p></td>
+<td><p>3077.47</p></td>
+<td><p>3091.88</p></td>
+<td><p>13916.10</p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p></p></td>
-<td><p>8</p></td>
-<td><p>16382.9807</p></td>
-<td><p>15533.1169</p></td>
-<td><p>10649.4968</p></td>
-<td><p>4572.3445</p></td>
-<td><p>1212.0566</p></td>
-<td><p>1381.7051</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p>128/2048</p></td>
-<td><p>1</p></td>
-<td><p>3612.2603</p></td>
-<td><p>445.7773</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p></p></td>
-<td><p>2</p></td>
-<td><p>7054.7235</p></td>
-<td><p>5869.3998</p></td>
-<td><p>822.1912</p></td>
-<td><p>483.1299</p></td>
-<td><p></p></td>
-<td><p></p></td>
+<td><p>500, 2000</p></td>
+<td><p>17229.29</p></td>
+<td><p>8294.02</p></td>
+<td><p>4339.77</p></td>
+<td><p>3883.38</p></td>
+<td><p>4498.74</p></td>
+<td><p>20702.51</p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
-<td><p>4</p></td>
-<td><p>12763.4114</p></td>
-<td><p>9017.4377</p></td>
-<td><p>4982.6225</p></td>
-<td><p>2492.4036</p></td>
-<td><p>1435.236</p></td>
-<td><p>1763.522</p></td>
+<td><p>1000, 1000</p></td>
+<td><p>15428.87</p></td>
+<td><p>7894.2</p></td>
+<td><p>3874.65</p></td>
+<td><p>3433.27</p></td>
+<td><p>4118.6</p></td>
+<td><p>17061.12</p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p></p></td>
-<td><p>8</p></td>
-<td><p>19266.0398</p></td>
-<td><p>15190.1652</p></td>
-<td><p>7605.5295</p></td>
-<td><p>4254.2871</p></td>
-<td><p>1609.2473</p></td>
-<td><p>1944.1251</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p>128/4096</p></td>
-<td><p>1</p></td>
-<td><p>2415.1981</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p></p></td>
-<td><p>2</p></td>
-<td><p>5671.9561</p></td>
-<td><p>3518.782</p></td>
-<td><p>419.0178</p></td>
-<td><p>272.9137</p></td>
-<td><p></p></td>
-<td><p></p></td>
+<td><p>2048, 128</p></td>
+<td><p>3546.44</p></td>
+<td><p>2001.13</p></td>
+<td><p>793.57</p></td>
+<td><p>635.46</p></td>
+<td><p>1067.47</p></td>
+<td><p>4039.02</p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
-<td><p>4</p></td>
-<td><p>8939.8227</p></td>
-<td><p>6431.2702</p></td>
-<td><p>3083.8794</p></td>
-<td><p>1685.9677</p></td>
-<td><p>1212.5416</p></td>
-<td><p>1280.3778</p></td>
+<td><p>2048, 2048</p></td>
+<td><p>9118.64</p></td>
+<td><p>4520.74</p></td>
+<td><p>2440.45</p></td>
+<td><p>2187.82</p></td>
+<td><p>2231.66</p></td>
+<td><p>9998.65</p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p></p></td>
-<td><p>8</p></td>
-<td><p>13974.2854</p></td>
-<td><p>9168.709</p></td>
-<td><p>4981.9765</p></td>
-<td><p>3067.5452</p></td>
-<td><p>1310.091</p></td>
-<td><p>1499.2441</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p>20000/2000</p></td>
-<td><p>1</p></td>
-<td><p>240.7202</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p></p></td>
-<td><p>2</p></td>
-<td><p>614.318</p></td>
-<td><p>397.6801</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
+<td><p>5000, 500</p></td>
+<td><p>3493.52</p></td>
+<td><p>1838.75</p></td>
+<td><p>828.17</p></td>
+<td><p>702.36</p></td>
+<td><p>999.35</p></td>
+<td><p>4042.82</p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
-<td><p>4</p></td>
-<td><p>1030.9528</p></td>
-<td><p>851.8542</p></td>
-<td><p>369.4269</p></td>
-<td><p>179.5181</p></td>
-<td><p>126.7676</p></td>
-<td><p>140.5565</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p></p></td>
-<td><p>8</p></td>
-<td><p>1898.9762</p></td>
-<td><p>1354.5333</p></td>
-<td><p></p></td>
-<td><p>362.9368</p></td>
-<td><p>156.5767</p></td>
-<td><p>141.1584</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p>2048/128</p></td>
-<td><p>1</p></td>
-<td><p>458.1948</p></td>
-<td><p>244.1842</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p></p></td>
-<td><p>2</p></td>
-<td><p>692.3911</p></td>
-<td><p>697.3907</p></td>
-<td><p>322.7016</p></td>
-<td><p>144.7921</p></td>
-<td><p>95.0306</p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p></p></td>
-<td><p>4</p></td>
-<td><p>1034.5773</p></td>
-<td><p>1001.0771</p></td>
-<td><p>688.0344</p></td>
-<td><p>278.4018</p></td>
-<td><p>150.6795</p></td>
-<td><p>169.0386</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p></p></td>
-<td><p>8</p></td>
-<td><p>2070.8157</p></td>
-<td><p>1966.6072</p></td>
-<td><p>1316.3086</p></td>
-<td><p>550.4751</p></td>
-<td><p>142.6166</p></td>
-<td><p>163.6749</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p>2048/2048</p></td>
-<td><p>1</p></td>
-<td><p>1797.6743</p></td>
-<td><p>209.1707</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p></p></td>
-<td><p>2</p></td>
-<td><p>3518.0774</p></td>
-<td><p>2445.0093</p></td>
-<td><p>166.792</p></td>
-<td><p>126.1127</p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p></p></td>
-<td><p>4</p></td>
-<td><p>6112.9026</p></td>
-<td><p>4838.5272</p></td>
-<td><p>2393.1359</p></td>
-<td><p>1231.0359</p></td>
-<td><p>823.4777</p></td>
-<td><p>876.2254</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p></p></td>
-<td><p>8</p></td>
-<td><p>9716.1934</p></td>
-<td><p>7434.8117</p></td>
-<td><p>4023.6978</p></td>
-<td><p>2171.5323</p></td>
-<td><p>858.6602</p></td>
-<td><p>1001.3649</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p>500/2000</p></td>
-<td><p>1</p></td>
-<td><p>2826.6665</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p></p></td>
-<td><p>2</p></td>
-<td><p>6106.5855</p></td>
-<td><p>4605.9226</p></td>
-<td><p>700.5415</p></td>
-<td><p>430.6129</p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p></p></td>
-<td><p>4</p></td>
-<td><p>10816.8283</p></td>
-<td><p>9205.3766</p></td>
-<td><p>3781.082</p></td>
-<td><p>2096.2441</p></td>
-<td><p>1176.418</p></td>
-<td><p>1470.0826</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p></p></td>
-<td><p>8</p></td>
-<td><p>17693.705</p></td>
-<td><p>13109.4437</p></td>
-<td><p>6205.2658</p></td>
-<td><p>3486.7891</p></td>
-<td><p>1306.35</p></td>
-<td><p>1639.2778</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p>5000/500</p></td>
-<td><p>1</p></td>
-<td><p>533.6128</p></td>
-<td><p>125.4236</p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p></p></td>
-<td><p>2</p></td>
-<td><p>936.7014</p></td>
-<td><p>886.6758</p></td>
-<td><p>228.874</p></td>
-<td><p>116.9529</p></td>
-<td><p>76.1601</p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p></p></td>
-<td><p>4</p></td>
-<td><p>1386.4827</p></td>
-<td><p>1313.893</p></td>
-<td><p>849.1091</p></td>
-<td><p>362.9361</p></td>
-<td><p>209.2045</p></td>
-<td><p>236.117</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p></p></td>
-<td><p>8</p></td>
-<td><p>2711.5057</p></td>
-<td><p>2444.9643</p></td>
-<td><p>1420.5163</p></td>
-<td><p>670.3742</p></td>
-<td><p>203.8008</p></td>
-<td><p>230.3084</p></td>
-</tr>
-<tr class="row-even"><td><p>LLaMA v3.1 8B</p></td>
-<td><p>1000/1000</p></td>
-<td><p>1</p></td>
-<td><p>16414.6988</p></td>
-<td><p>14108.0361</p></td>
-<td><p>7054.5156</p></td>
-<td><p>3634.3886</p></td>
-<td><p>3165.3542</p></td>
-<td><p>3726.7552</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p>128/128</p></td>
-<td><p>1</p></td>
-<td><p>27778.8885</p></td>
-<td><p>26933.1886</p></td>
-<td><p>15571.6549</p></td>
-<td><p>6701.7958</p></td>
-<td><p>5338.0166</p></td>
-<td><p>8639.7933</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p>128/2048</p></td>
-<td><p>1</p></td>
-<td><p>22948.5383</p></td>
-<td><p>18995.2523</p></td>
-<td><p>9150.7477</p></td>
-<td><p>4963.4443</p></td>
-<td><p>4250.6391</p></td>
-<td><p>5101.6652</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p>128/4096</p></td>
-<td><p>1</p></td>
-<td><p>15583.3035</p></td>
-<td><p>11815.449</p></td>
-<td><p>5368.9227</p></td>
-<td><p>3011.3335</p></td>
-<td><p>2568.5398</p></td>
-<td><p>2774.5363</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p>20000/2000</p></td>
-<td><p>1</p></td>
-<td><p>1649.5453</p></td>
-<td><p>1301.4754</p></td>
-<td><p>562.8735</p></td>
-<td><p>316.533</p></td>
-<td><p>291.4776</p></td>
-<td><p>270.5404</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p>2048/128</p></td>
-<td><p>1</p></td>
-<td><p>3619.4309</p></td>
-<td><p>3460.3545</p></td>
-<td><p>1904.3259</p></td>
-<td><p>795.389</p></td>
-<td><p>611.8446</p></td>
-<td><p>986.9134</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p>2048/2048</p></td>
-<td><p>1</p></td>
-<td><p>11032.9729</p></td>
-<td><p>8777.6623</p></td>
-<td><p>4159.6857</p></td>
-<td><p>2264.9513</p></td>
-<td><p>2011.1215</p></td>
-<td><p>2018.303</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p>500/2000</p></td>
-<td><p>1</p></td>
-<td><p>19510.4015</p></td>
-<td><p>14993.328</p></td>
-<td><p>7498.3331</p></td>
-<td><p>3945.1912</p></td>
-<td><p>3374.7133</p></td>
-<td><p>4065.3921</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p>5000/500</p></td>
-<td><p>1</p></td>
-<td><p>3787.6721</p></td>
-<td><p>3258.2001</p></td>
-<td><p>1708.0353</p></td>
-<td><p>790.6631</p></td>
-<td><p>703.56</p></td>
-<td><p>855.9822</p></td>
-</tr>
-<tr class="row-odd"><td><p>Mistral 7B</p></td>
-<td><p>1000/1000</p></td>
-<td><p>1</p></td>
-<td><p>17739.1436</p></td>
-<td><p>14986.7562</p></td>
-<td><p>7697.1418</p></td>
-<td><p>3804.5585</p></td>
-<td><p>3333.4754</p></td>
-<td><p>3981.4799</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p>128/128</p></td>
-<td><p>1</p></td>
-<td><p>30094.9137</p></td>
-<td><p>29341.284</p></td>
-<td><p>16238.937</p></td>
-<td><p>6914.2184</p></td>
-<td><p>5491.7418</p></td>
-<td><p>9127.5052</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p>128/2048</p></td>
-<td><p>1</p></td>
-<td><p>24671.5477</p></td>
-<td><p>20941.6631</p></td>
-<td><p>9708.1161</p></td>
-<td><p>5303.4318</p></td>
-<td><p>4402.3044</p></td>
-<td><p>5357.3405</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p>128/4096</p></td>
-<td><p>1</p></td>
-<td><p>16454.0833</p></td>
-<td><p>12780.3724</p></td>
-<td><p>5800.4957</p></td>
-<td><p>3235.0678</p></td>
-<td><p>2825.7896</p></td>
-<td><p>2879.9833</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p>20000/2000</p></td>
-<td><p>1</p></td>
-<td><p>1676.0415</p></td>
-<td><p>1317.9654</p></td>
-<td><p>569.7589</p></td>
-<td><p>324.5936</p></td>
-<td><p>281.4751</p></td>
-<td><p>286.353</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p>2048/128</p></td>
-<td><p>1</p></td>
-<td><p>3649.1462</p></td>
-<td><p>3492.3042</p></td>
-<td><p>1929.3126</p></td>
-<td><p>800.9286</p></td>
-<td><p>617.0932</p></td>
-<td><p>1019.75</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p>2048/2048</p></td>
-<td><p>1</p></td>
-<td><p>11403.6968</p></td>
-<td><p>8974.7383</p></td>
-<td><p>4367.8733</p></td>
-<td><p>2331.8112</p></td>
-<td><p>1988.3496</p></td>
-<td><p>2184.3861</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p>500/2000</p></td>
-<td><p>1</p></td>
-<td><p>20819.4592</p></td>
-<td><p>15992.3357</p></td>
-<td><p>7947.4257</p></td>
-<td><p>4189.395</p></td>
-<td><p>3603.4489</p></td>
-<td><p>4286.3867</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p>5000/500</p></td>
-<td><p>1</p></td>
-<td><p>3840.0108</p></td>
-<td><p>3340.7385</p></td>
-<td><p>1707.2611</p></td>
-<td><p>807.4561</p></td>
-<td><p>722.8385</p></td>
-<td><p>881.7336</p></td>
-</tr>
-<tr class="row-even"><td><p>Mixtral 8x22B</p></td>
-<td><p>1000/1000</p></td>
-<td><p>8</p></td>
-<td><p>18557.43</p></td>
-<td><p>16918.03</p></td>
-<td><p>9759.888</p></td>
-<td><p>4753.6273</p></td>
-<td><p></p></td>
-<td><p>2128.4403</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p>128/128</p></td>
-<td><p>8</p></td>
-<td><p>25179.4765</p></td>
-<td><p>23729.5293</p></td>
-<td><p>16421.3182</p></td>
-<td><p>6948.5923</p></td>
-<td><p></p></td>
-<td><p>2488.6297</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p>128/2048</p></td>
-<td><p>8</p></td>
-<td><p>27492.4926</p></td>
-<td><p>24556.7807</p></td>
-<td><p>12303.4168</p></td>
-<td><p>7246.7172</p></td>
-<td><p></p></td>
-<td><p>3540.0067</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p>128/4096</p></td>
-<td><p>8</p></td>
-<td><p>19718.8648</p></td>
-<td><p>17755.0018</p></td>
-<td><p>7474.3817</p></td>
-<td><p>4696.6123</p></td>
-<td><p></p></td>
-<td><p>2568.3114</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p>20000/2000</p></td>
-<td><p>8</p></td>
-<td><p>2897.182</p></td>
-<td><p>2189.606</p></td>
-<td><p>1118.8294</p></td>
-<td><p>594.8509</p></td>
-<td><p></p></td>
-<td><p>309.0799</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p>2048/128</p></td>
-<td><p>8</p></td>
-<td><p>3093.8418</p></td>
-<td><p>2917.1362</p></td>
-<td><p>1994.0127</p></td>
-<td><p>825.3934</p></td>
-<td><p></p></td>
-<td><p>294.7706</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p>2048/2048</p></td>
-<td><p>8</p></td>
-<td><p>13795.9827</p></td>
-<td><p>12487.6502</p></td>
-<td><p>5857.8831</p></td>
-<td><p>3377.8371</p></td>
-<td><p></p></td>
-<td><p>1694.6176</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p>500/2000</p></td>
-<td><p>8</p></td>
-<td><p>24637.473</p></td>
-<td><p>19997.3914</p></td>
-<td><p>10637.6598</p></td>
-<td><p>6007.619</p></td>
-<td><p></p></td>
-<td><p>2976.9633</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p>5000/500</p></td>
-<td><p>8</p></td>
-<td><p>3889.2745</p></td>
-<td><p>3578.4843</p></td>
-<td><p>2211.2377</p></td>
-<td><p>1028.3843</p></td>
-<td><p></p></td>
-<td><p>420.2156</p></td>
+<td><p>20000, 2000</p></td>
+<td><p>1267.96</p></td>
+<td><p>641</p></td>
+<td><p>334.06</p></td>
+<td><p>296.1</p></td>
+<td><p>336.18</p></td>
+<td><p>1521.67</p></td>
 </tr>
 <tr class="row-odd"><td><p>Mixtral 8x7B</p></td>
-<td><p>1000/1000</p></td>
+<td><p>1</p></td>
+<td><p>128, 128</p></td>
+<td><p>15882.61</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>16515.3</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>128, 2048</p></td>
+<td><p>8214.24</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>10956.79</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>128, 4096</p></td>
+<td><p>4671.49</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>6489.02</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>500, 2000</p></td>
+<td><p>6739.79</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>8809.27</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>1000, 1000</p></td>
+<td><p>6787.62</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>8402.89</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>2048, 128</p></td>
+<td><p>1885.43</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>1932.28</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>2048, 2048</p></td>
+<td><p>3725.12</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>5248.95</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>5000, 500</p></td>
+<td><p>1762.25</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>2098.53</p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>20000, 2000</p></td>
+<td><p>670.61</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p>870.76</p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
 <td><p>2</p></td>
-<td><p>18712.2046</p></td>
-<td><p>15931.8663</p></td>
-<td><p>6052.876</p></td>
-<td><p>3276.6186</p></td>
-<td><p>1907.8817</p></td>
+<td><p>128, 128</p></td>
+<td><p>27155.63</p></td>
+<td><p>15904.17</p></td>
+<td><p>5758.21</p></td>
+<td><p>3788.61</p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>128, 2048</p></td>
+<td><p>23009.9</p></td>
+<td><p>7660.05</p></td>
+<td><p>4365.92</p></td>
+<td><p>2219.51</p></td>
+<td><p></p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
+<td><p>128, 4096</p></td>
+<td><p>14095.62</p></td>
+<td><p>4287.96</p></td>
+<td><p>2502.13</p></td>
+<td><p>1272.21</p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>500, 2000</p></td>
+<td><p>16785.63</p></td>
+<td><p>6454.11</p></td>
+<td><p>3618.34</p></td>
+<td><p>1633.61</p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>1000, 1000</p></td>
+<td><p>15867.12</p></td>
+<td><p>6492.47</p></td>
+<td><p>3316.43</p></td>
+<td><p>1734.39</p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>2048, 128</p></td>
+<td><p>3367.65</p></td>
+<td><p>1895.85</p></td>
+<td><p>691.68</p></td>
+<td><p>465.45</p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>2048, 2048</p></td>
+<td><p>10464.57</p></td>
+<td><p>3642.6</p></td>
+<td><p>1990.95</p></td>
+<td><p>1038.11</p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>5000, 500</p></td>
+<td><p>3591.62</p></td>
+<td><p>1722.61</p></td>
+<td><p>755.64</p></td>
+<td><p>468.26</p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>20000, 2000</p></td>
+<td><p>1739.08</p></td>
+<td><p>655.5</p></td>
+<td><p>334.67</p></td>
+<td><p>187.43</p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
 <td><p>4</p></td>
-<td><p>32834.0923</p></td>
-<td><p>28015.1981</p></td>
-<td><p>15509.1538</p></td>
-<td><p>7357.1613</p></td>
-<td><p>4737.0179</p></td>
-<td><p>5060.8399</p></td>
+<td><p>128, 128</p></td>
+<td><p>40731.73</p></td>
+<td><p>28272.32</p></td>
+<td><p>11612.27</p></td>
+<td><p>6075.21</p></td>
+<td><p>6756.75</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>128, 2048</p></td>
+<td><p>41117.27</p></td>
+<td><p>23327.39</p></td>
+<td><p>11755.57</p></td>
+<td><p>7851.32</p></td>
+<td><p>7989.81</p></td>
+<td><p></p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p></p></td>
+<td><p>128, 4096</p></td>
+<td><p>28143.35</p></td>
+<td><p>13906.89</p></td>
+<td><p>8052.85</p></td>
+<td><p>5920.37</p></td>
+<td><p>5655.07</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>500, 2000</p></td>
+<td><p>34507.24</p></td>
+<td><p>16964.37</p></td>
+<td><p>9185.2</p></td>
+<td><p>6243.72</p></td>
+<td><p>6605.53</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>1000, 1000</p></td>
+<td><p>27614.12</p></td>
+<td><p>16217.64</p></td>
+<td><p>7640.13</p></td>
+<td><p>4818.03</p></td>
+<td><p>5132.48</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>2048, 128</p></td>
+<td><p>5275.25</p></td>
+<td><p>3416.82</p></td>
+<td><p>1383.85</p></td>
+<td><p>740</p></td>
+<td><p>811.01</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>2048, 2048</p></td>
+<td><p>18441.12</p></td>
+<td><p>10381.54</p></td>
+<td><p>5403.69</p></td>
+<td><p>3842.39</p></td>
+<td><p>3837.68</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>5000, 500</p></td>
+<td><p>6340.27</p></td>
+<td><p>3689.37</p></td>
+<td><p>1632.92</p></td>
+<td><p>966.38</p></td>
+<td><p>1072.16</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>20000, 2000</p></td>
+<td><p>3231.36</p></td>
+<td><p>1717.02</p></td>
+<td><p>856.62</p></td>
+<td><p>619.01</p></td>
+<td><p>655.74</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
 <td><p>8</p></td>
-<td><p>44410.7533</p></td>
-<td><p>40573.0499</p></td>
-<td><p>27684.9381</p></td>
-<td><p>13948.1533</p></td>
-<td><p>4970.9287</p></td>
-<td><p>5725.9638</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p>128/128</p></td>
-<td><p>2</p></td>
-<td><p>24970.5594</p></td>
-<td><p>24321.9927</p></td>
-<td><p>15334.2103</p></td>
-<td><p>5915.3897</p></td>
-<td><p>3810.1846</p></td>
+<td><p>128, 128</p></td>
+<td><p>51899.21</p></td>
+<td><p>40517.74</p></td>
+<td><p>18434.51</p></td>
+<td><p>5573.24</p></td>
+<td><p>6349.85</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p></p></td>
-<td><p>4</p></td>
-<td><p>42500.5855</p></td>
-<td><p>40182.7271</p></td>
-<td><p>27718.9857</p></td>
-<td><p>11328.7486</p></td>
-<td><p>6026.9206</p></td>
-<td><p>6769.9441</p></td>
+<td><p>128, 2048</p></td>
+<td><p>63701.21</p></td>
+<td><p>40322.45</p></td>
+<td><p>22120.7</p></td>
+<td><p>8657.63</p></td>
+<td><p>9696.71</p></td>
+<td><p></p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
+<td><p>128, 4096</p></td>
+<td><p>47833.64</p></td>
+<td><p>27121.19</p></td>
+<td><p>16280.11</p></td>
+<td><p>7747.32</p></td>
+<td><p>8038.78</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>500, 2000</p></td>
+<td><p>53260.36</p></td>
+<td><p>32190.46</p></td>
+<td><p>18439.46</p></td>
+<td><p>7393.45</p></td>
+<td><p>8319.84</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>1000, 1000</p></td>
+<td><p>40321.28</p></td>
+<td><p>27487.98</p></td>
+<td><p>13842.01</p></td>
+<td><p>5041.55</p></td>
+<td><p>5593.52</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>2048, 128</p></td>
+<td><p>7609.41</p></td>
+<td><p>5396.72</p></td>
+<td><p>2295.12</p></td>
+<td><p>670.71</p></td>
+<td><p>765.2</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>2048, 2048</p></td>
+<td><p>25624.61</p></td>
+<td><p>17823.29</p></td>
+<td><p>10114.34</p></td>
+<td><p>4509.4</p></td>
+<td><p>4791.64</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p></p></td>
+<td><p></p></td>
+<td><p>5000, 500</p></td>
+<td><p>9527.29</p></td>
+<td><p>6475.64</p></td>
+<td><p>3009.15</p></td>
+<td><p>973.63</p></td>
+<td><p>1094.62</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p></p></td>
+<td><p></p></td>
+<td><p>20000, 2000</p></td>
+<td><p>5507.84</p></td>
+<td><p>3156.06</p></td>
+<td><p>1673.29</p></td>
+<td><p>770.41</p></td>
+<td><p>872.96</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p>Mixtral 8x22B</p></td>
 <td><p>8</p></td>
-<td><p>54304.0436</p></td>
-<td><p>51030.9048</p></td>
-<td><p>40119.3268</p></td>
-<td><p>17918.1146</p></td>
-<td><p>5573.7682</p></td>
-<td><p>6422.4308</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p>128/2048</p></td>
-<td><p>2</p></td>
-<td><p>29314.1475</p></td>
-<td><p>20945.7816</p></td>
-<td><p>7409.9253</p></td>
-<td><p>4284.3035</p></td>
-<td><p>2248.1815</p></td>
+<td><p>128, 128</p></td>
+<td><p>22834.12</p></td>
+<td><p>16565.76</p></td>
+<td><p>6914.09</p></td>
+<td><p></p></td>
+<td><p>2470.15</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
-<td><p>4</p></td>
-<td><p>52680.8353</p></td>
-<td><p>40668.5928</p></td>
-<td><p>21293.1761</p></td>
-<td><p>10929.0182</p></td>
-<td><p>7353.7405</p></td>
-<td><p>7506.7612</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
+<td><p>128, 2048</p></td>
+<td><p>24975.75</p></td>
+<td><p>11676.16</p></td>
+<td><p>7170.04</p></td>
 <td><p></p></td>
-<td><p>8</p></td>
-<td><p>70409.1968</p></td>
-<td><p>64529.9982</p></td>
-<td><p>40839.3077</p></td>
-<td><p>21058.2144</p></td>
-<td><p>8866.251</p></td>
-<td><p>9907.6896</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p>128/4096</p></td>
-<td><p>2</p></td>
-<td><p>21520.4385</p></td>
-<td><p>12070.6724</p></td>
-<td><p>3928.6678</p></td>
-<td><p>2302.964</p></td>
-<td><p>1171.966</p></td>
+<td><p>3629.98</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p></p></td>
-<td><p>4</p></td>
-<td><p>32550.5267</p></td>
-<td><p>29120.2002</p></td>
-<td><p>11678.0071</p></td>
-<td><p>6538.1511</p></td>
-<td><p>5176.9632</p></td>
-<td><p>4958.7004</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
+<td><p>128, 4096</p></td>
+<td><p>17564.49</p></td>
+<td><p>7020.49</p></td>
+<td><p>5052.47</p></td>
 <td><p></p></td>
-<td><p>8</p></td>
-<td><p>40373.4857</p></td>
-<td><p>36357.7861</p></td>
-<td><p>21628.821</p></td>
-<td><p>13565.7778</p></td>
-<td><p>7209.2336</p></td>
-<td><p>8271.7938</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p>20000/2000</p></td>
-<td><p>2</p></td>
-<td><p>2204.1378</p></td>
-<td><p>1659.5907</p></td>
-<td><p>622.2717</p></td>
-<td><p>321.9839</p></td>
-<td><p>185.6671</p></td>
+<td><p>2933.79</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
-<td><p>4</p></td>
-<td><p>4047.7473</p></td>
-<td><p>3290.9457</p></td>
-<td><p>1602.0208</p></td>
-<td><p>778.7285</p></td>
-<td><p>572.4282</p></td>
-<td><p>587.1759</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
+<td><p>500, 2000</p></td>
+<td><p>21498.7</p></td>
+<td><p>10606.93</p></td>
+<td><p>6151.81</p></td>
 <td><p></p></td>
-<td><p>8</p></td>
-<td><p>6561.6849</p></td>
-<td><p>5328.5261</p></td>
-<td><p>3113.2047</p></td>
-<td><p>1645.8114</p></td>
-<td><p>750.5372</p></td>
-<td><p>828.8471</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p>2048/128</p></td>
-<td><p>2</p></td>
-<td><p>2958.0873</p></td>
-<td><p>2883.5166</p></td>
-<td><p>1796.5451</p></td>
-<td><p>687.7251</p></td>
-<td><p>465.1585</p></td>
+<td><p>2959.66</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p></p></td>
-<td><p>4</p></td>
-<td><p>5229.8744</p></td>
-<td><p>4972.6818</p></td>
-<td><p>3354.994</p></td>
-<td><p>1351.7191</p></td>
-<td><p>728.4943</p></td>
-<td><p>812.0143</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
+<td><p>1000, 1000</p></td>
+<td><p>16383.52</p></td>
+<td><p>9803.47</p></td>
+<td><p>4790.88</p></td>
 <td><p></p></td>
-<td><p>8</p></td>
-<td><p>7030.9766</p></td>
-<td><p>6532.721</p></td>
-<td><p>5025.3047</p></td>
-<td><p>2248.6418</p></td>
-<td><p>677.9886</p></td>
-<td><p>771.3656</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p>2048/2048</p></td>
-<td><p>2</p></td>
-<td><p>13842.834</p></td>
-<td><p>9334.0732</p></td>
-<td><p>3503.0218</p></td>
-<td><p>1997.1923</p></td>
-<td><p>1060.8946</p></td>
+<td><p>2146.74</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
-<td><p>4</p></td>
-<td><p>22389.4914</p></td>
-<td><p>20185.8212</p></td>
-<td><p>9143.2741</p></td>
-<td><p>4963.8758</p></td>
-<td><p>3520.3659</p></td>
-<td><p>3453.8076</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
+<td><p>2048, 128</p></td>
+<td><p>2945.44</p></td>
+<td><p>2028.84</p></td>
+<td><p>827.34</p></td>
 <td><p></p></td>
-<td><p>8</p></td>
-<td><p>28975.322</p></td>
-<td><p>26176.9163</p></td>
-<td><p>19291.8278</p></td>
-<td><p>10552.9732</p></td>
-<td><p>4590.187</p></td>
-<td><p>4929.7228</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
-<td><p>500/2000</p></td>
-<td><p>2</p></td>
-<td><p>23459.0411</p></td>
-<td><p>18185.6392</p></td>
-<td><p>6023.3308</p></td>
-<td><p>3438.6964</p></td>
-<td><p>1817.11</p></td>
+<td><p>291.53</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p></p></td>
-<td><p>4</p></td>
-<td><p>39971.0236</p></td>
-<td><p>31693.8787</p></td>
-<td><p>17087.037</p></td>
-<td><p>8930.3495</p></td>
-<td><p>6117.5624</p></td>
-<td><p>6434.9178</p></td>
-</tr>
-<tr class="row-even"><td><p></p></td>
+<td><p>2048, 2048</p></td>
+<td><p>11238.84</p></td>
+<td><p>5804.75</p></td>
+<td><p>3395</p></td>
 <td><p></p></td>
-<td><p>8</p></td>
-<td><p>60721.462</p></td>
-<td><p>48842.8084</p></td>
-<td><p>31358.2791</p></td>
-<td><p>17034.706</p></td>
-<td><p>7118.0767</p></td>
-<td><p>8130.8026</p></td>
-</tr>
-<tr class="row-odd"><td><p></p></td>
-<td><p>5000/500</p></td>
-<td><p>2</p></td>
-<td><p>3742.5293</p></td>
-<td><p>3563.8228</p></td>
-<td><p>1648.9041</p></td>
-<td><p>733.1921</p></td>
-<td><p>448.6716</p></td>
+<td><p>1830.44</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-even"><td><p></p></td>
 <td><p></p></td>
-<td><p>4</p></td>
-<td><p>6602.3877</p></td>
-<td><p>6020.6267</p></td>
-<td><p>3543.6819</p></td>
-<td><p>1603.8223</p></td>
-<td><p>948.0567</p></td>
-<td><p>1047.3212</p></td>
+<td><p>5000, 500</p></td>
+<td><p>3755.98</p></td>
+<td><p>2281.8</p></td>
+<td><p>1032.41</p></td>
+<td><p></p></td>
+<td><p>417.12</p></td>
+<td><p></p></td>
 </tr>
 <tr class="row-odd"><td><p></p></td>
 <td><p></p></td>
-<td><p>8</p></td>
-<td><p>8862.8164</p></td>
-<td><p>8214.9445</p></td>
-<td><p>5968.7734</p></td>
-<td><p>2813.1531</p></td>
-<td><p>969.817</p></td>
-<td><p>1098.3081</p></td>
+<td><p>20000, 2000</p></td>
+<td><p>2151.07</p></td>
+<td><p>1186.32</p></td>
+<td><p>597.81</p></td>
+<td><p></p></td>
+<td><p>323.37</p></td>
+<td><p></p></td>
 </tr>
 </tbody>
 </table>
@@ -1576,6 +1588,8 @@ and shows the throughput client-server scenario under maximum load.</p>
 description of this benchmarking workflow, see the <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/performance/perf-benchmarking.html">benchmarking suite documentation</a>.</p>
 <section id="commands">
 <h3>Commands<a class="headerlink" href="#commands" title="Link to this heading"></a></h3>
+<section id="for-non-gh200-systems">
+<h4>For non GH200 systems<a class="headerlink" href="#for-non-gh200-systems" title="Link to this heading"></a></h4>
 <table class="docutils align-default">
 <thead>
 <tr class="row-odd"><th class="head text-left"><p>Stage</p></th>
@@ -1590,7 +1604,7 @@ description of this benchmarking workflow, see the <a class="reference external"
 </tr>
 <tr class="row-odd"><td class="text-left"><p><a class="reference internal" href="#engine-building">Build</a></p></td>
 <td><p>Build a TensorRT-LLM engine</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">--model</span> <span class="pre">$model_name</span> <span class="pre">build</span> <span class="pre">--tp_size</span> <span class="pre">$tp_size</span> <span class="pre">--quantization</span> <span class="pre">FP8</span> <span class="pre">--dataset</span> <span class="pre">$dataset_file</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">--model</span> <span class="pre">$model_name</span> <span class="pre">build</span> <span class="pre">--tp_size</span> <span class="pre">$tp_size</span> <span class="pre">--pp_size</span> <span class="pre">$pp_size</span> <span class="pre">--quantization</span> <span class="pre">FP8</span> <span class="pre">--dataset</span> <span class="pre">$dataset_file</span></code></p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p><a class="reference internal" href="#running-the-benchmark">Run</a></p></td>
 <td><p>Run a benchmark with a dataset</p></td>
@@ -1598,6 +1612,37 @@ description of this benchmarking workflow, see the <a class="reference external"
 </tr>
 </tbody>
 </table>
+</section>
+<section id="for-gh200-systems-only">
+<h4>For GH200 systems only<a class="headerlink" href="#for-gh200-systems-only" title="Link to this heading"></a></h4>
+<p>For release v0.15, on GH200 systems, the recommendation is to use the legacy flow based on <em>gptManagerBenchmark</em> to measure performance.</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Stage</p></th>
+<th class="head"><p>Description</p></th>
+<th class="head"><p>Command</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p><a class="reference internal" href="#preparing-a-dataset">Dataset</a></p></td>
+<td><p>Create a synthetic dataset for engine building</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">benchmarks/cpp/prepare_dataset.py</span> <span class="pre">--tokenizer=$model_name</span> <span class="pre">--stdout</span> <span class="pre">token-norm-dist</span> <span class="pre">--num-requests=$num_requests</span> <span class="pre">--input-mean=$isl</span> <span class="pre">--output-mean=$osl</span> <span class="pre">--input-stdev=0</span> <span class="pre">--output-stdev=0</span> <span class="pre">&gt;</span> <span class="pre">$dataset_file</span></code></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><a class="reference internal" href="#engine-building">Build</a></p></td>
+<td><p>Build a TensorRT-LLM engine</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">--model</span> <span class="pre">$model_name</span> <span class="pre">build</span> <span class="pre">--tp_size</span> <span class="pre">$tp_size</span> <span class="pre">--quantization</span> <span class="pre">FP8</span> <span class="pre">--dataset</span> <span class="pre">$dataset_file</span></code></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p><a class="reference internal" href="#preparing-a-dataset">Dataset</a></p></td>
+<td><p>Create a synthetic dataset for benchmarking in json format</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">benchmarks/cpp/prepare_dataset.py</span> <span class="pre">--output=$dataset_file_json</span> <span class="pre">--tokenizer=$model_name</span> <span class="pre">token-norm-dist</span> <span class="pre">--num-requests=$num_requests</span> <span class="pre">--input-mean=$isl</span> <span class="pre">--output-mean=$osl</span> <span class="pre">--input-stdev=0</span> <span class="pre">--output-stdev=0</span></code></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><a class="reference internal" href="#running-the-benchmark">Run</a></p></td>
+<td><p>Run a benchmark with a dataset in json format</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">/app/tensorrt_llm/benchmarks/cpp/gptManagerBenchmark</span> <span class="pre">--engine_dir</span> <span class="pre">$engine_dir</span> <span class="pre">--type</span> <span class="pre">IFB</span> <span class="pre">--api</span> <span class="pre">executor</span> <span class="pre">--dataset</span> <span class="pre">$dataset_file_json</span> <span class="pre">--eos_id</span> <span class="pre">-1</span> <span class="pre">--log_iteration_data</span> <span class="pre">--scheduler_policy</span> <span class="pre">guaranteed_no_evict</span> <span class="pre">--kv_cache_free_gpu_mem_fraction</span> <span class="pre">0.95</span> <span class="pre">--output_csv</span> <span class="pre">result.csv</span> <span class="pre">--request_rate</span> <span class="pre">-1.0</span> <span class="pre">--enable_chunked_context</span> <span class="pre">--warm_up</span> <span class="pre">0</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</section>
 </section>
 <section id="variables">
 <h3>Variables<a class="headerlink" href="#variables" title="Link to this heading"></a></h3>
@@ -1615,21 +1660,24 @@ description of this benchmarking workflow, see the <a class="reference external"
 <td><p>Benchmark output sequence length.</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$tp_size</span></code></p></td>
-<td><p>Number of GPUs to run the benchmark with</p></td>
+<td><p>Tensor parallel mapping degree to run the benchmark with</p></td>
 </tr>
-<tr class="row-odd"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$engine_dir</span></code></p></td>
+<tr class="row-odd"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$pp_size</span></code></p></td>
+<td><p>Pipeline parallel mapping degree to run the benchmark with</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$engine_dir</span></code></p></td>
 <td><p>Location to store built engine file (can be deleted after running benchmarks).</p></td>
 </tr>
-<tr class="row-even"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$model_name</span></code></p></td>
+<tr class="row-odd"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$model_name</span></code></p></td>
 <td><p>HuggingFace model name eg. meta-llama/Llama-2-7b-hf or use the path to a local weights directory</p></td>
 </tr>
-<tr class="row-odd"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$dataset_file</span></code></p></td>
+<tr class="row-even"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$dataset_file</span></code></p></td>
 <td><p>Location of the dataset file generated by <code class="docutils literal notranslate"><span class="pre">prepare_dataset.py</span></code></p></td>
 </tr>
-<tr class="row-even"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$num_requests</span></code></p></td>
+<tr class="row-odd"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$num_requests</span></code></p></td>
 <td><p>The number of requests to generate for dataset generation</p></td>
 </tr>
-<tr class="row-odd"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$seq_len</span></code></p></td>
+<tr class="row-even"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">$seq_len</span></code></p></td>
 <td><p>A sequence length of ISL + OSL</p></td>
 </tr>
 </tbody>
@@ -1640,7 +1688,7 @@ description of this benchmarking workflow, see the <a class="reference external"
 <h2>Preparing a Dataset<a class="headerlink" href="#preparing-a-dataset" title="Link to this heading"></a></h2>
 <p>In order to prepare a dataset, you can use the provided <a class="reference download internal" download="" href="../_downloads/ea8faa5e98124e92f96b66dc586fb429/prepare_dataset.py"><span class="xref download myst">script</span></a>.
 To generate a synthetic dataset, run the following command:</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>benchmarks/cpp/prepare_dataset.py<span class="w"> </span>--output<span class="o">=</span><span class="nv">$dataset_file</span><span class="w"> </span>--tokenizer<span class="o">=</span><span class="nv">$model_name</span><span class="w"> </span>token-norm-dist<span class="w"> </span>--num-requests<span class="o">=</span><span class="nv">$num_requests</span><span class="w"> </span>--input-mean<span class="o">=</span><span class="nv">$isl</span><span class="w"> </span>--output-mean<span class="o">=</span><span class="nv">$osl</span><span class="w"> </span>--input-stdev<span class="o">=</span><span class="m">0</span><span class="w"> </span>--output-stdev<span class="o">=</span><span class="m">0</span><span class="w"> </span>&gt;<span class="w"> </span><span class="nv">$dataset_file</span>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>benchmarks/cpp/prepare_dataset.py<span class="w"> </span>--tokenizer<span class="o">=</span><span class="nv">$model_name</span><span class="w"> </span>--stdout<span class="w"> </span>token-norm-dist<span class="w"> </span>--num-requests<span class="o">=</span><span class="nv">$num_requests</span><span class="w"> </span>--input-mean<span class="o">=</span><span class="nv">$isl</span><span class="w"> </span>--output-mean<span class="o">=</span><span class="nv">$osl</span><span class="w"> </span>--input-stdev<span class="o">=</span><span class="m">0</span><span class="w"> </span>--output-stdev<span class="o">=</span><span class="m">0</span><span class="w"> </span>&gt;<span class="w"> </span><span class="nv">$dataset_file</span>
 </pre></div>
 </div>
 <p>The command will generate a text file located at the path specified <code class="docutils literal notranslate"><span class="pre">$dataset_file</span></code> where all requests are of the same
@@ -1685,24 +1733,46 @@ remain in the system longer and therefore require less requests to achieve stead
 <td><p>4096</p></td>
 <td><p>1500</p></td>
 </tr>
+<tr class="row-odd"><td><p>5000</p></td>
+<td><p>500</p></td>
+<td><p>5500</p></td>
+<td><p>1500</p></td>
+</tr>
+<tr class="row-even"><td><p>1000</p></td>
+<td><p>1000</p></td>
+<td><p>2000</p></td>
+<td><p>3000</p></td>
+</tr>
+<tr class="row-odd"><td><p>500</p></td>
+<td><p>2000</p></td>
+<td><p>2500</p></td>
+<td><p>3000</p></td>
+</tr>
+<tr class="row-even"><td><p>20000</p></td>
+<td><p>2000</p></td>
+<td><p>22000</p></td>
+<td><p>1000</p></td>
+</tr>
 </tbody>
 </table>
 </section>
 <section id="engine-building">
 <h2>Engine Building<a class="headerlink" href="#engine-building" title="Link to this heading"></a></h2>
-<p>All engines are built using the <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">build</span></code> sub-command. The basic command for FP8 quantized engines is as follows:</p>
-<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>trtllm-bench --model $model_name build --tp_size $tp_size --quantization FP8 --dataset $dataset_file
+<p>All engines are built using the <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">build</span></code> subcommand.
+The basic command for FP8 quantized engines is as follows:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>trtllm-bench --model $model_name build --tp_size $tp_size --pp_size $pp_size --quantization FP8 --dataset $dataset_file
 </pre></div>
 </div>
-<p>or if you would like to build for a specific sequence length:</p>
-<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>trtllm-bench --model $model_name build --tp_size $tp_size --quantization FP8 --max_seq_length $seq_len
+<p>When providing <code class="docutils literal notranslate"><span class="pre">--dataset</span></code> in the build subcommand, <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">build</span></code> uses high-level statistics of the dataset (average ISL/OSL, max sequence length) and tuning heuristics to optimize engine build settings.</p>
+<p>Alternatively, if you would like to build the engine with specific settings, you can do so by specifying the values for <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> and <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code>:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>trtllm-bench --model $model_name build --tp_size $tp_size --pp_size $pp_size --quantization FP8 --max_seq_len $seq_len --max_batch_size $max_bs --max_num_tokens $max_token
 </pre></div>
 </div>
 <p>If you would like to build an FP16 engine without any quantization, simply remove the <code class="docutils literal notranslate"><span class="pre">--quantization</span> <span class="pre">FP8</span></code> option.</p>
 <blockquote>
 <div><p>[!NOTE] If you specify FP8 quantization, the KV cache will automatically be set to FP8 as well!</p>
 </div></blockquote>
-<p>The <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">build</span></code> sub-command will output the path where the engine is located upon a successful build. For example,</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">build</span></code> subcommand will output the path where the engine is located upon a successful build. For example,</p>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="o">===========================================================</span>
 ENGINE<span class="w"> </span>SAVED:<span class="w"> </span>/tmp/meta-llama/Llama-2-7b-hf/tp_1_pp_1
 <span class="o">===========================================================</span>
@@ -1711,12 +1781,15 @@ ENGINE<span class="w"> </span>SAVED:<span class="w"> </span>/tmp/meta-llama/Llam
 </section>
 <section id="running-the-benchmark">
 <h2>Running the Benchmark<a class="headerlink" href="#running-the-benchmark" title="Link to this heading"></a></h2>
-<p>To run the benchmark with the generated data set, simply use the <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">throughput</span></code> sub-command. The benchmarker will
+<section id="id1">
+<h3>For non GH200 systems<a class="headerlink" href="#id1" title="Link to this heading"></a></h3>
+<p>To run the benchmark with the generated data set, simply use the <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">throughput</span></code> subcommand. The benchmarker will
 run an offline maximum throughput scenario such that all requests are queued in rapid succession. You simply need to provide
 the patch to the engine from the <a class="reference internal" href="#engine-building">build</a> phase and a <a class="reference internal" href="#preparing-a-dataset">generated dataset</a>.</p>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span><span class="nv">$model_name</span><span class="w"> </span>throughput<span class="w"> </span>--dataset<span class="w"> </span><span class="nv">$dataset_file</span><span class="w"> </span>--engine_dir<span class="w"> </span><span class="nv">$engine_dir</span>
 </pre></div>
 </div>
+<p>In majority of cases, we also use a higher KV cache percentage by setting <code class="docutils literal notranslate"><span class="pre">--kv_cache_free_gpu_mem_fraction</span> <span class="pre">0.95</span></code> in the benchmark command. This allows us to obtain better performance than the default setting of <code class="docutils literal notranslate"><span class="pre">0.90</span></code>. We fall back to <code class="docutils literal notranslate"><span class="pre">0.90</span></code> if we hit an out of memory issue.</p>
 <p>The results will be printed to the terminal upon benchmark completion. For example,</p>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="o">===========================================================</span>
 <span class="o">=</span><span class="w"> </span>ENGINE<span class="w"> </span><span class="nv">DETAILS</span>
@@ -1758,6 +1831,20 @@ means that the benchmark has hit an out of memory issue. Try reducing the KV cac
 using the <code class="docutils literal notranslate"><span class="pre">--kv_cache_free_gpu_mem_fraction</span></code> option to lower the percentage of used memory.</p>
 </div></blockquote>
 </section>
+<section id="id2">
+<h3>For GH200 systems only<a class="headerlink" href="#id2" title="Link to this heading"></a></h3>
+<p>For release v0.15, on GH200 systems, the recommendation is to use <em>gptManagerBenchmark</em> to measure performance. Throughput measurements are reported based on the below commands.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="w"> </span>/app/tensorrt_llm/benchmarks/cpp/gptManagerBenchmark<span class="w">  </span>--engine_dir<span class="w"> </span><span class="nv">$engine_dir</span><span class="w"> </span>--type<span class="w"> </span>IFB<span class="w"> </span>--dataset<span class="w"> </span><span class="nv">$dataset_file_json</span><span class="w"> </span>--eos_id<span class="w"> </span>-1<span class="w"> </span>--scheduler_policy<span class="w"> </span>guaranteed_no_evict<span class="w"> </span>--kv_cache_free_gpu_mem_fraction<span class="w"> </span><span class="m">0</span>.95<span class="w"> </span>--output_csv<span class="w"> </span>result.csv<span class="w"> </span>--request_rate<span class="w"> </span>-1.0<span class="w"> </span>--enable_chunked_context<span class="w"> </span>--warm_up<span class="w"> </span><span class="m">0</span>
+</pre></div>
+</div>
+<blockquote>
+<div><p>[!Warning] CUDA error: out of memory <br />
+For benchmarks with large models causing OOM error, the command above must be modified to use <code class="docutils literal notranslate"><span class="pre">--kv_cache_free_gpu_mem_fraction</span> <span class="pre">0.90</span></code> to avoid the scenario.</p>
+</div></blockquote>
+<p>The command will run the <code class="docutils literal notranslate"><span class="pre">gptManagerBenchmark</span></code> binary that will report the throughput and other metrics as part of its output
+that can be compared with the table in the <a class="reference internal" href="#throughput-measurements">Throughput Measurements</a> of this README.</p>
+</section>
+</section>
 </section>
 
 
@@ -1771,7 +1858,7 @@ using the <code class="docutils literal notranslate"><span class="pre">--kv_cach
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fc13e582e60>
+<jinja2.runtime.BlockReference object at 0x7f9458e17e90>
 
 <div class="footer">
     <p>
