@@ -1,6 +1,19 @@
-(speculative-decoding)=
-
 # Speculative Sampling
+
+- [About Speculative Sampling](#about-speculative-sampling)
+- [Performance Improvements](#Performance-improvements)
+- [Draft-Target-Model](#Draft-Target-Model)
+  - [Using Draft model approach with Triton Inference Server](#Using-Draft-model-approach-with-Triton-Inference-Server)
+- [Prompt-Lookup-Decoding](#prompt-lookup-decoding)
+- [Medusa](#medusa)
+  - [Medusa Tree](#medusa-tree)
+  - [Using Medusa with TensorRT-LLM](#using-medusa-with-tensorrt-llm)
+    - [Limitations](#limitations)
+- [ReDrafter](#redrafter)
+- [EAGLE](#eagle)
+- [Lookahead decoding](#lookahead-decoding)
+
+## About Speculative Sampling
 
 Speculative Sampling (also referred to as Speculative Decoding) is a set of techniques designed to allow generation of more than one token per forward pass iteration. This can lead to a reduction in the average per-token latency **in situations where the GPU
 is underutilized due to small batch sizes.**
@@ -22,6 +35,11 @@ TensorRT-LLM supports several approaches for generating draft tokens, including:
 2. Implementing additional language model heads that predict tokens for future positions:
     1. [Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads paper](https://arxiv.org/abs/2401.10774).
     2. [Recurrent Drafter for Fast Speculative Decoding in Large Language Models](https://arxiv.org/html/2403.09919v1).
+    3. [EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty](https://arxiv.org/pdf/2401.15077).
+3. Utilizing prompt tokens as draft tokens. For more information, refer to [Prompt Lookup Decoding](https://github.com/apoorvumang/prompt-lookup-decoding/).
+4. Utilizing Jacobi-like decoding to predict and verify draft tokens using the same model which does not need additional fine-tuning. Refer to [Break the Sequential Dependency of LLM Inference Using Lookahead Decoding](https://arxiv.org/pdf/2402.02057).
+
+
 
 ## Performance Improvements
 
@@ -32,11 +50,11 @@ may prove simpler than generating a summary for an article.
 Furthermore, when integrating Medusa with a standard PyTorch model implementation which may not be as finely
 tuned as TensorRT-LLM, the potential time savings are more pronounced.
 
-## Draft-Target-Model Approach
+## Draft-Target-Model
 
 The Draft-Target-Model involves the use of two distinct models trained independently but sharing the same vocabulary: a smaller Draft model and a larger Target model. For example, GPT 125M / 6.7B models can serve as the Draft / Target model.
 
-There are two styles of using Draft-Target-Model in TensorRT-LLM now. The first one is using TensorRT-LLM-BLS in Triton, which more information and detailed steps can be found in this document. The second one is using it directly in TensorRT-LLM, which steps can be found in [examples/draft_target_model/README.md](../../../examples/draft_target_model/README.md) and the code can be found in [examples/run.py](../../../examples/run.py).
+There are two styles of using Draft-Target-Model in TensorRT-LLM now. The first one is using TensorRT-LLM-BLS in Triton, which more information and detailed steps can be found in this document. The second one is using it directly in TensorRT-LLM, which steps can be found in [examples/draft_target_model/README.md](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/draft_target_model/README.md) and the code can be found in [examples/prompt_lookup/run_dtm_pld.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/prompt_lookup/run_dtm_pld.py).
 
 The management of Draft and Target models is facilitated through two separate `GptManager` instances.
 It is essential that you to coordinate the interactions between the Draft and Target models effectively.
@@ -60,7 +78,9 @@ it is advisable to enable KV cache reuse for both models.
 This can be achieved by adding the `--use_paged_context_fmha=enable` flag to the `trtllm-build` command
 and setting `enableBlockReuse=true` in the `KVCacheConfig`.
 
-### Using Draft model approach with Triton Inference Server
+### Using Draft-Target-Model approach with Triton Inference Server
+
+This example is only relevant for Draft-Target-Model model method. For all other speculative decoding models, you can deploy them in Triton server in the same way as standard non-speculative autoregressive models.
 
 + Draft model approach is supported since TensorRT-LLM-0.7.0 (using two separate Tritonserver to maintain draft and target model respectively), but has significant optimization in TensorRT-LLM-0.10.0 (using one Tritonserver with [Business Logic Scripting](https://github.com/triton-inference-server/python_backend?tab=readme-ov-file#business-logic-scripting), BLS).
 + The source file of Draft model with BLS can be found [here](https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/all_models/inflight_batcher_llm/tensorrt_llm_bls/1/lib/decode.py).
@@ -98,8 +118,8 @@ and setting `enableBlockReuse=true` in the `KVCacheConfig`.
     # FP8 mode
     export DRAFT_NAME=llama-7b-fp8-tp1
     export TARGET_NAME=llama-30b-fp8-tp1
-    python3 convert_checkpoint.py --model_dir=$DRAFT_MODEL_PATH --output_dir=ckpt/$DRAFT_NAME --tp_size=1
-    python3 convert_checkpoint.py --model_dir=$TARGET_MODEL_PATH --output_dir=ckpt/$TARGET_NAME --tp_size=1
+    python3 ../quantization/quantize.py --model_dir=$DRAFT_MODEL_PATH --dtype float16 --qformat fp8 --kv_cache_dtype fp8 --output_dir=ckpt/$DRAFT_NAME --tp_size=1
+    python3 ../quantization/quantize.py --model_dir=$TARGET_MODEL_PATH --dtype float16 --qformat fp8 --kv_cache_dtype fp8 --output_dir=ckpt/$TARGET_NAME --tp_size=1
     trtllm-build --checkpoint_dir=ckpt/$DRAFT_NAME --output_dir=engine/draft/$DRAFT_NAME $DRAFT_COMMAND_FP8
     trtllm-build --checkpoint_dir=ckpt/$TARGET_NAME --output_dir=engine/target/$TARGET_NAME $TARGET_COMMAND_FP8
     export DRAFT_ENGINE_PATH=$(pwd)/engine/draft/$DRAFT_NAME
@@ -159,7 +179,7 @@ and setting `enableBlockReuse=true` in the `KVCacheConfig`.
     # Make a copy of tensorrt_llm as configurations of draft / target models.
     cp -R ${TRITON_REPO}/tensorrt_llm ${TRITON_REPO}/tensorrt_llm_draft
     sed -i 's/name: "tensorrt_llm"/name: "tensorrt_llm_draft"/g' ${TRITON_REPO}/tensorrt_llm_draft/config.pbtxt
-    python3 tools/fill_template.py -i ${TRITON_REPO}/tensorrt_llm/config.pbtxt          triton_backend:${BACKEND},engine_dir:${ENGINE_PATH},decoupled_mode:${DECOUPLED_MODE},max_tokens_in_paged_kv_cache:${MAX_TOKENS_IN_KV_CACHE},max_attention_window_size:${MAX_ATTENTION_WINDOW_SIZE},batch_scheduler_policy:${BATCH_SCHEDULER_POLICY},batching_strategy:${BATCHING_STRATEGY},kv_cache_free_gpu_mem_fraction:${KV_CACHE_FREE_GPU_MEM_FRACTION},exclude_input_in_output:${EXCLUDE_INPUT_IN_OUTPUT},triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},max_queue_delay_microseconds:${MAX_QUEUE_DELAY_MICROSECONDS},max_beam_width:${MAX_BEAM_WIDTH},enable_kv_cache_reuse:${ENABLE_KV_CACHE_REUSE},normalize_log_probs:${NORMALIZE_LOG_PROBS},enable_chunked_context:${ENABLE_CHUNKED_CONTEXT},gpu_device_ids:${TARGET_GPU_DEVICE_IDS},decoding_mode:${DECODING_MODE}
+    python3 tools/fill_template.py -i ${TRITON_REPO}/tensorrt_llm/config.pbtxt          triton_backend:${BACKEND},engine_dir:${ENGINE_PATH},decoupled_mode:${DECOUPLED_MODE},max_tokens_in_paged_kv_cache:${MAX_TOKENS_IN_KV_CACHE},max_attention_window_size:${MAX_ATTENTION_WINDOW_SIZE},batch_scheduler_policy:${BATCH_SCHEDULER_POLICY},batching_strategy:${BATCHING_STRATEGY},kv_cache_free_gpu_mem_fraction:${KV_CACHE_FREE_GPU_MEM_FRACTION},exclude_input_in_output:${EXCLUDE_INPUT_IN_OUTPUT},triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},max_queue_delay_microseconds:${MAX_QUEUE_DELAY_MICROSECONDS},max_beam_width:${MAX_BEAM_WIDTH},enable_kv_cache_reuse:${ENABLE_KV_CACHE_REUSE},normalize_log_probs:${NORMALIZE_LOG_PROBS},enable_chunked_context:${ENABLE_CHUNKED_CONTEXT},gpu_device_ids:${TARGET_GPU_DEVICE_IDS},decoding_mode:${DECODING_MODE},encoder_input_features_data_type:TYPE_FP16
     python3 tools/fill_template.py -i ${TRITON_REPO}/tensorrt_llm_draft/config.pbtxt    triton_backend:${BACKEND},engine_dir:${DRAFT_ENGINE_PATH},decoupled_mode:${DECOUPLED_MODE},max_tokens_in_paged_kv_cache:${MAX_TOKENS_IN_KV_CACHE},max_attention_window_size:${MAX_ATTENTION_WINDOW_SIZE},batch_scheduler_policy:${BATCH_SCHEDULER_POLICY},batching_strategy:${BATCHING_STRATEGY},kv_cache_free_gpu_mem_fraction:${KV_CACHE_FREE_GPU_MEM_FRACTION},exclude_input_in_output:${EXCLUDE_INPUT_IN_OUTPUT},triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},max_queue_delay_microseconds:${MAX_QUEUE_DELAY_MICROSECONDS},max_beam_width:${MAX_BEAM_WIDTH},enable_kv_cache_reuse:${ENABLE_KV_CACHE_REUSE},normalize_log_probs:${NORMALIZE_LOG_PROBS},enable_chunked_context:${ENABLE_CHUNKED_CONTEXT},gpu_device_ids:${DRAFT_GPU_DEVICE_IDS},decoding_mode:${DECODING_MODE}
     ```
 
@@ -213,12 +233,80 @@ and setting `enableBlockReuse=true` in the `KVCacheConfig`.
         --verbose
     ```
 
-5. Kill Tritonserver after finishing inference
+5. Enable fast logits D2D transfer when `"use_draft_logits": True`
+    + Obtaining adjusted logits distribution from draft logits is a proposed method in the [Fast Inference from Transformers via Speculative Decoding paper](https://arxiv.org/pdf/2211.17192.pdf). Fast logits feature boosts the performance (TPS) by hiding the latency of logits transfer from draft engine to target engine.
+    + Fast logits feature is newly supported in TensorRT-LLM-0.15.0.
+    + Modify `participant_ids` entry in `tensorrt_llm/config.pbtxt` and `tensorrt_llm_draft/config.pbtxt` to suitable MPI ranks. Usually in this setting, rank 0 is reserved for the orchestrator rank; rank 1 is for draft engine; the rest of the ranks are for target engine. In this example, `particpant_ids` can be set as snippet below. Same logic also applies to TP>1 target engine.
+    ```
+    ### In tensorrt_llm_draft/config.pbtxt
+    parameters: {
+        key: "gpu_device_ids"
+        value: {
+            string_value: "0"
+        }
+    }
+    parameters: {
+        key: "participant_ids"
+        value: {
+            string_value: "1"
+        }
+    }
+    ### In tensorrt_llm/config.pbtxt
+    parameters: {
+        key: "gpu_device_ids"
+        value: {
+            string_value: "1"
+        }
+    }
+    parameters: {
+        key: "participant_ids"
+        value: {
+            string_value: "2"
+        }
+    }
+    ```
+    + Enable `speculative_decoding_fast_logits` in both `tensorrt_llm/config.pbtxt` and `tensorrt_llm_draft/config.pbtxt`.
+    ```
+    parameters: {
+        key: "speculative_decoding_fast_logits"
+        value: {
+            string_value: "1"
+        }
+    }
+    ```
+    + Fast logits feature requires Tritonserver to be launched in orchestrator mode with `--disable-spawn-process`. See [model config](https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/docs/model_config.md) for more information. `--world_size` has to be set as 1 (orchestrator rank 0) + 1 (draft engine ranks) + 1 (target engine ranks).
+    ```bash
+    python3 scripts/launch_triton_server.py \
+        --model_repo=$TRITON_REPO \
+        --tensorrt_llm_model_name "tensorrt_llm,tensorrt_llm_draft" \
+        --multi-model \
+        --disable-spawn-processes \
+        --world_size=3 --log &
+    ```
+    + Send request with `use_draft_logits` to tritonserver BLS API:
+    ```
+    curl -X POST "http://localhost:8000/v2/models/tensorrt_llm_bls/generate" \
+        -H "Content-Type: application/json" \
+        -d '{
+            "text_input": "Continue writing the following story: James Best, best known for his",
+            "max_tokens": 128,
+            "num_draft_tokens": 10,
+            "use_draft_logits": true,
+            "stream": false
+            }'
+    ```
+    + With the fast logits enabled and following optimization tips in [model configuration](https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/docs/model_config.md#some-tips-for-model-configuration), speculative decoding with draft logits achieves 2.x throughput in BS1, 1.x throughput in BS16 comparing to auto-regressive decoding using Llama 3.2 1B draft and Llama 3.1 70B target.
+
+6. Kill Tritonserver after finishing inference
 
     ```bash
     pkill -9 -f trtllmExecutorWorker
     pkill -9 -f tritonserver
     ```
+
+## Prompt-Lookup-Decoding
+
+See document in [examples/prompt_lookup/README.md](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/prompt_lookup/README.md) and the code can be found in [examples/prompt_lookup/run_dtm_pld.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/prompt_lookup/run_dtm_pld.py).
 
 ## Medusa
 
@@ -304,95 +392,22 @@ For guidance on constructing and executing Medusa with the Python runtime, consu
 
 - TensorRT-LLM supports Medusa only for Vicuna (fine tuned LLaMA).
 However, similar to any new model, you can follow the same approach to define your own Medusa model and deploy with TensorRT-LLM.
-- We match only tokens during the validation phasem that is `medusa_temperature=0`.
+- We match only tokens during the validation phase that is `medusa_temperature=0`.
 - Beam search is **not** compatible with Medusa.
 
 
 ## ReDrafter
 
-This approach enhances the single-model Medusa method by predicting and verifying tokens using the same model. However, unlike Medusa, it predicts draft tokens using a recurrent predictor, where each draft token depends on the previous one. This method also allows the use of beam search to identify more prominent draft tokens. For more details, please read [the ReDrafter paper](https://arxiv.org/html/2403.09919v1).
+The ReDrafter approach enhances the single-model Medusa method by predicting and verifying tokens using the same model. However, unlike Medusa, it predicts draft tokens using a recurrent predictor, where each draft token depends on the previous one. This method also allows the use of beam search to identify more prominent draft tokens. For more details, please read [the ReDrafter paper](https://arxiv.org/html/2403.09919v1).
 
-TensorRT-LLM implements the ReDrafter model such that logits prediction, beam search, and draft token acceptance are performed inside the TensorRT engine. This contrasts with standard model inference, which only predicts logits and performs decoding outside the engine. Since the engine predicts explicit draft tokens instead of implicit tokens decoded from logits, we categorize this speculative decoding method as `explicit_draft_tokens`. Please, visit the [ReDrafter README](../../examples/redrafter/README.md) for information about building and running the model. ReDrafter supports both Inflight Fused Batching runtime and Python static batching runtime.
+TensorRT-LLM implements the ReDrafter model such that logits prediction, beam search, and draft token acceptance are performed inside the TensorRT engine. This contrasts with standard model inference, which only predicts logits and performs decoding outside the engine. Since the engine predicts explicit draft tokens instead of implicit tokens decoded from logits, we categorize this speculative decoding method as `explicit_draft_tokens`. Please, visit the [ReDrafter README](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/redrafter/README.md) for information about building and running the model. ReDrafter supports both Inflight Fused Batching runtime and Python static batching runtime.
 
-# Lookahead decoding
+## EAGLE
 
-## Overview
+The EAGLE approach enhances the single-model Medusa method by predicting and verifying tokens using the same model. Similarly to ReDrafter, it predicts draft tokens using a recurrent predictor where each draft token depends on the previous one. However, unlike ReDrafter, it uses a single-layer transformer model to predict draft tokens from previous hidden states and decoded tokens. In the EAGLE-1 decoding tree needs to be known during the decoding. In the EAGLE-2 this tree is asssembled during the execution by searching for the most probable hypothesis along the beam.
 
-Lookahead is a general feature of all LLM models. This tutorial uses vicuna-7b-v1.3 as an example. Some models may have limitations to apply this Lookahead feature, known as specific XQA support.
+Similarly to ReDrafter, TensorRT-LLM implements the EAGLE model such that logits prediction, draft tokens acceptance and draft token generation are performed inside of the TensorRT engine. Only EAGLE-1 with greedy sampling and acceptance is supported. Please, visit the [EAGLE README](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/eagle/README.md) for information about building and running the model.
 
-Lookahead algorithm depends on a tuple of `(windows_size, ngram_size, verification_set_size)`. TensorRT-LLM needs to specify the Lookahead configurations in three places:
+## Lookahead Decoding
 
-1. *The built model engine*.
-
-To build an engine with Lookahead support, `--specualtive_decoding_mode lookahead_decoding` must be specified.
-
-When building the engine for speculative decoding, including Lookahead, `--max_draft_len` must be provided. For Lookahead, the `max_draft_len` is defined as:
-```python
-def max_draft_len(windows_size, ngram_size, verification_set_size):
-    return (0 if (ngran_size==1) else ngram_size - 2)
-        + (windows_size - 1 + verification_set_size) * (ngram_size - 1)
-```
-
-2. *The TensorRT-LLM runtime program*.
-When TensorRT-LLM starts, it needs to reserve resources according to an `executor_lookahead_config`. The configuration should be equal to the config in the engine-building phase. The executor lookahead configuration is noted as `(W, N, G)`.
-
-3. *The request*.
-Each request can be assigned a specific lookahead configuration when input to the execution engine, noted as `(w, n, g)`. If none is assigned, the executor config is used. The request lookahead config is valid and fixed along the request lifecycle. The minimum Lookahead config is `(1, 1, 0)`, meaning only one Jacobi window, ngram size one, and no verification candidates, which is automatically degenerated to normal mode. The meaningful minimum configuration is `(2, 2, 1)`. It is required that the request lookahead config and executor config satisfy `w <= W, n <= N, g <= G`.
-
-## Build and execute an engine from a model
-
-Vicuna models reuse Llmama Python scripts located in [examples/llama](../../examples/llama).
-
-### Convert a model to checkpoint
-```bash
-MODEL_DIR=/path/to/vicuna-7b-v1.3
-ENGINE_DIR=tmp/engine
-CKPT_DIR=tmp/engine/ckpt
-
-python3 examples/llama/convert_checkpoint.py    \
-    --model_dir=$MODEL_DIR                      \
-    --output_dir=$CKPT_DIR                      \
-    --dtype=float16                             \
-    --tp_size=1                                 \
-    --pp_size=1
-```
-
-### Build checkpoints for an engine
-```bash
-trtllm-build                        \
-    --checkpoint_dir=$CKPT_DIR      \
-    --output_dir=$ENGINE_DIR        \
-    --gpt_attention_plugin=float16  \
-    --gemm_plugin=float16           \
-    --max_batch_size=32             \
-    --max_input_len=1024            \
-    --max_seq_len=2048              \
-    --max_beam_width=1              \
-    --log_level=error               \
-    --max_draft_len=83              \
-    --speculative_decoding_mode=lookahead_decoding
-```
-
-### Execute an engine
-
-Run `examples/run.py` to generate sequences.
-```bash
-python examples/run.py          \
-    --tokenizer_dir=$MODEL_DIR  \
-    --engine_dir=$ENGINE_DIR    \
-    --max_output_len=32         \
-    --lookahead_config=[7,7,7]  \
-    --log_level=verbose         \
-    --input_text 'Once upon' 'To be, or not' 'Be not afraid of greatness'
-```
-
-Run `examples/summarize.py` to summarize the CNN daily dataset.
-```bash
-python examples/summarize.py    \
-    --test_hf                   \
-    --test_trt_llm              \
-    --hf_model_dir=$MODEL_DIR   \
-    --engine_dir=$ENGINE_DIR    \
-    --data_type=fp16            \
-    --lookahead_config=[7,7,7]
-```
+Lookahead decoding algorithm operates through two parallel computation branches within the same model: a lookahead branch that generates n-grams using a fixed-sized 2D window, and a verification branch that validates promising n-gram candidates. This approach eliminates the necessity for additional model training or fine-tuning and can be enabled for any autoregressive model. Refer to the [Lookahead decoding README](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/lookahead/README.md) for information about building and running the model.

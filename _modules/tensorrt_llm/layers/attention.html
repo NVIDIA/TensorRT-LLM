@@ -1,3 +1,5 @@
+
+
 <!DOCTYPE html>
 <html class="writer-html5" lang="en" data-content_root="../../../">
 <head>
@@ -5,21 +7,17 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>tensorrt_llm.layers.attention &mdash; tensorrt_llm  documentation</title>
       <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=80d5e7a1" />
-      <link rel="stylesheet" type="text/css" href="../../../_static/css/theme.css?v=19f00094" />
+      <link rel="stylesheet" type="text/css" href="../../../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
 
   
-  <!--[if lt IE 9]>
-    <script src="../../../_static/js/html5shiv.min.js"></script>
-  <![endif]-->
-  
-        <script src="../../../_static/jquery.js?v=5d32c60e"></script>
-        <script src="../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-        <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="../../../_static/doctools.js?v=888ff710"></script>
-        <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
-        <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
-        <script src="../../../_static/copybutton.js?v=f281be69"></script>
+      <script src="../../../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="../../../_static/doctools.js?v=888ff710"></script>
+      <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
+      <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
     <script src="../../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../../genindex.html" />
     <link rel="search" title="Search" href="../../../search.html" /> 
@@ -57,6 +55,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../installation/windows.html">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul>
@@ -86,6 +85,7 @@
 <p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-serve.html">trtllm-serve</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
@@ -104,14 +104,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/executor.html">Executor API</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/inference-request.html">Inference Request</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../advanced/speculative-decoding.html#lookahead-decoding">Lookahead decoding</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul>
@@ -183,8 +181,8 @@
 <span class="kn">import</span> <span class="nn">torch</span>
 
 <span class="kn">from</span> <span class="nn">.._common</span> <span class="kn">import</span> <span class="n">default_net</span><span class="p">,</span> <span class="n">precision</span>
-<span class="kn">from</span> <span class="nn">.._utils</span> <span class="kn">import</span> <span class="p">(</span><span class="n">fp32_array</span><span class="p">,</span> <span class="n">int32_array</span><span class="p">,</span> <span class="n">is_same_dtype</span><span class="p">,</span> <span class="n">trt_dtype_to_np</span><span class="p">,</span>
-                      <span class="n">trt_dtype_to_str</span><span class="p">)</span>
+<span class="kn">from</span> <span class="nn">.._utils</span> <span class="kn">import</span> <span class="p">(</span><span class="n">fp32_array</span><span class="p">,</span> <span class="n">int32_array</span><span class="p">,</span> <span class="n">is_same_dtype</span><span class="p">,</span> <span class="n">set_obj_attrs</span><span class="p">,</span>
+                      <span class="n">trt_dtype_to_np</span><span class="p">,</span> <span class="n">trt_dtype_to_str</span><span class="p">)</span>
 <span class="kn">from</span> <span class="nn">..functional</span> <span class="kn">import</span> <span class="p">(</span><span class="n">ACT2FN</span><span class="p">,</span> <span class="n">AllReduceFusionParams</span><span class="p">,</span> <span class="n">AttentionMaskType</span><span class="p">,</span>
                           <span class="n">Conditional</span><span class="p">,</span> <span class="n">LayerNormType</span><span class="p">,</span> <span class="n">PositionEmbeddingType</span><span class="p">,</span>
                           <span class="n">RopeEmbeddingUtils</span><span class="p">,</span> <span class="n">RotaryScalingType</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span>
@@ -195,6 +193,7 @@
 <span class="kn">from</span> <span class="nn">..functional</span> <span class="kn">import</span> <span class="nb">max</span> <span class="k">as</span> <span class="n">fmax</span>
 <span class="kn">from</span> <span class="nn">..functional</span> <span class="kn">import</span> <span class="p">(</span><span class="n">minimum</span><span class="p">,</span> <span class="n">repeat_interleave</span><span class="p">,</span> <span class="n">shape</span><span class="p">,</span> <span class="nb">slice</span><span class="p">,</span> <span class="n">softmax</span><span class="p">,</span>
                           <span class="n">split</span><span class="p">,</span> <span class="n">unsqueeze</span><span class="p">,</span> <span class="n">where</span><span class="p">)</span>
+<span class="kn">from</span> <span class="nn">..mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
 <span class="kn">from</span> <span class="nn">..module</span> <span class="kn">import</span> <span class="n">Module</span>
 <span class="kn">from</span> <span class="nn">..parameter</span> <span class="kn">import</span> <span class="n">Parameter</span>
 <span class="kn">from</span> <span class="nn">..quantization</span> <span class="kn">import</span> <span class="n">QuantMode</span>
@@ -449,6 +448,20 @@
 
 
 
+<div class="viewcode-block" id="MropeParams">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.MropeParams">[docs]</a>
+<span class="k">class</span> <span class="nc">MropeParams</span><span class="p">:</span>
+
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">mrope_rotary_sin_cos</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">mrope_position_deltas</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">mrope_rotary_sin_cos</span> <span class="o">=</span> <span class="n">mrope_rotary_sin_cos</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">mrope_position_deltas</span> <span class="o">=</span> <span class="n">mrope_position_deltas</span></div>
+
+
+
 <div class="viewcode-block" id="KeyValueCacheParams">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.KeyValueCacheParams">[docs]</a>
 <span class="k">class</span> <span class="nc">KeyValueCacheParams</span><span class="p">:</span>
@@ -580,7 +593,8 @@
                  <span class="n">block_sparse_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                  <span class="n">use_implicit_relative_attention</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                  <span class="n">reorder</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                 <span class="n">layer_idx_in_cache_pool</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+                 <span class="n">layer_idx_in_cache_pool</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                 <span class="n">enable_qkv</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">local_layer_idx</span> <span class="o">=</span> <span class="n">local_layer_idx</span>
@@ -639,6 +653,7 @@
                 <span class="s2">&quot;type&quot;</span><span class="p">,</span> <span class="n">rotary_embedding_scaling</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;rope_type&quot;</span><span class="p">))</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_scale_type</span> <span class="o">=</span> <span class="n">RotaryScalingType</span><span class="o">.</span><span class="n">from_string</span><span class="p">(</span>
                 <span class="n">rotary_scaling_type</span><span class="p">)</span>
+
             <span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_scale</span> <span class="o">=</span> <span class="n">rotary_embedding_scaling</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
                 <span class="s2">&quot;factor&quot;</span><span class="p">,</span> <span class="mf">1.0</span><span class="p">)</span>
 
@@ -673,17 +688,18 @@
 
         <span class="c1"># out dim is not necessarily hidden_size + kv specific size (in MQA/GQA), but num_heads * heads_size</span>
         <span class="c1"># example: d_model != num_heads * head_size in Flan-T5/ByT5/Gemma</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">qkv</span> <span class="o">=</span> <span class="n">ColumnLinear</span><span class="p">(</span>
-            <span class="n">hidden_size</span><span class="p">,</span>
-            <span class="n">tp_size</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span> <span class="o">+</span>
-            <span class="p">(</span><span class="mi">2</span> <span class="o">*</span> <span class="n">tp_size</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_kv_heads</span> <span class="o">*</span>
-             <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span><span class="p">),</span>
-            <span class="n">bias</span><span class="o">=</span><span class="n">bias</span><span class="p">,</span>
-            <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
-            <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
-            <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
-            <span class="n">gather_output</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-            <span class="n">is_qkv</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">enable_qkv</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">qkv</span> <span class="o">=</span> <span class="n">ColumnLinear</span><span class="p">(</span>
+                <span class="n">hidden_size</span><span class="p">,</span>
+                <span class="n">tp_size</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span> <span class="o">+</span>
+                <span class="p">(</span><span class="mi">2</span> <span class="o">*</span> <span class="n">tp_size</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_kv_heads</span> <span class="o">*</span>
+                 <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span><span class="p">),</span>
+                <span class="n">bias</span><span class="o">=</span><span class="n">bias</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+                <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
+                <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
+                <span class="n">gather_output</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                <span class="n">is_qkv</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">dense</span> <span class="o">=</span> <span class="n">RowLinear</span><span class="p">(</span><span class="n">tp_size</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span> <span class="o">*</span>
                                <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span><span class="p">,</span>
                                <span class="n">hidden_size</span><span class="p">,</span>
@@ -889,26 +905,32 @@
 
 <div class="viewcode-block" id="Attention.forward">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.Attention.forward">[docs]</a>
-    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
-                <span class="n">hidden_states</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
-                <span class="n">attention_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">attention_packed_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">use_cache</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                <span class="n">spec_decoding_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">kv_cache_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">attention_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">encoder_output</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-                <span class="n">position_embedding</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">norm_before_bmm1</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                <span class="n">lora_layer_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">cross_kv_cache_gen</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-                <span class="n">cross_kv_reuse</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-                <span class="n">reduce_fusion_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">AllReduceFusionParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">hidden_states</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">attention_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">attention_packed_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">use_cache</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">spec_decoding_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">mrope_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">kv_cache_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">attention_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">encoder_output</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">position_embedding</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">norm_before_bmm1</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">lora_layer_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">cross_kv_cache_gen</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">cross_kv_reuse</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">reduce_fusion_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">AllReduceFusionParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">skip_attn</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+    <span class="p">):</span>
 
         <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">)</span>
 
         <span class="n">spec_decoding_params</span> <span class="o">=</span> <span class="n">SpecDecodingParams</span><span class="p">(</span>
         <span class="p">)</span> <span class="k">if</span> <span class="n">spec_decoding_params</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">spec_decoding_params</span>
+
+        <span class="n">mrope_params</span> <span class="o">=</span> <span class="n">MropeParams</span><span class="p">()</span> <span class="k">if</span> <span class="n">mrope_params</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">mrope_params</span>
 
         <span class="n">alibi_slopes</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">position_embedding_type</span><span class="o">.</span><span class="n">is_alibi</span><span class="p">():</span>
@@ -1067,41 +1089,61 @@
             <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">encoder_output</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">)</span>
 
             <span class="k">def</span> <span class="nf">compute_cross_kv</span><span class="p">(</span><span class="n">encoder_output</span><span class="p">):</span>
-                <span class="n">cross_qkv</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">qkv</span><span class="p">(</span><span class="n">encoder_output</span><span class="p">,</span> <span class="n">qkv_lora_params</span><span class="p">)</span>
-                <span class="n">base_shape</span> <span class="o">=</span> <span class="n">shape</span><span class="p">(</span>
-                    <span class="n">cross_qkv</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="k">if</span> <span class="n">cross_qkv</span><span class="o">.</span><span class="n">ndim</span><span class="p">()</span> <span class="o">==</span> <span class="mi">2</span> <span class="k">else</span> <span class="n">concat</span><span class="p">(</span>
-                        <span class="p">[</span><span class="n">shape</span><span class="p">(</span><span class="n">cross_qkv</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span>
-                         <span class="n">shape</span><span class="p">(</span><span class="n">cross_qkv</span><span class="p">,</span> <span class="mi">1</span><span class="p">)])</span>
+                <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s1">&#39;kv&#39;</span><span class="p">):</span>
+                    <span class="c1"># We optimize the graph by adding kv in the cross attention layer, preventing computing the</span>
+                    <span class="c1"># query of encoder_output.</span>
+                    <span class="k">assert</span> <span class="n">qkv_lora_params</span> <span class="o">==</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;Not support LoRA when we only compute key/value in cross atteniton&quot;</span>
+                    <span class="c1"># see optimization_model&#39;s optimize_cross_qkv</span>
+                    <span class="n">cross_kv</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv</span><span class="p">(</span><span class="n">encoder_output</span><span class="p">,</span> <span class="n">qkv_lora_params</span><span class="p">)</span>
+                    <span class="n">base_shape</span> <span class="o">=</span> <span class="n">shape</span><span class="p">(</span>
+                        <span class="n">cross_kv</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="k">if</span> <span class="n">cross_kv</span><span class="o">.</span><span class="n">ndim</span><span class="p">()</span> <span class="o">==</span> <span class="mi">2</span> <span class="k">else</span> <span class="n">concat</span><span class="p">(</span>
+                            <span class="p">[</span><span class="n">shape</span><span class="p">(</span><span class="n">cross_kv</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span>
+                             <span class="n">shape</span><span class="p">(</span><span class="n">cross_kv</span><span class="p">,</span> <span class="mi">1</span><span class="p">)])</span>
+                    <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">qk_layernorm</span><span class="p">:</span>
+                        <span class="n">cross_kv</span> <span class="o">=</span> <span class="n">cross_kv</span><span class="o">.</span><span class="n">view</span><span class="p">(</span>
+                            <span class="n">concat</span><span class="p">([</span>
+                                <span class="n">base_shape</span><span class="p">,</span> <span class="mi">2</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_kv_heads</span><span class="p">,</span>
+                                <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span>
+                            <span class="p">]))</span>
 
-                <span class="n">cross_qkv</span> <span class="o">=</span> <span class="n">cross_qkv</span><span class="o">.</span><span class="n">view</span><span class="p">(</span>
-                    <span class="n">concat</span><span class="p">([</span>
-                        <span class="n">base_shape</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span> <span class="o">+</span>
-                        <span class="mi">2</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_kv_heads</span><span class="p">,</span>
-                        <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span>
-                    <span class="p">]))</span>
+                        <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="o">=</span> <span class="n">split</span><span class="p">(</span><span class="n">cross_kv</span><span class="p">,</span> <span class="p">[</span>
+                            <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_kv_heads</span><span class="p">,</span>
+                            <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_kv_heads</span>
+                        <span class="p">],</span>
+                                           <span class="n">dim</span><span class="o">=</span><span class="n">cross_kv</span><span class="o">.</span><span class="n">ndim</span><span class="p">()</span> <span class="o">-</span> <span class="mi">2</span><span class="p">)</span>
 
-                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">qk_layernorm</span><span class="p">:</span>
-                    <span class="n">_</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="o">=</span> <span class="n">split</span><span class="p">(</span><span class="n">cross_qkv</span><span class="p">,</span> <span class="p">[</span>
-                        <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_kv_heads</span><span class="p">,</span>
-                        <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_kv_heads</span>
-                    <span class="p">],</span>
-                                          <span class="n">dim</span><span class="o">=</span><span class="n">cross_qkv</span><span class="o">.</span><span class="n">ndim</span><span class="p">()</span> <span class="o">-</span> <span class="mi">2</span><span class="p">)</span>
+                        <span class="n">key</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">k_layernorm</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
+                        <span class="n">cross_kv</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span><span class="n">key</span><span class="p">,</span> <span class="n">value</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="n">key</span><span class="o">.</span><span class="n">ndim</span><span class="p">()</span> <span class="o">-</span> <span class="mi">2</span><span class="p">)</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="n">cross_qkv</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">qkv</span><span class="p">(</span><span class="n">encoder_output</span><span class="p">,</span> <span class="n">qkv_lora_params</span><span class="p">)</span>
+                    <span class="n">base_shape</span> <span class="o">=</span> <span class="n">shape</span><span class="p">(</span>
+                        <span class="n">cross_qkv</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="k">if</span> <span class="n">cross_qkv</span><span class="o">.</span><span class="n">ndim</span><span class="p">()</span> <span class="o">==</span> <span class="mi">2</span> <span class="k">else</span> <span class="n">concat</span><span class="p">(</span>
+                            <span class="p">[</span><span class="n">shape</span><span class="p">(</span><span class="n">cross_qkv</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span>
+                             <span class="n">shape</span><span class="p">(</span><span class="n">cross_qkv</span><span class="p">,</span> <span class="mi">1</span><span class="p">)])</span>
 
-                    <span class="n">key</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">k_layernorm</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
-                    <span class="n">key</span> <span class="o">=</span> <span class="n">key</span><span class="o">.</span><span class="n">view</span><span class="p">(</span>
+                    <span class="n">cross_qkv</span> <span class="o">=</span> <span class="n">cross_qkv</span><span class="o">.</span><span class="n">view</span><span class="p">(</span>
                         <span class="n">concat</span><span class="p">([</span>
-                            <span class="n">base_shape</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_kv_heads</span><span class="p">,</span>
+                            <span class="n">base_shape</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span> <span class="o">+</span>
+                            <span class="mi">2</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_kv_heads</span><span class="p">,</span>
                             <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_size</span>
                         <span class="p">]))</span>
 
-                    <span class="n">cross_kv</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span><span class="n">key</span><span class="p">,</span> <span class="n">value</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="n">key</span><span class="o">.</span><span class="n">ndim</span><span class="p">()</span> <span class="o">-</span> <span class="mi">2</span><span class="p">)</span>
-                <span class="k">else</span><span class="p">:</span>
-                    <span class="n">_</span><span class="p">,</span> <span class="n">cross_kv</span> <span class="o">=</span> <span class="n">split</span><span class="p">(</span><span class="n">cross_qkv</span><span class="p">,</span> <span class="p">[</span>
-                        <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">,</span>
-                        <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_kv_heads</span> <span class="o">*</span> <span class="mi">2</span>
-                    <span class="p">],</span>
-                                        <span class="n">dim</span><span class="o">=</span><span class="n">cross_qkv</span><span class="o">.</span><span class="n">ndim</span><span class="p">()</span> <span class="o">-</span> <span class="mi">2</span><span class="p">)</span>
+                    <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">qk_layernorm</span><span class="p">:</span>
+                        <span class="n">_</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="o">=</span> <span class="n">split</span><span class="p">(</span><span class="n">cross_qkv</span><span class="p">,</span> <span class="p">[</span>
+                            <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">,</span>
+                            <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_kv_heads</span><span class="p">,</span>
+                            <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_kv_heads</span>
+                        <span class="p">],</span>
+                                              <span class="n">dim</span><span class="o">=</span><span class="n">cross_qkv</span><span class="o">.</span><span class="n">ndim</span><span class="p">()</span> <span class="o">-</span> <span class="mi">2</span><span class="p">)</span>
 
+                        <span class="n">key</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">k_layernorm</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
+                        <span class="n">cross_kv</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span><span class="n">key</span><span class="p">,</span> <span class="n">value</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="n">key</span><span class="o">.</span><span class="n">ndim</span><span class="p">()</span> <span class="o">-</span> <span class="mi">2</span><span class="p">)</span>
+                    <span class="k">else</span><span class="p">:</span>
+                        <span class="n">_</span><span class="p">,</span> <span class="n">cross_kv</span> <span class="o">=</span> <span class="n">split</span><span class="p">(</span><span class="n">cross_qkv</span><span class="p">,</span> <span class="p">[</span>
+                            <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">,</span>
+                            <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_kv_heads</span> <span class="o">*</span> <span class="mi">2</span>
+                        <span class="p">],</span>
+                                            <span class="n">dim</span><span class="o">=</span><span class="n">cross_qkv</span><span class="o">.</span><span class="n">ndim</span><span class="p">()</span> <span class="o">-</span> <span class="mi">2</span><span class="p">)</span>
                 <span class="n">cross_kv</span> <span class="o">=</span> <span class="n">cross_kv</span><span class="o">.</span><span class="n">view</span><span class="p">(</span>
                     <span class="n">concat</span><span class="p">([</span>
                         <span class="n">base_shape</span><span class="p">,</span> <span class="mi">2</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_kv_heads</span> <span class="o">*</span>
@@ -1289,10 +1331,13 @@
                 <span class="n">spec_decoding_position_offsets</span><span class="p">,</span>
                 <span class="n">spec_decoding_packed_mask</span><span class="o">=</span><span class="n">spec_decoding_params</span><span class="o">.</span>
                 <span class="n">spec_decoding_packed_mask</span><span class="p">,</span>
-                <span class="n">qk_tanh_scale</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_attn_value</span><span class="p">,</span>
+                <span class="n">mrope_rotary_sin_cos</span><span class="o">=</span><span class="n">mrope_params</span><span class="o">.</span><span class="n">mrope_rotary_sin_cos</span><span class="p">,</span>
+                <span class="n">mrope_position_deltas</span><span class="o">=</span><span class="n">mrope_params</span><span class="o">.</span><span class="n">mrope_position_deltas</span><span class="p">,</span>
+                <span class="n">attn_logit_softcapping_scale</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_attn_value</span><span class="p">,</span>
                 <span class="n">host_runtime_perf_knobs</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span>
                 <span class="n">host_runtime_perf_knobs</span><span class="p">,</span>
                 <span class="n">host_context_progress</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span><span class="n">host_context_progress</span><span class="p">,</span>
+                <span class="n">skip_attn</span><span class="o">=</span><span class="n">skip_attn</span><span class="p">,</span>
             <span class="p">)</span>
 
         <span class="k">else</span><span class="p">:</span>
@@ -1630,11 +1675,23 @@
             <span class="n">dense_lora_params</span> <span class="o">=</span> <span class="n">lora_layer_params</span><span class="o">.</span><span class="n">get_runtime_params</span><span class="p">(</span>
                 <span class="mi">0</span><span class="p">,</span> <span class="s2">&quot;attn_dense&quot;</span><span class="p">)</span>
 
+        <span class="k">if</span> <span class="n">skip_attn</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="c1"># This case is used when we can skip this attention layer directly.</span>
+            <span class="c1"># The output would be undefined and not used if skip_attn is not None</span>
+            <span class="c1"># and set skip_attn as True during runtime</span>
+
+            <span class="n">dense_conditional</span> <span class="o">=</span> <span class="n">Conditional</span><span class="p">(</span><span class="n">skip_attn</span><span class="p">)</span>
+            <span class="n">skip_case</span> <span class="o">=</span> <span class="n">dense_conditional</span><span class="o">.</span><span class="n">add_input</span><span class="p">(</span><span class="n">context</span><span class="p">)</span>
+            <span class="n">context</span> <span class="o">=</span> <span class="n">dense_conditional</span><span class="o">.</span><span class="n">add_input</span><span class="p">(</span><span class="n">context</span><span class="p">)</span>
+
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">inner_layernorm</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">context</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">inner_layernorm</span><span class="p">(</span><span class="n">context</span><span class="p">)</span>
         <span class="n">context</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">dense</span><span class="p">(</span><span class="n">context</span><span class="p">,</span>
                              <span class="n">lora_runtime_params</span><span class="o">=</span><span class="n">dense_lora_params</span><span class="p">,</span>
                              <span class="n">reduce_fusion_params</span><span class="o">=</span><span class="n">reduce_fusion_params</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">skip_attn</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">context</span> <span class="o">=</span> <span class="n">dense_conditional</span><span class="o">.</span><span class="n">add_output</span><span class="p">(</span><span class="n">skip_case</span><span class="p">,</span> <span class="n">context</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
             <span class="k">return</span> <span class="p">(</span><span class="n">context</span><span class="p">,</span> <span class="n">past_key_value</span><span class="p">)</span>
@@ -2040,6 +2097,8 @@
                 <span class="n">use_cache</span><span class="o">=</span><span class="n">use_cache</span><span class="p">,</span>
                 <span class="n">spec_decoding_position_offsets</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">spec_decoding_packed_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">mrope_rotary_sin_cos</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">mrope_position_deltas</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">host_runtime_perf_knobs</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span>
                 <span class="n">host_runtime_perf_knobs</span><span class="p">,</span>
                 <span class="n">host_context_progress</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span><span class="n">host_context_progress</span><span class="p">,</span>
@@ -2048,6 +2107,328 @@
         <span class="n">vision_dense</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">vis_dense</span><span class="p">(</span><span class="n">context</span><span class="p">)</span>
         <span class="n">language_dense</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">dense</span><span class="p">(</span><span class="n">context</span><span class="p">)</span>
         <span class="n">context</span> <span class="o">=</span> <span class="n">where</span><span class="p">(</span><span class="n">vision_token_mask</span><span class="p">,</span> <span class="n">vision_dense</span><span class="p">,</span> <span class="n">language_dense</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
+            <span class="k">return</span> <span class="p">(</span><span class="n">context</span><span class="p">,</span> <span class="n">past_key_value</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">context</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="DeepseekV2Attention">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.DeepseekV2Attention">[docs]</a>
+<span class="k">class</span> <span class="nc">DeepseekV2Attention</span><span class="p">(</span><span class="n">Attention</span><span class="p">):</span>
+
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span>
+            <span class="bp">self</span><span class="p">,</span>
+            <span class="o">*</span><span class="p">,</span>
+            <span class="n">local_layer_idx</span><span class="p">,</span>
+            <span class="n">hidden_size</span><span class="p">,</span>
+            <span class="n">num_attention_heads</span><span class="p">,</span>
+            <span class="n">q_lora_rank</span><span class="p">,</span>
+            <span class="n">kv_lora_rank</span><span class="p">,</span>
+            <span class="n">qk_nope_head_dim</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+            <span class="n">qk_rope_head_dim</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+            <span class="n">v_head_dim</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+            <span class="n">eps</span><span class="o">=</span><span class="mf">1e-06</span><span class="p">,</span>
+            <span class="n">attention_mask_type</span><span class="o">=</span><span class="n">AttentionMaskType</span><span class="o">.</span><span class="n">causal</span><span class="p">,</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+            <span class="n">position_embedding_type</span><span class="o">=</span><span class="n">PositionEmbeddingType</span><span class="o">.</span><span class="n">learned_absolute</span><span class="p">,</span>
+            <span class="n">max_position_embeddings</span><span class="o">=</span><span class="mi">1024</span><span class="p">,</span>
+            <span class="n">rotary_embedding_base</span><span class="o">=</span><span class="mf">10000.0</span><span class="p">,</span>
+            <span class="n">rotary_embedding_scaling</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+            <span class="n">rotary_embedding_beta_fast</span><span class="o">=</span><span class="mi">32</span><span class="p">,</span>
+            <span class="n">rotary_embedding_beta_slow</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+            <span class="n">rotary_embedding_mscale</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+            <span class="n">rotary_embedding_mscale_all_dim</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+            <span class="n">rotary_embedding_origin_max_position</span><span class="o">=</span><span class="mi">4096</span><span class="p">,</span>
+            <span class="n">rotary_scaling</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+            <span class="n">tp_group</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+            <span class="n">tp_size</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+            <span class="n">tp_rank</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+            <span class="n">quant_mode</span><span class="p">:</span> <span class="n">QuantMode</span> <span class="o">=</span> <span class="n">QuantMode</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span>
+    <span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">local_layer_idx</span><span class="o">=</span><span class="n">local_layer_idx</span><span class="p">,</span>
+                         <span class="n">hidden_size</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
+                         <span class="n">num_attention_heads</span><span class="o">=</span><span class="n">num_attention_heads</span><span class="p">,</span>
+                         <span class="n">num_kv_heads</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+                         <span class="n">max_position_embeddings</span><span class="o">=</span><span class="n">max_position_embeddings</span><span class="p">,</span>
+                         <span class="n">attention_head_size</span><span class="o">=</span><span class="n">kv_lora_rank</span> <span class="o">+</span> <span class="n">qk_rope_head_dim</span><span class="p">,</span>
+                         <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+                         <span class="n">attention_mask_type</span><span class="o">=</span><span class="n">attention_mask_type</span><span class="p">,</span>
+                         <span class="n">position_embedding_type</span><span class="o">=</span><span class="n">position_embedding_type</span><span class="p">,</span>
+                         <span class="n">rotary_embedding_base</span><span class="o">=</span><span class="n">rotary_embedding_base</span><span class="p">,</span>
+                         <span class="n">rotary_embedding_scaling</span><span class="o">=</span><span class="n">rotary_embedding_scaling</span><span class="p">,</span>
+                         <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
+                         <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
+                         <span class="n">tp_rank</span><span class="o">=</span><span class="n">tp_rank</span><span class="p">,</span>
+                         <span class="n">quant_mode</span><span class="o">=</span><span class="n">quant_mode</span><span class="p">,</span>
+                         <span class="n">bias</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                         <span class="n">dense_bias</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                         <span class="n">enable_qkv</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">=</span> <span class="n">tp_size</span>
+
+        <span class="k">if</span> <span class="n">q_lora_rank</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">q_lora_rank</span> <span class="o">=</span> <span class="n">hidden_size</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">is_deepseek_v2_lite</span> <span class="o">=</span> <span class="kc">True</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">q_lora_rank</span> <span class="o">=</span> <span class="n">q_lora_rank</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">is_deepseek_v2_lite</span> <span class="o">=</span> <span class="kc">False</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">kv_lora_rank</span> <span class="o">=</span> <span class="n">kv_lora_rank</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">qk_nope_head_dim</span> <span class="o">=</span> <span class="n">qk_nope_head_dim</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">qk_rope_head_dim</span> <span class="o">=</span> <span class="n">qk_rope_head_dim</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">v_head_dim</span> <span class="o">=</span> <span class="n">v_head_dim</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_dim</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">rotary_scaling</span> <span class="o">=</span> <span class="n">rotary_scaling</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">shard_dim</span> <span class="o">=</span> <span class="mi">1</span>
+
+        <span class="k">def</span> <span class="nf">yarn_get_mscale</span><span class="p">(</span><span class="n">scale</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">mscale</span><span class="o">=</span><span class="mi">1</span><span class="p">):</span>
+            <span class="k">if</span> <span class="n">scale</span> <span class="o">&lt;=</span> <span class="mi">1</span><span class="p">:</span>
+                <span class="k">return</span> <span class="mf">1.0</span>
+            <span class="k">return</span> <span class="mf">0.1</span> <span class="o">*</span> <span class="n">mscale</span> <span class="o">*</span> <span class="n">math</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="n">scale</span><span class="p">)</span> <span class="o">+</span> <span class="mf">1.0</span>
+
+        <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">rotary_scaling</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">rotary_scaling</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">mscale_all_dim</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">rotary_scaling</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;mscale_all_dim&quot;</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+            <span class="n">scaling_factor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">rotary_scaling</span><span class="p">[</span><span class="s2">&quot;factor&quot;</span><span class="p">]</span>
+            <span class="k">if</span> <span class="n">mscale_all_dim</span><span class="p">:</span>
+                <span class="n">mscale</span> <span class="o">=</span> <span class="n">yarn_get_mscale</span><span class="p">(</span><span class="n">scaling_factor</span><span class="p">,</span> <span class="n">mscale_all_dim</span><span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">q_scaling</span> <span class="o">=</span> <span class="mf">1.0</span> <span class="o">/</span> <span class="p">(</span><span class="n">mscale</span> <span class="o">*</span> <span class="n">mscale</span><span class="p">)</span>
+
+        <span class="n">embed_positions_for_gpt_attention</span> <span class="o">=</span> <span class="n">RopeEmbeddingUtils</span><span class="o">.</span><span class="n">create_sinusoidal_positions_for_deepseek_attention_plugin</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">qk_rope_head_dim</span><span class="p">,</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_base</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">rotary_scaling</span><span class="p">[</span><span class="s2">&quot;factor&quot;</span><span class="p">],</span>
+            <span class="n">rotary_embedding_origin_max_position</span><span class="p">,</span> <span class="n">rotary_embedding_beta_fast</span><span class="p">,</span>
+            <span class="n">rotary_embedding_beta_slow</span><span class="p">,</span> <span class="n">rotary_embedding_mscale</span><span class="p">,</span>
+            <span class="n">rotary_embedding_mscale_all_dim</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">register_parameter</span><span class="p">(</span>
+            <span class="s1">&#39;embed_positions_for_gpt_attention&#39;</span><span class="p">,</span>
+            <span class="n">Parameter</span><span class="p">(</span><span class="n">embed_positions_for_gpt_attention</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="s1">&#39;float32&#39;</span><span class="p">))</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_scale_type</span> <span class="o">=</span> <span class="n">RotaryScalingType</span><span class="o">.</span><span class="n">none</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_scale</span> <span class="o">=</span> <span class="mf">1.0</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_deepseek_v2_lite</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">fused_a</span> <span class="o">=</span> <span class="n">ColumnLinear</span><span class="p">(</span>
+                <span class="n">hidden_size</span><span class="p">,</span>
+                <span class="n">kv_lora_rank</span> <span class="o">+</span> <span class="n">qk_rope_head_dim</span><span class="p">,</span>
+                <span class="n">bias</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">dense_bias</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+            <span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">fused_a</span> <span class="o">=</span> <span class="n">ColumnLinear</span><span class="p">(</span>
+                <span class="n">hidden_size</span><span class="p">,</span>
+                <span class="n">q_lora_rank</span> <span class="o">+</span> <span class="n">kv_lora_rank</span> <span class="o">+</span> <span class="n">qk_rope_head_dim</span><span class="p">,</span>
+                <span class="n">bias</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">dense_bias</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+            <span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">q_a_layernorm</span> <span class="o">=</span> <span class="n">RmsNorm</span><span class="p">(</span><span class="n">q_lora_rank</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span> <span class="n">eps</span><span class="o">=</span><span class="n">eps</span><span class="p">)</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">kv_a_layernorm</span> <span class="o">=</span> <span class="n">RmsNorm</span><span class="p">(</span><span class="n">kv_lora_rank</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span> <span class="n">eps</span><span class="o">=</span><span class="n">eps</span><span class="p">)</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">fused_q_proj</span> <span class="o">=</span> <span class="n">Parameter</span><span class="p">(</span>
+            <span class="n">shape</span><span class="o">=</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span> <span class="o">*</span>
+                   <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">kv_lora_rank</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">qk_rope_head_dim</span><span class="p">),</span>
+                   <span class="bp">self</span><span class="o">.</span><span class="n">q_lora_rank</span><span class="p">),</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">kv_b_proj</span> <span class="o">=</span> <span class="n">Parameter</span><span class="p">(</span>
+            <span class="n">shape</span><span class="o">=</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">qk_nope_head_dim</span> <span class="o">*</span> <span class="mi">2</span><span class="p">,</span>
+                   <span class="bp">self</span><span class="o">.</span><span class="n">kv_lora_rank</span><span class="p">),</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">q_b_proj</span> <span class="o">=</span> <span class="n">Parameter</span><span class="p">(</span>
+            <span class="n">shape</span><span class="o">=</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span> <span class="o">*</span>
+                   <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">qk_nope_head_dim</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">qk_rope_head_dim</span><span class="p">),</span>
+                   <span class="bp">self</span><span class="o">.</span><span class="n">q_lora_rank</span><span class="p">),</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">dense</span> <span class="o">=</span> <span class="n">RowLinear</span><span class="p">(</span><span class="n">tp_size</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span> <span class="o">*</span>
+                               <span class="bp">self</span><span class="o">.</span><span class="n">v_head_dim</span><span class="p">,</span>
+                               <span class="n">hidden_size</span><span class="p">,</span>
+                               <span class="n">bias</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">dense_bias</span><span class="p">,</span>
+                               <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+                               <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
+                               <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">)</span>
+        <span class="n">set_obj_attrs</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">fused_q_proj</span><span class="p">,</span> <span class="p">{</span>
+            <span class="s2">&quot;weight_loader&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">weight_loader</span><span class="p">,</span>
+        <span class="p">})</span>
+        <span class="n">set_obj_attrs</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">q_b_proj</span><span class="p">,</span> <span class="p">{</span>
+            <span class="s2">&quot;weight_loader&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">weight_loader</span><span class="p">,</span>
+        <span class="p">})</span>
+        <span class="n">set_obj_attrs</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">kv_b_proj</span><span class="p">,</span> <span class="p">{</span>
+            <span class="s2">&quot;weight_loader&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">weight_loader</span><span class="p">,</span>
+        <span class="p">})</span>
+
+<div class="viewcode-block" id="DeepseekV2Attention.weight_loader">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.DeepseekV2Attention.weight_loader">[docs]</a>
+    <span class="k">def</span> <span class="nf">weight_loader</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">mapping</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">param</span><span class="p">:</span> <span class="n">Parameter</span><span class="p">,</span>
+                      <span class="n">loaded_weight</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">):</span>
+        <span class="c1"># use_parallel_embedding</span>
+        <span class="n">tp_rank</span> <span class="o">=</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_rank</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="n">sharding_dim</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">sharding_dim</span>
+            <span class="n">shard_size</span> <span class="o">=</span> <span class="n">param</span><span class="o">.</span><span class="n">_shape</span><span class="p">[</span><span class="n">sharding_dim</span><span class="p">]</span>
+            <span class="n">start_idx</span> <span class="o">=</span> <span class="n">tp_rank</span> <span class="o">*</span> <span class="n">shard_size</span>
+            <span class="n">loaded_weight</span> <span class="o">=</span> <span class="n">loaded_weight</span><span class="o">.</span><span class="n">narrow</span><span class="p">(</span><span class="n">sharding_dim</span><span class="p">,</span> <span class="n">start_idx</span><span class="p">,</span>
+                                                 <span class="n">shard_size</span><span class="p">)</span>
+        <span class="n">param</span><span class="o">.</span><span class="n">value</span> <span class="o">=</span> <span class="n">loaded_weight</span></div>
+
+
+<div class="viewcode-block" id="DeepseekV2Attention.forward">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.DeepseekV2Attention.forward">[docs]</a>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                <span class="n">hidden_states</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+                <span class="n">use_cache</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                <span class="n">spec_decoding_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">kv_cache_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">attention_params</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+        <span class="k">assert</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">remove_input_padding</span>
+
+        <span class="n">spec_decoding_params</span> <span class="o">=</span> <span class="n">SpecDecodingParams</span><span class="p">(</span>
+        <span class="p">)</span> <span class="k">if</span> <span class="n">spec_decoding_params</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">spec_decoding_params</span>
+
+        <span class="k">if</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">remove_input_padding</span><span class="p">:</span>
+            <span class="k">assert</span> <span class="n">hidden_states</span><span class="o">.</span><span class="n">ndim</span><span class="p">()</span> <span class="o">==</span> <span class="mi">2</span>
+
+        <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">paged_kv_cache</span>
+
+        <span class="k">assert</span> <span class="n">attention_params</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">attention_params</span><span class="o">.</span><span class="n">is_valid</span><span class="p">(</span>
+            <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gpt_attention_plugin</span><span class="p">,</span>
+            <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">remove_input_padding</span><span class="p">,</span> <span class="n">use_cache</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
+            <span class="k">assert</span> <span class="n">kv_cache_params</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">is_valid</span><span class="p">(</span>
+                <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gpt_attention_plugin</span><span class="p">)</span>
+
+        <span class="n">past_key_value</span> <span class="o">=</span> <span class="kc">None</span> <span class="k">if</span> <span class="n">kv_cache_params</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">get_first_past_key_value</span><span class="p">(</span>
+        <span class="p">)</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_deepseek_v2_lite</span><span class="p">:</span>
+            <span class="n">compressed_kv</span><span class="p">,</span> <span class="n">k_pe</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">fused_a</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span><span class="o">.</span><span class="n">split</span><span class="p">(</span>
+                <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">kv_lora_rank</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">qk_rope_head_dim</span><span class="p">],</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+            <span class="n">compressed_kv</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_a_layernorm</span><span class="p">(</span><span class="n">compressed_kv</span><span class="p">)</span>
+            <span class="n">input_qkv</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span><span class="n">hidden_states</span><span class="p">,</span> <span class="n">compressed_kv</span><span class="p">,</span> <span class="n">k_pe</span><span class="p">],</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">compressed_q</span><span class="p">,</span> <span class="n">compressed_kv</span><span class="p">,</span> <span class="n">k_pe</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">fused_a</span><span class="p">(</span>
+                <span class="n">hidden_states</span><span class="p">)</span><span class="o">.</span><span class="n">split</span><span class="p">([</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">q_lora_rank</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_lora_rank</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">qk_rope_head_dim</span>
+                <span class="p">],</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+            <span class="n">compressed_q</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">q_a_layernorm</span><span class="p">(</span><span class="n">compressed_q</span><span class="p">)</span>
+            <span class="n">compressed_kv</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_a_layernorm</span><span class="p">(</span><span class="n">compressed_kv</span><span class="p">)</span>
+            <span class="n">input_qkv</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span><span class="n">compressed_q</span><span class="p">,</span> <span class="n">compressed_kv</span><span class="p">,</span> <span class="n">k_pe</span><span class="p">],</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gpt_attention_plugin</span><span class="p">:</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">cross_attention</span> <span class="ow">and</span> <span class="p">(</span><span class="n">past_key_value</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">):</span>
+                <span class="n">past_key_value</span> <span class="o">=</span> <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">past_key_value</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+            <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_mask_type</span> <span class="ow">in</span> <span class="p">[</span>
+                <span class="n">AttentionMaskType</span><span class="o">.</span><span class="n">causal</span><span class="p">,</span>
+                <span class="n">AttentionMaskType</span><span class="o">.</span><span class="n">bidirectional</span><span class="p">,</span>
+                <span class="n">AttentionMaskType</span><span class="o">.</span><span class="n">bidirectionalglm</span><span class="p">,</span>
+            <span class="p">],</span> <span class="s1">&#39;Plugin only support masked MHA.&#39;</span>
+
+            <span class="c1"># KV cache scales.</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_scaling_factor</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">kv_orig_quant_scale</span> <span class="o">=</span> <span class="n">constant</span><span class="p">(</span><span class="n">fp32_array</span><span class="p">(</span>
+                    <span class="p">[</span><span class="mf">1.0</span><span class="p">]))</span> <span class="o">/</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_scaling_factor</span><span class="o">.</span><span class="n">value</span>
+                <span class="n">kv_quant_orig_scale</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_scaling_factor</span><span class="o">.</span><span class="n">value</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">kv_orig_quant_scale</span> <span class="o">=</span> <span class="kc">None</span>
+                <span class="n">kv_quant_orig_scale</span> <span class="o">=</span> <span class="kc">None</span>
+
+            <span class="c1"># Attention output scales</span>
+            <span class="k">assert</span> <span class="p">(</span>
+                <span class="ow">not</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">use_fp8_context_fmha</span>
+            <span class="p">)</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_fp8_qdq</span><span class="p">(</span>
+            <span class="p">),</span> <span class="s2">&quot;FP8 Context FMHA must be used together with the fp8 quantization workflow.&quot;</span>
+
+            <span class="n">attention_output_orig_quant_scale</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_output_orig_quant_scale</span><span class="o">.</span><span class="n">value</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_output_orig_quant_scale</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
+
+            <span class="n">rotary_cos_sin</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">embed_positions_for_gpt_attention</span><span class="o">.</span><span class="n">value</span>
+
+            <span class="n">context</span><span class="p">,</span> <span class="n">past_key_value</span> <span class="o">=</span> <span class="n">gpt_attention</span><span class="p">(</span>
+                <span class="n">qkv</span><span class="o">=</span><span class="n">input_qkv</span><span class="p">,</span>
+                <span class="n">past_key_value</span><span class="o">=</span><span class="n">past_key_value</span><span class="p">,</span>
+                <span class="n">sequence_length</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span><span class="n">sequence_length</span><span class="p">,</span>
+                <span class="n">host_past_key_value_lengths</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
+                <span class="n">host_past_key_value_lengths</span><span class="p">,</span>
+                <span class="n">host_max_attention_window_sizes</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
+                <span class="n">host_max_attention_window_sizes</span><span class="p">,</span>
+                <span class="n">host_sink_token_length</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span><span class="n">host_sink_token_length</span><span class="p">,</span>
+                <span class="n">context_lengths</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span><span class="n">context_lengths</span><span class="p">,</span>
+                <span class="n">cache_indirection</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span><span class="n">cache_indirection</span><span class="p">,</span>
+                <span class="n">host_request_types</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span><span class="n">host_request_types</span><span class="p">,</span>
+                <span class="n">layer_idx</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">local_layer_idx</span><span class="p">,</span>
+                <span class="n">num_heads</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">,</span>
+                <span class="n">num_kv_heads</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+                <span class="n">layer_idx_in_cache_pool</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">layer_idx_in_cache_pool</span><span class="p">,</span>
+                <span class="n">hidden_size_per_head</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">kv_lora_rank</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">qk_rope_head_dim</span><span class="p">,</span>
+                <span class="n">q_scaling</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">q_scaling</span><span class="p">,</span>
+                <span class="n">position_embedding_type</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">position_embedding_type</span><span class="p">,</span>
+                <span class="n">rotary_inv_freq</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">rotary_cos_sin</span><span class="o">=</span><span class="n">rotary_cos_sin</span><span class="p">,</span>
+                <span class="n">kv_orig_quant_scale</span><span class="o">=</span><span class="n">kv_orig_quant_scale</span><span class="p">,</span>
+                <span class="n">kv_quant_orig_scale</span><span class="o">=</span><span class="n">kv_quant_orig_scale</span><span class="p">,</span>
+                <span class="n">attention_output_orig_quant_scale</span><span class="o">=</span>
+                <span class="n">attention_output_orig_quant_scale</span><span class="p">,</span>
+                <span class="n">kv_cache_quant_mode</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="p">,</span>
+                <span class="n">max_context_length</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span><span class="n">max_context_length</span><span class="p">,</span>
+                <span class="n">mask_type</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">attention_mask_type</span><span class="p">,</span>
+                <span class="n">block_sparse_block_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">block_sparse_params</span><span class="o">.</span><span class="n">block_size</span><span class="p">,</span>
+                <span class="n">block_sparse_homo_head_pattern</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">block_sparse_params</span><span class="o">.</span>
+                <span class="n">homo_head_pattern</span><span class="p">,</span>
+                <span class="n">block_sparse_num_local_blocks</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">block_sparse_params</span><span class="o">.</span>
+                <span class="n">num_local_blocks</span><span class="p">,</span>
+                <span class="n">block_sparse_vertical_stride</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">block_sparse_params</span><span class="o">.</span>
+                <span class="n">vertical_stride</span><span class="p">,</span>
+                <span class="n">alibi_slopes</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">tp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
+                <span class="n">tp_rank</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tp_rank</span><span class="p">,</span>
+                <span class="n">kv_cache_block_offsets</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span><span class="n">kv_cache_block_offsets</span>
+                <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">cross_attention</span> <span class="k">else</span>
+                <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">cross_kv_cache_block_offsets</span><span class="p">,</span>
+                <span class="n">host_kv_cache_block_offsets</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
+                <span class="n">host_kv_cache_block_offsets</span> <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">cross_attention</span> <span class="k">else</span>
+                <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">host_cross_kv_cache_block_offsets</span><span class="p">,</span>
+                <span class="n">host_kv_cache_pool_pointers</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
+                <span class="n">host_kv_cache_pool_pointers</span> <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">cross_attention</span> <span class="k">else</span>
+                <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">host_cross_kv_cache_pool_pointers</span><span class="p">,</span>
+                <span class="n">host_kv_cache_pool_mapping</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="o">.</span>
+                <span class="n">host_kv_cache_pool_mapping</span><span class="p">,</span>
+                <span class="n">do_cross_attention</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">cross_attention</span><span class="p">,</span>
+                <span class="n">cross_kv</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">cross_kv_length</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span><span class="n">encoder_max_input_length</span><span class="p">,</span>
+                <span class="n">encoder_input_lengths</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span><span class="n">encoder_input_lengths</span><span class="p">,</span>
+                <span class="n">relative_attention_bias</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">rel_attn_table</span><span class="o">.</span><span class="n">value</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">relative_attention</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
+                <span class="n">max_distance</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_distance</span><span class="p">,</span>
+                <span class="n">host_context_lengths</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span><span class="n">host_context_lengths</span><span class="p">,</span>
+                <span class="n">use_cache</span><span class="o">=</span><span class="n">use_cache</span><span class="p">,</span>
+                <span class="n">spec_decoding_is_generation_length_variable</span><span class="o">=</span><span class="n">spec_decoding_params</span>
+                <span class="o">.</span><span class="n">spec_decoding_is_generation_length_variable</span><span class="p">,</span>
+                <span class="n">spec_decoding_max_generation_length</span><span class="o">=</span><span class="n">spec_decoding_params</span><span class="o">.</span>
+                <span class="n">spec_decoding_max_generation_length</span><span class="p">,</span>
+                <span class="n">spec_decoding_generation_lengths</span><span class="o">=</span><span class="n">spec_decoding_params</span><span class="o">.</span>
+                <span class="n">spec_decoding_generation_lengths</span><span class="p">,</span>
+                <span class="n">spec_decoding_position_offsets</span><span class="o">=</span><span class="n">spec_decoding_params</span><span class="o">.</span>
+                <span class="n">spec_decoding_position_offsets</span><span class="p">,</span>
+                <span class="n">spec_decoding_packed_mask</span><span class="o">=</span><span class="n">spec_decoding_params</span><span class="o">.</span>
+                <span class="n">spec_decoding_packed_mask</span><span class="p">,</span>
+                <span class="n">attn_logit_softcapping_scale</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_attn_value</span><span class="p">,</span>
+                <span class="n">host_runtime_perf_knobs</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span>
+                <span class="n">host_runtime_perf_knobs</span><span class="p">,</span>
+                <span class="n">host_context_progress</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span><span class="n">host_context_progress</span><span class="p">,</span>
+                <span class="n">is_mla_enabled_flag</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+                <span class="n">q_lora_rank</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">q_lora_rank</span><span class="p">,</span>
+                <span class="n">kv_lora_rank</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">kv_lora_rank</span><span class="p">,</span>
+                <span class="n">qk_nope_head_dim</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">qk_nope_head_dim</span><span class="p">,</span>
+                <span class="n">qk_rope_head_dim</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">qk_rope_head_dim</span><span class="p">,</span>
+                <span class="n">v_head_dim</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">v_head_dim</span><span class="p">,</span>
+                <span class="n">fused_q_proj</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">fused_q_proj</span><span class="o">.</span><span class="n">value</span><span class="p">,</span>
+                <span class="n">q_b_proj</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">q_b_proj</span><span class="o">.</span><span class="n">value</span><span class="p">,</span>
+                <span class="n">kv_b_proj</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">kv_b_proj</span><span class="o">.</span><span class="n">value</span><span class="p">)</span>
+
+        <span class="n">context</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">dense</span><span class="p">(</span><span class="n">context</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
             <span class="k">return</span> <span class="p">(</span><span class="n">context</span><span class="p">,</span> <span class="n">past_key_value</span><span class="p">)</span>
@@ -2064,7 +2445,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fc13ee9b130>
+<jinja2.runtime.BlockReference object at 0x7f9468e16a20>
 
 <div class="footer">
     <p>

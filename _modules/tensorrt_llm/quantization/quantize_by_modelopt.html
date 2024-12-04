@@ -1,3 +1,5 @@
+
+
 <!DOCTYPE html>
 <html class="writer-html5" lang="en" data-content_root="../../../">
 <head>
@@ -5,21 +7,17 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>tensorrt_llm.quantization.quantize_by_modelopt &mdash; tensorrt_llm  documentation</title>
       <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=80d5e7a1" />
-      <link rel="stylesheet" type="text/css" href="../../../_static/css/theme.css?v=19f00094" />
+      <link rel="stylesheet" type="text/css" href="../../../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
 
   
-  <!--[if lt IE 9]>
-    <script src="../../../_static/js/html5shiv.min.js"></script>
-  <![endif]-->
-  
-        <script src="../../../_static/jquery.js?v=5d32c60e"></script>
-        <script src="../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-        <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="../../../_static/doctools.js?v=888ff710"></script>
-        <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
-        <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
-        <script src="../../../_static/copybutton.js?v=f281be69"></script>
+      <script src="../../../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="../../../_static/doctools.js?v=888ff710"></script>
+      <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
+      <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
     <script src="../../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../../genindex.html" />
     <link rel="search" title="Search" href="../../../search.html" /> 
@@ -57,6 +55,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../installation/windows.html">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul>
@@ -86,6 +85,7 @@
 <p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-serve.html">trtllm-serve</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
@@ -104,14 +104,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/executor.html">Executor API</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/inference-request.html">Inference Request</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../advanced/speculative-decoding.html#lookahead-decoding">Lookahead decoding</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul>
@@ -195,7 +193,7 @@
 <span class="kn">from</span> <span class="nn">torch.utils.data</span> <span class="kn">import</span> <span class="n">DataLoader</span>
 <span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">AutoConfig</span><span class="p">,</span> <span class="n">AutoModelForCausalLM</span><span class="p">,</span> <span class="n">AutoTokenizer</span>
 
-<span class="kn">from</span> <span class="nn">.._utils</span> <span class="kn">import</span> <span class="n">release_gc</span>
+<span class="kn">from</span> <span class="nn">.._utils</span> <span class="kn">import</span> <span class="n">release_gc</span><span class="p">,</span> <span class="n">str_dtype_to_torch</span>
 <span class="kn">from</span> <span class="nn">..logger</span> <span class="kn">import</span> <span class="n">logger</span>
 <span class="kn">from</span> <span class="nn">..mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
 <span class="kn">from</span> <span class="nn">.mode</span> <span class="kn">import</span> <span class="n">QuantAlgo</span>
@@ -282,8 +280,11 @@
     <span class="s2">&quot;Bloom&quot;</span><span class="p">:</span> <span class="s2">&quot;bloom&quot;</span><span class="p">,</span>
     <span class="s2">&quot;ChatGLM&quot;</span><span class="p">:</span> <span class="s2">&quot;chatglm&quot;</span><span class="p">,</span>
     <span class="s2">&quot;QWen&quot;</span><span class="p">:</span> <span class="s2">&quot;qwen&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;Gemma2&quot;</span><span class="p">:</span> <span class="s2">&quot;gemma2&quot;</span><span class="p">,</span>
     <span class="s2">&quot;Gemma&quot;</span><span class="p">:</span> <span class="s2">&quot;gemma&quot;</span><span class="p">,</span>
     <span class="s2">&quot;MixtralForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;llama&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;NemotronForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;nemotron&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;GPTBigCodeForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;gpt_bigcode&quot;</span><span class="p">,</span>
     <span class="s2">&quot;ArcticForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;llama&quot;</span><span class="p">,</span>
     <span class="s2">&quot;Phi3SmallForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;phi3small&quot;</span><span class="p">,</span>
     <span class="s2">&quot;Phi3ForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;phi3&quot;</span><span class="p">,</span>
@@ -345,19 +346,37 @@
     <span class="k">return</span> <span class="n">model</span><span class="o">.</span><span class="n">llm</span>
 
 
-<span class="k">def</span> <span class="nf">get_model</span><span class="p">(</span><span class="n">ckpt_path</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="s2">&quot;fp16&quot;</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">&quot;cuda&quot;</span><span class="p">):</span>
-    <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Initializing model from </span><span class="si">{</span><span class="n">ckpt_path</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
-    <span class="k">if</span> <span class="n">dtype</span> <span class="o">==</span> <span class="s2">&quot;bf16&quot;</span> <span class="ow">or</span> <span class="n">dtype</span> <span class="o">==</span> <span class="s2">&quot;bfloat16&quot;</span><span class="p">:</span>
-        <span class="n">dtype</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span>
-    <span class="k">elif</span> <span class="n">dtype</span> <span class="o">==</span> <span class="s2">&quot;fp16&quot;</span> <span class="ow">or</span> <span class="n">dtype</span> <span class="o">==</span> <span class="s2">&quot;float16&quot;</span><span class="p">:</span>
-        <span class="n">dtype</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">float16</span>
-    <span class="k">elif</span> <span class="n">dtype</span> <span class="o">==</span> <span class="s2">&quot;fp32&quot;</span> <span class="ow">or</span> <span class="n">dtype</span> <span class="o">==</span> <span class="s2">&quot;float32&quot;</span><span class="p">:</span>
-        <span class="n">dtype</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">float32</span>
+<span class="k">def</span> <span class="nf">get_hf_config</span><span class="p">(</span><span class="n">ckpt_path</span><span class="p">):</span>
+    <span class="k">if</span> <span class="s2">&quot;mpt&quot;</span> <span class="ow">in</span> <span class="n">ckpt_path</span><span class="p">:</span>
+        <span class="c1"># MPT-7B cannot get initialized from AutoConfig</span>
+        <span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">MptConfig</span>
+        <span class="k">return</span> <span class="n">MptConfig</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">ckpt_path</span><span class="p">)</span>
     <span class="k">else</span><span class="p">:</span>
-        <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Unknown dtype </span><span class="si">{</span><span class="n">dtype</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">AutoConfig</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">ckpt_path</span><span class="p">,</span> <span class="n">trust_remote_code</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 
+
+<span class="k">def</span> <span class="nf">_get_llava_qwen_model</span><span class="p">(</span><span class="n">model_dir</span><span class="p">,</span> <span class="n">dtype</span><span class="p">,</span> <span class="n">device</span><span class="p">):</span>
+    <span class="k">if</span> <span class="s2">&quot;hf&quot;</span> <span class="ow">in</span> <span class="n">model_dir</span><span class="p">:</span>
+        <span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">LlavaOnevisionForConditionalGeneration</span>
+        <span class="n">model</span> <span class="o">=</span> <span class="n">LlavaOnevisionForConditionalGeneration</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
+            <span class="n">model_dir</span><span class="p">,</span> <span class="n">torch_dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span> <span class="n">device_map</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+        <span class="n">model</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">language_model</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="kn">from</span> <span class="nn">llava.model.builder</span> <span class="kn">import</span> <span class="n">load_pretrained_model</span>
+        <span class="n">_</span><span class="p">,</span> <span class="n">model</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">load_pretrained_model</span><span class="p">(</span><span class="n">model_dir</span><span class="p">,</span>
+                                               <span class="kc">None</span><span class="p">,</span>
+                                               <span class="s1">&#39;llava_qwen&#39;</span><span class="p">,</span>
+                                               <span class="n">torch_dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+                                               <span class="n">device_map</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">model</span>
+
+
+<span class="k">def</span> <span class="nf">get_model</span><span class="p">(</span><span class="n">ckpt_path</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s1">&#39;bfloat16&#39;</span><span class="p">,</span> <span class="n">device</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s1">&#39;cuda&#39;</span><span class="p">):</span>
+    <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Initializing model from </span><span class="si">{</span><span class="n">ckpt_path</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
     <span class="c1"># Note: VILA model is not in public HF model zoo yet. We need to explicitly import from the git repo</span>
-    <span class="n">hf_config</span> <span class="o">=</span> <span class="n">AutoConfig</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">ckpt_path</span><span class="p">,</span> <span class="n">trust_remote_code</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="n">hf_config</span> <span class="o">=</span> <span class="n">get_hf_config</span><span class="p">(</span><span class="n">ckpt_path</span><span class="p">)</span>
+    <span class="n">torch_dtype</span> <span class="o">=</span> <span class="n">str_dtype_to_torch</span><span class="p">(</span><span class="n">dtype</span><span class="p">)</span>
+
     <span class="n">model_cls</span> <span class="o">=</span> <span class="n">AutoModelForCausalLM</span>
     <span class="k">if</span> <span class="n">hf_config</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;llava&quot;</span><span class="p">:</span>
         <span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">LlavaForConditionalGeneration</span>
@@ -367,11 +386,13 @@
         <span class="n">model_cls</span> <span class="o">=</span> <span class="n">MptForCausalLM</span>
     <span class="k">if</span> <span class="s2">&quot;vila&quot;</span> <span class="ow">in</span> <span class="n">ckpt_path</span><span class="p">:</span>
         <span class="n">model</span> <span class="o">=</span> <span class="n">_get_vila_model</span><span class="p">(</span><span class="n">ckpt_path</span><span class="p">)</span>
+    <span class="k">elif</span> <span class="s2">&quot;llava-onevision-qwen2&quot;</span> <span class="ow">in</span> <span class="n">ckpt_path</span><span class="p">:</span>
+        <span class="n">model</span> <span class="o">=</span> <span class="n">_get_llava_qwen_model</span><span class="p">(</span><span class="n">ckpt_path</span><span class="p">,</span> <span class="n">dtype</span><span class="p">,</span> <span class="n">device</span><span class="p">)</span>
     <span class="k">elif</span> <span class="n">hf_config</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;glm&quot;</span><span class="p">:</span>
         <span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">AutoModelForSeq2SeqLM</span>
         <span class="n">model</span> <span class="o">=</span> <span class="n">AutoModelForSeq2SeqLM</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">ckpt_path</span><span class="p">,</span>
                                                       <span class="n">device_map</span><span class="o">=</span><span class="s2">&quot;cuda&quot;</span><span class="p">,</span>
-                                                      <span class="n">torch_dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+                                                      <span class="n">torch_dtype</span><span class="o">=</span><span class="n">torch_dtype</span><span class="p">,</span>
                                                       <span class="n">trust_remote_code</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
     <span class="k">else</span><span class="p">:</span>
         <span class="n">model</span> <span class="o">=</span> <span class="n">model_cls</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
@@ -379,12 +400,12 @@
             <span class="n">device_map</span><span class="o">=</span><span class="s2">&quot;auto&quot;</span> <span class="k">if</span> <span class="n">device</span> <span class="o">!=</span> <span class="s2">&quot;cpu&quot;</span> <span class="k">else</span> <span class="s2">&quot;cpu&quot;</span><span class="p">,</span>
             <span class="n">torch_dtype</span><span class="o">=</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span>
             <span class="n">trust_remote_code</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">hf_config</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;llava&quot;</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">hf_config</span><span class="o">.</span><span class="n">model_type</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;llava&quot;</span><span class="p">,</span> <span class="s2">&quot;internvl_chat&quot;</span><span class="p">]:</span>
             <span class="n">model</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">language_model</span>
     <span class="n">model</span><span class="o">.</span><span class="n">eval</span><span class="p">()</span>
 
     <span class="n">model_dtype</span> <span class="o">=</span> <span class="nb">next</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">parameters</span><span class="p">())</span><span class="o">.</span><span class="n">dtype</span>
-    <span class="k">if</span> <span class="n">dtype</span> <span class="o">!=</span> <span class="n">model_dtype</span><span class="p">:</span>
+    <span class="k">if</span> <span class="n">torch_dtype</span> <span class="o">!=</span> <span class="n">model_dtype</span><span class="p">:</span>
         <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
             <span class="sa">f</span><span class="s2">&quot;[TensorRT-LLM][WARNING] The manually set model data type is </span><span class="si">{</span><span class="n">dtype</span><span class="si">}</span><span class="s2">, &quot;</span>
             <span class="sa">f</span><span class="s2">&quot;but the data type of the HuggingFace model is </span><span class="si">{</span><span class="n">model_dtype</span><span class="si">}</span><span class="s2">.&quot;</span><span class="p">)</span>
@@ -673,6 +694,8 @@
 
     <span class="kn">from</span> <span class="nn">modelopt.torch.export</span> <span class="kn">import</span> <span class="n">export_tensorrt_llm_checkpoint</span>
 
+    <span class="kn">from</span> <span class="nn">tensorrt_llm.models.convert_utils</span> <span class="kn">import</span> <span class="n">infer_dtype</span>
+
     <span class="k">if</span> <span class="ow">not</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">():</span>
         <span class="k">raise</span> <span class="ne">EnvironmentError</span><span class="p">(</span><span class="s2">&quot;GPU is required for inference.&quot;</span><span class="p">)</span>
 
@@ -683,6 +706,9 @@
     <span class="k">if</span> <span class="ow">not</span> <span class="n">auto_quantize_bits</span><span class="p">:</span>
         <span class="k">assert</span> <span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">qformat</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">&quot;,&quot;</span><span class="p">))</span> <span class="o">==</span> <span class="mi">1</span>
                 <span class="p">),</span> <span class="s2">&quot;Quantization supports only one quantization format.&quot;</span>
+
+    <span class="n">hf_config</span> <span class="o">=</span> <span class="n">get_hf_config</span><span class="p">(</span><span class="n">model_dir</span><span class="p">)</span>
+    <span class="n">dtype</span> <span class="o">=</span> <span class="n">infer_dtype</span><span class="p">(</span><span class="n">dtype</span><span class="p">,</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">hf_config</span><span class="p">,</span> <span class="s1">&#39;torch_dtype&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">))</span>
 
     <span class="n">model</span> <span class="o">=</span> <span class="n">get_model</span><span class="p">(</span><span class="n">model_dir</span><span class="p">,</span> <span class="n">dtype</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
     <span class="n">model_type</span> <span class="o">=</span> <span class="n">get_model_type</span><span class="p">(</span><span class="n">model</span><span class="p">)</span>
@@ -733,18 +759,11 @@
                         <span class="s2">&quot;alpha_step&quot;</span><span class="p">:</span> <span class="mi">1</span>
                     <span class="p">}</span>
 
-            <span class="c1"># Always turn on FP8 kv cache to save memory footprint.</span>
-            <span class="c1"># For int8_sq, we do not quantize kv cache to preserve accuracy.</span>
-            <span class="c1"># We turn off FP8 kv cache for unified_hf checkpoint</span>
-            <span class="n">enable_quant_kv_cache</span> <span class="o">=</span> <span class="s2">&quot;int8_sq&quot;</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">qformat</span>
-            <span class="nb">print</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s1">&#39;</span><span class="si">{</span><span class="s2">&quot;Enable&quot;</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">enable_quant_kv_cache</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="s2">&quot;Disable&quot;</span><span class="si">}</span><span class="s1"> KV cache quantization&#39;</span>
-            <span class="p">)</span>
-            <span class="n">quant_cfg</span><span class="p">[</span><span class="s2">&quot;quant_cfg&quot;</span><span class="p">][</span><span class="s2">&quot;*output_quantizer&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
-                <span class="s2">&quot;num_bits&quot;</span><span class="p">:</span> <span class="mi">8</span> <span class="k">if</span> <span class="n">qformat</span> <span class="o">==</span> <span class="s2">&quot;int8_sq&quot;</span> <span class="k">else</span> <span class="p">(</span><span class="mi">4</span><span class="p">,</span> <span class="mi">3</span><span class="p">),</span>
-                <span class="s2">&quot;axis&quot;</span><span class="p">:</span> <span class="kc">None</span><span class="p">,</span>
-                <span class="s2">&quot;enable&quot;</span><span class="p">:</span> <span class="n">enable_quant_kv_cache</span><span class="p">,</span>
-            <span class="p">}</span>
+            <span class="k">if</span> <span class="n">kv_cache_dtype</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">if</span> <span class="n">kv_cache_dtype</span> <span class="o">==</span> <span class="s2">&quot;fp8&quot;</span><span class="p">:</span>
+                    <span class="k">for</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">KV_CACHE_CFG</span><span class="o">.</span><span class="n">values</span><span class="p">():</span>
+                        <span class="n">value</span><span class="o">.</span><span class="n">update</span><span class="p">({</span><span class="s2">&quot;num_bits&quot;</span><span class="p">:</span> <span class="p">(</span><span class="mi">4</span><span class="p">,</span> <span class="mi">3</span><span class="p">)})</span>  <span class="c1"># type: ignore</span>
+                <span class="n">quant_cfg</span><span class="p">[</span><span class="s2">&quot;quant_cfg&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">KV_CACHE_CFG</span><span class="p">)</span>  <span class="c1"># type: ignore</span>
 
             <span class="c1"># Gemma 7B has accuracy regression using alpha 1. We set 0.5 instead.</span>
             <span class="k">if</span> <span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;gemma&quot;</span> <span class="ow">and</span> <span class="s2">&quot;int8_sq&quot;</span> <span class="ow">in</span> <span class="n">qformat</span><span class="p">:</span>
@@ -845,6 +864,12 @@
                 <span class="n">tensorrt_llm_config</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
             <span class="n">qwen_config</span> <span class="o">=</span> <span class="n">AutoConfig</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">model_dir</span><span class="p">,</span>
                                                      <span class="n">trust_remote_code</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">LlavaOnevisionConfig</span>
+                <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">qwen_config</span><span class="p">,</span> <span class="n">LlavaOnevisionConfig</span><span class="p">):</span>
+                    <span class="n">qwen_config</span> <span class="o">=</span> <span class="n">qwen_config</span><span class="o">.</span><span class="n">text_config</span>
+            <span class="k">except</span><span class="p">:</span>
+                <span class="k">pass</span>
             <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s2">&quot;qwen_type&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">qwen_config</span><span class="o">.</span><span class="n">model_type</span>
             <span class="k">if</span> <span class="n">qwen_config</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;qwen2&quot;</span><span class="p">:</span>
                 <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s2">&quot;norm_epsilon&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">qwen_config</span><span class="o">.</span><span class="n">rms_norm_eps</span>
@@ -992,13 +1017,22 @@
     <span class="n">random</span><span class="o">.</span><span class="n">seed</span><span class="p">(</span><span class="n">seed</span><span class="p">)</span>
     <span class="n">np</span><span class="o">.</span><span class="n">random</span><span class="o">.</span><span class="n">seed</span><span class="p">(</span><span class="n">seed</span><span class="p">)</span>
 
-    <span class="c1"># dtype is used for non-quantized layers</span>
-    <span class="n">supported_dtype</span> <span class="o">=</span> <span class="p">[</span><span class="s2">&quot;float16&quot;</span><span class="p">,</span> <span class="s2">&quot;bfloat16&quot;</span><span class="p">]</span>
-    <span class="k">assert</span> <span class="p">(</span><span class="n">dtype</span> <span class="ow">in</span> <span class="n">supported_dtype</span>
-            <span class="p">),</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">dtype</span><span class="si">}</span><span class="s2"> not supported. Supported dtypes are </span><span class="si">{</span><span class="n">supported_dtype</span><span class="si">}</span><span class="s2">&quot;</span>
-    <span class="n">torch_dtype</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">torch</span><span class="p">,</span> <span class="n">dtype</span><span class="p">)</span>
-
     <span class="n">model_cfg</span> <span class="o">=</span> <span class="n">load_config</span><span class="p">(</span><span class="n">nemo_ckpt_path</span><span class="p">)</span>
+
+    <span class="c1"># dtype is used for non-quantized layers</span>
+    <span class="n">supported_dtype</span> <span class="o">=</span> <span class="p">[</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span> <span class="s2">&quot;float16&quot;</span><span class="p">,</span> <span class="s2">&quot;bfloat16&quot;</span><span class="p">]</span>
+    <span class="k">assert</span> <span class="n">dtype</span> <span class="ow">in</span> <span class="n">supported_dtype</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">dtype</span><span class="si">}</span><span class="s2"> not supported. Supported dtypes are </span><span class="si">{</span><span class="n">supported_dtype</span><span class="si">}</span><span class="s2">&quot;</span>
+
+    <span class="k">if</span> <span class="n">dtype</span> <span class="o">==</span> <span class="s1">&#39;auto&#39;</span><span class="p">:</span>
+        <span class="n">dtype</span> <span class="o">=</span> <span class="n">model_cfg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;precision&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">dtype</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">dtype</span> <span class="o">=</span> <span class="s1">&#39;float16&#39;</span>
+        <span class="k">elif</span> <span class="s1">&#39;bf16&#39;</span> <span class="ow">in</span> <span class="n">dtype</span> <span class="ow">or</span> <span class="s1">&#39;bfloat16&#39;</span> <span class="ow">in</span> <span class="n">dtype</span><span class="p">:</span>
+            <span class="n">dtype</span> <span class="o">=</span> <span class="s1">&#39;bfloat16&#39;</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">dtype</span> <span class="o">=</span> <span class="s1">&#39;float16&#39;</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Specified dtype &#39;auto&#39;; inferred dtype </span><span class="si">{</span><span class="n">dtype</span><span class="si">!r}</span><span class="s2">.&quot;</span><span class="p">)</span>
+    <span class="n">torch_dtype</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">torch</span><span class="p">,</span> <span class="n">dtype</span><span class="p">)</span>
 
     <span class="k">with</span> <span class="n">open_dict</span><span class="p">(</span><span class="n">model_cfg</span><span class="p">):</span>
         <span class="n">model_cfg</span><span class="o">.</span><span class="n">activations_checkpoint_method</span> <span class="o">=</span> <span class="kc">None</span>
@@ -1185,7 +1219,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fc13d8f5db0>
+<jinja2.runtime.BlockReference object at 0x7f946afdebd0>
 
 <div class="footer">
     <p>

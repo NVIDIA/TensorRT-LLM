@@ -1,31 +1,29 @@
+
+
 <!DOCTYPE html>
 <html class="writer-html5" lang="en" data-content_root="../">
 <head>
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>LLM Quantization &mdash; tensorrt_llm  documentation</title>
+  <title>Generation with Quantization &mdash; tensorrt_llm  documentation</title>
       <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=80d5e7a1" />
-      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=19f00094" />
+      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
 
   
-  <!--[if lt IE 9]>
-    <script src="../_static/js/html5shiv.min.js"></script>
-  <![endif]-->
-  
-        <script src="../_static/jquery.js?v=5d32c60e"></script>
-        <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-        <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="../_static/doctools.js?v=888ff710"></script>
-        <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
-        <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
-        <script src="../_static/copybutton.js?v=f281be69"></script>
+      <script src="../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="../_static/doctools.js?v=888ff710"></script>
+      <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+      <script src="../_static/copybutton.js?v=65e89d2a"></script>
     <script src="../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="LLM Auto Parallel" href="llm_auto_parallel.html" />
-    <link rel="prev" title="LLM Logits Processor" href="llm_logits_processor.html" /> 
+    <link rel="next" title="Automatic Parallelism with LLM" href="llm_auto_parallel.html" />
+    <link rel="prev" title="Generate Text in Streaming" href="llm_inference_async_streaming.html" /> 
 </head>
 
 <body class="wy-body-for-nav"> 
@@ -60,6 +58,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/windows.html">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul>
@@ -71,14 +70,15 @@
 <li class="toctree-l1"><a class="reference internal" href="index.html">LLM Examples Introduction</a></li>
 <li class="toctree-l1"><a class="reference internal" href="customization.html">Common Customizations</a></li>
 <li class="toctree-l1 current"><a class="reference internal" href="llm_api_examples.html">Examples</a><ul class="current">
-<li class="toctree-l2"><a class="reference internal" href="llm_inference.html">LLM Inference</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference_async.html">LLM Inference Async</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference_async_streaming.html">LLM Inference Async Streaming</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference_customize.html">LLM Inference Customize</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference_distributed.html">LLM Inference Distributed</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_logits_processor.html">LLM Logits Processor</a></li>
-<li class="toctree-l2 current"><a class="current reference internal" href="#">LLM Quantization</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_auto_parallel.html">LLM Auto Parallel</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_inference_customize.html">Generate text</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_logits_processor.html">Control generated text using logits post processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
 </ul>
 </li>
 </ul>
@@ -99,6 +99,7 @@
 <p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-serve.html">trtllm-serve</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
@@ -117,14 +118,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/executor.html">Executor API</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html">Inference Request</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html#lookahead-decoding">Lookahead decoding</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul>
@@ -163,8 +162,8 @@
           <div role="navigation" aria-label="Page navigation">
   <ul class="wy-breadcrumbs">
       <li><a href="../index.html" class="icon icon-home" aria-label="Home"></a></li>
-          <li class="breadcrumb-item"><a href="llm_api_examples.html">Examples</a></li>
-      <li class="breadcrumb-item active">LLM Quantization</li>
+          <li class="breadcrumb-item"><a href="index.html">LLM Examples Introduction</a></li>
+      <li class="breadcrumb-item active">Generation with Quantization</li>
       <li class="wy-breadcrumbs-aside">
             <a href="../_sources/llm-api-examples/llm_quantization.rst.txt" rel="nofollow"> View page source</a>
       </li>
@@ -174,8 +173,8 @@
           <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
            <div itemprop="articleBody">
              
-  <section id="llm-quantization">
-<h1>LLM Quantization<a class="headerlink" href="#llm-quantization" title="Link to this heading"></a></h1>
+  <section id="generation-with-quantization">
+<h1>Generation with Quantization<a class="headerlink" href="#generation-with-quantization" title="Link to this heading"></a></h1>
 <p>Source <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llm-api/llm_quantization.py">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llm-api/llm_quantization.py</a>.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="c1">### Generation with Quantization</span>
 <span class="linenos"> 2</span><span class="kn">import</span> <span class="nn">logging</span>
@@ -183,51 +182,59 @@
 <span class="linenos"> 4</span><span class="kn">import</span> <span class="nn">torch</span>
 <span class="linenos"> 5</span>
 <span class="linenos"> 6</span><span class="kn">from</span> <span class="nn">tensorrt_llm</span> <span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
-<span class="linenos"> 7</span><span class="kn">from</span> <span class="nn">tensorrt_llm.hlapi</span> <span class="kn">import</span> <span class="n">QuantAlgo</span><span class="p">,</span> <span class="n">QuantConfig</span>
+<span class="linenos"> 7</span><span class="kn">from</span> <span class="nn">tensorrt_llm.llmapi</span> <span class="kn">import</span> <span class="n">CalibConfig</span><span class="p">,</span> <span class="n">QuantAlgo</span><span class="p">,</span> <span class="n">QuantConfig</span>
 <span class="linenos"> 8</span>
 <span class="linenos"> 9</span><span class="n">major</span><span class="p">,</span> <span class="n">minor</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">get_device_capability</span><span class="p">()</span>
 <span class="linenos">10</span><span class="n">post_ada</span> <span class="o">=</span> <span class="n">major</span> <span class="o">&gt;</span> <span class="mi">8</span> <span class="ow">or</span> <span class="p">(</span><span class="n">major</span> <span class="o">==</span> <span class="mi">8</span> <span class="ow">and</span> <span class="n">minor</span> <span class="o">&gt;=</span> <span class="mi">9</span><span class="p">)</span>
 <span class="linenos">11</span>
-<span class="linenos">12</span><span class="n">quant_configs</span> <span class="o">=</span> <span class="p">[</span>
-<span class="linenos">13</span>    <span class="n">QuantConfig</span><span class="p">(</span><span class="n">quant_algo</span><span class="o">=</span><span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A16_AWQ</span><span class="p">),</span>
-<span class="linenos">14</span><span class="p">]</span>
-<span class="linenos">15</span>
-<span class="linenos">16</span><span class="k">if</span> <span class="n">post_ada</span><span class="p">:</span>
-<span class="linenos">17</span>    <span class="n">quant_configs</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
-<span class="linenos">18</span>        <span class="n">QuantConfig</span><span class="p">(</span><span class="n">quant_algo</span><span class="o">=</span><span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8</span><span class="p">,</span>
-<span class="linenos">19</span>                    <span class="n">kv_cache_quant_algo</span><span class="o">=</span><span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8</span><span class="p">))</span>
-<span class="linenos">20</span><span class="k">else</span><span class="p">:</span>
-<span class="linenos">21</span>    <span class="n">logging</span><span class="o">.</span><span class="n">error</span><span class="p">(</span>
-<span class="linenos">22</span>        <span class="s2">&quot;FP8 quantization only works on post-ada GPUs, skipped in the example.&quot;</span><span class="p">)</span>
-<span class="linenos">23</span>
-<span class="linenos">24</span><span class="k">for</span> <span class="n">quant_config</span> <span class="ow">in</span> <span class="n">quant_configs</span><span class="p">:</span>
-<span class="linenos">25</span>
-<span class="linenos">26</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span>
-<span class="linenos">27</span>        <span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">,</span>
-<span class="linenos">28</span>        <span class="c1"># define the quantization config to trigger built-in end-to-end quantization.</span>
-<span class="linenos">29</span>        <span class="n">quant_config</span><span class="o">=</span><span class="n">quant_config</span><span class="p">)</span>
-<span class="linenos">30</span>
-<span class="linenos">31</span>    <span class="c1"># Sample prompts.</span>
-<span class="linenos">32</span>    <span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span>
-<span class="linenos">33</span>        <span class="s2">&quot;Hello, my name is&quot;</span><span class="p">,</span>
-<span class="linenos">34</span>        <span class="s2">&quot;The president of the United States is&quot;</span><span class="p">,</span>
-<span class="linenos">35</span>        <span class="s2">&quot;The capital of France is&quot;</span><span class="p">,</span>
-<span class="linenos">36</span>        <span class="s2">&quot;The future of AI is&quot;</span><span class="p">,</span>
-<span class="linenos">37</span>    <span class="p">]</span>
+<span class="linenos">12</span><span class="n">quant_and_calib_configs</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="linenos">13</span>
+<span class="linenos">14</span><span class="c1"># Example 1: Specify int4 AWQ quantization to QuantConfig.</span>
+<span class="linenos">15</span><span class="c1"># We can skip specifying CalibConfig or leave a None as the default value.</span>
+<span class="linenos">16</span><span class="n">quant_and_calib_configs</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
+<span class="linenos">17</span>    <span class="p">(</span><span class="n">QuantConfig</span><span class="p">(</span><span class="n">quant_algo</span><span class="o">=</span><span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A16_AWQ</span><span class="p">),</span> <span class="kc">None</span><span class="p">))</span>
+<span class="linenos">18</span>
+<span class="linenos">19</span><span class="k">if</span> <span class="n">post_ada</span><span class="p">:</span>
+<span class="linenos">20</span>    <span class="c1"># Example 2: Specify FP8 quantization to QuantConfig.</span>
+<span class="linenos">21</span>    <span class="c1"># We can create a CalibConfig to specify the calibration dataset and other details.</span>
+<span class="linenos">22</span>    <span class="c1"># Note that the calibration dataset could be either HF dataset name or a path to local HF dataset.</span>
+<span class="linenos">23</span>    <span class="n">quant_and_calib_configs</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
+<span class="linenos">24</span>        <span class="p">(</span><span class="n">QuantConfig</span><span class="p">(</span><span class="n">quant_algo</span><span class="o">=</span><span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8</span><span class="p">,</span>
+<span class="linenos">25</span>                     <span class="n">kv_cache_quant_algo</span><span class="o">=</span><span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8</span><span class="p">),</span>
+<span class="linenos">26</span>         <span class="n">CalibConfig</span><span class="p">(</span><span class="n">calib_dataset</span><span class="o">=</span><span class="s1">&#39;cnn_dailymail&#39;</span><span class="p">,</span>
+<span class="linenos">27</span>                     <span class="n">calib_batches</span><span class="o">=</span><span class="mi">256</span><span class="p">,</span>
+<span class="linenos">28</span>                     <span class="n">calib_max_seq_length</span><span class="o">=</span><span class="mi">256</span><span class="p">)))</span>
+<span class="linenos">29</span><span class="k">else</span><span class="p">:</span>
+<span class="linenos">30</span>    <span class="n">logging</span><span class="o">.</span><span class="n">error</span><span class="p">(</span>
+<span class="linenos">31</span>        <span class="s2">&quot;FP8 quantization only works on post-ada GPUs, skipped in the example.&quot;</span><span class="p">)</span>
+<span class="linenos">32</span>
+<span class="linenos">33</span><span class="k">for</span> <span class="n">quant_config</span><span class="p">,</span> <span class="n">calib_config</span> <span class="ow">in</span> <span class="n">quant_and_calib_configs</span><span class="p">:</span>
+<span class="linenos">34</span>    <span class="c1"># The built-in end-to-end quantization is triggered according to the passed quant_config.</span>
+<span class="linenos">35</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">,</span>
+<span class="linenos">36</span>              <span class="n">quant_config</span><span class="o">=</span><span class="n">quant_config</span><span class="p">,</span>
+<span class="linenos">37</span>              <span class="n">calib_config</span><span class="o">=</span><span class="n">calib_config</span><span class="p">)</span>
 <span class="linenos">38</span>
-<span class="linenos">39</span>    <span class="c1"># Create a sampling params.</span>
-<span class="linenos">40</span>    <span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">temperature</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span> <span class="n">top_p</span><span class="o">=</span><span class="mf">0.95</span><span class="p">)</span>
-<span class="linenos">41</span>
-<span class="linenos">42</span>    <span class="k">for</span> <span class="n">output</span> <span class="ow">in</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">):</span>
-<span class="linenos">43</span>        <span class="nb">print</span><span class="p">(</span>
-<span class="linenos">44</span>            <span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">, Generated text: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="si">!r}</span><span class="s2">&quot;</span>
-<span class="linenos">45</span>        <span class="p">)</span>
+<span class="linenos">39</span>    <span class="c1"># Sample prompts.</span>
+<span class="linenos">40</span>    <span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span>
+<span class="linenos">41</span>        <span class="s2">&quot;Hello, my name is&quot;</span><span class="p">,</span>
+<span class="linenos">42</span>        <span class="s2">&quot;The president of the United States is&quot;</span><span class="p">,</span>
+<span class="linenos">43</span>        <span class="s2">&quot;The capital of France is&quot;</span><span class="p">,</span>
+<span class="linenos">44</span>        <span class="s2">&quot;The future of AI is&quot;</span><span class="p">,</span>
+<span class="linenos">45</span>    <span class="p">]</span>
 <span class="linenos">46</span>
-<span class="linenos">47</span><span class="c1"># Got output like</span>
-<span class="linenos">48</span><span class="c1"># Prompt: &#39;Hello, my name is&#39;, Generated text: &#39;Jane Smith. I am a resident of the city. Can you tell me more about the public services provided in the area?&#39;</span>
-<span class="linenos">49</span><span class="c1"># Prompt: &#39;The president of the United States is&#39;, Generated text: &#39;considered the head of state, and the vice president of the United States is considered the head of state. President and Vice President of the United States (US)&#39;</span>
-<span class="linenos">50</span><span class="c1"># Prompt: &#39;The capital of France is&#39;, Generated text: &#39;located in Paris, France. The population of Paris, France, is estimated to be 2 million. France is home to many famous artists, including Picasso&#39;</span>
-<span class="linenos">51</span><span class="c1"># Prompt: &#39;The future of AI is&#39;, Generated text: &#39;an open and collaborative project. The project is an ongoing effort, and we invite participation from members of the community.\n\nOur community is&#39;</span>
+<span class="linenos">47</span>    <span class="c1"># Create a sampling params.</span>
+<span class="linenos">48</span>    <span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">temperature</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span> <span class="n">top_p</span><span class="o">=</span><span class="mf">0.95</span><span class="p">)</span>
+<span class="linenos">49</span>
+<span class="linenos">50</span>    <span class="k">for</span> <span class="n">output</span> <span class="ow">in</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">):</span>
+<span class="linenos">51</span>        <span class="nb">print</span><span class="p">(</span>
+<span class="linenos">52</span>            <span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">, Generated text: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="si">!r}</span><span class="s2">&quot;</span>
+<span class="linenos">53</span>        <span class="p">)</span>
+<span class="linenos">54</span>
+<span class="linenos">55</span><span class="c1"># Got output like</span>
+<span class="linenos">56</span><span class="c1"># Prompt: &#39;Hello, my name is&#39;, Generated text: &#39;Jane Smith. I am a resident of the city. Can you tell me more about the public services provided in the area?&#39;</span>
+<span class="linenos">57</span><span class="c1"># Prompt: &#39;The president of the United States is&#39;, Generated text: &#39;considered the head of state, and the vice president of the United States is considered the head of state. President and Vice President of the United States (US)&#39;</span>
+<span class="linenos">58</span><span class="c1"># Prompt: &#39;The capital of France is&#39;, Generated text: &#39;located in Paris, France. The population of Paris, France, is estimated to be 2 million. France is home to many famous artists, including Picasso&#39;</span>
+<span class="linenos">59</span><span class="c1"># Prompt: &#39;The future of AI is&#39;, Generated text: &#39;an open and collaborative project. The project is an ongoing effort, and we invite participation from members of the community.\n\nOur community is&#39;</span>
 </pre></div>
 </div>
 </section>
@@ -236,14 +243,14 @@
            </div>
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
-        <a href="llm_logits_processor.html" class="btn btn-neutral float-left" title="LLM Logits Processor" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
-        <a href="llm_auto_parallel.html" class="btn btn-neutral float-right" title="LLM Auto Parallel" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+        <a href="llm_inference_async_streaming.html" class="btn btn-neutral float-left" title="Generate Text in Streaming" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="llm_auto_parallel.html" class="btn btn-neutral float-right" title="Automatic Parallelism with LLM" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fc13e3c3cd0>
+<jinja2.runtime.BlockReference object at 0x7f94596fda30>
 
 <div class="footer">
     <p>

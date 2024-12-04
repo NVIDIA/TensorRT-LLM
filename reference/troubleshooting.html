@@ -1,3 +1,5 @@
+
+
 <!DOCTYPE html>
 <html class="writer-html5" lang="en" data-content_root="../">
 <head>
@@ -6,21 +8,17 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Troubleshooting &mdash; tensorrt_llm  documentation</title>
       <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=80d5e7a1" />
-      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=19f00094" />
+      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
 
   
-  <!--[if lt IE 9]>
-    <script src="../_static/js/html5shiv.min.js"></script>
-  <![endif]-->
-  
-        <script src="../_static/jquery.js?v=5d32c60e"></script>
-        <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-        <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="../_static/doctools.js?v=888ff710"></script>
-        <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
-        <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
-        <script src="../_static/copybutton.js?v=f281be69"></script>
+      <script src="../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="../_static/doctools.js?v=888ff710"></script>
+      <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+      <script src="../_static/copybutton.js?v=65e89d2a"></script>
     <script src="../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
@@ -60,6 +58,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/windows.html">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul>
@@ -89,6 +88,7 @@
 <p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-serve.html">trtllm-serve</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
@@ -107,14 +107,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/executor.html">Executor API</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html">Inference Request</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html#lookahead-decoding">Lookahead decoding</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul>
@@ -126,11 +124,10 @@
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
 <ul class="current">
 <li class="toctree-l1 current"><a class="current reference internal" href="#">Troubleshooting</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="#build-errors">Build Errors</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#installation-errors">Installation Errors</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#debug-on-unit-tests">Debug on Unit Tests</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#debug-on-e2e-models">Debug on E2E Models</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#debug-execution-errors">Debug Execution Errors</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#installation-errors">Installation Errors</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#tips">Tips</a></li>
 </ul>
 </li>
@@ -173,44 +170,31 @@
              
   <section id="troubleshooting">
 <span id="id1"></span><h1>Troubleshooting<a class="headerlink" href="#troubleshooting" title="Link to this heading"></a></h1>
-<p>This document describes how to debug in TensorRT-LLM.</p>
-<p>Usually, we want to print the intermediate tensor values when debugging a TensorRT-LLM model.
-TensorRT-LLM obeys define-and-run paradigm, we should mark the interested intermediate tensors as the network outputs.
-Then, we print the values at runtime.</p>
-<section id="build-errors">
-<h2>Build Errors<a class="headerlink" href="#build-errors" title="Link to this heading"></a></h2>
-<p>Many build errors can be resolved by simply deleting the build tree. Try running the build script with <code class="docutils literal notranslate"><span class="pre">--clean</span></code> or running <code class="docutils literal notranslate"><span class="pre">rm</span> <span class="pre">-r</span> <span class="pre">cpp/build</span></code>.</p>
+<p>This document describes some of the frequently asked questions and their solutions in TensorRT-LLM, including problems of installation, model-building, model-execution, and input / output size.</p>
+<section id="installation-errors">
+<h2>Installation Errors<a class="headerlink" href="#installation-errors" title="Link to this heading"></a></h2>
+<p>During compilation and installation of TensorRT-LLM, many build errors can be resolved by simply deleting the build tree and rebuilding again.</p>
+<p>In most occasions, these problems are caused by the workflow like: an old compilation -&gt; some code change (update of the repo or users’ writing) -&gt; a later compilation.</p>
+<p>Solution: try running build script with <code class="docutils literal notranslate"><span class="pre">--clean</span></code>, or try running <code class="docutils literal notranslate"><span class="pre">rm</span> <span class="pre">-r</span> <span class="pre">build</span> <span class="pre">cpp/build</span></code> before running build script again.</p>
 </section>
 <section id="debug-on-unit-tests">
 <h2>Debug on Unit Tests<a class="headerlink" href="#debug-on-unit-tests" title="Link to this heading"></a></h2>
+<p>Here is an example to print the values of the MLP output tensor in the a unit test (<a class="reference download internal" download="" href="../_downloads/29c17f8c7171976309d720e2b031e77e/test_debugging_api.py"><span class="xref download myst">full example</span></a>).</p>
 <ol class="arabic simple">
 <li><p>Register the intermediate tensors as the network outputs with <code class="docutils literal notranslate"><span class="pre">register_network_output</span></code> API.</p></li>
 </ol>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span> <span class="nc">MLP</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
-    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
-                 <span class="n">hidden_size</span><span class="p">,</span>
-                 <span class="n">ffn_hidden_size</span><span class="p">,</span>
-                 <span class="n">bias</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-                 <span class="n">tp_group</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                 <span class="n">tp_size</span><span class="o">=</span><span class="mi">1</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">fc</span> <span class="o">=</span> <span class="n">tensorrt_llm</span><span class="o">.</span><span class="n">layers</span><span class="o">.</span><span class="n">ColumnLinear</span><span class="p">(</span><span class="n">hidden_size</span><span class="p">,</span>
-                                                   <span class="n">ffn_hidden_size</span><span class="p">,</span>
-                                                   <span class="n">bias</span><span class="o">=</span><span class="n">bias</span><span class="p">,</span>
-                                                   <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
-                                                   <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
-                                                   <span class="n">gather_output</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">proj</span> <span class="o">=</span> <span class="n">tensorrt_llm</span><span class="o">.</span><span class="n">layers</span><span class="o">.</span><span class="n">RowLinear</span><span class="p">(</span><span class="n">ffn_hidden_size</span><span class="p">,</span>
-                                                  <span class="n">hidden_size</span><span class="p">,</span>
-                                                  <span class="n">bias</span><span class="o">=</span><span class="n">bias</span><span class="p">,</span>
-                                                  <span class="n">tp_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
-                                                  <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">)</span>
+        <span class="c1"># Do not modify the definition in `__init__` method</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">fc</span> <span class="o">=</span> <span class="o">...</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">proj</span> <span class="o">=</span> <span class="o">...</span>
 
     <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">):</span>
         <span class="n">inter</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">fc</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
         <span class="n">inter</span> <span class="o">=</span> <span class="n">tensorrt_llm</span><span class="o">.</span><span class="n">functional</span><span class="o">.</span><span class="n">relu</span><span class="p">(</span><span class="n">inter</span><span class="p">)</span>
-        <span class="c1"># Here, we want to print the tensor value after relu</span>
+        <span class="c1"># Here register the tensor `inter` as our debug output tensor</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">register_network_output</span><span class="p">(</span><span class="s1">&#39;inter&#39;</span><span class="p">,</span> <span class="n">inter</span><span class="p">)</span>
         <span class="n">output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">proj</span><span class="p">(</span><span class="n">inter</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">output</span>
@@ -230,13 +214,12 @@ Then, we print the values at runtime.</p>
 <span class="nb">print</span><span class="p">(</span><span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;inter&#39;</span><span class="p">])</span>
 </pre></div>
 </div>
-<p>Here is the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/tests/test_debugging_api.py">full example</a>.</p>
 </section>
 <section id="debug-on-e2e-models">
 <h2>Debug on E2E Models<a class="headerlink" href="#debug-on-e2e-models" title="Link to this heading"></a></h2>
 <p>Here is an example to print the values of the MLP output tensor in the GPT model.</p>
 <ol class="arabic simple">
-<li><p>In <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/models/gpt/model.py</span></code>, we register the MLP output tensor:</p></li>
+<li><p>Register the MLP output tensor in <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/models/gpt/model.py</span></code>.</p></li>
 </ol>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span>        <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">residual</span> <span class="o">+</span> <span class="n">attention_output</span><span class="o">.</span><span class="n">data</span>
 
@@ -244,7 +227,7 @@ Then, we print the values at runtime.</p>
         <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">post_layernorm</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
 
         <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
-        <span class="c1"># register as model output</span>
+        <span class="c1"># Register as model output</span>
         <span class="c1"># ------------------------------------------------------</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">register_network_output</span><span class="p">(</span><span class="s1">&#39;mlp_output&#39;</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">)</span>
         <span class="c1"># ------------------------------------------------------</span>
@@ -253,9 +236,9 @@ Then, we print the values at runtime.</p>
 </pre></div>
 </div>
 <ol class="arabic simple" start="2">
-<li><p>Build the TensorRT engine of the model:</p></li>
+<li><p>Build the TensorRT engine of the model.</p></li>
 </ol>
-<p>When building engines with <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code>, enable the <code class="docutils literal notranslate"><span class="pre">--enable_debug_output</span></code> option.</p>
+<p>Enable the <code class="docutils literal notranslate"><span class="pre">--enable_debug_output</span></code> option when building engines with <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code></p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>examples/gpt
 
 <span class="c1"># Download hf gpt2 model</span>
@@ -263,22 +246,22 @@ rm<span class="w"> </span>-rf<span class="w"> </span>gpt2<span class="w"> </span
 <span class="nb">pushd</span><span class="w"> </span>gpt2<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>rm<span class="w"> </span>pytorch_model.bin<span class="w"> </span>model.safetensors<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>wget<span class="w"> </span>-q<span class="w"> </span>https://huggingface.co/gpt2-medium/resolve/main/pytorch_model.bin<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nb">popd</span>
 
 <span class="c1"># Convert to TensorRT-LLM checkpoint</span>
-python3<span class="w"> </span>convert_checkpoint.py<span class="w"> </span>--model_dir<span class="w"> </span>gpt2<span class="w"> </span><span class="se">\</span>
-<span class="w">        </span>--dtype<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
-<span class="w">        </span>--output_dir<span class="w"> </span>gpt2/trt_ckpt/fp16/1-gpu
+python3<span class="w"> </span>convert_checkpoint.py<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--model_dir<span class="w"> </span>gpt2<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--dtype<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--output_dir<span class="w"> </span>gpt2/trt_ckpt/fp16/1-gpu
 
 <span class="c1"># Build TensorRT-LLM engines with --enable_debug_output</span>
-trtllm-build<span class="w"> </span>--checkpoint_dir<span class="w"> </span>gpt2/trt_ckpt/fp16/1-gpu<span class="w"> </span><span class="se">\</span>
-<span class="w">        </span>--gpt_attention_plugin<span class="w"> </span>float16<span class="w"> </span><span class="se">\</span>
-<span class="w">        </span>--remove_input_padding<span class="w"> </span><span class="nb">enable</span><span class="w"> </span><span class="se">\</span>
-<span class="w">        </span>--enable_debug_output<span class="w"> </span><span class="se">\</span>
-<span class="w">        </span>--output_dir<span class="w"> </span>gpt2/trt_engines/fp16/1-gpu
+trtllm-build<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--checkpoint_dir<span class="w"> </span>gpt2/trt_ckpt/fp16/1-gpu<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--enable_debug_output<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--output_dir<span class="w"> </span>gpt2/trt_engines/fp16/1-gpu
 </pre></div>
 </div>
 <ol class="arabic simple" start="3">
-<li><p>Print the intermediate output tensors:</p></li>
+<li><p>Print the intermediate output tensors.</p></li>
 </ol>
-<p>In <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/runtime/generation.py</span></code>, we print the debug info:</p>
+<p>Add debug info in <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/runtime/generation.py</span></code>.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span>        <span class="n">stream</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">current_stream</span><span class="p">()</span><span class="o">.</span><span class="n">cuda_stream</span>
         <span class="n">instance_idx</span> <span class="o">=</span> <span class="n">step</span> <span class="o">%</span> <span class="mi">2</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">cuda_graph_mode</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">runtime</span><span class="o">.</span><span class="n">cuda_graph_instances</span><span class="p">[</span>
@@ -303,62 +286,116 @@ trtllm-build<span class="w"> </span>--checkpoint_dir<span class="w"> </span>gpt2
             <span class="c1"># -------------------------------------------</span>
 </pre></div>
 </div>
-<p>Then, run <code class="docutils literal notranslate"><span class="pre">../run.py</span></code> with <code class="docutils literal notranslate"><span class="pre">--debug_mode</span></code> and <code class="docutils literal notranslate"><span class="pre">--use_py_session</span></code>:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>../run.py<span class="w"> </span>--engine_dir<span class="w"> </span>gpt2/trt_engines/fp16/1-gpu<span class="w"> </span><span class="se">\</span>
-<span class="w">        </span>--tokenizer_dir<span class="w"> </span>gpt2<span class="w"> </span><span class="se">\</span>
-<span class="w">        </span>--max_output_len<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
-<span class="w">        </span>--debug_mode<span class="w"> </span><span class="se">\</span>
-<span class="w">        </span>--use_py_session
+<ol class="arabic simple" start="4">
+<li><p>Run <code class="docutils literal notranslate"><span class="pre">../run.py</span></code> with <code class="docutils literal notranslate"><span class="pre">--debug_mode</span></code> and <code class="docutils literal notranslate"><span class="pre">--use_py_session</span></code>.</p></li>
+</ol>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>../run.py<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--engine_dir<span class="w"> </span>gpt2/trt_engines/fp16/1-gpu<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--tokenizer_dir<span class="w"> </span>gpt2<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_output_len<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--debug_mode<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--use_py_session
 </pre></div>
 </div>
-<p>We will see the tensor values:</p>
-<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="o">......</span>
-<span class="n">dict_keys</span><span class="p">([</span><span class="s1">&#39;context_lengths&#39;</span><span class="p">,</span> <span class="s1">&#39;cache_indirection&#39;</span><span class="p">,</span> <span class="s1">&#39;position_ids&#39;</span><span class="p">,</span> <span class="s1">&#39;logits&#39;</span><span class="p">,</span> <span class="s1">&#39;last_token_ids&#39;</span><span class="p">,</span> <span class="s1">&#39;input_ids&#39;</span><span class="p">,</span> <span class="s1">&#39;kv_cache_block_pointers&#39;</span><span class="p">,</span> <span class="s1">&#39;host_kv_cache_block_pointers&#39;</span><span class="p">,</span> <span class="s1">&#39;sequence_length&#39;</span><span class="p">,</span> <span class="s1">&#39;host_past_key_value_lengths&#39;</span><span class="p">,</span> <span class="s1">&#39;host_sink_token_length&#39;</span><span class="p">,</span> <span class="s1">&#39;host_request_types&#39;</span><span class="p">,</span> <span class="s1">&#39;host_max_attention_window_sizes&#39;</span><span class="p">,</span> <span class="s1">&#39;host_context_lengths&#39;</span><span class="p">,</span> <span class="s1">&#39;transformer.layers.0.mlp_output&#39;</span><span class="p">,</span> <span class="s1">&#39;transformer.layers.1.mlp_output&#39;</span><span class="p">,</span> <span class="s1">&#39;transformer.layers.2.mlp_output&#39;</span><span class="p">,</span> <span class="s1">&#39;transformer.layers.3.mlp_output&#39;</span><span class="p">,</span> <span class="s1">&#39;transformer.layers.4.mlp_output&#39;</span><span class="p">,</span> <span class="s1">&#39;transformer.layers.5.mlp_output&#39;</span><span class="p">,</span> <span class="s1">&#39;transformer.layers.6.mlp_output&#39;</span><span class="p">,</span> <span class="s1">&#39;transformer.layers.7.mlp_output&#39;</span><span class="p">,</span> <span class="s1">&#39;transformer.layers.8.mlp_output&#39;</span><span class="p">,</span> <span class="s1">&#39;transformer.layers.9.mlp_output&#39;</span><span class="p">,</span> <span class="s1">&#39;transformer.layers.10.mlp_output&#39;</span><span class="p">,</span> <span class="s1">&#39;transformer.layers.11.mlp_output&#39;</span><span class="p">,</span> <span class="s1">&#39;transformer.layers.12.mlp_output&#39;</span><span class="p">,</span> <span class="s1">&#39;transformer.layers.13.mlp_output&#39;</span><span class="p">,</span> <span class="s1">&#39;transformer.layers.14.mlp_output&#39;</span><span class="p">,</span> <span class="s1">&#39;transformer.layers.15.mlp_output&#39;</span><span class="p">,</span> <span class="s1">&#39;transformer.layers.16.mlp_output&#39;</span><span class="p">,</span> <span class="s1">&#39;transformer.layers.17.mlp_output&#39;</span><span class="p">,</span> <span class="s1">&#39;transformer.layers.18.mlp_output&#39;</span><span class="p">,</span> <span class="s1">&#39;transformer.layers.19.mlp_output&#39;</span><span class="p">,</span> <span class="s1">&#39;transformer.layers.20.mlp_output&#39;</span><span class="p">,</span> <span class="s1">&#39;transformer.layers.21.mlp_output&#39;</span><span class="p">,</span> <span class="s1">&#39;transformer.layers.22.mlp_output&#39;</span><span class="p">,</span> <span class="s1">&#39;transformer.layers.23.mlp_output&#39;</span><span class="p">])</span>
-<span class="n">Step</span><span class="p">:</span> <span class="mi">0</span>
-<span class="n">tensor</span><span class="p">([[</span> <span class="mf">0.0294</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.0260</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.0776</span><span class="p">,</span>  <span class="o">...</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.0560</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.0235</span><span class="p">,</span>  <span class="mf">0.0273</span><span class="p">],</span>
-        <span class="p">[</span><span class="o">-</span><span class="mf">0.0071</span><span class="p">,</span>  <span class="mf">0.5879</span><span class="p">,</span>  <span class="mf">0.1993</span><span class="p">,</span>  <span class="o">...</span><span class="p">,</span> <span class="o">-</span><span class="mf">1.0449</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.6299</span><span class="p">,</span>  <span class="mf">0.5957</span><span class="p">],</span>
-        <span class="p">[</span><span class="o">-</span><span class="mf">0.8779</span><span class="p">,</span>  <span class="mf">0.1050</span><span class="p">,</span>  <span class="mf">0.7090</span><span class="p">,</span>  <span class="o">...</span><span class="p">,</span>  <span class="mf">0.0910</span><span class="p">,</span>  <span class="mf">1.0713</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.2939</span><span class="p">],</span>
-        <span class="o">...</span><span class="p">,</span>
-        <span class="p">[</span> <span class="mf">0.1212</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.0903</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.5918</span><span class="p">,</span>  <span class="o">...</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.1045</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.3445</span><span class="p">,</span>  <span class="mf">0.1082</span><span class="p">],</span>
-        <span class="p">[</span><span class="o">-</span><span class="mf">1.0723</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.0732</span><span class="p">,</span>  <span class="mf">0.6157</span><span class="p">,</span>  <span class="o">...</span><span class="p">,</span>  <span class="mf">0.3452</span><span class="p">,</span>  <span class="mf">0.2998</span><span class="p">,</span>  <span class="mf">0.2649</span><span class="p">],</span>
-        <span class="p">[</span><span class="o">-</span><span class="mf">0.7134</span><span class="p">,</span>  <span class="mf">0.9692</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.1141</span><span class="p">,</span>  <span class="o">...</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.0096</span><span class="p">,</span>  <span class="mf">0.9521</span><span class="p">,</span>  <span class="mf">0.1437</span><span class="p">]],</span>
-       <span class="n">device</span><span class="o">=</span><span class="s1">&#39;cuda:0&#39;</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">)</span>
-<span class="n">Step</span><span class="p">:</span> <span class="mi">1</span>
-<span class="n">tensor</span><span class="p">([[</span><span class="o">-</span><span class="mf">0.2107</span><span class="p">,</span>  <span class="mf">0.5874</span><span class="p">,</span>  <span class="mf">0.8179</span><span class="p">,</span>  <span class="o">...</span><span class="p">,</span>  <span class="mf">0.7900</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.6890</span><span class="p">,</span>  <span class="mf">0.6064</span><span class="p">]],</span>
-       <span class="n">device</span><span class="o">=</span><span class="s1">&#39;cuda:0&#39;</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">)</span>
-<span class="n">Step</span><span class="p">:</span> <span class="mi">2</span>
-<span class="n">tensor</span><span class="p">([[</span> <span class="mf">0.4192</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.0047</span><span class="p">,</span>  <span class="mf">1.3887</span><span class="p">,</span>  <span class="o">...</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.9028</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.0682</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.2820</span><span class="p">]],</span>
-       <span class="n">device</span><span class="o">=</span><span class="s1">&#39;cuda:0&#39;</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">)</span>
-<span class="n">Step</span><span class="p">:</span> <span class="mi">3</span>
-<span class="n">tensor</span><span class="p">([[</span><span class="o">-</span><span class="mf">0.7949</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.5073</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.1721</span><span class="p">,</span>  <span class="o">...</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.5830</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.1378</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.0070</span><span class="p">]],</span>
-       <span class="n">device</span><span class="o">=</span><span class="s1">&#39;cuda:0&#39;</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">)</span>
-<span class="n">Step</span><span class="p">:</span> <span class="mi">4</span>
-<span class="n">tensor</span><span class="p">([[</span><span class="o">-</span><span class="mf">0.0804</span><span class="p">,</span>  <span class="mf">0.1272</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.6255</span><span class="p">,</span>  <span class="o">...</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.1072</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.0523</span><span class="p">,</span>  <span class="mf">0.7144</span><span class="p">]],</span>
-       <span class="n">device</span><span class="o">=</span><span class="s1">&#39;cuda:0&#39;</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">)</span>
-<span class="n">Step</span><span class="p">:</span> <span class="mi">5</span>
-<span class="n">tensor</span><span class="p">([[</span><span class="o">-</span><span class="mf">0.3328</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.8828</span><span class="p">,</span>  <span class="mf">0.3442</span><span class="p">,</span>  <span class="o">...</span><span class="p">,</span>  <span class="mf">0.8149</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.0630</span><span class="p">,</span>  <span class="mf">1.2305</span><span class="p">]],</span>
-       <span class="n">device</span><span class="o">=</span><span class="s1">&#39;cuda:0&#39;</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">)</span>
-<span class="n">Step</span><span class="p">:</span> <span class="mi">6</span>
-<span class="n">tensor</span><span class="p">([[</span><span class="o">-</span><span class="mf">0.2225</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.2079</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.1459</span><span class="p">,</span>  <span class="o">...</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.3555</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.1672</span><span class="p">,</span>  <span class="mf">0.1135</span><span class="p">]],</span>
-       <span class="n">device</span><span class="o">=</span><span class="s1">&#39;cuda:0&#39;</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">)</span>
-<span class="n">Step</span><span class="p">:</span> <span class="mi">7</span>
-<span class="n">tensor</span><span class="p">([[</span> <span class="mf">0.1290</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.1556</span><span class="p">,</span>  <span class="mf">0.3977</span><span class="p">,</span>  <span class="o">...</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.8218</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.3291</span><span class="p">,</span> <span class="o">-</span><span class="mf">0.8672</span><span class="p">]],</span>
-       <span class="n">device</span><span class="o">=</span><span class="s1">&#39;cuda:0&#39;</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">)</span>
-<span class="n">Input</span> <span class="p">[</span><span class="n">Text</span> <span class="mi">0</span><span class="p">]:</span> <span class="s2">&quot;Born in north-east France, Soyer trained as a&quot;</span>
-<span class="n">Output</span> <span class="p">[</span><span class="n">Text</span> <span class="mi">0</span> <span class="n">Beam</span> <span class="mi">0</span><span class="p">]:</span> <span class="s2">&quot; chef before moving to London in the early&quot;</span>
+<ol class="arabic simple" start="5">
+<li><p>See the value of the tensor.</p></li>
+</ol>
+<div class="highlight-txt notranslate"><div class="highlight"><pre><span></span>......
+dict_keys([&#39;context_lengths&#39;, &#39;cache_indirection&#39;, &#39;position_ids&#39;, &#39;logits&#39;, &#39;last_token_ids&#39;, &#39;input_ids&#39;, &#39;kv_cache_block_pointers&#39;, &#39;host_kv_cache_block_pointers&#39;, &#39;sequence_length&#39;, &#39;host_past_key_value_lengths&#39;, &#39;host_sink_token_length&#39;, &#39;host_request_types&#39;, &#39;host_max_attention_window_sizes&#39;, &#39;host_context_lengths&#39;, &#39;transformer.layers.0.mlp_output&#39;, &#39;transformer.layers.1.mlp_output&#39;, &#39;transformer.layers.2.mlp_output&#39;, &#39;transformer.layers.3.mlp_output&#39;, &#39;transformer.layers.4.mlp_output&#39;, &#39;transformer.layers.5.mlp_output&#39;, &#39;transformer.layers.6.mlp_output&#39;, &#39;transformer.layers.7.mlp_output&#39;, &#39;transformer.layers.8.mlp_output&#39;, &#39;transformer.layers.9.mlp_output&#39;, &#39;transformer.layers.10.mlp_output&#39;, &#39;transformer.layers.11.mlp_output&#39;, &#39;transformer.layers.12.mlp_output&#39;, &#39;transformer.layers.13.mlp_output&#39;, &#39;transformer.layers.14.mlp_output&#39;, &#39;transformer.layers.15.mlp_output&#39;, &#39;transformer.layers.16.mlp_output&#39;, &#39;transformer.layers.17.mlp_output&#39;, &#39;transformer.layers.18.mlp_output&#39;, &#39;transformer.layers.19.mlp_output&#39;, &#39;transformer.layers.20.mlp_output&#39;, &#39;transformer.layers.21.mlp_output&#39;, &#39;transformer.layers.22.mlp_output&#39;, &#39;transformer.layers.23.mlp_output&#39;])
+Step: 0
+tensor([[ 0.0294, -0.0260, -0.0776,  ..., -0.0560, -0.0235,  0.0273],
+        [-0.0071,  0.5879,  0.1993,  ..., -1.0449, -0.6299,  0.5957],
+        [-0.8779,  0.1050,  0.7090,  ...,  0.0910,  1.0713, -0.2939],
+        ...,
+        [ 0.1212, -0.0903, -0.5918,  ..., -0.1045, -0.3445,  0.1082],
+        [-1.0723, -0.0732,  0.6157,  ...,  0.3452,  0.2998,  0.2649],
+        [-0.7134,  0.9692, -0.1141,  ..., -0.0096,  0.9521,  0.1437]],
+       device=&#39;cuda:0&#39;, dtype=torch.float16)
+Step: 1
+tensor([[-0.2107,  0.5874,  0.8179,  ...,  0.7900, -0.6890,  0.6064]],
+       device=&#39;cuda:0&#39;, dtype=torch.float16)
+Step: 2
+tensor([[ 0.4192, -0.0047,  1.3887,  ..., -0.9028, -0.0682, -0.2820]],
+       device=&#39;cuda:0&#39;, dtype=torch.float16)
+Step: 3
+tensor([[-0.7949, -0.5073, -0.1721,  ..., -0.5830, -0.1378, -0.0070]],
+       device=&#39;cuda:0&#39;, dtype=torch.float16)
+Step: 4
+tensor([[-0.0804,  0.1272, -0.6255,  ..., -0.1072, -0.0523,  0.7144]],
+       device=&#39;cuda:0&#39;, dtype=torch.float16)
+Step: 5
+tensor([[-0.3328, -0.8828,  0.3442,  ...,  0.8149, -0.0630,  1.2305]],
+       device=&#39;cuda:0&#39;, dtype=torch.float16)
+Step: 6
+tensor([[-0.2225, -0.2079, -0.1459,  ..., -0.3555, -0.1672,  0.1135]],
+       device=&#39;cuda:0&#39;, dtype=torch.float16)
+Step: 7
+tensor([[ 0.1290, -0.1556,  0.3977,  ..., -0.8218, -0.3291, -0.8672]],
+       device=&#39;cuda:0&#39;, dtype=torch.float16)
+Input [Text 0]: &quot;Born in north-east France, Soyer trained as a&quot;
+Output [Text 0 Beam 0]: &quot; chef before moving to London in the early&quot;
 </pre></div>
 </div>
 </section>
 <section id="debug-execution-errors">
 <h2>Debug Execution Errors<a class="headerlink" href="#debug-execution-errors" title="Link to this heading"></a></h2>
-<ul class="simple">
-<li><p>If you use plugins, use can set the environment variable <code class="docutils literal notranslate"><span class="pre">CUDA_LAUNCH_BLOCKING=1</span></code> so that kernels are launch synchronously, with their return status checked immediately.</p></li>
-<li><p>If you see memory errors, make sure that the engine inputs respect the build-time shapes and that they reside <strong>on the correct device</strong> (CPU/GPU).</p></li>
-</ul>
-</section>
-<section id="installation-errors">
-<h2>Installation Errors<a class="headerlink" href="#installation-errors" title="Link to this heading"></a></h2>
-<p>Many build errors can be resolved by simply deleting the build tree. Try running the build script with <code class="docutils literal notranslate"><span class="pre">--clean</span></code> or running <code class="docutils literal notranslate"><span class="pre">rm</span> <span class="pre">-r</span> <span class="pre">cpp/build</span></code>.</p>
+<p>If problems come from plugins, try setting the environment variable <code class="docutils literal notranslate"><span class="pre">CUDA_LAUNCH_BLOCKING=1</span></code> to make kernels launch synchronously with their return status checked immediately.</p>
+<p>If problems come from runtime-shape of the input tensors, double-check the shape (rank and length of each rank) and location (CPU / GPU) of input tensors for the engine obey the build-time setting.</p>
+<p>For example, one possible reason of getting the error information like below is, we use mismatched configuration between engine building and running, including code change (update of repo or users’ rewrting), too large or too small input shape, etc..</p>
+<div class="highlight-txt notranslate"><div class="highlight"><pre><span></span>unexpected shape for input &#39;XXX&#39; for model &#39;YYY&#39;. Expected [-1,-1,-1], got [8,16]. NOTE: Setting a non-zero max_batch_size in the model config requires a batch dimension to be prepended to each input shape. If you want to specify the full shape including the batch dim in your input dims config, try setting max_batch_size to zero. See the model configuration docs for more info on max_batch_size.
+
+[TensorRT-LLM][ERROR] Assertion failed: Tensor &#39;input_ids&#39; has invalid shape (8192), expected (-1) (/code/tensorrt_llm/cpp/tensorrt_llm/runtime/tllmRuntime.cpp:149)
+
+RuntimeError: Sizes of tensors must match except in dimension 0. Expected size 8192 but got size 1024 for tensor number 1 in the list.
+</pre></div>
+</div>
+<p>By setting environment variable <code class="docutils literal notranslate"><span class="pre">export</span> <span class="pre">TLLM_LOG_LEVEL=TRACE</span></code>, we can get more information about the TensorRT engine at runtime, which contains the shapes of each input / output tensors, and all allowed ranges of every input shapes.</p>
+<div class="highlight-txt notranslate"><div class="highlight"><pre><span></span>[TensorRT-LLM][TRACE] =====================================================================
+[TensorRT-LLM][TRACE]              Name              |I/O|Location|DataType|    Shape     |
+[TensorRT-LLM][TRACE] ---------------------------------------------------------------------
+[TensorRT-LLM][TRACE] input_ids                      | I |  GPU   | INT32  |     (-1)     |
+[TensorRT-LLM][TRACE] position_ids                   | I |  GPU   | INT32  |     (-1)     |
+[TensorRT-LLM][TRACE] last_token_ids                 | I |  GPU   | INT32  |     (-1)     |
+[TensorRT-LLM][TRACE] kv_cache_block_offsets         | I |  GPU   | INT32  |(1, -1, 2, -1)|
+[TensorRT-LLM][TRACE] host_kv_cache_block_offsets    | I |  GPU   | INT32  |(1, -1, 2, -1)|
+[TensorRT-LLM][TRACE] host_kv_cache_pool_pointers    | I |  GPU   | INT64  |    (1, 2)    |
+[TensorRT-LLM][TRACE] host_kv_cache_pool_mapping     | I |  GPU   | INT32  |     (28)     |
+[TensorRT-LLM][TRACE] sequence_length                | I |  GPU   | INT32  |     (-1)     |
+[TensorRT-LLM][TRACE] host_request_types             | I |  GPU   | INT32  |     (-1)     |
+[TensorRT-LLM][TRACE] host_past_key_value_lengths    | I |  GPU   | INT32  |     (-1)     |
+[TensorRT-LLM][TRACE] context_lengths                | I |  GPU   | INT32  |     (-1)     |
+[TensorRT-LLM][TRACE] host_runtime_perf_knobs        | I |  GPU   | INT64  |     (16)     |
+[TensorRT-LLM][TRACE] host_context_lengths           | I |  GPU   | INT32  |     (-1)     |
+[TensorRT-LLM][TRACE] host_max_attention_window_sizes| I |  GPU   | INT32  |     (28)     |
+[TensorRT-LLM][TRACE] host_sink_token_length         | I |  GPU   | INT32  |     (1)      |
+[TensorRT-LLM][TRACE] cache_indirection              | I |  GPU   | INT32  | (-1, 1, -1)  |
+[TensorRT-LLM][TRACE] logits                         | O |  GPU   |  FP32  | (-1, 65024)  |
+[TensorRT-LLM][TRACE] =====================================================================
+[TensorRT-LLM][TRACE] Information of optimization profile.
+[TensorRT-LLM][TRACE] Optimization Profile 0:
+[TensorRT-LLM][TRACE] =============================================================================
+[TensorRT-LLM][TRACE]              Name              |     Min      |     Opt      |     Max      |
+[TensorRT-LLM][TRACE] -----------------------------------------------------------------------------
+[TensorRT-LLM][TRACE] input_ids                      |     (1)      |     (8)      |    (8192)    |
+[TensorRT-LLM][TRACE] position_ids                   |     (1)      |     (8)      |    (8192)    |
+[TensorRT-LLM][TRACE] last_token_ids                 |     (1)      |     (4)      |     (8)      |
+[TensorRT-LLM][TRACE] kv_cache_block_offsets         | (1, 1, 2, 1) |(1, 4, 2, 16) |(1, 8, 2, 32) |
+[TensorRT-LLM][TRACE] host_kv_cache_block_offsets    | (1, 1, 2, 1) |(1, 4, 2, 16) |(1, 8, 2, 32) |
+[TensorRT-LLM][TRACE] host_kv_cache_pool_pointers    |    (1, 2)    |    (1, 2)    |    (1, 2)    |
+[TensorRT-LLM][TRACE] host_kv_cache_pool_mapping     |     (28)     |     (28)     |     (28)     |
+[TensorRT-LLM][TRACE] sequence_length                |     (1)      |     (4)      |     (8)      |
+[TensorRT-LLM][TRACE] host_request_types             |     (1)      |     (4)      |     (8)      |
+[TensorRT-LLM][TRACE] host_past_key_value_lengths    |     (1)      |     (4)      |     (8)      |
+[TensorRT-LLM][TRACE] context_lengths                |     (1)      |     (4)      |     (8)      |
+[TensorRT-LLM][TRACE] host_runtime_perf_knobs        |     (16)     |     (16)     |     (16)     |
+[TensorRT-LLM][TRACE] host_context_lengths           |     (1)      |     (4)      |     (8)      |
+[TensorRT-LLM][TRACE] host_max_attention_window_sizes|     (28)     |     (28)     |     (28)     |
+[TensorRT-LLM][TRACE] host_sink_token_length         |     (1)      |     (1)      |     (1)      |
+[TensorRT-LLM][TRACE] cache_indirection              |  (1, 1, 1)   | (4, 1, 1024) | (8, 1, 2048) |
+[TensorRT-LLM][TRACE] logits                         |  (1, 65024)  |  (4, 65024)  |  (8, 65024)  |
+[TensorRT-LLM][TRACE] =============================================================================
+</pre></div>
+</div>
 </section>
 <section id="tips">
 <h2>Tips<a class="headerlink" href="#tips" title="Link to this heading"></a></h2>
@@ -406,10 +443,12 @@ encounter interferences:</p>
 <span class="o">--------------------------------------------------------------------------</span>
 </pre></div>
 </div>
+<p>You may experience other problems like hanging on the program startup.</p>
 <p>As a rule of thumb, if you are running TensorRT-LLM interactively on a Slurm
 node, prefix your commands with <code class="docutils literal notranslate"><span class="pre">mpirun</span> <span class="pre">-n</span> <span class="pre">1</span></code> to run TensorRT-LLM in a
 dedicated MPI environment, not the one provided by your Slurm allocation.</p>
 <p>For example: <code class="docutils literal notranslate"><span class="pre">mpirun</span> <span class="pre">-n</span> <span class="pre">1</span> <span class="pre">python3</span> <span class="pre">examples/gpt/build.py</span> <span class="pre">...</span></code></p>
+<p>It’s critical that it’s always <code class="docutils literal notranslate"><span class="pre">-n</span> <span class="pre">1</span></code> regardless of how many GPUs are being used. If you’d use <code class="docutils literal notranslate"><span class="pre">-n</span> <span class="pre">2</span></code> for a 2 GPU program it will not work. <code class="docutils literal notranslate"><span class="pre">mpirun</span></code> here isn’t being used to orchestrate multiple processes, but to invoke the right environment on SLURM. The internal MPI implementation deals with spawning the additional processes.</p>
 </section>
 </section>
 
@@ -424,7 +463,7 @@ dedicated MPI environment, not the one provided by your Slurm allocation.</p>
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fc13f3da6e0>
+<jinja2.runtime.BlockReference object at 0x7f9468f3ff80>
 
 <div class="footer">
     <p>

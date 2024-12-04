@@ -1,31 +1,29 @@
+
+
 <!DOCTYPE html>
 <html class="writer-html5" lang="en" data-content_root="../">
 <head>
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>LLM Auto Parallel &mdash; tensorrt_llm  documentation</title>
+  <title>Automatic Parallelism with LLM &mdash; tensorrt_llm  documentation</title>
       <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=80d5e7a1" />
-      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=19f00094" />
+      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
 
   
-  <!--[if lt IE 9]>
-    <script src="../_static/js/html5shiv.min.js"></script>
-  <![endif]-->
-  
-        <script src="../_static/jquery.js?v=5d32c60e"></script>
-        <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-        <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="../_static/doctools.js?v=888ff710"></script>
-        <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
-        <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
-        <script src="../_static/copybutton.js?v=f281be69"></script>
+      <script src="../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="../_static/doctools.js?v=888ff710"></script>
+      <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+      <script src="../_static/copybutton.js?v=65e89d2a"></script>
     <script src="../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="Layers" href="../python-api/tensorrt_llm.layers.html" />
-    <link rel="prev" title="LLM Quantization" href="llm_quantization.html" /> 
+    <link rel="next" title="Control generated text using logits post processor" href="llm_logits_processor.html" />
+    <link rel="prev" title="Generation with Quantization" href="llm_quantization.html" /> 
 </head>
 
 <body class="wy-body-for-nav"> 
@@ -60,6 +58,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/windows.html">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul>
@@ -71,14 +70,15 @@
 <li class="toctree-l1"><a class="reference internal" href="index.html">LLM Examples Introduction</a></li>
 <li class="toctree-l1"><a class="reference internal" href="customization.html">Common Customizations</a></li>
 <li class="toctree-l1 current"><a class="reference internal" href="llm_api_examples.html">Examples</a><ul class="current">
-<li class="toctree-l2"><a class="reference internal" href="llm_inference.html">LLM Inference</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference_async.html">LLM Inference Async</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference_async_streaming.html">LLM Inference Async Streaming</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference_customize.html">LLM Inference Customize</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference_distributed.html">LLM Inference Distributed</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_logits_processor.html">LLM Logits Processor</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_quantization.html">LLM Quantization</a></li>
-<li class="toctree-l2 current"><a class="current reference internal" href="#">LLM Auto Parallel</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_inference_customize.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_logits_processor.html">Control generated text using logits post processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">Automatic Parallelism with LLM</a></li>
 </ul>
 </li>
 </ul>
@@ -99,6 +99,7 @@
 <p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-serve.html">trtllm-serve</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
@@ -117,14 +118,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/executor.html">Executor API</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html">Inference Request</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html#lookahead-decoding">Lookahead decoding</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul>
@@ -163,8 +162,8 @@
           <div role="navigation" aria-label="Page navigation">
   <ul class="wy-breadcrumbs">
       <li><a href="../index.html" class="icon icon-home" aria-label="Home"></a></li>
-          <li class="breadcrumb-item"><a href="llm_api_examples.html">Examples</a></li>
-      <li class="breadcrumb-item active">LLM Auto Parallel</li>
+          <li class="breadcrumb-item"><a href="index.html">LLM Examples Introduction</a></li>
+      <li class="breadcrumb-item active">Automatic Parallelism with LLM</li>
       <li class="wy-breadcrumbs-aside">
             <a href="../_sources/llm-api-examples/llm_auto_parallel.rst.txt" rel="nofollow"> View page source</a>
       </li>
@@ -174,8 +173,8 @@
           <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
            <div itemprop="articleBody">
              
-  <section id="llm-auto-parallel">
-<h1>LLM Auto Parallel<a class="headerlink" href="#llm-auto-parallel" title="Link to this heading"></a></h1>
+  <section id="automatic-parallelism-with-llm">
+<h1>Automatic Parallelism with LLM<a class="headerlink" href="#automatic-parallelism-with-llm" title="Link to this heading"></a></h1>
 <p>Source <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llm-api/llm_auto_parallel.py">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llm-api/llm_auto_parallel.py</a>.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="c1">### Automatic Parallelism with LLM</span>
 <span class="linenos"> 2</span><span class="kn">from</span> <span class="nn">tensorrt_llm</span> <span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
@@ -187,7 +186,7 @@
 <span class="linenos"> 8</span>
 <span class="linenos"> 9</span>        <span class="c1"># Enable auto parallelism</span>
 <span class="linenos">10</span>        <span class="n">auto_parallel</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-<span class="linenos">11</span>        <span class="n">world_size</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span>
+<span class="linenos">11</span>        <span class="n">auto_parallel_world_size</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span>
 <span class="linenos">12</span>
 <span class="linenos">13</span>    <span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span>
 <span class="linenos">14</span>        <span class="s2">&quot;Hello, my name is&quot;</span><span class="p">,</span>
@@ -220,14 +219,14 @@
            </div>
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
-        <a href="llm_quantization.html" class="btn btn-neutral float-left" title="LLM Quantization" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
-        <a href="../python-api/tensorrt_llm.layers.html" class="btn btn-neutral float-right" title="Layers" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+        <a href="llm_quantization.html" class="btn btn-neutral float-left" title="Generation with Quantization" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="llm_logits_processor.html" class="btn btn-neutral float-right" title="Control generated text using logits post processor" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fc13e4ead10>
+<jinja2.runtime.BlockReference object at 0x7f94598aca70>
 
 <div class="footer">
     <p>

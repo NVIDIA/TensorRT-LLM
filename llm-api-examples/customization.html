@@ -1,3 +1,5 @@
+
+
 <!DOCTYPE html>
 <html class="writer-html5" lang="en" data-content_root="../">
 <head>
@@ -6,26 +8,22 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Common Customizations &mdash; tensorrt_llm  documentation</title>
       <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=80d5e7a1" />
-      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=19f00094" />
+      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
 
   
-  <!--[if lt IE 9]>
-    <script src="../_static/js/html5shiv.min.js"></script>
-  <![endif]-->
-  
-        <script src="../_static/jquery.js?v=5d32c60e"></script>
-        <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-        <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="../_static/doctools.js?v=888ff710"></script>
-        <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
-        <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
-        <script src="../_static/copybutton.js?v=f281be69"></script>
+      <script src="../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="../_static/doctools.js?v=888ff710"></script>
+      <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+      <script src="../_static/copybutton.js?v=65e89d2a"></script>
     <script src="../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
     <link rel="next" title="Examples" href="llm_api_examples.html" />
-    <link rel="prev" title="LLM Examples Introduction" href="index.html" /> 
+    <link rel="prev" title="Control generated text using logits post processor" href="llm_logits_processor.html" /> 
 </head>
 
 <body class="wy-body-for-nav"> 
@@ -60,6 +58,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/windows.html">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul>
@@ -104,6 +103,7 @@
 <p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-serve.html">trtllm-serve</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
@@ -122,14 +122,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/executor.html">Executor API</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html">Inference Request</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html#lookahead-decoding">Lookahead decoding</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul>
@@ -183,7 +181,7 @@
 <section id="quantization">
 <h2>Quantization<a class="headerlink" href="#quantization" title="Link to this heading"></a></h2>
 <p>TensorRT-LLM can quantize the Hugging Face model automatically. By setting the appropriate flags in the <code class="docutils literal notranslate"><span class="pre">LLM</span></code> instance. For example, to perform an Int4 AWQ quantization, the following code triggers the model quantization. Please refer to complete list of <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/_modules/tensorrt_llm/quantization/mode.html#QuantAlgo">supported flags</a> and acceptable values.</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span> <span class="nn">tensorrt_llm.hlapi</span> <span class="kn">import</span> <span class="n">QuantConfig</span><span class="p">,</span> <span class="n">QuantAlgo</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span> <span class="nn">tensorrt_llm.llmapi</span> <span class="kn">import</span> <span class="n">QuantConfig</span><span class="p">,</span> <span class="n">QuantAlgo</span>
 
 <span class="n">quant_config</span> <span class="o">=</span> <span class="n">QuantConfig</span><span class="p">(</span><span class="n">quant_algo</span><span class="o">=</span><span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A16_AWQ</span><span class="p">)</span>
 
@@ -193,9 +191,9 @@
 </section>
 <section id="sampling">
 <h2>Sampling<a class="headerlink" href="#sampling" title="Link to this heading"></a></h2>
-<p>SamplingParams can customize the sampling strategy to control LLM generated responses, such as beam search, temperature, and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/hlapi/utils.py#L55-L76">others</a>.</p>
+<p>SamplingParams can customize the sampling strategy to control LLM generated responses, such as beam search, temperature, and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/llmapi/utils.py#L55-L76">others</a>.</p>
 <p>As an example, to enable beam search with a beam size of 4, set the <code class="docutils literal notranslate"><span class="pre">sampling_params</span></code> as follows:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span> <span class="nn">tensorrt_llm.hlapi</span> <span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span><span class="p">,</span> <span class="n">BuildConfig</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span> <span class="nn">tensorrt_llm.llmapi</span> <span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span><span class="p">,</span> <span class="n">BuildConfig</span>
 
 <span class="n">build_config</span> <span class="o">=</span> <span class="n">BuildConfig</span><span class="p">()</span>
 <span class="n">build_config</span><span class="o">.</span><span class="n">max_beam_width</span> <span class="o">=</span> <span class="mi">4</span>
@@ -214,7 +212,7 @@
 <li><p><a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14SamplingConfigE">SamplingConfig</a></p></li>
 <li><p><a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor12OutputConfigE">OutputConfig</a></p></li>
 </ul>
-<p>Refer to the <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api/index.html#tensorrt_llm.hlapi.SamplingParams">class documentation</a> for more details.</p>
+<p>Refer to the <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api/index.html#tensorrt_llm.llmapi.SamplingParams">class documentation</a> for more details.</p>
 </section>
 <section id="build-configuration">
 <h2>Build Configuration<a class="headerlink" href="#build-configuration" title="Link to this heading"></a></h2>
@@ -230,8 +228,8 @@
 </section>
 <section id="runtime-customization">
 <h2>Runtime Customization<a class="headerlink" href="#runtime-customization" title="Link to this heading"></a></h2>
-<p>Similar to <code class="docutils literal notranslate"><span class="pre">build_config</span></code>, you can also customize the runtime configuration with the <code class="docutils literal notranslate"><span class="pre">runtime_config</span></code>, <code class="docutils literal notranslate"><span class="pre">peft_cache_config</span></code> or other <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/hlapi/llm_utils.py#L186-L223">arguments</a> borrowed from the lower-level APIs.  These runtime configuration options provide additional flexibility with respect to KV cache management, GPU memory allocation and so on. Refer to the following example:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span> <span class="nn">tensorrt_llm.hlapi</span> <span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">KvCacheConfig</span>
+<p>Similar to <code class="docutils literal notranslate"><span class="pre">build_config</span></code>, you can also customize the runtime configuration with the <code class="docutils literal notranslate"><span class="pre">runtime_config</span></code>, <code class="docutils literal notranslate"><span class="pre">peft_cache_config</span></code> or other <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/llmapi/llm_utils.py#L186-L223">arguments</a> borrowed from the Executor APIs.  These runtime configuration options provide additional flexibility with respect to KV cache management, GPU memory allocation and so on. Refer to the following example:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span> <span class="nn">tensorrt_llm.llmapi</span> <span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">KvCacheConfig</span>
 
 <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="o">&lt;</span><span class="n">llama_model_path</span><span class="o">&gt;</span><span class="p">,</span>
           <span class="n">kv_cache_config</span><span class="o">=</span><span class="n">KvCacheConfig</span><span class="p">(</span>
@@ -241,7 +239,7 @@
 </section>
 <section id="tokenizer-customization">
 <h2>Tokenizer Customization<a class="headerlink" href="#tokenizer-customization" title="Link to this heading"></a></h2>
-<p>By default, the high-level API uses transformers’ <code class="docutils literal notranslate"><span class="pre">AutoTokenizer</span></code>. You can override it with your own tokenizer by passing it when creating the LLM object. Refer to the following example:</p>
+<p>By default, the LLM API uses transformers’ <code class="docutils literal notranslate"><span class="pre">AutoTokenizer</span></code>. You can override it with your own tokenizer by passing it when creating the LLM object. Refer to the following example:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="o">&lt;</span><span class="n">llama_model_path</span><span class="o">&gt;</span><span class="p">,</span> <span class="n">tokenizer</span><span class="o">=&lt;</span><span class="n">my_faster_one</span><span class="o">&gt;</span><span class="p">)</span>
 </pre></div>
 </div>
@@ -308,14 +306,14 @@
            </div>
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
-        <a href="index.html" class="btn btn-neutral float-left" title="LLM Examples Introduction" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="llm_logits_processor.html" class="btn btn-neutral float-left" title="Control generated text using logits post processor" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
         <a href="llm_api_examples.html" class="btn btn-neutral float-right" title="Examples" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fc13eac1b40>
+<jinja2.runtime.BlockReference object at 0x7f94598c0f20>
 
 <div class="footer">
     <p>

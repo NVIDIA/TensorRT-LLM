@@ -11,6 +11,8 @@ For details about the API, refer to the {ref}`_cpp_gen/executor.rst`.
 
 The following sections provide an overview of the main classes defined in the Executor API.
 
+## API
+
 ### The Executor Class
 
 The `Executor` class is responsible for receiving requests from the client, and providing responses for those requests. The executor is constructed by providing a path to a directory containing the TensorRT-LLM engine or buffers containing the engine and the model JSON configuration. The client can create requests and enqueue those requests for execution using the `enqueueRequest` or `enqueueRequests` methods of the `Executor` class. Enqueued requests will be scheduled for execution by the executor, and multiple independent requests can be batched together at every iteration of the main execution loop (a process often referred to as continuous batching or iteration-level batching). Responses for a particular request can be awaited for by calling the `awaitResponses` method, and by providing the request id. Alternatively, responses for any requests can be awaited for by omitting to provide the request id when calling `awaitResponses`. The `Executor` class also allows to cancel requests using the `cancelRequest` method and to obtain per-iteration and per-request statistics using the `getLatestIterationStats`.
@@ -29,7 +31,7 @@ The `awaitResponses` method of the `Executor` class returns a vector of response
 
 The `Result` class holds the result for a given request. It contains a Boolean parameter called `isFinal` that indicates if this is the last `Result` that will be returned for the given request id. It also contains the generated tokens. If the request is configured with `streaming = false` and `numReturnSequences = 1`, a single response will be returned, the `isFinal` Boolean will be set to `true` and all generated tokens will be included in the `outputTokenIds`. If `streaming = true` and `numReturnSequences = 1` is used, a `Result` will include one or more tokens (depending on the request `returnAllGeneratedTokens` parameter) except the last result and the `isFinal` flag will be set to `true` for the last result associated with this request.
 
-The request `numReturnSequences` parameter controls the number of output sequences to generate for each prompt. When this option is used, the Executor will return at least `numReturnSequences` responses for each request, each containing one Result. The `sequenceIndex` attribute of the `Result` class indicates the index of the generated sequence in the result (`0 <= sequenceIndex < numReturnSequences`).  It contains a Boolean parameter called `isSequenceFinal` that indicates if this is the last result for the sequence and also contains a Boolean parameter `isFinal` that indicates when all sequences for the request have been generated.  When `numReturnSequences = 1`, `isFinal` is identical to `isSequenceFinal`.
+The request `numReturnSequences` parameter controls the number of output sequences to generate for each prompt. When this option is used, the Executor will return at least `numReturnSequences` responses for each request, each containing one Result. In beam search (`beamWidth > 1`), the number of beams to be returned will be limited by `numReturnSequences` and the `sequenceIndex` attribute of the `Result` class will always be zero. Otherwise, in sampling (`beamWidth = 1`), the `sequenceIndex` attribute indicates the index of the generated sequence in the result (`0 <= sequenceIndex < numReturnSequences`). It contains a Boolean parameter called `isSequenceFinal` that indicates if this is the last result for the sequence and also contains a Boolean parameter `isFinal` that indicates when all sequences for the request have been generated. When `numReturnSequences = 1`, `isFinal` is identical to `isSequenceFinal`.
 
 Here is an example that shows how a subset of 3 responses might look like for `numReturnSequences = 3`:
 
@@ -87,3 +89,10 @@ Two C++ examples are provided that shows how to use the Executor API and can be 
 Python bindings for the Executor API are also available to use the Executor API from Python. The Python bindings are defined in [bindings.cpp](source:cpp/tensorrt_llm/pybind/executor/bindings.cpp) and once built, are available in package `tensorrt_llm.bindings.executor`. Running `'help('tensorrt_llm.bindings.executor')` in a Python interpreter will provide an overview of the classes available.
 
 In addition, three Python examples are provided to demonstrate how to use the Python bindings to the Executor API for single and multi-GPU models. They can be found in [`examples/bindings`](source:examples/bindings).
+
+## In-flight Batching with the Triton Inference Server
+
+A Triton Inference Server C++ [backend](https://github.com/triton-inference-server/tensorrtllm_backend) is provided with TensorRT-LLM that
+includes the mechanisms needed to serve models using in-flight batching. That
+backend is also a good starting example of how to implement in-flight batching using
+the TensorRT-LLM C++ Executor API.

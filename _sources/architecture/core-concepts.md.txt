@@ -82,7 +82,7 @@ The TensorRT compiler can sweep through the graph to choose the best kernel for 
 
 TensorRT also compiles the graph of operations into a single [CUDA Graph](https://developer.nvidia.com/blog/cuda-graphs/) that can be launched all at one time, further reducing the kernel launch overhead.
 
-The TensorRT compiler is extremely powerful for fusing layers and increasing execution speed, but there are some complex layer fusions—like [FlashAttention](https://arxiv.org/abs/2307.08691) — that involve interleaving many operations together and which can’t be automatically discovered. For those, you can explicitly replace parts of the graph with [plugins](https://nvidia.github.io/TensorRT-LLM/architecture.html#plugins) at compile time.
+The TensorRT compiler is extremely powerful for fusing layers and increasing execution speed, but there are some complex layer fusions—like [FlashAttention](https://arxiv.org/abs/2307.08691) — that involve interleaving many operations together and which can’t be automatically discovered. For those, you can explicitly replace parts of the graph with [plugins](#plugins) at compile time.
 
 ## Model Engine
 

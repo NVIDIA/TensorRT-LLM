@@ -1,3 +1,5 @@
+
+
 <!DOCTYPE html>
 <html class="writer-html5" lang="en" data-content_root="../">
 <head>
@@ -6,21 +8,17 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Speculative Sampling &mdash; tensorrt_llm  documentation</title>
       <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=80d5e7a1" />
-      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=19f00094" />
+      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
 
   
-  <!--[if lt IE 9]>
-    <script src="../_static/js/html5shiv.min.js"></script>
-  <![endif]-->
-  
-        <script src="../_static/jquery.js?v=5d32c60e"></script>
-        <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-        <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="../_static/doctools.js?v=888ff710"></script>
-        <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
-        <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
-        <script src="../_static/copybutton.js?v=f281be69"></script>
+      <script src="../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="../_static/doctools.js?v=888ff710"></script>
+      <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+      <script src="../_static/copybutton.js?v=65e89d2a"></script>
     <script src="../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
@@ -60,6 +58,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/windows.html">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul>
@@ -89,6 +88,7 @@
 <p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-serve.html">trtllm-serve</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
@@ -107,18 +107,19 @@
 <li class="toctree-l1"><a class="reference internal" href="gpt-runtime.html">C++ GPT Runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="executor.html">Executor API</a></li>
 <li class="toctree-l1"><a class="reference internal" href="graph-rewriting.html">Graph Rewriting Module</a></li>
-<li class="toctree-l1"><a class="reference internal" href="batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="inference-request.html">Inference Request</a></li>
 <li class="toctree-l1"><a class="reference internal" href="inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1 current"><a class="current reference internal" href="#">Speculative Sampling</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#about-speculative-sampling">About Speculative Sampling</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#performance-improvements">Performance Improvements</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#draft-target-model-approach">Draft-Target-Model Approach</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="#using-draft-model-approach-with-triton-inference-server">Using Draft model approach with Triton Inference Server</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#draft-target-model">Draft-Target-Model</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#using-draft-target-model-approach-with-triton-inference-server">Using Draft-Target-Model approach with Triton Inference Server</a></li>
 </ul>
 </li>
+<li class="toctree-l2"><a class="reference internal" href="#prompt-lookup-decoding">Prompt-Lookup-Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#medusa">Medusa</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="#medusa-tree">Medusa Tree</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#using-medusa-with-tensorrt-llm">Using Medusa with TensorRT-LLM</a><ul>
@@ -128,16 +129,8 @@
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="#redrafter">ReDrafter</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="#lookahead-decoding">Lookahead decoding</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="#overview">Overview</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#build-and-execute-an-engine-from-a-model">Build and execute an engine from a model</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="#convert-a-model-to-checkpoint">Convert a model to checkpoint</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#build-checkpoints-for-an-engine">Build checkpoints for an engine</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#execute-an-engine">Execute an engine</a></li>
-</ul>
-</li>
+<li class="toctree-l2"><a class="reference internal" href="#eagle">EAGLE</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#lookahead-decoding">Lookahead Decoding</a></li>
 </ul>
 </li>
 </ul>
@@ -189,7 +182,32 @@
            <div itemprop="articleBody">
              
   <section id="speculative-sampling">
-<span id="speculative-decoding"></span><h1>Speculative Sampling<a class="headerlink" href="#speculative-sampling" title="Link to this heading"></a></h1>
+<h1>Speculative Sampling<a class="headerlink" href="#speculative-sampling" title="Link to this heading"></a></h1>
+<ul class="simple">
+<li><p><a class="reference internal" href="#about-speculative-sampling">About Speculative Sampling</a></p></li>
+<li><p><a class="reference internal" href="#Performance-improvements"><span class="xref myst">Performance Improvements</span></a></p></li>
+<li><p><a class="reference internal" href="#Draft-Target-Model"><span class="xref myst">Draft-Target-Model</span></a></p>
+<ul>
+<li><p><a class="reference internal" href="#Using-Draft-model-approach-with-Triton-Inference-Server"><span class="xref myst">Using Draft model approach with Triton Inference Server</span></a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#prompt-lookup-decoding">Prompt-Lookup-Decoding</a></p></li>
+<li><p><a class="reference internal" href="#medusa">Medusa</a></p>
+<ul>
+<li><p><a class="reference internal" href="#medusa-tree">Medusa Tree</a></p></li>
+<li><p><a class="reference internal" href="#using-medusa-with-tensorrt-llm">Using Medusa with TensorRT-LLM</a></p>
+<ul>
+<li><p><a class="reference internal" href="#limitations">Limitations</a></p></li>
+</ul>
+</li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#redrafter">ReDrafter</a></p></li>
+<li><p><a class="reference internal" href="#eagle">EAGLE</a></p></li>
+<li><p><a class="reference internal" href="#lookahead-decoding">Lookahead decoding</a></p></li>
+</ul>
+<section id="about-speculative-sampling">
+<h2>About Speculative Sampling<a class="headerlink" href="#about-speculative-sampling" title="Link to this heading"></a></h2>
 <p>Speculative Sampling (also referred to as Speculative Decoding) is a set of techniques designed to allow generation of more than one token per forward pass iteration. This can lead to a reduction in the average per-token latency <strong>in situations where the GPU
 is underutilized due to small batch sizes.</strong></p>
 <p>Speculative Sampling involves predicting a sequence of future tokens, referred to as draft tokens, using a method
@@ -209,9 +227,13 @@ The combination of both these allows speculative decoding to result in reduced l
 <ol class="arabic simple">
 <li><p><a class="reference external" href="https://arxiv.org/abs/2401.10774">Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads paper</a>.</p></li>
 <li><p><a class="reference external" href="https://arxiv.org/html/2403.09919v1">Recurrent Drafter for Fast Speculative Decoding in Large Language Models</a>.</p></li>
+<li><p><a class="reference external" href="https://arxiv.org/pdf/2401.15077">EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty</a>.</p></li>
 </ol>
 </li>
+<li><p>Utilizing prompt tokens as draft tokens. For more information, refer to <a class="reference external" href="https://github.com/apoorvumang/prompt-lookup-decoding/">Prompt Lookup Decoding</a>.</p></li>
+<li><p>Utilizing Jacobi-like decoding to predict and verify draft tokens using the same model which does not need additional fine-tuning. Refer to <a class="reference external" href="https://arxiv.org/pdf/2402.02057">Break the Sequential Dependency of LLM Inference Using Lookahead Decoding</a>.</p></li>
 </ol>
+</section>
 <section id="performance-improvements">
 <h2>Performance Improvements<a class="headerlink" href="#performance-improvements" title="Link to this heading"></a></h2>
 <p>It’s important to note that the effectiveness of speculative decoding techniques is highly dependent
@@ -220,10 +242,10 @@ may prove simpler than generating a summary for an article.</p>
 <p>Furthermore, when integrating Medusa with a standard PyTorch model implementation which may not be as finely
 tuned as TensorRT-LLM, the potential time savings are more pronounced.</p>
 </section>
-<section id="draft-target-model-approach">
-<h2>Draft-Target-Model Approach<a class="headerlink" href="#draft-target-model-approach" title="Link to this heading"></a></h2>
+<section id="draft-target-model">
+<h2>Draft-Target-Model<a class="headerlink" href="#draft-target-model" title="Link to this heading"></a></h2>
 <p>The Draft-Target-Model involves the use of two distinct models trained independently but sharing the same vocabulary: a smaller Draft model and a larger Target model. For example, GPT 125M / 6.7B models can serve as the Draft / Target model.</p>
-<p>There are two styles of using Draft-Target-Model in TensorRT-LLM now. The first one is using TensorRT-LLM-BLS in Triton, which more information and detailed steps can be found in this document. The second one is using it directly in TensorRT-LLM, which steps can be found in <span class="xref myst">examples/draft_target_model/README.md</span> and the code can be found in <a class="reference download internal" download="" href="../_downloads/88f3b9e26017aec26d265a948485d0e4/run.py"><span class="xref download myst">examples/run.py</span></a>.</p>
+<p>There are two styles of using Draft-Target-Model in TensorRT-LLM now. The first one is using TensorRT-LLM-BLS in Triton, which more information and detailed steps can be found in this document. The second one is using it directly in TensorRT-LLM, which steps can be found in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/draft_target_model/README.md">examples/draft_target_model/README.md</a> and the code can be found in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/prompt_lookup/run_dtm_pld.py">examples/prompt_lookup/run_dtm_pld.py</a>.</p>
 <p>The management of Draft and Target models is facilitated through two separate <code class="docutils literal notranslate"><span class="pre">GptManager</span></code> instances.
 It is essential that you to coordinate the interactions between the Draft and Target models effectively.
 Initially, the Draft model is queried to generate up to <code class="docutils literal notranslate"><span class="pre">K</span></code> draft tokens.
@@ -242,8 +264,9 @@ and the draft tokens must be set in the <code class="docutils literal notranslat
 it is advisable to enable KV cache reuse for both models.
 This can be achieved by adding the <code class="docutils literal notranslate"><span class="pre">--use_paged_context_fmha=enable</span></code> flag to the <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> command
 and setting <code class="docutils literal notranslate"><span class="pre">enableBlockReuse=true</span></code> in the <code class="docutils literal notranslate"><span class="pre">KVCacheConfig</span></code>.</p>
-<section id="using-draft-model-approach-with-triton-inference-server">
-<h3>Using Draft model approach with Triton Inference Server<a class="headerlink" href="#using-draft-model-approach-with-triton-inference-server" title="Link to this heading"></a></h3>
+<section id="using-draft-target-model-approach-with-triton-inference-server">
+<h3>Using Draft-Target-Model approach with Triton Inference Server<a class="headerlink" href="#using-draft-target-model-approach-with-triton-inference-server" title="Link to this heading"></a></h3>
+<p>This example is only relevant for Draft-Target-Model model method. For all other speculative decoding models, you can deploy them in Triton server in the same way as standard non-speculative autoregressive models.</p>
 <ul class="simple">
 <li><p>Draft model approach is supported since TensorRT-LLM-0.7.0 (using two separate Tritonserver to maintain draft and target model respectively), but has significant optimization in TensorRT-LLM-0.10.0 (using one Tritonserver with <a class="reference external" href="https://github.com/triton-inference-server/python_backend?tab=readme-ov-file#business-logic-scripting">Business Logic Scripting</a>, BLS).</p></li>
 <li><p>The source file of Draft model with BLS can be found <a class="reference external" href="https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/all_models/inflight_batcher_llm/tensorrt_llm_bls/1/lib/decode.py">here</a>.</p></li>
@@ -282,8 +305,8 @@ trtllm-build<span class="w"> </span>--checkpoint_dir<span class="o">=</span>ckpt
 <span class="c1"># FP8 mode</span>
 <span class="nb">export</span><span class="w"> </span><span class="nv">DRAFT_NAME</span><span class="o">=</span>llama-7b-fp8-tp1
 <span class="nb">export</span><span class="w"> </span><span class="nv">TARGET_NAME</span><span class="o">=</span>llama-30b-fp8-tp1
-python3<span class="w"> </span>convert_checkpoint.py<span class="w"> </span>--model_dir<span class="o">=</span><span class="nv">$DRAFT_MODEL_PATH</span><span class="w"> </span>--output_dir<span class="o">=</span>ckpt/<span class="nv">$DRAFT_NAME</span><span class="w"> </span>--tp_size<span class="o">=</span><span class="m">1</span>
-python3<span class="w"> </span>convert_checkpoint.py<span class="w"> </span>--model_dir<span class="o">=</span><span class="nv">$TARGET_MODEL_PATH</span><span class="w"> </span>--output_dir<span class="o">=</span>ckpt/<span class="nv">$TARGET_NAME</span><span class="w"> </span>--tp_size<span class="o">=</span><span class="m">1</span>
+python3<span class="w"> </span>../quantization/quantize.py<span class="w"> </span>--model_dir<span class="o">=</span><span class="nv">$DRAFT_MODEL_PATH</span><span class="w"> </span>--dtype<span class="w"> </span>float16<span class="w"> </span>--qformat<span class="w"> </span>fp8<span class="w"> </span>--kv_cache_dtype<span class="w"> </span>fp8<span class="w"> </span>--output_dir<span class="o">=</span>ckpt/<span class="nv">$DRAFT_NAME</span><span class="w"> </span>--tp_size<span class="o">=</span><span class="m">1</span>
+python3<span class="w"> </span>../quantization/quantize.py<span class="w"> </span>--model_dir<span class="o">=</span><span class="nv">$TARGET_MODEL_PATH</span><span class="w"> </span>--dtype<span class="w"> </span>float16<span class="w"> </span>--qformat<span class="w"> </span>fp8<span class="w"> </span>--kv_cache_dtype<span class="w"> </span>fp8<span class="w"> </span>--output_dir<span class="o">=</span>ckpt/<span class="nv">$TARGET_NAME</span><span class="w"> </span>--tp_size<span class="o">=</span><span class="m">1</span>
 trtllm-build<span class="w"> </span>--checkpoint_dir<span class="o">=</span>ckpt/<span class="nv">$DRAFT_NAME</span><span class="w"> </span>--output_dir<span class="o">=</span>engine/draft/<span class="nv">$DRAFT_NAME</span><span class="w"> </span><span class="nv">$DRAFT_COMMAND_FP8</span>
 trtllm-build<span class="w"> </span>--checkpoint_dir<span class="o">=</span>ckpt/<span class="nv">$TARGET_NAME</span><span class="w"> </span>--output_dir<span class="o">=</span>engine/target/<span class="nv">$TARGET_NAME</span><span class="w"> </span><span class="nv">$TARGET_COMMAND_FP8</span>
 <span class="nb">export</span><span class="w"> </span><span class="nv">DRAFT_ENGINE_PATH</span><span class="o">=</span><span class="k">$(</span><span class="nb">pwd</span><span class="k">)</span>/engine/draft/<span class="nv">$DRAFT_NAME</span>
@@ -344,7 +367,7 @@ python3<span class="w"> </span>tools/fill_template.py<span class="w"> </span>-i<
 <span class="c1"># Make a copy of tensorrt_llm as configurations of draft / target models.</span>
 cp<span class="w"> </span>-R<span class="w"> </span><span class="si">${</span><span class="nv">TRITON_REPO</span><span class="si">}</span>/tensorrt_llm<span class="w"> </span><span class="si">${</span><span class="nv">TRITON_REPO</span><span class="si">}</span>/tensorrt_llm_draft
 sed<span class="w"> </span>-i<span class="w"> </span><span class="s1">&#39;s/name: &quot;tensorrt_llm&quot;/name: &quot;tensorrt_llm_draft&quot;/g&#39;</span><span class="w"> </span><span class="si">${</span><span class="nv">TRITON_REPO</span><span class="si">}</span>/tensorrt_llm_draft/config.pbtxt
-python3<span class="w"> </span>tools/fill_template.py<span class="w"> </span>-i<span class="w"> </span><span class="si">${</span><span class="nv">TRITON_REPO</span><span class="si">}</span>/tensorrt_llm/config.pbtxt<span class="w">          </span>triton_backend:<span class="si">${</span><span class="nv">BACKEND</span><span class="si">}</span>,engine_dir:<span class="si">${</span><span class="nv">ENGINE_PATH</span><span class="si">}</span>,decoupled_mode:<span class="si">${</span><span class="nv">DECOUPLED_MODE</span><span class="si">}</span>,max_tokens_in_paged_kv_cache:<span class="si">${</span><span class="nv">MAX_TOKENS_IN_KV_CACHE</span><span class="si">}</span>,max_attention_window_size:<span class="si">${</span><span class="nv">MAX_ATTENTION_WINDOW_SIZE</span><span class="si">}</span>,batch_scheduler_policy:<span class="si">${</span><span class="nv">BATCH_SCHEDULER_POLICY</span><span class="si">}</span>,batching_strategy:<span class="si">${</span><span class="nv">BATCHING_STRATEGY</span><span class="si">}</span>,kv_cache_free_gpu_mem_fraction:<span class="si">${</span><span class="nv">KV_CACHE_FREE_GPU_MEM_FRACTION</span><span class="si">}</span>,exclude_input_in_output:<span class="si">${</span><span class="nv">EXCLUDE_INPUT_IN_OUTPUT</span><span class="si">}</span>,triton_max_batch_size:<span class="si">${</span><span class="nv">TRITON_MAX_BATCH_SIZE</span><span class="si">}</span>,max_queue_delay_microseconds:<span class="si">${</span><span class="nv">MAX_QUEUE_DELAY_MICROSECONDS</span><span class="si">}</span>,max_beam_width:<span class="si">${</span><span class="nv">MAX_BEAM_WIDTH</span><span class="si">}</span>,enable_kv_cache_reuse:<span class="si">${</span><span class="nv">ENABLE_KV_CACHE_REUSE</span><span class="si">}</span>,normalize_log_probs:<span class="si">${</span><span class="nv">NORMALIZE_LOG_PROBS</span><span class="si">}</span>,enable_chunked_context:<span class="si">${</span><span class="nv">ENABLE_CHUNKED_CONTEXT</span><span class="si">}</span>,gpu_device_ids:<span class="si">${</span><span class="nv">TARGET_GPU_DEVICE_IDS</span><span class="si">}</span>,decoding_mode:<span class="si">${</span><span class="nv">DECODING_MODE</span><span class="si">}</span>
+python3<span class="w"> </span>tools/fill_template.py<span class="w"> </span>-i<span class="w"> </span><span class="si">${</span><span class="nv">TRITON_REPO</span><span class="si">}</span>/tensorrt_llm/config.pbtxt<span class="w">          </span>triton_backend:<span class="si">${</span><span class="nv">BACKEND</span><span class="si">}</span>,engine_dir:<span class="si">${</span><span class="nv">ENGINE_PATH</span><span class="si">}</span>,decoupled_mode:<span class="si">${</span><span class="nv">DECOUPLED_MODE</span><span class="si">}</span>,max_tokens_in_paged_kv_cache:<span class="si">${</span><span class="nv">MAX_TOKENS_IN_KV_CACHE</span><span class="si">}</span>,max_attention_window_size:<span class="si">${</span><span class="nv">MAX_ATTENTION_WINDOW_SIZE</span><span class="si">}</span>,batch_scheduler_policy:<span class="si">${</span><span class="nv">BATCH_SCHEDULER_POLICY</span><span class="si">}</span>,batching_strategy:<span class="si">${</span><span class="nv">BATCHING_STRATEGY</span><span class="si">}</span>,kv_cache_free_gpu_mem_fraction:<span class="si">${</span><span class="nv">KV_CACHE_FREE_GPU_MEM_FRACTION</span><span class="si">}</span>,exclude_input_in_output:<span class="si">${</span><span class="nv">EXCLUDE_INPUT_IN_OUTPUT</span><span class="si">}</span>,triton_max_batch_size:<span class="si">${</span><span class="nv">TRITON_MAX_BATCH_SIZE</span><span class="si">}</span>,max_queue_delay_microseconds:<span class="si">${</span><span class="nv">MAX_QUEUE_DELAY_MICROSECONDS</span><span class="si">}</span>,max_beam_width:<span class="si">${</span><span class="nv">MAX_BEAM_WIDTH</span><span class="si">}</span>,enable_kv_cache_reuse:<span class="si">${</span><span class="nv">ENABLE_KV_CACHE_REUSE</span><span class="si">}</span>,normalize_log_probs:<span class="si">${</span><span class="nv">NORMALIZE_LOG_PROBS</span><span class="si">}</span>,enable_chunked_context:<span class="si">${</span><span class="nv">ENABLE_CHUNKED_CONTEXT</span><span class="si">}</span>,gpu_device_ids:<span class="si">${</span><span class="nv">TARGET_GPU_DEVICE_IDS</span><span class="si">}</span>,decoding_mode:<span class="si">${</span><span class="nv">DECODING_MODE</span><span class="si">}</span>,encoder_input_features_data_type:TYPE_FP16
 python3<span class="w"> </span>tools/fill_template.py<span class="w"> </span>-i<span class="w"> </span><span class="si">${</span><span class="nv">TRITON_REPO</span><span class="si">}</span>/tensorrt_llm_draft/config.pbtxt<span class="w">    </span>triton_backend:<span class="si">${</span><span class="nv">BACKEND</span><span class="si">}</span>,engine_dir:<span class="si">${</span><span class="nv">DRAFT_ENGINE_PATH</span><span class="si">}</span>,decoupled_mode:<span class="si">${</span><span class="nv">DECOUPLED_MODE</span><span class="si">}</span>,max_tokens_in_paged_kv_cache:<span class="si">${</span><span class="nv">MAX_TOKENS_IN_KV_CACHE</span><span class="si">}</span>,max_attention_window_size:<span class="si">${</span><span class="nv">MAX_ATTENTION_WINDOW_SIZE</span><span class="si">}</span>,batch_scheduler_policy:<span class="si">${</span><span class="nv">BATCH_SCHEDULER_POLICY</span><span class="si">}</span>,batching_strategy:<span class="si">${</span><span class="nv">BATCHING_STRATEGY</span><span class="si">}</span>,kv_cache_free_gpu_mem_fraction:<span class="si">${</span><span class="nv">KV_CACHE_FREE_GPU_MEM_FRACTION</span><span class="si">}</span>,exclude_input_in_output:<span class="si">${</span><span class="nv">EXCLUDE_INPUT_IN_OUTPUT</span><span class="si">}</span>,triton_max_batch_size:<span class="si">${</span><span class="nv">TRITON_MAX_BATCH_SIZE</span><span class="si">}</span>,max_queue_delay_microseconds:<span class="si">${</span><span class="nv">MAX_QUEUE_DELAY_MICROSECONDS</span><span class="si">}</span>,max_beam_width:<span class="si">${</span><span class="nv">MAX_BEAM_WIDTH</span><span class="si">}</span>,enable_kv_cache_reuse:<span class="si">${</span><span class="nv">ENABLE_KV_CACHE_REUSE</span><span class="si">}</span>,normalize_log_probs:<span class="si">${</span><span class="nv">NORMALIZE_LOG_PROBS</span><span class="si">}</span>,enable_chunked_context:<span class="si">${</span><span class="nv">ENABLE_CHUNKED_CONTEXT</span><span class="si">}</span>,gpu_device_ids:<span class="si">${</span><span class="nv">DRAFT_GPU_DEVICE_IDS</span><span class="si">}</span>,decoding_mode:<span class="si">${</span><span class="nv">DECODING_MODE</span><span class="si">}</span>
 </pre></div>
 </div>
@@ -401,6 +424,80 @@ Started Metrics Service at 0.0.0.0:8002
 </pre></div>
 </div>
 </li>
+<li><p>Enable fast logits D2D transfer when <code class="docutils literal notranslate"><span class="pre">&quot;use_draft_logits&quot;:</span> <span class="pre">True</span></code></p>
+<ul class="simple">
+<li><p>Obtaining adjusted logits distribution from draft logits is a proposed method in the <a class="reference external" href="https://arxiv.org/pdf/2211.17192.pdf">Fast Inference from Transformers via Speculative Decoding paper</a>. Fast logits feature boosts the performance (TPS) by hiding the latency of logits transfer from draft engine to target engine.</p></li>
+<li><p>Fast logits feature is newly supported in TensorRT-LLM-0.15.0.</p></li>
+<li><p>Modify <code class="docutils literal notranslate"><span class="pre">participant_ids</span></code> entry in <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/config.pbtxt</span></code> and <code class="docutils literal notranslate"><span class="pre">tensorrt_llm_draft/config.pbtxt</span></code> to suitable MPI ranks. Usually in this setting, rank 0 is reserved for the orchestrator rank; rank 1 is for draft engine; the rest of the ranks are for target engine. In this example, <code class="docutils literal notranslate"><span class="pre">particpant_ids</span></code> can be set as snippet below. Same logic also applies to TP&gt;1 target engine.</p></li>
+</ul>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="c1">### In tensorrt_llm_draft/config.pbtxt</span>
+<span class="n">parameters</span><span class="p">:</span> <span class="p">{</span>
+    <span class="n">key</span><span class="p">:</span> <span class="s2">&quot;gpu_device_ids&quot;</span>
+    <span class="n">value</span><span class="p">:</span> <span class="p">{</span>
+        <span class="n">string_value</span><span class="p">:</span> <span class="s2">&quot;0&quot;</span>
+    <span class="p">}</span>
+<span class="p">}</span>
+<span class="n">parameters</span><span class="p">:</span> <span class="p">{</span>
+    <span class="n">key</span><span class="p">:</span> <span class="s2">&quot;participant_ids&quot;</span>
+    <span class="n">value</span><span class="p">:</span> <span class="p">{</span>
+        <span class="n">string_value</span><span class="p">:</span> <span class="s2">&quot;1&quot;</span>
+    <span class="p">}</span>
+<span class="p">}</span>
+<span class="c1">### In tensorrt_llm/config.pbtxt</span>
+<span class="n">parameters</span><span class="p">:</span> <span class="p">{</span>
+    <span class="n">key</span><span class="p">:</span> <span class="s2">&quot;gpu_device_ids&quot;</span>
+    <span class="n">value</span><span class="p">:</span> <span class="p">{</span>
+        <span class="n">string_value</span><span class="p">:</span> <span class="s2">&quot;1&quot;</span>
+    <span class="p">}</span>
+<span class="p">}</span>
+<span class="n">parameters</span><span class="p">:</span> <span class="p">{</span>
+    <span class="n">key</span><span class="p">:</span> <span class="s2">&quot;participant_ids&quot;</span>
+    <span class="n">value</span><span class="p">:</span> <span class="p">{</span>
+        <span class="n">string_value</span><span class="p">:</span> <span class="s2">&quot;2&quot;</span>
+    <span class="p">}</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p>Enable <code class="docutils literal notranslate"><span class="pre">speculative_decoding_fast_logits</span></code> in both <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/config.pbtxt</span></code> and <code class="docutils literal notranslate"><span class="pre">tensorrt_llm_draft/config.pbtxt</span></code>.</p></li>
+</ul>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">parameters</span><span class="p">:</span> <span class="p">{</span>
+    <span class="n">key</span><span class="p">:</span> <span class="s2">&quot;speculative_decoding_fast_logits&quot;</span>
+    <span class="n">value</span><span class="p">:</span> <span class="p">{</span>
+        <span class="n">string_value</span><span class="p">:</span> <span class="s2">&quot;1&quot;</span>
+    <span class="p">}</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p>Fast logits feature requires Tritonserver to be launched in orchestrator mode with <code class="docutils literal notranslate"><span class="pre">--disable-spawn-process</span></code>. See <a class="reference external" href="https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/docs/model_config.md">model config</a> for more information. <code class="docutils literal notranslate"><span class="pre">--world_size</span></code> has to be set as 1 (orchestrator rank 0) + 1 (draft engine ranks) + 1 (target engine ranks).</p></li>
+</ul>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>scripts/launch_triton_server.py<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--model_repo<span class="o">=</span><span class="nv">$TRITON_REPO</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--tensorrt_llm_model_name<span class="w"> </span><span class="s2">&quot;tensorrt_llm,tensorrt_llm_draft&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--multi-model<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--disable-spawn-processes<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--world_size<span class="o">=</span><span class="m">3</span><span class="w"> </span>--log<span class="w"> </span><span class="p">&amp;</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p>Send request with <code class="docutils literal notranslate"><span class="pre">use_draft_logits</span></code> to tritonserver BLS API:</p></li>
+</ul>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">curl</span> <span class="o">-</span><span class="n">X</span> <span class="n">POST</span> <span class="s2">&quot;http://localhost:8000/v2/models/tensorrt_llm_bls/generate&quot;</span> \
+    <span class="o">-</span><span class="n">H</span> <span class="s2">&quot;Content-Type: application/json&quot;</span> \
+    <span class="o">-</span><span class="n">d</span> <span class="s1">&#39;{</span>
+        <span class="s2">&quot;text_input&quot;</span><span class="p">:</span> <span class="s2">&quot;Continue writing the following story: James Best, best known for his&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;max_tokens&quot;</span><span class="p">:</span> <span class="mi">128</span><span class="p">,</span>
+        <span class="s2">&quot;num_draft_tokens&quot;</span><span class="p">:</span> <span class="mi">10</span><span class="p">,</span>
+        <span class="s2">&quot;use_draft_logits&quot;</span><span class="p">:</span> <span class="n">true</span><span class="p">,</span>
+        <span class="s2">&quot;stream&quot;</span><span class="p">:</span> <span class="n">false</span>
+        <span class="p">}</span><span class="s1">&#39;</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p>With the fast logits enabled and following optimization tips in <a class="reference external" href="https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/docs/model_config.md#some-tips-for-model-configuration">model configuration</a>, speculative decoding with draft logits achieves 2.x throughput in BS1, 1.x throughput in BS16 comparing to auto-regressive decoding using Llama 3.2 1B draft and Llama 3.1 70B target.</p></li>
+</ul>
+</li>
 <li><p>Kill Tritonserver after finishing inference</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pkill<span class="w"> </span>-9<span class="w"> </span>-f<span class="w"> </span>trtllmExecutorWorker
 pkill<span class="w"> </span>-9<span class="w"> </span>-f<span class="w"> </span>tritonserver
@@ -409,6 +506,10 @@ pkill<span class="w"> </span>-9<span class="w"> </span>-f<span class="w"> </span
 </li>
 </ol>
 </section>
+</section>
+<section id="prompt-lookup-decoding">
+<h2>Prompt-Lookup-Decoding<a class="headerlink" href="#prompt-lookup-decoding" title="Link to this heading"></a></h2>
+<p>See document in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/prompt_lookup/README.md">examples/prompt_lookup/README.md</a> and the code can be found in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/prompt_lookup/run_dtm_pld.py">examples/prompt_lookup/run_dtm_pld.py</a>.</p>
 </section>
 <section id="medusa">
 <h2>Medusa<a class="headerlink" href="#medusa" title="Link to this heading"></a></h2>
@@ -484,7 +585,7 @@ So, only <code class="docutils literal notranslate"><span class="pre">9</span></
 <ul class="simple">
 <li><p>TensorRT-LLM supports Medusa only for Vicuna (fine tuned LLaMA).
 However, similar to any new model, you can follow the same approach to define your own Medusa model and deploy with TensorRT-LLM.</p></li>
-<li><p>We match only tokens during the validation phasem that is <code class="docutils literal notranslate"><span class="pre">medusa_temperature=0</span></code>.</p></li>
+<li><p>We match only tokens during the validation phase that is <code class="docutils literal notranslate"><span class="pre">medusa_temperature=0</span></code>.</p></li>
 <li><p>Beam search is <strong>not</strong> compatible with Medusa.</p></li>
 </ul>
 </section>
@@ -492,91 +593,17 @@ However, similar to any new model, you can follow the same approach to define yo
 </section>
 <section id="redrafter">
 <h2>ReDrafter<a class="headerlink" href="#redrafter" title="Link to this heading"></a></h2>
-<p>This approach enhances the single-model Medusa method by predicting and verifying tokens using the same model. However, unlike Medusa, it predicts draft tokens using a recurrent predictor, where each draft token depends on the previous one. This method also allows the use of beam search to identify more prominent draft tokens. For more details, please read <a class="reference external" href="https://arxiv.org/html/2403.09919v1">the ReDrafter paper</a>.</p>
-<p>TensorRT-LLM implements the ReDrafter model such that logits prediction, beam search, and draft token acceptance are performed inside the TensorRT engine. This contrasts with standard model inference, which only predicts logits and performs decoding outside the engine. Since the engine predicts explicit draft tokens instead of implicit tokens decoded from logits, we categorize this speculative decoding method as <code class="docutils literal notranslate"><span class="pre">explicit_draft_tokens</span></code>. Please, visit the <a class="reference internal" href="#../../examples/redrafter/README.md"><span class="xref myst">ReDrafter README</span></a> for information about building and running the model. ReDrafter supports both Inflight Fused Batching runtime and Python static batching runtime.</p>
+<p>The ReDrafter approach enhances the single-model Medusa method by predicting and verifying tokens using the same model. However, unlike Medusa, it predicts draft tokens using a recurrent predictor, where each draft token depends on the previous one. This method also allows the use of beam search to identify more prominent draft tokens. For more details, please read <a class="reference external" href="https://arxiv.org/html/2403.09919v1">the ReDrafter paper</a>.</p>
+<p>TensorRT-LLM implements the ReDrafter model such that logits prediction, beam search, and draft token acceptance are performed inside the TensorRT engine. This contrasts with standard model inference, which only predicts logits and performs decoding outside the engine. Since the engine predicts explicit draft tokens instead of implicit tokens decoded from logits, we categorize this speculative decoding method as <code class="docutils literal notranslate"><span class="pre">explicit_draft_tokens</span></code>. Please, visit the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/redrafter/README.md">ReDrafter README</a> for information about building and running the model. ReDrafter supports both Inflight Fused Batching runtime and Python static batching runtime.</p>
 </section>
+<section id="eagle">
+<h2>EAGLE<a class="headerlink" href="#eagle" title="Link to this heading"></a></h2>
+<p>The EAGLE approach enhances the single-model Medusa method by predicting and verifying tokens using the same model. Similarly to ReDrafter, it predicts draft tokens using a recurrent predictor where each draft token depends on the previous one. However, unlike ReDrafter, it uses a single-layer transformer model to predict draft tokens from previous hidden states and decoded tokens. In the EAGLE-1 decoding tree needs to be known during the decoding. In the EAGLE-2 this tree is asssembled during the execution by searching for the most probable hypothesis along the beam.</p>
+<p>Similarly to ReDrafter, TensorRT-LLM implements the EAGLE model such that logits prediction, draft tokens acceptance and draft token generation are performed inside of the TensorRT engine. Only EAGLE-1 with greedy sampling and acceptance is supported. Please, visit the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/eagle/README.md">EAGLE README</a> for information about building and running the model.</p>
 </section>
 <section id="lookahead-decoding">
-<h1>Lookahead decoding<a class="headerlink" href="#lookahead-decoding" title="Link to this heading"></a></h1>
-<section id="overview">
-<h2>Overview<a class="headerlink" href="#overview" title="Link to this heading"></a></h2>
-<p>Lookahead is a general feature of all LLM models. This tutorial uses vicuna-7b-v1.3 as an example. Some models may have limitations to apply this Lookahead feature, known as specific XQA support.</p>
-<p>Lookahead algorithm depends on a tuple of <code class="docutils literal notranslate"><span class="pre">(windows_size,</span> <span class="pre">ngram_size,</span> <span class="pre">verification_set_size)</span></code>. TensorRT-LLM needs to specify the Lookahead configurations in three places:</p>
-<ol class="arabic simple">
-<li><p><em>The built model engine</em>.</p></li>
-</ol>
-<p>To build an engine with Lookahead support, <code class="docutils literal notranslate"><span class="pre">--specualtive_decoding_mode</span> <span class="pre">lookahead_decoding</span></code> must be specified.</p>
-<p>When building the engine for speculative decoding, including Lookahead, <code class="docutils literal notranslate"><span class="pre">--max_draft_len</span></code> must be provided. For Lookahead, the <code class="docutils literal notranslate"><span class="pre">max_draft_len</span></code> is defined as:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span> <span class="nf">max_draft_len</span><span class="p">(</span><span class="n">windows_size</span><span class="p">,</span> <span class="n">ngram_size</span><span class="p">,</span> <span class="n">verification_set_size</span><span class="p">):</span>
-    <span class="k">return</span> <span class="p">(</span><span class="mi">0</span> <span class="k">if</span> <span class="p">(</span><span class="n">ngran_size</span><span class="o">==</span><span class="mi">1</span><span class="p">)</span> <span class="k">else</span> <span class="n">ngram_size</span> <span class="o">-</span> <span class="mi">2</span><span class="p">)</span>
-        <span class="o">+</span> <span class="p">(</span><span class="n">windows_size</span> <span class="o">-</span> <span class="mi">1</span> <span class="o">+</span> <span class="n">verification_set_size</span><span class="p">)</span> <span class="o">*</span> <span class="p">(</span><span class="n">ngram_size</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span>
-</pre></div>
-</div>
-<ol class="arabic simple" start="2">
-<li><p><em>The TensorRT-LLM runtime program</em>.
-When TensorRT-LLM starts, it needs to reserve resources according to an <code class="docutils literal notranslate"><span class="pre">executor_lookahead_config</span></code>. The configuration should be equal to the config in the engine-building phase. The executor lookahead configuration is noted as <code class="docutils literal notranslate"><span class="pre">(W,</span> <span class="pre">N,</span> <span class="pre">G)</span></code>.</p></li>
-<li><p><em>The request</em>.
-Each request can be assigned a specific lookahead configuration when input to the execution engine, noted as <code class="docutils literal notranslate"><span class="pre">(w,</span> <span class="pre">n,</span> <span class="pre">g)</span></code>. If none is assigned, the executor config is used. The request lookahead config is valid and fixed along the request lifecycle. The minimum Lookahead config is <code class="docutils literal notranslate"><span class="pre">(1,</span> <span class="pre">1,</span> <span class="pre">0)</span></code>, meaning only one Jacobi window, ngram size one, and no verification candidates, which is automatically degenerated to normal mode. The meaningful minimum configuration is <code class="docutils literal notranslate"><span class="pre">(2,</span> <span class="pre">2,</span> <span class="pre">1)</span></code>. It is required that the request lookahead config and executor config satisfy <code class="docutils literal notranslate"><span class="pre">w</span> <span class="pre">&lt;=</span> <span class="pre">W,</span> <span class="pre">n</span> <span class="pre">&lt;=</span> <span class="pre">N,</span> <span class="pre">g</span> <span class="pre">&lt;=</span> <span class="pre">G</span></code>.</p></li>
-</ol>
-</section>
-<section id="build-and-execute-an-engine-from-a-model">
-<h2>Build and execute an engine from a model<a class="headerlink" href="#build-and-execute-an-engine-from-a-model" title="Link to this heading"></a></h2>
-<p>Vicuna models reuse Llmama Python scripts located in <a class="reference internal" href="#../../examples/llama"><span class="xref myst">examples/llama</span></a>.</p>
-<section id="convert-a-model-to-checkpoint">
-<h3>Convert a model to checkpoint<a class="headerlink" href="#convert-a-model-to-checkpoint" title="Link to this heading"></a></h3>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">MODEL_DIR</span><span class="o">=</span>/path/to/vicuna-7b-v1.3
-<span class="nv">ENGINE_DIR</span><span class="o">=</span>tmp/engine
-<span class="nv">CKPT_DIR</span><span class="o">=</span>tmp/engine/ckpt
-
-python3<span class="w"> </span>examples/llama/convert_checkpoint.py<span class="w">    </span><span class="se">\</span>
-<span class="w">    </span>--model_dir<span class="o">=</span><span class="nv">$MODEL_DIR</span><span class="w">                      </span><span class="se">\</span>
-<span class="w">    </span>--output_dir<span class="o">=</span><span class="nv">$CKPT_DIR</span><span class="w">                      </span><span class="se">\</span>
-<span class="w">    </span>--dtype<span class="o">=</span>float16<span class="w">                             </span><span class="se">\</span>
-<span class="w">    </span>--tp_size<span class="o">=</span><span class="m">1</span><span class="w">                                 </span><span class="se">\</span>
-<span class="w">    </span>--pp_size<span class="o">=</span><span class="m">1</span>
-</pre></div>
-</div>
-</section>
-<section id="build-checkpoints-for-an-engine">
-<h3>Build checkpoints for an engine<a class="headerlink" href="#build-checkpoints-for-an-engine" title="Link to this heading"></a></h3>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>trtllm-build<span class="w">                        </span><span class="se">\</span>
-<span class="w">    </span>--checkpoint_dir<span class="o">=</span><span class="nv">$CKPT_DIR</span><span class="w">      </span><span class="se">\</span>
-<span class="w">    </span>--output_dir<span class="o">=</span><span class="nv">$ENGINE_DIR</span><span class="w">        </span><span class="se">\</span>
-<span class="w">    </span>--gpt_attention_plugin<span class="o">=</span>float16<span class="w">  </span><span class="se">\</span>
-<span class="w">    </span>--gemm_plugin<span class="o">=</span>float16<span class="w">           </span><span class="se">\</span>
-<span class="w">    </span>--max_batch_size<span class="o">=</span><span class="m">32</span><span class="w">             </span><span class="se">\</span>
-<span class="w">    </span>--max_input_len<span class="o">=</span><span class="m">1024</span><span class="w">            </span><span class="se">\</span>
-<span class="w">    </span>--max_seq_len<span class="o">=</span><span class="m">2048</span><span class="w">              </span><span class="se">\</span>
-<span class="w">    </span>--max_beam_width<span class="o">=</span><span class="m">1</span><span class="w">              </span><span class="se">\</span>
-<span class="w">    </span>--log_level<span class="o">=</span>error<span class="w">               </span><span class="se">\</span>
-<span class="w">    </span>--max_draft_len<span class="o">=</span><span class="m">83</span><span class="w">              </span><span class="se">\</span>
-<span class="w">    </span>--speculative_decoding_mode<span class="o">=</span>lookahead_decoding
-</pre></div>
-</div>
-</section>
-<section id="execute-an-engine">
-<h3>Execute an engine<a class="headerlink" href="#execute-an-engine" title="Link to this heading"></a></h3>
-<p>Run <code class="docutils literal notranslate"><span class="pre">examples/run.py</span></code> to generate sequences.</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>examples/run.py<span class="w">          </span><span class="se">\</span>
-<span class="w">    </span>--tokenizer_dir<span class="o">=</span><span class="nv">$MODEL_DIR</span><span class="w">  </span><span class="se">\</span>
-<span class="w">    </span>--engine_dir<span class="o">=</span><span class="nv">$ENGINE_DIR</span><span class="w">    </span><span class="se">\</span>
-<span class="w">    </span>--max_output_len<span class="o">=</span><span class="m">32</span><span class="w">         </span><span class="se">\</span>
-<span class="w">    </span>--lookahead_config<span class="o">=[</span><span class="m">7</span>,7,7<span class="o">]</span><span class="w">  </span><span class="se">\</span>
-<span class="w">    </span>--log_level<span class="o">=</span>verbose<span class="w">         </span><span class="se">\</span>
-<span class="w">    </span>--input_text<span class="w"> </span><span class="s1">&#39;Once upon&#39;</span><span class="w"> </span><span class="s1">&#39;To be, or not&#39;</span><span class="w"> </span><span class="s1">&#39;Be not afraid of greatness&#39;</span>
-</pre></div>
-</div>
-<p>Run <code class="docutils literal notranslate"><span class="pre">examples/summarize.py</span></code> to summarize the CNN daily dataset.</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>examples/summarize.py<span class="w">    </span><span class="se">\</span>
-<span class="w">    </span>--test_hf<span class="w">                   </span><span class="se">\</span>
-<span class="w">    </span>--test_trt_llm<span class="w">              </span><span class="se">\</span>
-<span class="w">    </span>--hf_model_dir<span class="o">=</span><span class="nv">$MODEL_DIR</span><span class="w">   </span><span class="se">\</span>
-<span class="w">    </span>--engine_dir<span class="o">=</span><span class="nv">$ENGINE_DIR</span><span class="w">    </span><span class="se">\</span>
-<span class="w">    </span>--data_type<span class="o">=</span>fp16<span class="w">            </span><span class="se">\</span>
-<span class="w">    </span>--lookahead_config<span class="o">=[</span><span class="m">7</span>,7,7<span class="o">]</span>
-</pre></div>
-</div>
-</section>
+<h2>Lookahead Decoding<a class="headerlink" href="#lookahead-decoding" title="Link to this heading"></a></h2>
+<p>Lookahead decoding algorithm operates through two parallel computation branches within the same model: a lookahead branch that generates n-grams using a fixed-sized 2D window, and a verification branch that validates promising n-gram candidates. This approach eliminates the necessity for additional model training or fine-tuning and can be enabled for any autoregressive model. Refer to the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/lookahead/README.md">Lookahead decoding README</a> for information about building and running the model.</p>
 </section>
 </section>
 
@@ -591,7 +618,7 @@ python3<span class="w"> </span>examples/llama/convert_checkpoint.py<span class="
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fc13e1c7070>
+<jinja2.runtime.BlockReference object at 0x7f9459eff530>
 
 <div class="footer">
     <p>

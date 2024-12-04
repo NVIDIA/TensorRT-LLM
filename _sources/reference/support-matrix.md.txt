@@ -32,6 +32,7 @@ TensorRT-LLM optimizes the performance of a range of well-known models on NVIDIA
 - [LLaMA/LLaMA 2/LLaMA 3/LLaMA 3.1](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama)
 - [Mamba](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mamba)
 - [mBART](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec)
+- [Minitron] (https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/nemotron)
 - [Mistral](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama)
 - [Mistral NeMo](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama)
 - [Mixtral](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mixtral)
@@ -63,6 +64,7 @@ TensorRT-LLM optimizes the performance of a range of well-known models on NVIDIA
 - [Kosmos](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
 - [LLaVA-v1.5](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
 - [LLaVa-Next](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
+- [LLaVa-OneVision](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
 - [NeVA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
 - [Nougat](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
 - [Phi-3-vision](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
@@ -75,7 +77,8 @@ TensorRT-LLM optimizes the performance of a range of well-known models on NVIDIA
 
 The following table shows the supported hardware for TensorRT-LLM.
 
-If a GPU is not listed, it is important to note that TensorRT-LLM is expected to work on GPUs based on the Volta, Turing, Ampere, Hopper, and Ada Lovelace architectures. Certain limitations may, however, apply.
+If a GPU architecture is not listed, the TensorRT-LLM team does not develop or test the software on the architecture and support is limited to community support.
+In addition, older architectures can have limitations for newer software releases.
 
 ```{list-table}
 :header-rows: 1
@@ -84,14 +87,13 @@ If a GPU is not listed, it is important to note that TensorRT-LLM is expected to
 * -
   - Hardware Compatibility
 * - Operating System
-  - TensorRT-LLM requires Linux x86_64 or Windows.
+  - TensorRT-LLM requires Linux x86_64, Linux aarch64 or Windows.
 * - GPU Model Architectures
   -
+    - [NVIDIA Grace Hopper Superchip](https://www.nvidia.com/en-us/data-center/grace-hopper-superchip/)
     - [NVIDIA Hopper Architecture](https://www.nvidia.com/en-us/data-center/technologies/hopper-architecture/)
     - [NVIDIA Ada Lovelace Architecture](https://www.nvidia.com/en-us/technologies/ada-architecture/)
     - [NVIDIA Ampere Architecture](https://www.nvidia.com/en-us/data-center/ampere-architecture/)
-    - [NVIDIA Turing Architecture](https://www.nvidia.com/en-us/geforce/turing/)
-    - [NVIDIA Volta Architecture](https://www.nvidia.com/en-us/data-center/volta-gpu-architecture/) (experimental)
 ```
 
 (support-matrix-software)=
@@ -106,22 +108,16 @@ The following table shows the supported software for TensorRT-LLM.
 * -
   - Software Compatibility
 * - Container
-  - [24.07](https://docs.nvidia.com/deeplearning/frameworks/support-matrix/index.html)
+  - [24.10](https://docs.nvidia.com/deeplearning/frameworks/support-matrix/index.html)
 * - TensorRT
-  - [10.4](https://docs.nvidia.com/deeplearning/tensorrt/release-notes/index.html)
+  - [10.6](https://docs.nvidia.com/deeplearning/tensorrt/release-notes/index.html)
 * - Precision
   -
     - Hopper (SM90) - FP32, FP16, BF16, FP8, INT8, INT4
     - Ada Lovelace (SM89) - FP32, FP16, BF16, FP8, INT8, INT4
     - Ampere (SM80, SM86) - FP32, FP16, BF16, INT8, INT4[^smgte89]
-    - Turing (SM75) - FP32, FP16, INT8[^smooth], INT4
-    - Volta (SM70) - FP32, FP16, INT8[^smooth], INT4[^smlt75]
 ```
 [^ReplitCode]：Replit Code is not supported with the transformers 4.45+.
-
-[^smooth]: INT8 SmoothQuant is not supported on SM70 and SM75.
-
-[^smlt75]: INT4 AWQ and GPTQ are not supported on SM < 75.
 
 [^smgte89]: INT4 AWQ and GPTQ with FP8 activations require SM >= 89.
 

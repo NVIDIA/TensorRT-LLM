@@ -127,6 +127,7 @@ class QWenDecoderLayer(Module):
         hidden_states: Tensor,
         attention_mask=None,
         use_cache=False,
+        spec_decoding_params=None,
         kv_cache_params=None,
         attention_params=None,
         lora_layer_params=None,
@@ -137,6 +138,7 @@ class QWenDecoderLayer(Module):
             hidden_states,
             attention_mask=attention_mask,
             use_cache=use_cache,
+            spec_decoding_params=spec_decoding_params,
             kv_cache_params=kv_cache_params,
             attention_params=attention_params,
             lora_layer_params=lora_layer_params,
@@ -198,6 +200,7 @@ class QWenModel(Module):
                 input_ids: Tensor,
                 position_ids=None,
                 use_cache=False,
+                spec_decoding_params=None,
                 attention_mask=None,
                 kv_cache_params=None,
                 attention_params=None,
@@ -216,12 +219,14 @@ class QWenModel(Module):
         else:
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
 
-        hidden_states = self.layers.forward(hidden_states,
-                                            use_cache=use_cache,
-                                            attention_mask=attention_mask,
-                                            kv_cache_params=kv_cache_params,
-                                            attention_params=attention_params,
-                                            lora_params=lora_params)
+        hidden_states = self.layers.forward(
+            hidden_states,
+            use_cache=use_cache,
+            spec_decoding_params=spec_decoding_params,
+            attention_mask=attention_mask,
+            kv_cache_params=kv_cache_params,
+            attention_params=attention_params,
+            lora_params=lora_params)
 
         if use_cache:
             hidden_states, presents = hidden_states
@@ -245,13 +250,22 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                                            config.mapping.tp_size)
 
         if config.mapping.is_last_pp_rank():
-            lm_head = ColumnLinear(config.hidden_size,
-                                   vocab_size_padded,
-                                   bias=False,
-                                   dtype=config.dtype,
-                                   tp_group=config.mapping.tp_group,
-                                   tp_size=config.mapping.tp_size,
-                                   gather_output=True)
+            if config.architecture == 'Qwen2ForSequenceClassification':
+                lm_head = ColumnLinear(config.hidden_size,
+                                       config.num_labels,
+                                       bias=False,
+                                       dtype=config.dtype,
+                                       tp_group=config.mapping.tp_group,
+                                       tp_size=config.mapping.tp_size,
+                                       gather_output=True)
+            else:
+                lm_head = ColumnLinear(config.hidden_size,
+                                       vocab_size_padded,
+                                       bias=False,
+                                       dtype=config.dtype,
+                                       tp_group=config.mapping.tp_group,
+                                       tp_size=config.mapping.tp_size,
+                                       gather_output=True)
         else:
             lm_head = None
         self.quant_mode = config.quant_mode
@@ -320,6 +334,7 @@ class QWenForCausalLM(DecoderModelForCausalLM):
 
         if os.environ.get("TRTLLM_DISABLE_UNIFIED_CONVERTER") is None:
             custom_dict = {}
+
             if config.qwen_type == "qwen":
                 custom_dict = {
                     "transformer": "transformer",
@@ -341,9 +356,19 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                     "shared_expert_gate": "mlp.shared_expert_gate",
                     "fc": ["up_proj", "gate_proj"],
                 }
+            elif config.qwen_type == "qwen2" and config.tie_word_embeddings:
+                custom_dict = {"lm_head": "model.embed_tokens"}
+            elif config.architecture == "Qwen2ForSequenceClassification":
+                custom_dict = {
+                    "lm_head": "score",
+                }
+            elif config.qwen_type == "qwen2_llava_onevision":
+                custom_dict = {
+                    "transformer": "language_model.model",
+                    "lm_head": "language_model.lm_head",
+                }
             loader = ModelWeightsLoader(hf_model_dir, custom_dict)
-            if config.share_embedding_table:
-                config.share_embedding_table = loader.check_share_embedding()
+            loader.check_share_embedding(config)
             model = cls(config)
 
             if config.qwen_type == "qwen" and model.config.mapping.has_tp():

@@ -1,3 +1,5 @@
+
+
 <!DOCTYPE html>
 <html class="writer-html5" lang="en" data-content_root="./">
 <head>
@@ -6,21 +8,17 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Welcome to TensorRT-LLM’s Documentation! &mdash; tensorrt_llm  documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=80d5e7a1" />
-      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=19f00094" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="_static/copybutton.css?v=76b2166b" />
 
   
-  <!--[if lt IE 9]>
-    <script src="_static/js/html5shiv.min.js"></script>
-  <![endif]-->
-  
-        <script src="_static/jquery.js?v=5d32c60e"></script>
-        <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-        <script src="_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="_static/doctools.js?v=888ff710"></script>
-        <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
-        <script src="_static/clipboard.min.js?v=a7894cd8"></script>
-        <script src="_static/copybutton.js?v=f281be69"></script>
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="_static/doctools.js?v=888ff710"></script>
+      <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="_static/clipboard.min.js?v=a7894cd8"></script>
+      <script src="_static/copybutton.js?v=65e89d2a"></script>
     <script src="_static/js/theme.js"></script>
     <link rel="index" title="Index" href="genindex.html" />
     <link rel="search" title="Search" href="search.html" />
@@ -59,6 +57,7 @@
 <li class="toctree-l1"><a class="reference internal" href="installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 <li class="toctree-l1"><a class="reference internal" href="installation/windows.html">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="installation/grace-hopper.html">Installing on Grace Hopper</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul>
@@ -88,6 +87,7 @@
 <p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="commands/trtllm-serve.html">trtllm-serve</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
@@ -106,14 +106,12 @@
 <li class="toctree-l1"><a class="reference internal" href="advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="advanced/executor.html">Executor API</a></li>
 <li class="toctree-l1"><a class="reference internal" href="advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
-<li class="toctree-l1"><a class="reference internal" href="advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="advanced/inference-request.html">Inference Request</a></li>
 <li class="toctree-l1"><a class="reference internal" href="advanced/inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="advanced/speculative-decoding.html#lookahead-decoding">Lookahead decoding</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul>
@@ -184,6 +182,7 @@
 </li>
 <li class="toctree-l1"><a class="reference internal" href="key-features.html">Key Features</a></li>
 <li class="toctree-l1"><a class="reference internal" href="release-notes.html">Release Notes</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="release-notes.html#tensorrt-llm-release-0-15-0">TensorRT-LLM Release 0.15.0</a></li>
 <li class="toctree-l2"><a class="reference internal" href="release-notes.html#tensorrt-llm-release-0-14-0">TensorRT-LLM Release 0.14.0</a></li>
 <li class="toctree-l2"><a class="reference internal" href="release-notes.html#tensorrt-llm-release-0-13-0">TensorRT-LLM Release 0.13.0</a></li>
 <li class="toctree-l2"><a class="reference internal" href="release-notes.html#tensorrt-llm-release-0-12-0">TensorRT-LLM Release 0.12.0</a></li>
@@ -215,6 +214,7 @@
 <li class="toctree-l2"><a class="reference internal" href="installation/build-from-source-windows.html#linking-with-the-tensorrt-llm-c-runtime">Linking with the TensorRT-LLM C++ Runtime</a></li>
 </ul>
 </li>
+<li class="toctree-l1"><a class="reference internal" href="installation/grace-hopper.html">Installing on Grace Hopper</a></li>
 </ul>
 </div>
 <div class="toctree-wrapper compound">
@@ -298,25 +298,16 @@
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="advanced/executor.html">Executor API</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="advanced/executor.html#the-executor-class">The Executor Class</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/executor.html#the-request-class">The Request Class</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/executor.html#the-response-class">The Response Class</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/executor.html#the-result-class">The Result Class</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/executor.html#sending-requests-with-different-beam-widths">Sending Requests with Different Beam Widths</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/executor.html#controlling-output-with-logits-post-processor">Controlling output with Logits Post-Processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="advanced/executor.html#api">API</a></li>
 <li class="toctree-l2"><a class="reference internal" href="advanced/executor.html#c-executor-api-example">C++ Executor API Example</a></li>
 <li class="toctree-l2"><a class="reference internal" href="advanced/executor.html#python-bindings-for-the-executor-api">Python Bindings for the Executor API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="advanced/executor.html#in-flight-batching-with-the-triton-inference-server">In-flight Batching with the Triton Inference Server</a></li>
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="advanced/graph-rewriting.html">Graph Rewriting Module</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="advanced/graph-rewriting.html#when-to-use-graph-rewriting">When to Use Graph Rewriting?</a></li>
 <li class="toctree-l2"><a class="reference internal" href="advanced/graph-rewriting.html#graph-rewriting-apis">Graph Rewriting APIs</a></li>
 <li class="toctree-l2"><a class="reference internal" href="advanced/graph-rewriting.html#classical-workflow">Classical Workflow</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="advanced/batch-manager.html#the-batch-manager-api">The Batch Manager API</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/batch-manager.html#in-flight-batching-with-the-triton-inference-server">In-flight Batching with the Triton Inference Server</a></li>
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="advanced/inference-request.html">Inference Request</a></li>
@@ -339,15 +330,14 @@
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="advanced/speculative-decoding.html">Speculative Sampling</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="advanced/speculative-decoding.html#about-speculative-sampling">About Speculative Sampling</a></li>
 <li class="toctree-l2"><a class="reference internal" href="advanced/speculative-decoding.html#performance-improvements">Performance Improvements</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/speculative-decoding.html#draft-target-model-approach">Draft-Target-Model Approach</a></li>
+<li class="toctree-l2"><a class="reference internal" href="advanced/speculative-decoding.html#draft-target-model">Draft-Target-Model</a></li>
+<li class="toctree-l2"><a class="reference internal" href="advanced/speculative-decoding.html#prompt-lookup-decoding">Prompt-Lookup-Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="advanced/speculative-decoding.html#medusa">Medusa</a></li>
 <li class="toctree-l2"><a class="reference internal" href="advanced/speculative-decoding.html#redrafter">ReDrafter</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="advanced/speculative-decoding.html#lookahead-decoding">Lookahead decoding</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="advanced/speculative-decoding.html#overview">Overview</a></li>
-<li class="toctree-l2"><a class="reference internal" href="advanced/speculative-decoding.html#build-and-execute-an-engine-from-a-model">Build and execute an engine from a model</a></li>
+<li class="toctree-l2"><a class="reference internal" href="advanced/speculative-decoding.html#eagle">EAGLE</a></li>
+<li class="toctree-l2"><a class="reference internal" href="advanced/speculative-decoding.html#lookahead-decoding">Lookahead Decoding</a></li>
 </ul>
 </li>
 </ul>
@@ -368,6 +358,9 @@
 <li class="toctree-l2"><a class="reference internal" href="performance/perf-benchmarking.html#supported-networks-for-benchmarking">Supported Networks for Benchmarking</a></li>
 <li class="toctree-l2"><a class="reference internal" href="performance/perf-benchmarking.html#support-quantization-modes">Support Quantization Modes</a></li>
 <li class="toctree-l2"><a class="reference internal" href="performance/perf-benchmarking.html#inflight-benchmarking-with-a-dataset">Inflight Benchmarking with a Dataset</a></li>
+<li class="toctree-l2"><a class="reference internal" href="performance/perf-benchmarking.html#preparing-a-dataset">Preparing a Dataset</a></li>
+<li class="toctree-l2"><a class="reference internal" href="performance/perf-benchmarking.html#building-a-benchmark-engine">Building a Benchmark Engine</a></li>
+<li class="toctree-l2"><a class="reference internal" href="performance/perf-benchmarking.html#max-throughput-benchmark">Max Throughput Benchmark</a></li>
 <li class="toctree-l2"><a class="reference internal" href="performance/perf-benchmarking.html#low-latency-benchmark">Low Latency Benchmark</a></li>
 <li class="toctree-l2"><a class="reference internal" href="performance/perf-benchmarking.html#summary">Summary</a></li>
 </ul>
@@ -392,11 +385,10 @@
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="reference/troubleshooting.html">Troubleshooting</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="reference/troubleshooting.html#build-errors">Build Errors</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/troubleshooting.html#installation-errors">Installation Errors</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/troubleshooting.html#debug-on-unit-tests">Debug on Unit Tests</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/troubleshooting.html#debug-on-e2e-models">Debug on E2E Models</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/troubleshooting.html#debug-execution-errors">Debug Execution Errors</a></li>
-<li class="toctree-l2"><a class="reference internal" href="reference/troubleshooting.html#installation-errors">Installation Errors</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/troubleshooting.html#tips">Tips</a></li>
 </ul>
 </li>
@@ -448,7 +440,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fc13e3d4190>
+<jinja2.runtime.BlockReference object at 0x7f9459cfb290>
 
 <div class="footer">
     <p>

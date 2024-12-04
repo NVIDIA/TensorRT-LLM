@@ -1,25 +1,23 @@
+
+
 <!DOCTYPE html>
 <html class="writer-html5" lang="en" data-content_root="../../../">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>tensorrt_llm.hlapi.build_cache &mdash; tensorrt_llm  documentation</title>
+  <title>tensorrt_llm.llmapi.build_cache &mdash; tensorrt_llm  documentation</title>
       <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=80d5e7a1" />
-      <link rel="stylesheet" type="text/css" href="../../../_static/css/theme.css?v=19f00094" />
+      <link rel="stylesheet" type="text/css" href="../../../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
 
   
-  <!--[if lt IE 9]>
-    <script src="../../../_static/js/html5shiv.min.js"></script>
-  <![endif]-->
-  
-        <script src="../../../_static/jquery.js?v=5d32c60e"></script>
-        <script src="../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-        <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
-        <script src="../../../_static/doctools.js?v=9a2dae69"></script>
-        <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
-        <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
-        <script src="../../../_static/copybutton.js?v=f281be69"></script>
+      <script src="../../../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="../../../_static/doctools.js?v=888ff710"></script>
+      <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
+      <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
     <script src="../../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../../genindex.html" />
     <link rel="search" title="Search" href="../../../search.html" /> 
@@ -57,6 +55,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../installation/windows.html">Installing on Windows</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul>
@@ -86,6 +85,7 @@
 <p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-serve.html">trtllm-serve</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
@@ -104,14 +104,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/executor.html">Executor API</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../advanced/batch-manager.html">The Batch Manager in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/inference-request.html">Inference Request</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/inference-request.html#responses">Responses</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../advanced/speculative-decoding.html#lookahead-decoding">Lookahead decoding</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul>
@@ -151,7 +149,7 @@
   <ul class="wy-breadcrumbs">
       <li><a href="../../../index.html" class="icon icon-home" aria-label="Home"></a></li>
           <li class="breadcrumb-item"><a href="../../index.html">Module code</a></li>
-      <li class="breadcrumb-item active">tensorrt_llm.hlapi.build_cache</li>
+      <li class="breadcrumb-item active">tensorrt_llm.llmapi.build_cache</li>
       <li class="wy-breadcrumbs-aside">
       </li>
   </ul>
@@ -160,7 +158,7 @@
           <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
            <div itemprop="articleBody">
              
-  <h1>Source code for tensorrt_llm.hlapi.build_cache</h1><div class="highlight"><pre>
+  <h1>Source code for tensorrt_llm.llmapi.build_cache</h1><div class="highlight"><pre>
 <span></span><span class="kn">import</span> <span class="nn">contextlib</span>
 <span class="kn">import</span> <span class="nn">datetime</span>
 <span class="kn">import</span> <span class="nn">enum</span>
@@ -176,6 +174,7 @@
 
 <span class="kn">import</span> <span class="nn">tensorrt_llm</span>
 <span class="kn">from</span> <span class="nn">tensorrt_llm</span> <span class="kn">import</span> <span class="n">BuildConfig</span>
+<span class="kn">from</span> <span class="nn">tensorrt_llm.llmapi.utils</span> <span class="kn">import</span> <span class="n">enable_llm_debug</span><span class="p">,</span> <span class="n">print_colored</span>
 <span class="kn">from</span> <span class="nn">tensorrt_llm.logger</span> <span class="kn">import</span> <span class="n">logger</span>
 
 
@@ -183,15 +182,15 @@
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">    Get the build cache configuration from the environment variables</span>
 <span class="sd">    &quot;&quot;&quot;</span>
-    <span class="n">build_cache_enabled</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;TLLM_HLAPI_BUILD_CACHE&#39;</span><span class="p">)</span> <span class="o">==</span> <span class="s1">&#39;1&#39;</span>
+    <span class="n">build_cache_enabled</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;TLLM_LLMAPI_BUILD_CACHE&#39;</span><span class="p">)</span> <span class="o">==</span> <span class="s1">&#39;1&#39;</span>
     <span class="n">build_cache_root</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
-        <span class="s1">&#39;TLLM_HLAPI_BUILD_CACHE_ROOT&#39;</span><span class="p">,</span>
-        <span class="s1">&#39;/tmp/.cache/tensorrt_llm/hlapi/&#39;</span><span class="p">)</span>  <span class="c1"># nosec B108</span>
+        <span class="s1">&#39;TLLM_LLMAPI_BUILD_CACHE_ROOT&#39;</span><span class="p">,</span>
+        <span class="s1">&#39;/tmp/.cache/tensorrt_llm/llmapi/&#39;</span><span class="p">)</span>  <span class="c1"># nosec B108</span>
     <span class="k">return</span> <span class="n">build_cache_enabled</span><span class="p">,</span> <span class="n">build_cache_root</span>
 
 
 <div class="viewcode-block" id="BuildCacheConfig">
-<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.hlapi.BuildCacheConfig">[docs]</a>
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.BuildCacheConfig">[docs]</a>
 <span class="k">class</span> <span class="nc">BuildCacheConfig</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">    Configuration for the build cache.</span>
@@ -207,7 +206,7 @@
 <span class="sd">    &quot;&quot;&quot;</span>
 
 <div class="viewcode-block" id="BuildCacheConfig.__init__">
-<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.hlapi.BuildCacheConfig.__init__">[docs]</a>
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.BuildCacheConfig.__init__">[docs]</a>
     <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">cache_root</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Path</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">max_records</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">10</span><span class="p">,</span>
@@ -451,6 +450,8 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">parent</span><span class="o">.</span><span class="n">prune_caches</span><span class="p">(</span><span class="n">has_incoming_record</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 
         <span class="n">target_dir</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">get_cache_path</span><span class="p">()</span>
+        <span class="k">if</span> <span class="n">enable_llm_debug</span><span class="p">():</span>
+            <span class="n">print_colored</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Writing cache to </span><span class="si">{</span><span class="n">target_dir</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span> <span class="s2">&quot;yellow&quot;</span><span class="p">)</span>
 
         <span class="c1"># To avoid the cache modification conflict, a dummy directory is used to write the cache, and then rename it to</span>
         <span class="c1"># the target directory</span>
@@ -495,7 +496,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7faa19d82290>
+<jinja2.runtime.BlockReference object at 0x7f94692062a0>
 
 <div class="footer">
     <p>
