@@ -43,7 +43,7 @@ Note that for GH200 tests, TRT-LLM engines were built using *trtllm-bench build*
 
 |                 |                          |               |                     |                    |                    |                    |                    |           |
 | --------------- | ------------------------ | ------------- | ------------------- | ------------------ | ------------------ | ------------------ | ------------------ | --------- |
-| | GPU| | H100 80GB HBM3| | A100-SXM4-80GB| A100-PCIE-80GB| L40S| GH200 141GB HBM3 CG1 |
+| | GPU| | H100 80GB HBM3| | A100-SXM4-80GB| A100-PCIE-80GB| L40S| GH200 96GB HBM3 CG1 |
 | | Precision| | FP8| Mixed| Mixed| Mixed| FP8| FP8 |
 | Model| TP Size| Runtime Input/Output Lengths| | | | | |
 | LLaMA v3 70B| 1| 128, 128| 3197.73| | | | | 4023.31
