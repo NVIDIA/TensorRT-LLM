@@ -277,13 +277,17 @@ def load_weights_from_hf_model(model, config: FalconConfig):
         if new_decoder_architecture:
             input_ln_weight, input_ln_bias = get_weight_and_bias(
                 model_params, f'{prefix}.ln_attn', dtype)
+            if input_ln_weight is None:
+                input_ln_weight, input_ln_bias = get_weight_and_bias(
+                    model_params, f'{prefix}.input_layernorm', dtype)
             weights[f'{tllm_prex}.input_layernorm.weight'] = input_ln_weight
             if input_ln_bias is not None:
                 weights[f'{tllm_prex}.input_layernorm.bias'] = input_ln_bias
 
             mlp_ln_weight, mlp_ln_bias = get_weight_and_bias(
                 model_params, f'{prefix}.ln_mlp', dtype)
-            weights[f'{tllm_prex}.mlp_layernorm.weight'] = mlp_ln_weight
+            if mlp_ln_weight is not None:
+                weights[f'{tllm_prex}.mlp_layernorm.weight'] = mlp_ln_weight
             if mlp_ln_bias is not None:
                 weights[f'{tllm_prex}.mlp_layernorm.bias'] = mlp_ln_bias
         else:
@@ -316,7 +320,11 @@ def load_weights_from_hf_model(model, config: FalconConfig):
 
     if mapping.is_last_pp_rank():
         if not share_embedding_table:
-            weights['lm_head.weight'] = split_matrix(embed_w.clone(),
+            lm_head = get_weight(model_params, 'lm_head', dtype)
+            if lm_head is None:
+                # No lm_head in the checkpoint, cloning word_embedding.
+                lm_head = embed_w.clone()
+            weights['lm_head.weight'] = split_matrix(lm_head,
                                                      mapping.tp_size,
                                                      mapping.tp_rank,
                                                      dim=0)

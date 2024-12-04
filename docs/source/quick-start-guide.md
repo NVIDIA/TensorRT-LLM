@@ -89,6 +89,7 @@ In this Quick Start Guide, you:
 - Retrieved the model weights
 - Compiled and ran the model
 - Deployed the model with Triton Inference Server
+- As an alternative to deploying the engine with FastAPI-based OpenAI API Server, you can use the [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html) CLI.
 
 For more examples, refer to:
 

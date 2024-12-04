@@ -56,7 +56,7 @@ struct BlockPrefixCallbackOp
 
 template <int THREADS_PER_BLOCK>
 __global__ __launch_bounds__(THREADS_PER_BLOCK) void buildCuMaskRows(
-    int batchSize, int const* qSeqLens, int* cuMaskRows)
+    int batchSize, int const* qSeqLens, int* cuQSeqLens, int* cuMaskRows)
 {
 
     // The implementation of the parallel scan in the thread block (see CUB for details).
@@ -64,9 +64,11 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void buildCuMaskRows(
 
     // Allocate storage in shared memory to do the scan.
     __shared__ typename BlockScan::TempStorage tempStorage;
+    __shared__ typename BlockScan::TempStorage tempStorageForMask;
 
     // This prefixOp operator keeps a running sum for when we need multiple iterations of the loop.
     BlockPrefixCallbackOp prefixOp(0);
+    BlockPrefixCallbackOp prefixOpForMask(0);
 
     // Iterate over the sequences in the batch.
     //
@@ -83,20 +85,28 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void buildCuMaskRows(
 
         // Threads that correspond to valid sequences read the length.
         int maskRows = 0;
+        int qSeqLen = 0;
         if (batchIdx < batchSizeBound)
         {
+            qSeqLen = qSeqLens[batchIdx];
             // Need to pad to multiple of 128.
             maskRows = divUp(qSeqLens[batchIdx], int(FLASH_ATTEN_PACKED_MASK_M_ALIGNMENT))
                 * FLASH_ATTEN_PACKED_MASK_M_ALIGNMENT;
         }
 
         // Do the prefix-scan (it calls syncthreads internally).
+        int qSeqLenOffset;
         int maskRowOffset;
-        BlockScan(tempStorage).ExclusiveSum(maskRows, maskRowOffset, prefixOp);
+        BlockScan(tempStorage).ExclusiveSum(qSeqLen, qSeqLenOffset, prefixOp);
+        BlockScan(tempStorageForMask).ExclusiveSum(maskRows, maskRowOffset, prefixOpForMask);
 
         // Store the result.
         if (batchIdx <= batchSizeBound && storeOffsets)
         {
+            if (cuQSeqLens)
+            {
+                cuQSeqLens[batchIdx] = qSeqLenOffset;
+            }
             cuMaskRows[batchIdx] = maskRowOffset;
         }
 
@@ -129,10 +139,12 @@ __global__ void packFlashAttentionMask(PackedMaskParams<MaskInputDataType> param
     int mmasN = gridDim.x;
 
     // The upper bound of q and kv sequence length.
-    int qSeqLenBound
-        = (MaskType == ContextAttentionMaskType::CUSTOM_MASK) ? params.maxQSeqLen : params.actualQSeqLens[batchIdx];
-    int kvSeqLenBound
-        = (MaskType == ContextAttentionMaskType::CUSTOM_MASK) ? params.maxKvSeqLen : params.actualKvSeqLens[batchIdx];
+    int qSeqLenBound = params.actualQSeqLens[batchIdx];
+    int kvSeqLenBound = params.actualKvSeqLens[batchIdx];
+
+    // The mask input offset for batchIdx.
+    size_t maskInputBatchOffset
+        = (params.cuQSeqLens ? params.cuQSeqLens[batchIdx] : batchIdx * params.maxQSeqLen) * params.maxKvSeqLen;
 
     // The actual mask rows in the sequence.
     int actualMaskRows = params.cuMaskRows[batchIdx + 1] - params.cuMaskRows[batchIdx];
@@ -164,14 +176,15 @@ __global__ void packFlashAttentionMask(PackedMaskParams<MaskInputDataType> param
             col += mmasNIdx * NUM_CORE_MMAS_N * 8;
 
             // The offset to the 1st element computed by that thread in the mask.
-            size_t offset = batchIdx * params.maxQSeqLen * params.maxKvSeqLen + row * params.maxKvSeqLen + col;
+            size_t offset = maskInputBatchOffset + row * params.maxKvSeqLen + col;
 
             // The mask for each row of MMAs.
             uint32_t mask = 0u;
 
 // Iterate over the core mmas in the N dimension.
 #pragma unroll
-            for (size_t ni = 0; ni < NUM_CORE_MMAS_N; ++ni, offset += 8 * FLASH_ATTEN_WARPS_N)
+            for (size_t ni = 0; ni < NUM_CORE_MMAS_N;
+                 ++ni, offset += 8 * FLASH_ATTEN_WARPS_N, col += 8 * FLASH_ATTEN_WARPS_N)
             {
 
                 bool validMasks[4] = {row < qSeqLenBound && col < kvSeqLenBound,
@@ -180,10 +193,14 @@ __global__ void packFlashAttentionMask(PackedMaskParams<MaskInputDataType> param
 
                 if constexpr (MaskType == ContextAttentionMaskType::CUSTOM_MASK)
                 {
-                    validMasks[0] &= (params.maskInput[offset + 0 * params.maxKvSeqLen + 0] == params.validPosVal);
-                    validMasks[1] &= (params.maskInput[offset + 0 * params.maxKvSeqLen + 1] == params.validPosVal);
-                    validMasks[2] &= (params.maskInput[offset + 8 * params.maxKvSeqLen + 0] == params.validPosVal);
-                    validMasks[3] &= (params.maskInput[offset + 8 * params.maxKvSeqLen + 1] == params.validPosVal);
+                    validMasks[0] = validMasks[0]
+                        && (params.maskInput[offset + 0 * params.maxKvSeqLen + 0] == params.validPosVal);
+                    validMasks[1] = validMasks[1]
+                        && (params.maskInput[offset + 0 * params.maxKvSeqLen + 1] == params.validPosVal);
+                    validMasks[2] = validMasks[2]
+                        && (params.maskInput[offset + 8 * params.maxKvSeqLen + 0] == params.validPosVal);
+                    validMasks[3] = validMasks[3]
+                        && (params.maskInput[offset + 8 * params.maxKvSeqLen + 1] == params.validPosVal);
                 }
                 else if constexpr (MaskType == ContextAttentionMaskType::CAUSAL)
                 {
@@ -220,9 +237,9 @@ template <typename MaskInputDataType>
 void invokeBuildPackedMask(PackedMaskParams<MaskInputDataType> const& params, cudaStream_t stream)
 {
     // Calculate the cuMaskRows.
-    buildCuMaskRows<256>
-        <<<params.batchSize, 256, 0, stream>>>(params.batchSize, params.actualQSeqLens, params.cuMaskRows);
-
+    buildCuMaskRows<256><<<params.batchSize, 256, 0, stream>>>(
+        params.batchSize, params.actualQSeqLens, params.cuQSeqLens, params.cuMaskRows);
+    sync_check_cuda_error();
     // The number of mmas in the N dimension (MMA_N = 64).
     size_t mmasN
         = (divUp(params.maxKvSeqLen, size_t(FLASH_ATTEN_PACKED_MASK_N_ALIGNMENT)) * FLASH_ATTEN_PACKED_MASK_N_ALIGNMENT)
@@ -252,6 +269,7 @@ void invokeBuildPackedMask(PackedMaskParams<MaskInputDataType> const& params, cu
     {
         TLLM_CHECK_WITH_INFO(false, "The attention mask type is not supported.");
     }
+    sync_check_cuda_error();
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

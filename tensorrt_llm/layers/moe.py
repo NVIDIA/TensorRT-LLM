@@ -29,8 +29,9 @@ from .._utils import QuantModeWrapper, int32_array
 from ..functional import (AllReduceFusionParams, _add_plugin_info,
                           _create_tensor, allreduce, cast, concat, constant,
                           div, expand, gather_nd, is_gated_activation,
-                          non_gated_version, nonzero, repeat_interleave,
-                          scatter_nd, shape, softmax, split, sum, topk)
+                          non_gated_version, nonzero, reduce_scatter,
+                          repeat_interleave, scatter, scatter_nd, shape,
+                          softmax, split, sum, topk, unsqueeze)
 from ..layers import MLP, GatedMLP
 from ..mapping import Mapping
 from ..module import Module, ModuleList
@@ -59,6 +60,8 @@ class MoeConfig:
         NONE = 0
         RENORMALIZE = 1
         SPARSE_MIXER = 2
+        DEVICE_LIMITED = 3
+        DEVICE_LIMITED_RENORM = 4
 
     num_experts: int = 0
     moe_intermediate_size: int = 0  # Add moe inter size (shanshan)
@@ -68,6 +71,10 @@ class MoeConfig:
     normalization_mode: ExpertScaleNormalizationMode = ExpertScaleNormalizationMode.RENORMALIZE
     sparse_mixer_epsilon: float = 0.01
     tp_mode: int = 0
+
+    device_limited_n_group: int = 0
+    device_limited_topk_group: int = 0
+    device_limited_routed_scaling_factor: float = 1.0
 
     def validate(self) -> "MoeConfig":
         if (self.num_experts == 0) != (self.top_k == 0):
@@ -438,6 +445,10 @@ class MixtureOfExperts(Module):
                 )
             self.expert_inter_size = self.ffn_hidden_size // self.mapping.moe_tp_size
 
+        if quant_mode.has_fp8_rowwise():
+            raise ValueError(
+                "MixtureOfExperts - MOE Does not support FP8 rowwise quantize")
+
         if quant_mode.has_fp8_qdq() and self.bias:
             # TODO (dastokes) We will need to revisit this if we have a use case for it
             raise ValueError(
@@ -499,21 +510,48 @@ class MixtureOfExperts(Module):
                                      self.wrapper_tllm_to_externel_key_dict,
                                      self.mapping.moe_tp_size, 1)
 
+    def group_limited_greedy(self, logits):
+        n_group = self.moe_config.device_limited_n_group
+        scores = softmax(logits, -1)
+        scores_shape = [shape(scores, i) for i in range(scores.ndim())]
+        group_scores = scores.view(
+            concat(scores_shape[:-1] +
+                   [n_group, scores_shape[-1] // n_group])).max(dim=-1)
+        _, group_idx = topk(group_scores,
+                            k=self.moe_config.device_limited_topk_group,
+                            dim=-1)
+        group_mask = scatter(group_scores * 0, -1, group_idx,
+                             group_idx.cast(group_scores.dtype) * 0 + 1)
+        score_mask = expand(
+            unsqueeze(group_mask, -1),
+            concat(scores_shape[:-1] + [n_group, scores_shape[-1] // n_group]),
+        ).view(concat(scores_shape))
+        scores = scores * score_mask * \
+            self.moe_config.device_limited_routed_scaling_factor
+        return scores
+
     def forward(self,
                 hidden_states,
                 finished=None,
                 lora_layer_params=None,
-                reduce_fusion_params: Optional[AllReduceFusionParams] = None):
+                reduce_fusion_params: Optional[AllReduceFusionParams] = None,
+                last_local_layer_residual=None):
         moe_router_lora_params = None
         if lora_layer_params is not None:
             moe_router_lora_params = lora_layer_params.get_runtime_params(
                 0, "moe_router")
         routing_input = cast(hidden_states, trt.float32)
         routing = self.router(routing_input, moe_router_lora_params)
+        if self.moe_config.normalization_mode in [
+                MoeConfig.ExpertScaleNormalizationMode.DEVICE_LIMITED,
+                MoeConfig.ExpertScaleNormalizationMode.DEVICE_LIMITED_RENORM
+        ]:
+            routing = self.group_limited_greedy(routing)
         output = self.forward_experts(hidden_states, routing, finished,
                                       lora_layer_params)
         if self.use_all_reduce:
-            output = self.forward_allreduce(output, reduce_fusion_params)
+            output = self.forward_allreduce(output, reduce_fusion_params,
+                                            last_local_layer_residual)
         return output
 
     def forward_experts(self, hidden_states, routing, finished,
@@ -593,9 +631,25 @@ class MixtureOfExperts(Module):
 
         return output
 
-    def forward_allreduce(
-            self, output,
-            reduce_fusion_params: Optional[AllReduceFusionParams]):
+    def forward_allreduce(self,
+                          output,
+                          reduce_fusion_params: Optional[AllReduceFusionParams],
+                          last_local_layer_residual=None):
+
+        if last_local_layer_residual is not None:
+            if self.mapping.tp_rank == 0:
+                output = output + last_local_layer_residual
+            else:
+                # we need to add this line here to minimize the numerical difference
+                output = output + 0
+            # reshape to (-1)
+            output = output.view(concat([-1]))
+            if self.tp_size > 1 and self.tp_group is not None:
+                output = reduce_scatter(output, self.tp_group)
+            # reshape to (-1, hidden_size // tp_size)
+            output = output.view(concat([-1, self.hidden_size // self.tp_size]))
+            return output
+
         if self.tp_size > 1 and self.tp_group is not None:
             output = allreduce(output,
                                self.tp_group,
@@ -611,6 +665,14 @@ class MixtureOfExperts(Module):
     def to(self,
            moe_cls: Type["MixtureOfExperts"],
            quant_config=None) -> "MixtureOfExperts":
+
+        if isinstance(moe_cls, MoeOOTB):
+            if self.moe_config.normalization_mode in [
+                    MoeConfig.ExpertScaleNormalizationMode.DEVICE_LIMITED,
+                    MoeConfig.ExpertScaleNormalizationMode.DEVICE_LIMITED_RENORM
+            ]:
+                raise ValueError(
+                    'MoeOOTB doesn\'t support group_limited_greedy yet.')
         from ..quantization.quantize import quantize
         if isinstance(self, moe_cls):
             return self
@@ -628,6 +690,7 @@ class MixtureOfExperts(Module):
 MOE = MixtureOfExperts
 
 
+# TODO: Support `group_limited_greedy` in MoeOOTB.
 class MoeOOTB(MOE):
 
     def init_experts(self):
@@ -841,7 +904,7 @@ class MoeOOTB(MOE):
                         i, :self.expert_inter_size]
 
 
-# Add SharedMoE class (shanshan)
+# Add SharedMoE class
 class SharedMoE(Module):
 
     def __init__(self,
@@ -852,6 +915,7 @@ class SharedMoE(Module):
                  mapping: Mapping = Mapping(),
                  bias: bool = True,
                  dtype=None,
+                 quant_mode=QuantMode(0),
                  **kwargs):
         super().__init__()
 
@@ -862,6 +926,7 @@ class SharedMoE(Module):
         self.mapping = mapping
         self.bias = bias
         self.dtype = dtype
+        self.quant_mode = quant_mode
 
         self.moe = MOE(hidden_size=self.hidden_size,
                        moe_config=self.moe_config,
@@ -871,7 +936,8 @@ class SharedMoE(Module):
                        dtype=self.dtype,
                        bias=False,
                        tp_group=self.mapping.tp_group,
-                       tp_size=self.mapping.tp_size)
+                       tp_size=self.mapping.tp_size,
+                       quant_mode=self.quant_mode)
         ClsMLP = GatedMLP if is_gated_activation(self.hidden_act) else MLP
         self.shared_experts = ClsMLP(
             hidden_size=self.hidden_size,
@@ -880,7 +946,8 @@ class SharedMoE(Module):
             bias=False,
             dtype=self.dtype,
             tp_group=self.mapping.tp_group,
-            tp_size=self.mapping.tp_size)
+            tp_size=self.mapping.tp_size,
+            quant_mode=self.quant_mode)
 
     def forward(self, hidden_states):
         if self.moe_config.num_shared_experts > 0:

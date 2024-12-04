@@ -110,6 +110,10 @@ struct TopPSamplingKernelParams
 template <typename T>
 [[nodiscard]] size_t getTopPWorkspaceSize(runtime::SizeType32 batchSize, runtime::SizeType32 vocabSizePadded);
 
+//! \brief Returns workspace size in bytes needed for initialization of sampling TopP
+//! \param batchSize batch size
+[[nodiscard]] std::vector<size_t> getTopPInitWorkspaceSizes(runtime::SizeType32 batchSize);
+
 // clang-format off
 //! \brief Given probs, performs Top P sampling. Fills sampled tokens to outputIds.
 //! Updates sequenceLength, finished state, cumLogProbs inplace.
@@ -165,9 +169,8 @@ uint32_t calcAirTopPBlockNum(int batchSize, int len, int smCnt, bool isDetermini
 template <typename T>
 [[nodiscard]] size_t getAirTopPWorkspaceSize(int32_t batchSize, int32_t vocabSizePadded, bool isDeterministic = false);
 
-void invokeSetTopPRuntimeArgs(runtime::SizeType32 batchSize, runtime::SizeType32 topK,
-    runtime::SizeType32* runtimeTopKDevicePtr, runtime::SizeType32 runtimeTopKSize, float topP,
-    float* runtimeTopPDevicePtr, runtime::SizeType32 runtimeTopPSize, bool* skipDecode,
-    runtime::SizeType32 const* batchSlotsDevicePtr, float* initialTopPBuf, cudaStream_t stream);
+void invokeSetTopPRuntimeArgs(runtime::SizeType32 batchSize, ScatterDecodingParamEntry<runtime::SizeType32> topK,
+    ScatterDecodingParamEntry<float> topP, bool* skipDecodePtr, float* initialTopPPtr,
+    runtime::SizeType32 const* batchSlotsPtr, bool onDevice, cudaStream_t stream = nullptr);
 
 } // namespace tensorrt_llm::kernels

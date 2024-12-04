@@ -174,6 +174,21 @@ def convert_from_hf(hf_model,
     tik = time.time()
 
     model_params = dict(hf_model.named_parameters())
+    #This is for InternVL2
+    if hf_config.architectures[0] == 'InternLM2ForCausalLM':
+        keys_to_rename = [
+            key for key in model_params.keys() if 'language_model.' in key
+        ]
+        keys_to_delete = [
+            key for key in model_params.keys() if 'vision_model.' in key
+        ]
+        for key in keys_to_rename:
+            keys_rename = key.replace('language_model.', '')
+            model_params[keys_rename] = model_params[key]
+            del model_params[key]
+        for key in keys_to_delete:
+            del model_params[key]
+
     dtype = getattr(torch, dtype)
     num_attention_heads = hf_config.num_attention_heads
     hidden_size = hf_config.hidden_size
@@ -339,6 +354,10 @@ if __name__ == '__main__':
 
     hf_config = AutoConfig.from_pretrained(args.model_dir,
                                            trust_remote_code=True)
+    #This is for InternVL2
+    if hasattr(hf_config, 'llm_config'):
+        hf_config = hf_config.llm_config
+
     config = {
         'architecture': hf_config.architectures[0],
         'dtype': args.dtype,

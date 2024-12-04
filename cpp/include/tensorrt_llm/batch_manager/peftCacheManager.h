@@ -1,13 +1,17 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ * Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #pragma once
@@ -51,11 +55,9 @@ public:
 class BasePeftCacheManager
 {
 public:
-    friend class BasePeftCacheManagerBindings;
-
     using LlmRequestPtr = std::shared_ptr<LlmRequest>;
     using RequestVector = std::vector<LlmRequestPtr>;
-    using PeftTable = std::map<uint64_t, std::shared_ptr<std::vector<runtime::LoraCache::TaskLayerModuleConfig>>>;
+    using PeftTable = std::map<uint64_t, std::vector<runtime::LoraCache::TaskLayerModuleConfig>>;
 
     /**
      * \brief add PEFT weights from llmRequest if any.  This will kickoff background copy tasks.
@@ -72,14 +74,16 @@ public:
      * \param[in] resetGpuCache: reset (make all tasks evictable)
      * \returns -- a PeftTable
      */
-    virtual PeftTable ensureBatch(ScheduledRequests const& scheduledRequests, bool resetGpuCache = false) = 0;
+    virtual PeftTable ensureBatch(
+        RequestVector const& contextRequests, RequestVector const& generationRequests, bool resetGpuCache = false)
+        = 0;
 
     /**
      * \brief mark all the tasks in device cache as done
      */
     virtual void resetDeviceCache() = 0;
 
-    virtual void markRequestDone(LlmRequestPtr const& llmReq, bool pause = false) = 0;
+    virtual void markRequestDone(LlmRequest const& llmReq, bool pause = false) = 0;
 
     [[nodiscard]] virtual SizeType32 getMaxDevicePages() const = 0;
 
@@ -98,7 +102,8 @@ public:
 
     void addRequestPeft(std::shared_ptr<LlmRequest> llmRequest, bool tryGpuCache = true) override;
 
-    PeftTable ensureBatch(ScheduledRequests const& scheduledRequests, bool resetGpuCache = false) override;
+    PeftTable ensureBatch(RequestVector const& contextRequests, RequestVector const& generationRequests,
+        bool resetGpuCache = false) override;
 
     [[nodiscard]] bool isTaskCached(uint64_t taskId) const;
 
@@ -108,7 +113,7 @@ public:
 
     void resetDeviceCache() override;
 
-    void markRequestDone(std::shared_ptr<LlmRequest> const& llmReq, bool pause = false) override;
+    void markRequestDone(LlmRequest const& llmReq, bool pause = false) override;
 
     [[nodiscard]] SizeType32 getMaxDevicePages() const override;
 
@@ -149,7 +154,7 @@ private:
     std::unordered_map<uint64_t, std::unordered_set<uint64_t>> mTaskIdToPausedReqIds;
 
     std::tuple<std::map<uint64_t, std::future<void>>, std::map<uint64_t, std::vector<uint64_t>>> getTaskMaps(
-        ScheduledRequests const& scheduledRequests);
+        RequestVector const& contextRequests, RequestVector const& generationRequests);
 
     runtime::ModelConfig mModelConfig;
     runtime::WorldConfig mWorldConfig;
@@ -161,11 +166,12 @@ class NoOpPeftCacheManager : public BasePeftCacheManager
 {
     void addRequestPeft(std::shared_ptr<LlmRequest> llmRequest, bool tryGpuCache = true) override;
 
-    PeftTable ensureBatch(ScheduledRequests const& scheduledRequests, bool resetGpuCache = false) override;
+    PeftTable ensureBatch(RequestVector const& contextRequests, RequestVector const& generationRequests,
+        bool resetGpuCache = false) override;
 
     void resetDeviceCache() override;
 
-    void markRequestDone(std::shared_ptr<LlmRequest> const& llmReq, bool pause = false) override;
+    void markRequestDone(LlmRequest const& llmReq, bool pause = false) override;
 
     [[nodiscard]] SizeType32 getMaxDevicePages() const override;
 

@@ -112,7 +112,8 @@ public:
     }
 
     // Compiles and inserts the cubin if not found in mMap. Does nothing otherwise.
-    void insertCubinIfNotExists(Key const& key, CompileEngine* compileEngine)
+    // When initialize is true, also initialize cubins.
+    void insertCubinIfNotExists(Key const& key, CompileEngine* compileEngine, bool initialize)
     {
         TLLM_CHECK(compileEngine != nullptr);
 
@@ -125,14 +126,12 @@ public:
         }
 
         CubinObj obj = compileEngine->compile();
+        if (initialize)
+        {
+            obj.initialize();
+        }
         mMap.insert({key, std::move(obj)});
         return;
-    }
-
-    void insertCubin(Key const& key, CubinObj&& obj)
-    {
-        std::lock_guard<std::mutex> lock(mMutex);
-        mMap.insert({key, std::forward<CubinObj>(obj)});
     }
 
     CubinObj* getCubin(Key const& key)
@@ -149,11 +148,18 @@ public:
         }
     }
 
-    void merge(CubinObjRegistryTemplate<Key, Hash> const& other)
+    // When initialize is true, initialize cubins.
+    void merge(CubinObjRegistryTemplate<Key, Hash> const& other, bool initialize)
     {
+        std::lock_guard<std::mutex> lock(mMutex);
         for (auto&& p : other.mMap)
         {
-            mMap.insert(p);
+            auto [iter, success] = mMap.insert(p);
+            if (success && initialize)
+            {
+                // If insertion takes place, initialize the cubin.
+                iter->second.initialize();
+            }
         }
     }
 

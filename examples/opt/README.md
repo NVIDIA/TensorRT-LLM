@@ -217,7 +217,6 @@ python3 convert_checkpoint.py --model_dir ./opt-125m \
 
 trtllm-build --checkpoint_dir ./opt/125M/trt_ckpt/fp16/2-gpu/ \
                 --gemm_plugin float16 \
-                --lookup_plugin float16 \
                 --max_batch_size 8 \
                 --max_input_len 924 \
                 --max_seq_len 1024 \

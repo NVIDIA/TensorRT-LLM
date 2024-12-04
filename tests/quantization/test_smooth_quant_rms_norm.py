@@ -25,6 +25,8 @@ from tensorrt_llm import Parameter, Tensor
 from tensorrt_llm.quantization.functional import smooth_quant_rms_norm
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from itertools import product
+
 from utils.util import (create_session, run_session, skip_bf16_pre_ampere,
                         unittest_name_func)
 
@@ -34,11 +36,37 @@ class TestSmoothQuantRmsNorm(unittest.TestCase):
     def setUp(self):
         tensorrt_llm.logger.set_level('error')
 
-    @parameterized.expand([('float16', False), ('float16', True),
-                           ('bfloat16', False), ('bfloat16', True),
-                           ('float32', False), ('float32', True)],
-                          name_func=unittest_name_func)
-    def test_smooth_quant_rms_norm_plugin(self, dtype, dynamic_act_scaling):
+    @parameterized.expand(
+        [
+            combo for combo in product(
+                ['float16', 'bfloat16', 'float32'],  # dtypes
+                [False, True],  # use_plugin
+                [True, False],  # dynamic_act_scaling
+                [True, False]  # sum_per_token
+            )
+        ],  # Skip when dynamic_act_scaling=False and sum_per_token=True
+        name_func=unittest_name_func)
+    def test_smooth_quant_rms_norm(self, dtype, use_plugin, dynamic_act_scaling,
+                                   sum_per_token):
+
+        if sum_per_token and not dynamic_act_scaling:
+            # Create builder
+            builder = tensorrt_llm.Builder()
+            # Create empty network
+            network = builder.create_network()
+            with tensorrt_llm.net_guard(network):
+                # Should fail
+                with self.assertRaisesRegex(
+                        ValueError,
+                        "sum_per_token is only allowed if dynamic_act_scaling is enabled!"
+                ):
+                    smooth_quant_rms_norm(
+                        None,
+                        None,
+                        dynamic_act_scaling=dynamic_act_scaling,
+                        sum_per_token=sum_per_token)
+            return
+
         # Skip tests that are not supported in pre-ampere architecture
         skip_bf16_pre_ampere(dtype)
 
@@ -70,6 +98,9 @@ class TestSmoothQuantRmsNorm(unittest.TestCase):
                     dynamic_scale = abs_max_f / 127.0
                     ref_quantized = cast_to_int8_with_sat(ref *
                                                           (127.0 / abs_max_f))
+                    if sum_per_token:
+                        ref_sums = ref.sum(dim=-1, keepdim=True)
+
                 else:
                     ref_quantized = cast_to_int8_with_sat(ref * scale_data)
 
@@ -77,7 +108,8 @@ class TestSmoothQuantRmsNorm(unittest.TestCase):
         builder = tensorrt_llm.Builder()
         builder.strongly_typed = False  # Test need to run in weekly typed mode
         network = builder.create_network()
-        network.plugin_config.rmsnorm_quantization_plugin = dtype
+        if use_plugin:
+            network.plugin_config.rmsnorm_quantization_plugin = dtype
         with tensorrt_llm.net_guard(network):
             x = Tensor(name='x',
                        shape=x_data.shape,
@@ -89,10 +121,17 @@ class TestSmoothQuantRmsNorm(unittest.TestCase):
                 weight=tensorrt_llm.constant(m.weight.detach().cpu().numpy()),
                 scale=Parameter(scale_data.cpu().numpy()).value,
                 eps=m.variance_epsilon,
-                dynamic_act_scaling=dynamic_act_scaling)
+                dynamic_act_scaling=dynamic_act_scaling,
+                sum_per_token=sum_per_token,
+            )
 
             if dynamic_act_scaling:
-                output, dynamic_scales = output
+                if sum_per_token:
+                    output, dynamic_scales, sums = output
+                    sums.mark_output('sums', 'float32')
+                else:
+                    output, dynamic_scales = output
+
                 dynamic_scales.mark_output('dynamic_scales', 'float32')
 
             output.mark_output('output', 'int8')
@@ -118,18 +157,11 @@ class TestSmoothQuantRmsNorm(unittest.TestCase):
                                        atol=1e-2,
                                        rtol=1e-2)
 
-    def test_sq_rms_norm_no_plugin(self):
-        # Create builder
-        builder = tensorrt_llm.Builder()
-        builder.strongly_typed = False  # Test need to run in weekly typed mode
-        # Create empty network
-        network = builder.create_network()
-        with tensorrt_llm.net_guard(network):
-            # SQ Rmsnorm ootb should fail.
-            with self.assertRaisesRegex(
-                    TypeError,
-                    "Smooth Quant Rms Norm is only supported with plugin"):
-                smooth_quant_rms_norm(None, 0, None, None, None, 0)
+            if sum_per_token:
+                torch.testing.assert_close(ref_sums,
+                                           outputs['sums'],
+                                           atol=1e-2,
+                                           rtol=1e-2)
 
 
 if __name__ == '__main__':

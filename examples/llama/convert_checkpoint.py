@@ -13,6 +13,7 @@ from tensorrt_llm.layers import MoeConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import LLaMAForCausalLM
+from tensorrt_llm.models.convert_utils import infer_dtype
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -44,10 +45,15 @@ def parse_arguments():
         help=
         'N-way expert parallelism size for MOE, default is 1, which will do tp-only for MoE'
     )
-    parser.add_argument('--dtype',
-                        type=str,
-                        default='float16',
-                        choices=['float32', 'bfloat16', 'float16'])
+    parser.add_argument(
+        '--dtype',
+        type=str,
+        default='auto',
+        choices=['auto', 'float16', 'bfloat16', 'float32'],
+        help=
+        "The data type for the model weights and activations if not quantized. "
+        "If 'auto', the data type is automatically inferred from the source model; "
+        "however, if the source dtype is float32, it is converted to float16.")
     parser.add_argument('--vocab_size', type=int, default=32000)
     parser.add_argument('--n_positions', type=int, default=2048)
     parser.add_argument('--n_layer', type=int, default=32)
@@ -79,7 +85,7 @@ def parse_arguments():
         type=str,
         nargs='?',
         default='int8',
-        choices=['int8', 'int4', 'int4_gptq', 'int4_awq'],
+        choices=['int8', 'int4', 'int8_gptq', 'int4_gptq', 'int4_awq'],
         help=
         'Define the precision for the weights when using weight-only quantization.'
         'You must also use --use_weight_only for that argument to have an impact.'
@@ -112,6 +118,10 @@ def parse_arguments():
         help="Set the α parameter (see https://arxiv.org/pdf/2211.10438.pdf)"
         " to Smoothquant the model, and output int8 weights."
         " A good first try is 0.5. Must be in [0, 1]")
+    parser.add_argument('--use_qserve',
+                        default=False,
+                        action="store_true",
+                        help='Use QServe W4A8 quantization.')
     parser.add_argument(
         '--per_channel',
         action="store_true",
@@ -155,6 +165,14 @@ def parse_arguments():
                         action="store_true",
                         default=False,
                         help="Enable Fp8 per-token per-channel quantization")
+    parser.add_argument(
+        "--use_meta_fp8_rowwise_recipe",
+        action="store_true",
+        default=False,
+        help=
+        "Enable Meta's LLaMA 3.1 recipe for Fp8 per-token per-channel quantization. "
+        "This skips quantization for the first and last Transformer layers and all the Attention layers. "
+        "This option is effective only if use_fp8_rowwise is enabled.")
 
     parser.add_argument(
         '--per_group',
@@ -163,7 +181,9 @@ def parse_arguments():
         help=
         'By default, we use a single static scaling factor to scale weights in the int4 range. '
         'per_group chooses at run time, and for each group, a custom scaling factor. '
-        'The flag is built for GPTQ/AWQ quantization.')
+        'The flag is built for GPTQ/AWQ quantization.'
+        'If --use_qserve is enabled, this option also decides whether we use per-group or per-channel version of QServe'
+    )
 
     parser.add_argument('--load_by_shard',
                         action='store_true',
@@ -254,15 +274,36 @@ def parse_arguments():
     return args
 
 
+def precision_to_config(precision, group_size, quant_config) -> QuantConfig:
+    '''update config dict for weight-only quantization
+    '''
+    quant_config = QuantConfig()
+    precision_to_algo = {
+        'int8': QuantAlgo.W8A16,
+        'int4': QuantAlgo.W4A16,
+        'int8_gptq': QuantAlgo.W8A16_GPTQ,
+        'int4_gptq': QuantAlgo.W4A16_GPTQ,
+        'int4_awq': QuantAlgo.W4A16_AWQ
+    }
+    quant_config.quant_algo = precision_to_algo.get(precision)
+    if precision in {'int4_gptq', 'int8_gptq'}:
+        quant_config.group_size = group_size
+        quant_config.has_zero_point = True
+        quant_config.pre_quant_scale = False
+    elif precision == 'int4_awq':
+        quant_config.group_size = group_size
+        quant_config.has_zero_point = False
+        quant_config.pre_quant_scale = True
+    return quant_config
+
+
 def args_to_quant_config(args: argparse.Namespace) -> QuantConfig:
     '''return config dict with quantization info based on the command line args
     '''
     quant_config = QuantConfig()
     if args.use_weight_only:
-        if args.weight_only_precision == 'int8':
-            quant_config.quant_algo = QuantAlgo.W8A16
-        elif args.weight_only_precision == 'int4':
-            quant_config.quant_algo = QuantAlgo.W4A16
+        quant_config = precision_to_config(args.weight_only_precision,
+                                           args.group_size, quant_config)
     elif args.use_fp8:
         quant_config.quant_algo = QuantAlgo.FP8
     elif args.smoothquant:
@@ -282,23 +323,16 @@ def args_to_quant_config(args: argparse.Namespace) -> QuantConfig:
         # this will be overwritten if specified in the hf config.
         quant_config.clamp_val = [-1200.0, 1200.0]
 
+    elif args.use_qserve:
+        quant_config.quant_algo = QuantAlgo.W4A8_QSERVE_PER_GROUP if args.per_group else QuantAlgo.W4A8_QSERVE_PER_CHANNEL
+
+    quant_config.use_meta_recipe = args.use_meta_fp8_rowwise_recipe
+
     if args.int8_kv_cache:
         quant_config.kv_cache_quant_algo = QuantAlgo.INT8
 
     if args.fp8_kv_cache:
         quant_config.kv_cache_quant_algo = QuantAlgo.FP8
-
-    if args.weight_only_precision == 'int4_gptq':
-        quant_config.group_size = args.group_size
-        quant_config.has_zero_point = True
-        quant_config.pre_quant_scale = False
-        quant_config.quant_algo = QuantAlgo.W4A16_GPTQ
-
-    if args.weight_only_precision == 'int4_awq':
-        quant_config.group_size = args.group_size
-        quant_config.has_zero_point = False
-        quant_config.pre_quant_scale = True
-        quant_config.quant_algo = QuantAlgo.W4A16_AWQ
 
     return quant_config
 
@@ -352,7 +386,7 @@ def from_cli_args(args):
     n_kv_head = args.n_kv_head if args.n_kv_head is not None else args.n_head
     config = {
         'architecture': "LlamaForCausalLM",
-        'dtype': args.dtype,
+        'dtype': infer_dtype(args.dtype),
         'logits_dtype': 'float32',
         'num_hidden_layers': args.n_layer,
         'num_attention_heads': args.n_head,
@@ -443,11 +477,13 @@ def convert_and_save_hf(args):
                 load_by_shard=load_by_shard,
                 **override_fields,
             )
-            print(f'Total time of reading and converting {time.time()-tik} s')
+            print(
+                f'Total time of reading and converting: {time.time()-tik:.3f} s'
+            )
             tik = time.time()
             llama.save_checkpoint(args.output_dir, save_config=(rank == 0))
             del llama
-            print(f'Total time of saving checkpoint {time.time()-tik} s')
+            print(f'Total time of saving checkpoint: {time.time()-tik:.3f} s')
 
         execute(args.workers, [convert_and_save_rank] * world_size, args)
         release_gc()
@@ -504,9 +540,10 @@ def main():
     else:  # all other paths from hf model
         assert args.model_dir is not None
         assert (
-            args.quant_ckpt_path is not None
-            and args.weight_only_precision == 'int4_gptq'
-        ) or args.quant_ckpt_path is None, "only gptq weights only needs this option"
+            args.quant_ckpt_path is not None and
+            (args.weight_only_precision in {'int4_gptq', 'int8_gptq'}
+             or args.use_qserve)
+        ) or args.quant_ckpt_path is None, "only gptq weights or qserve need this option"
         convert_and_save_hf(args)
 
     tok = time.time()

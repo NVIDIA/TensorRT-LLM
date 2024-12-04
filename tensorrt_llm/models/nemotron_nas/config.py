@@ -15,12 +15,9 @@
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Union
 
-import torch
-
-from tensorrt_llm._utils import torch_dtype_to_str
 from tensorrt_llm.functional import PositionEmbeddingType
-from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.convert_utils import infer_dtype
 from tensorrt_llm.models.modeling_utils import PretrainedConfig, QuantConfig
 from tensorrt_llm.models.nemotron_nas.convert import \
     hf_block_configs_to_layer_configs
@@ -192,17 +189,7 @@ class DeciConfig(PretrainedConfig):
             else:
                 layer_configs = None
 
-        if dtype == 'auto':
-            dtype = getattr(hf_config, 'torch_dtype', "float16")
-            if isinstance(dtype, torch.dtype):
-                dtype = torch_dtype_to_str(dtype)
-            if dtype == 'float32':
-                dtype = 'float16'
-        if dtype == 'bfloat16' and torch.cuda.get_device_properties(
-                0).major < 8:
-            logger.warning(
-                "Pre SM 80 GPUs do not support bfloat16, fallback to float16")
-            dtype = 'float16'
+        dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
 
         return cls(dtype=dtype,
                    hidden_size=hf_config.hidden_size,

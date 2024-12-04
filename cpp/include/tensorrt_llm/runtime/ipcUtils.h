@@ -71,4 +71,6 @@ public:
     std::vector<runtime::IpcMemory> mIpcMemoryHandles;
 };
 
+void lamportInitializeAll(void* buffer_0, void* buffer_1, void* buffer_2, size_t size);
+
 } // namespace tensorrt_llm::runtime

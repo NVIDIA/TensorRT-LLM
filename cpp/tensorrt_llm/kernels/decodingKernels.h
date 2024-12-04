@@ -72,7 +72,7 @@ void invokeFinalize(BeamHypotheses& bh, cudaStream_t stream);
 //! \param maxSeqLen The maximum sequence length, inferred from the finalOutputIds.shape[3]
 //! \param stream The CUDA stream on which to perform the operation.
 void invokeInitializeOutput(runtime::TokenIdType* finalOutputIds, runtime::TokenIdType const* endIds,
-    runtime::SizeType32 batchBeam, runtime::SizeType32 maxSeqLen, cudaStream_t stream);
+    runtime::SizeType32 batch, runtime::SizeType32 beam, runtime::SizeType32 maxSeqLen, cudaStream_t stream);
 
 //! \brief Copies the data from the buffers in src to dst to reduce the kernel launch overhead of individual memcpy.
 //! for streaming + beam search, where we need to avoid overwriting the beam search buffers.

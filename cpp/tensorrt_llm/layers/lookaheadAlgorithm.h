@@ -39,7 +39,8 @@ public:
         runtime::SizeType32 maxW, runtime::SizeType32 maxN, runtime::SizeType32 maxG, runtime::SizeType32 id = 0);
 
     //! @brief setup per request, fill internal states from @param prompt.
-    void setup(TensorConstPtr const& prompt, runtime::SizeType32 w, runtime::SizeType32 n, runtime::SizeType32 g);
+    void setup(TensorConstPtr const& prompt, runtime::SizeType32 w, runtime::SizeType32 n, runtime::SizeType32 g,
+        uint64_t seed);
 
     //! @brief accept the new generated tokens.
     //! LookaheadDecodingLayer need call once for the first token in generation phase.

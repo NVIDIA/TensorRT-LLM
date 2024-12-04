@@ -7,7 +7,7 @@ Similar to other speculative decoding techniques, ReDrafter contains two major c
 
 The TensorRT-LLM's ReDrafter implementation can be found in [tensorrt_llm/models/redrafter/model.py](../../tensorrt_llm/models/redrafter/model.py), which combines the base model and the drafter definition which can be found in [tensorrt_llm/models/redrafter/model.py](../../tensorrt_llm/models/redrafter/drafter.py).
 
-For more information about ReDrafter visit [speculative decoding documentation](../../docs/source/speculative_decoding.md).
+For more information about ReDrafter visit [speculative decoding documentation](https://nvidia.github.io/TensorRT-LLM/advanced/speculative-decoding.html).
 
 ReDrafter has 3 additional hyperparameter that you can control for speculative decoding:
 - `redrafter_num_beams`: the number of paths to explore for speculation using beam search. Default is set to `5`.

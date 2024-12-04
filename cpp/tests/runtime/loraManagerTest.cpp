@@ -255,7 +255,6 @@ static std::tuple<std::vector<int32_t>, std::vector<int64_t>, PeftTable> createF
         {
             continue;
         }
-        peftTable.try_emplace(reqIds[bid], valuesWorkspace[bid]);
         if (config->getShape().nbDims == 3)
         {
             config->squeeze(0);
@@ -284,9 +283,10 @@ static std::tuple<std::vector<int32_t>, std::vector<int64_t>, PeftTable> createF
                     = outPointer;
             }
         }
+        peftTable.try_emplace(reqIds[bid], *valuesWorkspace[bid]);
     }
 
-    return std::make_tuple(targetAdapterSizes, targetPointers, peftTable);
+    return std::make_tuple(std::move(targetAdapterSizes), std::move(targetPointers), std::move(peftTable));
 }
 
 TEST_F(LoraManagerTest, fillInputTensors)

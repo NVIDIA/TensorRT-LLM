@@ -186,21 +186,33 @@ template <typename T>
 void BeamSearchLayer<T>::allocateBuffer(runtime::SizeType32 const batchSize, runtime::SizeType32 const beamWidth)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    auto const nPadBeamWidth = padToNextPowerOfTwo(beamWidth);
-    auto const nTopK = batchSize * nPadBeamWidth * nPadBeamWidth * 2;
-    auto const nTempBuffer
-        = batchSize * nPadBeamWidth * nMaxVocabPartForStage1FastKernel * (2 * (nPadBeamWidth * 2) + 2);
     auto const batchSizeShape = ITensor::makeShape({mDecoderDomain.getBatchSize()});
     mBeamSearchDiversityRateHost = mBufferManager->pinnedPool(batchSizeShape, TRTDataType<float>::value);
     mLengthPenaltyHost = mBufferManager->pinnedPool(batchSizeShape, TRTDataType<float>::value);
     mEarlyStoppingHost = mBufferManager->pinnedPool(batchSizeShape, TRTDataType<int>::value);
-
-    // Unit of workspaceSize is number of elements (not Byte), align to 4 for further optimization
-    mWorkspaceSize = common::roundUp(nTopK, 4) * 2 + common::roundUp(nTempBuffer, 4);
-
     mBeamSearchDiversityRateDevice = mBufferManager->gpu(batchSizeShape, TRTDataType<float>::value);
     mLengthPenaltyDevice = mBufferManager->gpu(batchSizeShape, TRTDataType<float>::value);
     mEarlyStoppingDevice = mBufferManager->gpu(batchSizeShape, TRTDataType<int>::value);
+
+    auto const nPadBeamWidth = padToNextPowerOfTwo(beamWidth);
+    auto const nTempBuffer
+        = batchSize * nPadBeamWidth * nMaxVocabPartForStage1FastKernel * (2 * (nPadBeamWidth * 2) + 2);
+    auto const nTopK = batchSize * nPadBeamWidth * nPadBeamWidth * 2;
+    // workspace1 and workspace2, see in function `beamStage2KernelLauncher`
+    size_t nByteWorkspace1 = common::roundUp(sizeof(T) * nTopK * 2, 4);
+    size_t nByteWorkspace2 = common::roundUp(sizeof(T) * nTempBuffer, 4);
+    // workspace3, see in function `beamStage3Kernel`
+    int max_smem_per_sm = -1;
+    int const device = tensorrt_llm::common::getDevice();
+    TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&max_smem_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device));
+    size_t nByteWorkspace3 = 0;
+    if (sizeof(T) * nPadBeamWidth * nPadBeamWidth * 2 >= max_smem_per_sm)
+    {
+        // Share memory is not enough for such large beam width, we need to put it in global memory
+        nByteWorkspace3 = common::roundUp(sizeof(T) * nPadBeamWidth * nPadBeamWidth * 2, 4);
+    }
+    // workspace2 and workspace3 will are not used at the same time
+    mWorkspaceSize = nByteWorkspace1 + std::max(nByteWorkspace2, nByteWorkspace3);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 

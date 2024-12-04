@@ -55,7 +55,6 @@ enum class LlmRequestState : int32_t
                                               /// Waiting context-only request transmitting the kv cache
     kDISAGG_CONTEXT_COMPLETE = 8,             ///< Context-only request finished kv cache transmission.
     kDISAGG_GENERATION_TRANS_IN_PROGRESS = 9, ///< For disaggregated serving only: transmitting the kv cache
-    kWAITING_TO_SEND_LOGITS = 10,             ///< Generation phase completed, logits not sent yet
 };
 
 enum LlmRequestType
@@ -95,8 +94,9 @@ public:
         std::optional<SizeType32> promptVocabSize = std::nullopt,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
         std::optional<TensorPtr> loraConfig = std::nullopt,
-        std::optional<executor::LookaheadDecodingConfig> lookaheadConfig = std::nullopt, bool returnLogProbs = false,
-        bool returnContextLogits = false, bool returnGenerationLogits = false,
+        std::optional<executor::LookaheadDecodingConfig> lookaheadConfig = std::nullopt,
+        std::optional<executor::KvCacheRetentionConfig> kvCacheRetentionConfig = std::nullopt,
+        bool returnLogProbs = false, bool returnContextLogits = false, bool returnGenerationLogits = false,
         std::optional<std::shared_ptr<VecTokens>> draftTokens = std::nullopt,
         std::optional<TensorPtr> draftLogits = std::nullopt, bool excludeInputFromOutput = false,
         std::optional<LogitsPostProcessor> logitsPostProcessor = std::nullopt,
@@ -106,9 +106,11 @@ public:
         executor::PriorityType priority = executor::Request::kDefaultPriority,
         std::optional<TensorPtr> encoderInputFeatures = std::nullopt,
         std::optional<SizeType32> encoderOutputLength = std::nullopt,
+        std::optional<TensorPtr> crossAttentionMask = std::nullopt,
         LlmRequestType llmRequestType = LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
         std::optional<std::shared_ptr<VecTokenExtraIds>> inputTokenExtraIds = std::nullopt,
-        SizeType32 numReturnSequences = 1)
+        SizeType32 numReturnSequences = 1, std::optional<executor::EagleConfig> eagleConfig = std::nullopt,
+        std::optional<TensorPtr> skipCrossAttnBlocks = std::nullopt)
         : mRequestId(requestId)
         , mPromptLen(inputTokens->size())
         , mMaxNewTokens(maxNewTokens)
@@ -133,6 +135,7 @@ public:
         , mLoraWeights(std::move(loraWeights))
         , mLoraConfig(std::move(loraConfig))
         , mLookaheadConfig(std::move(lookaheadConfig))
+        , mKvCacheRetentionConfig(std::move(kvCacheRetentionConfig))
         , mContextChunkSize{mPromptLen}
         , mLogProbs(samplingConfig.beamWidth)
         , mCumLogProbs(samplingConfig.beamWidth)
@@ -150,10 +153,13 @@ public:
         , mFinishReasons(samplingConfig.beamWidth)
         , mEncoderInputFeatures(std::move(encoderInputFeatures))
         , mEncoderOutputLength(encoderOutputLength)
+        , mCrossAttentionMask(std::move(crossAttentionMask))
         , mLlmRequestType(llmRequestType)
         , mInputTokenExtraIds(std::move(inputTokenExtraIds))
         , mNumReturnSequences(numReturnSequences)
+        , mEagleConfig(eagleConfig)
         , mSequenceIndex(0)
+        , mSkipCrossAttnBlocks(std::move(skipCrossAttnBlocks))
     {
         if (mEncoderTokens.has_value() || encoderInputFeatures.has_value())
         {
@@ -186,6 +192,7 @@ public:
         , mLoraWeights(std::nullopt)
         , mLoraConfig(std::nullopt)
         , mLookaheadConfig(std::nullopt)
+        , mKvCacheRetentionConfig(std::nullopt)
         , mContextChunkSize{mPromptLen}
         , mLogProbs(mSamplingConfig.beamWidth)
         , mCumLogProbs(mSamplingConfig.beamWidth)
@@ -201,10 +208,12 @@ public:
         , mDecodingIter(0)
         , mPriority(req.getPriority())
         , mFinishReasons(mSamplingConfig.beamWidth)
+        , mEncoderInputFeatures(std::nullopt)
         , mEncoderOutputLength(req.getEncoderOutputLength())
         , mContextPhaseParams(req.getContextPhaseParams())
         , mInputTokenExtraIds(std::nullopt)
-        , mNumReturnSequences(req.getNumReturnSequences())
+        , mNumReturnSequences(1)
+        , mEagleConfig(req.getEagleConfig())
         , mSequenceIndex(0)
     {
         if (req.getRequestType() == executor::RequestType::REQUEST_TYPE_GENERATION_ONLY)
@@ -242,7 +251,8 @@ public:
 
         if (req.getEmbeddingBias())
         {
-            mEmbeddingBias = executor::detail::toITensor(req.getEmbeddingBias().value());
+            mEmbeddingBias
+                = tensorrt_llm::runtime::ITensor::view(executor::detail::toITensor(req.getEmbeddingBias().value()));
             // Add leading 1 dimension since that's what IFB code expects
             mEmbeddingBias.value()->unsqueeze(0);
         }
@@ -263,7 +273,8 @@ public:
         auto pTuningConfig = req.getPromptTuningConfig();
         if (pTuningConfig)
         {
-            mPromptEmbeddingTable = executor::detail::toITensor(pTuningConfig.value().getEmbeddingTable());
+            mPromptEmbeddingTable = tensorrt_llm::runtime::ITensor::view(
+                executor::detail::toITensor(pTuningConfig.value().getEmbeddingTable()));
             TLLM_CHECK(mPromptEmbeddingTable.value()->getShape().nbDims == 2);
             mPromptVocabSize = mPromptEmbeddingTable.value()->getShape().d[0];
             mPromptEmbeddingTable.value()->unsqueeze(0);
@@ -294,11 +305,6 @@ public:
             }
         }
 
-        auto lookaheadConfig = req.getLookaheadConfig();
-        if (lookaheadConfig)
-        {
-        }
-
         auto externalDraftTokensConfig = req.getExternalDraftTokensConfig();
         if (externalDraftTokensConfig)
         {
@@ -320,6 +326,26 @@ public:
         else
         {
             mEncoderInputFeatures = std::nullopt;
+        }
+
+        auto const& crossAttentionMask = req.getCrossAttentionMask();
+        if (crossAttentionMask.has_value())
+        {
+            mCrossAttentionMask = executor::detail::toITensor(crossAttentionMask.value());
+        }
+        else
+        {
+            mCrossAttentionMask = std::nullopt;
+        }
+
+        auto const& skipCrossAttnBlocks = req.getSkipCrossAttnBlocks();
+        if (skipCrossAttnBlocks.has_value())
+        {
+            mSkipCrossAttnBlocks = executor::detail::toITensor(skipCrossAttnBlocks.value());
+        }
+        else
+        {
+            mSkipCrossAttnBlocks = std::nullopt;
         }
 
         switch (req.getRequestType())
@@ -391,15 +417,6 @@ public:
             mMaxNewTokens = maxNewTokens;
         }
 
-        if (mNumReturnSequences > 1 && mSamplingConfig.beamWidth > 1)
-        {
-            TLLM_THROW(
-                "Using mNumReturnSequences (%d) > 1 with beam search is currently disabled, since TensorRT-LLM returns "
-                "a total of mNumReturnSequences x beamWidth beams, rather than limiting the number of returned beams "
-                "to mNumReturnSequences. This restriction will be removed once the issue is resolved.",
-                mNumReturnSequences);
-        }
-
         TLLM_CHECK_WITH_INFO(mSamplingConfig.validate(), "Incorrect sampling config");
 
         // validate extra ids when enabling kv cache reuse with prompt table
@@ -430,6 +447,16 @@ public:
         mContextPhaseParams = std::move(contextPhaseParams);
     }
 
+    [[nodiscard]] bool isLayerWiseKvCacheEnabled() const
+    {
+        return isContextOnlyRequest() && mLayerWiseKvCacheEnabled;
+    }
+
+    void setLayerWiseKvCacheEnabled(bool enabled)
+    {
+        mLayerWiseKvCacheEnabled = enabled;
+    }
+
     /// @brief Get the state params of the context
     /// @return The state params of the context
     [[nodiscard]] executor::DataTransceiverState const& getDataTransceiverState() const
@@ -450,7 +477,18 @@ public:
     /// @return  The number of sequences to return.
     [[nodiscard]] SizeType32 getNumReturnSequences() const
     {
+        TLLM_LOG_WARNING(
+            "mNumReturnSequences in the LlmRequest class is deprecated. Please use numReturnSequences in "
+            "SamplingConfig directly.");
         return mNumReturnSequences;
+    }
+
+    /// @brief Get the number of subrequests, the expected number of responses under non-streaming mode. In sampling
+    /// mode, it will be equal to mSamplingConfig.numReturnSequences, while it will be equal to 1 in beam search.
+    /// @return  The number of subrequests in total  request size.
+    [[nodiscard]] SizeType32 getNumSubRequests() const
+    {
+        return mSamplingConfig.beamWidth == 1 ? mSamplingConfig.numReturnSequences.value_or(1) : 1;
     }
 
     /// @brief Get child requests spawned by this req.
@@ -659,8 +697,8 @@ public:
         TLLM_CHECK_WITH_INFO(mChildRequests.size() <= static_cast<size_t>(numReturnSequences),
             "Cannot set numReturnSequences %d smaller than the number %ld of child requests that have already created.",
             numReturnSequences, mChildRequests.size());
-        mNumReturnSequences = numReturnSequences;
-        mSequenceFinalVec->resize(mNumReturnSequences);
+        mSamplingConfig.numReturnSequences = numReturnSequences;
+        mSequenceFinalVec->resize(numReturnSequences);
     }
 
     [[nodiscard]] bool constexpr isChild() const noexcept
@@ -810,9 +848,29 @@ public:
         mLookaheadConfig = config;
     }
 
+    [[nodiscard]] std::optional<executor::KvCacheRetentionConfig> getKvCacheRetentionConfig() const
+    {
+        return mKvCacheRetentionConfig;
+    }
+
+    void setKvCacheRetentionConfig(executor::KvCacheRetentionConfig config)
+    {
+        mKvCacheRetentionConfig = config;
+    }
+
     void clearLookaheadConfig()
     {
         mLookaheadConfig = std::nullopt;
+    }
+
+    [[nodiscard]] std::optional<executor::EagleConfig> getEagleConfig() const
+    {
+        return mEagleConfig;
+    }
+
+    void setEagleConfig(executor::EagleConfig config)
+    {
+        mEagleConfig = config;
     }
 
     [[nodiscard]] std::optional<TensorPtr> getEmbeddingBias() const
@@ -1019,6 +1077,16 @@ public:
         TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     }
 
+    [[nodiscard]] TensorPtr const getCrossAttentionMask() const
+    {
+        return mCrossAttentionMask.value_or(nullptr);
+    }
+
+    [[nodiscard]] TensorPtr const getSkipCrossAttnBlocks() const
+    {
+        return mSkipCrossAttnBlocks.value_or(nullptr);
+    }
+
     [[nodiscard]] bool constexpr isStreaming() const noexcept
     {
         return mIsStreaming;
@@ -1183,11 +1251,6 @@ public:
         return mState == LlmRequestState::kDISAGG_CONTEXT_COMPLETE;
     }
 
-    [[nodiscard]] bool isCompleteWaitingToSendLogits() const noexcept
-    {
-        return mState == LlmRequestState::kWAITING_TO_SEND_LOGITS;
-    }
-
     /// To determine whether the context is unchunked. When a context is chunked into only a part, it
     /// is still different from the unchunked state, which indicates the initial status.
     [[nodiscard]] bool isFullContextRequest() const noexcept
@@ -1265,6 +1328,12 @@ public:
         return mPriority;
     }
 
+    /// Get the counter of decoding iterations.
+    SizeType32 getDecodingIter()
+    {
+        return mDecodingIter;
+    }
+
     /// Increment the counter of decoding iterations.
     void advanceDecodingIter()
     {
@@ -1284,7 +1353,7 @@ public:
 
     [[nodiscard]] bool isFinished() const noexcept
     {
-        return isGenerationCompleteState() || isDisaggContextTransmissionState() || isCompleteWaitingToSendLogits();
+        return isGenerationCompleteState() || isDisaggContextTransmissionState();
     }
 
     /// @brief  Create a Response from the current state of the request
@@ -1305,7 +1374,6 @@ public:
             result.isFinal = std::all_of(mSequenceFinalVec->begin(), mSequenceFinalVec->end(),
                 [](bool isSequenceFinal) { return isSequenceFinal; });
 
-            auto const nbBeams = mSamplingConfig.beamWidth;
             auto const maxNbTokens = getMaxBeamNumTokens();
 
             if (isDisaggContextTransmissionState() && isContextOnlyRequest())
@@ -1333,6 +1401,8 @@ public:
 
             auto const maxNbTokensOut = calculateNbTokensOut(maxNbTokens);
 
+            auto const nbBeams = mSamplingConfig.getNumReturnBeams();
+
             result.outputTokenIds.resize(nbBeams);
 
             auto const startTokenPos = maxNbTokens - maxNbTokensOut;
@@ -1357,10 +1427,13 @@ public:
                     }
                 }
 
+                auto sliceBeams = [&nbBeams](auto beams)
+                { return std::vector<typename decltype(beams)::value_type>(beams.begin(), beams.begin() + nbBeams); };
+
                 if (returnLogProbs())
                 {
-                    result.cumLogProbs = getCumLogProbs();
-                    result.logProbs = getLogProbs();
+                    result.cumLogProbs = sliceBeams(getCumLogProbs());
+                    result.logProbs = sliceBeams(getLogProbs());
                 }
 
                 if (getReturnContextLogits())
@@ -1370,7 +1443,8 @@ public:
 
                 if (getReturnGenerationLogits())
                 {
-                    if (isStreaming())
+                    bool hasDraftTokens = (mDraftTokens && mDraftTokens->size() > 0) ? true : false;
+                    if (isStreaming() && !hasDraftTokens)
                     {
                         auto startGenTokenPos = startTokenPos - getOrigPromptLen();
                         TensorPtr generationLogitsHostCurrentStep
@@ -1384,7 +1458,8 @@ public:
                     }
                     else
                     {
-                        result.generationLogits = executor::detail::ofITensor(getGenerationLogitsHost());
+                        result.generationLogits = executor::detail::ofITensor(
+                            runtime::ITensor::slice(getGenerationLogitsHost(), 0, nbBeams));
                     }
                 }
 
@@ -1393,7 +1468,7 @@ public:
                     result.encoderOutput = executor::detail::ofITensor(getEncoderOutputHost());
                 }
 
-                result.finishReasons = mFinishReasons;
+                result.finishReasons = sliceBeams(mFinishReasons);
                 result.decodingIter = mDecodingIter;
 
                 // Update position of last sent response
@@ -1436,6 +1511,53 @@ public:
         // get max with 0 in case this function is called while end time is not recorded
         return std::max(
             0.0, std::chrono::duration<double, std::milli>(mKvCacheTransferEnd - mKvCacheTransferStart).count());
+    }
+
+    void updateAllocTotalBlocksPerRequest(SizeType32 allocTotalBlocksPerRequest)
+    {
+        mAllocTotalBlocksPerRequest += allocTotalBlocksPerRequest;
+    }
+
+    [[nodiscard]] SizeType32 getAllocTotalBlocksPerRequest() const
+    {
+        return mAllocTotalBlocksPerRequest;
+    }
+
+    void updateAllocNewBlocksPerRequest(SizeType32 allocNewBlocksPerRequest)
+    {
+        mAllocNewBlocksPerRequest += allocNewBlocksPerRequest;
+    }
+
+    [[nodiscard]] SizeType32 getAllocNewBlocksPerRequest() const
+    {
+        return mAllocNewBlocksPerRequest;
+    }
+
+    void updateReusedBlocksPerRequest(SizeType32 reusedBlocksPerRequest)
+    {
+        mReusedBlocksPerRequest += reusedBlocksPerRequest;
+    }
+
+    [[nodiscard]] SizeType32 getReusedBlocksPerRequest() const
+    {
+        return mReusedBlocksPerRequest;
+    }
+
+    void updateMissedBlocksPerRequest(SizeType32 missedBlocksPerRequest)
+    {
+        mMissedBlocksPerRequest += missedBlocksPerRequest;
+    }
+
+    [[nodiscard]] SizeType32 getMissedBlocksPerRequest() const
+    {
+        return mMissedBlocksPerRequest;
+    }
+
+    [[nodiscard]] float getKVCacheHitRatePerRequest() const
+    {
+        return mReusedBlocksPerRequest == 0 ? 0
+                                            : static_cast<float>(mReusedBlocksPerRequest)
+                / (static_cast<float>(mReusedBlocksPerRequest + mMissedBlocksPerRequest));
     }
 
     RequestIdType mRequestId;
@@ -1488,6 +1610,7 @@ protected:
     std::optional<TensorPtr> mLoraConfig;
     std::optional<executor::LookaheadDecodingConfig> mLookaheadConfig;
 
+    std::optional<executor::KvCacheRetentionConfig> mKvCacheRetentionConfig;
     // To enable chunked context, the FHMA paged kv-cache also needs to be enabled. Except for the last one,
     // the size of the context chunk needs to be an integer multiple of the kv-cache block size. The meaning
     // of null value is that the context is not chunked.
@@ -1528,8 +1651,10 @@ protected:
     std::optional<SizeType32>
         mEncoderOutputLength; // For some models like Whisper, encoder output shape cannot be inferred from encoder
                               // input shape due to downsampling. Thus this is needed for setting buffer sizes correctly
+    std::optional<TensorPtr> mCrossAttentionMask; // Input cross attention mask
     LlmRequestType mLlmRequestType;
     std::optional<executor::ContextPhaseParams> mContextPhaseParams;
+    bool mLayerWiseKvCacheEnabled = false;
 
     std::optional<std::shared_ptr<VecTokenExtraIds>> mInputTokenExtraIds;
     BeamUniqueTokens mUniqueTokens;
@@ -1537,6 +1662,7 @@ protected:
     std::optional<std::shared_ptr<VecUniqueTokens>> mEncoderUniqueTokens;
 
     SizeType32 mNumReturnSequences;
+    std::optional<executor::EagleConfig> mEagleConfig;
     SizeType32 mSequenceIndex;
     std::vector<RequestPtr> mChildRequests;
     RequestIdType mParentRequestId;
@@ -1544,6 +1670,13 @@ protected:
 
     std::chrono::time_point<std::chrono::steady_clock> mKvCacheTransferStart;
     std::chrono::time_point<std::chrono::steady_clock> mKvCacheTransferEnd;
+
+    SizeType32 mAllocTotalBlocksPerRequest{0};
+    SizeType32 mAllocNewBlocksPerRequest{0};
+    SizeType32 mReusedBlocksPerRequest{0};
+    SizeType32 mMissedBlocksPerRequest{0};
+
+    std::optional<TensorPtr> mSkipCrossAttnBlocks;
 
 private:
     void initialize(VecTokens const& inputTokens, bool outputLogProbs)
@@ -1608,10 +1741,30 @@ private:
 
         setReturnLogProbs(outputLogProbs);
 
+        // Handling the backward compatibility of numReturnSequences.
+        if (mNumReturnSequences > 1)
+        {
+            if (!mSamplingConfig.numReturnSequences)
+            {
+                TLLM_LOG_WARNING(
+                    "In the Executor class, mNumReturnSequences is deprecated. Please set numReturnSequences in "
+                    "SamplingConfig directly.");
+            }
+            else if (mSamplingConfig.numReturnSequences
+                && mSamplingConfig.numReturnSequences.value() != mNumReturnSequences)
+            {
+                TLLM_THROW(
+                    "In the Executor class, both mSamplingConfig.numReturnSequences (%d) and mNumReturnSequences (%d) "
+                    "are provided but unmatched. Please use numReturnSequences in SamplingConfig directly.",
+                    mSamplingConfig.numReturnSequences.value(), mNumReturnSequences);
+            }
+            mSamplingConfig.numReturnSequences = mNumReturnSequences;
+        }
+
         if (!isChild())
         {
             // Initialize result states unless it is a child and a child request should share parent's one.
-            mSequenceFinalVec = std::make_shared<std::vector<bool>>(getNumReturnSequences(), false);
+            mSequenceFinalVec = std::make_shared<std::vector<bool>>(getNumSubRequests(), false);
         }
     }
 
@@ -1668,8 +1821,9 @@ public:
         std::optional<SizeType32> promptVocabSize = std::nullopt,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
         std::optional<TensorPtr> loraConfig = std::nullopt,
-        std::optional<executor::LookaheadDecodingConfig> lookaheadConfig = std::nullopt, bool returnLogProbs = false,
-        bool returnContextLogits = false, bool returnGenerationLogits = false,
+        std::optional<executor::LookaheadDecodingConfig> lookaheadConfig = std::nullopt,
+        std::optional<executor::KvCacheRetentionConfig> kvCacheRetentionConfig = std::nullopt,
+        bool returnLogProbs = false, bool returnContextLogits = false, bool returnGenerationLogits = false,
         std::optional<std::shared_ptr<VecTokens>> draftTokens = std::nullopt,
         std::optional<TensorPtr> draftLogits = std::nullopt, bool excludeInputFromOutput = false,
         std::optional<LogitsPostProcessor> logitsPostProcessor = std::nullopt,
@@ -1679,17 +1833,65 @@ public:
         executor::PriorityType priority = executor::Request::kDefaultPriority,
         std::optional<TensorPtr> encoderInputFeatures = std::nullopt,
         std::optional<SizeType32> encoderOutputLength = std::nullopt,
+        std::optional<TensorPtr> crossAttentionMask = std::nullopt,
         LlmRequestType llmRequestType = LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
         std::optional<std::shared_ptr<VecTokenExtraIds>> inputTokenExtraIds = std::nullopt,
-        SizeType32 numReturnSequences = 1)
+        SizeType32 numReturnSequences = 1, std::optional<executor::EagleConfig> eagleConfig = std::nullopt,
+        std::optional<TensorPtr> skipCrossAttnBlocks = std::nullopt)
         : Base(requestId, maxNewTokens, std::move(inputTokens), samplingConfig, isStreaming, endId, padId,
             std::move(embeddingBias), std::move(badWordsList), std::move(stopWordsList), std::move(positionIds),
             std::move(promptEmbeddingTable), promptVocabSize, loraTaskId, std::move(loraWeights), std::move(loraConfig),
-            std::move(lookaheadConfig), returnLogProbs, returnContextLogits, returnGenerationLogits,
-            std::move(draftTokens), std::move(draftLogits), excludeInputFromOutput, std::move(logitsPostProcessor),
-            applyLogitsPostProcessorBatched, std::move(encoderInputTokens), returnEncoderOutput, clientId, priority,
-            std::move(encoderInputFeatures), std::move(encoderOutputLength), llmRequestType,
-            std::move(inputTokenExtraIds), numReturnSequences)
+            std::move(lookaheadConfig), std::move(kvCacheRetentionConfig), returnLogProbs, returnContextLogits,
+            returnGenerationLogits, std::move(draftTokens), std::move(draftLogits), excludeInputFromOutput,
+            std::move(logitsPostProcessor), applyLogitsPostProcessorBatched, std::move(encoderInputTokens),
+            returnEncoderOutput, clientId, priority, std::move(encoderInputFeatures), std::move(encoderOutputLength),
+            std::move(crossAttentionMask), llmRequestType, std::move(inputTokenExtraIds), numReturnSequences,
+            std::move(eagleConfig), std::move(skipCrossAttnBlocks))
+    {
+    }
+
+    LlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::vector<TokenIdType> inputTokens,
+        runtime::SamplingConfig samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
+        std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
+        std::optional<TensorPtr> badWordsList = std::nullopt, std::optional<TensorPtr> stopWordsList = std::nullopt,
+        std::optional<std::vector<SizeType32>> positionIds = std::nullopt,
+        std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
+        std::optional<SizeType32> promptVocabSize = std::nullopt,
+        std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
+        std::optional<TensorPtr> loraConfig = std::nullopt,
+        std::optional<executor::LookaheadDecodingConfig> lookaheadConfig = std::nullopt,
+        std::optional<executor::KvCacheRetentionConfig> kvCacheRetentionConfig = std::nullopt,
+        bool returnLogProbs = false, bool returnContextLogits = false, bool returnGenerationLogits = false,
+        std::optional<VecTokens> draftTokens = std::nullopt, std::optional<TensorPtr> draftLogits = std::nullopt,
+        bool excludeInputFromOutput = false, std::optional<LogitsPostProcessor> logitsPostProcessor = std::nullopt,
+        bool applyLogitsPostProcessorBatched = false, std::optional<VecTokens> encoderInputTokens = std::nullopt,
+        bool returnEncoderOutput = false, std::optional<RequestIdType> clientId = std::nullopt,
+        executor::PriorityType priority = executor::Request::kDefaultPriority,
+        std::optional<TensorPtr> encoderInputFeatures = std::nullopt,
+        std::optional<SizeType32> encoderOutputLength = std::nullopt,
+        std::optional<TensorPtr> crossAttentionMask = std::nullopt,
+        LlmRequestType llmRequestType = LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
+        std::optional<VecTokenExtraIds> inputTokenExtraIds = std::nullopt, SizeType32 numReturnSequences = 1,
+        std::optional<executor::EagleConfig> eagleConfig = std::nullopt,
+        std::optional<TensorPtr> skipCrossAttnBlocks = std::nullopt)
+        : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
+            samplingConfig, isStreaming, endId, padId, std::move(embeddingBias), std::move(badWordsList),
+            std::move(stopWordsList),
+            positionIds.has_value() ? std::make_shared<std::vector<SizeType32>>(std::move(positionIds.value()))
+                                    : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),
+            std::move(promptEmbeddingTable), promptVocabSize, loraTaskId, std::move(loraWeights), std::move(loraConfig),
+            std::move(lookaheadConfig), std::move(kvCacheRetentionConfig), returnLogProbs, returnContextLogits,
+            returnGenerationLogits,
+            draftTokens.has_value() ? std::make_shared<VecTokens>(std::move(draftTokens.value()))
+                                    : std::make_shared<VecTokens>(),
+            draftLogits, excludeInputFromOutput, logitsPostProcessor, applyLogitsPostProcessorBatched,
+            encoderInputTokens ? std::make_optional(std::make_shared<VecTokens>(std::move(*encoderInputTokens)))
+                               : std::optional<std::shared_ptr<VecTokens>>(std::nullopt),
+            returnEncoderOutput, clientId, priority, encoderInputFeatures, encoderOutputLength, crossAttentionMask,
+            llmRequestType,
+            inputTokenExtraIds ? std::make_optional(std::make_shared<VecTokenExtraIds>(std::move(*inputTokenExtraIds)))
+                               : std::optional<std::shared_ptr<VecTokenExtraIds>>(std::nullopt),
+            numReturnSequences, std::move(eagleConfig), skipCrossAttnBlocks)
     {
     }
 
@@ -1701,13 +1903,14 @@ public:
         mLogitsPostProcessor = std::move(logitsPostProcessor);
         mApplyLogitsPostProcessorBatched = applyLogitsPostProcessorBatched;
         mLookaheadConfig = request.getLookaheadConfig();
+        mKvCacheRetentionConfig = request.getKvCacheRetentionConfig();
     }
 
     std::shared_ptr<LlmRequest> createChildRequest(RequestIdType requestId)
     {
         TLLM_CHECK_WITH_INFO(!isChild(), "A child request cannot create its own child.");
-        TLLM_CHECK_WITH_INFO(mChildRequests.size() + 1 < static_cast<size_t>(getNumReturnSequences()),
-            "Cannot create child requests more than the number of return sequences (%d)", getNumReturnSequences());
+        TLLM_CHECK_WITH_INFO(mChildRequests.size() + 1 < static_cast<size_t>(getNumSubRequests()),
+            "Cannot create child requests more than the number of return sequences (%d)", getNumSubRequests());
         auto childReq = std::make_shared<LlmRequest>(*this);
         childReq->mRequestId = requestId;
         childReq->mSequenceIndex = mChildRequests.size() + 1;

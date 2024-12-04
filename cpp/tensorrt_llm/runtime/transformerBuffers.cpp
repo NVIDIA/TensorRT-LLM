@@ -86,6 +86,8 @@ TransformerBuffers::TransformerBuffers(
         runtimePerfKnobsHost = BufferManager::cpu(ITensor::makeShape({perfKnobSize}), nvinfer1::DataType::kINT64);
         auto runtimePerfKnobsHostPtr = bufferCast<int64_t>(*runtimePerfKnobsHost);
         std::fill_n(runtimePerfKnobsHostPtr, perfKnobSize, -1);
+        contextProgressHost = BufferManager::cpu(ITensor::makeShape({1}), nvinfer1::DataType::kINT64);
+        bufferCast<int64_t>(*contextProgressHost)[0] = 0;
     }
     else
     {
@@ -216,6 +218,7 @@ TransformerBuffers TransformerBuffers::sliceTo(
         buffers.maxAttentionWindows = maxAttentionWindows;
         buffers.sinkTokenLengths = sinkTokenLengths;
         buffers.runtimePerfKnobsHost = runtimePerfKnobsHost;
+        buffers.contextProgressHost = contextProgressHost;
     }
     else
     {
@@ -729,6 +732,7 @@ void TransformerBuffers::getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers,
         inputBuffers.insert_or_assign("host_sink_token_length", sinkTokenLengths);
         inputBuffers.insert_or_assign("host_max_attention_window_sizes", maxAttentionWindows);
         inputBuffers.insert_or_assign("host_runtime_perf_knobs", runtimePerfKnobsHost);
+        inputBuffers.insert_or_assign("host_context_progress", contextProgressHost);
 
         if (modelConfig.usePackedInput())
         {

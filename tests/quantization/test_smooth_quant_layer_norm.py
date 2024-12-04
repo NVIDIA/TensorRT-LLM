@@ -40,13 +40,15 @@ class TestSmoothQuantLayerNorm(unittest.TestCase):
                       ('bfloat16', False, True), ('bfloat16', True, True),
                       ('float32', False, True), ('float32', True, True),
                       ('float16', True, False)]
+        test_cases = [i + (True, ) for i in test_cases
+                      ] + [i + (False, ) for i in test_cases]
         return [i + (True, )
                 for i in test_cases] + [i + (False, ) for i in test_cases]
 
     @parameterized.expand(load_test_cases, name_func=unittest_name_func)
-    def test_smooth_quant_layer_norm_plugin(self, dtype, dynamic_act_scaling,
-                                            elementwise_affine,
-                                            remove_batch_dim):
+    def test_smooth_quant_layer_norm(self, dtype, dynamic_act_scaling,
+                                     elementwise_affine, remove_batch_dim,
+                                     use_plugin):
         # Skip tests that are not supported in pre-ampere architecture
         skip_bf16_pre_ampere(dtype)
 
@@ -75,7 +77,8 @@ class TestSmoothQuantLayerNorm(unittest.TestCase):
         # construct trt network
         builder = tensorrt_llm.Builder()
         network = builder.create_network()
-        network.plugin_config.layernorm_quantization_plugin = dtype
+        if use_plugin:
+            network.plugin_config.layernorm_quantization_plugin = dtype
         with tensorrt_llm.net_guard(network):
             x = Tensor(name='x',
                        shape=x_data.shape,
@@ -138,18 +141,6 @@ class TestSmoothQuantLayerNorm(unittest.TestCase):
                                        outputs['dynamic_scales'],
                                        atol=1e-2,
                                        rtol=1e-2)
-
-    def test_sq_layer_norm_no_plugin(self):
-        # Create builder
-        builder = tensorrt_llm.Builder()
-        # Create empty network
-        network = builder.create_network()
-        with tensorrt_llm.net_guard(network):
-            # SQ LayerNorm ootb should fail
-            with self.assertRaisesRegex(
-                    TypeError,
-                    "Smooth Quant Layer Norm is only supported with plugin"):
-                smooth_quant_layer_norm(None, 0, None, None, None, 0)
 
 
 if __name__ == '__main__':

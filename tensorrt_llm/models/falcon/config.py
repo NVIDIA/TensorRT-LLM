@@ -14,11 +14,8 @@
 # limitations under the License.
 from typing import Optional, Union
 
-import torch
-
-from ..._utils import torch_dtype_to_str
-from ...logger import logger
 from ...mapping import Mapping
+from ..convert_utils import infer_dtype
 from ..modeling_utils import PretrainedConfig, QuantConfig
 
 
@@ -28,12 +25,15 @@ class FalconConfig(PretrainedConfig):
                  *,
                  bias: bool = False,
                  parallel_attention: bool = False,
+                 num_ln_in_parallel_attn: int | None = None,
                  new_decoder_architecture: bool = False,
+                 rotary_base: float = 10000.0,
                  **kwargs):
         self.bias = bias
         self.parallel_attention = parallel_attention
+        self.num_ln_in_parallel_attn = num_ln_in_parallel_attn
         self.new_decoder_architecture = new_decoder_architecture
-
+        self.rotary_base = rotary_base
         super().__init__(**kwargs)
 
     def to_dict(self):
@@ -87,19 +87,7 @@ class FalconConfig(PretrainedConfig):
             raise ValueError("Shouldn't reach here.")
         hf_config.model_type = 'falcon'
 
-        if dtype == 'auto':
-            dtype = getattr(hf_config, 'torch_dtype', None)
-            if dtype is None:
-                dtype = 'float16'
-            if isinstance(dtype, torch.dtype):
-                dtype = torch_dtype_to_str(dtype)
-            if dtype == 'float32':
-                dtype = 'float16'
-        if dtype == 'bfloat16' and torch.cuda.get_device_properties(
-                0).major < 8:
-            logger.warning(
-                "Pre SM 80 GPUs do not support bfloat16, fallback to float16")
-            dtype = 'float16'
+        dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
 
         return cls(architecture='FalconForCausalLM',
                    dtype=dtype,
@@ -114,10 +102,14 @@ class FalconConfig(PretrainedConfig):
                    hidden_act='gelu',
                    bias=hf_config.bias,
                    parallel_attention=hf_config.parallel_attn,
+                   num_ln_in_parallel_attn=getattr(hf_config,
+                                                   'num_ln_in_parallel_attn',
+                                                   None),
                    new_decoder_architecture=hf_config.new_decoder_architecture,
                    max_position_embeddings=getattr(hf_config,
                                                    'max_position_embeddings',
                                                    2048),
+                   rotary_base=getattr(hf_config, 'rope_theta', 10000.0),
                    intermediate_size=getattr(hf_config, 'ffn_hidden_size',
                                              None),
                    mapping=mapping,

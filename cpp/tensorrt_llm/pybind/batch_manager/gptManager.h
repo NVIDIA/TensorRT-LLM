@@ -21,7 +21,7 @@
 #include "namedTensor.h"
 #include "tensorrt_llm/batch_manager/GptManager.h"
 #include "tensorrt_llm/batch_manager/callbacks.h"
-#include "tensorrt_llm/pybind/common/opaqueBindings.h"
+#include "tensorrt_llm/pybind/common/customCasters.h"
 
 #include <ATen/ops/tensor.h>
 #include <functional>
@@ -51,8 +51,6 @@ public:
     pybind11::object enter();
     void exit(pybind11::handle type, pybind11::handle value, pybind11::handle traceback);
     void shutdown();
-
-    static void initBindings(pybind11::module_& m);
 
 private:
     std::unique_ptr<tensorrt_llm::batch_manager::GptManager> mManager;

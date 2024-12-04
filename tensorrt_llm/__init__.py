@@ -45,13 +45,14 @@ from ._utils import (mpi_rank, mpi_world_size, str_dtype_to_trt,
 from .auto_parallel import AutoParallelConfig, auto_parallel
 from .builder import BuildConfig, Builder, BuilderConfig, build
 from .functional import Tensor, constant
-from .hlapi.llm import LLM, LlmArgs, SamplingParams
+from .llmapi.llm import LLM, LlmArgs, SamplingParams
 from .logger import logger
 from .mapping import Mapping
 from .models.automodel import AutoConfig, AutoModelForCausalLM
 from .module import Module
 from .network import Network, net_guard
 from .parameter import Parameter
+from .python_plugin import PluginBase
 from .version import __version__
 
 __all__ = [
@@ -71,6 +72,7 @@ __all__ = [
     'net_guard',
     'Network',
     'Mapping',
+    'PluginBase',
     'Builder',
     'BuilderConfig',
     'build',

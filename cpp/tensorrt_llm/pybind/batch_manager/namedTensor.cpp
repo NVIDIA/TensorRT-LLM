@@ -34,12 +34,4 @@ NamedTensor::NamedTensor(tb::NamedTensor const& cppNamedTensor)
 {
 }
 
-void NamedTensor::initBindings(py::module_& m)
-{
-    py::class_<NamedTensor>(m, "NamedTensor")
-        .def(py::init<NamedTensor::TensorPtr, std::string>(), py::arg("tensor"), py::arg("name"))
-        .def_readwrite("tensor", &NamedTensor::tensor)
-        .def_readonly("name", &NamedTensor::name);
-}
-
 } // namespace tensorrt_llm::pybind::batch_manager

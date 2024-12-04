@@ -33,13 +33,19 @@ Tensor pack_fmha_mask_by_type(Tensor actual_q_seqlens, Tensor actual_kv_seqlens,
     // Create the cu_mask_rows tensor.
     Tensor cu_mask_rows
         = torch::empty({batch_size + 1}, torch::dtype(torch::kInt32).device(torch::kCUDA).requires_grad(false));
-    // Create the packed_mask tensor.
-    int aligned_rows
-        = divUp(int(max_q_seqlen), int(FLASH_ATTEN_PACKED_MASK_M_ALIGNMENT)) * FLASH_ATTEN_PACKED_MASK_M_ALIGNMENT;
-    int aligned_cols
-        = divUp(int(max_kv_seqlen), int(FLASH_ATTEN_PACKED_MASK_N_ALIGNMENT)) * FLASH_ATTEN_PACKED_MASK_N_ALIGNMENT;
-    Tensor packed_mask = torch::empty({batch_size, aligned_rows, aligned_cols / 32},
-        torch::dtype(torch::kInt32).device(torch::kCUDA).requires_grad(false));
+    // Copy actual_q_seqlens from device to host.
+    auto actual_q_seqlens_host = actual_q_seqlens.to(torch::kCPU);
+    // Get the aligned cols.
+    int aligned_cols = roundUp(int(max_kv_seqlen), int(FLASH_ATTEN_PACKED_MASK_N_ALIGNMENT));
+    // Remove paddings in the row dimension.
+    int total_aligned_rows = 0;
+    for (int batch_idx = 0; batch_idx < batch_size; batch_idx++)
+    {
+        total_aligned_rows
+            += roundUp(actual_q_seqlens_host.index({batch_idx}).item<int>(), int(FLASH_ATTEN_PACKED_MASK_M_ALIGNMENT));
+    }
+    Tensor packed_mask = torch::empty(
+        {total_aligned_rows, aligned_cols / 32}, torch::dtype(torch::kInt32).device(torch::kCUDA).requires_grad(false));
 
     // Set the parameters for creating packed mask.
     PackedMaskParams<float> maskParams;
@@ -72,8 +78,9 @@ Tensor pack_fmha_mask_by_input_helper(
     CHECK_CONTIGUOUS(actual_q_seqlens);
     CHECK_TH_CUDA(actual_q_seqlens);
     TORCH_CHECK(mask_input.numel() != 0 && actual_q_seqlens.numel() != 0, "input should not be empty tensor");
-    TORCH_CHECK(mask_input.dim() == 3,
-        "Invalid dim. The dim of mask_input should be 3, [batch_size, max_q_seqlen, max_kv_seqlen]");
+    TORCH_CHECK(mask_input.dim() == 2 || mask_input.dim() == 3,
+        "Invalid dim. The dim of mask_input should either be [num_tokens, max_kv_seqlen] or [batch_size, max_q_seqlen, "
+        "max_kv_seqlen]");
 
     auto maskDataType = mask_input.scalar_type();
     TORCH_CHECK(maskDataType == torch::kFloat32 || maskDataType == torch::kFloat16 || maskDataType == torch::kBFloat16
@@ -81,25 +88,40 @@ Tensor pack_fmha_mask_by_input_helper(
         "Invalid datatype. input must be FP16, BF16, FP32, Bool or INT32");
 
     // Get the shape info.
-    int batch_size = mask_input.size(0);
-    int max_q_seqlen = mask_input.size(1);
-    int max_kv_seqlen = mask_input.size(2);
+    bool packed_mask_input = mask_input.dim() == 2;
+    int batch_size = actual_q_seqlens.size(0);
+    int max_kv_seqlen = packed_mask_input ? mask_input.size(1) : mask_input.size(2);
 
+    // Create the cu_q_seqlens tensor.
+    Tensor cu_q_seqlens
+        = torch::empty({batch_size + 1}, torch::dtype(torch::kInt32).device(torch::kCUDA).requires_grad(false));
     // Create the cu_mask_rows tensor.
     Tensor cu_mask_rows
         = torch::empty({batch_size + 1}, torch::dtype(torch::kInt32).device(torch::kCUDA).requires_grad(false));
+    // Copy actual_q_seqlens from device to host.
+    auto actual_q_seqlens_host = actual_q_seqlens.to(torch::kCPU);
+    // Get the aligned cols.
+    int aligned_cols = roundUp(max_kv_seqlen, int(FLASH_ATTEN_PACKED_MASK_N_ALIGNMENT));
+    // Remove paddings in the row dimension.
+    int total_aligned_rows = 0;
+    int max_q_seqlen = 0;
+    for (int batch_idx = 0; batch_idx < batch_size; batch_idx++)
+    {
+        int actual_q_seqlen = actual_q_seqlens_host.index({batch_idx}).item<int>();
+        total_aligned_rows += roundUp(actual_q_seqlen, int(FLASH_ATTEN_PACKED_MASK_M_ALIGNMENT));
+        max_q_seqlen = std::max(max_q_seqlen, packed_mask_input ? actual_q_seqlen : int(mask_input.size(1)));
+    }
     // Create the packed_mask tensor.
-    int aligned_rows
-        = divUp(max_q_seqlen, int(FLASH_ATTEN_PACKED_MASK_M_ALIGNMENT)) * FLASH_ATTEN_PACKED_MASK_M_ALIGNMENT;
-    int aligned_cols
-        = divUp(max_kv_seqlen, int(FLASH_ATTEN_PACKED_MASK_N_ALIGNMENT)) * FLASH_ATTEN_PACKED_MASK_N_ALIGNMENT;
-    Tensor packed_mask = torch::empty({batch_size, aligned_rows, aligned_cols / 32},
+    Tensor packed_mask = torch::empty({total_aligned_rows, aligned_cols / NUM_POSITIONS_IN_UINT32},
         torch::dtype(torch::kInt32).device(torch::kCUDA).requires_grad(false));
 
     // Set the parameters for creating packed mask.
     PackedMaskParams<T> maskParams;
     memset(&maskParams, 0, sizeof(maskParams));
     maskParams.maskInput = get_ptr<T const>(mask_input);
+    // It assumes the mask input shape is [batchSize, maxQSeqLen, maxKvSeqLen] when nullptr is given, otherwise
+    // [batchSize, maxQSeqLen] is packed.
+    maskParams.cuQSeqLens = packed_mask_input ? get_ptr<int>(cu_q_seqlens) : nullptr;
     maskParams.packedMask = get_ptr<uint32_t>(packed_mask);
     maskParams.cuMaskRows = get_ptr<int>(cu_mask_rows);
     maskParams.actualQSeqLens = get_ptr<int>(actual_q_seqlens);
@@ -113,6 +135,7 @@ Tensor pack_fmha_mask_by_input_helper(
     // Launch the pack mask kernel.
     auto stream = at::cuda::getDefaultCUDAStream();
     invokeBuildPackedMask(maskParams, stream);
+    sync_check_cuda_error();
 
     return packed_mask;
 }

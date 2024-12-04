@@ -48,10 +48,10 @@ protected:
     bool mNormalizeLogProbs{true};
     size_t mWorkspaceSize{0};
     size_t mSetupWorkspaceSize{0};
-    runtime::SizeType32 mRuntimeMaxTopK{0};
     TensorPtr mRuntimeTopKDevice;
     TensorPtr mRuntimeTopPDevice;
     TensorPtr mSkipDecodeDevice;
+    TensorPtr mRuntimeTopKHost;
     TensorPtr mSkipDecodeHost;
 
     using Base::mDecoderDomain;

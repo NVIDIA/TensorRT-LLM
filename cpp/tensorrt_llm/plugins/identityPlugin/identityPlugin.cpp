@@ -16,6 +16,7 @@
  */
 #include "identityPlugin.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
+#include "tensorrt_llm/runtime/iTensor.h"
 
 using namespace nvinfer1;
 using tensorrt_llm::plugins::IdentityPluginCreator;

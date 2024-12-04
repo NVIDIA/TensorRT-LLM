@@ -15,9 +15,7 @@
 
 from typing import Optional
 
-import torch
-
-from ..._utils import pad_vocab_size, torch_dtype_to_str
+from ..._utils import pad_vocab_size
 from ...functional import Tensor, non_gated_version, recv, send
 from ...layers import (Attention, AttentionMaskType, ColumnLinear, Embedding,
                        GatedMLP, MoeConfig, PositionEmbeddingType, RmsNorm,
@@ -60,18 +58,14 @@ class DeepseekDecoderLayer(Module):
             rotary_embedding_scaling=config.rotary_scaling,
             tp_group=config.mapping.tp_group,
             tp_size=config.mapping.tp_size,
-            tp_rank=config.mapping.tp_rank)
+            tp_rank=config.mapping.tp_rank,
+            quant_mode=config.quant_mode)
 
         ClsMLP = GatedMLP
-
-        moe_config = MoeConfig(num_experts=config.moe_num_experts,
-                               moe_intermediate_size=config.moe_inter_size,
-                               num_shared_experts=config.moe_num_shared_experts,
-                               top_k=config.moe_top_k,
-                               normalization_mode=config.moe_renorm_mode)
+        moe_config = MoeConfig.from_dict(config.moe)
 
         mlp_kwargs = {}
-        if config.moe_num_experts > 0 and layer_idx > 0:
+        if moe_config.num_experts > 0 and layer_idx > 0:
             mlp_hidden_size = moe_config.num_shared_experts * moe_config.moe_intermediate_size
             hidden_act = config.hidden_act
             ClsMLP = SharedMoE
@@ -89,6 +83,7 @@ class DeepseekDecoderLayer(Module):
                           bias=False,
                           tp_group=config.mapping.tp_group,
                           tp_size=config.mapping.tp_size,
+                          quant_mode=config.quant_mode,
                           **mlp_kwargs)
 
         ### Pose layernorm in Deepseek v1 is same as Llama             )
@@ -228,26 +223,12 @@ class DeepseekForCausalLM(DecoderModelForCausalLM):
         pretrained_config = PretrainedConfig.from_dict(config)
         pretrained_config.set_rank(mapping.rank)  # TODO:remove this hack
 
-        if dtype == 'auto':
-            dtype = getattr(config, 'torch_dtype', None)
-        if dtype is None:
-            dtype = 'float16'
-        if isinstance(dtype, torch.dtype):
-            dtype = torch_dtype_to_str(dtype)
-        if dtype == 'float32':  # should remove "float32"
-            dtype = 'float16'
-        if dtype == 'bfloat16' and torch.cuda.get_device_properties(
-                0).major < 8:
-            logger.warning(
-                "Pre SM 80 GPUs do not support bfloat16, fallback to float16")
-            dtype = 'float16'
-
         deepseek = cls.from_config(pretrained_config)
         weights = convert_deepseek(
             hf_model,
             config,
-            mapping,
-            dtype=dtype,
+            mapping=pretrained_config.mapping,
+            dtype=pretrained_config.dtype,
             use_parallel_embedding=config.get('use_parallel_embedding', False),
             sharding_dim=config.get('embedding_sharding_dim', 0),
             share_embedding_table=config.get('share_embedding_table', False))

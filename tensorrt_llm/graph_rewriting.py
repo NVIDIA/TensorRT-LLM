@@ -123,6 +123,7 @@ class Layer:
         trt.LayerType.CONSTANT: trt.IConstantLayer,
         trt.LayerType.IDENTITY: trt.IIdentityLayer,
         trt.LayerType.PLUGIN_V2: trt.IPluginV2Layer,
+        trt.LayerType.PLUGIN_V3: trt.IPluginV3Layer,
         trt.LayerType.SLICE: trt.ISliceLayer,
         trt.LayerType.SHAPE: trt.IShapeLayer,
         trt.LayerType.PARAMETRIC_RELU: trt.IParametricReLULayer,

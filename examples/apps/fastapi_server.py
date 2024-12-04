@@ -1,3 +1,9 @@
+"""
+NOTE: This FastAPI-based server is only an example for demonstrating the usage
+of TensorRT-LLM LLM API. It is not intended for production use.
+For production, use the `trtllm-serve` command. The server exposes OpenAI compatible API endpoints.
+"""
+
 #!/usr/bin/env python
 import asyncio
 import json
@@ -13,7 +19,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from tensorrt_llm.executor import CppExecutorError, RequestError
-from tensorrt_llm.hlapi import LLM, BuildConfig, KvCacheConfig, SamplingParams
+from tensorrt_llm.llmapi import LLM, BuildConfig, KvCacheConfig, SamplingParams
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
 

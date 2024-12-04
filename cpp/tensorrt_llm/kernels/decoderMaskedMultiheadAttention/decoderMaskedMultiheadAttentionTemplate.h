@@ -1360,7 +1360,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
 #ifndef MMHA_USE_FP32_ACCUM_FOR_LOGITS
     if (sizeof(Tk) != 4)
     {
-        auto const max_timesteps = DO_CROSS_ATTENTION ? cyclic_kv_cache_len : min(timestep, cyclic_kv_cache_len);
+        auto const max_timesteps = min(timestep, cyclic_kv_cache_len);
         logits_smem_ += divUp(max_timesteps + 1, 4u) * 16;
     }
     Tk* logits_smem = reinterpret_cast<Tk*>(logits_smem_);
@@ -1565,10 +1565,17 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         if constexpr (DO_CROSS_ATTENTION)
         {
             auto const k_idx = QK_VEC_SIZE * tidx;
-            int const inBlockIdx = kvCacheBuffer.getKVLocalIdx(cyclic_tlength, hi, Dh, k_idx);
-            Tcache* k_cache = reinterpret_cast<Tcache*>(kvCacheBuffer.getKBlockPtr(batch_beam_idx, cyclic_tlength));
+            int const inBlockIdx = pastKCache.getKVLocalIdx(cyclic_tlength, hi_kv, Dh, k_idx);
+            Tcache* k_cache = reinterpret_cast<Tcache*>(pastKCache.getKBlockPtr(batch_beam_idx, cyclic_tlength));
 
-            k = vec_conversion<Qk_vec_k, Qk_vec_m>(*reinterpret_cast<Qk_vec_m const*>(&k_cache[inBlockIdx]));
+            if constexpr (ENABLE_8BITS_K_CACHE)
+            {
+                load_8bits_kv_cache_vec(&k, k_cache, inBlockIdx, k_scale_quant_orig_f);
+            }
+            else
+            {
+                k = vec_conversion<Qk_vec_k, Qk_vec_m>(*reinterpret_cast<Qk_vec_m const*>(&k_cache[inBlockIdx]));
+            }
         }
         else
         {
@@ -1799,12 +1806,26 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         relative_attention_bias_ptr_fixed = &params.relative_attention_bias[offset];
     }
 
+    // Pre-compute the pointer for the attention mask.
+    bool const* attention_mask_ptr = nullptr;
+    // Do we have attention mask ?
+    bool has_attention_mask = params.attention_mask != nullptr;
+    if (has_attention_mask)
+    {
+        attention_mask_ptr = params.attention_mask + batch_idx * params.attention_mask_stride;
+    }
+
     // Load the value.
     float relative_attention_bias = 0.f;
     if (has_relative_attention_bias && tidx == 0)
     {
-        // TODO: Use a better way to convert from T to float.
-        relative_attention_bias = add(relative_attention_bias, relative_attention_bias_ptr[tlength]);
+        relative_attention_bias = convert_to_float(relative_attention_bias_ptr[tlength]);
+    }
+    if (has_attention_mask && tidx == 0)
+    {
+        // Note: reuse the relative_attention_bias variable.
+        // attention_mask = 1.0 means that the position is not masked.
+        relative_attention_bias += (FLT_MAX * (float(attention_mask_ptr[tlength]) - 1.0f));
     }
 
     // Store that value in shared memory. Keep the Q*K^T value in register for softmax.
@@ -1994,8 +2015,13 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
             float relative_attention_bias = 0.f;
             if (is_active && has_relative_attention_bias)
             {
-                // TODO: Use a better way to convert from T to float.
-                relative_attention_bias = add(relative_attention_bias, relative_attention_bias_ptr[local_time_now]);
+                relative_attention_bias = convert_to_float(relative_attention_bias_ptr[local_time_now]);
+            }
+            if (is_active && has_attention_mask)
+            {
+                // Note: reuse the relative_attention_bias variable.
+                // attention_mask = 1.0 means that the position is not masked.
+                relative_attention_bias += (FLT_MAX * (float(attention_mask_ptr[tlength]) - 1.0f));
             }
 
             // Compute the dot product between Q and K.
@@ -2340,7 +2366,14 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         V_vec_k v;
         if (DO_CROSS_ATTENTION)
         {
-            v = vec_conversion<V_vec_k, V_vec_k>(*reinterpret_cast<V_vec_k const*>(&v_cache_base[inBlockIdx]));
+            if constexpr (ENABLE_8BITS_KV_CACHE)
+            {
+                load_8bits_kv_cache_vec(&v, v_cache_base, inBlockIdx, kv_scale_quant_orig_f);
+            }
+            else
+            {
+                v = vec_conversion<V_vec_k, V_vec_k>(*reinterpret_cast<V_vec_k const*>(&v_cache_base[inBlockIdx]));
+            }
         }
         else
         {
@@ -2382,7 +2415,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         // Store the values with bias back to global memory in the cache for V.
         //*reinterpret_cast<V_vec_k*>(&v_cache[params.timestep*Dh]) = v;
         // For MQA/GQA mode, write only with the first Q head of each group per KV head.
-        if (hi == (hi_kv * qhead_per_kv))
+        if (hi == (hi_kv * qhead_per_kv) && !DO_CROSS_ATTENTION)
         {
             if (ENABLE_8BITS_KV_CACHE)
             {

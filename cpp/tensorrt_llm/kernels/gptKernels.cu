@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/mathUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
+#include "tensorrt_llm/kernels/attentionMask.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttentionUtils.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include <cub/cub.cuh>
@@ -253,95 +254,6 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
     }
 }
 
-// This kernel computes the attention mask. We must compute this on-the-fly in the future.
-
-template <typename AttentionMaskDataType>
-__global__ void computeAttentionMask(AttentionMaskDataType* attentionMask, int const* seqLengths, int maxQSeqLength,
-    int attentionWindowSize, AttentionMaskType attentionMaskType, BlockSparseParams blockSparseParams)
-{
-    // The index of the sequence in the batch.
-    int batchIdx = blockIdx.y;
-
-    // The number of items in the mask for each sequence.
-    int maskSize = maxQSeqLength * maxQSeqLength;
-    // The offset to the 1st element of the mask for that particular sequence.
-    int batchOffset = batchIdx * maskSize;
-
-    // The length of the sequence.
-    int seqLength = seqLengths[batchIdx];
-
-    // Iterate over the tokens to update the number of padded elements.
-    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < maskSize; idx += gridDim.x * blockDim.x)
-    {
-        // The position in the matrix.
-        int rowIdx = idx / maxQSeqLength;
-        int colIdx = idx % maxQSeqLength;
-
-        // Is it a valid token?
-        bool isValid = true;
-        switch (attentionMaskType)
-        {
-        case AttentionMaskType::PADDING:
-            isValid = rowIdx < seqLength && colIdx < seqLength;
-            // seq_length==4, max_seq_len==5
-            // 1 1 1 1 0
-            // 1 1 1 1 0
-            // 1 1 1 1 0
-            // 1 1 1 1 0
-            // 0 0 0 0 0
-            break;
-        case AttentionMaskType::CAUSAL:
-            isValid = rowIdx < seqLength && colIdx < seqLength && colIdx <= rowIdx;
-            // Sliding_window_causal when there are not enough kv cache.
-            isValid = isValid && colIdx >= max(0, rowIdx - attentionWindowSize);
-            // seq_length==4, max_seq_len==5
-            // 1 0 0 0 0
-            // 1 1 0 0 0
-            // 1 1 1 0 0
-            // 1 1 1 1 0
-            // 0 0 0 0 0
-
-            // seq_length==6, max_seq_len==6, max_attention_window_size = 2
-            // 1 0 0 0 0 0
-            // 1 1 0 0 0 0
-            // 1 1 1 0 0 0
-            // 0 1 1 1 0 0
-            // 0 0 1 1 1 0
-            // 0 0 0 1 1 1
-            break;
-        case AttentionMaskType::BIDIRECTIONAL:
-            // clang-format off
-              isValid = (rowIdx <  seqLength - 1 && colIdx < seqLength - 1) ||
-                        (rowIdx == seqLength - 1 && colIdx < seqLength);
-            // clang-format on
-            // seq_length==4, max_seq_len==5
-            // 1 1 1 0 0
-            // 1 1 1 0 0
-            // 1 1 1 0 0
-            // 1 1 1 1 0
-            // 0 0 0 0 0
-        case AttentionMaskType::BIDIRECTIONALGLM:
-            // clang-format off
-              isValid = (colIdx < seqLength - 1) ||
-                        (rowIdx == seqLength - 1 && colIdx == seqLength - 1);
-            // clang-format on
-            // seq_length==4, max_seq_len==5
-            // 1 1 1 1 0
-            // 1 1 1 1 0
-            // 1 1 1 1 0
-            // 1 1 1 1 0
-            // 1 1 1 1 1
-            break;
-        case AttentionMaskType::BLOCKSPARSE:
-            isValid = blockSparseParams.computeMask(rowIdx, colIdx, seqLength, 1 /*num_heads*/, 0 /*head_id*/);
-            break;
-        }
-
-        // Store the mask.
-        attentionMask[batchOffset + idx] = isValid ? AttentionMaskDataType(1.f) : AttentionMaskDataType(0.f);
-    }
-}
-
 template <typename T>
 void invokeBuildDecoderInfo(BuildDecoderInfoParams<T> const& params, cudaStream_t stream)
 {
@@ -362,15 +274,22 @@ void invokeBuildDecoderInfo(BuildDecoderInfoParams<T> const& params, cudaStream_
     if (params.attentionMask != nullptr)
     {
         TLLM_CHECK_WITH_INFO(params.seqQLengths != nullptr, "Q sequence lengths buffer is invalid.");
-        int const MIN_BLOCKS = 512;
-        int blocksPerSeq = 16;
-        while (blocksPerSeq * params.batchSize < MIN_BLOCKS)
-        {
-            blocksPerSeq *= 2;
-        }
-        dim3 grid(blocksPerSeq, params.batchSize);
-        computeAttentionMask<<<grid, THREADS_PER_BLOCK, 0, stream>>>(params.attentionMask, params.seqQLengths,
-            params.maxQSeqLength, params.attentionWindowSize, params.attentionMaskType, params.blockSparseParams);
+        AttentionMaskParams<T> attentionMaskParams;
+        memset((void*) &attentionMaskParams, 0, sizeof(attentionMaskParams));
+        // Set parameters.
+        attentionMaskParams.mask = params.attentionMask;
+        // Nullptr indicates that the row dimension are not packed (i.e. paddings are not removed).
+        attentionMaskParams.cuQSeqLens = nullptr;
+        attentionMaskParams.actualQSeqLens = params.seqQLengths;
+        attentionMaskParams.actualKvSeqLens = params.seqQLengths;
+        attentionMaskParams.attentionMaskType = params.attentionMaskType;
+        attentionMaskParams.blockSparseParams = params.blockSparseParams;
+        attentionMaskParams.batchSize = params.batchSize;
+        attentionMaskParams.maxQSeqLen = params.maxQSeqLength;
+        attentionMaskParams.maxKvSeqLen = params.maxQSeqLength;
+        attentionMaskParams.slidingWindowSize = params.attentionWindowSize;
+        // Launch the kernel.
+        invokeBuildAttentionMask(attentionMaskParams, stream);
     }
 }
 

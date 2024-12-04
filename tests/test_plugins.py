@@ -9,10 +9,13 @@ import tensorrt_llm.plugin as _tlp
 def test_load_library():
     """Test loading the TensorRT-LLM plugin library."""
     runtime = _trt.Runtime(_trt.Logger(_trt.Logger.WARNING))
+    _trt.init_libnvinfer_plugins(runtime.logger,
+                                 namespace=_tlp.TRT_LLM_PLUGIN_NAMESPACE)
     registry = runtime.get_plugin_registry()
     handle = registry.load_library(_tlp.plugin_lib_path())
-    creators = registry.plugin_creator_list
-    assert len(creators) >= 10
+    creators = registry.all_creators
+    # This will give all plugins statically registered in getCreators (only V3 plugins for now)
+    assert len(creators) > 0
     for creator in creators:
         assert creator.plugin_namespace == _tlp.TRT_LLM_PLUGIN_NAMESPACE
 

@@ -40,8 +40,8 @@ public:
         SizeType32 maxTokensPerStep, nvinfer1::DataType dtype, ModelConfig const& modelConfig) override;
 
     //! @brief Initialize the decoder with new batch of inputs.
-    void newBatch(
-        GenerationInput const& input, GenerationOutput const& output, SamplingConfig const& samplingConfig) override;
+    void newBatch(GenerationInput const& input, GenerationOutput const& output, SamplingConfig const& samplingConfig,
+        ModelConfig const& modelConfig) override;
 
     void forwardAsync(decoder::Output& output, decoder::Input const& input) override;
 

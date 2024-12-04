@@ -31,6 +31,9 @@ python quantize.py --model_dir $MODEL_PATH --qformat int4_awq --awq_block_size 6
 # INT8 SQ with INT8 kv cache.
 python quantize.py --model_dir $MODEL_PATH --qformat int8_sq --kv_cache_dtype int8 --output_dir $OUTPUT_PATH
 
+# Auto quantization(e.g. fp8 + int4_awq + w4a8_awq) using average weights bits 5
+python quantize.py --model_dir $MODEL_PATH  --autoq_format fp8,int4_awq,w4a8_awq  --output_dir $OUTPUT_PATH --auto_quantize_bits 5 --tp_size 2
+
 # FP8 quantization for NeMo model.
 python quantize.py --nemo_ckpt_path nemotron-3-8b-base-4k/Nemotron-3-8B-Base-4k.nemo \
                    --dtype bfloat16 \
@@ -62,7 +65,9 @@ Checkpoint saved in `output_dir` can be directly passed to `trtllm-build`.
     - int8_wo: Actually nothing is applied to weights. Weights are quantized to INT8 channel wise when TRTLLM building the engine.
     - int4_wo: Same as int8_wo but in INT4.
     - full_prec: No quantization.
-- output_dir Path to save the quantized checkpoint.
+- autoq_format: Specific quantization algorithms are searched in auto quantization. The algorithm must in ['fp8', 'int4_awq', 'w4a8_awq', 'int8_sq'] and you can use ',' to separate more than one quantization algorithms, such as `--autoq_format fp8,int4_awq,w4a8_awq`. Please attention that using int8_sq and fp8 together is not supported.
+- auto_quantize_bits: Effective bits constraint for auto quantization. If not set, regular quantization without auto quantization search is applied. Note: it must be set within correct range otherwise it will be set by lowest value if possible. For example, the weights of LLMs have 16 bits defaultly and it results in a weight compression rate of 40% if we set `auto_quantize_bits` to 9.6 (9.6 / 16 = 0.6), which means the average bits of the weights are 9.6 but not 16. However, which format to choose is determined by solving an optimization problem, so you need to generate the according checkpoint manually if you want to customize your checkpoint formats. The format of mixed precision checkpoint is described in detail below.
+- output_dir: Path to save the quantized checkpoint.
 - dtype: Specify data type of model when loading from Hugging Face.
 - kv_cache_dtype: Specify kv cache data type.
     - int8: Use int8 kv cache.
@@ -119,9 +124,55 @@ FP_O * output_scale = FP8_O
     - int8_kv_cache: By default, we use dtype for KV cache. int8_kv_cache chooses int8 quantization for KV cache.
     - fp8_kv_cache: By default, we use dtype for KV cache. fp8_kv_cache chooses fp8 quantization for KV cache.
 
+### Format of Mixed Precision Checkpoints
+
+ModelOpt can produce a mixed precision TensorRT-LLM checkpoint. After producing the quantized checkpoint, you can build engine directly by `trtllm-build` command:
+```bash
+trtllm-build --checkpoint_dir <mixed-precision-checkpoint> --output_dir $OUTPUT_PATH
+```
+If you have some special needs about the model weights, such as int4 for MLP and int8 for the rest, you need to generate the checkpoint and config files by yourself.
+
+The `trtllm-build` command consumes the same format of weights, which is presented in [TensorRT-LLM checkpoint formats](https://nvidia.github.io/TensorRT-LLM/architecture/checkpoint.html), but has different quantization method for every linear. Therefore, each layer, such as layer30.mlp.fc, layer30.attention.dense, and so on, keeps the same model weights according to the quantization formats in TensorRT-LLM checkpoint. What's more, the `quantization` field in `config.json` will be like this:
+```
+    "quantization": {
+        "quant_algo": "MIXED_PRECISION",
+        "kv_cache_quant_algo": "FP8" // The quant_algo of KV cache may change
+    },
+```
+There will be another file about per-layer quantization information named `quant_cfg.json` in the same directory, the format of it is like:
+```
+{
+    "quant_algo": "MIXED_PRECISION",
+    "kv_cache_quant_algo": "FP8",
+    "quantized_layers": { // one more filed presents per-layer's information
+        "transformer.layers.0.attention.qkv": {
+            "quant_algo": "FP8" // specific algorithm for each linear
+        },
+        "transformer.layers.0.attention.dense": {
+            "quant_algo": "FP8"
+        },
+        "transformer.layers.0.mlp.fc": {
+            "quant_algo": "W4A16_AWQ",
+            "group_size": 128,
+            "has_zero_point": false,
+            "pre_quant_scale": true
+        },
+        "transformer.layers.0.mlp.proj": {
+            "quant_algo": "W8A8_SQ_PER_CHANNEL"
+        },
+        ...
+        "transformer.layers.31.mlp.proj": {
+            "quant_algo": "FP8"
+        }
+    }
+}
+```
+
+TensorRT-LLM will automatically read `quant_cfg.json` after recogniziong the `MIXED_PRECISION` quantization method in `config.json`. All the specific algorithm keeps the same as what in `quantization` filed before. If some layers are not listed, they'll be treated as no quantization.
+
 ## APIs
 
-[`quantize.py`](./quantize.py) uses the quantization toolkit to calibrate the PyTorch models and export TensorRT-LLM checkpoints. Each TensorRT-LLM checkpoint contains a config file (in .json format) and one or several rank weight files (in .safetensors format). The checkpoints can be directly used by `trtllm-build` command to build TensorRT-LLM engines. See this [`doc`](../../docs/source/architecture/checkpoint.md) for more details on the TensorRT-LLM checkpoint format.
+[`quantize.py`](./quantize.py) uses the quantization toolkit to calibrate the PyTorch models and export TensorRT-LLM checkpoints. Each TensorRT-LLM checkpoint contains a config file (in .json format) and one or several rank weight files (in .safetensors format). It will produce one another quantization config for per-layer's information when setting auto quantization. The checkpoints can be directly used by `trtllm-build` command to build TensorRT-LLM engines. See this [`doc`](../../docs/source/architecture/checkpoint.md) for more details on the TensorRT-LLM checkpoint format.
 
 > *This quantization step may take a long time to finish and requires large GPU memory. Please use a server grade GPU if a GPU out-of-memory error occurs*
 
@@ -136,24 +187,39 @@ PTQ can be achieved with simple calibration on a small set of training or evalua
 import torch
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM
-import modelopt.torch.quantization as atq
+import modelopt.torch.quantization as mtq
+import modelopt.torch.utils.dataset_utils as dataset_utils
 
 model = AutoModelForCausalLM.from_pretrained(...)
 
 # Select the quantization config, for example, FP8
-config = atq.FP8_DEFAULT_CFG
-
+config = mtq.FP8_DEFAULT_CFG
 
 # Prepare the calibration set and define a forward loop
 calib_dataloader = DataLoader(...)
-def calibrate_loop():
-    for data in calib_dataloader:
-        model(data)
-
+calibrate_loop = dataset_utils.create_forward_loop(
+    calib_dataloader, dataloader=calib_dataloader
+)
 
 # PTQ with in-place replacement to quantized modules
 with torch.no_grad():
-    atq.quantize(model, config, forward_loop=calibrate_loop)
+    mtq.quantize(model, config, forward_loop=calibrate_loop)
+
+# or PTQ with auto quantization
+with torch.no_grad():
+    model, search_history = mtq.auto_quantize(
+        model,
+        data_loader=calib_dataloader,
+        loss_func=lambda output, batch: output.loss,
+        constraints={"effective_bits": auto_quantize_bits}, # The average bits of quantized weights
+        forward_step=lambda model, batch: model(**batch),
+        quantization_formats=[quant_algo1, quant_algo2,...] + [None],
+        num_score_steps=min(
+        num_calib_steps=len(calib_dataloader),
+            len(calib_dataloader), 128 // batch_size
+        ),  # Limit the number of score steps to avoid long calibration time
+        verbose=True,
+    )
 ```
 
 ### Export Quantized Model

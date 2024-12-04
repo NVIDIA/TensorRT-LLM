@@ -7,7 +7,7 @@ from transformers import AutoTokenizer
 import tensorrt_llm
 from tensorrt_llm import BuildConfig, build
 from tensorrt_llm.executor import GenerationExecutor
-from tensorrt_llm.hlapi import SamplingParams
+from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.models import LLaMAForCausalLM
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo

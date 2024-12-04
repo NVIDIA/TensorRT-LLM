@@ -18,6 +18,7 @@
 #include "decodingLayer.h"
 #include "tensorrt_llm/layers/beamSearchLayer.h"
 #include "tensorrt_llm/layers/decodingParams.h"
+#include "tensorrt_llm/layers/eagleDecodingLayer.h"
 #include "tensorrt_llm/layers/explicitDraftTokensLayer.h"
 #include "tensorrt_llm/layers/externalDraftTokensLayer.h"
 #include "tensorrt_llm/layers/layerUtils.h"
@@ -28,43 +29,6 @@
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::runtime;
-
-namespace
-{
-
-template <typename T>
-bool allSame(std::optional<std::vector<T>> const& vOpt)
-{
-    if (!vOpt)
-    {
-        return true;
-    }
-
-    auto const& v = *vOpt;
-
-    if (v.size() <= 1)
-    {
-        return true;
-    }
-    auto first = v[0];
-    for (std::size_t i = 1; i < v.size(); ++i)
-    {
-        if (v[i] != first)
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
-bool hasDiffRuntimeArgs(std::shared_ptr<tensorrt_llm::layers::DynamicDecodeSetupParams> const& params)
-{
-    // return !allSame(params->penaltyParams.frequencyPenalty) || !allSame(params->penaltyParams.presencePenalty)
-    //     || !allSame(params->penaltyParams.repetitionPenalty) || !allSame(params->penaltyParams.temperature)
-    //     || !allSame(params->penaltyParams.minLength) || !allSame(params->banWordsInputs.noRepeatNgramSize);
-    return false;
-}
-} // namespace
 
 namespace tensorrt_llm::layers
 {
@@ -101,11 +65,15 @@ DecodingLayer<T>::DecodingLayer(executor::DecodingMode const& mode, DecoderDomai
     {
         mDecodingLayer = std::make_unique<ExternalDraftTokensLayer<T>>(mDecodingMode, decoderDomain, mBufferManager);
     }
+    else if (mDecodingMode.isEagle())
+    {
+        mDecodingLayer = std::make_unique<EagleDecodingLayer<T>>(decoderDomain, mBufferManager);
+    }
     else
     {
         TLLM_CHECK_WITH_INFO(false,
             "Decoding mode is none of the supported {TopK, TopP, TopKTopP, BeamSearch, Medusa, Lookahead, "
-            "ExplicitDraftTokens}");
+            "ExplicitDraftTokens, ExternalDraftTokens, Eagle}");
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -155,11 +123,16 @@ void DecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, TensorC
             beamWidth == 1, "Decoding mode is external draft tokens, but beamWidth != 1 (%d != 1)", beamWidth);
         mDecodingLayer->setup(batchSize, beamWidth, batchSlots, setupParams->decodingParams, workspace);
     }
+    else if (mDecodingMode.isEagle())
+    {
+        TLLM_CHECK_WITH_INFO(beamWidth == 1, "Decoding mode is Eagle, but beamWidth != 1 (%d != 1)", beamWidth);
+        mDecodingLayer->setup(batchSize, beamWidth, batchSlots, setupParams->decodingParams, workspace);
+    }
     else
     {
         TLLM_CHECK_WITH_INFO(false,
             "Decoding mode is none of the supported {TopK, TopP, TopKTopP, BeamSearch, Medusa, Lookahead, "
-            "ExplicitDraftTokens}");
+            "ExplicitDraftTokens, ExternalDraftTokens, Eagle}");
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -255,8 +228,6 @@ std::tuple<std::shared_ptr<BaseDecodingOutputs>, std::shared_ptr<BaseDecodingInp
     }
     else if (mDecodingMode.isExplicitDraftTokens())
     {
-        // TODO(nkorobov) add explicit draft tokens layer param prep
-        // Simply forward params for now
         preparedInputs = baseInputs;
         preparedOutputs = baseOutputs;
     }
@@ -299,11 +270,16 @@ std::tuple<std::shared_ptr<BaseDecodingOutputs>, std::shared_ptr<BaseDecodingInp
         preparedInputs = decodeInputs;
         preparedOutputs = baseOutputs;
     }
+    else if (mDecodingMode.isEagle())
+    {
+        preparedInputs = baseInputs;
+        preparedOutputs = baseOutputs;
+    }
     else
     {
         TLLM_CHECK_WITH_INFO(false,
             "Decoding mode is none of the supported {TopK, TopP, TopKTopP, BeamSearch, Medusa, Lookahead, "
-            "ExplicitDraftTokens}");
+            "ExplicitDraftTokens, ExternalDraftTokens, Eagle}");
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return {preparedOutputs, preparedInputs};

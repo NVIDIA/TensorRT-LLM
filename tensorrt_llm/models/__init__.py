@@ -20,10 +20,13 @@ from .chatglm.config import ChatGLMConfig
 from .chatglm.model import ChatGLMForCausalLM, ChatGLMModel
 from .cogvlm.config import CogVLMConfig
 from .cogvlm.model import CogVLMForCausalLM
+from .commandr.model import CohereForCausalLM
 from .dbrx.config import DbrxConfig
 from .dbrx.model import DbrxForCausalLM
 from .deepseek_v1.model import DeepseekForCausalLM
+from .deepseek_v2.model import DeepseekV2ForCausalLM
 from .dit.model import DiT
+from .eagle.model import EagleForCausalLM
 from .enc_dec.model import DecoderModel, EncoderModel, WhisperEncoder
 from .falcon.config import FalconConfig
 from .falcon.model import FalconForCausalLM, FalconModel
@@ -40,6 +43,7 @@ from .llama.model import LLaMAForCausalLM, LLaMAModel
 from .mamba.model import MambaForCausalLM
 from .medusa.config import MedusaConfig
 from .medusa.model import MedusaForCausalLm
+from .mllama.model import MLLaMAModel
 from .modeling_utils import (PretrainedConfig, PretrainedModel,
                              SpeculativeDecodingMode)
 from .mpt.model import MPTForCausalLM, MPTModel
@@ -60,6 +64,7 @@ __all__ = [
     'DiT',
     'DeepseekForCausalLM',
     'FalconConfig',
+    'DeepseekV2ForCausalLM',
     'FalconForCausalLM',
     'FalconModel',
     'GPTConfig',
@@ -108,7 +113,10 @@ __all__ = [
     'RecurrentGemmaForCausalLM',
     'CogVLMConfig',
     'CogVLMForCausalLM',
+    'EagleForCausalLM',
     'SpeculativeDecodingMode',
+    'CohereForCausalLM',
+    'MLLaMAModel',
 ]
 
 MODEL_MAP = {
@@ -120,6 +128,7 @@ MODEL_MAP = {
     'Kosmos2ForConditionalGeneration': GPTForCausalLM,
     'JAISLMHeadModel': GPTForCausalLM,
     'GPTForCausalLM': GPTForCausalLM,
+    'NemotronForCausalLM': GPTForCausalLM,
     'OPTForCausalLM': OPTForCausalLM,
     'BloomForCausalLM': BloomForCausalLM,
     'RWForCausalLM': FalconForCausalLM,
@@ -155,6 +164,7 @@ MODEL_MAP = {
     'QWenForCausalLM': QWenForCausalLM,
     'Qwen2ForCausalLM': QWenForCausalLM,
     'Qwen2MoeForCausalLM': QWenForCausalLM,
+    'Qwen2ForSequenceClassification': QWenForCausalLM,
     'WhisperEncoder': WhisperEncoder,
     'EncoderModel': EncoderModel,
     'DecoderModel': DecoderModel,
@@ -164,4 +174,8 @@ MODEL_MAP = {
     'DiT': DiT,
     'DeepseekForCausalLM': DeepseekForCausalLM,
     'DeciLMForCausalLM': DeciLMForCausalLM,
+    'DeepseekV2ForCausalLM': DeepseekV2ForCausalLM,
+    'EagleForCausalLM': EagleForCausalLM,
+    'CohereForCausalLM': CohereForCausalLM,
+    'MllamaForConditionalGeneration': MLLaMAModel,
 }

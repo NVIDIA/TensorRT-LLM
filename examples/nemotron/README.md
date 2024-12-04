@@ -30,8 +30,9 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
   * Inflight Batching
   * PAGED_KV_CACHE
   * STRONGLY TYPED
+  * checkpoint type: Nemo, Huggingface (HF)
 
-## Usage
+## Nemo checkpoint - Usage
 
 ### Download weights from HuggingFace Transformers
 
@@ -184,4 +185,30 @@ If the engines are run successfully, you will see output like:
 [04/23/2024-09:55:54] [TRT-LLM] [I]   rouge2 : 6.272381295466071
 [04/23/2024-09:55:54] [TRT-LLM] [I]   rougeL : 15.011005943152721
 [04/23/2024-09:55:54] [TRT-LLM] [I]   rougeLsum : 17.76145734406502
+```
+
+## HF checkpoint - Usage
+Support for Nemotron models was added with transformers 4.44.0 release.
+
+```bash
+# install transformers library
+pip install transformers>=4.44.0
+# Download hf minitron model
+git clone https://huggingface.co/nvidia/Minitron-4B-Base
+
+# Convert to TensorRT-LLM checkpoint
+python3 ../gpt/convert_checkpoint.py --model_dir Minitron-4B-Base \
+        --dtype bfloat16 \
+        --output_dir minitron/trt_ckpt/bf16/1-gpu
+
+# Build TensorRT-LLM engines
+trtllm-build --checkpoint_dir minitron/trt_ckpt/bf16/1-gpu \
+        --gemm_plugin auto \
+        --output_dir minitron/trt_engines/bf16/1-gpu
+
+# Run inference
+python3 ../run.py --engine_dir minitron/trt_engines/bf16/1-gpu \
+        --tokenizer_dir Minitron-4B-Base \
+        --input_text "def print_hello_world():" \
+        --max_output_len 20
 ```

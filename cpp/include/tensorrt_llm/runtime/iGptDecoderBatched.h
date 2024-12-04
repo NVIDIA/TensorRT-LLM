@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
+#include "tensorrt_llm/runtime/eagleBuffers.h"
 #include "tensorrt_llm/runtime/explicitDraftTokensBuffers.h"
 #include "tensorrt_llm/runtime/iStatefulGptDecoder.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -71,6 +72,10 @@ public:
     // explicit draft tokens data.
     std::optional<ExplicitDraftTokensBuffers::EngineOutputs> explicitDraftTokensInputs;
     std::optional<ExplicitDraftTokensBuffers::EngineInputs> explicitDraftTokensLastInputs;
+
+    // eagle data
+    std::optional<EagleBuffers::EngineOutputs> eagleInputs;
+    std::optional<EagleBuffers::Inputs> eagleLastInputs;
 };
 
 using Output = decoder::Output;
@@ -100,6 +105,9 @@ public:
 
     //! @brief Setup buffers for ExplicitDraftTokens decoding.
     virtual void setupExplicitDraftTokens(ExplicitDraftTokensBuffers::Inputs explicitDraftTokensBuffers) = 0;
+
+    //! @brief Setup buffers for Eagle decoding.
+    virtual void setupEagle(EagleBuffers::Inputs eagleBuffers) = 0;
 
     //! @brief Setup buffers for Lookahead decoding.
     virtual void setupLookahead(LookaheadDecodingBuffers lookaheadDecodingBuffers) = 0;
@@ -162,7 +170,8 @@ public:
 
     //! @brief Initialize batched decoder at seqSlots with a new `requests`.
     virtual void newRequests(std::vector<SizeType32> const& seqSlots,
-        std::vector<decoder_batch::Request> const& requests, std::vector<SamplingConfig> const& samplingConfigs)
+        std::vector<decoder_batch::Request> const& requests, std::vector<SamplingConfig> const& samplingConfigs,
+        ModelConfig const& modelConfig)
         = 0;
 
     //! @returns [batchSize, maxTokensPerStep-1], predicted draft tokens for next step, on gpu

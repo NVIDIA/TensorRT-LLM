@@ -115,6 +115,7 @@ public:
     {
         TLLM_CHECK(configs.size() > 0);
         beamWidth = configs.front().beamWidth;
+        numReturnSequences = configs.front().numReturnSequences;
         normalizeLogProbs = configs.front().normalizeLogProbs;
         temperature = fuseValues<FloatType>(
             configs, [&configs](size_t ci) { return configs[ci].temperature; },
@@ -174,6 +175,7 @@ public:
     explicit SamplingConfig(executor::SamplingConfig const& samplingConfig,
         std::optional<executor::ExternalDraftTokensConfig> const& externalDraftTokensConfig)
         : beamWidth{samplingConfig.getBeamWidth()}
+        , numReturnSequences(samplingConfig.getNumReturnSequences())
     {
 
         if (externalDraftTokensConfig && externalDraftTokensConfig.value().getAcceptanceThreshold())
@@ -220,6 +222,25 @@ public:
                 "Requested beam width %d is incorrect. Must be > 0. To de-activate beam searching set beamWidth to 1.",
                 beamWidth);
         }
+
+        if (numReturnSequences)
+        {
+            valid &= (numReturnSequences.value() > 0);
+            if (!valid)
+            {
+                TLLM_LOG_WARNING(
+                    "Requested numReturnSequences %d is incorrect. Must be > 0.", numReturnSequences.value());
+            }
+            valid &= (beamWidth == 1 || numReturnSequences.value() <= beamWidth);
+            if (!valid)
+            {
+                TLLM_LOG_WARNING(
+                    "Requested numReturnSequences %d is incorrect. In beam search, numReturnSequences should not "
+                    "exceed the beam width %d.",
+                    numReturnSequences.value(), beamWidth);
+            }
+        }
+
         valid &= validateVec("topK", topK, -1);
         valid &= validateVec("topP", topP, -fltEpsilon, {1.f});
         valid &= validateVec("topPMin", topPMin, 0.f, {1.f});
@@ -259,6 +280,7 @@ public:
 
 public:
     SizeType32 beamWidth;
+    std::optional<SizeType32> numReturnSequences;
 
     // penalties
     OptVec<FloatType> temperature;        // [1] or [batch_size] on cpu
@@ -295,7 +317,8 @@ public:
 
     bool operator==(SamplingConfig const& other) const
     {
-        return beamWidth == other.beamWidth && temperature == other.temperature && minLength == other.minLength
+        return beamWidth == other.beamWidth && numReturnSequences == other.numReturnSequences
+            && temperature == other.temperature && minLength == other.minLength
             && repetitionPenalty == other.repetitionPenalty && presencePenalty == other.presencePenalty
             && frequencyPenalty == other.frequencyPenalty && noRepeatNgramSize == other.noRepeatNgramSize
             && topK == other.topK && topP == other.topP && randomSeed == other.randomSeed
@@ -304,6 +327,15 @@ public:
             && earlyStopping == other.earlyStopping && draftAcceptanceThreshold == other.draftAcceptanceThreshold
             && topKMedusaHeads == other.topKMedusaHeads && normalizeLogProbs == other.normalizeLogProbs
             && outputLogProbs == other.outputLogProbs && cumLogProbs == other.cumLogProbs;
+    }
+
+    SizeType32 getNumReturnBeams() const
+    {
+        if (numReturnSequences && beamWidth > 1)
+        {
+            return std::min(numReturnSequences.value(), beamWidth);
+        }
+        return beamWidth;
     }
 };
 

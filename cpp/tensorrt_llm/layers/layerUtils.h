@@ -87,11 +87,18 @@ struct FillBuffers
 };
 
 template <typename T>
-inline bool allOfBatchSlots(
-    runtime::SizeType32 const* batchSlotsHost, T const* data, runtime::SizeType32 batchSize, T value)
+bool allOfBatchSlots(runtime::SizeType32 const* batchSlotsHost, T const* data, runtime::SizeType32 batchSize, T value)
 {
     return std::all_of(
         batchSlotsHost, batchSlotsHost + batchSize, [&](runtime::SizeType32 b) { return data[b] == value; });
+}
+
+template <typename T>
+T maxOfBatchSlots(runtime::SizeType32 const* batchSlotsHost, T const* data, runtime::SizeType32 batchSize)
+{
+    return std::transform_reduce(
+        batchSlotsHost, batchSlotsHost + batchSize, std::numeric_limits<T>::lowest(),
+        [](auto a, auto b) { return std::max(a, b); }, [&](auto i) { return data[i]; });
 }
 
 inline DecoderDomain getLocalDecoderDomain(
@@ -126,6 +133,33 @@ inline DecoderDomain getLocalDecoderDomain(
         TLLM_THROW("Can't get local Decoder domain");
     }
     return {batchSize, beamWidth, vocabSize};
+}
+
+template <typename... T>
+runtime::SizeType32 expandMatchElements(runtime::SizeType32 expandSize, std::vector<T>&... vector)
+{
+    std::array vectorSizes{vector.size()...};
+
+    bool allSingle = true;
+    for (auto size : vectorSizes)
+    {
+        if (size == expandSize)
+        {
+            allSingle = false;
+        }
+        else if (size != 1)
+        {
+            return 0;
+        }
+    }
+
+    if (allSingle)
+    {
+        return 1;
+    }
+
+    (vector.resize(expandSize, vector.front()), ...);
+    return expandSize;
 }
 
 } // namespace tensorrt_llm::layers

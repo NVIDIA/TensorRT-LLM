@@ -1349,7 +1349,7 @@ def convert_checkpoint(args):
         'encoder_hidden_size': decoder_config.encoder_hidden_size,
         'encoder_num_heads': decoder_config.encoder_num_heads,
         'encoder_head_size': decoder_config.encoder_head_size,
-        'skip_cross_qkv': args.skip_cross_qkv,
+        'skip_cross_kv': args.skip_cross_kv,
         'use_implicit_relative_attention': args.use_implicit_relative_attention,
         'decoder_start_token_id': decoder_config.decoder_start_token_id,
         'eos_token_id': decoder_config.eos_token_id,
@@ -1508,7 +1508,7 @@ if __name__ == "__main__":
         'Target inference dtype. Weights and Computation will be in this dtype, no matter what original dtype the weight checkpoint has.'
     )
     parser.add_argument(
-        '--skip_cross_qkv',
+        '--skip_cross_kv',
         action='store_true',
         help=
         'Skip redundant cross qkv computation by using TensorRT IfConditional switch (experimental).'

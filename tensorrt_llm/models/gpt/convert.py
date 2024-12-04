@@ -433,7 +433,7 @@ def load_weights_from_hf_model(hf_model,
     mapping = config.mapping
     layers_range = mapping.pp_layers(num_hidden_layers)
     for l in layers_range:
-        if gpt_variant == 'starcoder2':
+        if gpt_variant in ['starcoder2', 'nemotron']:
             prefix = f'model.layers.{l}'
         elif gpt_variant == 'persimmon':
             is_fuyu = f'language_model.model.embed_tokens.weight' in model_params
@@ -452,7 +452,7 @@ def load_weights_from_hf_model(hf_model,
                                              f'{prefix}.attn.kv_attn', dtype)
             qkv_w = torch.cat([q_w, kv_w], dim=-1)
             qkv_b = torch.cat([q_b, kv_b], dim=-1)
-        elif gpt_variant in ['starcoder2', 'kosmos-2']:
+        elif gpt_variant in ['starcoder2', 'nemotron', 'kosmos-2']:
             q_w, q_b = get_weight_and_bias(model_params,
                                            f'{prefix}.self_attn.q_proj', dtype)
             k_w, k_b = get_weight_and_bias(model_params,
@@ -460,7 +460,8 @@ def load_weights_from_hf_model(hf_model,
             v_w, v_b = get_weight_and_bias(model_params,
                                            f'{prefix}.self_attn.v_proj', dtype)
             qkv_w = torch.cat([q_w, k_w, v_w], dim=0)
-            qkv_b = torch.cat([q_b, k_b, v_b], dim=0)
+            qkv_b = torch.cat([q_b, k_b, v_b],
+                              dim=0) if q_b is not None else None
         elif gpt_variant == 'persimmon':
             qkv_w, qkv_b = get_weight_and_bias(
                 model_params, f'{prefix}.self_attn.query_key_value', dtype)
@@ -533,7 +534,7 @@ def load_weights_from_hf_model(hf_model,
                     'scale_y_quant_orig'].contiguous()
 
         # (2) Attention Dense Linear
-        if gpt_variant == 'starcoder2':
+        if gpt_variant in ['starcoder2', 'nemotron']:
             attn_dense_w, attn_dense_b = get_weight_and_bias(
                 model_params, f'{prefix}.self_attn.o_proj', dtype)
         elif gpt_variant == 'persimmon':
@@ -583,15 +584,15 @@ def load_weights_from_hf_model(hf_model,
 
         # (3) MLP FC Linear
         if gpt_variant == 'persimmon':
-            mlp_fc_w, mlp_fc_b = get_weight_and_bias(
-                model_params, f'{prefix}.mlp.dense_h_to_4h', dtype)
+            suffix = "mlp.dense_h_to_4h"
         elif gpt_variant == 'kosmos-2':
-            mlp_fc_w, mlp_fc_b = get_weight_and_bias(model_params,
-                                                     f'{prefix}.ffn.fc1', dtype)
+            suffix = "ffn.fc1"
+        elif gpt_variant == 'nemotron':
+            suffix = "mlp.up_proj"
         else:
-            mlp_fc_w, mlp_fc_b = get_weight_and_bias(model_params,
-                                                     f'{prefix}.mlp.c_fc',
-                                                     dtype)
+            suffix = "mlp.c_fc"
+        mlp_fc_w, mlp_fc_b = get_weight_and_bias(model_params,
+                                                 f'{prefix}.{suffix}', dtype)
         if gpt_variant in ['gpt2', 'santacoder', 'jais']:
             mlp_fc_w = mlp_fc_w.t().contiguous()  # transpose for Conv1D
         if gpt_variant in ['jais']:
@@ -660,14 +661,16 @@ def load_weights_from_hf_model(hf_model,
 
         # (4) MLP Proj Layer
         if gpt_variant == 'persimmon':
-            mlp_proj_w, mlp_proj_b = get_weight_and_bias(
-                model_params, f'{prefix}.mlp.dense_4h_to_h', dtype)
+            suffix = "mlp.dense_4h_to_h"
         elif gpt_variant == 'kosmos-2':
-            mlp_proj_w, mlp_proj_b = get_weight_and_bias(
-                model_params, f'{prefix}.ffn.fc2', dtype)
+            suffix = "ffn.fc2"
+        elif gpt_variant == 'nemotron':
+            suffix = "mlp.down_proj"
         else:
-            mlp_proj_w, mlp_proj_b = get_weight_and_bias(
-                model_params, f'{prefix}.mlp.c_proj', dtype)
+            suffix = "mlp.c_proj"
+        mlp_proj_w, mlp_proj_b = get_weight_and_bias(model_params,
+                                                     f'{prefix}.{suffix}',
+                                                     dtype)
         if gpt_variant in ['gpt2', 'santacoder', 'jais']:
             mlp_proj_w = mlp_proj_w.t().contiguous()  # transpose for Conv1D
         if gpt_variant in ['jais']:
@@ -704,7 +707,8 @@ def load_weights_from_hf_model(hf_model,
                                        plugin_weight_only_quant_type))
 
         # (5) Input layernorm
-        if gpt_variant in ['starcoder2', 'persimmon']:
+        apply_layernorm_1p = gpt_variant == 'nemotron'
+        if gpt_variant in ['starcoder2', 'nemotron', 'persimmon']:
             input_ln_w, input_ln_b = get_weight_and_bias(
                 model_params, f'{prefix}.input_layernorm', dtype)
         elif gpt_variant == 'kosmos-2':
@@ -713,12 +717,14 @@ def load_weights_from_hf_model(hf_model,
         else:
             input_ln_w, input_ln_b = get_weight_and_bias(
                 model_params, f'{prefix}.ln_1', dtype)
+        if apply_layernorm_1p:
+            input_ln_w += 1.0
         weights[f'{tllm_prex}.input_layernorm.weight'] = input_ln_w
         if input_ln_b is not None:
             weights[f'{tllm_prex}.input_layernorm.bias'] = input_ln_b
 
         # (6) Post layernorm
-        if gpt_variant in ['starcoder2', 'persimmon']:
+        if gpt_variant in ['starcoder2', 'nemotron', 'persimmon']:
             post_ln_w, post_ln_b = get_weight_and_bias(
                 model_params, f'{prefix}.post_attention_layernorm', dtype)
         elif gpt_variant == 'kosmos-2':
@@ -727,6 +733,8 @@ def load_weights_from_hf_model(hf_model,
         else:
             post_ln_w, post_ln_b = get_weight_and_bias(model_params,
                                                        f'{prefix}.ln_2', dtype)
+        if apply_layernorm_1p:
+            post_ln_w += 1.0
         weights[f'{tllm_prex}.post_layernorm.weight'] = post_ln_w
         if post_ln_b is not None:
             weights[f'{tllm_prex}.post_layernorm.bias'] = post_ln_b
@@ -760,7 +768,7 @@ def load_weights_from_hf_model(hf_model,
             weights[f'{tllm_prex}.mlp.inner_layernorm.bias'] = k_layernorm_b
 
     if mapping.is_first_pp_rank():
-        if gpt_variant == 'starcoder2':
+        if gpt_variant in ['starcoder2', 'nemotron']:
             embed_w = get_weight(model_params, 'model.embed_tokens', dtype)
         elif gpt_variant == 'kosmos-2':
             embed_w = get_weight(model_params, 'text_model.model.embed_tokens',
@@ -796,7 +804,7 @@ def load_weights_from_hf_model(hf_model,
                 sharding_dim=config.embedding_sharding_dim)
 
     if mapping.is_last_pp_rank():
-        if gpt_variant == 'starcoder2':
+        if gpt_variant in ['starcoder2', 'nemotron']:
             embed_w = get_weight(model_params, 'lm_head', dtype)
             if embed_w is None:
                 embed_w = get_weight(model_params, 'model.embed_tokens', dtype)
@@ -821,7 +829,7 @@ def load_weights_from_hf_model(hf_model,
                                               mapping.tp_rank,
                                               mapping.tp_size,
                                               is_column=True)
-        if gpt_variant == 'starcoder2':
+        if gpt_variant in ['starcoder2', 'nemotron']:
             ln_f_w, ln_f_b = get_weight_and_bias(model_params, 'model.norm',
                                                  dtype)
         elif gpt_variant == 'persimmon':
@@ -835,6 +843,8 @@ def load_weights_from_hf_model(hf_model,
         else:
             ln_f_w, ln_f_b = get_weight_and_bias(model_params,
                                                  'transformer.ln_f', dtype)
+        if apply_layernorm_1p:
+            ln_f_w += 1.0
         weights['transformer.ln_f.weight'] = ln_f_w
         if ln_f_b is not None:
             weights['transformer.ln_f.bias'] = ln_f_b

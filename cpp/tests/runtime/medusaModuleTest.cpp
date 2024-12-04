@@ -18,6 +18,7 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/utils/speculativeChoicesUtils.h"
 
 #include <NvInferRuntime.h>
 
@@ -66,10 +67,9 @@ protected:
         TensorPtr attentionPackedMaskHost
             = mManager->pinned(ITensor::makeShape({tokensPerStep, numPackedMasks}), nvinfer1::DataType::kINT32);
 
-        SizeType32 totalPaths = 0;
         std::vector<SizeType32> topKs;
-        medusaModule.initMedusaTensorsFromChoices(choices, topKs, medusaGenerationLengthsHost,
-            medusaPositionOffsetsHost, medusaTreeIdsHost, medusaPathsHost, attentionPackedMaskHost, totalPaths);
+        utils::initTensorsFromChoices(medusaModule, choices, topKs, medusaGenerationLengthsHost,
+            medusaPositionOffsetsHost, medusaTreeIdsHost, medusaPathsHost, attentionPackedMaskHost);
 
         std::cout << "medusaPositionOffsetsHost " << *medusaPositionOffsetsHost << std::endl;
         std::cout << "medusaTreeIdsHost " << *medusaTreeIdsHost << std::endl;
@@ -92,8 +92,7 @@ protected:
             EXPECT_EQ(bufferCast<SizeType32>(*medusaTreeIdsHost)[hi], refTreeIds[hi]);
         }
 
-        ASSERT_EQ(totalPaths, refPaths.size());
-        for (SizeType32 ri = 0; ri < totalPaths; ++ri)
+        for (SizeType32 ri = 0; ri < refPaths.size(); ++ri)
         {
             for (SizeType32 vi = 0; vi < medusaHeads + 1; ++vi)
             {

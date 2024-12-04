@@ -142,24 +142,28 @@ void MedusaDecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, T
     auto prepareRuntimeTopK = [this, workspace](std::vector<SizeType32> const& runtimeTopK, SizeType32 batchSize,
                                   BufferConstPtr const& batchSlots, BufferPtr const& runtimeTopKDevice)
     {
-        TLLM_CHECK_WITH_INFO(runtimeTopK.size() == batchSize,
+        TLLM_CHECK_WITH_INFO(runtimeTopK.size() == 1 || runtimeTopK.size() == batchSize,
             fmtstr("runtimeTopK.size() (%lu) == batchSize (%d) is not satisfied!", runtimeTopK.size(), batchSize));
-        DecodingLayerWorkspace::copyToWorkspace<SizeType32>(
-            *this->mBufferManager, runtimeTopK, workspace->getWorkspaceDeviceBuffer());
-        auto* setupWorkspaceDevicePtr = workspace->getWorkspaceDevicePtrAs<SizeType32>();
+        SizeType32* topKSetupPtr = nullptr;
+        if (runtimeTopK.size() > 1)
+        {
+            DecodingLayerWorkspace::copyToWorkspace<SizeType32>(
+                *this->mBufferManager, runtimeTopK, workspace->getWorkspaceDeviceBuffer());
+            topKSetupPtr = workspace->getWorkspaceDevicePtrAs<SizeType32>();
+        }
         auto* runtimeTopKDevicePtr = bufferCastOrNull<SizeType32>(runtimeTopKDevice);
         auto const* batchSlotsPtr = bufferCastOrNull<SizeType32 const>(batchSlots);
         invokeScatterDecodingParams(
-            setupWorkspaceDevicePtr, runtimeTopKDevicePtr, batchSlotsPtr, batchSize, getStream());
+            topKSetupPtr, runtimeTopK.front(), runtimeTopKDevicePtr, batchSlotsPtr, batchSize, getStream());
 
         // FIXME(nkorobov): monotonically growing
         auto const curMaxTopK = *std::max_element(std::begin(runtimeTopK), std::end(runtimeTopK));
         return curMaxTopK;
     };
 
-    auto constexpr defaultTopK = 1u;
+    SizeType32 constexpr defaultTopK = 1;
     {
-        auto runtimeTopK = setupParams->runtimeTopK.value_or(std::vector<SizeType32>(batchSize, defaultTopK));
+        auto runtimeTopK = setupParams->runtimeTopK.value_or(std::vector{defaultTopK});
         auto const curMaxTopK
             = prepareRuntimeTopK(runtimeTopK, batchSize, workspace->getDeviceBatchSlots(), mRuntimeTopKDevice);
         mRuntimeMaxTopK = std::max(mRuntimeMaxTopK, curMaxTopK);
@@ -329,11 +333,33 @@ void MedusaDecodingLayer<T>::acceptDraftTokens(SpeculativeDecodingOutputs const&
     auto medusaInputLogitsPtrsPtr = reinterpret_cast<T const**>(bufferCast<int64_t>(*mMedusaInputLogitsPtrs));
     auto medusaSelectedLogitsPtrsDevicePtr
         = const_cast<T const**>(bufferCastOrNull<T const*>(mMedusaSelectedLogitsPtrsDevice));
-    acceptDraftTokensByIdsWithPaths(outputIds, draftIds, targetTokensDevicePtr, sequenceLengths, numNewTokens,
-        finishedStatesPtr, workspace->getDeviceBatchSlotsPtr(), paths, endIds, medusaInputLogitsPtrsPtr,
-        medusaSelectedLogitsPtrsDevicePtr, curTokensPerStepDevice, targetTokensPerStepDevice, bestPathIdsDevicePtr,
-        batchSize, mDecoderDomain.getVocabSize(), mDecoderDomain.getBatchSize(), maxSeqLen, maxDraftPathLen,
-        mDecoderDomain.getMaxDecodingTokens(), getStream());
+
+    AcceptDraftTokensByIdsWithPathsParams<T> params;
+    params.outputIds = outputIds;
+    params.draftIds = draftIds;
+    params.targetIds = targetTokensDevicePtr;
+    params.sequenceLengths = sequenceLengths;
+    params.acceptedLengths = numNewTokens;
+    params.finishedFinal = finishedStatesPtr;
+    params.batchSlots = workspace->getDeviceBatchSlotsPtr();
+    params.paths = paths;
+    params.endIds = endIds;
+    params.medusaLogits = medusaInputLogitsPtrsPtr;
+    params.logitsPtrs = medusaSelectedLogitsPtrsDevicePtr;
+    params.curTokensPerStep = curTokensPerStepDevice;
+    params.targetTokensPerStep = targetTokensPerStepDevice;
+    params.bestPathIds = bestPathIdsDevicePtr;
+    params.batchSize = batchSize;
+    params.maxBatchSize = mDecoderDomain.getBatchSize();
+    params.vocabSize = mDecoderDomain.getVocabSize();
+    params.maxSeqLen = maxSeqLen;
+    params.maxDraftPathLen = maxDraftPathLen;
+    params.maxDecodingTokens = mDecoderDomain.getMaxDecodingTokens();
+    params.stream = getStream();
+
+    params.checkParams();
+
+    acceptDraftTokensByIdsWithPaths(params);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

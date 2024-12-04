@@ -1,3 +1,5 @@
+import pynvml
+
 DEFAULT_HF_MODEL_DIRS = {
     'BaichuanForCausalLM': 'baichuan-inc/Baichuan-13B-Chat',
     'BloomForCausalLM': 'bigscience/bloom-560m',
@@ -20,3 +22,13 @@ DEFAULT_HF_MODEL_DIRS = {
     'Qwen2MoeForCausalLM': 'Qwen/Qwen1.5-MoE-A2.7B',
     'RecurrentGemmaForCausalLM': 'google/recurrentgemma-2b',
 }
+
+
+def get_device_memory():
+    pynvml.nvmlInit()
+    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+    mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+    total_memory = mem_info.total / (1024**3)
+    pynvml.nvmlShutdown()
+
+    return total_memory

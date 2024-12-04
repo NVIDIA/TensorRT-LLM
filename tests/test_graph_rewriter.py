@@ -20,6 +20,8 @@ import numpy as np
 import torch
 import tensorrt as trt
 # isort: on
+from pathlib import Path
+
 from transformers import GPT2Config
 from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
 
@@ -289,6 +291,11 @@ class TestNetworkForGraphRewrite(unittest.TestCase):
     def test_to_dot(self):
         dot_code = self.network.to_dot()
         self.assertTrue('digraph' in dot_code)
+
+    def test_to_onnx(self):
+        file_path = Path('./rank0.onnx')
+        self.network.to_onnx(file_path)
+        self.assertTrue(file_path.exists())
 
 
 class TestLayer(unittest.TestCase):

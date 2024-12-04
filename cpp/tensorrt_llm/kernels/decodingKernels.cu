@@ -624,18 +624,19 @@ void invokeCopyBeamHypotheses(DecodingOutput::BeamHypotheses const& src, Decodin
     copyBeamHypotheses<<<numSMs, 256, 0, stream.get()>>>(copyStruct);
 }
 
-__global__ void initializeOutput(TokenIdType* finalOutputIds, TokenIdType const* endIds, SizeType32 const nMaxSeqLen)
+__global__ void initializeOutput(
+    TokenIdType* finalOutputIds, TokenIdType const* endIds, SizeType32 const beam, SizeType32 const nMaxSeqLen)
 {
     for (int i = threadIdx.x; i < nMaxSeqLen; i += blockDim.x)
     {
-        finalOutputIds[blockIdx.x * nMaxSeqLen + i] = endIds[blockIdx.x];
+        finalOutputIds[blockIdx.x * nMaxSeqLen + i] = endIds[blockIdx.x / beam];
     }
 }
 
-void invokeInitializeOutput(TokenIdType* finalOutputIds, TokenIdType const* endIds, SizeType32 const batchBeam,
-    SizeType32 const nMaxSeqLen, cudaStream_t stream)
+void invokeInitializeOutput(TokenIdType* finalOutputIds, TokenIdType const* endIds, SizeType32 const batch,
+    SizeType32 const beam, SizeType32 const nMaxSeqLen, cudaStream_t stream)
 {
-    initializeOutput<<<batchBeam, 256, 0, stream>>>(finalOutputIds, endIds, nMaxSeqLen);
+    initializeOutput<<<batch * beam, 256, 0, stream>>>(finalOutputIds, endIds, beam, nMaxSeqLen);
 }
 
 __global__ void copyNextStepIds(TokenIdType* nextStepIds, TokenIdType const* const* outputIdsPtr,
@@ -742,7 +743,7 @@ void gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decod
 
     // prefill finalOutputIds with the EOS tokens from decodingInput.endIds
     tensorrt_llm::kernels::invokeInitializeOutput(bufferCast<TokenIdType>(finalOutputIds),
-        bufferCast<TokenIdType>(*decodingInput.endIds), batchSize * beamWidth, maxSeqLength, stream);
+        bufferCast<TokenIdType>(*decodingInput.endIds), batchSize, beamWidth, maxSeqLength, stream);
     sync_check_cuda_error();
 
     std::vector<float> lengthPenaltyVec;

@@ -172,8 +172,10 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
         num_weights_in_32_bits = 0
         if quantized_weight_dtype == torch.int8:
             num_weights_in_32_bits = 4
+            use_int8_weight = 1
         elif quantized_weight_dtype == torch.quint4x2:
             num_weights_in_32_bits = 8
+            use_int8_weight = 0
         else:
             assert False, "Unsupported weight dtype."
 
@@ -184,18 +186,23 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
                                                dtype=torch.int32,
                                                device="cuda")
 
-        preprocessor = torch.ops.trtllm.preprocess_weights_for_mixed_gemm
-        # Weights must be a CPU Tensor
-        unpacker = torch.ops.trtllm.unpack_int4_packed_tensor_to_int8
-
         unprocessed_weight = unprocessed_int_weight.view(torch.int8)
-        # Weights must be a CPU Tensor
-        ref_q_weight = unpacker(unprocessed_weight.cpu())
+
         if use_w4a8_awq:
             activation_type = torch.float8_e4m3fn
         else:
             activation_type = torch.float16
-        # Weights must be a CPU Tensor
+
+        if quantized_weight_dtype == torch.int8:
+            ref_q_weight = unprocessed_weight
+        elif quantized_weight_dtype == torch.quint4x2:
+            # Weights must be a CPU Tensor
+            unpacker = torch.ops.trtllm.unpack_int4_packed_tensor_to_int8
+            ref_q_weight = unpacker(unprocessed_weight.cpu())
+        else:
+            assert False, "Unsupported weight dtype."
+
+        preprocessor = torch.ops.trtllm.preprocess_weights_for_mixed_gemm
         cuda_q_weight = preprocessor(unprocessed_weight.cpu(),
                                      quantized_weight_dtype,
                                      activation_type).view(activation_dtype)
@@ -205,8 +212,11 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
         ZERO = 2
         PRE_QUANT_SCALE = 4
         W4A8_AWQ = 8
+        INT8_WEIGHT = 16
 
-        quant_algo = use_w4a8_awq * W4A8_AWQ + has_pre_quant * PRE_QUANT_SCALE + has_zero * ZERO + has_bias * BIAS
+        quant_algo = (use_int8_weight * INT8_WEIGHT + use_w4a8_awq * W4A8_AWQ +
+                      has_pre_quant * PRE_QUANT_SCALE + has_zero * ZERO +
+                      has_bias * BIAS)
 
         scale_ref = scale.repeat_interleave(group_size, dim=0)[:k, :]
         ref_th_weight = ref_q_weight.cuda().to(activation_dtype) * scale_ref
@@ -230,6 +240,54 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
         ref = _utils.woq_groupwise_gt_matmul(activation, ref_th_weight, bias)
         _utils.woq_assert_near_eq(ref, output, 2)
 
+    # test for INT8 weight
+    @parameterized.expand(
+        [(1, 1024, 64, 'float16', False, True, True, 64),
+         (16, 1024, 256, 'float16', False, True, False, 64),
+         (32, 2048, 384, 'float16', False, False, True, 64),
+         (64, 2048, 1024, 'float16', False, False, False, 64),
+         (2, 1024, 128, 'float16', False, True, True, 128),
+         (8, 1024, 256, 'float16', False, True, False, 128),
+         (48, 2048, 384, 'float16', False, False, True, 128),
+         (96, 2048, 1024, 'float16', False, False, False, 128)],
+        name_func=unittest_name_func)
+    @skip_pre_ampere_unittest
+    def test_matmul_int8_input(self,
+                               m,
+                               n,
+                               k,
+                               dtype,
+                               has_pre_quant,
+                               has_zero,
+                               has_bias,
+                               group_size=128):
+        self._woq_groupwise_matmul(m, n, k, dtype, torch.int8, has_pre_quant,
+                                   has_zero, has_bias, group_size)
+
+    @parameterized.expand(
+        [(1, 1024, 64, 'bfloat16', False, True, True, 64),
+         (16, 1024, 256, 'bfloat16', False, True, False, 64),
+         (32, 2048, 384, 'bfloat16', False, False, True, 64),
+         (64, 2048, 1024, 'bfloat16', False, False, False, 64),
+         (2, 1024, 128, 'bfloat16', False, True, True, 128),
+         (8, 1024, 256, 'bfloat16', False, True, False, 128),
+         (48, 2048, 384, 'bfloat16', False, False, True, 128),
+         (96, 2048, 1024, 'bfloat16', False, False, False, 128)],
+        name_func=unittest_name_func)
+    @skip_pre_ampere_unittest
+    def test_matmul_bf16_int8_input(self,
+                                    m,
+                                    n,
+                                    k,
+                                    dtype,
+                                    has_pre_quant,
+                                    has_zero,
+                                    has_bias,
+                                    group_size=128):
+        self._woq_groupwise_matmul(m, n, k, dtype, torch.int8, has_pre_quant,
+                                   has_zero, has_bias, group_size)
+
+    # test for INT4 weight
     @parameterized.expand(
         [(1, 1024, 64, 'float16', False, True, True, 64),
          (16, 1024, 256, 'float16', False, True, False, 64),

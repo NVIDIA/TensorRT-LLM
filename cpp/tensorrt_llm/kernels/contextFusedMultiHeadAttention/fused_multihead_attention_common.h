@@ -43,6 +43,8 @@ static constexpr int FLASH_ATTEN_PACKED_MASK_MMA_N = 64;
 // The flash attention always uses 4x1 warp layout.
 static constexpr int FLASH_ATTEN_WARPS_M = 4;
 static constexpr int FLASH_ATTEN_WARPS_N = 1;
+// The number of positions in one uint32_t.
+static constexpr int NUM_POSITIONS_IN_UINT32 = 32;
 // The number of threads per warp group.
 static constexpr int NUM_THREADS_PER_WARP_GROUP = FLASH_ATTEN_WARPS_M * FLASH_ATTEN_WARPS_N * 32;
 // The number of core mmas_n in one uint32_t packed mask.
@@ -105,6 +107,8 @@ struct MHARunnerFixedParams
     int numKvHeads;
     // The head size.
     int headSize;
+    // The head size of V.
+    int headSizeV = 0;
     // The scaling applied to bmm1_scale.
     float qScaling;
     // The tanh scale after bmm1 (used in Grok models).
@@ -132,6 +136,7 @@ struct MHARunnerFixedParams
         }
         // Head size.
         output += ", head_size = " + std::to_string(headSize);
+        output += ", head_size_V = " + std::to_string(headSizeV);
         // Attention mask type.
         output += ", attention_mask_type = ";
         switch (attentionMaskType)
@@ -323,6 +328,11 @@ struct Fused_multihead_attention_params_v2
 
     // is input/output padded
     bool is_s_padded = false;
+
+    // The dimension of V.
+    int dv = 0;
+    // The stride of V. If unset, v_stride_in_bytes = kv_stride_in_bytes * dv / d
+    int64_t v_stride_in_bytes = 0;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

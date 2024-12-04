@@ -23,7 +23,7 @@ import tensorrt as trt
 
 from transformers import BertConfig, BertForQuestionAnswering, BertForSequenceClassification, BertModel  # isort:skip
 from transformers import RobertaConfig, RobertaForQuestionAnswering, RobertaForSequenceClassification, RobertaModel  # isort:skip
-
+from safetensors.torch import load_file
 from weight import (load_from_hf_cls_model, load_from_hf_model,
                     load_from_hf_qa_model)
 
@@ -276,10 +276,13 @@ if __name__ == '__main__':
     elif args.model == 'BertForSequenceClassification' or args.model == 'RobertaForSequenceClassification':
         hf_bert = globals()[f'{model_type}ForSequenceClassification'](
             config=bert_config)
-        if args.model_dir is not None and os.path.exist(
-                os.path.join(args.model_dir, "pytorch_model.bin")):
-            state_dict = torch.load(
-                os.path.join(args.model_dir, "pytorch_model.bin"))
+        if args.model_dir is not None:
+            try:
+                state_dict = torch.load(
+                    os.path.join(args.model_dir, "pytorch_model.bin"))
+            except FileNotFoundError:
+                state_dict = load_file(
+                    os.path.join(args.model_dir, "model.safetensors"))
             hf_bert.load_state_dict(state_dict, strict=False)
 
         tensorrt_llm_bert = tensorrt_llm.models.BertForSequenceClassification(

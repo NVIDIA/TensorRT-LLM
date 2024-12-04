@@ -22,7 +22,7 @@ namespace tensorrt_llm
 {
 namespace kernels
 {
-static constexpr int nMaxBeamWidth = 64; // max beam width supported now
+static constexpr int nMaxBeamWidth = 256; // max beam width supported now
 static constexpr int nBlockSizeForSmallBeamWidth = 256;
 static constexpr int nMaxVocabPartForStage1FastKernel = 128;
 

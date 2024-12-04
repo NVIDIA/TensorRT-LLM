@@ -359,7 +359,7 @@ class Linear(LinearBase):
         if self.is_qkv:
             if isinstance(weights, list):
                 head_size = config.hidden_size // config.num_attention_heads if config.head_size is None else config.head_size
-                if hasattr(config, "remove_duplicated_kv_heads"):
+                if getattr(config, "remove_duplicated_kv_heads", False):
                     if config.remove_duplicated_kv_heads:
                         k, v = weights[1:]
                         k = k.reshape([

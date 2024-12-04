@@ -20,6 +20,7 @@ The TensorRT-LLM Nemotron-NAS implementation can be found in [tensorrt_llm/model
 
   * FP16
   * BF16
+  * FP8
   * Tensor parallelism
   * Pipeline parallelism
 
@@ -57,31 +58,58 @@ In particular, the plugin-related options have two categories:
     * explicitly specify `float16`, `bfloat16`, or `float32`, so that the plugins are enabled with the specified precision
     * implicitly specify `auto`, so that the plugins are enabled with the precision that is automatically inferred from the model dtype, the dtype specified in weight conversion
 
-```bash
-# Optional: prepare environment variables
-export MODEL_DIR=...
-export TRT_CHECKPOINT_DIR=...
-export TRT_ENGINE_DIR=...
-export TP_SIZE=...
-export PP_SIZE=...
 
-# create a local copy of the model checkpoint
-git clone https://huggingface.co/nvidia/Llama-3_1-Nemotron-51B-Instruct $MODEL_DIR
+0. Optional: prepare environment variables
+    ```bash
+    export MODEL_DIR="~/models/huggingface/nemotron-nas"
+    export TRT_CHECKPOINT_DIR="~/models/intermediate/nemotron-nas"
+    export TRT_ENGINE_DIR="~/models/engines/nemotron-nas"
+    export TP_SIZE=1
+    export PP_SIZE=1
+    ```
+1. Clone the HF model:
+    ```bash
+    git clone https://huggingface.co/nvidia/Llama-3_1-Nemotron-51B-Instruct $MODEL_DIR
+    ```
 
-# Convert the model to TRT BF16 checkpoint
-# Note, currently must provide --trust_remote_code flag
-python convert_checkpoint.py --model_dir $MODEL_DIR \
-                             --dtype bfloat16 \
-                             --output_dir $TRT_CHECKPOINT_DIR \
-                             --tp_size=$TP_SIZE --pp_size=$PP_SIZE \
-                             --trust_remote_code
+2. Convert the checkpoint:
+  * For BF16/FP16:
+    ```bash
+    # Note, currently must provide --trust_remote_code flag
+    python ./convert_checkpoint.py \
+                  --model_dir $MODEL_DIR \
+                  --output_dir $TRT_CHECKPOINT_DIR \
+                  --dtype bfloat16 \
+                  --tp_size $TP_SIZE \
+                  --pp_size $PP_SIZE \
+                  --trust_remote_code
+    ```
 
-# Build the model engine using a single GPU and FP16
-trtllm-build --checkpoint_dir $TRT_CHECKPOINT_DIR \
-             --output_dir $TRT_ENGINE_DIR \
-             --gemm_plugin auto \
-             --kv_cache_type paged
-```
+  * **Alternatively**, Quantize to FP8:
+    ```bash
+    # Below is how to optionally consume the recommended dataset for optimal accuracy.
+    # You may use any dataset you prefer, however.
+
+    export DATASET_DIR="~/datasets/nemotron-nas"
+    python ./calibration_utils.py $DATASET_DIR # download and transform the recommended dataset.
+
+    python ../quantization/quantize.py \
+                  --model_dir $MODEL_DIR \
+                  --output_dir $TRT_CHECKPOINT_DIR \
+                  --dtype bfloat16 \
+                  --kv_cache_dtype fp8 \
+                  --qformat fp8 \
+                  --calib_dataset $DATASET_DIR
+    ```
+
+3. Build the engine:
+    ```bash
+    # Build the model engine using a single GPU and FP16
+    trtllm-build --checkpoint_dir $TRT_CHECKPOINT_DIR \
+                --output_dir $TRT_ENGINE_DIR \
+                --gemm_plugin auto \
+                --kv_cache_type paged
+    ```
 
 The conversion script supports additional models with variable GQA, such as [DeciLM-7B](https://huggingface.co/Deci/DeciLM-7B).
 
@@ -91,12 +119,12 @@ After you build the engine, you can use the engine with any TensorRT-LLM entrypo
 For example, you can run inference with [examples/run.py](../run.py):
 
 ```bash
-export MODEL_DIR=...
-export TRT_ENGINE_DIR=...
+export MODEL_DIR="~/models/huggingface/nemotron-nas"
+export TRT_ENGINE_DIR="~/models/engines/nemotron-nas"
 
 python run.py --engine_dir $TRT_ENGINE_DIR --tokenizer_dir $MODEL_DIR --max_output_len 1024 ...
 
 # for multi-GPU inference (engine must be built with either tp_size>1, pp_size>1, or both)
-export NUM_GPUS=...
+export NUM_GPUS=2
 mpirun -n $NUM_GPUS --allow-run-as-root python run.py ...
 ```

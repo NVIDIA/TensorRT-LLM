@@ -27,8 +27,6 @@ using namespace tensorrt_llm::kernels::cutlass_kernels;
 using tensorrt_llm::plugins::Fp8RowwiseGemmPluginCreator;
 using tensorrt_llm::plugins::Fp8RowwiseGemmPlugin;
 using tensorrt_llm::plugins::Fp8RowwiseGemmPluginProfiler;
-using tensorrt_llm::plugins::read;
-using tensorrt_llm::plugins::write;
 
 static char const* FP8_ROWWISE_GEMM_PLUGIN_VERSION{"1"};
 static char const* FP8_ROWWISE_GEMM_PLUGIN_NAME{"Fp8RowwiseGemm"};
@@ -218,9 +216,7 @@ bool Fp8RowwiseGemmPlugin::supportsFormatCombination(
         // out
         return inOut[pos].type == mType && inOut[pos].format == TensorFormat::kLINEAR;
     default:
-        // Never should be here
-        TLLM_THROW("Fp8 Rowwise Gemm plugin doesn't support this type now");
-        assert(false);
+        // All other format combinations are unsupported.
         return false;
     }
 }

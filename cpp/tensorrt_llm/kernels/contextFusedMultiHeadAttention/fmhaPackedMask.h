@@ -15,12 +15,15 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/contextFusedMultiHeadAttention/fused_multihead_attention_common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include <cstdint>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <sstream>
+
+namespace tc = tensorrt_llm::common;
 
 namespace tensorrt_llm
 {
@@ -29,12 +32,24 @@ namespace kernels
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Round up packed mask dimensions.
+static inline std::pair<int, int> roundUpPackedMaskMNDims(int m, int n)
+{
+    return std::make_pair(tc::roundUp(m, FLASH_ATTEN_PACKED_MASK_M_ALIGNMENT),
+        tc::roundUp(n, FLASH_ATTEN_PACKED_MASK_N_ALIGNMENT) / NUM_POSITIONS_IN_UINT32);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 template <typename MaskInputDataType>
 struct PackedMaskParams
 {
-    // The full mask input with shape [batchSize, maxQSeqLen, maxKvSeqLen].
+    // The full mask input's shape is [batchSize, maxQSeqLen, maxKvSeqLen] when cuQSeqLens is nullptr,
+    // otherwise [batchSize, maxQSeqLen] is packed as numTokens.
     MaskInputDataType const* maskInput = nullptr;
-    // The packed mask output with shape [numQTokens, maxKvSeqLen / 32].
+    // The cumulative sequence lengths of Q.
+    int* cuQSeqLens = nullptr;
+    // The packed mask output with shape [numQTokens, maxKvSeqLen / NUM_POSITIONS_IN_UINT32].
     uint32_t* packedMask = nullptr;
     // The cumulative mask row offsets with shape [batchSize + 1].
     // Note the number of mask rows in each sequence needs to be padded to multiple of 128.

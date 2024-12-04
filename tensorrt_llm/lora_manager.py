@@ -719,20 +719,22 @@ class LoraManager(object):
                                             t_out.shape[dim] // tp_size,
                                             dim=dim)[tp_rank].contiguous()
 
+                    rank_dim = 1 if is_moe else 0
+                    effective_rank = t_in.shape[rank_dim]
+
                     t_in = t_in.cuda().contiguous()
                     t_out = t_out.cuda().contiguous()
                     if rs_lora:
-                        scale = float(hf_config["lora_alpha"]) / np.sqrt(rank)
+                        scale = float(
+                            hf_config["lora_alpha"]) / np.sqrt(effective_rank)
                     else:
-                        scale = float(hf_config["lora_alpha"]) / rank
+                        scale = float(hf_config["lora_alpha"]) / effective_rank
                     t_out = t_out * scale
                     t_in = t_in.to(str_dtype_to_torch(model_config.dtype))
                     t_out = t_out.to(str_dtype_to_torch(model_config.dtype))
 
-                    rank_dim = 1 if is_moe else 0
-                    assert t_in.shape[rank_dim] == rank
                     self._lora_uid_to_low_ranks[uid][layer_idx][
-                        lora_module] = rank
+                        lora_module] = effective_rank
                     self._lora_weights_pointers_list[uid][layer_idx][
                         lora_module] = [t_in.data_ptr(),
                                         t_out.data_ptr()]
@@ -747,7 +749,7 @@ class LoraManager(object):
                     self._cpp_lora_config[uid].append(
                         torch.tensor([
                             self.LORA_MODULE_IDS[lora_module], layer_idx,
-                            int(hf_config['r'])
+                            effective_rank
                         ],
                                      dtype=torch.int32))
 

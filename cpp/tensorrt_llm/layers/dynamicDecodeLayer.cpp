@@ -160,8 +160,9 @@ void DynamicDecodeLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> co
 
     auto params = std::dynamic_pointer_cast<DecodingInputs>(baseInputs);
 
-    TLLM_CHECK_WITH_INFO(mDecodingMode.isExplicitDraftTokens() || params->logits || params->logitsVec,
-        "If not explicit Draft Tokens mode, either logits or logitsVec have to be specified.");
+    TLLM_CHECK_WITH_INFO(
+        mDecodingMode.isExplicitDraftTokens() || mDecodingMode.isEagle() || params->logits || params->logitsVec,
+        "If not Explicit Draft Tokens or Eagle mode, either logits or logitsVec have to be specified.");
     TLLM_CHECK_WITH_INFO(
         baseOutputs->sequenceLength.has_value(), "sequenceLength tensor is required in DynamicDecoderLayer.");
 
