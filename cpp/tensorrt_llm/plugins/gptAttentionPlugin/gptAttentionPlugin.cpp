@@ -55,24 +55,27 @@ GPTAttentionPlugin::GPTAttentionPlugin(int layer_idx, int num_heads, int vision_
     int rotary_embedding_max_positions, int rotary_embedding_original_max_positions, int tp_size,
     int tp_rank,                         // for ALiBi
     bool unfuse_qkv_gemm,                // for AutoPP
-    tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool enable_xqa, int kv_cache_quant_mode,
-    bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type,
-    tensorrt_llm::kernels::BlockSparseParams block_sparse_params, bool paged_kv_cache, int tokens_per_block,
-    nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled, bool cross_attention, int max_distance,
-    bool pos_shift_enabled, bool dense_context_fmha, bool use_paged_context_fmha, bool use_fp8_context_fmha,
-    bool has_full_attention_mask, bool use_cache, bool is_spec_decoding_enabled,
-    bool spec_decoding_is_generation_length_variable, int spec_decoding_max_generation_length, bool is_mla_enabled,
-    int q_lora_rank, int kv_lora_rank, int qk_nope_head_dim, int qk_rope_head_dim, int v_head_dim, bool skip_attn)
+    tensorrt_llm::kernels::ContextFMHAType context_fmha_type, int kv_cache_quant_mode, bool remove_input_padding,
+    tensorrt_llm::kernels::AttentionMaskType mask_type, tensorrt_llm::kernels::BlockSparseParams block_sparse_params,
+    bool paged_kv_cache, int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length,
+    bool qkv_bias_enabled, bool cross_attention, int max_distance, bool pos_shift_enabled, bool dense_context_fmha,
+    bool use_paged_context_fmha, bool use_fp8_context_fmha, bool has_full_attention_mask, bool use_cache,
+    bool is_spec_decoding_enabled, bool spec_decoding_is_generation_length_variable,
+    int spec_decoding_max_generation_length, bool is_mla_enabled, int q_lora_rank, int kv_lora_rank,
+    int qk_nope_head_dim, int qk_rope_head_dim, int v_head_dim, bool skip_attn, int cp_size, int cp_rank,
+    std::set<int32_t> cp_group)
     : GPTAttentionPluginCommon(layer_idx, num_heads, vision_start, vision_length, num_kv_heads, layer_idx_in_cache_pool,
         head_size, unidirectional, q_scaling, attn_logit_softcapping_scale, position_embedding_type,
         rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale_type, rotary_embedding_scale,
         rotary_embedding_short_m_scale, rotary_embedding_long_m_scale, rotary_embedding_max_positions,
-        rotary_embedding_original_max_positions, tp_size, tp_rank, unfuse_qkv_gemm, context_fmha_type, enable_xqa,
+        rotary_embedding_original_max_positions, tp_size, tp_rank, unfuse_qkv_gemm, context_fmha_type,
         kv_cache_quant_mode, remove_input_padding, mask_type, block_sparse_params, paged_kv_cache, tokens_per_block,
         type, max_context_length, qkv_bias_enabled, cross_attention, max_distance, pos_shift_enabled,
         dense_context_fmha, use_paged_context_fmha, use_fp8_context_fmha, has_full_attention_mask, use_cache,
         is_spec_decoding_enabled, spec_decoding_is_generation_length_variable, spec_decoding_max_generation_length,
-        is_mla_enabled, q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim, skip_attn)
+        is_mla_enabled, q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim, skip_attn, cp_size,
+
+        cp_rank, cp_group)
 {
     initEntryIdx();
 }
@@ -214,11 +217,22 @@ int GPTAttentionPlugin::getGenerationInputSequenceLength(
         // Speculative decoding mode might need variable generation input sequence length.
         if (mIsSpecDecodingEnabled)
         {
+            TLLM_CHECK_WITH_INFO(mCpSize <= 1, "Context Parallel does not support speculative decoding mode for now");
             // SPEC_DECODING_POSITION_OFFSETS: [batch_size, max_generation_input_length].
             return inputDesc[getIdx(IdxEntry::SPEC_DECODING_POSITION_OFFSETS)].dims.d[1];
         }
         else
         {
+            if (mCpSize > 1)
+            {
+                // Given that localNbTokens == (beamSize * localNbSeq + mCpSize - 1) / mCpSize, but when mCpSize - 1 >
+                // localNbSeq, there are multiple choices for beamSize. Assume beamSize == 1 here.
+                TLLM_CHECK_WITH_INFO(localNbTokens == (localNbSeq + mCpSize - 1) / mCpSize,
+                    "Context Parallel does not support beamSize > 1 for non-speculative decoding mode, "
+                    "localNbTokens=%d, localNbSeq=%d",
+                    localNbTokens, localNbSeq);
+                return 1;
+            }
             // [num_tokens, local_hidden_size] where num_tokens = batch_size * generation_input_length
             TLLM_CHECK_WITH_INFO(localNbTokens % localNbSeq == 0,
                 "seq_len should be same for all generation requests, localNbTokens=%d, localNbSeq=%d", localNbTokens,
@@ -569,6 +583,7 @@ int GPTAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc,
 
     int32_t nbContextRequests = 0;
     int32_t contextTokenIdxEnd = 0;
+    int32_t contextTokenIdxEndForCp = 0;
     // count context requests
     for (int32_t seqIdx = 0; seqIdx < nbSeq; seqIdx++)
     {
@@ -580,6 +595,10 @@ int GPTAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc,
         contextTokenIdxEnd += mRemovePadding
             ? static_cast<int32_t const*>(inputs[getIdx(IdxEntry::HOST_CONTEXT_LENGTH)])[seqIdx]
             : inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims.d[1];
+        contextTokenIdxEndForCp += mRemovePadding
+            ? (static_cast<int32_t const*>(inputs[getIdx(IdxEntry::HOST_CONTEXT_LENGTH)])[seqIdx] + mCpSize - 1)
+                / mCpSize
+            : (inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims.d[1] + mCpSize - 1) / mCpSize;
     }
 
     for (int32_t seqIdx = nbContextRequests; seqIdx < nbSeq; seqIdx++)
@@ -605,12 +624,12 @@ int GPTAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc,
     if (auto nbGenerationSeq = nbSeq - nbContextRequests; nbGenerationSeq > 0)
     {
         auto seqIdxBeg = nbContextRequests;
-        auto tokenIdxBeg = contextTokenIdxEnd;
+        auto tokenIdxBeg = mCpSize > 1 ? contextTokenIdxEndForCp : contextTokenIdxEnd;
         // if mRemovePadding is true, we may have IFB, and need to remove context tokens.
         // if mRemovePadding is false, it is only generation requests, so just multiply batch_beam and seq_len (May not
         // 1 for Parallel Decoding)
         auto localNbTokens = mRemovePadding
-            ? inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims.d[0] - contextTokenIdxEnd
+            ? inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims.d[0] - tokenIdxBeg
             : inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims.d[0] * inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims.d[1];
         enqueueSome<T, AttentionOutT, KVCacheBuffer>(seqIdxBeg, nbGenerationSeq, tokenIdxBeg, localNbTokens, inputDesc,
             outputDesc, inputs, outputs, workspace, stream);
@@ -984,6 +1003,12 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
                 = reinterpret_cast<int const*>(inputs[getIdx(IdxEntry::ENCODER_INPUT_LENGTH)]) + seqIdxBeg;
             enqueue_params.num_encoder_tokens = num_encoder_tokens;
         }
+        if (mCpSize > 1)
+        {
+            enqueue_params.host_context_lengths = mRemovePadding
+                ? reinterpret_cast<int const*>(inputs[getIdx(IdxEntry::HOST_CONTEXT_LENGTH)])
+                : nullptr;
+        }
 
         if (mIsMLAEnabled)
         {
@@ -1252,7 +1277,6 @@ IPluginV2* GPTAttentionPluginCreator::createPlugin(char const* name, PluginField
             static_cast<int32_t>(p.getScalar<int32_t>("tp_rank").value()),
             static_cast<bool>(p.getScalar<int8_t>("unfuse_qkv_gemm").value()),
             static_cast<ContextFMHAType>(p.getScalar<int8_t>("context_fmha_type").value()),
-            static_cast<bool>(p.getScalar<int8_t>("enable_xqa").value()),
             p.getScalar<int32_t>("kv_cache_quant_mode").value(),
             static_cast<bool>(p.getScalar<int8_t>("remove_input_padding").value()),
             static_cast<AttentionMaskType>(p.getScalar<int32_t>("mask_type").value()),
@@ -1282,7 +1306,10 @@ IPluginV2* GPTAttentionPluginCreator::createPlugin(char const* name, PluginField
             static_cast<int32_t>(p.getScalar<int32_t>("qk_nope_head_dim").value()),
             static_cast<int32_t>(p.getScalar<int32_t>("qk_rope_head_dim").value()),
             static_cast<int32_t>(p.getScalar<int32_t>("v_head_dim").value()),
-            static_cast<bool>(p.getScalar<int8_t>("skip_attn").value()));
+            static_cast<bool>(p.getScalar<int8_t>("skip_attn").value()),
+            static_cast<int32_t>(p.getScalar<int32_t>("cp_size").value()),
+            static_cast<int32_t>(p.getScalar<int32_t>("cp_rank").value()),
+            static_cast<std::set<int32_t>>(p.getSet<int32_t>("cp_group").value()));
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }

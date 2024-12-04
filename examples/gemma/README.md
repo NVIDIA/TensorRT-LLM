@@ -22,10 +22,8 @@
       - [Run 7B inference under SmoothQuant for jax checkpoint](#run-7b-inference-under-smoothquant-for-jax-checkpoint)
       - [Run inference under weight only for keras checkpoint](#run-inference-under-weight-only-for-keras-checkpoint)
       - [Run inference under INT8 KV caches for keras checkpoint](#run-inference-under-int8-kv-caches-for-keras-checkpoint)
-    - [Run Gemma 9B](#run-gemma-2)
-      - [Run inference under bfloat16 for HF checkpoint](#run-inference-under-bfloat16-for-hf-checkpoint)
-    - [Run Gemma 27B](#run-gemma-2)
-      - [Run inference under bfloat16 for HF checkpoint](#run-inference-under-bfloat16-for-hf-checkpoint)
+    - [Run Gemma 2](#run-gemma-2)
+      - [Run inference under bfloat16 for torch checkpoint](#run-inference-under-bfloat16-for-torch-checkpoint-1)
     - [Run Modelopt Quantization](#run-modelopt-quantization)
       - [Requirements](#requirements)
       - [Quantize Checkpoints](#quantize-checkpoints)
@@ -264,7 +262,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_batch_size 8 \
              --max_input_len 3000 \
              --max_seq_len 3100 \
-             --enable_xqa enable \
              --output_dir ${ENGINE_PATH}
 
 python3 ../summarize.py --test_trt_llm \
@@ -310,7 +307,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
                  --max_batch_size 32 \
                  --max_input_len 3000 \
                  --max_seq_len 3100 \
-                 --enable_xqa enable \
                  --output_dir ${ENGINE_PATH}
 
 python3 ../summarize.py --test_trt_llm \
@@ -352,7 +348,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_batch_size 32 \
              --max_input_len 3000 \
              --max_seq_len 3100 \
-             --enable_xqa enable \
              --output_dir ${ENGINE_PATH}
 
 python3 ../summarize.py --test_trt_llm \
@@ -480,7 +475,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_batch_size 8 \
              --max_input_len 3000 \
              --max_seq_len 3100 \
-             --enable_xqa enable \
              --output_dir ${ENGINE_PATH}
 
 python3 ../summarize.py --test_trt_llm \
@@ -531,7 +525,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
                  --max_batch_size 32 \
                  --max_input_len 3000 \
                  --max_seq_len 3100 \
-                 --enable_xqa enable \
                  --output_dir ${ENGINE_PATH}
 
 python3 ../summarize.py --test_trt_llm \
@@ -572,7 +565,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_batch_size 32 \
              --max_input_len 3000 \
              --max_seq_len 3100 \
-             --enable_xqa enable \
              --output_dir ${ENGINE_PATH}
 
 python3 ../summarize.py --test_trt_llm \
@@ -673,7 +665,6 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_PATH} \
              --max_batch_size 8 \
              --max_input_len 3000 \
              --max_seq_len 3100 \
-             --enable_xqa enable \
              --output_dir ${ENGINE_PATH}
 ```
 

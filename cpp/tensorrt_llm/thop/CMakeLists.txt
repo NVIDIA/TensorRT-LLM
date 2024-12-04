@@ -20,6 +20,8 @@ target_link_libraries(th_utils PUBLIC ${TORCH_LIBRARIES} ${CUBLAS_LIB}
 
 add_library(
   th_common SHARED
+  allgatherOp.cpp
+  allreduceOp.cpp
   convertSpecDecodingMaskToPackedMaskOp.cpp
   dynamicDecodeOp.cpp
   fmhaPackMaskOp.cpp
@@ -33,6 +35,12 @@ add_library(
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(th_common PRIVATE ${TORCH_LIBRARIES} th_utils
                                         ${Python3_LIBRARIES} ${SHARED_TARGET})
+
+if(ENABLE_MULTI_DEVICE)
+  target_include_directories(th_common PUBLIC ${MPI_C_INCLUDE_DIRS})
+  target_link_libraries(th_common PRIVATE ${MPI_C_LIBRARIES} ${NCCL_LIB}
+                                          CUDA::nvml)
+endif()
 
 if(NOT WIN32)
   set_target_properties(

@@ -812,8 +812,9 @@ public:
             }
             if (mEnableCollectIterStats)
             {
-                for (auto const& iterStats : contextStats)
+                for (std::size_t i = 0; i < contextStats.size(); i++)
                 {
+                    auto const& iterStats = contextStats.at(i);
                     for (auto const& stat : iterStats)
                     {
                         SizeType32 numNewActiveRequests = stat.numNewActiveRequests;
@@ -826,13 +827,15 @@ public:
                         }
                         if (mLogIterationData)
                         {
-                            TLLM_LOG_INFO(texec::JsonSerialization::toJsonStr(stat));
+                            TLLM_LOG_INFO(
+                                "ctx_id %d, ctx_stat: %s", i, texec::JsonSerialization::toJsonStr(stat).c_str());
                         }
                     }
                 }
 
-                for (auto const& iterStats : generationStats)
+                for (std::size_t i = 0; i < generationStats.size(); i++)
                 {
+                    auto const& iterStats = generationStats.at(i);
                     for (auto const& stat : iterStats)
                     {
                         SizeType32 numNewActiveRequests = stat.numNewActiveRequests;
@@ -845,7 +848,8 @@ public:
                         }
                         if (mLogIterationData)
                         {
-                            TLLM_LOG_INFO(texec::JsonSerialization::toJsonStr(stat));
+                            TLLM_LOG_INFO(
+                                "gen_id %d, gen_stat: %s", i, texec::JsonSerialization::toJsonStr(stat).c_str());
                         }
                     }
                 }
@@ -854,9 +858,9 @@ public:
             {
                 continue;
             }
-            for (auto const& stats : generationRequestStatsPerIteration)
+            for (std::size_t i = 0; i < generationRequestStatsPerIteration.size(); i++)
             {
-
+                auto const& stats = generationRequestStatsPerIteration.at(i);
                 for (auto const& stat : stats)
                 {
                     std::vector<float> kvCacheTransferMs;
@@ -874,7 +878,8 @@ public:
                     }
                     if (mLogIterationData)
                     {
-                        TLLM_LOG_INFO(texec::JsonSerialization::toJsonStr(stat));
+                        TLLM_LOG_INFO(
+                            "gen_id %d, gen_req_stat: %s", i, texec::JsonSerialization::toJsonStr(stat).c_str());
                     }
                 }
             }
@@ -973,6 +978,7 @@ void benchmark(std::vector<std::filesystem::path> const& contextEngineDirs,
     if (worldRank == 0)
     {
         { // warmup
+            TLLM_LOG_INFO("Warmup start");
             std::vector<tensorrt_llm::executor::Request> contextRequests;
             contextRequests.reserve(warmUp);
             for (int i = 0; i < warmUp; ++i)
@@ -989,6 +995,7 @@ void benchmark(std::vector<std::filesystem::path> const& contextEngineDirs,
             disaggExecutor->waitForGenResponse(warmUp, true);
             auto const warmUpWaitSleep = std::chrono::milliseconds(50);
             std::this_thread::sleep_for(warmUpWaitSleep);
+            TLLM_LOG_INFO("Warmup done");
         }
 
         {

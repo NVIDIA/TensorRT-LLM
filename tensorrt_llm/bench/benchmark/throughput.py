@@ -19,7 +19,6 @@ from tensorrt_llm.bench.benchmark.utils.multiproc import ThroughputBenchmark
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.enums import IFBSchedulingPolicy
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
-from tensorrt_llm.bench.dataclasses.reporting import report_statistics
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer)
 from tensorrt_llm.logger import logger
@@ -92,6 +91,16 @@ from tensorrt_llm.logger import logger
     default=False,
     help="Enable streaming mode for requests.",
 )
+@click.option(
+    "--iteration_log",
+    type=click.Path(dir_okay=False,
+                    writable=True,
+                    readable=False,
+                    path_type=Path,
+                    resolve_path=True),
+    required=False,
+    help="Path where iteration stats should be written to.",
+)
 @click.pass_obj
 def throughput_command(
     bench_env: BenchmarkEnvironment,
@@ -110,6 +119,7 @@ def throughput_command(
     num_requests: int = params.pop("num_requests")
     model: str = bench_env.model
     engine_dir: Path = params.pop("engine_dir")
+    iteration_log: Path = params.pop("iteration_log")
 
     # Engine configuration parsing
     exec_settings, build_cfg = get_settings_from_engine(engine_dir)
@@ -141,6 +151,10 @@ def throughput_command(
     exec_settings["settings_config"]["beam_width"] = beam_width
     exec_settings["settings_config"][
         "scheduler_policy"] = IFBSchedulingPolicy.NO_EVICT
+
+    # Dynamic runtime features.
+    exec_settings["settings_config"]["dynamic_max_batch_size"] = True
+
     # Construct the runtime configuration dataclass.
     runtime_config = RuntimeConfig(**exec_settings)
 
@@ -171,26 +185,27 @@ def throughput_command(
         )
         del requests
 
-        logger.info("Setting up benchmarker and infrastructure.")
-        new_request_queue = mp.Queue()
-        response_queue = mp.Queue()
-        benchmark = ThroughputBenchmark(
-            dataset=executor_requests,
-            request_rate=request_rate,
-            runtime_cfg=runtime_config,
-            request_queue=new_request_queue,
-            response_queue=response_queue,
-            streaming=streaming,
-        )
+    logger.info("Setting up benchmarker and infrastructure.")
+    new_request_queue = mp.Queue()
+    response_queue = mp.Queue()
+    benchmark = ThroughputBenchmark(
+        dataset=executor_requests,
+        request_rate=request_rate,
+        runtime_cfg=runtime_config,
+        request_queue=new_request_queue,
+        response_queue=response_queue,
+        streaming=streaming,
+        iteration_log=iteration_log,
+    )
 
-        try:
-            logger.info("Ready to start benchmark.")
-            benchmark.start_benchmark()
-            benchmark.wait()
-            benchmark.stop_benchmark()
-            report_statistics(benchmark.statistics, runtime_config, logger,
-                              streaming)
-        except KeyboardInterrupt:
-            benchmark.stop_benchmark()
-        finally:
-            benchmark.shutdown()
+    try:
+        logger.info("Ready to start benchmark.")
+        benchmark.start_benchmark()
+        benchmark.wait()
+        benchmark.stop_benchmark()
+        benchmark.dump_extra_stats()
+        benchmark.report_statistics()
+    except KeyboardInterrupt:
+        benchmark.stop_benchmark()
+    finally:
+        benchmark.shutdown()

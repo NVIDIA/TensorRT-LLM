@@ -204,7 +204,7 @@ class Workspace
 {
 public:
     Workspace(int world_size, int rank, int max_token_num, int max_hidden_size)
-        : world_config(world_size, 1, rank, world_size)
+        : world_config(world_size, 1, 1, rank, world_size)
         , set_device(world_config.getDevice())
         , p_s(std::make_shared<tr::CudaStream>())
         , buf_mgr(p_s)

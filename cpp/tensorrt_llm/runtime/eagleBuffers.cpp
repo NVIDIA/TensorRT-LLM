@@ -37,7 +37,6 @@ void EagleBuffers::Inputs::create(SizeType32 maxNumSequences, TllmRuntime const&
 
     auto const& speculativeDecodingModule = modelConfig.getSpeculativeDecodingModule();
     auto const maxNumPaths = speculativeDecodingModule.getMaxNumPaths();
-    auto const maxDraftPathLen = speculativeDecodingModule.getMaxDraftPathLen();
     auto const maxPathLen = speculativeDecodingModule.getMaxPathLen();
     auto const maxDecodingTokens = speculativeDecodingModule.getMaxDecodingTokens();
     auto const maxDecodingDraftTokens = speculativeDecodingModule.getMaxDecodingDraftTokens();
@@ -47,7 +46,7 @@ void EagleBuffers::Inputs::create(SizeType32 maxNumSequences, TllmRuntime const&
     temperatures = manager.gpu(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kFLOAT);
     randomDataSample = manager.gpu(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kFLOAT);
     randomDataValidation
-        = manager.gpu(ITensor::makeShape({maxNumSequences, maxNumPaths, maxDraftPathLen}), nvinfer1::DataType::kFLOAT);
+        = manager.gpu(ITensor::makeShape({maxNumSequences, maxDecodingTokens}), nvinfer1::DataType::kFLOAT);
     draftTokens = manager.gpu(ITensor::makeShape({maxNumSequences, maxDecodingDraftTokens}), TRTTokenIdType);
     draftLens = manager.gpu(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
     draftPaths
@@ -96,6 +95,11 @@ EagleBuffers::EagleBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, run
 
     // input tensors
     engineInputs.temperatures = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kFLOAT);
+    engineInputs.posteriorAlpha = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kFLOAT);
+    engineInputs.posteriorThreshold = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kFLOAT);
+    posteriorAlphaHost = manager.emptyTensor(runtime::MemoryType::kPINNEDPOOL, nvinfer1::DataType::kFLOAT);
+    posteriorThresholdHost = manager.emptyTensor(runtime::MemoryType::kPINNEDPOOL, nvinfer1::DataType::kFLOAT);
+    greedySamplingHost = manager.pinnedPool(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
 
     engineInputs.draftTokens
         = manager.gpu(ITensor::makeShape({maxNumSequences, maxDecodingDraftTokens}), TRTTokenIdType);
@@ -155,6 +159,12 @@ EagleBuffers::EagleBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, run
     // pre-allocate empty tensors
     reshape(0, maxNumSequences, modelConfig);
 
+    // Init defaults
+    auto const defaultConfig = decodingConfig.getEagleConfig().value_or(tensorrt_llm::executor::EagleConfig());
+    mDoGreedySampling = defaultConfig.isGreedySampling();
+    mDefaultPosteriorThreshold = defaultConfig.getPosteriorThreshold().value_or(mDefaultPosteriorThreshold);
+    bufferCast<SizeType32>(*greedySamplingHost)[0] = mDoGreedySampling;
+
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -172,6 +182,10 @@ void EagleBuffers::reshape(
 
     // input tensors
     engineInputs.temperatures->reshape(ITensor::makeShape({numSequences}));
+    engineInputs.posteriorAlpha->reshape(ITensor::makeShape({numSequences}));
+    engineInputs.posteriorThreshold->reshape(ITensor::makeShape({numSequences}));
+    posteriorAlphaHost->reshape(ITensor::makeShape({numSequences}));
+    posteriorThresholdHost->reshape(ITensor::makeShape({numSequences}));
 
     auto draftTokensShape = engineInputs.draftTokens->getShape();
     draftTokensShape.d[0] = numSequences;
@@ -189,7 +203,7 @@ void EagleBuffers::reshape(
         ITensor::makeShape({numGenSequences * maxDecodingTokens, common::ceilDiv(maxDecodingTokens, 32)}));
 
     engineInputs.randomDataSample->reshape(ITensor::makeShape({numSequences}));
-    engineInputs.randomDataValidation->reshape(ITensor::makeShape({numSequences}));
+    engineInputs.randomDataValidation->reshape(ITensor::makeShape({numSequences, maxDecodingTokens}));
 
     engineInputs.eagleNetCtxRequestTypesHost->reshape(ITensor::makeShape({numSequences}));
     engineInputs.eagleNetCtxContextLengthsHost->reshape(ITensor::makeShape({numSequences}));
@@ -304,6 +318,22 @@ void EagleBuffers::setFromInputs(RequestVector const& contextRequests, RequestVe
             = bufferCast<SizeType32>(*draftBuffers.eagleNetGenPastKeyValueLengthsHost)[batchSlot];
     };
 
+    auto posteriorAlphaHostPtr = bufferCast<float>(*posteriorAlphaHost);
+    auto posteriorThresholdHostPtr = bufferCast<float>(*posteriorThresholdHost);
+    auto setPosteriorThresholds
+        = [this, posteriorAlphaHostPtr, posteriorThresholdHostPtr](LlmRequestPtr const& llmReq, SizeType32 batchIdx)
+    {
+        auto const eagleConfig = llmReq->getEagleConfig();
+
+        float posteriorThreshold{this->mDefaultPosteriorThreshold};
+        if (eagleConfig.has_value())
+        {
+            posteriorThreshold = eagleConfig->getPosteriorThreshold().value_or(posteriorThreshold);
+        }
+        posteriorAlphaHostPtr[batchIdx] = std::sqrt(posteriorThreshold);
+        posteriorThresholdHostPtr[batchIdx] = posteriorThreshold;
+    };
+
     for (auto const& llmReq : contextRequests)
     {
         if (llmReq->isLastContextChunk())
@@ -347,17 +377,23 @@ void EagleBuffers::setFromInputs(RequestVector const& contextRequests, RequestVe
             chunkedContextNextTokensHostPtr[batchIdx] = reqTokens[endCompute];
         }
 
+        setPosteriorThresholds(llmReq, batchIdx);
+
         ++batchIdx;
     }
-    for (; batchIdx < numCtxSequences + numGenSequences; ++batchIdx)
+
+    for (auto const& llmReq : genRequests)
     {
         auto const batchSlot = params.batchSlots[batchIdx];
         setupEagleNetHostBuffers(batchIdx, batchSlot);
+        setPosteriorThresholds(llmReq, batchIdx);
 
         auto const generationLength
             = bufferCast<SizeType32>(*draftBuffers.specDecodingGenerationLengthsHost)[batchSlot];
         maxGenerationLengthHostValue = std::max(maxGenerationLengthHostValue, generationLength);
         numGenerationTokens += generationLength;
+
+        ++batchIdx;
     }
 
     if (maxGenerationLengthHostValue <= 0)
@@ -375,6 +411,8 @@ void EagleBuffers::setFromInputs(RequestVector const& contextRequests, RequestVe
 
     manager.copy(*chunkedContextNextTokensHost, *engineInputs.chunkedContextNextTokens);
     manager.copy(*chunkedContextNextTokensHost, *engineOutputs.chunkedContextNextTokens);
+    manager.copy(*posteriorAlphaHost, *engineInputs.posteriorAlpha);
+    manager.copy(*posteriorThresholdHost, *engineInputs.posteriorThreshold);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -416,7 +454,10 @@ void EagleBuffers::insertInputTensors(
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     // inputs
+    inputBuffers.insert_or_assign("greedy_sampling", greedySamplingHost);
     inputBuffers.insert_or_assign("eagle_temperature", engineInputs.temperatures);
+    inputBuffers.insert_or_assign("posterior_alpha", engineInputs.posteriorAlpha);
+    inputBuffers.insert_or_assign("posterior_threshold", engineInputs.posteriorThreshold);
 
     inputBuffers.insert_or_assign("spec_decoding_generation_lengths", engineInputs.specDecodingGenerationLengths);
     inputBuffers.insert_or_assign("spec_decoding_position_offsets", engineInputs.specDecodingPositionOffsets);

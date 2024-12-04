@@ -121,11 +121,7 @@ LayoutDetails getLayoutDetailsForArch(QuantType quant_type)
 
 LayoutDetails getLayoutDetailsForTransform(QuantType quant_type, int arch)
 {
-    if (arch >= 70 && arch < 75)
-    {
-        return getLayoutDetailsForArch<cutlass::arch::Sm70>(quant_type);
-    }
-    else if (arch >= 75 && arch < 80)
+    if (arch >= 75 && arch < 80)
     {
         return getLayoutDetailsForArch<cutlass::arch::Sm75>(quant_type);
     }
@@ -598,16 +594,13 @@ void preprocess_weights_for_mixed_gemm(int8_t* preprocessed_quantized_weight, in
         src_buf.swap(dst_buf);
     }
 
-    if (details.columns_interleaved > 1)
+    if (details.columns_interleaved > 1 && arch < 90)
     {
         interleave_column_major_tensor(dst_buf.data(), src_buf.data(), shape, quant_type, details);
         src_buf.swap(dst_buf);
     }
 
-    if (arch >= 70 && arch < 90)
-    {
-        add_bias_and_interleave_quantized_tensor_inplace(src_buf.data(), num_elts, quant_type);
-    }
+    add_bias_and_interleave_quantized_tensor_inplace(src_buf.data(), num_elts, quant_type);
     std::copy(src_buf.begin(), src_buf.end(), preprocessed_quantized_weight);
 }
 

@@ -8,10 +8,10 @@ mpi4py
 numpy<2
 onnx>=1.12.0
 onnx_graphsurgeon>=0.5.2
-openai
+openai==1.54.3
 polygraphy
 psutil
-pynvml>=11.5.0
+pynvml~=11.5.0
 pulp
 pandas
 h5py==3.10.0
@@ -38,3 +38,4 @@ fastapi==0.115.4
 uvicorn
 httpx
 setuptools==69.5.1
+ordered-set

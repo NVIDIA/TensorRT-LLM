@@ -17,6 +17,7 @@
 #include <gmock/gmock-matchers.h>
 #include <gtest/gtest.h>
 
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
@@ -41,7 +42,6 @@ decoder_batch::Input prepareDecoderInputs(SizeType32 batchSize, SizeType32 maxBe
 {
     std::vector<decoder_batch::Input::TensorPtr> logits;
     logits.reserve(batchSize);
-    auto constexpr tokenId = 1;
     for (auto batchIdx = 0; batchIdx < batchSize; ++batchIdx)
     {
         auto const beamWidth = samplingConfigs[batchIdx].beamWidth;
@@ -87,10 +87,10 @@ decoder_batch::Output prepareDecoderOutputs(SizeType32 batchSize, SizeType32 max
 
 std::vector<decoder_batch::Request> prepareRequests(SizeType32 batchSize, SizeType32 maxNewTokens,
     std::vector<SizeType32> const& inputLengths, std::vector<SizeType32> const& generatedTokensPerSteps,
-    std::vector<SizeType32> const& acceptedTokensPerStep, TokenIdType tokenId, TokenIdType endId, TokenIdType padId,
-    BufferManager& manager)
+    std::vector<SizeType32> const& acceptedTokensPerStep, TokenIdType inputTokenId, TokenIdType expectedTokenId,
+    TokenIdType endId, BufferManager const& manager)
 {
-    auto& stream = manager.getStream();
+    auto const& stream = manager.getStream();
 
     std::vector<decoder_batch::Request> requests;
     requests.reserve(batchSize);
@@ -98,13 +98,17 @@ std::vector<decoder_batch::Request> prepareRequests(SizeType32 batchSize, SizeTy
     {
         auto shape = ITensor::makeShape({inputLengths[batchIdx]});
         auto input = manager.gpu(shape, TRTDataType<SizeType32>::value);
-        kernels::invokeFill(*input, tokenId, stream);
+        kernels::invokeFill(*input, inputTokenId, stream);
 
-        requests.emplace_back(decoder_batch::Request{std::move(input), inputLengths[batchIdx], maxNewTokens, endId});
+        requests.emplace_back(std::move(input), inputLengths[batchIdx], maxNewTokens, endId);
         if (generatedTokensPerSteps[batchIdx] > 1)
         {
-            std::vector<TokenIdType> draftTokens(generatedTokensPerSteps[batchIdx] - 1);
-            std::fill(draftTokens.begin(), draftTokens.begin() + acceptedTokensPerStep[batchIdx], 1023);
+            TokenIdType constexpr tokenToReject{1};
+            TLLM_CHECK(tokenToReject != expectedTokenId);
+            // fill with tokens to reject
+            std::vector<TokenIdType> draftTokens(generatedTokensPerSteps[batchIdx] - 1, tokenToReject);
+            // fill with tokens to accept
+            std::fill(draftTokens.begin(), draftTokens.begin() + acceptedTokensPerStep[batchIdx], expectedTokenId);
             requests.back().draftTokens = manager.copyFrom(draftTokens, MemoryType::kGPU);
             requests.back().generatedTokensPerEngineStep = generatedTokensPerSteps[batchIdx];
         }
@@ -138,7 +142,7 @@ void checkSequenceLengths(
 void verifyResults(BufferManager& manager, GptDecoderBatched const& decoder,
     std::vector<SamplingConfig> const& samplingConfigs, std::vector<SizeType32> const& inputLengths,
     std::vector<SizeType32> const& sequenceLengths, SizeType32 batchSize, SizeType32 maxBeamWidth,
-    SizeType32 maxSeqLength, SizeType32 tokenId, SizeType32 padId)
+    SizeType32 maxSeqLength, SizeType32 inputTokenId, SizeType32 expectedTokenId, SizeType32 padId)
 {
     auto outputsIds = decoder.getIds();
     // TODO: test parentIds
@@ -159,17 +163,20 @@ void verifyResults(BufferManager& manager, GptDecoderBatched const& decoder,
         auto samplingConfig = samplingConfigs.at(b);
         for (auto bw = 0; bw < samplingConfig.beamWidth; ++bw)
         {
-            auto const result = (samplingConfig.beamWidth == 1) ? 1023 : bw;
+            auto const result = (samplingConfig.beamWidth == 1) ? expectedTokenId : bw;
 
-            auto const outputPtr = output + tc::flat_index(outputShape.d, b, bw, 0);
-            auto begin = outputPtr;
-            auto end = outputPtr + inputLengths.at(b);
-            ASSERT_LE(begin, end) << "bad input length " << inputLengths.at(b);
-            ASSERT_THAT(std::vector(begin, end), ::testing::Each(tokenId)) << "input tokens: "
-                                                                           << "b:" << b << " bw: " << bw;
+            auto* const outputPtr = output + tc::flat_index(outputShape.d, b, bw, 0);
+
+            auto const inputLength = inputLengths.at(b);
+            auto* begin = outputPtr;
+            auto* end = outputPtr + inputLength;
+            ASSERT_LE(begin, end) << "bad input length " << inputLength;
+            ASSERT_THAT(std::vector(begin, end), ::testing::Each(inputTokenId)) << "input tokens: "
+                                                                                << "b:" << b << " bw: " << bw;
+            auto const seqLength = sequenceLengths.at(tc::flat_index2(b, bw, maxBeamWidth));
             begin = end;
-            end = outputPtr + sequenceLengths.at(tc::flat_index2(b, bw, maxBeamWidth));
-            ASSERT_LE(begin, end) << "bad seq length " << sequenceLengths.at(b);
+            end = outputPtr + seqLength;
+            ASSERT_LE(begin, end) << "bad seq length " << seqLength;
             ASSERT_THAT(std::vector(begin, end), ::testing::Each(result)) << "new tokens: "
                                                                           << "b:" << b << " bw: " << bw;
             begin = end;
@@ -187,8 +194,9 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& sa
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     SizeType32 constexpr tensorParallelism{1};
     SizeType32 constexpr pipelineParallelism{1};
+    SizeType32 constexpr contextParallelism{1};
     SizeType32 constexpr localRank{0};
-    WorldConfig const worldConfig{tensorParallelism, pipelineParallelism, localRank};
+    WorldConfig const worldConfig{tensorParallelism, pipelineParallelism, contextParallelism, localRank};
 
     SizeType32 constexpr vocabSize{51200};
     SizeType32 constexpr nbAttentionLayers{2};
@@ -234,9 +242,10 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& sa
         acceptedTokensPerStep[batchIdx] = generatedTokensPerSteps[batchIdx] - 1;
     }
 
-    auto constexpr tokenId = 1;
+    auto constexpr inputTokenId = 1;
+    auto constexpr expectedTokenId = 1023;
     auto requests = prepareRequests(batchSize, maxNewTokens, inputLengths, generatedTokensPerSteps,
-        acceptedTokensPerStep, tokenId, endId, padId, manager);
+        acceptedTokensPerStep, inputTokenId, expectedTokenId, endId, manager);
 
     // set up inputs and outputs
     auto inputs = prepareDecoderInputs(batchSize, maxBeamWidth, maxSeqLength, vocabSizePadded, dataType,
@@ -272,7 +281,7 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& sa
     EXPECT_THAT(finished, ::testing::Each(false));
 
     verifyResults(manager, decoder, samplingConfigs, inputLengths, expectedLengths, batchSize, maxBeamWidth,
-        maxSeqLength, tokenId, padId);
+        maxSeqLength, inputTokenId, expectedTokenId, padId);
 
     // run decoder for 1 step
     decoder.forward(outputs, inputs);
@@ -282,7 +291,7 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& sa
     EXPECT_THAT(decoder.getFinished(), ::testing::Each(false));
 
     verifyResults(manager, decoder, samplingConfigs, inputLengths, expectedLengths, batchSize, maxBeamWidth,
-        maxSeqLength, tokenId, padId);
+        maxSeqLength, inputTokenId, expectedTokenId, padId);
 
     // run decoder for 1 step
     decoder.forward(outputs, inputs);
@@ -292,7 +301,7 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& sa
     EXPECT_THAT(decoder.getFinished(), ::testing::Each(true));
 
     verifyResults(manager, decoder, samplingConfigs, inputLengths, expectedLengths, batchSize, maxBeamWidth,
-        maxSeqLength, tokenId, padId);
+        maxSeqLength, inputTokenId, expectedTokenId, padId);
 
     EXPECT_NO_THROW(decoder.forward(outputs, inputs));
     checkSequenceLengths(*outputs.sequenceLengths, expectedLengths, manager);
@@ -308,8 +317,9 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     SizeType32 constexpr tensorParallelism{1};
     SizeType32 constexpr pipelineParallelism{1};
+    SizeType32 constexpr contextParallelism{1};
     SizeType32 constexpr localRank{0};
-    WorldConfig const worldConfig{tensorParallelism, pipelineParallelism, localRank};
+    WorldConfig const worldConfig{tensorParallelism, pipelineParallelism, contextParallelism, localRank};
 
     SizeType32 constexpr vocabSize{51200};
     SizeType32 constexpr nbAttentionLayers{2};
@@ -355,9 +365,10 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
         acceptedTokensPerStep[batchIdx] = generatedTokensPerSteps[batchIdx] - 1;
     }
 
-    auto constexpr tokenId = 1;
+    auto constexpr inputTokenId = 1;
+    auto constexpr expectedTokenId = 1023;
     auto requests = prepareRequests(batchSize, maxNewTokens, inputLengths, generatedTokensPerSteps,
-        acceptedTokensPerStep, tokenId, endId, padId, manager);
+        acceptedTokensPerStep, inputTokenId, expectedTokenId, endId, manager);
 
     // set up inputs and outputs
     auto inputs = prepareDecoderInputs(batchSize, maxBeamWidth, maxSeqLength, vocabSizePadded, dataType,
@@ -421,7 +432,7 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
     }
 
     verifyResults(manager, decoder, samplingConfigs, inputLengths, expectedLengths, batchSize, maxBeamWidth,
-        maxSeqLength, tokenId, padId);
+        maxSeqLength, inputTokenId, expectedTokenId, padId);
 }
 
 void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& samplingConfigs,
@@ -434,8 +445,9 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
 
     SizeType32 constexpr tensorParallelism{1};
     SizeType32 constexpr pipelineParallelism{1};
+    SizeType32 constexpr contextParallelism{1};
     SizeType32 constexpr localRank{0};
-    WorldConfig const worldConfig{tensorParallelism, pipelineParallelism, localRank};
+    WorldConfig const worldConfig{tensorParallelism, pipelineParallelism, contextParallelism, localRank};
 
     SizeType32 constexpr vocabSize{51200};
     SizeType32 constexpr nbAttentionLayers{2};
@@ -473,12 +485,10 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
         }
     }
 
-    std::vector<SizeType32> advancedTokensPerStep{generatedTokensPerSteps};
-    std::for_each(advancedTokensPerStep.begin(), advancedTokensPerStep.end(), [](auto& x) { x -= 1; });
-
-    auto constexpr tokenId = 1;
+    auto constexpr inputTokenId = 1;
+    auto constexpr expectedTokenId = 1023;
     auto requests = prepareRequests(batchSize, maxNewTokens, inputLengths, generatedTokensPerSteps,
-        acceptedTokensPerStep, tokenId, endId, padId, manager);
+        acceptedTokensPerStep, inputTokenId, expectedTokenId, endId, manager);
 
     // set up inputs and outputs
     auto inputs = prepareDecoderInputs(batchSize, maxBeamWidth, maxSeqLength, vocabSizePadded, dataType,
@@ -504,7 +514,6 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
     cudaDeviceSynchronize();
 
     auto expectedLengths = tiledInputLengths;
-    auto generatedLengths = tiledInputLengths;
     checkSequenceLengths(*outputs.sequenceLengths, expectedLengths, manager);
 
     auto const& finished = decoder.getFinished();
@@ -512,7 +521,7 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
     EXPECT_THAT(finished, ::testing::Each(false));
 
     verifyResults(manager, decoder, samplingConfigs, inputLengths, expectedLengths, batchSize, maxBeamWidth,
-        maxSeqLength, tokenId, padId);
+        maxSeqLength, inputTokenId, expectedTokenId, padId);
 
     // run decoder for 1 step
     decoder.forward(outputs, inputs);
@@ -522,7 +531,7 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
     EXPECT_THAT(decoder.getFinished(), ::testing::Each(false));
 
     verifyResults(manager, decoder, samplingConfigs, inputLengths, expectedLengths, batchSize, maxBeamWidth,
-        maxSeqLength, tokenId, padId);
+        maxSeqLength, inputTokenId, expectedTokenId, padId);
 }
 
 } // namespace

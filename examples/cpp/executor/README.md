@@ -104,3 +104,14 @@ mpirun -n 3  --allow-run-as-root ./executorExampleFastLogits --engine_dir <path_
 The examples uses 3 MPI ranks (one for the orchestrator, one for the draft model and one for the target model).
 
 Use `--fast_logits=false` to disable the fast logits feature.
+
+### executorExampleKvEvents
+
+From the `examples/cpp/executor/build` folder, you can get run the `executorExampleKvEvents` example with:
+
+```
+./executorExampleKvEvents --engine_dir <path_to_engine_dir>
+```
+where `<path_to_engine_dir>` is the path to the directly containing the TensorRT engine files.
+
+This example shows how the KV Cache Event API can be used to reconstruct the state of TRT-LLM's internal radix tree. This can be used in applications such as smart routing to route requests between multiple executor instances to maximize KV Cache reuse. Events are emitted when blocks are stored, removed, or updated in the radix tree.

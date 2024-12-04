@@ -25,8 +25,9 @@
     ```
     2. Convert
     ```bash
-    python3 ../qwen/convert_checkpoint.py --model_dir=./Qwen-VL-Chat \
-            --output_dir=./tllm_checkpoint_1gpu
+    python3 ./examples/qwen/convert_checkpoint.py --model_dir=./Qwen-VL-Chat \
+            --output_dir=./tllm_checkpoint_1gpu \
+            --dtype float16
     ```
 
 - Build TensorRT-LLM engine

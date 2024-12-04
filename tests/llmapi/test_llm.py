@@ -11,13 +11,15 @@ import datasets
 import pytest
 import torch
 import transformers
+from pydantic import BaseModel
 
 from tensorrt_llm._utils import release_gc
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.executor import (ExecutorBindingsWorker, LoRARequest,
                                    PromptAdapterRequest, RequestError)
-from tensorrt_llm.llmapi import (LLM, BuildCacheConfig, KvCacheConfig,
-                                 NoStatsAvailable, SamplingParams)
+from tensorrt_llm.llmapi import (LLM, BuildCacheConfig, GuidedDecodingParams,
+                                 KvCacheConfig, NoStatsAvailable,
+                                 SamplingParams)
 from tensorrt_llm.llmapi.llm_utils import BuildConfig, _ParallelConfig
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase, TransformersTokenizer
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
@@ -785,6 +787,61 @@ def test_generate_with_logits_post_processor():
         logits_post_processor_map={"my_logits_pp": logits_post_processor})
 
 
+def tinyllama_guided_decoding_test_harness(**llm_kwargs):
+    prompts = [
+        "What is 1+1? Answer formatted in a dict in json format: ",
+        "What is the year after 2024? Answer: ",
+    ]
+
+    class Answer(BaseModel):
+        answer: int
+
+    json_schema = json.dumps(Answer.model_json_schema())
+    regex = "\d+"
+    ebnf_grammar = "root ::= [0-9]+"
+
+    sampling_params = [
+        SamplingParams(max_tokens=10),
+        SamplingParams(max_tokens=10,
+                       guided_decoding=GuidedDecodingParams(json_object=True)),
+        SamplingParams(max_tokens=10,
+                       guided_decoding=GuidedDecodingParams(json=json_schema)),
+        SamplingParams(max_tokens=10,
+                       guided_decoding=GuidedDecodingParams(regex=regex)),
+        SamplingParams(
+            max_tokens=10,
+            guided_decoding=GuidedDecodingParams(grammar=ebnf_grammar)),
+    ]
+
+    num_prompts, num_sampling_params = len(prompts), len(sampling_params)
+    prompts = [p for p in prompts for _ in range(num_sampling_params)]
+    sampling_params = [sp for _ in range(num_prompts) for sp in sampling_params]
+    references = [
+        '\n\n```\n{\n    "1":',
+        '{"1": "1", "2": "',
+        '{"answer": 1}',
+        '1',
+        '1',
+        '2025\n\nQuestion 3:',
+        '[2025]',
+        '{"answer": 202',
+        '2025',
+        '2025',
+    ]
+    llm_test_harness(llama_model_path,
+                     prompts,
+                     references,
+                     sampling_params=sampling_params,
+                     guided_decoding_backend='xgrammar',
+                     similar_threshold=0.7,
+                     **llm_kwargs)
+
+
+@force_ampere
+def test_tinyllama_guided_decoding():
+    tinyllama_guided_decoding_test_harness()
+
+
 def llama_v2_13b_lora_test_harness(**llm_kwargs):
     hf_model_dir = get_model_path("llama-models-v2/llama-v2-13b-hf")
     hf_lora_dir = get_model_path("llama-models-v2/chinese-llama-2-lora-13b")
@@ -1298,5 +1355,24 @@ def test_llm_chunked_prefill():
     success_path()
 
 
+def _test_llm_capture_request_error(tp_size: int = 1):
+    build_config = BuildConfig()
+    build_config.max_num_tokens = 64
+
+    llm = LLM(
+        model=llama_model_path,
+        build_config=build_config,
+    )
+
+    prompt = 'A ' * 65  # the minimum max_num_tokens is 64
+
+    with pytest.raises(RequestError):
+        llm.generate(prompt)
+
+
+def test_llm_capture_request_error():
+    _test_llm_capture_request_error(tp_size=1)
+
+
 if __name__ == '__main__':
-    test_llm_chunked_prefill()
+    test_llm_capture_request_error()

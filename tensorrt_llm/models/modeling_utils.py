@@ -4,6 +4,7 @@ import dataclasses
 import json
 import os
 import re
+from collections import Counter
 from enum import IntFlag, auto
 from functools import cached_property
 from pathlib import Path
@@ -20,8 +21,9 @@ from .._utils import (QuantModeWrapper, get_init_params, numpy_to_torch,
                       trt_dtype_to_torch)
 from ..bindings import KVCacheType
 from ..bindings.executor import RuntimeDefaults
-from ..functional import (PositionEmbeddingType, Tensor,
-                          gather_last_token_logits, tanh)
+from ..functional import (PositionEmbeddingType, Tensor, allgather, constant,
+                          cp_split_plugin, gather_last_token_logits,
+                          index_select, tanh, view)
 from ..layers import (MLP, AttentionParams, Embedding, FusedGatedMLP,
                       FusedRgLru, GatedMLP, KeyValueCacheParams, LoraParams,
                       PromptTuningEmbedding, RgLru)
@@ -255,9 +257,10 @@ class LayerQuantConfig(QuantConfig):
         return obj
 
     def get_quant_cfg(self, module_name):
-        assert module_name in self.quantized_layers.keys(), \
-            "module {module_name} should be included in `quantized_layers` in AutoQuant mode"
-        return self.quantized_layers[module_name]
+        if module_name in self.quantized_layers.keys():
+            return self.quantized_layers[module_name]
+        else:
+            return QuantConfig()
 
     def get_modelopt_qformat(self):
         algo_to_modelopt_map = {
@@ -502,6 +505,7 @@ class DecoderLayerList(ModuleList):
     def __init__(self, cls, config):
         self.num_hidden_layers = config.num_hidden_layers
         self.layer_list = config.mapping.pp_layers(config.num_hidden_layers)
+        self.quant_mode = config.quant_mode
         super().__init__([cls(config, idx) for idx in self.layer_list])
 
     def forward(self,
@@ -539,12 +543,19 @@ class DecoderLayerList(ModuleList):
             if mrope_params is not None:
                 kwargs['mrope_params'] = mrope_params
             if default_net().plugin_config.reduce_fusion:
-                if layer_idx < self.layer_list[-1]:
+                if layer_idx + self.layer_list[0] < self.layer_list[-1]:
+                    if default_net(
+                    ).plugin_config.user_buffer and self.quant_mode.has_fp8_qdq(
+                    ):
+                        qkv_activation_scaling_factor = constant(
+                            self[layer_idx + 1].attention.qkv.
+                            activation_scaling_factor.raw_value.copy())
+                    else:
+                        qkv_activation_scaling_factor = None
                     kwargs['next_layer_input_layernorm_args'] = (
-                        self[layer_idx + 1 -
-                             self.layer_list[0]].input_layernorm.weight.value,
-                        self[layer_idx + 1 -
-                             self.layer_list[0]].input_layernorm.eps)
+                        self[layer_idx + 1].input_layernorm.weight.value,
+                        self[layer_idx + 1].input_layernorm.eps,
+                        qkv_activation_scaling_factor)
                 else:
                     kwargs['next_layer_input_layernorm_args'] = None
 
@@ -643,6 +654,11 @@ class PretrainedModel(Module,
             config.set_rank(rank)
 
         rank = config.mapping.rank
+        # tp_cp_pp rank -> tp_pp rank: because different cp ranks share the same ckpt
+        if config.mapping.cp_size > 1:
+            tp_size = config.mapping.tp_size
+            cp_size = config.mapping.cp_size
+            rank = rank % tp_size + rank // (tp_size * cp_size) * tp_size
         weights_path = os.path.join(ckpt_dir, f'rank{rank}.safetensors')
 
         assert os.path.isfile(weights_path)
@@ -695,6 +711,18 @@ class PretrainedModel(Module,
             name: numpy_to_torch(param.raw_value)
             for name, param in self.named_parameters()
         }
+
+        # If there are some tensors share memory, this will lead to error when we call "save_file". So, for repeated tensors, we
+        # clone the tensors to prevent this issue.
+        weights_ptrs = [weights[key].data_ptr() for key in weights]
+        repeated_ptrs = [
+            key for key, value in dict(Counter(weights_ptrs)).items()
+            if value > 1
+        ]
+        for key in weights:
+            if weights[key].data_ptr() in repeated_ptrs:
+                weights[key] = weights[key].clone().detach()
+
         safetensors.torch.save_file(
             weights, os.path.join(output_dir, f'rank{rank}.safetensors'))
         if save_config:
@@ -899,6 +927,7 @@ class PretrainedModel(Module,
             output_dir=output_dir,
             tp_size=config.mapping.tp_size,
             pp_size=config.mapping.pp_size,
+            cp_size=config.mapping.cp_size,
             seed=random_seed,
             tokenizer_max_seq_length=tokenizer_max_seq_length,
         )
@@ -936,6 +965,20 @@ class DecoderModelForCausalLM(PretrainedModel):
         attention_params = Attention.fill_attention_params(
             self, attention_params)
 
+        # split the sequence for context parallelism
+        if self.config.mapping.cp_size > 1:
+            if len(input_ids.shape) == 1:
+                # input shape is [-1]
+                input_ids, cp_join_index = cp_split_plugin(
+                    input_ids,
+                    attention_params.host_request_types,
+                    attention_params.host_context_lengths,
+                    self.config.mapping.cp_size,
+                    self.config.mapping.cp_rank,
+                )
+            else:
+                assert False, "Context parallelism with non-remove-padding is not supported yet."
+
         kwargs = {
             'input_ids': input_ids,
             'position_ids': position_ids,
@@ -964,6 +1007,18 @@ class DecoderModelForCausalLM(PretrainedModel):
 
         if use_cache:
             hidden_states, presents = hidden_states
+
+        # All gather and rebuild sequence after transformer layer for context parallelism
+        if self.config.mapping.cp_size > 1:
+            if len(hidden_states.shape) == 2:
+                hidden_states = allgather(hidden_states,
+                                          self.config.mapping.cp_group,
+                                          gather_dim=0)
+                hidden_states = view(hidden_states,
+                                     [-1, hidden_states.shape[-1]])
+                hidden_states = index_select(hidden_states, 0, cp_join_index)
+            else:
+                assert False, "Context parallelism with non-remove-padding is not supported yet."
 
         if self.config.mapping.is_last_pp_rank():
             all_hidden_states = hidden_states

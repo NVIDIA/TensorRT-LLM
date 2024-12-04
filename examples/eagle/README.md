@@ -11,7 +11,6 @@ The implementation adds an EAGLE drafter network to a base model.
 For more info about EAGLE, refer to [speculative decoding documentation](https://nvidia.github.io/TensorRT-LLM/advanced/speculative-decoding.html).
 
 ## Limitations
-  * Only greedy decoding and greedy acceptance are supported.
   * EAGLE-2 is not supported.
   * All EAGLE choices have to have exactly the same depth as `num_eagle_layers` of the engine.
   * Pipeline parallelism is not supported.
@@ -95,13 +94,25 @@ to `convert_checkpoint`. For example, in the tree below (`mc_sim_7b_63`) the min
 The maximum depth, meaning the maximum length of inner `list[int]` specified in the `--eagle_choices` argument, should
 be equal to `num_eagle_layers`.
 
+To run non-greedy sampling and use typical acceptance, set `--eagle_posterior_threshold` to `run.py`. `eagle_posterior_threshold` corresponds to epsilon in typical acceptance criteria from [Medusa paper](https://arxiv.org/pdf/2401.10774).
+`--temperature` can be specified as well. When no `--eagle_posterior_threshold` is specified or `--temperature=0.0` is set, greedy sampling is used.
+
 ```bash
-# Eagle decoding using vicuna-7b-v1.3 model with 1 GPU
+# Eagle greedy decoding using vicuna-7b-v1.3 model with 1 GPU
 python ../run.py --engine_dir ./tmp/eagle/7B/trt_engines/fp16/1-gpu/ \
                  --tokenizer_dir ./vicuna-7b-v1.3/ \
                  --max_output_len=100 \
                  --eagle_choices="[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], [0, 0, 0, 0], [0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [0, 0, 0, 1], [1, 6], [0, 7, 0]]" \
                  --input_text "Once upon"
+
+# Eagle typical acceptance decoding using vicuna-7b-v1.3 model with 1 GPU
+python ../run.py --engine_dir ./tmp/eagle/7B/trt_engines/fp16/1-gpu/ \
+                 --tokenizer_dir ./vicuna-7b-v1.3/ \
+                 --max_output_len=100 \
+                 --eagle_choices="[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], [0, 0, 0, 0], [0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [0, 0, 0, 1], [1, 6], [0, 7, 0]]" \
+                 --input_text "Once upon" \
+                 --temperature 0.7 \
+                 --eagle_posterior_threshold 0.09
 
 # Eagle decoding using vicuna-7b-v1.3 model with 4 GPUs
 mpirun -np 4 --allow-run-as-root --oversubscribe \
@@ -112,7 +123,7 @@ mpirun -np 4 --allow-run-as-root --oversubscribe \
                  --input_text "Once upon"
 ```
 
-Refer to the following example output:
+For greedy decoding, refer to the following example output:
 ```text
 ......
 Input [Text 0]: "<s> Once upon"

@@ -374,6 +374,7 @@ set(TRTLLM_LINK_LIBS
     cutlass_src
     layers_src
     runtime_src
+    userbuffers_src
     ${DECODER_SHARED_TARGET})
 
 if(ENABLE_MULTI_DEVICE)

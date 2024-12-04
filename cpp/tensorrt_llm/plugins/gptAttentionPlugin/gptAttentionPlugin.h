@@ -106,8 +106,8 @@ public:
         int rotary_embedding_max_positions, int rotary_embedding_original_max_positions, int tp_size,
         int tp_rank,          // for ALiBi
         bool unfuse_qkv_gemm, // for AutoPP
-        tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool enable_xqa, int kv_cache_quant_mode,
-        bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type,
+        tensorrt_llm::kernels::ContextFMHAType context_fmha_type, int kv_cache_quant_mode, bool remove_input_padding,
+        tensorrt_llm::kernels::AttentionMaskType mask_type,
         tensorrt_llm::kernels::BlockSparseParams block_sparse_params, bool paged_kv_cache, int tokens_per_block,
         nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled, bool cross_attention = false,
         int max_distance = 0, bool pos_shift_enabled = false, bool dense_context_fmha = false,
@@ -115,7 +115,8 @@ public:
         bool use_cache = true, bool is_spec_decoding_enabled = false,
         bool spec_decoding_is_generation_length_variable = false, int spec_decoding_max_generation_length = 1,
         bool is_mla_enabled = false, int q_lora_rank = 0, int kv_lora_rank = 0, int qk_nope_head_dim = 0,
-        int qk_rope_head_dim = 0, int v_head_dim = 0, bool skip_attn = false);
+        int qk_rope_head_dim = 0, int v_head_dim = 0, bool skip_attn = false, int cp_size = 1, int cp_rank = 0,
+        std::set<int32_t> cp_group = {});
 
     GPTAttentionPlugin(void const* data, size_t length);
 

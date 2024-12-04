@@ -6,6 +6,7 @@ __all__ = [
     '_ModelInfo',
     '_ParallelConfig',
     '_ModelFormatKind',
+    '_ModelWrapper',
     'BatchingType',
     'ExecutorConfig',
     'SchedulerConfig',
@@ -43,7 +44,8 @@ from ..bindings.executor import (BatchingType, CapacitySchedulerPolicy,
                                  ContextChunkingPolicy, DecodingConfig,
                                  ExecutorConfig, KvCacheConfig, PeftCacheConfig,
                                  SchedulerConfig)
-from ..builder import BuildConfig, Engine, EngineConfig, build
+from ..builder import (BuildConfig, Engine, EngineConfig, _init_max_seq_len,
+                       build)
 from ..logger import logger
 from ..mapping import Mapping
 from ..models.automodel import MODEL_MAP, AutoConfig, AutoModelForCausalLM
@@ -65,6 +67,7 @@ class _ParallelConfig:
     ''' The model distribution configs for LLM.  '''
     tp_size: int = 1
     pp_size: int = 1
+    cp_size: int = 1
     moe_tp_size: int = 1
     moe_ep_size: int = 1
     auto_parallel: bool = False
@@ -89,7 +92,7 @@ class _ParallelConfig:
     @property
     def world_size(self) -> bool:
         if self.auto_parallel:
-            if self.tp_size > 1 or self.pp_size > 1:
+            if self.tp_size > 1 or self.pp_size > 1 or self.cp_size > 1:
                 raise RuntimeError(
                     "manually TP and PP are not supported in auto parallel mode."
                 )
@@ -98,16 +101,16 @@ class _ParallelConfig:
         if self._world_size > 1:
             raise RuntimeError(
                 "world_size > 1 is only supported in auto parallel mode.")
-        return self.tp_size * self.pp_size
+        return self.tp_size * self.pp_size * self.cp_size
 
     @world_size.setter
     def world_size(self, world_size: int):
         if self.auto_parallel:
             self._world_size = world_size
         elif (not self.auto_parallel
-              ) and world_size != self.tp_size * self.pp_size:
+              ) and world_size != self.tp_size * self.pp_size * self.cp_size:
             raise ValueError(
-                f"world_size {world_size} should be equal to tp_size * pp_size {self.tp_size * self.pp_size} "
+                f"world_size {world_size} should be equal to tp_size * pp_size * cp_size {self.tp_size * self.pp_size * self.cp_size} "
                 "in non-auto_parallel mode.\n"
                 "For non-auto-parallel mode, the world_size is not needed to set"
             )
@@ -184,6 +187,46 @@ class _ModelInfo:
         raise NotImplementedError()
 
 
+@dataclass
+class _ModelWrapper:
+    model: Union[str, Path]
+
+    def __post_init__(self):
+        if not self.model:
+            raise ValueError("model should be provided.")
+        assert isinstance(self.model,
+                          (str, Path)), f"Invalid model: {self.model}"
+
+        model_dir = Path(self.model)
+
+        if model_dir.exists() and model_dir.is_dir():
+            self.model = model_dir
+
+    @property
+    def is_hub_model(self) -> bool:
+        return not self.is_local_model
+
+    @property
+    def is_local_model(self) -> bool:
+        return isinstance(self.model, Path)
+
+    @property
+    def model_dir(self) -> Path:
+        assert self.is_local_model, f"model_dir is only available for local model, {self.model}."
+        return self.model
+
+    @model_dir.setter
+    def model_dir(self, model_dir: Union[str, Path]):
+        model_dir = Path(model_dir)
+        assert model_dir.exists() and model_dir.is_dir(
+        ), f"model_dir is not a valid path, {model_dir}"
+        self.model = model_dir
+
+    @property
+    def model_name(self) -> Union[str, Path]:
+        return self.model if isinstance(self.model, str) else None
+
+
 # The docstring for LlmArgs and LLM; will be appended to the two classes' apidocs.
 LLMARGS_DOCSTRING = r"""
         model (str or Path): The model name or a local model directory.
@@ -219,6 +262,8 @@ LLMARGS_DOCSTRING = r"""
 
         pipeline_parallel_size (int): The pipeline parallel size. Defaults to 1.
 
+        context_parallel_size (int): The context parallel size. Defaults to 1.
+
         load_format (Literal['auto', 'dummy']): The format of the model weights to load.
             * 'auto' will try to load the weights from the provided checkpoint.
             * 'dummy' will initialize the weights with random values, which is mainly for profiling.
@@ -249,6 +294,8 @@ LLMARGS_DOCSTRING = r"""
         enable_chunked_prefill (bool): Whether to enable chunked prefill. Defaults to False.
 
         decoding_config (DecodingConfig, optional): The decoding configuration for the model. Defaults to None.
+
+        guided_decoding_backend (str, optional): The guided decoding backend, currently supports 'xgrammar'. Defaults to None.
 
         logits_post_processor_map (Dict[str, Callable], optional): A map of logit post-processing functions. Defaults to None.
 
@@ -320,6 +367,8 @@ class LlmArgs:
     # Below are all remaining arguments
     pipeline_parallel_size: int = 1
 
+    context_parallel_size: int = 1
+
     moe_tensor_parallel_size: Optional[int] = None
 
     moe_expert_parallel_size: Optional[int] = None
@@ -362,6 +411,8 @@ class LlmArgs:
     # TODO[enweiz]: this might affect medusa, and could be removed in the future for API consistency
     decoding_config: Optional[DecodingConfig] = None
 
+    guided_decoding_backend: Optional[str] = None
+
     logits_post_processor_map: Optional[Dict[str, Callable]] = None
 
     iter_stats_max_iterations: Optional[int] = None
@@ -393,6 +444,7 @@ class LlmArgs:
     # TODO[chunweiy]: Enable this by default and remove the option in the future
     enable_processes_for_single_gpu: bool = False
 
+
     def __post_init__(self):
         # TODO[chunweiy]: Enable this option in the future
         # Currently we want LLMAPI to be consistent with the lower APIs in the model building, thus disable this to avoid
@@ -422,6 +474,7 @@ class LlmArgs:
         self.parallel_config = _ParallelConfig(
             tp_size=self.tensor_parallel_size,
             pp_size=self.pipeline_parallel_size,
+            cp_size=self.context_parallel_size,
             moe_tp_size=self.moe_tensor_parallel_size,
             moe_ep_size=self.moe_expert_parallel_size,
             auto_parallel=self.auto_parallel)
@@ -481,8 +534,6 @@ class LlmArgs:
         assert isinstance(self.model,
                           (str, Path)), f"Invalid model: {self.model}"
 
-        self._check_model_or_model_dir()
-
         self._setup_embedding_parallel_mode()
 
         if self.enable_build_cache:
@@ -491,16 +542,17 @@ class LlmArgs:
             if not isinstance(self.enable_build_cache, BuildCacheConfig):
                 raise ValueError(
                     f"Invalid build_cache_config: {self.enable_build_cache}")
-
-        if self.is_local_model:
+        model_obj = _ModelWrapper(self.model)
+        if model_obj.is_local_model:
             # Load parallel_config from the engine.
-            self.model_format = ModelLoader.get_model_format(self.model_dir)
+            self.model_format = ModelLoader.get_model_format(self.model)
+
             if self.model_format is _ModelFormatKind.TLLM_ENGINE:
                 if self.build_config is not None:
                     logger.warning(
                         "The build_config is ignored for model format of TLLM_ENGINE."
                     )
-                self._load_config_from_engine(Path(self.model_dir))
+                self._load_config_from_engine(model_obj.model_dir)
                 runtime_defaults = self._pretrained_config.runtime_defaults
                 if self.use_runtime_defaults and runtime_defaults:
                     self.kv_cache_config.fill_empty_fields_from_runtime_defaults(
@@ -508,7 +560,7 @@ class LlmArgs:
 
             # Load parallel_config from the checkpoint.
             elif self.model_format is _ModelFormatKind.TLLM_CKPT:
-                self._load_config_from_ckpt(Path(self.model_dir))
+                self._load_config_from_ckpt(model_obj.model_dir)
         else:
             self.model_format = _ModelFormatKind.HF
 
@@ -573,28 +625,6 @@ class LlmArgs:
 
         self._config_arbitrator = None
 
-    def _check_model_or_model_dir(self):
-        if not self.model:
-            raise ValueError("model should be provided.")
-        assert isinstance(self.model,
-                          (str, Path)), f"Invalid model: {self.model}"
-        model_dir = Path(self.model)
-        if model_dir.exists() and model_dir.is_dir():
-            self.model = model_dir
-
-    @property
-    def is_local_model(self) -> bool:
-        return isinstance(self.model, Path)
-
-    @property
-    def is_hub_model(self) -> bool:
-        return not self.is_local_model
-
-    @property
-    def model_dir(self) -> Path:
-        assert self.is_local_model, f"model_dir is only available for local model, {self.model}."
-        return self.model
-
     @property
     def build_config_mutable(self) -> bool:
         return self.model_format is not _ModelFormatKind.TLLM_ENGINE
@@ -617,8 +647,13 @@ class LlmArgs:
             raise ValueError(
                 f"pp_size {self.parallel_config.pp_size} is not consistent with the engine's pp_size {mapping.pp_size}"
             )
+        if self.parallel_config.cp_size not in (1, mapping.cp_size):
+            raise ValueError(
+                f"cp_size {self.parallel_config.cp_size} is not consistent with the engine's cp_size {mapping.cp_size}"
+            )
         self.parallel_config = _ParallelConfig(tp_size=mapping.tp_size,
                                                pp_size=mapping.pp_size,
+                                               cp_size=mapping.cp_size,
                                                moe_tp_size=mapping.moe_tp_size,
                                                moe_ep_size=mapping.moe_ep_size)
 
@@ -627,6 +662,7 @@ class LlmArgs:
                                                             "config.json")
         tp_size = pretrained_config.mapping.tp_size
         pp_size = pretrained_config.mapping.pp_size
+        cp_size = pretrained_config.mapping.cp_size
         moe_tp_size = pretrained_config.mapping.moe_tp_size
         moe_ep_size = pretrained_config.mapping.moe_ep_size
         world_size = pretrained_config.mapping.world_size
@@ -640,6 +676,10 @@ class LlmArgs:
             raise ValueError(
                 f"pp_size {self.parallel_config.pp_size} is not consistent with the checkpoint's pp_size {pp_size}"
             )
+        if self.parallel_config.cp_size != 1 and self.parallel_config.cp_size != cp_size:
+            raise ValueError(
+                f"cp_size {self.parallel_config.cp_size} is not consistent with the checkpoint's cp_size {cp_size}"
+            )
         if (self.parallel_config.auto_parallel
                 and self.parallel_config.world_size != 1 and world_size != 1):
             raise ValueError(
@@ -648,6 +688,7 @@ class LlmArgs:
         if not self.parallel_config.auto_parallel:
             self.parallel_config = _ParallelConfig(tp_size=tp_size,
                                                    pp_size=pp_size,
+                                                   cp_size=cp_size,
                                                    moe_tp_size=moe_tp_size,
                                                    moe_ep_size=moe_ep_size)
 
@@ -911,12 +952,14 @@ class ModelLoader:
         assert self.llm_args.build_config
         self.build_config = self.llm_args.build_config
 
+        self.model_obj = _ModelWrapper(self.llm_args.model)
         self.convert_checkpoint_options = self.llm_args._convert_checkpoint_options
         self.rank = mpi_rank() if llm_args.parallel_config.is_multi_gpu else 0
         if llm_args.parallel_config.is_multi_gpu and not llm_args.parallel_config.auto_parallel:
             self.mapping = Mapping(
                 tp_size=llm_args.parallel_config.tp_size,
                 pp_size=llm_args.parallel_config.pp_size,
+                cp_size=llm_args.parallel_config.cp_size,
                 moe_tp_size=llm_args.parallel_config.moe_tp_size,
                 moe_ep_size=llm_args.parallel_config.moe_ep_size,
                 rank=self.rank,
@@ -929,9 +972,8 @@ class ModelLoader:
 
         # For model from hub, the _model_dir is None, and will updated once downloaded
         self._model_dir: Optional[
-            Path] = self.llm_args.model_dir if self.llm_args.is_local_model else None
+            Path] = self.model_obj.model_dir if self.model_obj.is_local_model else None
         self._model_info: Optional[_ModelInfo] = None
-        self._model_name = self.llm_args.model
         self._model_format = self.llm_args.model_format
 
         self.auto_parallel_config = AutoParallelConfig(
@@ -956,9 +998,9 @@ class ModelLoader:
                  self._build_engine_from_inmemory_model))
             return
 
-        if self.llm_args.is_hub_model and self._model_format is not _ModelFormatKind.TLLM_ENGINE:
+        if self.model_obj.is_hub_model and self._model_format is not _ModelFormatKind.TLLM_ENGINE:
             # Download HF model if necessary
-            if self.llm_args.model is None:
+            if self.model_obj.model_name is None:
                 raise ValueError(
                     "Either model_dir or model should be provided to ModelConfig."
                 )
@@ -1052,7 +1094,7 @@ class ModelLoader:
         The engine_dir is the path to save the built engine.
         '''
         if self.llm_args.model_format is _ModelFormatKind.TLLM_ENGINE:
-            return self.llm_args.model_dir
+            return self.model_obj.model_dir
 
         if self.llm_args.parallel_config.is_multi_gpu:
             torch.cuda.set_device(self.rank)
@@ -1072,7 +1114,7 @@ class ModelLoader:
             mapping=self.mapping,
             model_info=self._model_info,
         )
-        ModelLoader.save(runtime_context, self.llm_args.model_dir, engine_dir)
+        ModelLoader.save(runtime_context, self.model_obj.model_dir, engine_dir)
         return engine_dir
 
     def __enter__(self):
@@ -1159,15 +1201,16 @@ class ModelLoader:
         # Only the rank0 are allowed to download model
         if mpi_rank() == 0:
             assert self._workspace is not None
-            assert isinstance(self.llm_args.model, str)
+            assert isinstance(self.model_obj.model_name, str)
             # this will download only once when multiple MPI processes are running
-            model_dir = download_hf_model(self.llm_args.model,
+
+            model_dir = download_hf_model(self.model_obj.model_name,
                                           revision=self.llm_args.revision)
             print_colored(f"Downloaded model to {model_dir}\n", 'grey')
         # Make all the processes got the same model_dir
         self._model_dir = mpi_broadcast(model_dir, root=0)
-        self.llm_args.model = Path(self._model_dir)  # mark as a local model
-        assert self.llm_args.is_local_model
+        self.model_obj.model_dir = self._model_dir  # mark as a local model
+        assert self.model_obj.is_local_model
 
     def _load_model_from_hf(self):
         ''' Load a TRT-LLM model from a HF model. '''
@@ -1344,24 +1387,28 @@ class CachedModelLoader:
             self._workspace, tempfile.TemporaryDirectory) else Path(
                 self._workspace)
 
-    def __call__(self) -> Path:
+    def __call__(self) -> Tuple[Path, Union[Path, None]]:
 
         if self.llm_args.model_format is _ModelFormatKind.TLLM_ENGINE:
-            # do nothing for engine input
-            return self.llm_args.model_dir
+            return self.llm_args.model, None
 
         self.engine_cache_stage: Optional[CachedStage] = None
 
+        self._hf_model_dir = None
+
+        self.model_loader = ModelLoader(self.llm_args)
+
         if self.build_cache_enabled:
             print_colored("Build cache is enabled.\n", 'yellow')
-            if self.llm_args.is_hub_model:
+            if self.model_loader.model_obj.is_hub_model:
                 # This will download the config.json from HF model hub, this helps to create a PretrainedConfig for
                 # cache key.
                 self._hf_model_dir = download_hf_pretrained_config(
-                    self.llm_args.model, revision=self.llm_args.revision)
+                    self.model_loader.model_obj.model_name,
+                    revision=self.llm_args.revision)
 
-            elif self.llm_args.is_local_model:
-                self._hf_model_dir = self.llm_args.model_dir if self.llm_args.model_format is _ModelFormatKind.HF else None
+            elif self.model_loader.model_obj.is_local_model:
+                self._hf_model_dir = self.model_loader.model_obj.model_dir if self.llm_args.model_format is _ModelFormatKind.HF else None
 
             self.engine_cache_stage = self._get_engine_cache_stage()
             if self.engine_cache_stage.is_cached():
@@ -1369,15 +1416,17 @@ class CachedModelLoader:
                 print_colored(
                     f"Reusing cached engine in {self.engine_cache_stage.get_engine_path()}\n\n",
                     'grey')
-                self.llm_args.model = self.engine_cache_stage.get_engine_path()
-                self.llm_build_stats.engine_dir = self.llm_args.model_dir
-                return self.llm_build_stats.engine_dir
+                self.model_loader.model_obj.model_dir = self.engine_cache_stage.get_engine_path(
+                )
+                self.llm_build_stats.engine_dir = self.model_loader.model_obj.model_dir
+                return self.llm_build_stats.engine_dir, self._hf_model_dir
 
-        return self._build_model()
+
+        return self._build_model(), self._hf_model_dir
 
     def get_engine_dir(self) -> Path:
         if self.llm_args.model_format is _ModelFormatKind.TLLM_ENGINE:
-            return self.llm_args.model_dir
+            return self.model_obj.model_dir
 
         # generate a new path for writing the engine
         if self.build_cache_enabled:
@@ -1432,7 +1481,8 @@ class CachedModelLoader:
             self._hf_model_dir,
             mapping=Mapping(world_size=self.llm_args.parallel_config.world_size,
                             tp_size=self.llm_args.parallel_config.tp_size,
-                            pp_size=self.llm_args.parallel_config.pp_size),
+                            pp_size=self.llm_args.parallel_config.pp_size,
+                            cp_size=self.llm_args.parallel_config.cp_size),
             quant_config=self.llm_args.quant_config,
             dtype=self.llm_args.dtype)
 
@@ -1466,12 +1516,12 @@ class CachedModelLoader:
         if self.build_cache_enabled:
             try:
                 # TODO[chunweiy]: Cover the case when the model is from HF model hub.
-                if self.llm_args.is_local_model:
+                if self.model_loader.model_obj.is_local_model:
                     # This is not perfect, but will make build-cache much more robust.
                     free_storage = self.engine_cache_stage.parent.free_storage_in_gb(
                     )
                     model_size = get_directory_size_in_gb(
-                        self.llm_args.model_dir)
+                        self.model_loader.model_obj.model_dir)
                     require_size = model_size * 1.3
                     has_storage = free_storage >= require_size
 

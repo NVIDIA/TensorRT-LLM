@@ -262,9 +262,9 @@ __global__ void perTokenQuantization(QuantT* dst, T const* src, int64_t const nu
         uint4 vec = srcVec[i];
 
 #pragma unroll
-        for (int i = 0; i < NUM_ELTS2_PER_VEC; ++i)
+        for (int j = 0; j < NUM_ELTS2_PER_VEC; ++j)
         {
-            T2& val2 = reinterpret_cast<T2*>(&vec)[i];
+            T2& val2 = reinterpret_cast<T2*>(&vec)[j];
             val2 = cuda_clamp(val2, clampMin2, clampMax2);
             localMax2 = cuda_max(localMax2, cuda_abs(val2));
             // TODO: template the version that requires sum to avoid dynamic branching.

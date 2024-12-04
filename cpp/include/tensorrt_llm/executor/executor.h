@@ -41,7 +41,7 @@ class MpiComm;
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
-class KVCacheManager;
+class BaseKVCacheManager;
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager
 
 namespace tensorrt_llm::executor
@@ -188,7 +188,8 @@ class OutputConfig
 {
 public:
     explicit OutputConfig(bool returnLogProbs = false, bool returnContextLogits = false,
-        bool returnGenerationLogits = false, bool excludeInputFromOutput = false, bool returnEncoderOutput = false);
+        bool returnGenerationLogits = false, bool excludeInputFromOutput = false, bool returnEncoderOutput = false,
+        bool returnPerfMetrics = false);
 
     /// @brief Controls if Result should contain log probabilities. Default is false.
     bool returnLogProbs;
@@ -201,6 +202,8 @@ public:
     /// @brief Controls if Result should contain encoder output hidden states (for encoder-only and encoder-decoder
     /// models). Default is false.
     bool returnEncoderOutput;
+    /// @brief Controls if Result should contain performance metrics
+    bool returnPerfMetrics;
 };
 
 /// @brief Configuration for speculative decoding with external draft tokens.
@@ -327,16 +330,29 @@ private:
 
 struct EagleConfig
 {
-    explicit EagleConfig(std::optional<EagleChoices> eagleChoices = std::nullopt);
+    explicit EagleConfig(std::optional<EagleChoices> eagleChoices = std::nullopt, bool greedySampling = true,
+        std::optional<float> posteriorThreshold = std::nullopt);
 
     bool operator==(EagleConfig const& other) const;
     [[nodiscard]] std::optional<EagleChoices> getEagleChoices() const;
+    [[nodiscard]] std::optional<float> getPosteriorThreshold() const;
+    [[nodiscard]] bool isGreedySampling() const;
+
+private:
+    std::optional<float> const& checkPosteriorValue(std::optional<float> const& value);
 
 private:
     friend class Serialization;
 
     /// @brief choices forming tree for EAGLE-1.
     std::optional<EagleChoices> mEagleChoices;
+
+    /// @brief Flag to use greedy or typical acceptance.
+    bool mGreedySampling;
+    /// @brief Minimum token probability of the typical acceptance.
+    /// Corresponds to epsilon in https://arxiv.org/pdf/2401.10774.
+    /// Default is 0.09f.
+    std::optional<float> mPosteriorThreshold;
 };
 
 class ContextPhaseParams
@@ -388,6 +404,43 @@ public:
 
     /// @brief Send logits tensor directly from draft to target model.
     bool fastLogits;
+};
+
+/// @brief Guided decoding parameters for a request.
+class GuidedDecodingParams
+{
+public:
+    enum class GuideType
+    {
+        /// @brief The generated text is amenable to json format.
+        kJSON = 0,
+
+        /// @brief The generated text is amenable to json format with additional user-specified restrictions, namely
+        /// schema.
+        kJSON_SCHEMA = 1,
+
+        /// @brief The generated text is amenable to the user-specified regular expression.
+        kREGEX = 2,
+
+        /// @brief The generated text is amenable to the user-specified extended Backus-Naur form (EBNF) grammar.
+        /// EBNF grammar is widely-used to express context-free grammars.
+        kEBNF_GRAMMAR = 3,
+    };
+
+    explicit GuidedDecodingParams(GuideType guideType, std::optional<std::string> guide = std::nullopt);
+
+    bool operator==(GuidedDecodingParams const& other) const;
+    [[nodiscard]] GuideType getGuideType() const;
+    [[nodiscard]] std::optional<std::string> getGuide() const;
+
+private:
+    friend class Serialization;
+
+    /// @brief The guide type. See GuideType.
+    GuideType mGuideType;
+    /// @brief The detailed guide string. It could be a json schema, a regular expression or a EBNF grammar depending on
+    /// mGuideType.
+    std::optional<std::string> mGuide;
 };
 
 using RetentionPriority = SizeType32;
@@ -521,6 +574,7 @@ public:
     /// @param numReturnSequences The number of returning sequences.
     /// @param eagleConfig The EAGLE speculative decoding configuration
     /// @param skipCrossAttnBlocks Skip the cross attention transformer blocks or not.
+    /// @param guidedDecodingParams The guided decoding parameters.
     Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming = false,
         SamplingConfig const& samplingConfig = SamplingConfig(), OutputConfig const& outputConfig = OutputConfig(),
         std::optional<SizeType32> const& endId = std::nullopt, std::optional<SizeType32> const& padId = std::nullopt,
@@ -541,8 +595,8 @@ public:
         std::optional<Tensor> encoderInputFeatures = std::nullopt,
         std::optional<SizeType32> encoderOutputLength = std::nullopt,
         std::optional<Tensor> crossAttentionMask = std::nullopt, SizeType32 numReturnSequences = 1,
-        std::optional<EagleConfig> eagleConfig = std::nullopt,
-        std::optional<Tensor> skipCrossAttnBlocks = std::nullopt);
+        std::optional<EagleConfig> eagleConfig = std::nullopt, std::optional<Tensor> skipCrossAttnBlocks = std::nullopt,
+        std::optional<GuidedDecodingParams> guidedDecodingParams = std::nullopt);
 
     /// @brief This logits postprocessor name will dispatch to the batched logits postprocessor
     static auto constexpr kBatchedPostProcessorName = "batched";
@@ -584,6 +638,7 @@ public:
     [[nodiscard]] SizeType32 getNumReturnSequences() const;
     [[nodiscard]] std::optional<EagleConfig> getEagleConfig() const;
     [[nodiscard]] std::optional<Tensor> getSkipCrossAttnBlocks() const;
+    [[nodiscard]] std::optional<GuidedDecodingParams> getGuidedDecodingParams() const;
 
     void setStreaming(bool streaming);
     void setSamplingConfig(SamplingConfig const& config);
@@ -613,6 +668,7 @@ public:
     void setNumReturnSequences(SizeType32 numReturnSequences);
     void setEagleConfig(std::optional<EagleConfig> const& eagleConfig);
     void setSkipCrossAttnBlocks(Tensor skipCrossAttnBlocks);
+    void setGuidedDecodingParams(GuidedDecodingParams const& guidedDecodingParams);
 
 private:
     friend class Serialization;
@@ -683,6 +739,9 @@ struct Result
     /// @brief Indicates if this is the final result for a given sequence in the request
     /// In beam search (beamWidth > 1), the value will always equal to the value of isFinal.
     bool isSequenceFinal;
+
+    /// @brief Performance metrics if returnPerfMetrics is set in OutputConfig
+    std::optional<RequestPerfMetrics> requestPerfMetrics;
 };
 
 /// @brief Class that holds either an error or a result
@@ -1122,6 +1181,57 @@ private:
     std::optional<EagleConfig> mEagleConfig;
 };
 
+/// @brief Guided decoding configurations for executor.
+class GuidedDecodingConfig
+{
+public:
+    enum class GuidedDecodingBackend
+    {
+        /// @brief Enable guided decoding with XGrammar backend.
+        kXGRAMMAR = 0,
+    };
+
+    explicit GuidedDecodingConfig(GuidedDecodingBackend backend,
+        std::optional<std::vector<std::string>> encodedVocab = std::nullopt,
+        std::optional<std::string> tokenizerStr = std::nullopt,
+        std::optional<std::vector<TokenIdType>> stopTokenIds = std::nullopt);
+
+    bool operator==(GuidedDecodingConfig const& other) const;
+
+    void setBackend(GuidedDecodingBackend const& backend);
+    [[nodiscard]] GuidedDecodingBackend getBackend() const;
+
+    void setEncodedVocab(std::vector<std::string> const& encodedVocab);
+    [[nodiscard]] std::optional<std::vector<std::string>> getEncodedVocab() const;
+
+    void setTokenizerStr(std::string const& tokenizerStr);
+    [[nodiscard]] std::optional<std::string> getTokenizerStr() const;
+
+    void setStopTokenIds(std::vector<TokenIdType> const& stopTokenIds);
+    [[nodiscard]] std::optional<std::vector<TokenIdType>> getStopTokenIds() const;
+
+    void validate() const;
+
+private:
+    friend class Serialization;
+
+    /// @brief Guided decoding backend. Currently supports XGrammar.
+    GuidedDecodingBackend mBackend;
+    /// @brief Encoded vocabulary. For a huggingface tokenizer, it can be extracted by:
+    /// ```python
+    /// encoded_vocab = tokenizer.get_vocab()
+    /// encoded_vocab = [token for token, _ in sorted(encoded_vocab.items(), key=lambda x: x[1])]
+    /// ```
+    std::optional<std::vector<std::string>> mEncodedVocab;
+    /// @brief Tokenizer string. For a huggingface fast tokenizer, it can be extracted by:
+    /// ```python
+    /// tokenizer_str = tokenizer.backend_tokenizer.to_str()
+    /// ```
+    std::optional<std::string> mTokenizerStr;
+    /// @brief Stop token ids. If not provided, it can be automatically detected.
+    std::optional<std::vector<TokenIdType>> mStopTokenIds;
+};
+
 class LogitsPostProcessorConfig
 {
 public:
@@ -1163,11 +1273,17 @@ public:
         ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig = ExtendedRuntimePerfKnobConfig(),
         std::optional<DebugConfig> debugConfig = std::nullopt, SizeType32 recvPollPeriodMs = 0,
         uint64_t maxSeqIdleMicroseconds = 180000000,
-        std::optional<SpeculativeDecodingConfig> specDecConfig = std::nullopt);
+        std::optional<SpeculativeDecodingConfig> specDecConfig = std::nullopt,
+        std::optional<GuidedDecodingConfig> guidedDecodingConfig = std::nullopt);
 
     [[nodiscard]] SizeType32 getMaxBeamWidth() const;
     [[nodiscard]] SchedulerConfig getSchedulerConfig() const;
     [[nodiscard]] KvCacheConfig getKvCacheConfig() const;
+    // These functions return references and are useful for defining pybind properties.
+    // If we used the normal return by value getters, we would get really confusing
+    // behavior on the Python side.
+    [[nodiscard]] SchedulerConfig& getSchedulerConfigRef();
+    [[nodiscard]] KvCacheConfig& getKvCacheConfigRef();
     [[nodiscard]] bool getEnableChunkedContext() const;
     [[nodiscard]] bool getNormalizeLogProbs() const;
     [[nodiscard]] SizeType32 getIterStatsMaxIterations() const;
@@ -1186,6 +1302,7 @@ public:
     [[nodiscard]] SizeType32 getRecvPollPeriodMs() const;
     [[nodiscard]] uint64_t getMaxSeqIdleMicroseconds() const;
     [[nodiscard]] std::optional<SpeculativeDecodingConfig> getSpecDecConfig() const;
+    [[nodiscard]] std::optional<GuidedDecodingConfig> getGuidedDecodingConfig() const;
 
     void setMaxBeamWidth(SizeType32 maxBeamWidth);
     void setMaxBatchSize(SizeType32 maxBatchSize);
@@ -1208,6 +1325,7 @@ public:
     void setRecvPollPeriodMs(SizeType32 const& recvPollPeriodMs);
     void setMaxSeqIdleMicroseconds(uint64_t maxNumTokens);
     void setSpecDecConfig(SpeculativeDecodingConfig const& specDecConfig);
+    void setGuidedDecodingConfig(GuidedDecodingConfig const& guidedDecodingConfig);
 
 private:
     friend class Serialization;
@@ -1273,6 +1391,9 @@ private:
 
     /// @brief The speculative decoding configuration
     std::optional<SpeculativeDecodingConfig> mSpeculativeDecodingConfig;
+
+    /// @brief The guided decoding configuration
+    std::optional<GuidedDecodingConfig> mGuidedDecodingConfig;
 };
 
 struct KVCacheCreatedData
@@ -1371,7 +1492,8 @@ struct KVCacheEvent
 class KVCacheEventManager
 {
 public:
-    KVCacheEventManager(std::shared_ptr<tensorrt_llm::batch_manager::kv_cache_manager::KVCacheManager> kvCacheManager);
+    KVCacheEventManager(
+        std::shared_ptr<tensorrt_llm::batch_manager::kv_cache_manager::BaseKVCacheManager> kvCacheManager);
 
     /// @brief Get the latest KV Cache events.
     /// @param timeout The maximum time to wait for new events. If nullopt, will only return when new events are
@@ -1379,7 +1501,7 @@ public:
     std::deque<KVCacheEvent> getLatestEvents(std::optional<std::chrono::milliseconds> timeout = std::nullopt);
 
 private:
-    std::shared_ptr<tensorrt_llm::batch_manager::kv_cache_manager::KVCacheManager> kvCacheManager;
+    std::shared_ptr<tensorrt_llm::batch_manager::kv_cache_manager::BaseKVCacheManager> kvCacheManager;
 };
 
 /// @brief The executor is responsible for receiving new requests and sending responses, and running the inference

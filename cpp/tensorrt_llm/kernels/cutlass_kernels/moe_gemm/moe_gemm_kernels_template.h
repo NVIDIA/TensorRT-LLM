@@ -563,7 +563,7 @@ template <typename T, typename WeightType, typename OutputType, typename ScaleBi
 bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::supportsFusedGatedActivation(
     bool is_gated_activation, int gemm_n, int gemm_k) const
 {
-    constexpr bool ENABLE_FUSED_GATED_ACTIVATION = false; // TODO There is a bug that causes non-determinism
+    constexpr bool ENABLE_FUSED_GATED_ACTIVATION = true;
     return is_gated_activation && std::is_same_v<T, WeightType> && !std::is_same_v<T, float> && !use_fp8
         && (this->getSM() >= 80) && (gemm_k % 64 == 0) && (gemm_n % 64 == 0) && ENABLE_FUSED_GATED_ACTIVATION;
 }
@@ -605,13 +605,7 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch<Epi
     TLLM_CHECK_WITH_INFO(
         sm_ == 90 || !gemm_config.is_sm90, "Hopper configuration provided for non-Hopper architecture");
 
-    if (sm_ >= 70 && sm_ < 75)
-    {
-        dispatchMoeGemmToCutlass<T, WeightType, ScaleBiasType, cutlass::arch::Sm70, EpilogueTag>(A, B, weight_scales,
-            biases, bias_is_broadcast, C, total_tokens_including_expert, total_rows, gemm_n, gemm_k, num_experts,
-            gemm_config, multi_processor_count_, use_fused_moe, alpha_scale_ptr_array, stream, occupancy);
-    }
-    else if (sm_ >= 75 && sm_ < 80)
+    if (sm_ >= 75 && sm_ < 80)
     {
         dispatchMoeGemmToCutlass<T, WeightType, ScaleBiasType, cutlass::arch::Sm75, EpilogueTag>(A, B, weight_scales,
             biases, bias_is_broadcast, C, total_tokens_including_expert, total_rows, gemm_n, gemm_k, num_experts,

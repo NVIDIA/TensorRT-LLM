@@ -14,8 +14,7 @@ from filelock import FileLock
 
 from tensorrt_llm._utils import (str_dtype_to_trt, trt_dtype_to_np,
                                  trt_dtype_to_torch)
-from tensorrt_llm.functional import (AllReduceConfig, AllReduceFusionParams,
-                                     AllReduceStrategy, create_allreduce_plugin)
+from tensorrt_llm.functional import AllReduceParams, create_allreduce_plugin
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.network import (PluginInfo, delete_plugin_info, get_np_weight,
@@ -1569,7 +1568,6 @@ class DistributedGraphGroup(GraphGroupBase):
             layer_info = (input_name, output_name, device_id)
             network = self.get_network(device_id)
             graph = self.get_graph(device_id)
-            strategy = AllReduceStrategy.AUTO
             workspace = graph.get_input("all_reduce_workspace").as_trt()
 
             all_reduce_layer, allreduce_plg_creator, pfc = create_allreduce_plugin(
@@ -1578,10 +1576,8 @@ class DistributedGraphGroup(GraphGroupBase):
                 workspace=workspace,
                 group=np.ascontiguousarray(
                     device_ids.reshape(-1).astype(np.int32)),
-                strategy=strategy,
                 dtype=to_reduce_tensor.dtype,
-                config=AllReduceConfig(0),
-                reduce_fusion_params=AllReduceFusionParams(),
+                all_reduce_params=AllReduceParams(),
             )
             plugin_info = PluginInfo(allreduce_plg_creator, "allreduce", pfc)
             set_plugin_info(network, all_reduce_layer.name, plugin_info)

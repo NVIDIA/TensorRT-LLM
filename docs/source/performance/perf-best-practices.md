@@ -6,11 +6,10 @@ This document provides some best practices for tuning the performance of TensorR
 
 ## How To Measure Performance?
 
-TensorRT-LLM can be benchmarked using the included
-[C++](https://github.com/NVIDIA/TensorRT-LLM/blob/main/benchmarks/cpp/README.md)
-and
-[Python](https://github.com/NVIDIA/TensorRT-LLM/blob/main/benchmarks/python/README.md) tools. However, it is *strongly*
-recommended to use the C++ benchmarking tool. For detailed performance data and
+TensorRT-LLM can be benchmarked using the
+[C++](https://github.com/NVIDIA/TensorRT-LLM/blob/main/benchmarks/cpp/README.md) tools. We are actively developing `trtllm-bench` command, which is going to be the recommended way of benchmarking TensorRT-LLM.
+
+For detailed performance data and
 the steps to reproduce those results, see
 this [Document](https://nvidia.github.io/TensorRT-LLM/performance/perf-overview.html).
 The [TensorRT-LLM backend](https://github.com/triton-inference-server/tensorrtllm_backend)
@@ -19,7 +18,8 @@ can also be used to measure the performance of TensorRT-LLM for online serving.
 ## Build Options to Optimize the Performance of TensorRT-LLM Models
 
 This part summarizes how to build engines to enhance the performance of the
-runtime and, for some of them, decrease the engine build time.
+runtime. The following options have reasonable default values but for some of them,
+it's possible that tuning is needed to get the peak numbers.
 
 ***Note that some of those features and how to enable them may change in the future.***
 
@@ -83,7 +83,13 @@ built engines, it will benefits the performance especially when GEMM plugin is
 disabled, because more optimization profiles help TensorRT have more chances to
 select better kernels.
 
-However, this feature will increase the engine build time.
+Note: This feature increases engine build time but no other adverse effects are expected.
+
+#### FP8 Context Fused Multi-Head Attention
+
+`--use_fp8_context_fmha` enables FP8 Context fused multi-head attention. We
+recommend enabling this when fp8 quantization is used to improve the context phase
+attention performance. Note that only NVIDIA Hopper architecture is supported.
 
 ### GPT Attention Plugin and Context Fused Multi-Head Attention
 
@@ -99,12 +105,6 @@ implementation that uses the `concat` operator to update the KV cache).
 Enabling the fused multi-head attention, during the context phase, will trigger
 a kernel that performs the MHA/MQA/GQA block using a single kernel, for more
 details, see this [Document](https://nvidia.github.io/TensorRT-LLM/advanced/gpt-attention.html#context-phase).
-
-#### FP8 Context Fused Multi-Head Attention
-
-`--use_fp8_context_fmha` enables FP8 Context fused multi-head attention, which
-is recommended to be enabled when fp8 quantization is used to improve the
-performance. Note that only NVIDIA Hopper architecture is supported.
 
 ### Remove Input Padding
 
@@ -124,25 +124,25 @@ The paged KV cache helps manage memory for the KV cache more efficiently (see
 this [Document](https://nvidia.github.io/TensorRT-LLM/advanced/gpt-attention.html#paged-kv-cache)). It usually leads to an
 increase in the batch size and an improved efficiency.
 
-### In-flight Sequence Batching
-
-In-flight sequence batching is enabled by default with `trtllm-build`,
-which requires that the GPT attention plugin, input padding removal and paged KV
-cache are all enabled together.
-
-In-flight sequence batching schedules sequences in context phase together with
-sequences in generation phase to increase efficiency and reduce latency, see
-this [Document](https://nvidia.github.io/TensorRT-LLM/advanced/gpt-attention.html#in-flight-batching) for more details.
-
 ### Reduce Norm Fusion
 
 There is an experimental feature called "Reduce Norm Fusion"
 available to extend the custom AllReduce functionality. It can be enabled by
 using the `--reduce_fusion enable` argument with `trtllm-build` when the
-custom AllReduce is already enabled. This feature aims to fuse the ResidualAdd
-and LayerNorm kernels after AllReduce into a single kernel, resulting in
-improved end-to-end performance. Please note that currently, this feature is
+custom AllReduce is already enabled.
+
+This feature aims to fuse the `ResidualAdd`
+and `LayerNorm` kernels after `AllReduce` into a single kernel, resulting in
+improved end-to-end performance.
+
+Please note that currently, this feature is
 only supported for the llama model. It is recommended to enable this feature when the batch size is small and the generation phase time is the dominant factor.
+
+### User Buffer
+
+An experimental feature called "User Buffer" is available to enhance communication performance. It can be enabled by using the `--user_buffer enable` argument with `trtllm-build`.
+This feature aims to eliminate extra copies from the local buffer to the shared buffer in the communication kernel, leading to improved end-to-end performance.
+This feature must be enabled with `--reduce_fusion enable` and is only supported for the FP8 LLAMA model.
 
 ### Embedding Parallelism, Embedding Sharing, and Look-Up Plugin
 
@@ -164,26 +164,7 @@ See those [Examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/g
 
 Horizontal fusion in Gated-MLP combines two Matmul operations into a single one
 followed by a separate SwiGLU kernel. It can effectively reduce latency.
-
-The feature is enabled by default. However, for FP8 PTQ, the downside is slight
-reduction of accuracy because one of the quantization scaling factors are discarded.
-If you're using FP8 PTQ and the accuracy does not satisfy your requirement, you
-can try disable the feature by setting `--use_fused_mlp=disable` argument to `trtllm-build`.
-
-### GEMM + SwiGLU Fusion in Gated-MLP
-
-GEMM + SwiGLU fusion in Gated-MLP combines two Matmul operations and one SwiGLU
-operation into a single kernel. It only supports FP8 on Hopper now. For FP8 PTQ,
-the downside is slight reduction of accuracy because one of the quantization
-scaling factors are discarded.
-
-If model is large and you are running it on Hopper with FP8 precision, it is
-recommended to enable the feature by using the `--use_fused_mlp=enable --gemm_swiglu_plugin fp8`
-argument with `trtllm-build`. When the workload is very small, or the accuracy
-after enabling it does not satisfy your requirement, it is not recommended to
-enable that feature.
-
-If your bachsize is small, you can also use `--use_fused_mlp=enable --low_latency_gemm_swiglu_plugin fp8` argument with `trtllm-build` to accelerate the running time.
+This feature is enabled by default.
 
 ### GEMM Plugin
 
@@ -200,6 +181,18 @@ inferenced, the performance may decrease as batch size grows. Therefore, this
 feature is only recommended for latency reduction in small-batch-size scenarios
 currently.
 
+#### GEMM + SwiGLU Fusion in Gated-MLP
+
+The GEMM + SwiGLU fusion in Gated-MLP combines two Matmul operations and one SwiGLU operation into a single kernel. Currently this is only supported for FP8 precision on Hopper. While this fusion improves performance, it can slightly reduce accuracy in FP8 PTQ because one quantization scaling factor is discarded.
+
+We recommend enabling this feature for large models running on Hopper with FP8 precision. Use the following `trtllm-build` arguments to enable it:
+
+* For large models: `--use_fused_mlp=enable --gemm_swiglu_plugin=fp8`
+* For small batch sizes: `--use_fused_mlp=enable --low_latency_gemm_swiglu_plugin=fp8` to improve latency.
+
+We do not recommend enabling this feature for very small workloads or if the
+accuracy loss is unacceptable.
+
 ### BERT Attention Plugin and Context Fused Multi-Head Attention
 
 BERT attention plugin and context fused multi-head attention are both
@@ -212,15 +205,48 @@ recommended for the BERT model. They are enabled by default using the
 This part summarizes the runtime configuration knobs that can be tweaked to
 enhance the performance of already built engines. Note that currently the
 configurations can be modified using the
-[Batch Manager API](https://nvidia.github.io/TensorRT-LLM/advanced/batch-manager.html#the-batch-manager-api)
+[Executor API](https://nvidia.github.io/TensorRT-LLM/advanced/executor.html#executor-api)
 as well as the
 [TensorRT-LLM backend](https://github.com/triton-inference-server/tensorrtllm_backend).
 
-### GPT Model Type
+### Capacity Scheduler Policy
 
-The GPT model type can be set to `V1`, `inflight_batching` and
-`inflight_fused_batching`. It is recommended to use `inflight_fused_batching`
-to increase throughput and reduce latency.
+There currently are three batch scheduler policies: `GUARANTEED_NO_EVICT` (default),
+`MAX_UTILIZATION` and `STATIC_BATCH`.
+
+The scheduling policy can be set to `MAX_UTILIZATION` to pack as many
+requests as possible at each iteration of the forward loop, when in-flight
+sequence batching is enabled. It maximizes the utilization of the GPUs by
+aggressively scheduling requests at the risk of having to pause requests if the
+KV cache size limit is reached.
+
+For a more conservative approach with respect to the KV cache limitations in
+terms of memory allocation, `CapacitySchedulerPolicy` should be set to
+`GUARANTEED_NO_EVICT` to guarantee that a started request is never paused.
+
+If the goal is to maximizes the throughput, users should try `MAX_UTILIZATION`.
+However, they need to keep in mind that it may have a negative impact on
+latency if requests have to be paused.
+
+`STATIC_BATCH` is a legacy mode and is not recommended for production usage.
+
+### Context Chunking Policy
+
+Context chunking will increase the chance of batch processing between
+the context and the generation phase, thereby balancing the calculation amount
+of each iteration and increasing throughput.
+
+There currently are two context chunking policies: `FIRST_COME_FIRST_SERVED` (default)
+and `EQUAL_PROGRESS`.
+
+`FIRST_COME_FIRST_SERVED` should achieve overall better performance, while
+`EQUAL_PROGRESS` can be helpful in theory to make sure time to first token (TTFT)
+for most requests are relatively similar.
+
+### Batching Type
+
+The batching type can be set to `INFLIGHT` (default) and `STATIC`.
+It is recommended to use `INFLIGHT` to increase throughput and reduce latency.
 
 ### Max Tokens in Paged KV Cache and KV Cache Free GPU Memory Fraction
 
@@ -254,37 +280,6 @@ high throughput. Note that the `kv_cache_free_gpu_mem_fraction` parameter
 cannot be set to `1.0` because some amount of memory has to be reserved for
 inputs and outputs.
 
-### Batch Scheduler Policy
-
-There currently are two batch scheduler policies: `MAX_UTILIZATION` and
-`GUARANTEED_NO_EVICT`.
-
-As explained in the [GPT Manager Design](https://nvidia.github.io/TensorRT-LLM/advanced/batch-manager.html#gptmanager-design)
-section, the scheduling policy can be set to `MAX_UTILIZATION` to pack as many
-requests as possible at each iteration of the forward loop, when in-flight
-sequence batching is enabled. It maximizes the utilization of the GPUs by
-aggressively scheduling requests at the risk of having to pause requests if the
-KV cache size limit is reached.
-
-For a more conservative approach with respect to the KV cache limitations in
-terms of memory allocation, `CapacitySchedulerPolicy` should be set to
-`GUARANTEED_NO_EVICT` to guarantee that a started request is never paused.
-
-If the goal is to maximizes the throughput, users should try `MAX_UTILIZATION`.
-However, they need to keep in mind that it may have a negative impact on
-latency if requests have to be paused.
-
-### TensorRT Overlap
-
-***Note that this option is now deprecated and only available with the GptManager API.***
-
-This option allowed to partition available requests into 2
-micro-batches that could be run concurrently and thereby allowed TensorRT-LLM to hide
-some exposed CPU runtime. However, optimization work has been done to reduce this
-exposed CPU runtime and it has been found that the concurrent execution
-of micro-batches did not provide additional benefits in terms of throughput,
-and in most cases, was hurting latency.
-
 ### Maximum Attention Window Size
 
 The `max_attention_window_size` flag sets the maximum number of tokens that are
@@ -292,23 +287,13 @@ attended to in order to generate one token when using techniques like sliding wi
 attention. See this
 [Document](https://nvidia.github.io/TensorRT-LLM/advanced/gpt-attention.md#sliding-window-attention-cyclic-rolling-buffer-kv-cache)
 for more details. It defaults to the maximum sequence length
-(`max_input_length + max_output_length` when building the engine), which means
+(`max_seq_len` when building the engine), which means
 that the feature is disabled by default.
 
-When set to a smaller value than `max_input_length + max_output_length` (during
+When set to a smaller value than `max_seq_len` (during
 engine build), only the KV cache of the last `max_attention_window_size` tokens
 will be stored. If the input sequence length at runtime exceeds the
 `max_attention_window_size` value, the accuracy may start dropping, but the
 runtime performance will be better (due to the reduction in terms of
 computations and GPU memory allocation). Users can modify that value to
 increase runtime performance at the expense of reduced accuracy.
-
-### Chunked Context
-
-Turning on context chunking by specifying `enable_chunked_context` in
-`TrtGptModelOptionalParams` will increase the chance of batch processing between
-the context and the generation phase, thereby balancing the calculation amount
-of each iteration and increasing throughput. When this function is turned on,
-different performance can be obtained by adjusting `max_num_tokens`. Usually
-its recommended value is `N * tokens_per_block`, and `N` is an integer that is
-recommended to start from `1` and increase until the best performance is achieved.

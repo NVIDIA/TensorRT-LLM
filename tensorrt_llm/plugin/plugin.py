@@ -186,7 +186,7 @@ class PluginConfig(metaclass=PluginConfigMeta):
     _paged_kv_cache: Optional[bool] = field(default=None, init=False)
     _remove_input_padding: bool = field(default=True, init=False)
     _reduce_fusion: bool = field(default=False, init=False)
-    _enable_xqa: bool = field(default=True, init=False)
+    _user_buffer: bool = field(default=False, init=False)
     _tokens_per_block: int = field(default=64, init=False)
     _use_paged_context_fmha: bool = field(default=False, init=False)
     _use_fp8_context_fmha: bool = field(default=False, init=False)
@@ -324,7 +324,6 @@ cli_plugin_args = [
     "context_fmha",
     "bert_context_fmha_fp32_acc",
     "remove_input_padding",
-    "enable_xqa",
     "tokens_per_block",
     "use_paged_context_fmha",
     "use_fp8_context_fmha",
@@ -332,6 +331,7 @@ cli_plugin_args = [
     "paged_state",
     "streamingllm",
     "reduce_fusion",
+    "user_buffer",
     "use_fused_mlp",
     "pp_reduce_scatter",
 ]

@@ -1607,8 +1607,9 @@ def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
         v = load(param_name_map["lm_head"], -1, 1) if pad_vocab else load(
             param_name_map["lm_head"], 0, 1)  # lm_head
         if v is None:
-            v = load(param_name_map["vocab_embedding"], -1 if pad_vocab else 0,
-                     1)
+            v = load(param_name_map["vocab_embedding"],
+                     -1 if pad_vocab else 0).clone().detach()
+
         if pad_vocab:
             v = torch.nn.functional.pad(
                 v, (0, 0, 0, vocab_size_padded - vocab_size), 'constant', 0)
@@ -1921,9 +1922,9 @@ def load_weights_from_gptq(quant_ckpt_path: str, config: LLaMAConfig):
     return weights
 
 
-def load_weights_from_lmquant(lmquant_ckpt_path: str, config: LLaMAConfig):
+def load_weights_from_deepcompressor(quant_ckpt_path: str, config: LLaMAConfig):
     logger.info(
-        'Loading weights from lmquant torch checkpoint for QServe W4A8 inference...'
+        'Loading weights from DeepCompressor torch checkpoint for QServe W4A8 inference...'
     )
     weights = {}
     tik = time.time()
@@ -1939,11 +1940,11 @@ def load_weights_from_lmquant(lmquant_ckpt_path: str, config: LLaMAConfig):
     assert torch_dtype == torch.float16, "Currently QServe only supports float16"
 
     # weight
-    fake_quant_weights = torch.load(lmquant_ckpt_path + '/model.pt',
+    fake_quant_weights = torch.load(quant_ckpt_path + '/model.pt',
                                     map_location='cpu',
                                     weights_only=True)
     # scale.0, scale.1, zero
-    quant_params = torch.load(lmquant_ckpt_path + '/scale.pt',
+    quant_params = torch.load(quant_ckpt_path + '/scale.pt',
                               map_location='cpu',
                               weights_only=True)
 
@@ -1959,12 +1960,14 @@ def load_weights_from_lmquant(lmquant_ckpt_path: str, config: LLaMAConfig):
         return fake_quant_weights[key]
 
     if per_group:
-        lmquant_suffix = [
+        deepcompressor_suffix = [
             'weight', 'weight.scale.0', 'weight.scale.1', 'weight.scaled_zero'
         ]
-        qserve_suffix = ['weight', 's1_scales', 's2_scales', 's2_zeros']
+        qserve_suffix = ['weight', 's1_scales', 's2_scales', 's2_szeros']
     else:
-        lmquant_suffix = ['weight', 'weight.scale.0', 'weight.zero']
+        deepcompressor_suffix = [
+            'weight', 'weight.scale.0', 'weight.scaled_zero'
+        ]
         qserve_suffix = ['weight', 's1_scales', 's1_szeros']
 
     def tp_split_tensor(v: torch.Tensor, dim):
@@ -1978,45 +1981,45 @@ def load_weights_from_lmquant(lmquant_ckpt_path: str, config: LLaMAConfig):
 
     def tp_split_weight_and_params(v: List[torch.Tensor], column_linear: bool):
         if per_group:
-            weight, s1_scales, s2_scales, s2_zeros = v
+            weight, s1_scales, s2_scales, s2_szeros = v
             # weight (out_features, in_features)
             # weight.scale.0 (out_features, 1, 1, 1)
             # weight.scale.1 (out_features, 1, in_features/group_size, 1)
-            # weight.zero (out_features, 1, in_features/group_size, 1)
+            # weight.scaled_zero (out_features, 1, in_features/group_size, 1)
             if column_linear:
                 weight = tp_split_tensor(weight, 0)
                 s1_scales = tp_split_tensor(s1_scales, 0)
                 s2_scales = tp_split_tensor(s2_scales, 0)
-                s2_zeros = tp_split_tensor(s2_zeros, 0)
+                s2_szeros = tp_split_tensor(s2_szeros, 0)
             else:
                 weight = tp_split_tensor(weight, 1)
                 s1_scales = s1_scales
                 s2_scales = tp_split_tensor(s2_scales, 2)
-                s2_zeros = tp_split_tensor(s2_zeros, 2)
-            return [weight, s1_scales, s2_scales, s2_zeros]
+                s2_szeros = tp_split_tensor(s2_szeros, 2)
+            return [weight, s1_scales, s2_scales, s2_szeros]
         else:
-            weight, s1_scales, s1_zeros = v
+            weight, s1_scales, s1_szeros = v
             # weight (out_features, in_features)
             # weight.scale.0 (out_features, 1, 1, 1)
             # weight.zero (out_features, 1, 1, 1)
             if column_linear:
                 weight = tp_split_tensor(weight, 0)
                 s1_scales = tp_split_tensor(s1_scales, 0)
-                s1_zeros = tp_split_tensor(s1_zeros, 0)
+                s1_szeros = tp_split_tensor(s1_szeros, 0)
             else:
                 weight = tp_split_tensor(weight, 1)
                 s1_scales = s1_scales
-                s1_zeros = s1_zeros
-            return [weight, s1_scales, s1_zeros]
+                s1_szeros = s1_szeros
+            return [weight, s1_scales, s1_szeros]
 
     def process_weight_and_params(v: List[torch.Tensor], tllm_prex: str):
         if per_group:
-            weight, s1_scales, s2_scales, s2_zeros = v
+            weight, s1_scales, s2_scales, s2_szeros = v
             qweight = qserve_quantize_weight_per_group(weight, s1_scales,
-                                                       s2_scales, s2_zeros,
+                                                       s2_scales, s2_szeros,
                                                        group_size)
             qweight, s1_scales, s2_scales, s2_zeros = qserve_pack_reorder_per_group(
-                qweight, s1_scales, s2_scales, s2_zeros, group_size)
+                qweight, s1_scales, s2_scales, s2_szeros, group_size)
 
             return {
                 # Note: Linear modules in TRTLLM do not use the name 'qweight'
@@ -2026,11 +2029,11 @@ def load_weights_from_lmquant(lmquant_ckpt_path: str, config: LLaMAConfig):
                 f'{tllm_prex}.{qserve_suffix[3]}': s2_zeros,
             }
         else:
-            weight, s1_scales, s1_zeros = v
+            weight, s1_scales, s1_szeros = v
             qweight = qserve_quantize_weight_per_channel(
-                weight, s1_scales, s1_zeros)
+                weight, s1_scales, s1_szeros)
             qweight, s1_scales, s1_szeros = qserve_pack_reorder_per_channel(
-                qweight, s1_scales, s1_zeros)
+                qweight, s1_scales, s1_szeros)
 
             return {
                 # Note: Linear modules in TRTLLM use the name 'weight' instead of 'qweight'
@@ -2072,7 +2075,7 @@ def load_weights_from_lmquant(lmquant_ckpt_path: str, config: LLaMAConfig):
         for comp in ["q", "k", "v"]:
             v = [
                 load(f'{prefix}.self_attn.{comp}_proj.{suffix}')
-                for suffix in lmquant_suffix
+                for suffix in deepcompressor_suffix
             ]
             v = tp_split_weight_and_params(v, column_linear=True)
             qkv_list.append(v)
@@ -2080,7 +2083,7 @@ def load_weights_from_lmquant(lmquant_ckpt_path: str, config: LLaMAConfig):
         q, k, v = qkv_list
         qkv = [
             torch.concat((q[i], k[i], v[i]), dim=0)
-            for i in range(len(lmquant_suffix))
+            for i in range(len(deepcompressor_suffix))
         ]
         weights.update(
             process_weight_and_params(qkv, f'{tllm_prex}.attention.qkv'))
@@ -2088,7 +2091,7 @@ def load_weights_from_lmquant(lmquant_ckpt_path: str, config: LLaMAConfig):
         # 4.2 attention.dense
         v = [
             load(f'{prefix}.self_attn.o_proj.{suffix}')
-            for suffix in lmquant_suffix
+            for suffix in deepcompressor_suffix
         ]
         v = tp_split_weight_and_params(v, column_linear=False)
         weights.update(
@@ -2100,7 +2103,8 @@ def load_weights_from_lmquant(lmquant_ckpt_path: str, config: LLaMAConfig):
 
         # 4.3 mlp.gate
         v = [
-            load(f'{prefix}.mlp.up_proj.{suffix}') for suffix in lmquant_suffix
+            load(f'{prefix}.mlp.up_proj.{suffix}')
+            for suffix in deepcompressor_suffix
         ]
         v = tp_split_weight_and_params(v, column_linear=True)
         weights.update(process_weight_and_params(v, f'{tllm_prex}.mlp.gate'))
@@ -2108,7 +2112,7 @@ def load_weights_from_lmquant(lmquant_ckpt_path: str, config: LLaMAConfig):
         # 4.4 mlp.fc
         v = [
             load(f'{prefix}.mlp.gate_proj.{suffix}')
-            for suffix in lmquant_suffix
+            for suffix in deepcompressor_suffix
         ]
         v = tp_split_weight_and_params(v, column_linear=True)
         weights.update(process_weight_and_params(v, f'{tllm_prex}.mlp.fc'))
@@ -2116,7 +2120,7 @@ def load_weights_from_lmquant(lmquant_ckpt_path: str, config: LLaMAConfig):
         # 4.5 mlp.proj
         v = [
             load(f'{prefix}.mlp.down_proj.{suffix}')
-            for suffix in lmquant_suffix
+            for suffix in deepcompressor_suffix
         ]
         v = tp_split_weight_and_params(v, column_linear=False)
         weights.update(process_weight_and_params(v, f'{tllm_prex}.mlp.proj'))

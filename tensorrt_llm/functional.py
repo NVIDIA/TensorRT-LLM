@@ -3705,7 +3705,8 @@ class AllReduceStrategy(IntEnum):
     NCCL = 0
     ONESHOT = 1
     TWOSHOT = 2
-    AUTO = 3
+    UB = 3
+    AUTO = 4
 
 
 class AllReduceConfig(IntFlag):
@@ -3724,20 +3725,27 @@ class AllReduceFusionOp(IntFlag):
     """
     NONE = 0
     RESIDUAL_RMS_NORM = 1
+    LAST_PROCESS_FOR_UB = 2
 
 
-class AllReduceFusionParams():
+class AllReduceParams():
 
     def __init__(self,
+                 strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
+                 config: AllReduceConfig = AllReduceConfig(0),
                  fusion_op: AllReduceFusionOp = AllReduceFusionOp.NONE,
                  bias: Optional[Tensor] = None,
                  residual: Optional[Tensor] = None,
                  norm_weight: Optional[Tensor] = None,
+                 scale: Optional[Tensor] = None,
                  eps: float = 1e-06):
+        self.strategy = strategy
+        self.config = config
         self.fusion_op = fusion_op
         self.bias = bias
         self.residual = residual
         self.norm_weight = norm_weight
+        self.scale = scale
         self.eps = eps
         assert fusion_op == AllReduceFusionOp.NONE or (residual is not None)
 
@@ -3747,16 +3755,22 @@ class AllReduceFusionParams():
     def has_bias(self):
         return 1 if self.bias is not None else 0
 
+    def has_scale(self):
+        return 1 if self.scale is not None else 0
+
+    def update_strategy(self):
+        if self.strategy == AllReduceStrategy.AUTO and default_net(
+        ).plugin_config.user_buffer:
+            self.strategy = AllReduceStrategy.UB
+
 
 def create_allreduce_plugin(
     network: trt.INetworkDefinition,
     tensor: trt.ITensor,
     workspace: Optional[trt.ITensor],
     group: np.array,
-    strategy: AllReduceStrategy,
     dtype: trt.DataType,
-    config: AllReduceConfig,
-    reduce_fusion_params: AllReduceFusionParams,
+    all_reduce_params: AllReduceParams,
 ):
     allreduce_plg_creator = trt.get_plugin_registry().get_plugin_creator(
         'AllReduce', '1', TRT_LLM_PLUGIN_NAMESPACE)
@@ -3766,51 +3780,61 @@ def create_allreduce_plugin(
     pf_dtype = trt.PluginField("type_id", np.array([int(dtype)], np.int32),
                                trt.PluginFieldType.INT32)
     pfc = [pf_group, pf_dtype]
-    p_strategy = trt.PluginField("strategy", np.array([int(strategy)], np.int8),
-                                 trt.PluginFieldType.INT8)
+    p_strategy = trt.PluginField(
+        "strategy", np.array([int(all_reduce_params.strategy)], np.int8),
+        trt.PluginFieldType.INT8)
     pfc.append(p_strategy)
-    p_config = trt.PluginField("config", np.array([int(config)], np.int8),
-                               trt.PluginFieldType.INT8)
+    p_config = trt.PluginField(
+        "config", np.array([int(all_reduce_params.config)], np.int8),
+        trt.PluginFieldType.INT8)
     pfc.append(p_config)
     p_fusion_op = trt.PluginField(
-        "fusion_op", np.array([int(reduce_fusion_params.fusion_op)], np.int8),
+        "fusion_op", np.array([int(all_reduce_params.fusion_op)], np.int8),
         trt.PluginFieldType.INT8)
     pfc.append(p_fusion_op)
     p_eps = trt.PluginField(
-        "eps", np.array([float(reduce_fusion_params.eps)], np.float32),
+        "eps", np.array([float(all_reduce_params.eps)], np.float32),
         trt.PluginFieldType.FLOAT32)
     pfc.append(p_eps)
     p_affine = trt.PluginField(
-        "affine", np.array([int(reduce_fusion_params.has_affine())], np.int8),
+        "affine", np.array([int(all_reduce_params.has_affine())], np.int8),
         trt.PluginFieldType.INT8)
     pfc.append(p_affine)
     p_bias = trt.PluginField(
-        "bias", np.array([int(reduce_fusion_params.has_bias())], np.int8),
+        "bias", np.array([int(all_reduce_params.has_bias())], np.int8),
         trt.PluginFieldType.INT8)
     pfc.append(p_bias)
+    p_scale = trt.PluginField(
+        "scale", np.array([int(all_reduce_params.has_scale())], np.int8),
+        trt.PluginFieldType.INT8)
+    pfc.append(p_scale)
 
     pfc = trt.PluginFieldCollection(pfc)
     ar_plug = allreduce_plg_creator.create_plugin("allreduce", pfc)
     plug_inputs = [tensor]
-    if strategy != AllReduceStrategy.NCCL:
+    if all_reduce_params.strategy != AllReduceStrategy.NCCL and all_reduce_params.strategy != AllReduceStrategy.UB:
         plug_inputs.append(workspace)
-    if reduce_fusion_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
-        if reduce_fusion_params.has_bias() == 1:
-            plug_inputs.append(reduce_fusion_params.bias.trt_tensor)
-        plug_inputs.append(reduce_fusion_params.residual.trt_tensor)
-        if reduce_fusion_params.has_affine() == 1:
-            plug_inputs.append(reduce_fusion_params.norm_weight.trt_tensor)
+    if all_reduce_params.fusion_op != AllReduceFusionOp.NONE:
+        if all_reduce_params.has_bias() == 1:
+            plug_inputs.append(all_reduce_params.bias.trt_tensor)
+        plug_inputs.append(all_reduce_params.residual.trt_tensor)
+        if all_reduce_params.has_affine() == 1:
+            plug_inputs.append(all_reduce_params.norm_weight.trt_tensor)
+        if all_reduce_params.has_scale() == 1:
+            plug_inputs.append(all_reduce_params.scale.trt_tensor)
 
     layer = network.add_plugin_v2(plug_inputs, ar_plug)
     return layer, allreduce_plg_creator, pfc
 
 
+allreduce_ub_counter = 0
+
+
 def allreduce(
-        tensor: Tensor,
-        group: List[int],
-        strategy: Optional[AllReduceStrategy] = AllReduceStrategy.AUTO,
-        config: AllReduceConfig = AllReduceConfig(0),
-        reduce_fusion_params: Optional[AllReduceFusionParams] = None) -> Tensor:
+    tensor: Tensor,
+    group: List[int],
+    all_reduce_params: Optional[AllReduceParams] = AllReduceParams()
+) -> Tensor:
     '''
     Add an operation that performs a collective all-reduce.
 
@@ -3845,38 +3869,56 @@ def allreduce(
         The tensor produced by that layer.
     '''
 
+    global allreduce_ub_counter
+    allreduce_ub_counter += 1
+
+    if all_reduce_params is None:
+        all_reduce_params = AllReduceParams()
+    all_reduce_params.update_strategy()
+
     # TODO(TRTLLM-996): remove this WAR when custom allreduce is supported
     # for encoder models in C++ runtime.
-    if current_all_reduce_helper().workspace is None:
-        strategy = AllReduceStrategy.NCCL
-
     workspace = None
-    if strategy != AllReduceStrategy.NCCL:
-        workspace = current_all_reduce_helper().workspace.trt_tensor
-
-    if reduce_fusion_params is None:
-        reduce_fusion_params = AllReduceFusionParams()
-
+    if all_reduce_params.strategy != AllReduceStrategy.NCCL and all_reduce_params.strategy != AllReduceStrategy.UB:
+        if current_all_reduce_helper().workspace is None:
+            all_reduce_params.strategy = AllReduceStrategy.NCCL
+        else:
+            workspace = current_all_reduce_helper().workspace.trt_tensor
+    if all_reduce_params.strategy == AllReduceStrategy.UB:
+        tensor.mark_output("allreduce_ub_0_" + str(allreduce_ub_counter))
     dtype = default_net().plugin_config.nccl_plugin
     layer, allreduce_plg_creator, pfc = create_allreduce_plugin(
         network=default_trtnet(),
         tensor=tensor.cast(dtype).trt_tensor,
         workspace=workspace,
         group=np.array(group, dtype=np.int32),
-        strategy=strategy,
         dtype=str_dtype_to_trt(dtype),
-        config=config,
-        reduce_fusion_params=reduce_fusion_params,
+        all_reduce_params=all_reduce_params,
     )
     _add_plugin_info(layer, allreduce_plg_creator, "allreduce", pfc)
-    if reduce_fusion_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
-        final_output = _create_tensor(layer.get_output(0),
-                                      layer).cast(tensor.dtype)
+    if all_reduce_params.fusion_op != AllReduceFusionOp.NONE:
         inter_output = _create_tensor(layer.get_output(1),
                                       layer).cast(tensor.dtype)
+        if all_reduce_params.strategy == AllReduceStrategy.UB and all_reduce_params.has_scale(
+        ) == 1:
+            # data type: trt.DataType.FP8
+            final_output = _create_tensor(layer.get_output(0), layer)
+        else:
+            final_output = _create_tensor(layer.get_output(0),
+                                          layer).cast(tensor.dtype)
+        if all_reduce_params.strategy == AllReduceStrategy.UB:
+            if all_reduce_params.has_scale() == 1:
+                final_output.mark_output("allreduce_ub_1_" +
+                                         str(allreduce_ub_counter))
+            else:
+                assert all_reduce_params.fusion_op == AllReduceFusionOp.LAST_PROCESS_FOR_UB
+                inter_output.mark_output("allreduce_ub_1_" +
+                                         str(allreduce_ub_counter))
         return final_output, inter_output
     else:
-        return _create_tensor(layer.get_output(0), layer).cast(tensor.dtype)
+        final_output = _create_tensor(layer.get_output(0),
+                                      layer).cast(tensor.dtype)
+        return final_output
 
 
 def allgather(tensor: Tensor, group: List[int], gather_dim: int = 0) -> Tensor:
@@ -4786,6 +4828,9 @@ def gpt_attention(
     q_b_proj: Optional[Tensor] = None,
     kv_b_proj: Optional[Tensor] = None,
     skip_attn=None,
+    cp_group: List[int] = [0],
+    cp_size: int = 1,
+    cp_rank: int = 0,
 ) -> Tuple[Tensor, Optional[Tensor]]:
     '''
     Add an operation that performs the multi-head attention in GPT-like models.
@@ -5205,10 +5250,6 @@ def gpt_attention(
         "block_sparse_vertical_stride",
         np.array([block_sparse_vertical_stride], np.int32),
         trt.PluginFieldType.INT32)
-    enable_xqa = trt.PluginField(
-        "enable_xqa",
-        np.array(np.int8(default_net().plugin_config.enable_xqa),
-                 dtype=np.int8), trt.PluginFieldType.INT8)
     tp_size = trt.PluginField("tp_size", np.array(tp_size, dtype=np.int32),
                               trt.PluginFieldType.INT32)
     tp_rank = trt.PluginField("tp_rank", np.array(tp_rank, dtype=np.int32),
@@ -5270,6 +5311,13 @@ def gpt_attention(
     skip_attn_pf = trt.PluginField(
         "skip_attn", np.array([skip_attn is not None], dtype=np.int8),
         trt.PluginFieldType.INT8)
+    cp_size = trt.PluginField("cp_size", np.array(cp_size, dtype=np.int32),
+                              trt.PluginFieldType.INT32)
+    cp_rank = trt.PluginField("cp_rank", np.array(cp_rank, dtype=np.int32),
+                              trt.PluginFieldType.INT32)
+    cp_group = np.array(cp_group, dtype=np.int32)
+    cp_group = trt.PluginField("cp_group", cp_group, trt.PluginFieldType.INT32)
+
     pfc = trt.PluginFieldCollection([
         layer_idx, nheads, vision_start, vision_length, num_kv_heads,
         layer_idx_in_cache_pool, head_size, unidirectional, q_scaling,
@@ -5278,7 +5326,7 @@ def gpt_attention(
         rotary_embedding_scale_type, rotary_embedding_scale,
         rotary_embedding_short_m_scale, rotary_embedding_long_m_scale,
         rotary_embedding_max_positions, rotary_embedding_original_max_positions,
-        tp_size, tp_rank, unfuse_qkv_gemm, context_fmha_type, enable_xqa,
+        tp_size, tp_rank, unfuse_qkv_gemm, context_fmha_type,
         kv_cache_quant_mode_field, remove_input_padding, mask_type_filed,
         block_sparse_block_size, block_sparse_homo_head_pattern,
         block_sparse_num_local_blocks, block_sparse_vertical_stride,
@@ -5289,7 +5337,7 @@ def gpt_attention(
         is_spec_decoding_enabled, spec_decoding_is_generation_length_variable,
         spec_decoding_max_generation_length, is_mla_enabled, q_lora_rank,
         kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim,
-        skip_attn_pf
+        skip_attn_pf, cp_size, cp_rank, cp_group
     ])
 
     attn_plug = attn_plg_creator.create_plugin("causal_attn", pfc)
@@ -6715,3 +6763,60 @@ def cuda_stream_sync(input_list: List[Tensor],
     _add_plugin_info(layer, plg_creator, "cuda_stream", pfc)
     output = _create_tensor(layer.get_output(0), layer)
     return output
+
+
+def cp_split_plugin(
+    input_ids: Tensor,
+    host_request_types: Tensor,
+    host_context_lengths: Tensor,  # for pad-free input mode
+    cp_size: int = 1,
+    cp_rank: int = 0,
+) -> Tensor:
+    '''
+    Add an operation to perform splitting for context parallelism.
+
+    This operation split the input_ids into cp_size chunks, and return the cp_rank-th
+    chunk.
+    When the seqlen % cp_size != 0, the chunk sizes of each rank would be
+    [seqlen // cp_size, seqlen // cp_size, ..., seqlen - (seqlen // cp_size) * cp_size]
+
+    It inserts a IPluginV3Layer.
+
+    Parameters:
+        input : Tensor
+            The input tensor contains the indices to split.
+
+        host_request_types: Tensor = None (On CPU)
+            The tensor on the host that indicates if a request is in context or
+            generation phase. Its shape is [batch_size]. See Inflight Batching
+            in docs/gpt_attention.md,
+
+        host_context_lengths: Tensor = None (On CPU)
+            A host tensor that contains the lengths of the different inputs
+
+    Returns:
+        The output split tensor.
+        The length of the output split tensor.
+        The index for rebuilding the sequence
+    '''
+    plg_creator = trt.get_plugin_registry().get_creator(
+        'CpSplit', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert plg_creator is not None
+
+    cp_size = trt.PluginField("cp_size", np.array([int(cp_size)], np.int32),
+                              trt.PluginFieldType.INT32)
+    cp_rank = trt.PluginField("cp_rank", np.array([int(cp_rank)], np.int32),
+                              trt.PluginFieldType.INT32)
+
+    pfc = trt.PluginFieldCollection([cp_size, cp_rank])
+    cp_split_plug = plg_creator.create_plugin("cp_split", pfc,
+                                              trt.TensorRTPhase.BUILD)
+    plug_inputs = [
+        input_ids.trt_tensor, host_request_types.trt_tensor,
+        host_context_lengths.trt_tensor
+    ]
+
+    layer = default_trtnet().add_plugin_v3(plug_inputs, [], cp_split_plug)
+    _add_plugin_info(layer, plg_creator, "cp_split", pfc)
+    return _create_tensor(layer.get_output(0),
+                          layer), _create_tensor(layer.get_output(2), layer)

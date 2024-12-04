@@ -11,6 +11,8 @@ For details about the API, refer to the {ref}`_cpp_gen/executor.rst`.
 
 The following sections provide an overview of the main classes defined in the Executor API.
 
+## API
+
 ### The Executor Class
 
 The `Executor` class is responsible for receiving requests from the client, and providing responses for those requests. The executor is constructed by providing a path to a directory containing the TensorRT-LLM engine or buffers containing the engine and the model JSON configuration. The client can create requests and enqueue those requests for execution using the `enqueueRequest` or `enqueueRequests` methods of the `Executor` class. Enqueued requests will be scheduled for execution by the executor, and multiple independent requests can be batched together at every iteration of the main execution loop (a process often referred to as continuous batching or iteration-level batching). Responses for a particular request can be awaited for by calling the `awaitResponses` method, and by providing the request id. Alternatively, responses for any requests can be awaited for by omitting to provide the request id when calling `awaitResponses`. The `Executor` class also allows to cancel requests using the `cancelRequest` method and to obtain per-iteration and per-request statistics using the `getLatestIterationStats`.
@@ -87,3 +89,10 @@ Two C++ examples are provided that shows how to use the Executor API and can be 
 Python bindings for the Executor API are also available to use the Executor API from Python. The Python bindings are defined in [bindings.cpp](source:cpp/tensorrt_llm/pybind/executor/bindings.cpp) and once built, are available in package `tensorrt_llm.bindings.executor`. Running `'help('tensorrt_llm.bindings.executor')` in a Python interpreter will provide an overview of the classes available.
 
 In addition, three Python examples are provided to demonstrate how to use the Python bindings to the Executor API for single and multi-GPU models. They can be found in [`examples/bindings`](source:examples/bindings).
+
+## In-flight Batching with the Triton Inference Server
+
+A Triton Inference Server C++ [backend](https://github.com/triton-inference-server/tensorrtllm_backend) is provided with TensorRT-LLM that
+includes the mechanisms needed to serve models using in-flight batching. That
+backend is also a good starting example of how to implement in-flight batching using
+the TensorRT-LLM C++ Executor API.

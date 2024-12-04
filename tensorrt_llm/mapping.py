@@ -89,6 +89,26 @@ class Mapping(object):
     - [5 13]
     - [6 14]
     - [7 15]
+
+    2 nodes with 8 GPUs, tp_size 2, pp_size 2, cp_size 2
+
+    4 tp groups:
+    - [0, 1]
+    - [2, 3]
+    - [4, 5]
+    - [6, 7]
+
+    4 pp groups:
+    - [0, 4]
+    - [1, 5]
+    - [2, 6]
+    - [3, 7]
+
+    4 cp groups:
+    - [0, 2]
+    - [1, 3]
+    - [4, 6]
+    - [5, 7]
     '''
 
     def __init__(
@@ -171,7 +191,7 @@ class Mapping(object):
 
         self.pp_rank = self.rank // (self.tp_size * self.cp_size)
         self.cp_rank = self.rank % (self.tp_size * self.cp_size) // self.tp_size
-        self.tp_rank = self.rank % (self.tp_size * self.cp_size) % self.tp_size
+        self.tp_rank = self.rank % self.tp_size
         self.moe_tp_rank = self.tp_rank // self.moe_ep_size
         self.moe_ep_rank = self.tp_rank % self.moe_ep_size
 
@@ -188,6 +208,24 @@ class Mapping(object):
 
         self.node_rank = self.rank // self.gpus_per_node
         self.local_rank = self.rank % self.gpus_per_node
+
+    def __eq__(self, other):
+        if not isinstance(other, Mapping):
+            return NotImplemented
+
+        return (self.world_size == other.world_size and self.rank == other.rank
+                and self.gpus_per_node == other.gpus_per_node
+                and self.cp_size == other.cp_size
+                and self.tp_size == other.tp_size
+                and self.pp_size == other.pp_size
+                and self.moe_tp_size == other.moe_tp_size
+                and self.moe_ep_size == other.moe_ep_size)
+
+    def __hash__(self):
+        return (hash(self.world_size) ^ hash(self.rank)
+                ^ hash(self.gpus_per_node) ^ hash(self.cp_size)
+                ^ hash(self.tp_size) ^ hash(self.pp_size)
+                ^ hash(self.moe_tp_size) ^ hash(self.moe_ep_size))
 
     def has_cp(self):
         return self.cp_size > 1

@@ -2,8 +2,9 @@ import abc
 import socket
 import sys
 import time
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Any, List, Optional
+from typing import List, Optional, TypeVar
 
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 
@@ -11,6 +12,8 @@ if ENABLE_MULTI_DEVICE:
     from mpi4py.futures import MPICommExecutor, MPIPoolExecutor
 
     from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
+
+T = TypeVar("T")
 
 
 class MPINodeState:
@@ -61,11 +64,12 @@ def need_spawn_mpi_workers(model_world_size: int) -> bool:
 class MpiSession(abc.ABC):
 
     @abc.abstractmethod
-    def submit(self, task: (...), *args, **kwargs) -> List[Future]:
+    def submit(self, task: Callable[..., T], *args,
+               **kwargs) -> List[Future[T]]:
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def submit_sync(self, task: (...), *args, **kwargs) -> List[Any]:
+    def submit_sync(self, task: Callable[..., T], *args, **kwargs) -> List[T]:
         raise NotImplementedError()
 
     @abc.abstractmethod
@@ -80,13 +84,14 @@ class MpiPoolSession(MpiSession):
         self.mpi_pool: Optional[MPIPoolExecutor] = None
         self._start_mpi_pool()
 
-    def submit(self, task: (...), *args, **kwargs) -> List[Future]:
+    def submit(self, task: Callable[..., T], *args,
+               **kwargs) -> List[Future[T]]:
         return [
             self.mpi_pool.submit(task, *args, **kwargs)
             for i in range(self.n_workers)
         ]
 
-    def submit_sync(self, task: (...), *args, **kwargs) -> List[Any]:
+    def submit_sync(self, task: Callable[..., T], *args, **kwargs) -> List[T]:
         futures = [
             self.mpi_pool.submit(task, *args, **kwargs)
             for i in range(self.n_workers)
@@ -134,7 +139,8 @@ class MpiCommSession(MpiSession):
 
         self._start_mpi_pool()
 
-    def submit(self, task: (...), *args, **kwargs) -> List[Future]:
+    def submit(self, task: Callable[..., T], *args,
+               **kwargs) -> List[Future[T]]:
         assert self.mpi_pool is not None, 'MPI session not started'
 
         # Trick: The MPICommExecutor excludes rank0 from workers, thus an extra task dispatching to rank0 is needed
@@ -149,7 +155,7 @@ class MpiCommSession(MpiSession):
         rank0_future = self.thread_pool.submit(task, *args, **kwargs)
         return [rank0_future] + worker_futures
 
-    def submit_sync(self, task: (...), *args, **kwargs) -> List[Any]:
+    def submit_sync(self, task: Callable[..., T], *args, **kwargs) -> List[T]:
         futures = self.submit(task, *args, **kwargs)
         return [future.result() for future in futures]
 

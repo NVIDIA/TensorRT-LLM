@@ -33,7 +33,7 @@ class AllreducePlugin : public BasePlugin
 public:
     AllreducePlugin(std::set<int> group, nvinfer1::DataType type, kernels::AllReduceStrategyType strategy,
         kernels::AllReduceStrategyConfig config, kernels::AllReduceFusionOp op, int32_t counter, float eps,
-        int8_t affine, int8_t bias);
+        int8_t affine, int8_t bias, int8_t scale);
 
     AllreducePlugin(void const* data, size_t length);
 
@@ -72,6 +72,7 @@ private:
     void setGroupTopology() noexcept;
     kernels::AllReduceStrategyType selectImplementation(
         size_t messageSize, int worldSize, nvinfer1::DataType type) noexcept;
+    void check() noexcept;
 
 private:
     std::string const mLayerName;
@@ -86,6 +87,7 @@ private:
     std::shared_ptr<ncclComm_t> mNcclComm;
     int8_t mAffine;
     int8_t mBias;
+    int8_t mScale;
 };
 
 class AllreducePluginCreator : public BaseCreator

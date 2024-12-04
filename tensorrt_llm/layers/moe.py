@@ -26,11 +26,11 @@ from tensorrt_llm.layers.lora import LoraParams
 
 from .._common import default_net, default_trtnet
 from .._utils import QuantModeWrapper, int32_array
-from ..functional import (AllReduceFusionParams, SideStreamIDType,
-                          _add_plugin_info, _create_tensor, allreduce, cast,
-                          concat, constant, cuda_stream_sync, div, expand,
-                          gather_nd, is_gated_activation, non_gated_version,
-                          nonzero, reduce_scatter, repeat_interleave, scatter,
+from ..functional import (AllReduceParams, SideStreamIDType, _add_plugin_info,
+                          _create_tensor, allreduce, cast, concat, constant,
+                          cuda_stream_sync, div, expand, gather_nd,
+                          is_gated_activation, non_gated_version, nonzero,
+                          reduce_scatter, repeat_interleave, scatter,
                           scatter_nd, shape, sigmoid, softmax, split, sum, topk,
                           unsqueeze)
 from ..layers import MLP, GatedMLP
@@ -546,7 +546,7 @@ class MixtureOfExperts(Module):
                 hidden_states,
                 finished=None,
                 lora_layer_params=None,
-                reduce_fusion_params: Optional[AllReduceFusionParams] = None,
+                all_reduce_params: Optional[AllReduceParams] = None,
                 last_local_layer_residual=None,
                 side_stream_id: Optional[SideStreamIDType] = SideStreamIDType.
                 disable):
@@ -566,7 +566,7 @@ class MixtureOfExperts(Module):
         if side_stream_id != SideStreamIDType.disable:
             output, hidden_states = output
         if self.use_all_reduce:
-            output = self.forward_allreduce(output, reduce_fusion_params,
+            output = self.forward_allreduce(output, all_reduce_params,
                                             last_local_layer_residual)
         if side_stream_id != SideStreamIDType.disable:
             output = (output, hidden_states)
@@ -653,7 +653,7 @@ class MixtureOfExperts(Module):
 
     def forward_allreduce(self,
                           output,
-                          reduce_fusion_params: Optional[AllReduceFusionParams],
+                          all_reduce_params: Optional[AllReduceParams],
                           last_local_layer_residual=None):
 
         if last_local_layer_residual is not None:
@@ -669,11 +669,10 @@ class MixtureOfExperts(Module):
             # reshape to (-1, hidden_size // tp_size)
             output = output.view(concat([-1, self.hidden_size // self.tp_size]))
             return output
-
         if self.tp_size > 1 and self.tp_group is not None:
             output = allreduce(output,
                                self.tp_group,
-                               reduce_fusion_params=reduce_fusion_params)
+                               all_reduce_params=all_reduce_params)
         return output
 
     def load_weights(self, moe: "MixtureOfExperts"):

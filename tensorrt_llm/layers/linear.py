@@ -21,7 +21,7 @@ import torch
 
 from .._common import default_net, default_trtnet
 from .._utils import set_obj_attrs, str_dtype_to_torch, str_dtype_to_trt
-from ..functional import (AllReduceFusionOp, AllReduceFusionParams, Tensor,
+from ..functional import (AllReduceFusionOp, AllReduceParams, Tensor,
                           _add_plugin_info, _create_tensor, allgather,
                           allreduce, cast, low_latency_gemm, matmul)
 from ..mapping import Mapping
@@ -385,11 +385,18 @@ class Linear(LinearBase):
                         if qkv_idx > 0:
                             assert tp_size % num_kv_heads == 0
                             reps = tp_size // num_kv_heads
-                            v = v.reshape(num_kv_heads, head_size,
-                                          -1)[:, None, :, :].expand(
-                                              num_kv_heads, reps, head_size,
-                                              v.shape[1])
-                            v = v.reshape(num_kv_heads * reps * head_size, -1)
+                            if tllm_key.endswith("bias"):
+                                v = v.reshape(num_kv_heads,
+                                              head_size)[:, None, :].expand(
+                                                  num_kv_heads, reps, head_size)
+                                v = v.reshape(num_kv_heads * reps * head_size)
+                            else:
+                                v = v.reshape(num_kv_heads, head_size,
+                                              -1)[:, None, :, :].expand(
+                                                  num_kv_heads, reps, head_size,
+                                                  v.shape[1])
+                                v = v.reshape(num_kv_heads * reps * head_size,
+                                              -1)
                         weights[qkv_idx] = v.chunk(
                             tp_size, self.tp_dim)[config.mapping.tp_rank]
                 weights = torch.cat(weights)
@@ -447,20 +454,20 @@ class RowLinear(LinearBase):
         return 1
 
     def collect_and_bias(self, x, **kwargs):
-        reduce_fusion_params: Optional[AllReduceFusionParams] = kwargs.get(
-            "reduce_fusion_params", None)
+        all_reduce_params: Optional[AllReduceParams] = kwargs.get(
+            "all_reduce_params", None)
         if self.tp_size > 1 and self.tp_group is not None:
             need_bias = self.bias is not None
             fuse_bias_into_all_reduce = (
-                need_bias and (reduce_fusion_params is not None)
-                and (reduce_fusion_params.fusion_op
+                need_bias and (all_reduce_params is not None)
+                and (all_reduce_params.fusion_op
                      == AllReduceFusionOp.RESIDUAL_RMS_NORM))
             if fuse_bias_into_all_reduce:
-                reduce_fusion_params.bias = self.bias.value
+                all_reduce_params.bias = self.bias.value
             if not self.is_expert:
                 x = allreduce(x,
                               self.tp_group,
-                              reduce_fusion_params=reduce_fusion_params)
+                              all_reduce_params=all_reduce_params)
                 if need_bias and not fuse_bias_into_all_reduce:
                     bias = cast(self.bias.value, x.dtype)
                     x = x + bias

@@ -1,10 +1,10 @@
 # Apps examples with GenerationExecutor / LLM API
 ## OpenAI API
-[openai_server.py](../../tensorrt_llm/serve/openai_server.py) is an OpenAI compatible server which supports `v1/version`, `v1/completions` and `v1/chat/completions`. [openai_client.py](./openai_client.py) is a simple example using OpenAI client to query your model. To start the server, you can run
+The `trtllm-serve` command launches an OpenAI compatible server which supports `v1/version`, `v1/completions` and `v1/chat/completions`. [openai_client.py](./openai_client.py) is a simple example using OpenAI client to query your model. To start the server, you can run
 ```
 trtllm-serve <model>
 ```
-Then you can use the following APIs by running our example client or by `curl`.
+Then you can query the APIs by running our example client or by `curl`.
 ### v1/completions
 Query by `curl`:
 ```
@@ -55,6 +55,10 @@ Note that, the `model_dir` could accept the following formats:
 3. The name of a HuggingFace model such as "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 
 ## FastAPI server
+
+NOTE: This FastAPI-based server is only an example for demonstrating the usage
+of TensorRT-LLM LLM API. It is not intended for production use.
+For production, use the `trtllm-serve` command. The server exposes OpenAI compatible API endpoints.
 
 ### Install the additional requirements
 

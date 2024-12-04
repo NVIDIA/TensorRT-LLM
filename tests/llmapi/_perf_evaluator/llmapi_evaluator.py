@@ -7,7 +7,9 @@ from pathlib import Path
 from typing import Optional
 
 import click
+import torch.cuda
 
+from tensorrt_llm import logger
 from tensorrt_llm.llmapi import BuildConfig
 from tensorrt_llm.llmapi._perf_evaluator import LLMPerfEvaluator
 from tensorrt_llm.llmapi.llm import ModelLoader
@@ -46,26 +48,32 @@ def cli():
 @click.option("--return-context-logits", type=bool, default=False)
 @click.option("--return-generation-logits", type=bool, default=False)
 @click.option("--kv-cache-free-gpu-mem-fraction", type=float, default=None)
-def benchmark_main(model_path: str,
-                   samples_path: str,
-                   report_path_prefix: str,
-                   num_samples: Optional[int] = None,
-                   tp_size: int = 1,
-                   streaming: bool = False,
-                   warmup: int = 2,
-                   concurrency: Optional[int] = None,
-                   max_num_tokens: int = 2048,
-                   max_input_length: int = 200,
-                   max_seq_length: int = 400,
-                   max_batch_size: int = 128,
-                   engine_output_dir: str = "",
-                   cpp_executable: Optional[str] = None,
-                   return_context_logits=False,
-                   return_generation_logits=False,
-                   kv_cache_free_gpu_mem_fraction: Optional[float] = None):
+@click.option("--log-level", type=str, default="warning", show_default=True)
+@click.option("--chunked-context/--no-chunked-context", type=bool, default=True)
+def benchmark_main(
+        model_path: str,
+        samples_path: str,
+        report_path_prefix: str,
+        num_samples: Optional[int] = None,
+        tp_size: int = 1,
+        streaming: bool = False,
+        warmup: int = 2,
+        concurrency: Optional[int] = None,
+        max_num_tokens: int = 2048,
+        max_input_length: int = 200,
+        max_seq_length: int = 400,
+        max_batch_size: int = 128,
+        engine_output_dir: str = "",
+        cpp_executable: Optional[str] = None,
+        return_context_logits=False,
+        return_generation_logits=False,
+        kv_cache_free_gpu_mem_fraction: Optional[float] = None,
+        log_level: str = "warning",
+        chunked_context: bool = True):
     ''' Run the benchmark on LLM API.
     If `cpp_executable_path` is provided, it will run the cpp benchmark as well.
     '''
+    logger.set_level(log_level)
     model_path = Path(model_path)
     samples_path = Path(samples_path)
     if not model_path.exists():
@@ -106,7 +114,9 @@ def benchmark_main(model_path: str,
             build_config=build_config,
             return_context_logits=return_context_logits,
             return_generation_logits=return_generation_logits,
-            kv_cache_free_gpu_mem_fraction=kv_cache_free_gpu_mem_fraction)
+            kv_cache_free_gpu_mem_fraction=kv_cache_free_gpu_mem_fraction,
+            chunked_context=chunked_context,
+        )
         assert evaluator
         report = evaluator.run()
         report.display()
@@ -127,7 +137,7 @@ def benchmark_main(model_path: str,
                 os.path.dirname(__file__),
                 "../../../cpp/build/benchmarks/gptManagerBenchmark")
 
-        command = f"{cpp_executable_path} --engine_dir {engine_output_dir} --type IFB --dataset {samples_path} --warm_up {warmup} --output_csv {report_path_prefix}.cpp.csv --api executor --enable_chunked_context"
+        command = f"{cpp_executable_path} --engine_dir {engine_output_dir} --type IFB --dataset {samples_path} --warm_up {warmup} --output_csv {report_path_prefix}.cpp.csv --api executor"
         if streaming:
             command = f"{command} --streaming"
         if concurrency:
@@ -140,6 +150,8 @@ def benchmark_main(model_path: str,
             command = f"{command} --kv_cache_free_gpu_mem_fraction {kv_cache_free_gpu_mem_fraction}"
         if tp_size > 1:
             command = f"mpirun -n {tp_size} {command}"
+        if chunked_context:
+            command = f"{command} --enable_chunked_context"
         print_colored(f'cpp benchmark command: {command}\n', "grey")
         output = subprocess.run(command,
                                 check=True,
@@ -154,6 +166,8 @@ def benchmark_main(model_path: str,
             print_colored(f'cpp benchmark error: {output.stderr}', "red")
 
     run_llmapi()
+    torch.cuda.empty_cache()
+
     if cpp_executable:
         run_gpt_manager_benchmark()
 

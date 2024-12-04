@@ -124,9 +124,13 @@ def skip_bf16_fp32_accum(dtype, context_fmha_type):
         )
 
 
-skip_single_gpu = pytest.mark.skipif(
-    torch.cuda.device_count() < 2,
-    reason="The test needs at least 2 GPUs, skipping")
+def skip_num_gpus_less_than(num_gpus: int):
+    return pytest.mark.skipif(
+        torch.cuda.device_count() < num_gpus,
+        reason=f"The test needs at least {num_gpus} GPUs, skipping")
+
+
+skip_single_gpu = skip_num_gpus_less_than(2)
 
 
 def skip_less_than_memory(required_memory: int):

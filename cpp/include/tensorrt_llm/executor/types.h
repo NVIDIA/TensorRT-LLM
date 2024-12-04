@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -403,6 +404,52 @@ struct RequestStatsPerIteration
     IterationType iter;
     /// @brief The stats of all active requests for this iteration
     std::vector<RequestStats> requestStats;
+};
+
+/// @brief Struct that holds the stats of a request
+struct RequestPerfMetrics
+{
+    using TimePoint = std::chrono::time_point<std::chrono::steady_clock>;
+
+    struct TimingMetrics
+    {
+        /// @brief The time when the request arrived
+        TimePoint arrivalTime;
+        /// @brief The time when the request was first scheduled
+        TimePoint firstScheduledTime;
+        /// @brief The time when the first token was generated
+        TimePoint firstTokenTime;
+        /// @brief The time when the request was finished
+        TimePoint lastTokenTime;
+        /// @brief Start time of the KV cache transfer for disaggregated serving
+        TimePoint kvCacheTransferStart;
+        /// @brief End time of the KV cache transfer for disaggregated serving
+        TimePoint kvCacheTransferEnd;
+    };
+
+    struct KvCacheMetrics
+    {
+        /// @brief Number of total allocated blocks
+        SizeType32 numTotalAllocatedBlocks{0};
+        /// @brief Number of newly allocated blocks
+        SizeType32 numNewAllocatedBlocks{0};
+        /// @brief Number of reused blocks
+        SizeType32 numReusedBlocks{0};
+        /// @brief Number of missed blocks
+        SizeType32 numMissedBlocks{0};
+        /// @brief KV Cache Hit Rate, defined as reusedBlocks / (reusedBlocks + missedBlocks)
+        SizeType32 kvCacheHitRate{0};
+    };
+
+    TimingMetrics timingMetrics;
+    KvCacheMetrics kvCacheMetrics;
+
+    /// @brief First iteration where the request was processed
+    std::optional<IterationType> firstIter;
+    /// @brief Last iteration where a token was generated
+    std::optional<IterationType> lastIter;
+    /// @brief Current iteration
+    std::optional<IterationType> iter;
 };
 
 /// @brief Struct that holds the debug tensors in an iteration

@@ -431,8 +431,6 @@ class TestFunctional(unittest.TestCase):
                 net.plugin_config.enable_paged_kv_cache(tokens_per_block)
             else:
                 net.plugin_config.paged_kv_cache = False
-            # always enable xqa kernels for test.
-            net.plugin_config.enable_xqa = True
 
             with tensorrt_llm.net_guard(net):
                 x_tensor = Tensor(name='input',

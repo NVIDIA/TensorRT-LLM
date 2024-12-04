@@ -162,6 +162,7 @@ class LLaMAConfig(PretrainedConfig):
         moe_config.validate()
 
         dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
+        tie_word_embeddings = getattr(hf_config, 'tie_word_embeddings', False)
 
         return cls(
             architecture=hf_config.architectures[0],
@@ -186,6 +187,7 @@ class LLaMAConfig(PretrainedConfig):
             mapping=mapping,
             quantization=quant_config,
             remove_duplicated_kv_heads=remove_duplicated_kv_heads,
+            tie_word_embeddings=tie_word_embeddings,
             **kwargs)
 
     @classmethod

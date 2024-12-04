@@ -823,7 +823,7 @@ def validate_group_size(layer):
             "W4A8_AWQ with group_size = 64 is not implemented yet!")
 
 
-def unpack_int32_into_int8(w_packed):
+def unpack_int32_into_int8(w_packed, autoawq_reorder=False):
     # Unpack inputs packed in int32/float32 into uint4 and store them in int8 format
     w_packed_int4x2 = w_packed.contiguous().view(torch.uint8)
     w_unpacked = torch.zeros(w_packed_int4x2.shape[0],
@@ -831,6 +831,9 @@ def unpack_int32_into_int8(w_packed):
                              dtype=torch.int8)
     w_unpacked[:, ::2] = w_packed_int4x2 % 16
     w_unpacked[:, 1::2] = w_packed_int4x2 // 16
+    if autoawq_reorder:
+        w_unpacked = w_unpacked.view(-1, 8)[:, [0, 4, 1, 5, 2, 6, 3, 7]].view(
+            w_unpacked.shape)
     return w_unpacked.contiguous()
 
 
@@ -949,7 +952,7 @@ def postprocess_weight_only_groupwise(tllm_key, weights, torch_dtype, layer,
             if USE_GPTQ:
                 qweight = unpack_int32_into_int8(weights[0].T).T - 8
             elif USE_HF_AWQ:
-                qweight = unpack_int32_into_int8(weights[0]) - 8
+                qweight = unpack_int32_into_int8(weights[0], True) - 8
             else:
                 qweight = unpack_int32_into_int8(weights.T)
             qweight[qweight < 0] += 16
@@ -982,7 +985,7 @@ def postprocess_weight_only_groupwise(tllm_key, weights, torch_dtype, layer,
             if USE_INT8_WEIGHT:
                 qzeros = weights[2].view(torch.uint8)
             else:
-                qzeros = unpack_int32_into_int8(weights[2])
+                qzeros = unpack_int32_into_int8(weights[2], USE_HF_AWQ)
             if using_head_as_leading_dim:
                 scales = change_qkv_leading_dim(scales, num_heads)
                 qzeros = change_qkv_leading_dim(qzeros, num_heads)

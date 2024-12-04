@@ -382,10 +382,10 @@ class TestWeightOnlyGroupWiseQuantMatmul(unittest.TestCase):
                                    group_size)
 
     @parameterized.expand(
-        [(1, 1024, 128, 'float16', True, True, True, 64, False),
+        [(1, 1024, 128, 'float16', True, True, True, 128, True),
          (2, 1024, 256, 'float16', True, True, True, 64, False),
          (3, 1024, 384, 'float16', True, True, True, 64, False),
-         (4, 1024, 512, 'float16', True, True, True, 128, False),
+         (4, 1024, 512, 'float16', True, True, True, 128, True),
          (16, 1024, 256, 'float16', True, True, False, 128, True),
          (64, 1024, 256, 'float16', True, True, False, 128, True),
          (128, 2048, 384, 'float16', True, False, True, 128, False),

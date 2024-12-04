@@ -106,7 +106,7 @@ void generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType const
         MixedGemmArchTraits::ElementsPerAccessB, CutlassOutputType, cutlass::layout::RowMajor, ElementAccumulator,
         cutlass::arch::OpClassTensorOp, arch, ThreadblockShape, WarpShape,
         typename MixedGemmArchTraits::InstructionShape, EpilogueOp,
-        typename cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, Stages, true,
+        typename cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<8>, Stages, true,
         TaggedOperator>::GemmKernel;
 
     using GemmKernel = cutlass::gemm::kernel::GemmFpAIntB<typename GemmKernel_::Mma, typename GemmKernel_::Epilogue,
@@ -433,13 +433,7 @@ void CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType
     char* workspace_ptr, const size_t workspace_bytes, cudaStream_t stream, int* occupancy)
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-    if (sm_ >= 70 && sm_ < 75)
-    {
-        dispatch_gemm_to_cutlass<ActivationType, WeightType, ScaleZeroType, BiasType, OutputType, cutlass::arch::Sm70,
-            QuantOp, EpilogueTag>(A, B, weight_scales, weight_zero_points, biases, alpha, C, m, n, k, group_size,
-            workspace_ptr, workspace_bytes, gemm_config, stream, occupancy);
-    }
-    else if (sm_ >= 75 && sm_ < 80)
+    if (sm_ >= 75 && sm_ < 80)
     {
         dispatch_gemm_to_cutlass<ActivationType, WeightType, ScaleZeroType, BiasType, OutputType, cutlass::arch::Sm75,
             QuantOp, EpilogueTag>(A, B, weight_scales, weight_zero_points, biases, alpha, C, m, n, k, group_size,

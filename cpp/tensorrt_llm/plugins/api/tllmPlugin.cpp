@@ -32,6 +32,7 @@
 #include "tensorrt_llm/plugins/mambaConv1dPlugin/mambaConv1dPlugin.h"
 #include "tensorrt_llm/plugins/mixtureOfExperts/mixtureOfExpertsPlugin.h"
 #if ENABLE_MULTI_DEVICE
+#include "tensorrt_llm/plugins/cpSplitPlugin/cpSplitPlugin.h"
 #include "tensorrt_llm/plugins/ncclPlugin/allgatherPlugin.h"
 #include "tensorrt_llm/plugins/ncclPlugin/allreducePlugin.h"
 #include "tensorrt_llm/plugins/ncclPlugin/recvPlugin.h"
@@ -280,10 +281,16 @@ extern "C"
     [[maybe_unused]] nvinfer1::IPluginCreatorInterface* const* getCreators(std::int32_t& nbCreators)
     {
         static tensorrt_llm::plugins::EaglePrepareDrafterInputsPluginCreator eaglePrepareDrafterInputsPluginCreator;
+#if ENABLE_MULTI_DEVICE
+        static tensorrt_llm::plugins::CpSplitPluginCreator cpSplitPluginCreator;
+#endif // ENABLE_MULTI_DEVICE
 
-        static std::array creators = {
-            creatorInterfacePtr(eaglePrepareDrafterInputsPluginCreator),
-        };
+        static std::array creators
+            = { creatorInterfacePtr(eaglePrepareDrafterInputsPluginCreator),
+#if ENABLE_MULTI_DEVICE
+                  creatorInterfacePtr(cpSplitPluginCreator),
+#endif // ENABLE_MULTI_DEVICE
+              };
         nbCreators = creators.size();
         return creators.data();
     }

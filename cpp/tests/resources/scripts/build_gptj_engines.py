@@ -118,7 +118,8 @@ def build_engines(model_cache: _tp.Optional[str] = None, only_fp8=False):
     # TODO add Tensor and Pipeline parallelism to GPT-J
     tp_size = 1
     pp_size = 1
-    tp_pp_dir = f"tp{tp_size}-pp{pp_size}-gpu"
+    cp_size = 1
+    tp_pp_cp_dir = f"tp{tp_size}-pp{pp_size}-cp{cp_size}-gpu"
     input_file = 'input_tokens.npy'
 
     if only_fp8:
@@ -129,46 +130,46 @@ def build_engines(model_cache: _tp.Optional[str] = None, only_fp8=False):
         # TODO: use dummy scales atm; to re-enable when data is uploaded to the model cache
         # quantized_fp8_model_arg = '--quantized_fp8_model_path=' + \
         #     str(_pl.Path(model_cache) / 'fp8-quantized-modelopt' / 'gptj_tp1_rank0.npz')
-        fp8_ckpt_path = engine_dir / 'fp8' / tp_pp_dir
+        fp8_ckpt_path = engine_dir / 'fp8' / tp_pp_cp_dir
         get_ckpt_with_modelopt_quant(hf_dir, fp8_ckpt_path, model_cache)
         model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.FP8)
         model_spec_obj.use_gpt_plugin()
         model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
         model_spec_obj.use_packed_input()
-        build_engine(fp8_ckpt_path,
-                     engine_dir / model_spec_obj.get_model_path() / tp_pp_dir,
-                     '--gpt_attention_plugin=float16',
-                     '--paged_kv_cache=enable', '--remove_input_padding=enable',
-                     "--context_fmha=disable")
+        build_engine(
+            fp8_ckpt_path,
+            engine_dir / model_spec_obj.get_model_path() / tp_pp_cp_dir,
+            '--gpt_attention_plugin=float16', '--paged_kv_cache=enable',
+            '--remove_input_padding=enable', "--context_fmha=disable")
     else:
-        fp16_ckpt_path = engine_dir / 'fp16' / tp_pp_dir
+        fp16_ckpt_path = engine_dir / 'fp16' / tp_pp_cp_dir
         get_ckpt_without_quatization(hf_dir, fp16_ckpt_path)
         print("\nBuilding fp16-plugin engine")
         model_spec_obj = model_spec.ModelSpec(input_file, _tb.DataType.HALF)
         model_spec_obj.use_gpt_plugin()
         model_spec_obj.set_kv_cache_type(_tb.KVCacheType.CONTINUOUS)
 
-        build_engine(fp16_ckpt_path,
-                     engine_dir / model_spec_obj.get_model_path() / tp_pp_dir,
-                     '--gpt_attention_plugin=float16',
-                     '--paged_kv_cache=disable',
-                     '--remove_input_padding=disable', "--context_fmha=disable")
+        build_engine(
+            fp16_ckpt_path,
+            engine_dir / model_spec_obj.get_model_path() / tp_pp_cp_dir,
+            '--gpt_attention_plugin=float16', '--paged_kv_cache=disable',
+            '--remove_input_padding=disable', "--context_fmha=disable")
 
         print("\nBuilding fp16-plugin-packed engine")
         model_spec_obj.use_packed_input()
-        build_engine(fp16_ckpt_path,
-                     engine_dir / model_spec_obj.get_model_path() / tp_pp_dir,
-                     '--gpt_attention_plugin=float16',
-                     '--paged_kv_cache=disable',
-                     '--remove_input_padding=enable', "--context_fmha=disable")
+        build_engine(
+            fp16_ckpt_path,
+            engine_dir / model_spec_obj.get_model_path() / tp_pp_cp_dir,
+            '--gpt_attention_plugin=float16', '--paged_kv_cache=disable',
+            '--remove_input_padding=enable', "--context_fmha=disable")
 
         print("\nBuilding fp16-plugin-packed-paged engine")
         model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
-        build_engine(fp16_ckpt_path,
-                     engine_dir / model_spec_obj.get_model_path() / tp_pp_dir,
-                     '--gpt_attention_plugin=float16',
-                     '--paged_kv_cache=enable', '--remove_input_padding=enable',
-                     "--context_fmha=disable")
+        build_engine(
+            fp16_ckpt_path,
+            engine_dir / model_spec_obj.get_model_path() / tp_pp_cp_dir,
+            '--gpt_attention_plugin=float16', '--paged_kv_cache=enable',
+            '--remove_input_padding=enable', "--context_fmha=disable")
         print("Done.")
 
 

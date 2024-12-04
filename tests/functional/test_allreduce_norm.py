@@ -29,7 +29,7 @@ from parameterized import parameterized
 import tensorrt_llm as tllm
 from tensorrt_llm import Mapping, Tensor
 from tensorrt_llm.functional import (AllReduceConfig, AllReduceFusionOp,
-                                     AllReduceFusionParams, AllReduceStrategy,
+                                     AllReduceParams, AllReduceStrategy,
                                      allreduce)
 from tensorrt_llm.plugin.plugin import (current_all_reduce_helper,
                                         init_all_reduce_helper)
@@ -129,9 +129,9 @@ class TestCommunicationPlugin(unittest.TestCase):
             current, z = allreduce(
                 current,
                 self.mapping.tp_group,
-                strategy=strategy,
-                config=config,
-                reduce_fusion_params=AllReduceFusionParams(
+                all_reduce_params=AllReduceParams(
+                    strategy=strategy,
+                    config=config,
                     fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
                     bias=y,
                     residual=z,

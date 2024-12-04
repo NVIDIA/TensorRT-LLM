@@ -1130,12 +1130,17 @@ __global__ void packEagleTensors(PackEagleParams params)
     {
         params.outputRandomDataSample[batchIdx] = params.inputRandomDataSample[batchSlot];
         params.outputTemperatures[batchIdx] = params.inputTemperatures[batchSlot];
-        // FIXME we need 1 value per draft token
-        params.outputRandomDataValidation[batchIdx] = params.inputRandomDataValidation[batchSlot];
 
         // 0 for ctx request and actual draft len for gen requests.
         params.outputNextDraftLens[batchIdx]
             = isGenerationRequest ? params.inputSpecDecodingGenerationLengths[batchSlot] - 1 : 0;
+    }
+
+    for (auto ti = static_cast<SizeType32>(threadIdx.x); ti < params.maxDecodingTokens;
+         ti += static_cast<SizeType32>(blockDim.x))
+    {
+        params.outputRandomDataValidation[batchIdx * params.maxDecodingTokens + ti]
+            = params.inputRandomDataValidation[batchSlot * params.maxDecodingTokens + ti];
     }
 
     // Copy draft paths
@@ -1252,9 +1257,12 @@ __global__ void unpackEagleData(UnpackEagleDataParams params)
         // Set random data for draft sampling kernels.
         params.outputRandDataSample[batchSlot]
             = static_cast<float>(curand_uniform(params.inputCurandState + batchSlot));
-        // Set random data for draft verification kernels.
-        params.outputRandDataVerification[batchSlot]
-            = static_cast<float>(curand_uniform(params.inputCurandState + batchSlot));
+        for (SizeType32 ti = 0; ti < params.maxDecodingTokens; ++ti)
+        {
+            // Set random data for draft verification kernels.
+            params.outputRandDataVerification[batchSlot * params.maxDecodingTokens + ti]
+                = static_cast<float>(curand_uniform(params.inputCurandState + batchSlot));
+        }
         // Copy temperature.
         params.outputTemperatures[batchSlot] = params.inputTemperatures[batchSlot];
 

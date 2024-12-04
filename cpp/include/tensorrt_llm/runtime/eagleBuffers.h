@@ -53,8 +53,12 @@ public:
         //! [maxBatchSize] or [numSequences]
         TensorPtr temperatures;
         //! [maxBatchSize] or [numSequences]
+        TensorPtr posteriorAlpha;
+        //! [maxBatchSize] or [numSequences]
+        TensorPtr posteriorThreshold;
+        //! [maxBatchSize] or [numSequences]
         TensorPtr randomDataSample;
-        //! [maxBatchSize, maxNumPaths, maxPathDraftLen] or [numSequences, maxNumPaths, maxPathDraftLen]
+        //! [maxBatchSize, maxDecodingTokens] or [numSequences, maxDecodingTokens]
         TensorPtr randomDataValidation;
         //! [maxBatchSize, maxDecodingDraftTokens] or [numSequences, maxDecodingDraftTokens]
         TensorPtr draftTokens;
@@ -141,10 +145,15 @@ private:
     // helper tensors
     std::size_t scanTempStorageBytes{0};
     std::size_t reduceTempStorageBytes{0};
+    float mDefaultPosteriorThreshold{0.09f};
+    bool mDoGreedySampling{true};
     BufferPtr scanReduceTempStorage;
     TensorPtr cumSumGenerationLengths;
     TensorPtr maxGenerationLength;
     TensorPtr chunkedContextNextTokensHost;
+    TensorPtr greedySamplingHost;
+    TensorPtr posteriorAlphaHost;
+    TensorPtr posteriorThresholdHost;
 };
 
 } // namespace tensorrt_llm::runtime

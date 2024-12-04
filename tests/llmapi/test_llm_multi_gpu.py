@@ -9,7 +9,7 @@ import torch
 from parameterized import parameterized
 
 from tensorrt_llm._utils import release_gc
-from tensorrt_llm.executor import ExecutorBindingsProxy, RequestError
+from tensorrt_llm.executor import ExecutorBindingsProxy
 from tensorrt_llm.llmapi import LLM, KvCacheConfig, SamplingParams
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
@@ -17,7 +17,8 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.llama.model import LLaMAForCausalLM
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import skip_single_gpu, unittest_name_func
+from utils.util import (skip_num_gpus_less_than, skip_single_gpu,
+                        unittest_name_func)
 
 # isort: off
 try:
@@ -28,7 +29,8 @@ try:
         llama_model_path, llama_v2_7b_prompt_adapter_test_harness,
         llama_v2_13b_lora_test_harness, llm_check_output, llm_test_harness,
         mixtral_model_name, prompts, test_llm_get_stats,
-        test_llm_get_stats_async, test_mixtral_8x7b_moe_tp_and_moe_ep)
+        test_llm_get_stats_async, test_mixtral_8x7b_moe_tp_and_moe_ep,
+        tinyllama_guided_decoding_test_harness, _test_llm_capture_request_error)
 except ImportError:
     from test_llm import (
         DummyError, DummyExecutorWorker3, _test_llm_generate_async,
@@ -37,7 +39,8 @@ except ImportError:
         llama_model_path, llama_v2_7b_prompt_adapter_test_harness,
         llama_v2_13b_lora_test_harness, llm_check_output, llm_test_harness,
         mixtral_model_name, prompts, test_llm_get_stats,
-        test_llm_get_stats_async, test_mixtral_8x7b_moe_tp_and_moe_ep)
+        test_llm_get_stats_async, test_mixtral_8x7b_moe_tp_and_moe_ep,
+        tinyllama_guided_decoding_test_harness, _test_llm_capture_request_error)
 # isort: on
 
 
@@ -223,6 +226,14 @@ def test_llm_end2end_tp2(llm_additional_options):
                      sampling_params=SamplingParams(max_tokens=8))
 
 
+@skip_num_gpus_less_than(4)
+def test_tinyllama_guided_decoding_tp2pp2():
+    tinyllama_guided_decoding_test_harness(
+        tensor_parallel_size=2,
+        pipeline_parallel_size=2,
+        kv_cache_config=global_kv_cache_config)
+
+
 @skip_single_gpu
 def test_llama_v2_13b_lora_tp2():
     llama_v2_13b_lora_test_harness(tensor_parallel_size=2,
@@ -364,34 +375,8 @@ DummyExecutor3 = DummyExecutorMeta("DummyExecutor3", (), {},
                                    proxy_class=DummyExecutorProxy3)
 
 
-# TODO[chunweiy]: This test is not stable, need to investigate
-# The phenomenon is that the IpcQueues don't match each other.
-def _test_executor_handle_per_request_error():
-
-    llm = LLM(model=llama_model_path,
-              executor_cls=DummyExecutor3,
-              kv_cache_config=global_kv_cache_config,
-              fast_build=True)
-    # The dummy executor will delay the responses
-    sampling_params = SamplingParams(max_tokens=6)
-
-    # test in streaming mode
-    async def task():
-        nonlocal llm
-        with llm:
-            with pytest.raises(RequestError):
-                async for output in llm.generate_async(
-                        prompts[0], streaming=True,
-                        sampling_params=sampling_params):
-                    print(output)
-
-    asyncio.run(task())
-
-    del llm
-    release_gc()
-
-
-def test_llm_get_stats_tp2():
+# Temporarily disabled due to https://nvbugspro.nvidia.com/bug/4955607
+def _test_llm_get_stats_tp2():
     test_llm_get_stats(tp_size=2)
 
 
@@ -399,8 +384,10 @@ def test_llm_get_stats_async_tp2():
     test_llm_get_stats_async(tp_size=2)
 
 
+def test_llm_capture_request_error():
+    _test_llm_capture_request_error(tp_size=2)
+
+
 if __name__ == '__main__':
 
-    test_llm_get_stats()
-    test_llm_get_stats_async()
-    test_llm_generate_tp2()
+    test_llm_capture_request_error()

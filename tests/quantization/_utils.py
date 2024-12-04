@@ -152,14 +152,14 @@ def gt_qserve_gemm_per_group(qact: torch.IntTensor,
                              qweight: torch.IntTensor,
                              s1_scales: torch.HalfTensor,
                              s2_scales: torch.IntTensor,
-                             s2_zeros: torch.IntTensor,
+                             s2_szeros: torch.IntTensor,
                              group_size=128) -> torch.HalfTensor:
     out_features = qweight.shape[0]
     in_features = qweight.shape[1]
 
     # Step 1: Dequantize weight from int4 to int8
-    s2_zeros = s2_zeros.reshape(out_features, in_features // group_size,
-                                1).to(qweight.device)
+    s2_szeros = s2_szeros.reshape(out_features, in_features // group_size,
+                                  1).to(qweight.device)
     s2_scales = s2_scales.reshape(out_features, in_features // group_size,
                                   1).to(qweight.device)
 
@@ -168,7 +168,7 @@ def gt_qserve_gemm_per_group(qact: torch.IntTensor,
     # If qweight is converted to int32 the result will not match the kernel.
     dequantized_weight = qweight.reshape(
         out_features, in_features // group_size,
-        group_size).sub(s2_zeros).mul(s2_scales)
+        group_size).mul(s2_scales).sub(s2_szeros)
     dequantized_weight = dequantized_weight.reshape(out_features, in_features)
 
     # Step 2: Perform matrix multiplication in int32
@@ -191,7 +191,7 @@ def gt_qserve_gemm_per_channel(qact: torch.IntTensor,
                                act_sums: torch.HalfTensor,
                                qweight: torch.CharTensor,
                                s1_scales: torch.HalfTensor,
-                               s1_zeros: torch.HalfTensor) -> torch.HalfTensor:
+                               s1_szeros: torch.HalfTensor) -> torch.HalfTensor:
     out_features = qweight.shape[0]
     qweight.shape[1]
     num_activations = qact.shape[0]
@@ -210,8 +210,7 @@ def gt_qserve_gemm_per_channel(qact: torch.IntTensor,
     # Step 3: Add the outer product between act_sums and s1_szeros
     # Note: no unary minus before zeros like in per-channel version.
     act_sums = act_sums.reshape(num_activations, 1).to(result.device).float()
-    s1_szeros = s1_zeros.reshape(1, out_features).to(
-        result.device).float() * s1_scales
+    s1_szeros = s1_szeros.reshape(1, out_features).to(result.device).float()
     result = result - act_sums * s1_szeros
 
     return result.half()

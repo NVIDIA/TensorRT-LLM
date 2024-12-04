@@ -51,17 +51,17 @@ def get_base_model_spec() -> model_spec.ModelSpec:
 
 @pytest.fixture(scope="module")
 def model_path(engine_path):
-    return engine_path / f"gpt2/{get_base_model_spec().get_model_path()}/tp1-pp1-gpu"
+    return engine_path / f"gpt2/{get_base_model_spec().get_model_path()}/tp1-pp1-cp1-gpu"
 
 
 @pytest.fixture(scope="module")
 def model_path_return_logits(engine_path):
-    return engine_path / f"gpt2/{get_base_model_spec().gather_logits().get_model_path()}/tp1-pp1-gpu"
+    return engine_path / f"gpt2/{get_base_model_spec().gather_logits().get_model_path()}/tp1-pp1-cp1-gpu"
 
 
 @pytest.fixture
 def model_path_lora(engine_path: _pl.Path) -> _pl.Path:
-    return engine_path / f"gpt2/{get_base_model_spec().use_lora_plugin().get_model_path()}/tp1-pp1-gpu"
+    return engine_path / f"gpt2/{get_base_model_spec().use_lora_plugin().get_model_path()}/tp1-pp1-cp1-gpu"
 
 
 @pytest.fixture

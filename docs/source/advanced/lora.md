@@ -120,7 +120,7 @@ The core idea is that we will have a fixed size, 2-level LoRA cache in TRT-LLM. 
 
 The CPU cache is configured to be a max size.  The GPU cache is configured to a percentage of free GPU memory after engine load. As requests come in LoRAs are stored in the host cache.
 
-As requests are scheduled for execution LoRAs are loaded into the GPU cache. Refer to the {ref}`batch-manager` section for more information.
+As requests are scheduled for execution LoRAs are loaded into the GPU cache.
 
 #### LoRA with tensor parallel
 

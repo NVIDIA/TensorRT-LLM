@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple, Type, Union
 
 from tensorrt_llm.bindings import KVCacheType
-from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceFusionParams,
+from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AttentionMaskType, PositionEmbeddingType,
                                      Tensor, gather_last_token_logits, recv,
                                      send)
@@ -98,12 +98,10 @@ class LinearAttention(ColumnLinear):
 
 class LinearFFN(ColumnLinear):
 
-    def forward(
-            self,
-            hidden_states,
-            lora_layer_params=None,
-            reduce_fusion_params: Optional[AllReduceFusionParams] = None
-    ) -> Tensor:
+    def forward(self,
+                hidden_states,
+                lora_layer_params=None,
+                all_reduce_params: Optional[AllReduceParams] = None) -> Tensor:
         return super().forward(x=hidden_states,
                                lora_runtime_params=None,
                                lora_hidden_state=None)
@@ -344,13 +342,13 @@ class DeciLMDecoderLayer(Module):
             hidden_states = self.input_layernorm(hidden_states)
 
         if self.can_fuse_post_layernorm:
-            reduce_fusion_params = AllReduceFusionParams(
+            all_reduce_params = AllReduceParams(
                 fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
                 residual=residual,
                 norm_weight=self.post_layernorm.weight.value,
                 eps=self.post_layernorm.eps)
         else:
-            reduce_fusion_params = None
+            all_reduce_params = None
 
         attention_output = self._run_attention(
             hidden_states=hidden_states,
@@ -360,7 +358,7 @@ class DeciLMDecoderLayer(Module):
             kv_cache_params=kv_cache_params,
             attention_params=attention_params,
             lora_layer_params=lora_layer_params,
-            reduce_fusion_params=reduce_fusion_params)
+            all_reduce_params=all_reduce_params)
 
         if use_cache:
             attention_output, present_kv = attention_output
@@ -377,15 +375,14 @@ class DeciLMDecoderLayer(Module):
         if next_layer_input_layernorm_args is not None:
             assert self.can_fuse_input_layernorm
             norm_weight, eps = next_layer_input_layernorm_args
-            reduce_fusion_params = AllReduceFusionParams(
+            all_reduce_params = AllReduceParams(
                 fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
                 residual=residual,
                 norm_weight=norm_weight,
                 eps=eps)
-            hidden_states = self._run_ffn(
-                hidden_states,
-                lora_layer_params=lora_layer_params,
-                reduce_fusion_params=reduce_fusion_params)
+            hidden_states = self._run_ffn(hidden_states,
+                                          lora_layer_params=lora_layer_params,
+                                          all_reduce_params=all_reduce_params)
 
         else:
             hidden_states = self._run_ffn(hidden_states,
@@ -404,7 +401,7 @@ class DeciLMDecoderLayer(Module):
         kv_cache_params: Optional[KeyValueCacheParams] = None,
         attention_params: Optional[AttentionParams] = None,
         lora_layer_params: Optional[LoraParams] = None,
-        reduce_fusion_params: Optional[AllReduceFusionParams] = None
+        all_reduce_params: Optional[AllReduceParams] = None
     ) -> Union[Tensor, Tuple[Tensor, None]]:
         """
         Ideally, this functionality would be encapsulated in a LinearAttention class, but during
@@ -416,7 +413,7 @@ class DeciLMDecoderLayer(Module):
             return out, None if use_cache else out
         else:
             if not self.layer_config.is_attention_layer:
-                assert reduce_fusion_params is None, f"Layer with attention of type {self.layer_config.attention.impl} can't do reduce_fusion"
+                assert all_reduce_params is None, f"Layer with attention of type {self.layer_config.attention.impl} can't do reduce_fusion"
 
             return self.attention(hidden_states=hidden_states,
                                   attention_mask=attention_mask,
@@ -425,18 +422,18 @@ class DeciLMDecoderLayer(Module):
                                   kv_cache_params=kv_cache_params,
                                   attention_params=attention_params,
                                   lora_layer_params=lora_layer_params,
-                                  reduce_fusion_params=reduce_fusion_params)
+                                  all_reduce_params=all_reduce_params)
 
     def _run_ffn(self,
                  hidden_states,
                  lora_layer_params=None,
-                 reduce_fusion_params: Optional[AllReduceFusionParams] = None):
+                 all_reduce_params: Optional[AllReduceParams] = None):
         """
         Ideally, this functionality would be encapsulated in a LinearMLP class, but during
         FP8 and lower quantization, our linear classes get overrun by ModelOpt, thus we must
         control the MLP inputs at the DecoderLayer level.
         """
-        if reduce_fusion_params is not None:
+        if all_reduce_params is not None:
             assert self.layer_config.is_mlp_layer, f"Layer with FFN of type {self.layer_config.ffn.impl} can't do reduce_fusion"
 
         if self.layer_config.is_linear_ffn_layer:
@@ -444,7 +441,7 @@ class DeciLMDecoderLayer(Module):
         else:
             return self.ffn(hidden_states,
                             lora_layer_params=lora_layer_params,
-                            reduce_fusion_params=reduce_fusion_params)
+                            all_reduce_params=all_reduce_params)
 
 
 class DeciLMDecoderLayerList(ModuleList):

@@ -18,7 +18,7 @@ TensorRT-LLM supports the latest LLMs. Refer to the {ref}`support-matrix-softwar
 
 ### In-Flight Batching and Paged Attention
 
-{ref}`inflight-batching` takes advantage of the overall text generation process for an LLM can be broken down into multiple iterations of execution on the model. Rather than waiting for the whole batch to finish before moving on to the next set of requests, the TensorRT-LLM runtime immediately evicts finished sequences from the batch. It then begins executing new requests while other requests are still in flight. It's a {ref}`batch-manager` that aims at reducing wait times in queues, eliminating the need for padding requests, and allowing for higher GPU utilization.
+{ref}`inflight-batching` takes advantage of the overall text generation process for an LLM can be broken down into multiple iterations of execution on the model. Rather than waiting for the whole batch to finish before moving on to the next set of requests, the TensorRT-LLM runtime immediately evicts finished sequences from the batch. It then begins executing new requests while other requests are still in flight. It's a {ref}`executor` that aims at reducing wait times in queues, eliminating the need for padding requests, and allowing for higher GPU utilization.
 
 ### Multi-GPU Multi-Node Inference
 

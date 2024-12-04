@@ -64,7 +64,7 @@ protected:
     {
         mModelConfig = std::make_unique<ModelConfig>(0, 2, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
         mModelConfig->setMlpHiddenSize(32);
-        mWorldConfig = std::make_unique<WorldConfig>(2, 1, 0);
+        mWorldConfig = std::make_unique<WorldConfig>(2, 1, 1, 0);
         std::vector<LoraModule> modules{
             LoraModule(LoraModule::ModuleType::kATTN_QKV, 16, 3 * 16, false, true, -1, 0),
             LoraModule(LoraModule::ModuleType::kATTN_Q, 16, 16, false, true, -1, 0),
@@ -168,7 +168,7 @@ TEST_F(LoraCacheTest, determineNumPages)
 {
     ModelConfig modelConfig(0, 2, 2, 0, 1, 4, nvinfer1::DataType::kFLOAT);
     modelConfig.setLoraModules(LoraModule::createLoraModules({"attn_dense", "attn_qkv"}, 4, 4, 1, 1, 2, 2, 0));
-    WorldConfig worldConfig(1, 1, 0);
+    WorldConfig worldConfig(1, 1, 1, 0);
 
     LoraCachePageManagerConfig pageConfig(MemoryType::kCPU, nvinfer1::DataType::kFLOAT, 12393, 40, 80, 16, 1);
 
@@ -359,7 +359,7 @@ TEST_F(LoraCacheTest, basicPutGet)
 TEST_F(LoraCacheTest, splitTransposeCpu)
 {
     auto modelConfig = ModelConfig(0, 2, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
-    auto worldConfig = WorldConfig(2, 1, 0);
+    auto worldConfig = WorldConfig(2, 1, 1, 0);
 
     SizeType32 const split{2};
     std::vector<std::int32_t> const input{28524, 287, 5093, 12, 23316, 4881, 11, 30022, 263, 8776, 355, 257};
@@ -423,7 +423,7 @@ TEST_F(LoraCacheTest, copyToPages_tp1)
 {
     auto modelConfig = ModelConfig(0, 2, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
     modelConfig.setMlpHiddenSize(32);
-    auto worldConfig = WorldConfig(1, 1, 0);
+    auto worldConfig = WorldConfig(1, 1, 1, 0);
     std::vector<LoraModule> modules{
         LoraModule(LoraModule::ModuleType::kATTN_QKV, 16, 3 * 16, false, true, -1, 0),
         LoraModule(LoraModule::ModuleType::kATTN_Q, 16, 16, false, true, -1, 0),
@@ -481,7 +481,7 @@ TEST_F(LoraCacheTest, copyToPages_tp2_rank0)
 {
     auto modelConfig = ModelConfig(0, 2, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
     modelConfig.setMlpHiddenSize(32);
-    auto worldConfig = WorldConfig(2, 1, 0);
+    auto worldConfig = WorldConfig(2, 1, 1, 0);
     std::vector<LoraModule> modules{
         LoraModule(LoraModule::ModuleType::kATTN_QKV, 16, 3 * 16, false, true, -1, 0),
         LoraModule(LoraModule::ModuleType::kATTN_Q, 16, 16, false, true, -1, 0),
@@ -538,7 +538,7 @@ TEST_F(LoraCacheTest, copyToPages_tp2_rank1)
 {
     auto modelConfig = ModelConfig(0, 2, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
     modelConfig.setMlpHiddenSize(32);
-    auto worldConfig = WorldConfig(2, 1, 1);
+    auto worldConfig = WorldConfig(2, 1, 1, 1);
     std::vector<LoraModule> modules{
         LoraModule(LoraModule::ModuleType::kATTN_QKV, 16, 3 * 16, false, true, -1, 0),
         LoraModule(LoraModule::ModuleType::kATTN_Q, 16, 16, false, true, -1, 0),

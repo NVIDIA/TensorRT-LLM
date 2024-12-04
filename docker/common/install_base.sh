@@ -2,6 +2,11 @@
 
 set -ex
 
+GITHUB_URL="https://github.com"
+if [ -n "${GITHUB_MIRROR}" ]; then
+    GITHUB_URL=${GITHUB_MIRROR}
+fi
+
 set_bash_env() {
   if [ ! -f ${BASH_ENV} ];then
     touch ${BASH_ENV}
@@ -48,7 +53,7 @@ install_gcc_centos() {
   # https://gcc.gnu.org/gcc-9/changes.html
   GCC_VERSION="9.5.0"
   yum install -y gcc gcc-c++ file libtool make wget bzip2 bison yacc flex
-  wget -q https://github.com/gcc-mirror/gcc/archive/refs/tags/releases/gcc-${GCC_VERSION}.tar.gz -O /tmp/gcc-${GCC_VERSION}.tar.gz
+  wget -q ${GITHUB_URL}/gcc-mirror/gcc/archive/refs/tags/releases/gcc-${GCC_VERSION}.tar.gz -O /tmp/gcc-${GCC_VERSION}.tar.gz
   tar -xf /tmp/gcc-${GCC_VERSION}.tar.gz -C /tmp/ && cd /tmp/gcc-releases-gcc-${GCC_VERSION}
   ./contrib/download_prerequisites
   ./configure --disable-multilib --enable-languages=c,c++ --with-pi

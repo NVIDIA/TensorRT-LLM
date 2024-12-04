@@ -44,6 +44,7 @@ docs/source/llm-api-examples/llm_*.rst
 # Testing
 .coverage.*
 results_trt/
+llm-test-workspace/
 
 # build/debug
 *.safetensors

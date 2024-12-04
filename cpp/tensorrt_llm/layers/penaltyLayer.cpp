@@ -301,12 +301,21 @@ void PenaltyLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& b
 
     if (penaltyParams.beamWidth > 1)
     {
-        T** logits = const_cast<T**>(penaltyParams.inputLogits);
-        // `BeamSearch` needs converting logits into logProbs before penalties, but `Sampling` doesn't
-        invokeAddBiasSoftMax((T*) nullptr, logits, (T*) nullptr, penaltyParams.biases, penaltyParams.endIds, nullptr,
-            penaltyParams.batchSlots, penaltyParams.batchSize, mDecoderDomain.getBatchSize(), penaltyParams.beamWidth,
-            penaltyParams.vocabSize, penaltyParams.vocabSizePadded, /*skipSoftMax*/ false,
-            /*batchSlotsLogits*/ penaltyParams.batchSlots != nullptr, penaltyParams.stream);
+        // Convert logits into logProbs before penalties, only necessary in Beam-Search.
+        BiasSoftmaxParams<T> biasSoftmaxParams;
+        biasSoftmaxParams.logitsPtrs = const_cast<T**>(penaltyParams.inputLogits);
+        biasSoftmaxParams.bias = penaltyParams.biases;
+        biasSoftmaxParams.endIds = penaltyParams.endIds;
+        biasSoftmaxParams.batchSlots = penaltyParams.batchSlots;
+        biasSoftmaxParams.batchSize = penaltyParams.batchSize;
+        biasSoftmaxParams.maxBatchSize = mDecoderDomain.getBatchSize();
+        biasSoftmaxParams.maxBeamWidth = penaltyParams.beamWidth;
+        biasSoftmaxParams.vocabSize = penaltyParams.vocabSize;
+        biasSoftmaxParams.vocabSizePadded = penaltyParams.vocabSizePadded;
+        biasSoftmaxParams.skipSoftMax = false;
+        biasSoftmaxParams.batchSlotsLogits = penaltyParams.batchSlots != nullptr;
+        biasSoftmaxParams.checkParams();
+        invokeAddBiasSoftMax(biasSoftmaxParams, penaltyParams.stream);
     }
 
     invokeBatchApplyPenalty(penaltyParams);

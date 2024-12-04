@@ -120,6 +120,9 @@ public:
         temperature = fuseValues<FloatType>(
             configs, [&configs](size_t ci) { return configs[ci].temperature; },
             layers::DefaultDecodingParams::getTemperature());
+        originalTemperature = fuseValues<FloatType>(
+            configs, [&configs](size_t ci) { return configs[ci].originalTemperature; },
+            layers::DefaultDecodingParams::getTemperature());
         minLength = fuseValues<SizeType32>(
             configs, [&configs](size_t ci) { return configs[ci].minLength; },
             layers::DefaultDecodingParams::getMinLength());
@@ -198,6 +201,7 @@ public:
         SET_FROM_OPTIONAL(topPDecay, TopPDecay, FloatType)
         SET_FROM_OPTIONAL(randomSeed, Seed, uint64_t)
         SET_FROM_OPTIONAL(temperature, Temperature, FloatType)
+        SET_FROM_OPTIONAL(originalTemperature, Temperature, FloatType)
         SET_FROM_OPTIONAL(minLength, MinTokens, SizeType32)
         SET_FROM_OPTIONAL(beamSearchDiversityRate, BeamSearchDiversityRate, FloatType)
         SET_FROM_OPTIONAL(repetitionPenalty, RepetitionPenalty, FloatType)
@@ -257,10 +261,22 @@ public:
         // Detect greedy sampling and overwrite params.
         if (temperature)
         {
+            // Keep original temperature for Eagle.
+            bool saveOriginalTemperature{false};
+            if (!originalTemperature)
+            {
+                saveOriginalTemperature = true;
+                originalTemperature = std::vector<FloatType>(temperature->size());
+            }
+
             for (size_t ti = 0; ti < temperature->size(); ++ti)
             {
                 if (temperature->at(ti) == 0.f)
                 {
+                    if (saveOriginalTemperature)
+                    {
+                        originalTemperature->at(ti) = 0.f;
+                    }
                     temperature->at(ti) = 1.0f;
 
                     if (topK)
@@ -271,6 +287,10 @@ public:
                     {
                         topP->at(ti) = 1.f;
                     }
+                }
+                else if (saveOriginalTemperature)
+                {
+                    originalTemperature->at(ti) = temperature->at(ti);
                 }
             }
         }
@@ -283,12 +303,13 @@ public:
     std::optional<SizeType32> numReturnSequences;
 
     // penalties
-    OptVec<FloatType> temperature;        // [1] or [batch_size] on cpu
-    OptVec<SizeType32> minLength;         // [1] or [batch_size] on cpu
-    OptVec<FloatType> repetitionPenalty;  // [1] or [batch_size] on cpu
-    OptVec<FloatType> presencePenalty;    // [1] or [batch_size] on cpu
-    OptVec<FloatType> frequencyPenalty;   // [1] or [batch_size] on cpu
-    OptVec<SizeType32> noRepeatNgramSize; // [1] or [batch_size] on cpu
+    OptVec<FloatType> temperature;         // [1] or [batch_size] on cpu
+    OptVec<FloatType> originalTemperature; // [1] or [batch_size] on cpu
+    OptVec<SizeType32> minLength;          // [1] or [batch_size] on cpu
+    OptVec<FloatType> repetitionPenalty;   // [1] or [batch_size] on cpu
+    OptVec<FloatType> presencePenalty;     // [1] or [batch_size] on cpu
+    OptVec<FloatType> frequencyPenalty;    // [1] or [batch_size] on cpu
+    OptVec<SizeType32> noRepeatNgramSize;  // [1] or [batch_size] on cpu
 
     // probs
     OptVec<bool> outputLogProbs;
@@ -318,15 +339,16 @@ public:
     bool operator==(SamplingConfig const& other) const
     {
         return beamWidth == other.beamWidth && numReturnSequences == other.numReturnSequences
-            && temperature == other.temperature && minLength == other.minLength
-            && repetitionPenalty == other.repetitionPenalty && presencePenalty == other.presencePenalty
-            && frequencyPenalty == other.frequencyPenalty && noRepeatNgramSize == other.noRepeatNgramSize
-            && topK == other.topK && topP == other.topP && randomSeed == other.randomSeed
-            && topPDecay == other.topPDecay && topPMin == other.topPMin && topPResetIds == other.topPResetIds
-            && beamSearchDiversityRate == other.beamSearchDiversityRate && lengthPenalty == other.lengthPenalty
-            && earlyStopping == other.earlyStopping && draftAcceptanceThreshold == other.draftAcceptanceThreshold
-            && topKMedusaHeads == other.topKMedusaHeads && normalizeLogProbs == other.normalizeLogProbs
-            && outputLogProbs == other.outputLogProbs && cumLogProbs == other.cumLogProbs;
+            && temperature == other.temperature && originalTemperature == other.originalTemperature
+            && minLength == other.minLength && repetitionPenalty == other.repetitionPenalty
+            && presencePenalty == other.presencePenalty && frequencyPenalty == other.frequencyPenalty
+            && noRepeatNgramSize == other.noRepeatNgramSize && topK == other.topK && topP == other.topP
+            && randomSeed == other.randomSeed && topPDecay == other.topPDecay && topPMin == other.topPMin
+            && topPResetIds == other.topPResetIds && beamSearchDiversityRate == other.beamSearchDiversityRate
+            && lengthPenalty == other.lengthPenalty && earlyStopping == other.earlyStopping
+            && draftAcceptanceThreshold == other.draftAcceptanceThreshold && topKMedusaHeads == other.topKMedusaHeads
+            && normalizeLogProbs == other.normalizeLogProbs && outputLogProbs == other.outputLogProbs
+            && cumLogProbs == other.cumLogProbs;
     }
 
     SizeType32 getNumReturnBeams() const

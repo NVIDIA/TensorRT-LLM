@@ -20,9 +20,9 @@ namespace tensorrt_llm
 {
 namespace kernels
 {
-
-INSTANTIATE_BEAMSEARCH_K(float, 4);
-INSTANTIATE_BEAMSEARCH_K(half, 4);
-
+INSTANTIATE_BEAM_SEARCH(float, 4, false);
+INSTANTIATE_BEAM_SEARCH(float, 4, true);
+INSTANTIATE_BEAM_SEARCH(half, 4, false);
+INSTANTIATE_BEAM_SEARCH(half, 4, true);
 } // namespace kernels
 } // namespace tensorrt_llm

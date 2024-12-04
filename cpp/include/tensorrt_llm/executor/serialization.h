@@ -35,6 +35,16 @@ class SocketState;
 class Serialization
 {
 public:
+    // TimePoint
+    [[nodiscard]] static RequestPerfMetrics::TimePoint deserializeTimePoint(std::istream& is);
+    static void serialize(RequestPerfMetrics::TimePoint const& config, std::ostream& os);
+    [[nodiscard]] static size_t serializedSize(RequestPerfMetrics::TimePoint const&);
+
+    // RequestPerfMetrics
+    [[nodiscard]] static RequestPerfMetrics deserializeRequestPerfMetrics(std::istream& is);
+    static void serialize(RequestPerfMetrics const& config, std::ostream& os);
+    [[nodiscard]] static size_t serializedSize(RequestPerfMetrics const& config);
+
     // SamplingConfig
     [[nodiscard]] static SamplingConfig deserializeSamplingConfig(std::istream& is);
     static void serialize(SamplingConfig const& config, std::ostream& os);
@@ -168,6 +178,21 @@ public:
     static EagleConfig deserializeEagleConfig(std::istream& is);
     static void serialize(EagleConfig const& eagleConfig, std::ostream& os);
     static size_t serializedSize(EagleConfig const& eagleConfig);
+
+    // SpeculativeDecodingConfig
+    static SpeculativeDecodingConfig deserializeSpeculativeDecodingConfig(std::istream& is);
+    static void serialize(SpeculativeDecodingConfig const& specDecConfig, std::ostream& os);
+    static size_t serializedSize(SpeculativeDecodingConfig const& specDecConfig);
+
+    // GuidedDecodingConfig
+    static GuidedDecodingConfig deserializeGuidedDecodingConfig(std::istream& is);
+    static void serialize(GuidedDecodingConfig const& guidedDecodingConfig, std::ostream& os);
+    static size_t serializedSize(GuidedDecodingConfig const& guidedDecodingConfig);
+
+    // GuidedDecodingParams
+    static GuidedDecodingParams deserializeGuidedDecodingParams(std::istream& is);
+    static void serialize(GuidedDecodingParams const& guidedDecodingParams, std::ostream& os);
+    static size_t serializedSize(GuidedDecodingParams const& guidedDecodingParams);
 
     // KvCacheRetentionConfig
     static KvCacheRetentionConfig deserializeKvCacheRetentionConfig(std::istream& is);

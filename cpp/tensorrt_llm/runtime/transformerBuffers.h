@@ -26,8 +26,8 @@
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
-class KVCacheManager;
-} // namespace tensorrt_llm::batch_manager::kv_cache_manager
+class BaseKVCacheManager;
+}
 
 namespace tensorrt_llm::runtime
 {
@@ -38,7 +38,7 @@ class TransformerBuffers
 {
 public:
     using TensorPtr = ITensor::SharedPtr;
-    using KvCacheManager = batch_manager::kv_cache_manager::KVCacheManager;
+    using BaseKVCacheManager = batch_manager::kv_cache_manager::BaseKVCacheManager;
     using TensorMap = StringPtrMap<ITensor>;
 
     TransformerBuffers();
@@ -52,8 +52,8 @@ public:
     void reshapeKvTensors(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxBlocksPerSeq,
         runtime::TllmRuntime const& runtime);
 
-    void setKvPoolPointers(KvCacheManager const* kvCacheManager);
-    void setKvPoolMapping(KvCacheManager const* kvCacheManager);
+    void setKvPoolPointers(BaseKVCacheManager const* kvCacheManager);
+    void setKvPoolMapping(BaseKVCacheManager const* kvCacheManager);
 
     void reset(BufferManager& manager){};
 
@@ -61,14 +61,14 @@ public:
         SizeType32 offset, SizeType32 batchSize);
 
     void prepareContextStep(RuntimeBuffers* runtimeBuffers, TensorPtr const& inputIds, TokenIdType padId,
-        BufferManager& manager, KvCacheManager const* kvCacheManager, SizeType32 firstBatchSlotIdx,
+        BufferManager& manager, BaseKVCacheManager const* kvCacheManager, SizeType32 firstBatchSlotIdx,
         ModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
     void postContextStep(RuntimeBuffers* runtimeBuffers, std::vector<RuntimeBuffers> const& contextBuffers,
         BufferManager& manager, ModelConfig const& modelConfig, WorldConfig const& worldConfig);
 
     void prepareNextStep(RuntimeBuffers* runtimeBuffers, SizeType32 step, BufferManager& manager,
-        KvCacheManager* kvCacheManager, SizeType32 firstBatchSlotIdx, ModelConfig const& modelConfig,
+        BaseKVCacheManager* kvCacheManager, SizeType32 firstBatchSlotIdx, ModelConfig const& modelConfig,
         WorldConfig const& worldConfig);
 
     void getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers, TensorMap& inputBuffers, TensorMap& outputBuffers,

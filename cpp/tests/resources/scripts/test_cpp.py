@@ -228,17 +228,12 @@ def run_tests(build_dir: _pl.Path,
 
     if run_recurrentgemma:
         run_command([
-            "git", "clone",
-            "https://github.com/google-deepmind/recurrentgemma.git"
+            python_exe, "-m", "pip", "install", "-r",
+            "examples/recurrentgemma/requirements.txt"
         ],
                     cwd=root_dir,
                     env=_os.environ,
                     timeout=300)
-        run_command(
-            [python_exe, "-m", "pip", "install", "./recurrentgemma[full]"],
-            cwd=root_dir,
-            env=_os.environ,
-            timeout=300)
 
     build_dir = build_dir if build_dir.is_absolute() else root_dir / build_dir
     resources_dir = _pl.Path("cpp") / "tests" / "resources"
@@ -600,6 +595,21 @@ def prepare_model_tests(model_name: str,
                     env=model_env,
                     timeout=600)
 
+    if model_name in ['gpt', 'llama']:
+        if model_name == 'gpt':
+            script_model_name = 'gpt2'
+        elif model_name == 'llama':
+            script_model_name = 'llama-7b-hf'
+        generate_tokenizer_info = [
+            python_exe,
+            str(scripts_dir / "generate_xgrammar_tokenizer_info.py"),
+            f"--model_name={script_model_name}"
+        ]
+        run_command(generate_tokenizer_info,
+                    cwd=root_dir,
+                    env=model_env,
+                    timeout=600)
+
 
 def build_tests(build_dir: _pl.Path):
     make_google_tests = [
@@ -864,13 +874,18 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
 
     #Logits processor test in leader mode
     new_env = copy.copy(cpp_env)
+    new_env["RUN_LLAMA_MULTI_GPU"] = "true"
     xml_output_file = build_dir / "results-multi-gpu-logits-proc.xml"
+    tp_pp_sizes = [(4, 1), (2, 2), (1, 4)]
+    gtest_filter = ":".join([
+        f"LlamaExecutorTest/LogitsProcParamsTest*tp{tp}_pp{pp}*"
+        for tp, pp in tp_pp_sizes
+    ])
     trt_model_test = produce_mpirun_command(
         global_commands=["mpirun", "--allow-run-as-root"],
         nranks=4,
         local_commands=[
-            "executor/executorTest",
-            "--gtest_filter=LlamaExecutorTest/LogitsProcParamsTest*tp2_pp2*"
+            "executor/executorTest", f"--gtest_filter={gtest_filter}"
         ],
         leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
     run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
@@ -1015,7 +1030,7 @@ def run_benchmarks(model_name: str, python_exe: str, root_dir: _pl.Path,
             model_spec_obj.set_kv_cache_type(_tb.KVCacheType.CONTINUOUS)
             model_spec_obj.use_gpt_plugin()
             model_engine_path = model_engine_dir / model_spec_obj.get_model_path(
-            ) / "tp1-pp1-gpu"
+            ) / "tp1-pp1-cp1-gpu"
         else:
             _log.info(
                 f"gptSessionBenchmark test does not support {model_name}. Skipping benchmarks"
@@ -1057,7 +1072,7 @@ def run_benchmarks(model_name: str, python_exe: str, root_dir: _pl.Path,
         model_spec_obj.use_gpt_plugin()
         model_spec_obj.use_packed_input()
         model_engine_path = model_engine_dir / model_spec_obj.get_model_path(
-        ) / "tp1-pp1-gpu"
+        ) / "tp1-pp1-cp1-gpu"
 
     for prompt_ds_args, tokens_f, len, num_req in zip(prompt_datasets_args,
                                                       token_files,

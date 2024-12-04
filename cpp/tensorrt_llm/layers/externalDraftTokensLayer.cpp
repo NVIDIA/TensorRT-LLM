@@ -218,9 +218,27 @@ void ExternalDraftTokensLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutpu
     auto biasPtr = static_cast<T*>(nullptr);
     auto const* batchSlotsPtr = workspace->getDeviceBatchSlotsPtr();
     mBufferManager->copy(runtimeLogitsPtr, *mTargetLogits);
-    invokeAddBiasSoftMax(runtimeLogitsPtr, logitsPtrsPtr, runtimeLogitsPtr, biasPtr, endIds, finishedInput,
-        batchSlotsPtr, batchSize, mDecoderDomain.getBatchSize(), /* bw */ 1, mDecoderDomain.getVocabSize(),
-        mDecoderDomain.getVocabSizePadded(), /*skipSoftMax*/ false, /* batchSlotLogits */ false, getStream());
+
+    {
+        BiasSoftmaxParams<T> biasSoftmaxParams;
+        biasSoftmaxParams.logits = runtimeLogitsPtr;
+        biasSoftmaxParams.logitsPtrs = logitsPtrsPtr;
+        biasSoftmaxParams.probs = runtimeLogitsPtr;
+        biasSoftmaxParams.bias = biasPtr;
+        biasSoftmaxParams.endIds = endIds;
+        biasSoftmaxParams.finished = finishedInput;
+        biasSoftmaxParams.batchSlots = batchSlotsPtr;
+        biasSoftmaxParams.batchSize = batchSize;
+        biasSoftmaxParams.maxBatchSize = mDecoderDomain.getBatchSize();
+        biasSoftmaxParams.maxBeamWidth = 1;
+        biasSoftmaxParams.vocabSize = mDecoderDomain.getVocabSize();
+        biasSoftmaxParams.vocabSizePadded = mDecoderDomain.getVocabSizePadded();
+        biasSoftmaxParams.skipSoftMax = false;
+        biasSoftmaxParams.batchSlotsLogits = false;
+        biasSoftmaxParams.checkParams();
+
+        invokeAddBiasSoftMax(biasSoftmaxParams, getStream());
+    }
 
     // Fill the buffer for selected ids from sampling with zero. -1 will be set as a boundary if topP kernel is required
     auto& outputIdsAfterSamplingTensor = const_cast<ITensor&>(*mOutputIdsAfterSampling);
@@ -269,7 +287,7 @@ void ExternalDraftTokensLayer<T>::acceptDraftTokens(std::shared_ptr<BaseDecoding
     auto const draftLogitsShape = (*inputs->draftLogits).getShape();
     auto const maxBatchSize = mDecoderDomain.getBatchSize();
     auto const maxTokensPerStep = draftLogitsShape.d[1]; // 1
-    auto const batchSize = inputs->logits.value()->getDimension<0>();
+    auto const batchSize = static_cast<SizeType32>(inputs->logits.value()->getDimension<0>());
     auto constexpr beamWidth = 1;
 
     FinishedState const* finishedInput = (inputs->finished)
@@ -282,25 +300,47 @@ void ExternalDraftTokensLayer<T>::acceptDraftTokens(std::shared_ptr<BaseDecoding
 
     tksd::invokeMaskTargetLogits(batchSize, bufferCast<T>(*mTargetLogits), workspace->getDeviceBatchSlotsPtr(),
         beamWidth, mDecoderDomain.getVocabSizePadded(), finishedInput, maxBatchSize,
-        bufferCast<bool>(*inputs->useDraftLogits), bufferCast<SizeType32>(*mOutputIdsAfterSampling),
-        bufferCast<SizeType32>(*mTargetOutputIds), bufferCastOrNull<SizeType32>(mRuntimeTopKDevice),
+        bufferCast<SizeType32>(*mOutputIdsAfterSampling), bufferCastOrNull<SizeType32>(mRuntimeTopKDevice),
         bufferCast<bool>(*mMaskBuffer), getStream());
 
-    if (inputs->step == 0)
+    auto const* batchSlotsHost = bufferCast<SizeType32>(*inputs->batchSlots);
+    auto const* useDraftLogitsHostPtr = bufferCastOrNull<bool>(inputs->useDraftLogitsHost);
+    auto const skipDraftLogits = allOfBatchSlots(batchSlotsHost, useDraftLogitsHostPtr, batchSize, false);
+
+    if (!skipDraftLogits && inputs->step == 0)
     {
-        invokeAddBiasSoftMax(bufferCast<T>(*inputs->draftLogits), static_cast<T**>(nullptr),
-            bufferCast<T>(*inputs->draftProbs), static_cast<T*>(nullptr), nullptr, finishedInput,
-            workspace->getDeviceBatchSlotsPtr(), batchSize, maxBatchSize, beamWidth * maxTokensPerStep,
-            mDecoderDomain.getVocabSize(), mDecoderDomain.getVocabSizePadded(),
-            /* skip softmax */ false,
-            /* batchSlotLogits */ true, getStream());
+        BiasSoftmaxParams<T> biasSoftmaxParams;
+        biasSoftmaxParams.logits = bufferCast<T>(*inputs->draftLogits);
+        biasSoftmaxParams.probs = bufferCast<T>(*inputs->draftProbs);
+        biasSoftmaxParams.finished = finishedInput;
+        biasSoftmaxParams.batchSlots = workspace->getDeviceBatchSlotsPtr();
+        biasSoftmaxParams.batchSize = batchSize;
+        biasSoftmaxParams.maxBatchSize = maxBatchSize;
+        biasSoftmaxParams.maxBeamWidth = beamWidth * maxTokensPerStep;
+        biasSoftmaxParams.vocabSize = mDecoderDomain.getVocabSize();
+        biasSoftmaxParams.vocabSizePadded = mDecoderDomain.getVocabSizePadded();
+        biasSoftmaxParams.skipSoftMax = false;
+        biasSoftmaxParams.batchSlotsLogits = true;
+        biasSoftmaxParams.checkParams();
+        invokeAddBiasSoftMax(biasSoftmaxParams, getStream());
     }
 
-    invokeAddBiasSoftMax(bufferCast<T>(*mTargetLogits), static_cast<T**>(nullptr), bufferCast<T>(*inputs->targetProbs),
-        static_cast<T*>(nullptr), nullptr, finishedInput, workspace->getDeviceBatchSlotsPtr(), batchSize, maxBatchSize,
-        beamWidth /* 1 */, mDecoderDomain.getVocabSize(), mDecoderDomain.getVocabSizePadded(),
-        /* skip softmax */ false,
-        /* batchSlotLogits */ false, getStream());
+    {
+        BiasSoftmaxParams<T> biasSoftmaxParams;
+        biasSoftmaxParams.logits = bufferCast<T>(*mTargetLogits);
+        biasSoftmaxParams.probs = bufferCast<T>(*inputs->targetProbs);
+        biasSoftmaxParams.finished = finishedInput;
+        biasSoftmaxParams.batchSlots = workspace->getDeviceBatchSlotsPtr();
+        biasSoftmaxParams.batchSize = batchSize;
+        biasSoftmaxParams.maxBatchSize = maxBatchSize;
+        biasSoftmaxParams.maxBeamWidth = beamWidth;
+        biasSoftmaxParams.vocabSize = mDecoderDomain.getVocabSize();
+        biasSoftmaxParams.vocabSizePadded = mDecoderDomain.getVocabSizePadded();
+        biasSoftmaxParams.skipSoftMax = false;
+        biasSoftmaxParams.batchSlotsLogits = false;
+        biasSoftmaxParams.checkParams();
+        invokeAddBiasSoftMax(biasSoftmaxParams, getStream());
+    }
 
     sync_check_cuda_error();
 
@@ -409,6 +449,8 @@ void ExternalDraftTokensLayer<T>::getAllTopKs(std::shared_ptr<BaseDecodingInputs
     params.returnAllSelectedTokens = true;
     params.maxSeqLen = mDecoderDomain.getVocabSizePadded(); // workaround for returning all topKs with outputIds
     params.logitsHasProbs = inputs->probsComputed;
+    params.outputIdCurrentStep = bufferCastOrNull<TokenIdType>(mTargetOutputIds);
+    params.skipOutputIdCurrentStep = bufferCast<bool>(*inputs->useDraftLogits);
 
     invokeBatchTopKSampling(params, getStream());
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -423,7 +465,7 @@ void ExternalDraftTokensLayer<T>::getAllTopPs(std::shared_ptr<BaseDecodingInputs
 
     auto logits = bufferCastOrNull<T>(inputs->logits);
 
-    auto const batchSize = inputs->logits.value()->getDimension<0>();
+    auto const batchSize = static_cast<SizeType32>(inputs->logits.value()->getDimension<0>());
 
     auto const* batchSlotsHost = bufferCast<SizeType32>(*inputs->batchSlots);
     auto const* skipDecodeHostPtr = bufferCastOrNull<bool>(mSkipTopPDecodeHost);
@@ -451,6 +493,8 @@ void ExternalDraftTokensLayer<T>::getAllTopPs(std::shared_ptr<BaseDecodingInputs
     params.vocabSizePadded = mDecoderDomain.getVocabSizePadded();
     params.returnAllSelectedTokens = true;
     params.maxSeqLen = mDecoderDomain.getVocabSizePadded();
+    params.outputIdCurrentStep = bufferCastOrNull<TokenIdType>(mTargetOutputIds);
+    params.skipOutputIdCurrentStep = bufferCast<bool>(*inputs->useDraftLogits);
 
     invokeBatchTopPSampling<T>(params, getStream());
 

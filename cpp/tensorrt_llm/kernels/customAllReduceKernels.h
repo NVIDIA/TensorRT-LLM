@@ -48,7 +48,8 @@ enum class AllReduceStrategyType : int8_t
     NCCL = 0,
     ONESHOT = 1,
     TWOSHOT = 2,
-    AUTO = 3,
+    UB = 3,
+    AUTO = 4,
 };
 
 enum class AllReduceStrategyConfig : int8_t
@@ -61,6 +62,7 @@ enum class AllReduceFusionOp : int8_t
 {
     NONE = 0,
     RESIDUAL_RMS_NORM = 1,
+    LAST_PROCESS_FOR_UB = 2,
 };
 
 struct AllReduceFusionParams

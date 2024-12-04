@@ -34,6 +34,8 @@
 #include "cutlass_extensions/epilogue_helpers.h"
 #include "cutlass_extensions/gemm_configs.h"
 
+#include "cutlass_extensions/gemm/collective/collective_builder_interleaved.hpp"
+
 #ifdef __GNUC__ // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic pop
 #endif          // __GNUC__
@@ -72,13 +74,7 @@ void sm90_generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType 
 
     if constexpr (!should_filter_sm90_gemm_problem_shape_v<CTAShape, ClusterShape, ActivationType>)
     {
-        using CutlassWeightType__ = typename TllmToCutlassTypeAdapter<WeightType>::type;
-        // We need to remap this since SM90 uses a different layout for the weight matrix.
-        using CutlassWeightType_ = std::conditional_t<std::is_same_v<CutlassWeightType__, cutlass::uint4b_t>,
-            cutlass::int4b_t, CutlassWeightType__>;
-
-        using CutlassWeightType
-            = std::conditional_t<std::is_same_v<CutlassWeightType_, uint8_t>, int8_t, CutlassWeightType_>;
+        using CutlassWeightType = typename TllmToCutlassTypeAdapter<WeightType>::type;
 
         using CutlassScaleZeroType = typename TllmToCutlassTypeAdapter<ScaleZeroType>::type;
         using CutlassBiasType = typename TllmToCutlassTypeAdapter<BiasType>::type;
@@ -90,10 +86,10 @@ void sm90_generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType 
                 || std::is_same_v<CutlassActivationType, cutlass::float_e5m2_t>,
             "Activation type must be bfloat16, half, FP8");
 
-        static_assert(std::is_same_v<CutlassWeightType, int8_t> || std::is_same_v<CutlassWeightType, cutlass::int4b_t>
+        static_assert(std::is_same_v<CutlassWeightType, uint8_t> || std::is_same_v<CutlassWeightType, cutlass::uint4b_t>
                 || std::is_same_v<CutlassWeightType, cutlass::float_e4m3_t>
                 || std::is_same_v<CutlassWeightType, cutlass::float_e5m2_t>,
-            "Weight type must be fp8, int8_t or int4_t");
+            "Weight type must be fp8, uint8_t or uint4_t");
 
         using LayoutA = cutlass::layout::RowMajor; // Layout type for A matrix operand
         constexpr int AlignmentA = 128 / cutlass::sizeof_bits<CutlassActivationType>::value;
@@ -154,9 +150,9 @@ void sm90_generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType 
         using ElementBCollectiveInfo = std::conditional_t<cutlass::hasZero(QuantOp), PackedScaleZero, PackedScale>;
 
         // We swap A and B operands to the builder here
-        using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<ArchTag, OperatorClass,
-            ElementBCollectiveInfo, LayoutB_Transpose, AlignmentB, CutlassActivationType, LayoutA_Transpose, AlignmentA,
-            ElementAccumulator, TileShape, ClusterShape,
+        using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilderInterleaved<ArchTag,
+            OperatorClass, ElementBCollectiveInfo, LayoutB_Transpose, AlignmentB, CutlassActivationType,
+            LayoutA_Transpose, AlignmentA, ElementAccumulator, TileShape, ClusterShape,
             cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
                 sizeof(typename CollectiveEpilogue::SharedStorage))>,
             KernelSchedule>::CollectiveOp;

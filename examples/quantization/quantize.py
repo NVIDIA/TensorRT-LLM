@@ -98,6 +98,7 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", default="exported_model")
     parser.add_argument("--tp_size", type=int, default=1)
     parser.add_argument("--pp_size", type=int, default=1)
+    parser.add_argument("--cp_size", type=int, default=1)
     parser.add_argument("--awq_block_size", type=int, default=128)
     parser.add_argument("--kv_cache_dtype",
                         help="KV Cache dtype.",
@@ -161,6 +162,7 @@ if __name__ == "__main__":
             output_dir=args.output_dir,
             tp_size=args.tp_size,
             pp_size=args.pp_size,
+            cp_size=args.cp_size,
             seed=args.seed,
             tokenizer_max_seq_length=args.tokenizer_max_seq_length,
             num_medusa_heads=args.num_medusa_heads,
@@ -186,6 +188,7 @@ if __name__ == "__main__":
                                  output_dir=args.output_dir,
                                  tp_size=args.tp_size,
                                  pp_size=args.pp_size,
+                                 cp_size=args.cp_size,
                                  seed=args.seed)
     else:
         raise ValueError(

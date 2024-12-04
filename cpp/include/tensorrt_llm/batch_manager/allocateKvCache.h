@@ -30,7 +30,7 @@ namespace tle = tensorrt_llm::executor;
 
 class AllocateKvCache : Algorithm
 {
-    using KVCacheManager = tensorrt_llm::batch_manager::kv_cache_manager::KVCacheManager;
+    using BaseKVCacheManager = tensorrt_llm::batch_manager::kv_cache_manager::BaseKVCacheManager;
 
     template <typename T>
     using OptionalRef = tensorrt_llm::common::OptionalRef<T>;
@@ -42,9 +42,9 @@ public:
 
     AllocateKvCache() = default;
 
-    void operator()(KVCacheManager& kvCacheManager, RequestVector& contextRequests,
+    void operator()(BaseKVCacheManager& kvCacheManager, RequestVector& contextRequests,
         RequestVector const& generationRequests, runtime::ModelConfig const& modelConfig,
-        OptionalRef<KVCacheManager> crossKvCacheManager = std::nullopt) const;
+        OptionalRef<BaseKVCacheManager> crossKvCacheManager = std::nullopt) const;
 };
 
 } // namespace tensorrt_llm::batch_manager

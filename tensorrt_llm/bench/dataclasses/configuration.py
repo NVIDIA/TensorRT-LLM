@@ -28,18 +28,18 @@ class RuntimeConfig(BaseModel):
 
     def get_config(self) -> trtllm.ExecutorConfig:
         return trtllm.ExecutorConfig(
-            scheduler_config=self.settings_config.get_scheduler_config(),
-            kv_cache_config=self.settings_config.get_kvcache_config(),
-            parallel_config=self.world_config.get_parallel_config(),
             batching_type=trtllm.BatchingType.INFLIGHT,
-            iter_stats_max_iterations=0,
-            request_stats_max_iterations=0,
-            max_batch_size=self.settings_config.max_batch_size,
-            max_num_tokens=self.settings_config.max_num_tokens,
+            decoding_config=self.decoding_config.get_decoding_config(),
             enable_chunked_context=self.settings_config.chunking,
             extended_runtime_perf_knob_config=self.performance_options.
             get_perf_config(),
-            decoding_config=self.decoding_config.get_decoding_config(),
+            iter_stats_max_iterations=0,
+            kv_cache_config=self.settings_config.get_kvcache_config(),
+            max_batch_size=self.settings_config.max_batch_size,
+            max_num_tokens=self.settings_config.max_num_tokens,
+            parallel_config=self.world_config.get_parallel_config(),
+            request_stats_max_iterations=0,
+            scheduler_config=self.settings_config.get_scheduler_config(),
         )
 
     @model_validator(mode="after")
@@ -50,7 +50,7 @@ class RuntimeConfig(BaseModel):
 
 class PerformanceOptions(BaseModel):
     cuda_graphs: bool = False
-    multi_block_mode: bool = False
+    multi_block_mode: bool = True
     cuda_graph_cache_size: int = 1000
 
     def get_perf_config(self) -> trtllm.ExtendedRuntimePerfKnobConfig:
@@ -141,6 +141,12 @@ class ExecutorSettingsConfig(BaseModel):
     max_num_tokens: int
     kv_cache_percent: PositiveFloat = Field(default=.90, le=1.0)
     kv_cache_reuse: bool = False
+    dynamic_max_batch_size: bool = True
+
+    def get_dynamic_config(self) -> trtllm.DynamicBatchConfig:
+        window_size = 128 if self.dynamic_max_batch_size else 0
+        return trtllm.DynamicBatchConfig(self.dynamic_max_batch_size,
+                                         window_size)
 
     def get_kvcache_config(self) -> trtllm.KvCacheConfig:
         return trtllm.KvCacheConfig(

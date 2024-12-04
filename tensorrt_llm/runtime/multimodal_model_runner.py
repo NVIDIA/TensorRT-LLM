@@ -180,7 +180,7 @@ class LlavaOnevisionUtils:
             image_features (`torch.Tensor` of shape `(num_images, num_patches, image_length, embed_dim)`)
                 Image feature tensor, each contains all the visual feature of all patches.
             image_sizes (`torch.Tensor` of shape `(num_images, 2)`)
-                Actual image size of each images (W, H).
+                Actual image size of each images (H, W).
             image_newline (`torch.Tensor` of shape `(embed_dim)`)
                 New line embedding vector.
         Returns:
@@ -215,8 +215,8 @@ class LlavaOnevisionUtils:
                                         [1920, 1920], [1920, 2304], [2304, 384],
                                         [2304, 768], [2304, 1152], [2304, 1536],
                                         [2304, 1920], [2304, 2304]]
-                num_patch_height, num_patch_width = LlavaNextUtils.get_anyres_image_grid_shape(
-                    image_sizes[image_idx].tolist(), IMAGE_SIZE,
+                num_patch_width, num_patch_height = LlavaNextUtils.get_anyres_image_grid_shape(
+                    image_sizes[image_idx][[1, 0]].tolist(), IMAGE_SIZE,
                     IMAGE_GRID_PINPOINTS)
                 image_feature = image_feature.view(num_patch_height,
                                                    num_patch_width, height,
@@ -225,7 +225,7 @@ class LlavaOnevisionUtils:
                                                       3).contiguous()
                 image_feature = image_feature.flatten(1, 2).flatten(2, 3)
                 image_feature = LlavaNextUtils.unpad_image(
-                    image_feature, image_sizes[image_idx])
+                    image_feature, image_sizes[image_idx][[1, 0]])
 
                 channels, curr_height, curr_width = image_feature.shape
                 ratio = math.sqrt(curr_height * curr_width /
@@ -676,7 +676,7 @@ class MultimodalModelRunner:
             if self.args.video_path is None:
                 image = input['pixel_values']
                 image = image[0].repeat(self.args.batch_size, 1, 1, 1)
-                image_size = input['image_sizes'][0][[1, 0]]
+                image_size = input['image_sizes'][0]
                 image_size = image_size.repeat(self.args.batch_size, 1).cpu()
             else:
                 image = input['pixel_values_videos']
@@ -981,9 +981,10 @@ class MultimodalModelRunner:
             # When image is None, create dummy visual_features and cross_attention_mask
             if visual_features is None:
                 visual_features = torch.zeros([
-                    self.args.batch_size, 1, 4, 1, self.model_config.hidden_size
+                    self.args.batch_size, 1, 4, 1,
+                    self.model_config.hidden_size * self.runtime_mapping.tp_size
                 ],
-                                              dtype=torch.bfloat16,
+                                              dtype=self.model.dtype,
                                               device=self.device)
                 dummy_cross_attention_mask = torch.zeros(
                     [self.args.batch_size, input_ids.shape[1], 1, 4],
@@ -997,7 +998,7 @@ class MultimodalModelRunner:
                                                      dtype=torch.bool,
                                                      device='cpu')
 
-            visual_features = visual_features.to(torch.bfloat16).chunk(
+            visual_features = visual_features.to(self.model.dtype).chunk(
                 self.args.batch_size, dim=0)
             encoder_input_features = []
             cross_attention_masks = []

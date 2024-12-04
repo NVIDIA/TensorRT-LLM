@@ -9,7 +9,7 @@ onnx>=1.12.0
 onnx_graphsurgeon>=0.5.2
 polygraphy==0.49.9
 psutil
-pynvml>=11.5.0
+pynvml~=11.5.0
 pulp
 pandas
 h5py==3.10.0

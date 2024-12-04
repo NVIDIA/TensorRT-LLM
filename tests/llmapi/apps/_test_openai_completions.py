@@ -35,7 +35,7 @@ def async_client(server: RemoteOpenAIServer):
     return server.get_async_client()
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.parametrize("echo", [True, False])
 async def test_completion_streaming(async_client: openai.AsyncOpenAI,
                                     model_name: str, echo: bool):
@@ -97,7 +97,7 @@ def test_single_completion(client: openai.OpenAI, model_name):
     assert len(completion.choices[0].text) >= 1
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_batch_completions(async_client: openai.AsyncOpenAI, model_name):
     # test both text and token IDs
     for prompts in (["Hello, my name is"] * 2, [[0, 0, 0, 0, 0]] * 2):

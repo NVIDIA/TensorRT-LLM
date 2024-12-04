@@ -117,6 +117,15 @@ def dup_kv_weight(v, num_head, tp_size):
     return v.reshape(num_head * reps * head_size, -1).clone().detach()
 
 
+def dup_kv_bias(v, num_head, tp_size):
+    assert tp_size % num_head == 0
+    reps = tp_size // num_head
+    head_size = v.shape[0] // num_head
+    v = v.reshape(num_head,
+                  head_size)[:, None, :].expand(num_head, reps, head_size)
+    return v.reshape(num_head * reps * head_size).clone().detach()
+
+
 def weight_only_quantize_dict(weights: Dict[str, torch.Tensor],
                               quant_algo: str,
                               quant_weights=[
@@ -347,7 +356,7 @@ def smooth_gemm(gemm_weights,
             [gemm.abs().max(dim=0, keepdim=True)[0] for gemm in gemm_weights],
             dim=0)
         weight_scales = weight_scales.max(dim=0)[0]
-    weight_scales.to(float).clamp(min=1e-5)
+    weight_scales = weight_scales.to(float).clamp(min=1e-5)
     scales = (act_scales.to(gemm_weights[0].device).to(float).pow(alpha) /
               weight_scales.pow(1 - alpha)).clamp(min=1e-5)
 
@@ -386,7 +395,7 @@ def smooth_gemm_fc1_gate(fc1_weights,
             [gemm.abs().max(dim=0, keepdim=True)[0] for gemm in gemm_weights],
             dim=0)
         weight_scales = weight_scales.max(dim=0)[0]
-    weight_scales.to(float).clamp(min=1e-5)
+    weight_scales = weight_scales.to(float).clamp(min=1e-5)
     scales = (act_scales.to(gemm_weights[0].device).to(float).pow(alpha) /
               weight_scales.pow(1 - alpha)).clamp(min=1e-5)
 

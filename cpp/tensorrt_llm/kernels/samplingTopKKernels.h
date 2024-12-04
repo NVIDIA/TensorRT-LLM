@@ -112,6 +112,13 @@ struct TopKSamplingKernelParams
     //! flag to return all selected TopK results
     bool returnAllSelectedTokens{false};
 
+    //! output buffer [maxBatchSize], optional.
+    //! Store the multinomial sampled target token id in TopK/TopP sampled tokens when returnAllSelectedTokens==True.
+    //! Only return when skipOutputIdCurrentStep != nullptr && skipOutputIdCurrentStep == False
+    runtime::TokenIdType* outputIdCurrentStep{nullptr};
+    //! input buffer [maxBatchSize]. Determine if multinomial sampling is required when returnAllSelectedTokens==True.
+    bool const* skipOutputIdCurrentStep{nullptr};
+
     void checkParams() const
     {
         TLLM_CHECK(batchSize > 0);
@@ -150,6 +157,8 @@ struct TopKSamplingKernelParams
 
         TLLM_CHECK(0 < maxTopP && maxTopP <= 1.f);
         TLLM_CHECK(0 <= maxTopK && maxTopK <= TOP_K_MAX);
+        TLLM_CHECK((skipOutputIdCurrentStep && outputIdCurrentStep && returnAllSelectedTokens)
+            || (skipOutputIdCurrentStep == nullptr && outputIdCurrentStep == nullptr));
     }
 };
 

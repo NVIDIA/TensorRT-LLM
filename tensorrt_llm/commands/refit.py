@@ -15,7 +15,7 @@ import tensorrt as trt
 from tensorrt_llm._common import _is_building
 from tensorrt_llm._utils import np_dtype_to_trt
 from tensorrt_llm.builder import EngineConfig, optimize_model_with_config
-from tensorrt_llm.models import MODEL_MAP
+from tensorrt_llm.models import MODEL_MAP, PretrainedConfig
 
 from ..logger import logger
 
@@ -41,7 +41,8 @@ def refit_engine(engine_path: str, refit_engine_dir: str, checkpoint_dir: str,
 
     # Load model.
     tik = time.time()
-    rank_config = copy.deepcopy(engine_config.pretrained_config)
+    rank_config = PretrainedConfig.from_dict(
+        engine_config.pretrained_config.to_dict())
     rank_config.set_rank(rank)
 
     architecture = rank_config.architecture

@@ -36,6 +36,7 @@ baichuan2_13b_model_path = get_model_path('Baichuan2-13B-Chat')
 qwen_model_path = get_model_path('Qwen-1_8B-Chat')
 qwen1_5_model_path = get_model_path('Qwen1.5-0.5B-Chat')
 qwen2_model_path = get_model_path('Qwen2-7B-Instruct')
+qwen2_5_model_path = get_model_path('Qwen2.5-0.5B-Instruct')
 mamba2_370m_model_path = get_model_path('mamba2/mamba2-370m')
 gpt_neox_20b_model_path = get_model_path('gpt-neox-20b')
 commandr_v01_model_path = get_model_path('c4ai-command-r-v01')
@@ -320,6 +321,18 @@ def test_llm_qwen2():
     build_config = BuildConfig()
     build_config.max_batch_size = 512
     llm_test_harness(qwen2_model_path,
+                     inputs=['A B C'],
+                     references=['D E F G H I J K L M'],
+                     sampling_params=sampling_params,
+                     build_config=build_config,
+                     trust_remote_code=True)
+
+
+@skip_pre_ampere
+def test_llm_qwen2_5():
+    build_config = BuildConfig()
+    build_config.max_batch_size = 512
+    llm_test_harness(qwen2_5_model_path,
                      inputs=['A B C'],
                      references=['D E F G H I J K L M'],
                      sampling_params=sampling_params,

@@ -214,6 +214,28 @@ void InitBindings(pybind11::module_& m)
             [](tle::RequestStatsPerIteration const& iterationStats)
             { return tle::JsonSerialization::toJsonStr(iterationStats); });
 
+    auto samplingConfigGetstate = [](tle::SamplingConfig const& self)
+    {
+        return py::make_tuple(self.getBeamWidth(), self.getTopK(), self.getTopP(), self.getTopPMin(),
+            self.getTopPResetIds(), self.getTopPDecay(), self.getSeed(), self.getTemperature(), self.getMinTokens(),
+            self.getBeamSearchDiversityRate(), self.getRepetitionPenalty(), self.getPresencePenalty(),
+            self.getFrequencyPenalty(), self.getLengthPenalty(), self.getEarlyStopping(), self.getNoRepeatNgramSize());
+    };
+    auto samplingConfigSetstate = [](py::tuple state)
+    {
+        if (state.size() != 16)
+        {
+            throw std::runtime_error("Invalid SamplingConfig state!");
+        }
+        return tle::SamplingConfig(state[0].cast<SizeType32>(), state[1].cast<std::optional<SizeType32>>(),
+            state[2].cast<std::optional<FloatType>>(), state[3].cast<std::optional<FloatType>>(),
+            state[4].cast<std::optional<tle::TokenIdType>>(), state[5].cast<std::optional<FloatType>>(),
+            state[6].cast<std::optional<tle::RandomSeedType>>(), state[7].cast<std::optional<FloatType>>(),
+            state[8].cast<std::optional<SizeType32>>(), state[9].cast<std::optional<FloatType>>(),
+            state[10].cast<std::optional<FloatType>>(), state[11].cast<std::optional<FloatType>>(),
+            state[12].cast<std::optional<FloatType>>(), state[13].cast<std::optional<FloatType>>(),
+            state[14].cast<std::optional<SizeType32>>(), state[15].cast<std::optional<SizeType32>>());
+    };
     py::class_<tle::SamplingConfig>(m, "SamplingConfig")
         // A modified version of constructor to accpect deprecated args randomSeed and minLength
         // TODO(enweiz): use the original constructor after the deprecated args are removed
@@ -287,18 +309,47 @@ void InitBindings(pybind11::module_& m)
         .def_property("no_repeat_ngram_size", &tle::SamplingConfig::getNoRepeatNgramSize,
             &tle::SamplingConfig::setNoRepeatNgramSize)
         .def_property("num_return_sequences", &tle::SamplingConfig::getNumReturnSequences,
-            &tle::SamplingConfig::setNumReturnSequences);
+            &tle::SamplingConfig::setNumReturnSequences)
+        .def(py::pickle(samplingConfigGetstate, samplingConfigSetstate));
 
+    auto outputConfigGetstate = [](tle::OutputConfig const& self)
+    {
+        return py::make_tuple(self.returnLogProbs, self.returnContextLogits, self.returnGenerationLogits,
+            self.excludeInputFromOutput, self.returnEncoderOutput, self.returnPerfMetrics);
+    };
+    auto outputConfigSetstate = [](py::tuple state)
+    {
+        if (state.size() != 6)
+        {
+            throw std::runtime_error("Invalid OutputConfig state!");
+        }
+        return tle::OutputConfig(state[0].cast<bool>(), state[1].cast<bool>(), state[2].cast<bool>(),
+            state[3].cast<bool>(), state[4].cast<bool>(), state[5].cast<bool>());
+    };
     py::class_<tle::OutputConfig>(m, "OutputConfig")
-        .def(py::init<bool, bool, bool, bool, bool>(), py::arg("return_log_probs") = false,
+        .def(py::init<bool, bool, bool, bool, bool, bool>(), py::arg("return_log_probs") = false,
             py::arg("return_context_logits") = false, py::arg("return_generation_logits") = false,
-            py::arg("exclude_input_from_output") = false, py::arg("return_encoder_output") = false)
+            py::arg("exclude_input_from_output") = false, py::arg("return_encoder_output") = false,
+            py::arg("return_perf_metrics") = false)
         .def_readwrite("return_log_probs", &tle::OutputConfig::returnLogProbs)
         .def_readwrite("return_context_logits", &tle::OutputConfig::returnContextLogits)
         .def_readwrite("return_generation_logits", &tle::OutputConfig::returnGenerationLogits)
         .def_readwrite("exclude_input_from_output", &tle::OutputConfig::excludeInputFromOutput)
-        .def_readwrite("return_encoder_output", &tle::OutputConfig::returnEncoderOutput);
+        .def_readwrite("return_encoder_output", &tle::OutputConfig::returnEncoderOutput)
+        .def_readwrite("return_perf_metrics", &tle::OutputConfig::returnPerfMetrics)
+        .def(py::pickle(outputConfigGetstate, outputConfigSetstate));
 
+    auto externalDraftTokensConfigGetstate = [](tle::ExternalDraftTokensConfig const& self)
+    { return py::make_tuple(self.getTokens(), self.getLogits(), self.getAcceptanceThreshold()); };
+    auto externalDraftTokensConfigSetstate = [](py::tuple state)
+    {
+        if (state.size() != 3)
+        {
+            throw std::runtime_error("Invalid ExternalDraftTokensConfig state!");
+        }
+        return tle::ExternalDraftTokensConfig(state[0].cast<VecTokens>(), state[1].cast<std::optional<Tensor>>(),
+            state[2].cast<std::optional<FloatType>>());
+    };
     py::class_<tle::ExternalDraftTokensConfig>(m, "ExternalDraftTokensConfig")
         .def(py::init<VecTokens, std::optional<Tensor>, std::optional<FloatType> const&, std::optional<bool>>(),
             py::arg("tokens"), py::arg("logits") = py::none(), py::arg("acceptance_threshold") = py::none(),
@@ -306,36 +357,87 @@ void InitBindings(pybind11::module_& m)
         .def_property_readonly("tokens", &tle::ExternalDraftTokensConfig::getTokens)
         .def_property_readonly("logits", &tle::ExternalDraftTokensConfig::getLogits)
         .def_property_readonly("acceptance_threshold", &tle::ExternalDraftTokensConfig::getAcceptanceThreshold)
+        .def(py::pickle(externalDraftTokensConfigGetstate, externalDraftTokensConfigSetstate))
         .def_property_readonly("fast_logits", &tle::ExternalDraftTokensConfig::getFastLogits);
 
+    auto promptTuningConfigGetstate = [](tle::PromptTuningConfig const& self)
+    { return py::make_tuple(self.getEmbeddingTable(), self.getInputTokenExtraIds()); };
+    auto promptTuningConfigSetstate = [](py::tuple state)
+    {
+        if (state.size() != 2)
+        {
+            throw std::runtime_error("Invalid PromptTuningConfig state!");
+        }
+        return tle::PromptTuningConfig(state[0].cast<Tensor>(), state[1].cast<std::optional<VecTokenExtraIds>>());
+    };
     py::class_<tle::PromptTuningConfig>(m, "PromptTuningConfig")
         .def(py::init<Tensor, std::optional<VecTokenExtraIds>>(), py::arg("embedding_table"),
             py::arg("input_token_extra_ids") = py::none())
         .def_property_readonly("embedding_table", &tle::PromptTuningConfig::getEmbeddingTable)
-        .def_property_readonly("input_token_extra_ids", &tle::PromptTuningConfig::getInputTokenExtraIds);
+        .def_property_readonly("input_token_extra_ids", &tle::PromptTuningConfig::getInputTokenExtraIds)
+        .def(py::pickle(promptTuningConfigGetstate, promptTuningConfigSetstate));
 
-    py::class_<tle::MropeConfig>(m, "MropeConfig")
-        .def(py::init<Tensor, SizeType32>(), py::arg("mrope_rotary_sin_cos"), py::arg("mrope_position_deltas"))
-        .def_property_readonly("mrope_rotary_sin_cos", &tle::MropeConfig::getMRopeRotarySinCos)
-        .def_property_readonly("mrope_position_deltas", &tle::MropeConfig::getMRopePositionDeltas);
-
+    auto loraConfigGetstate = [](tle::LoraConfig const& self)
+    { return py::make_tuple(self.getTaskId(), self.getWeights(), self.getConfig()); };
+    auto loraConfigSetstate = [](py::tuple state)
+    {
+        if (state.size() != 3)
+        {
+            throw std::runtime_error("Invalid LoraConfig state!");
+        }
+        return tle::LoraConfig(
+            state[0].cast<IdType>(), state[1].cast<std::optional<Tensor>>(), state[2].cast<std::optional<Tensor>>());
+    };
     py::class_<tle::LoraConfig>(m, "LoraConfig")
         .def(py::init<uint64_t, std::optional<Tensor>, std::optional<Tensor>>(), py::arg("task_id"),
             py::arg("weights") = py::none(), py::arg("config") = py::none())
         .def_property_readonly("task_id", &tle::LoraConfig::getTaskId)
         .def_property_readonly("weights", &tle::LoraConfig::getWeights)
-        .def_property_readonly("config", &tle::LoraConfig::getConfig);
+        .def_property_readonly("config", &tle::LoraConfig::getConfig)
+        .def(py::pickle(loraConfigGetstate, loraConfigSetstate));
 
+    auto MropeConfigGetstate = [](tle::MropeConfig const& self)
+    { return py::make_tuple(self.getMRopeRotarySinCos(), self.getMRopePositionDeltas()); };
+    auto MropeConfigSetstate = [](py::tuple state)
+    {
+        if (state.size() != 2)
+        {
+            throw std::runtime_error("Invalid MropeConfig state!");
+        }
+        return tle::MropeConfig(state[0].cast<tle::Tensor>(), state[1].cast<SizeType32>());
+    };
+    py::class_<tle::MropeConfig>(m, "MropeConfig")
+        .def(py::init<Tensor, SizeType32>(), py::arg("mrope_rotary_sin_cos"), py::arg("mrope_position_deltas"))
+        .def_property_readonly("mrope_rotary_sin_cos", &tle::MropeConfig::getMRopeRotarySinCos)
+        .def_property_readonly("mrope_position_deltas", &tle::MropeConfig::getMRopePositionDeltas)
+        .def(py::pickle(MropeConfigGetstate, MropeConfigSetstate));
+
+    auto lookaheadDecodingConfigGetstate = [](tle::LookaheadDecodingConfig const& self)
+    { return py::make_tuple(self.getWindowSize(), self.getNgramSize(), self.getVerificationSetSize()); };
+    auto lookaheadDecodingConfigSetstate = [](py::tuple state)
+    {
+        if (state.size() != 3)
+        {
+            throw std::runtime_error("Invalid LookaheadDecodingConfig state!");
+        }
+        return tle::LookaheadDecodingConfig(
+            state[0].cast<SizeType32>(), state[1].cast<SizeType32>(), state[2].cast<SizeType32>());
+    };
     py::class_<tle::LookaheadDecodingConfig>(m, "LookaheadDecodingConfig")
         .def(py::init<SizeType32, SizeType32, SizeType32>(), py::arg("max_window_size"), py::arg("max_ngram_size"),
             py::arg("max_verification_set_size"))
         .def_property_readonly("max_window_size", &tle::LookaheadDecodingConfig::getWindowSize)
         .def_property_readonly("max_ngram_size", &tle::LookaheadDecodingConfig::getNgramSize)
-        .def_property_readonly("max_verification_set_size", &tle::LookaheadDecodingConfig::getVerificationSetSize);
+        .def_property_readonly("max_verification_set_size", &tle::LookaheadDecodingConfig::getVerificationSetSize)
+        .def(py::pickle(lookaheadDecodingConfigGetstate, lookaheadDecodingConfigSetstate));
 
     py::class_<tle::EagleConfig>(m, "EagleConfig")
-        .def(py::init<std::optional<tle::EagleChoices>>(), py::arg("eagle_choices"))
-        .def_property_readonly("eagle_choices", &tle::EagleConfig::getEagleChoices);
+        .def(py::init<std::optional<tle::EagleChoices>, bool, std::optional<float>>(),
+            py::arg("eagle_choices") = py::none(), py::arg("greedy_sampling") = true,
+            py::arg("posterior_threshold") = py::none())
+        .def_property_readonly("eagle_choices", &tle::EagleConfig::getEagleChoices)
+        .def_property_readonly("greedy_sampling", &tle::EagleConfig::isGreedySampling)
+        .def_property_readonly("posterior_threshold", &tle::EagleConfig::getPosteriorThreshold);
 
     auto kvCacheRetentionConfig = py::class_<tle::KvCacheRetentionConfig>(m, "KvCacheRetentionConfig");
 
@@ -382,48 +484,149 @@ void InitBindings(pybind11::module_& m)
         .def_readwrite("fast_logits", &tle::SpeculativeDecodingConfig::fastLogits)
         .def(py::pickle(SpeculativeDecodingConfigGetState, SpeculativeDecodingConfigSetState));
 
+    // Guided decoding config
+    auto pyGuidedDecodingConfig = py::class_<tle::GuidedDecodingConfig>(m, "GuidedDecodingConfig");
+
+    py::enum_<tle::GuidedDecodingConfig::GuidedDecodingBackend>(pyGuidedDecodingConfig, "GuidedDecodingBackend")
+        .value("XGRAMMAR", tle::GuidedDecodingConfig::GuidedDecodingBackend::kXGRAMMAR);
+
+    auto guidedDecodingConfigGetstate = [](tle::GuidedDecodingConfig const& self) {
+        return py::make_tuple(
+            self.getBackend(), self.getEncodedVocab(), self.getTokenizerStr(), self.getStopTokenIds());
+    };
+    auto guidedDecodingConfigSetstate = [](py::tuple state)
+    {
+        if (state.size() != 4)
+        {
+            throw std::runtime_error("Invalid GuidedDecodingConfig state!");
+        }
+        return tle::GuidedDecodingConfig(state[0].cast<tle::GuidedDecodingConfig::GuidedDecodingBackend>(),
+            state[1].cast<std::optional<std::vector<std::string>>>(), state[2].cast<std::optional<std::string>>(),
+            state[3].cast<std::optional<std::vector<tle::TokenIdType>>>());
+    };
+
+    pyGuidedDecodingConfig
+        .def(py::init<tle::GuidedDecodingConfig::GuidedDecodingBackend, std::optional<std::vector<std::string>>,
+                 std::optional<std::string>, std::optional<std::vector<tle::TokenIdType>>>(),
+            py::arg("backend"), py::arg("encoded_vocab") = py::none(), py::arg("tokenizer_str") = py::none(),
+            py::arg("stop_token_ids") = py::none())
+        .def_property("backend", &tle::GuidedDecodingConfig::getBackend, &tle::GuidedDecodingConfig::setBackend)
+        .def_property(
+            "encoded_vocab", &tle::GuidedDecodingConfig::getEncodedVocab, &tle::GuidedDecodingConfig::setEncodedVocab)
+        .def_property(
+            "tokenizer_str", &tle::GuidedDecodingConfig::getTokenizerStr, &tle::GuidedDecodingConfig::setTokenizerStr)
+        .def_property(
+            "stop_token_ids", &tle::GuidedDecodingConfig::getStopTokenIds, &tle::GuidedDecodingConfig::setStopTokenIds)
+        .def(py::pickle(guidedDecodingConfigGetstate, guidedDecodingConfigSetstate));
+
+    // Guided decoding params
+    auto pyGuidedDecodingParams = py::class_<tle::GuidedDecodingParams>(m, "GuidedDecodingParams");
+
+    py::enum_<tle::GuidedDecodingParams::GuideType>(pyGuidedDecodingParams, "GuideType")
+        .value("JSON", tle::GuidedDecodingParams::GuideType::kJSON)
+        .value("JSON_SCHEMA", tle::GuidedDecodingParams::GuideType::kJSON_SCHEMA)
+        .value("REGEX", tle::GuidedDecodingParams::GuideType::kREGEX)
+        .value("EBNF_GRAMMAR", tle::GuidedDecodingParams::GuideType::kEBNF_GRAMMAR);
+
+    auto guidedDecodingParamsGetstate
+        = [](tle::GuidedDecodingParams const& self) { return py::make_tuple(self.getGuideType(), self.getGuide()); };
+
+    auto guidedDecodingParamsSetstate = [](py::tuple state)
+    {
+        if (state.size() != 2)
+        {
+            throw std::runtime_error("Invalid GuidedDecodingParams state!");
+        }
+        return tle::GuidedDecodingParams(
+            state[0].cast<tle::GuidedDecodingParams::GuideType>(), state[1].cast<std::optional<std::string>>());
+    };
+
+    pyGuidedDecodingParams
+        .def(py::init<tle::GuidedDecodingParams::GuideType, std::optional<std::string>>(), py::arg("guide_type"),
+            py::arg("guide") = py::none())
+        .def_property_readonly("guide_type", &tle::GuidedDecodingParams::getGuideType)
+        .def_property_readonly("guide", &tle::GuidedDecodingParams::getGuide)
+        .def(py::pickle(guidedDecodingParamsGetstate, guidedDecodingParamsSetstate));
+
+    auto requestGetstate = [](tle::Request const& self)
+    {
+        return py::make_tuple(self.getInputTokenIds(), self.getMaxTokens(), self.getStreaming(),
+            self.getSamplingConfig(), self.getOutputConfig(), self.getEndId(), self.getPadId(), self.getPositionIds(),
+            self.getBadWords(), self.getStopWords(), self.getEmbeddingBias(), self.getExternalDraftTokensConfig(),
+            self.getPromptTuningConfig(), self.getMropeConfig(), self.getLoraConfig(), self.getLookaheadConfig(),
+            self.getKvCacheRetentionConfig(), self.getLogitsPostProcessorName(), self.getEncoderInputTokenIds(),
+            self.getClientId(), self.getReturnAllGeneratedTokens(), self.getPriority(), self.getRequestType(),
+            self.getContextPhaseParams(), self.getEncoderInputFeatures(), self.getEncoderOutputLength(),
+            self.getCrossAttentionMask(), self.getEagleConfig(), self.getSkipCrossAttnBlocks(),
+            self.getGuidedDecodingParams());
+    };
+    auto requestSetstate = [](py::tuple state)
+    {
+        if (state.size() != 30)
+        {
+            throw std::runtime_error("Invalid Request state!");
+        }
+        return std::make_unique<tle::Request>(state[0].cast<VecTokens>(), state[1].cast<SizeType32>(),
+            state[2].cast<bool>(), state[3].cast<tle::SamplingConfig>(), state[4].cast<tle::OutputConfig>(),
+            state[5].cast<std::optional<SizeType32>>(), state[6].cast<std::optional<SizeType32>>(),
+            state[7].cast<std::optional<std::vector<SizeType32>>>(),
+            state[8].cast<std::optional<std::list<VecTokens>>>(), state[9].cast<std::optional<std::list<VecTokens>>>(),
+            state[10].cast<std::optional<Tensor>>(), state[11].cast<std::optional<tle::ExternalDraftTokensConfig>>(),
+            state[12].cast<std::optional<tle::PromptTuningConfig>>(), state[13].cast<std::optional<tle::MropeConfig>>(),
+            state[14].cast<std::optional<tle::LoraConfig>>(),
+            state[15].cast<std::optional<tle::LookaheadDecodingConfig>>(),
+            state[16].cast<std::optional<tle::KvCacheRetentionConfig>>(), state[17].cast<std::optional<std::string>>(),
+            state[18].cast<std::optional<VecTokens>>(), state[19].cast<std::optional<IdType>>(), state[20].cast<bool>(),
+            state[21].cast<tle::PriorityType>(), state[22].cast<tle::RequestType>(),
+            state[23].cast<std::optional<tle::ContextPhaseParams>>(), state[24].cast<std::optional<tle::Tensor>>(),
+            state[25].cast<std::optional<SizeType32>>(), state[26].cast<std::optional<tle::Tensor>>(), 1,
+            state[27].cast<std::optional<tle::EagleConfig>>(), state[28].cast<std::optional<tle::Tensor>>(),
+            state[29].cast<std::optional<tle::GuidedDecodingParams>>());
+    };
+
     py::class_<tle::Request> request(m, "Request");
     request
         // A modified version of constructor to accpect deprecated args maxNewTokens
         // TODO(enweiz): use the original constructor after the deprecated args are removed
-        .def(
-            py::init(
-                [](tle::VecTokens inputTokenIds, std::optional<tle::SizeType32> maxTokens,
-                    std::optional<tle::SizeType32> maxNewTokens, bool streaming,
-                    tle::SamplingConfig const& samplingConfig, tle::OutputConfig const& outputConfig,
-                    std::optional<tle::SizeType32> const& endId, std::optional<tle::SizeType32> const& padId,
-                    std::optional<std::vector<SizeType32>> positionIds,
-                    std::optional<std::list<tle::VecTokens>> badWords,
-                    std::optional<std::list<tle::VecTokens>> stopWords, std::optional<tle::Tensor> embeddingBias,
-                    std::optional<tle::ExternalDraftTokensConfig> externalDraftTokensConfig,
-                    std::optional<tle::PromptTuningConfig> pTuningConfig, std::optional<tle::MropeConfig> mRopeConfig,
-                    std::optional<tle::LoraConfig> loraConfig,
-                    std::optional<tle::LookaheadDecodingConfig> lookaheadConfig,
-                    std::optional<tle::KvCacheRetentionConfig> kvCacheRetentionConfig,
-                    std::optional<std::string> logitsPostProcessorName,
-                    std::optional<tle::VecTokens> encoderInputTokenIds, std::optional<tle::IdType> clientId,
-                    bool returnAllGeneratedTokens, tle::PriorityType priority, tle::RequestType type,
-                    std::optional<tle::ContextPhaseParams> contextPhaseParams,
-                    std::optional<tle::Tensor> encoderInputFeatures, std::optional<tle::SizeType32> encoderOutputLength,
-                    std::optional<tle::Tensor> crossAttentionMask, SizeType32 numReturnSequences,
-                    std::optional<tle::EagleConfig> eagleConfig, std::optional<tle::Tensor> skipCrossAttnBlocks)
-                {
-                    if (maxNewTokens.has_value())
-                    {
-                        TLLM_LOG_WARNING("max_new_tokens is being deprecated; please use max_tokens instead.");
-                        if (!maxTokens.has_value())
-                        {
-                            maxTokens = maxNewTokens;
-                        }
-                    }
-                    TLLM_CHECK_WITH_INFO(maxTokens.has_value(), "missing required argument max_tokens");
-                    return std::make_unique<tle::Request>(inputTokenIds, maxTokens.value(), streaming, samplingConfig,
-                        outputConfig, endId, padId, positionIds, badWords, stopWords, embeddingBias,
-                        externalDraftTokensConfig, pTuningConfig, mRopeConfig, loraConfig, lookaheadConfig,
-                        kvCacheRetentionConfig, logitsPostProcessorName, encoderInputTokenIds, clientId,
-                        returnAllGeneratedTokens, priority, type, contextPhaseParams, encoderInputFeatures,
-                        encoderOutputLength, crossAttentionMask, numReturnSequences, eagleConfig, skipCrossAttnBlocks);
-                }),
+        .def(py::init(
+                 [](tle::VecTokens inputTokenIds, std::optional<tle::SizeType32> maxTokens,
+                     std::optional<tle::SizeType32> maxNewTokens, bool streaming,
+                     tle::SamplingConfig const& samplingConfig, tle::OutputConfig const& outputConfig,
+                     std::optional<tle::SizeType32> const& endId, std::optional<tle::SizeType32> const& padId,
+                     std::optional<std::vector<SizeType32>> positionIds,
+                     std::optional<std::list<tle::VecTokens>> badWords,
+                     std::optional<std::list<tle::VecTokens>> stopWords, std::optional<tle::Tensor> embeddingBias,
+                     std::optional<tle::ExternalDraftTokensConfig> externalDraftTokensConfig,
+                     std::optional<tle::PromptTuningConfig> pTuningConfig, std::optional<tle::MropeConfig> mRopeConfig,
+                     std::optional<tle::LoraConfig> loraConfig,
+                     std::optional<tle::LookaheadDecodingConfig> lookaheadConfig,
+                     std::optional<tle::KvCacheRetentionConfig> kvCacheRetentionConfig,
+                     std::optional<std::string> logitsPostProcessorName,
+                     std::optional<tle::VecTokens> encoderInputTokenIds, std::optional<tle::IdType> clientId,
+                     bool returnAllGeneratedTokens, tle::PriorityType priority, tle::RequestType type,
+                     std::optional<tle::ContextPhaseParams> contextPhaseParams,
+                     std::optional<tle::Tensor> encoderInputFeatures,
+                     std::optional<tle::SizeType32> encoderOutputLength, std::optional<tle::Tensor> crossAttentionMask,
+                     std::optional<tle::EagleConfig> eagleConfig, std::optional<tle::Tensor> skipCrossAttnBlocks,
+                     std::optional<tle::GuidedDecodingParams> guidedDecodingParams)
+                 {
+                     if (maxNewTokens.has_value())
+                     {
+                         TLLM_LOG_WARNING("max_new_tokens is being deprecated; please use max_tokens instead.");
+                         if (!maxTokens.has_value())
+                         {
+                             maxTokens = maxNewTokens;
+                         }
+                     }
+                     TLLM_CHECK_WITH_INFO(maxTokens.has_value(), "missing required argument max_tokens");
+                     return std::make_unique<tle::Request>(inputTokenIds, maxTokens.value(), streaming, samplingConfig,
+                         outputConfig, endId, padId, positionIds, badWords, stopWords, embeddingBias,
+                         externalDraftTokensConfig, pTuningConfig, mRopeConfig, loraConfig, lookaheadConfig,
+                         kvCacheRetentionConfig, logitsPostProcessorName, encoderInputTokenIds, clientId,
+                         returnAllGeneratedTokens, priority, type, contextPhaseParams, encoderInputFeatures,
+                         encoderOutputLength, crossAttentionMask, 1, eagleConfig, skipCrossAttnBlocks,
+                         guidedDecodingParams);
+                 }),
             py::arg("input_token_ids"), py::kw_only(), py::arg("max_tokens") = py::none(),
             py::arg("max_new_tokens") = py::none(), py::arg("streaming") = false,
             py::arg_v("sampling_config", tle::SamplingConfig(), "SamplingConfig()"),
@@ -440,8 +643,8 @@ void InitBindings(pybind11::module_& m)
                 "RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION"),
             py::arg("context_phase_params") = py::none(), py::arg("encoder_input_features") = py::none(),
             py::arg("encoder_output_length") = py::none(), py::arg("cross_attention_mask") = py::none(),
-            py::arg("num_return_sequences") = 1, py::arg("eagle_config") = py::none(),
-            py::arg("skip_cross_attn_blocks") = py::none())
+            py::arg("eagle_config") = py::none(), py::arg("skip_cross_attn_blocks") = py::none(),
+            py::arg("guided_decoding_params") = py::none())
         .def_property_readonly("input_token_ids", &tle::Request::getInputTokenIds)
         .def_property_readonly("max_tokens", &tle::Request::getMaxTokens)
         .def_property_readonly("max_new_tokens", &tle::Request::getMaxNewTokens)
@@ -475,11 +678,12 @@ void InitBindings(pybind11::module_& m)
             "encoder_input_features", &tle::Request::getEncoderInputFeatures, &tle::Request::setEncoderInputFeatures)
         .def_property(
             "cross_attention_mask", &tle::Request::getCrossAttentionMask, &tle::Request::setCrossAttentionMask)
-        .def_property(
-            "num_return_sequences", &tle::Request::getNumReturnSequences, &tle::Request::setNumReturnSequences)
         .def_property("eagle_config", &tle::Request::getEagleConfig, &tle::Request::setEagleConfig)
         .def_property(
-            "skip_cross_attn_blocks", &tle::Request::getSkipCrossAttnBlocks, &tle::Request::setSkipCrossAttnBlocks);
+            "skip_cross_attn_blocks", &tle::Request::getSkipCrossAttnBlocks, &tle::Request::setSkipCrossAttnBlocks)
+        .def_property(
+            "guided_decoding_params", &tle::Request::getGuidedDecodingParams, &tle::Request::setGuidedDecodingParams)
+        .def(py::pickle(requestGetstate, requestSetstate));
     request.attr("BATCHED_POST_PROCESSOR_NAME") = tle::Request::kBatchedPostProcessorName;
 
     py::enum_<tle::FinishReason>(m, "FinishReason")
@@ -493,6 +697,34 @@ void InitBindings(pybind11::module_& m)
         .def_readwrite("draft_request_id", &tle::SpeculativeDecodingFastLogitsInfo::draftRequestId)
         .def_readwrite("draft_participant_id", &tle::SpeculativeDecodingFastLogitsInfo::draftParticipantId)
         .def("to_tensor", &tle::SpeculativeDecodingFastLogitsInfo::toTensor);
+
+    auto requestPerfMetrics = py::class_<tle::RequestPerfMetrics>(m, "RequestPerfMetrics");
+
+    py::class_<tle::RequestPerfMetrics::TimingMetrics>(m, "TimingMetrics")
+        .def(py::init<>())
+        .def_readwrite("arrival_time", &tle::RequestPerfMetrics::TimingMetrics::arrivalTime)
+        .def_readwrite("first_scheduled_time", &tle::RequestPerfMetrics::TimingMetrics::firstScheduledTime)
+        .def_readwrite("first_token_time", &tle::RequestPerfMetrics::TimingMetrics::firstTokenTime)
+        .def_readwrite("last_token_time", &tle::RequestPerfMetrics::TimingMetrics::lastTokenTime)
+        .def_readwrite("kv_cache_transfer_start", &tle::RequestPerfMetrics::TimingMetrics::kvCacheTransferStart)
+        .def_readwrite("kv_cache_transfer_end", &tle::RequestPerfMetrics::TimingMetrics::kvCacheTransferEnd);
+
+    py::class_<tle::RequestPerfMetrics::KvCacheMetrics>(m, "KvCacheMetrics")
+        .def(py::init<>())
+        .def_readwrite("num_total_allocated_blocks", &tle::RequestPerfMetrics::KvCacheMetrics::numTotalAllocatedBlocks)
+        .def_readwrite("num_new_allocated_blocks", &tle::RequestPerfMetrics::KvCacheMetrics::numNewAllocatedBlocks)
+        .def_readwrite("num_reused_blocks", &tle::RequestPerfMetrics::KvCacheMetrics::numReusedBlocks)
+        .def_readwrite("num_missed_blocks", &tle::RequestPerfMetrics::KvCacheMetrics::numMissedBlocks)
+        .def_readwrite("kv_cache_hit_rate", &tle::RequestPerfMetrics::KvCacheMetrics::kvCacheHitRate);
+
+    // There's a circular dependency between the declaration of the TimingMetrics and RequestPerfMetrics bindings.
+    // Defer definition of the RequestPerfMetrics bindings until the TimingMetrics have been defined.
+    requestPerfMetrics.def(py::init<>())
+        .def_readwrite("timing_metrics", &tle::RequestPerfMetrics::timingMetrics)
+        .def_readwrite("kv_cache_metrics", &tle::RequestPerfMetrics::kvCacheMetrics)
+        .def_readwrite("first_iter", &tle::RequestPerfMetrics::firstIter)
+        .def_readwrite("last_iter", &tle::RequestPerfMetrics::lastIter)
+        .def_readwrite("iter", &tle::RequestPerfMetrics::iter);
 
     py::class_<tle::Result>(m, "Result")
         .def(py::init<>())
@@ -509,7 +741,9 @@ void InitBindings(pybind11::module_& m)
         .def_readwrite("is_sequence_final", &tle::Result::isSequenceFinal)
         .def_readwrite("decoding_iter", &tle::Result::decodingIter)
         .def_readwrite("context_phase_params", &tle::Result::contextPhaseParams)
-        .def_readwrite("sequence_index", &tle::Result::sequenceIndex);
+        .def_readwrite("sequence_index", &tle::Result::sequenceIndex)
+        .def_readwrite("is_sequence_final", &tle::Result::isSequenceFinal)
+        .def_readwrite("request_perf_metrics", &tle::Result::requestPerfMetrics);
 
     py::class_<tle::Response>(m, "Response")
         .def(py::init<IdType, std::string, std::optional<IdType>>(), py::arg("request_id"), py::arg("error_msg"),
@@ -824,40 +1058,54 @@ void InitBindings(pybind11::module_& m)
             &tle::ExtendedRuntimePerfKnobConfig::setCudaGraphCacheSize)
         .def(py::pickle(extendedRuntimePerfKnobConfigGetstate, extendedRuntimePerfKnobConfigSetstate));
 
-    auto executorConfigGetState = [](tle::ExecutorConfig const& self)
+    auto executorConfigGetState = [](py::object const& self)
     {
-        return py::make_tuple(self.getMaxBeamWidth(), self.getSchedulerConfig(), self.getKvCacheConfig(),
-            self.getEnableChunkedContext(), self.getNormalizeLogProbs(), self.getIterStatsMaxIterations(),
-            self.getRequestStatsMaxIterations(), self.getBatchingType(), self.getMaxBatchSize(), self.getMaxNumTokens(),
-            self.getParallelConfig(), self.getPeftCacheConfig(), self.getLogitsPostProcessorConfig(),
-            self.getDecodingConfig(), self.getGpuWeightsPercent(), self.getMaxQueueSize(),
-            self.getExtendedRuntimePerfKnobConfig(), self.getDebugConfig(), self.getRecvPollPeriodMs(),
-            self.getMaxSeqIdleMicroseconds(), self.getSpecDecConfig());
+        tle::ExecutorConfig& c = self.cast<tle::ExecutorConfig&>();
+        // Return a tuple containing C++ data and the Python __dict__
+        auto cpp_states = py::make_tuple(c.getMaxBeamWidth(), c.getSchedulerConfig(), c.getKvCacheConfig(),
+            c.getEnableChunkedContext(), c.getNormalizeLogProbs(), c.getIterStatsMaxIterations(),
+            c.getRequestStatsMaxIterations(), c.getBatchingType(), c.getMaxBatchSize(), c.getMaxNumTokens(),
+            c.getParallelConfig(), c.getPeftCacheConfig(), c.getLogitsPostProcessorConfig(), c.getDecodingConfig(),
+            c.getGpuWeightsPercent(), c.getMaxQueueSize(), c.getExtendedRuntimePerfKnobConfig(), c.getDebugConfig(),
+            c.getRecvPollPeriodMs(), c.getMaxSeqIdleMicroseconds(), c.getSpecDecConfig(), c.getGuidedDecodingConfig());
+        auto pickle_tuple = py::make_tuple(cpp_states, py::getattr(self, "__dict__"));
+        return pickle_tuple;
     };
-    auto executorConfigSetState = [](py::tuple state)
+    auto executorConfigSetState = [](py::tuple const& state)
     {
-        if (state.size() != 21)
-        {
+        if (state.size() != 2)
             throw std::runtime_error("Invalid state!");
-        }
-        return tle::ExecutorConfig(state[0].cast<SizeType32>(), state[1].cast<tle::SchedulerConfig>(),
-            state[2].cast<tle::KvCacheConfig>(), state[3].cast<bool>(), state[4].cast<bool>(),
-            state[5].cast<SizeType32>(), state[6].cast<SizeType32>(), state[7].cast<tle::BatchingType>(),
-            state[8].cast<std::optional<SizeType32>>(), state[9].cast<std::optional<SizeType32>>(),
-            state[10].cast<std::optional<tle::ParallelConfig>>(), state[11].cast<std::optional<tle::PeftCacheConfig>>(),
-            state[12].cast<std::optional<tle::LogitsPostProcessorConfig>>(),
-            state[13].cast<std::optional<tle::DecodingConfig>>(), state[14].cast<float>(),
-            state[15].cast<std::optional<SizeType32>>(), state[16].cast<tle::ExtendedRuntimePerfKnobConfig>(),
-            state[17].cast<std::optional<tle::DebugConfig>>(), state[18].cast<SizeType32>(), state[19].cast<uint64_t>(),
-            state[20].cast<std::optional<tle::SpeculativeDecodingConfig>>());
+
+        // Restore C++ data
+        auto cpp_states = state[0].cast<py::tuple>();
+        if (cpp_states.size() != 22)
+            throw std::runtime_error("Invalid cpp_states!");
+
+        auto ec = tle::ExecutorConfig(cpp_states[0].cast<SizeType32>(), cpp_states[1].cast<tle::SchedulerConfig>(),
+            cpp_states[2].cast<tle::KvCacheConfig>(), cpp_states[3].cast<bool>(), cpp_states[4].cast<bool>(),
+            cpp_states[5].cast<SizeType32>(), cpp_states[6].cast<SizeType32>(), cpp_states[7].cast<tle::BatchingType>(),
+            cpp_states[8].cast<std::optional<SizeType32>>(), cpp_states[9].cast<std::optional<SizeType32>>(),
+            cpp_states[10].cast<std::optional<tle::ParallelConfig>>(),
+            cpp_states[11].cast<std::optional<tle::PeftCacheConfig>>(),
+            cpp_states[12].cast<std::optional<tle::LogitsPostProcessorConfig>>(),
+            cpp_states[13].cast<std::optional<tle::DecodingConfig>>(), cpp_states[14].cast<float>(),
+            cpp_states[15].cast<std::optional<SizeType32>>(), cpp_states[16].cast<tle::ExtendedRuntimePerfKnobConfig>(),
+            cpp_states[17].cast<std::optional<tle::DebugConfig>>(), cpp_states[18].cast<SizeType32>(),
+            cpp_states[19].cast<uint64_t>(), cpp_states[20].cast<std::optional<tle::SpeculativeDecodingConfig>>(),
+            cpp_states[21].cast<std::optional<tle::GuidedDecodingConfig>>());
+
+        auto py_state = state[1].cast<py::dict>();
+
+        return std::make_pair(ec, py_state);
     };
-    py::class_<tle::ExecutorConfig>(m, "ExecutorConfig")
+    py::class_<tle::ExecutorConfig>(m, "ExecutorConfig", pybind11::dynamic_attr())
         .def(py::init<SizeType32, tle::SchedulerConfig const&, tle::KvCacheConfig const&, bool, bool, SizeType32,
                  SizeType32, tle::BatchingType, std::optional<SizeType32>, std::optional<SizeType32>,
                  std::optional<tle::ParallelConfig>, tle::PeftCacheConfig const&,
                  std::optional<tle::LogitsPostProcessorConfig>, std::optional<tle::DecodingConfig>, float,
                  std::optional<SizeType32>, tle::ExtendedRuntimePerfKnobConfig const&, std::optional<tle::DebugConfig>,
-                 SizeType32, uint64_t, std::optional<tle::SpeculativeDecodingConfig>>(),
+                 SizeType32, uint64_t, std::optional<tle::SpeculativeDecodingConfig>,
+                 std::optional<tle::GuidedDecodingConfig>>(),
             py::arg("max_beam_width") = 1, py::arg_v("scheduler_config", tle::SchedulerConfig(), "SchedulerConfig()"),
             py::arg_v("kv_cache_config", tle::KvCacheConfig(), "KvCacheConfig()"),
             py::arg("enable_chunked_context") = false, py::arg("normalize_log_probs") = true,
@@ -872,13 +1120,15 @@ void InitBindings(pybind11::module_& m)
             py::arg_v("extended_runtime_perf_knob_config", tle::ExtendedRuntimePerfKnobConfig(),
                 "ExtendedRuntimePerfKnobConfig()"),
             py::arg("debug_config") = py::none(), py::arg("recv_poll_period_ms") = 0,
-            py::arg("max_seq_idle_microseconds") = 180000000, py::arg("spec_dec_config") = py::none())
+            py::arg("max_seq_idle_microseconds") = 180000000, py::arg("spec_dec_config") = py::none(),
+            py::arg("guided_decoding_config") = py::none())
         .def_property("max_beam_width", &tle::ExecutorConfig::getMaxBeamWidth, &tle::ExecutorConfig::setMaxBeamWidth)
         .def_property("max_batch_size", &tle::ExecutorConfig::getMaxBatchSize, &tle::ExecutorConfig::setMaxBatchSize)
         .def_property("max_num_tokens", &tle::ExecutorConfig::getMaxNumTokens, &tle::ExecutorConfig::setMaxNumTokens)
         .def_property(
-            "scheduler_config", &tle::ExecutorConfig::getSchedulerConfig, &tle::ExecutorConfig::setSchedulerConfig)
-        .def_property("kv_cache_config", &tle::ExecutorConfig::getKvCacheConfig, &tle::ExecutorConfig::setKvCacheConfig)
+            "scheduler_config", &tle::ExecutorConfig::getSchedulerConfigRef, &tle::ExecutorConfig::setSchedulerConfig)
+        .def_property(
+            "kv_cache_config", &tle::ExecutorConfig::getKvCacheConfigRef, &tle::ExecutorConfig::setKvCacheConfig)
         .def_property("enable_chunked_context", &tle::ExecutorConfig::getEnableChunkedContext,
             &tle::ExecutorConfig::setEnableChunkedContext)
         .def_property("normalize_log_probs", &tle::ExecutorConfig::getNormalizeLogProbs,
@@ -907,6 +1157,8 @@ void InitBindings(pybind11::module_& m)
         .def_property("max_seq_idle_microseconds", &tle::ExecutorConfig::getMaxSeqIdleMicroseconds,
             &tle::ExecutorConfig::setMaxSeqIdleMicroseconds)
         .def_property("spec_dec_config", &tle::ExecutorConfig::getSpecDecConfig, &tle::ExecutorConfig::setSpecDecConfig)
+        .def_property("guided_decoding_config", &tle::ExecutorConfig::getGuidedDecodingConfig,
+            &tle::ExecutorConfig::setGuidedDecodingConfig)
         .def(py::pickle(executorConfigGetState, executorConfigSetState));
 
     py::module_ executor_kv_cache = m.def_submodule("kv_cache", "Executor KV Cache Manager");
@@ -945,8 +1197,7 @@ void InitBindings(pybind11::module_& m)
 
     py::class_<tle::KVCacheEventManager, std::shared_ptr<tle::KVCacheEventManager>>(
         executor_kv_cache, "KVCacheEventManager")
-        .def("get_latest_events", &tle::KVCacheEventManager::getLatestEvents,
-            py::arg("timeout") = std::chrono::milliseconds(0));
+        .def("get_latest_events", &tle::KVCacheEventManager::getLatestEvents, py::arg("timeout") = std::nullopt);
 
     tensorrt_llm::pybind::executor::Executor::initBindings(m);
 }

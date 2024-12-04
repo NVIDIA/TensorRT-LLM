@@ -44,6 +44,8 @@ namespace tensorrt_llm::runtime
 class ITensor : virtual public IBuffer
 {
 public:
+    friend class ITensorBindings;
+
     using UniquePtr = std::unique_ptr<ITensor>;
     using SharedPtr = std::shared_ptr<ITensor>;
     using UniqueConstPtr = std::unique_ptr<ITensor const>;

@@ -203,7 +203,6 @@ __device__ __forceinline__ void mma(void* acc, void* w_pack2, void* act)
 template <int Interleave, int ThreadsPerInterleavedTile, typename T>
 __device__ __forceinline__ T warp_reduce_sum(T& val)
 {
-    static_assert(Interleave * ThreadsPerInterleavedTile == 8);
     val += __shfl_xor_sync(~0, val, 16);
     val += __shfl_xor_sync(~0, val, 8);
     if (Interleave != 2 && Interleave != 4)

@@ -22,8 +22,8 @@ namespace tensorrt_llm
 namespace kernels
 {
 
-INSTANTIATE_ADDFUSEDQKVBIAS_TRANSPOSE(float, float, KVBlockArray);
-INSTANTIATE_ADDFUSEDQKVBIAS_TRANSPOSE(float, float, KVLinearBuffer);
+INSTANTIATE_ATTENTION_INPUT_OUTPUT_PROCESSING(float, float, KVBlockArray);
+INSTANTIATE_ATTENTION_INPUT_OUTPUT_PROCESSING(float, float, KVLinearBuffer);
 
 } // namespace kernels
 } // namespace tensorrt_llm

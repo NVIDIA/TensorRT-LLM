@@ -31,29 +31,38 @@ class BeamSearchLayer : public BaseLayer
 public:
     BeamSearchLayer(DecoderDomain const& decoderDomain, std::shared_ptr<runtime::BufferManager> bufferManager);
 
+    // Functions called after runtime data atrrives
+    [[nodiscard]] size_t getWorkspaceSize() const noexcept override;
+
+    // Functions called after runtime data atrrives
     void setup(runtime::SizeType32 const batchSize, runtime::SizeType32 const beamWidth, TensorConstPtr batchSlots,
         std::shared_ptr<BaseSetupParams> const& setupParams,
         std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace) override;
-
     void forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& outputs,
         std::shared_ptr<BaseDecodingInputs> const& inputs,
         std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace) override;
 
-    [[nodiscard]] size_t getWorkspaceSize() const noexcept override;
-
 private:
-    void allocateBuffer(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth);
+    // Functions called before runtime data atrrives
+    void allocateBuffer();
+    void configureBeamSearchLayer();
 
 private:
     using Base::mDecoderDomain;
 
-    size_t mWorkspaceSize;
-    TensorPtr mBeamSearchDiversityRateDevice; //<! [batchSize] shaped, in device memory.
-    TensorPtr mLengthPenaltyDevice;           //<! [batchSize] shaped, in device memory.
-    TensorPtr mEarlyStoppingDevice;           //<! [batchSize] shaped, in device memory.
-    TensorPtr mBeamSearchDiversityRateHost;   //<! [batchSize] shaped, in pinned host memory.
-    TensorPtr mLengthPenaltyHost;             //<! [batchSize] shaped, in pinned host memory.
-    TensorPtr mEarlyStoppingHost;             //<! [batchSize] shaped, in pinned host memory.
+    size_t mByteMaxSharedMemoryPerBlock{0};   // Device information
+    size_t mByteSharedMemoryStage1{0};        // Max dynamic shashared memoryn stage 1 kernel, useless in V2
+    size_t mByteSharedMemoryStage3{0};        // Max static shared memory in stage 3 kernel
+    size_t mVPart{0};                         // Count of parts the beamed-logProbs will be divided into, useless in V2
+    size_t mWorkspaceSize{0};                 // Total workspace size for Beam Search kernels
+    bool mV2{false};                          // Whether to use V2 Beam Search kernels
+
+    TensorPtr mBeamSearchDiversityRateDevice; // [batchSize], in device memory.
+    TensorPtr mLengthPenaltyDevice;           // [batchSize], in device memory.
+    TensorPtr mEarlyStoppingDevice;           // [batchSize], in device memory.
+    TensorPtr mBeamSearchDiversityRateHost;   // [batchSize], in pinned host memory.
+    TensorPtr mLengthPenaltyHost;             // [batchSize], in pinned host memory.
+    TensorPtr mEarlyStoppingHost;             // [batchSize], in pinned host memory.
 };
 
 } // namespace tensorrt_llm::layers

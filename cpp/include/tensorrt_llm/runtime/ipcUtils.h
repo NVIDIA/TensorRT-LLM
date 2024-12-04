@@ -65,7 +65,8 @@ public:
     using TensorPtr = ITensor::SharedPtr;
 
     AllReduceBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxSequenceLength,
-        SizeType32 hiddenSize, BufferManager const& manager, WorldConfig const& worldConfig);
+        SizeType32 hiddenSize, BufferManager const& manager, WorldConfig const& worldConfig,
+        bool const fakeBuffers = false);
 
     TensorPtr mAllReduceCommPtrs;
     std::vector<runtime::IpcMemory> mIpcMemoryHandles;

@@ -5,6 +5,81 @@
 All published functionality in the Release Notes has been fully tested and verified with known limitations documented. To share feedback about this release, access our [NVIDIA Developer Forum](https://forums.developer.nvidia.com/).
 
 
+## TensorRT-LLM Release 0.15.0
+
+### Key Features and Enhancements
+  - Added support for EAGLE. Refer to `examples/eagle/README.md`.
+  - Added functional support for GH200 systems.
+  - Added AutoQ (mixed precision) support.
+  - Added a `trtllm-serve` command to start a FastAPI based server.
+  - Added FP8 support for Nemotron NAS 51B. Refer to `examples/nemotron_nas/README.md`.
+  - Added FP8 support for Deepseek-v1. Refer to the “FP8 Quantization” section in `examples/deepseek_v1/README.md`.
+  - Added INT8 support for GPTQ quantization.
+  - Added TensorRT native support for INT8 Smooth Quantization.
+  - Added quantization support for Exaone model. Refer to `examples/exaone/README.md`.
+  - Enabled Medusa for Qwen2 models. Refer to “Medusa with Qwen2” section in `examples/medusa/README.md`.
+  - Optimized pipeline parallelism with ReduceScatter and AllGather for Mixtral models.
+  - Added support for `Qwen2ForSequenceClassification` model architecture.
+  - Added Python plugin support to simplify plugin development efforts. Refer to `examples/python_plugin/README.md`.
+  - Added different rank dimensions support for LoRA modules when using the Hugging Face format. Thanks for the contribution from @AlessioNetti in #2366.
+  - Enabled embedding sharing by default. Refer to "Embedding Parallelism, Embedding Sharing, and Look-Up Plugin" section in `docs/source/performance/perf-best-practices.md` for information about the required conditions for embedding sharing.
+  - Added support for per-token per-channel FP8 (namely row-wise FP8) on Ada.
+  - Extended the maximum supported `beam_width` to `256`.
+  - Added FP8 and INT8 SmoothQuant quantization support for the InternVL2-4B variant (LLM model only). Refer to `examples/multimodal/README.md`.
+  - Added support for prompt-lookup speculative decoding. Refer to `examples/prompt_lookup/README.md`.
+  - Integrated the QServe w4a8 per-group/per-channel quantization. Refer to “w4aINT8 quantization (QServe)” section in `examples/llama/README.md`.
+  - Added a C++ example for fast logits using the `executor` API. Refer to “executorExampleFastLogits” section in `examples/cpp/executor/README.md`.
+  - [BREAKING CHANGE] NVIDIA Volta GPU support is removed in this and future releases.
+  - Added the following enhancements to the [LLM API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html):
+    - [BREAKING CHANGE] Moved the runtime initialization from the first invocation of `LLM.generate` to `LLM.__init__` for better generation performance without warmup.
+    - Added `n` and `best_of` arguments to the `SamplingParams` class. These arguments enable returning multiple generations for a single request.
+    - Added `ignore_eos`, `detokenize`, `skip_special_tokens`, `spaces_between_special_tokens`, and `truncate_prompt_tokens` arguments to the `SamplingParams` class. These arguments enable more control over the tokenizer behavior.
+    - Added support for incremental detokenization to improve the detokenization performance for streaming generation.
+    - Added the `enable_prompt_adapter` argument to the `LLM` class and the `prompt_adapter_request` argument for the `LLM.generate` method. These arguments enable prompt tuning.
+  - Added support for a `gpt_variant` argument to the `examples/gpt/convert_checkpoint.py` file. This enhancement enables checkpoint conversion with more GPT model variants. Thanks to the contribution from @tonylek in #2352.
+
+### API Changes
+  - [BREAKING CHANGE] Moved the flag `builder_force_num_profiles` in `trtllm-build` command to the `BUILDER_FORCE_NUM_PROFILES` environment variable.
+  - [BREAKING CHANGE] Modified defaults for `BuildConfig` class so that they are aligned with the `trtllm-build` command.
+  - [BREAKING CHANGE] Removed Python bindings of `GptManager`.
+  - [BREAKING CHANGE] `auto` is used as the default value for `--dtype` option in quantize and checkpoints conversion scripts.
+  - [BREAKING CHANGE] Deprecated `gptManager` API path in `gptManagerBenchmark`.
+  - [BREAKING CHANGE] Deprecated the `beam_width` and `num_return_sequences` arguments to the `SamplingParams` class in the LLM API. Use the `n`, `best_of` and `use_beam_search` arguments instead.
+  - Exposed `--trust_remote_code` argument to the OpenAI API server. (#2357)
+
+### Model Updates
+  - Added support for Llama 3.2 and llama 3.2-Vision model. Refer to `examples/mllama/README.md` for more details on the llama 3.2-Vision model.
+  - Added support for Deepseek-v2. Refer to `examples/deepseek_v2/README.md`.
+  - Added support for Cohere Command R models. Refer to `examples/commandr/README.md`.
+  - Added support for Falcon 2,  refer to `examples/falcon/README.md`, thanks to the contribution from @puneeshkhanna in #1926.
+  - Added support for InternVL2. Refer to `examples/multimodal/README.md`.
+  - Added support for Qwen2-0.5B and Qwen2.5-1.5B model. (#2388)
+  - Added support for Minitron. Refer to `examples/nemotron`.
+  - Added a GPT Variant - Granite(20B and 34B). Refer to “GPT Variant - Granite” section in `examples/gpt/README.md`.
+  - Added support for LLaVA-OneVision model. Refer to “LLaVA, LLaVa-NeXT, LLaVA-OneVision and VILA” section in `examples/multimodal/README.md`.
+
+### Fixed Issues
+  - Fixed a slice error in forward function. (#1480)
+  - Fixed an issue that appears when building BERT. (#2373)
+  - Fixed an issue that model is not loaded when building BERT. (2379)
+  - Fixed the broken executor examples. (#2294)
+  - Fixed the issue that the kernel `moeTopK()` cannot find the correct expert when the number of experts is not a power of two. Thanks @dongjiyingdjy for reporting this bug.
+  - Fixed an assertion failure on `crossKvCacheFraction`. (#2419)
+  - Fixed an issue when using smoothquant to quantize Qwen2 model. (#2370)
+  - Fixed a PDL typo in `docs/source/performance/perf-benchmarking.md`, thanks @MARD1NO for pointing it out in #2425.
+
+### Infrastructure Changes
+  - The base Docker image for TensorRT-LLM is updated to `nvcr.io/nvidia/pytorch:24.10-py3`.
+  - The base Docker image for TensorRT-LLM Backend is updated to `nvcr.io/nvidia/tritonserver:24.10-py3`.
+  - The dependent TensorRT version is updated to 10.6.
+  - The dependent CUDA version is updated to 12.6.2.
+  - The dependent PyTorch version is updated to 2.5.1.
+  - The dependent ModelOpt version is updated to 0.19 for Linux platform, while 0.17 is still used on Windows platform.
+
+### Documentation
+  - Added a copy button for code snippets in the documentation. (#2288)
+
+
 ## TensorRT-LLM Release 0.14.0
 
 ### Key Features and Enhancements

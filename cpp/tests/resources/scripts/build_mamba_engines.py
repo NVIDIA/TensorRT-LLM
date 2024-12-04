@@ -108,7 +108,8 @@ def build_engines(model_cache: _tp.Optional[str] = None):
 
     tp_size = 1
     pp_size = 1
-    tp_pp_dir = f"tp{tp_size}-pp{pp_size}-gpu"
+    cp_size = 1
+    tp_pp_cp_dir = f"tp{tp_size}-pp{pp_size}-cp{cp_size}-gpu"
 
     ckpt_dir = models_dir / 'rt_ckpt' / model_name
     engine_dir = models_dir / 'rt_engine' / model_name
@@ -116,26 +117,31 @@ def build_engines(model_cache: _tp.Optional[str] = None):
     model_spec_obj.set_kv_cache_type(_tb.KVCacheType.CONTINUOUS)
     model_spec_obj.use_tensor_parallelism(tp_size)
     model_spec_obj.use_pipeline_parallelism(pp_size)
+    model_spec_obj.use_context_parallelism(cp_size)
 
     print("\nBuilding fp16 engine")
-    build_engine(hf_dir, ckpt_dir / model_spec_obj.get_model_path() / tp_pp_dir,
-                 engine_dir / model_spec_obj.get_model_path() / tp_pp_dir,
+    build_engine(hf_dir,
+                 ckpt_dir / model_spec_obj.get_model_path() / tp_pp_cp_dir,
+                 engine_dir / model_spec_obj.get_model_path() / tp_pp_cp_dir,
                  '--remove_input_padding=disable', '--paged_state=disable',
                  '--mamba_conv1d_plugin=disable')
     print("\nBuilding fp16-plugin engine")
     model_spec_obj.use_mamba_plugin()
-    build_engine(hf_dir, ckpt_dir / model_spec_obj.get_model_path() / tp_pp_dir,
-                 engine_dir / model_spec_obj.get_model_path() / tp_pp_dir,
+    build_engine(hf_dir,
+                 ckpt_dir / model_spec_obj.get_model_path() / tp_pp_cp_dir,
+                 engine_dir / model_spec_obj.get_model_path() / tp_pp_cp_dir,
                  '--remove_input_padding=disable', '--paged_state=disable')
     print("\nBuilding fp16-plugin-packed engine")
     model_spec_obj.use_packed_input()
-    build_engine(hf_dir, ckpt_dir / model_spec_obj.get_model_path() / tp_pp_dir,
-                 engine_dir / model_spec_obj.get_model_path() / tp_pp_dir,
+    build_engine(hf_dir,
+                 ckpt_dir / model_spec_obj.get_model_path() / tp_pp_cp_dir,
+                 engine_dir / model_spec_obj.get_model_path() / tp_pp_cp_dir,
                  '--remove_input_padding=enable', '--paged_state=disable')
     print("\nBuilding fp16-plugin-packed-paged engine")
     model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
-    build_engine(hf_dir, ckpt_dir / model_spec_obj.get_model_path() / tp_pp_dir,
-                 engine_dir / model_spec_obj.get_model_path() / tp_pp_dir,
+    build_engine(hf_dir,
+                 ckpt_dir / model_spec_obj.get_model_path() / tp_pp_cp_dir,
+                 engine_dir / model_spec_obj.get_model_path() / tp_pp_cp_dir,
                  '--remove_input_padding=enable', '--paged_state=enable')
     print("Done.")
 

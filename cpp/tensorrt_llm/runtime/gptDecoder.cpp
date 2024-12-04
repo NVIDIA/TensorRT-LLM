@@ -178,7 +178,7 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
     {
         TLLM_CHECK_WITH_INFO(output.has_value(), "Output tensors must be provided for Eagle");
         auto eagleParams = std::make_shared<tl::EagleSetupParams>();
-        eagleParams->temperature = mSamplingConfig.temperature;
+        eagleParams->temperature = mSamplingConfig.originalTemperature;
         eagleParams->randomDataSample = output->eagleBuffers->randomDataSample;
         eagleParams->temperatures = output->eagleBuffers->temperatures;
 
@@ -285,6 +285,8 @@ void prepareExternalDraftTokensInputs(
     inputParams->useRandomAcceptanceThreshold = externalDraftTokensInputs.useRandomAcceptanceThreshold;
     inputParams->step = externalDraftTokensInputs.step;
     inputParams->useDraftLogits = externalDraftTokensInputs.useDraftLogits;
+    inputParams->useDraftLogitsHost = externalDraftTokensInputs.useDraftLogitsHost;
+
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 

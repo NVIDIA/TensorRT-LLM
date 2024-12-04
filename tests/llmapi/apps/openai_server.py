@@ -8,6 +8,8 @@ from typing import List
 import openai
 import requests
 
+from tensorrt_llm.llmapi.mpi_session import find_free_port
+
 
 class RemoteOpenAIServer:
     DUMMY_API_KEY = "tensorrt_llm"
@@ -19,7 +21,7 @@ class RemoteOpenAIServer:
         cli_args: List[str],
     ) -> None:
         self.host = "localhost"
-        self.port = 8000
+        self.port = find_free_port()
 
         cli_args += ["--host", f"{self.host}", "--port", f"{self.port}"]
         self.proc = subprocess.Popen(["trtllm-serve"] + [model] + cli_args,

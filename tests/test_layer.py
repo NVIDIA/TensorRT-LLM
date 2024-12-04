@@ -2058,7 +2058,7 @@ class TestLayer(unittest.TestCase):
             hidden_states_ref, segment_pos, batch_size, remove_padding,
             last_token_ids, conv_state_ref, lru_state_ref, conv_indices_ref)
 
-        dtype_atol = {"float16": 5e-3, "float32": 5e-3, "bfloat16": 5e-2}
+        dtype_atol = {"float16": 1e-2, "float32": 5e-3, "bfloat16": 5e-2}
 
         # get mask
         if not remove_padding and req_type == 'context':

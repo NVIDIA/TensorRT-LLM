@@ -323,7 +323,6 @@ void parsePluginConfig(ModelConfig& modelConfig, Json const& pluginConfig)
     auto const contextFMHA = pluginConfig.at("context_fmha").template get<bool>();
     auto const pagedContextFMHA = pluginConfig.at("use_paged_context_fmha").template get<bool>();
     auto const pagedState = parseJsonFieldOr(pluginConfig, "paged_state", false);
-    auto const useXQA = parseJsonFieldOr(pluginConfig, "enable_xqa", false);
     auto const manageWeightsType = parseJsonFieldOr<bool>(pluginConfig, "manage_weights", false)
         ? ModelConfig::ManageWeightsType::kEnabled
         : ModelConfig::ManageWeightsType::kDisabled;
@@ -343,7 +342,6 @@ void parsePluginConfig(ModelConfig& modelConfig, Json const& pluginConfig)
     modelConfig.setTokensPerBlock(tokensPerBlock);
     modelConfig.setContextFMHA(contextFMHA);
     modelConfig.setPagedContextFMHA(pagedContextFMHA);
-    modelConfig.useXQA(useXQA);
     modelConfig.setManageWeightsType(manageWeightsType);
     modelConfig.setPpReduceScatter(ppReduceScatter);
 }
@@ -424,6 +422,9 @@ GptJsonConfig parseJson(InputType&& input)
     auto const pipelineParallelism = engineVersionNone
         ? parseJsonFieldOr(builderConfig, "pipeline_parallel", 1)
         : parseJsonFieldOr(json.at("pretrained_config").at("mapping"), "pp_size", 1);
+    auto const contextParallelism = engineVersionNone
+        ? parseJsonFieldOr(builderConfig, "context_parallel", 1)
+        : parseJsonFieldOr(json.at("pretrained_config").at("mapping"), "cp_size", 1);
     auto const gpusPerNode = engineVersionNone ? WorldConfig::kDefaultGpusPerNode
                                                : parseJsonFieldOr(json.at("pretrained_config").at("mapping"),
                                                    "gpus_per_node", WorldConfig::kDefaultGpusPerNode);
@@ -637,8 +638,8 @@ GptJsonConfig parseJson(InputType&& input)
             modelConfig.setRnnConfig(rnnConfig);
         }
     }
-    return GptJsonConfig{name, engineVersion, precision, tensorParallelism, pipelineParallelism, gpusPerNode,
-        modelConfig, runtimeDefaults};
+    return GptJsonConfig{name, engineVersion, precision, tensorParallelism, pipelineParallelism, contextParallelism,
+        gpusPerNode, modelConfig, runtimeDefaults};
 }
 
 } // namespace
@@ -648,11 +649,14 @@ std::string GptJsonConfig::engineFilename(WorldConfig const& worldConfig, std::s
     TLLM_CHECK_WITH_INFO(getTensorParallelism() == worldConfig.getTensorParallelism(), "tensor parallelism mismatch");
     TLLM_CHECK_WITH_INFO(
         getPipelineParallelism() == worldConfig.getPipelineParallelism(), "pipeline parallelism mismatch");
+    TLLM_CHECK_WITH_INFO(
+        getContextParallelism() == worldConfig.getContextParallelism(), "Context parallelism mismatch");
     auto pp = worldConfig.isPipelineParallel() ? "_pp" + std::to_string(worldConfig.getPipelineParallelism()) : "";
+    auto cp = worldConfig.isContextParallel() ? "_cp" + std::to_string(worldConfig.getContextParallelism()) : "";
     if (getVersion() == std::string("none"))
     {
-        return model + "_" + getPrecision() + "_tp" + std::to_string(worldConfig.getTensorParallelism()) + pp + "_rank"
-            + std::to_string(worldConfig.getRank()) + ".engine";
+        return model + "_" + getPrecision() + "_tp" + std::to_string(worldConfig.getTensorParallelism()) + pp + cp
+            + "_rank" + std::to_string(worldConfig.getRank()) + ".engine";
     }
 
     return "rank" + std::to_string(worldConfig.getRank()) + ".engine";

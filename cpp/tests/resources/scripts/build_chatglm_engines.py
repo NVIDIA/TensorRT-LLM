@@ -152,7 +152,7 @@ def build_engines(model_cache: typing.Optional[str] = None,
         engine_dir = Path(
             model_dir
         ) / "rt_engine" / model_name / model_spec_obj.get_model_path(
-        ) / "tp1-pp1-gpu"
+        ) / "tp1-pp1-cp1-gpu"
         if clean:
             print('clean up engine folder ', engine_dir)
             if engine_dir.is_dir():
@@ -164,7 +164,7 @@ def build_engines(model_cache: typing.Optional[str] = None,
         engine_dir = Path(
             model_dir
         ) / "rt_engine" / model_name / model_spec_obj.get_model_path(
-        ) / "tp1-pp1-gpu"
+        ) / "tp1-pp1-cp1-gpu"
         if clean:
             print('clean up engine folder ', engine_dir)
             if engine_dir.is_dir():

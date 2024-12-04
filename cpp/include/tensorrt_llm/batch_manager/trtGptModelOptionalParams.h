@@ -48,6 +48,7 @@ public:
         = executor::ExtendedRuntimePerfKnobConfig{},
         std::optional<executor::DebugConfig> debugConfig = std::nullopt, uint64_t maxSeqIdleMicroseconds = 180000000,
         std::optional<executor::SpeculativeDecodingConfig> specDecConfig = std::nullopt,
+        std::optional<executor::GuidedDecodingConfig> guidedDecodingConfig = std::nullopt,
         bool isLeaderInOrchMode = false)
         : kvCacheConfig{kvCacheConfig}
         , enableTrtOverlap{enableTrtOverlap}
@@ -65,8 +66,13 @@ public:
         , debugConfig{std::move(debugConfig)}
         , maxSeqIdleMicroseconds{maxSeqIdleMicroseconds}
         , speculativeDecodingConfig{std::move(specDecConfig)}
+        , guidedDecodingConfig{std::move(guidedDecodingConfig)}
         , isLeaderInOrchMode{isLeaderInOrchMode}
     {
+        if (guidedDecodingConfig)
+        {
+            guidedDecodingConfig->validate();
+        }
     }
 
     explicit TrtGptModelOptionalParams(executor::ExecutorConfig const& executorConfig, bool isLeaderInOrchMode)
@@ -78,7 +84,8 @@ public:
             executorConfig.getGpuWeightsPercent(), executorConfig.getMaxBeamWidth(), executorConfig.getMaxBatchSize(),
             executorConfig.getMaxNumTokens(), executorConfig.getSchedulerConfig(),
             executorConfig.getExtendedRuntimePerfKnobConfig(), executorConfig.getDebugConfig(),
-            executorConfig.getMaxSeqIdleMicroseconds(), executorConfig.getSpecDecConfig(), isLeaderInOrchMode)
+            executorConfig.getMaxSeqIdleMicroseconds(), executorConfig.getSpecDecConfig(),
+            executorConfig.getGuidedDecodingConfig(), isLeaderInOrchMode)
     {
     }
 
@@ -99,6 +106,7 @@ public:
             && debugConfig == other.debugConfig                                     //
             && maxSeqIdleMicroseconds == other.maxSeqIdleMicroseconds               //
             && speculativeDecodingConfig == other.speculativeDecodingConfig         //
+            && guidedDecodingConfig == other.guidedDecodingConfig                   //
             && isLeaderInOrchMode == other.isLeaderInOrchMode                       //
             ;
     }
@@ -124,6 +132,7 @@ public:
     // Sequence is considered idle if not updated for this amount of time.
     uint64_t maxSeqIdleMicroseconds;
     std::optional<executor::SpeculativeDecodingConfig> speculativeDecodingConfig;
+    std::optional<executor::GuidedDecodingConfig> guidedDecodingConfig;
     // This rank is the leader worker in orchestrator mode
     bool isLeaderInOrchMode;
 };

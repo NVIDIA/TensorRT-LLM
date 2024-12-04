@@ -496,14 +496,16 @@ class ModelRunner(ModelRunnerMixin):
     An interface class that wraps GenerationSession and provides generation methods.
     """
 
-    def __init__(self,
-                 session: GenerationSession,
-                 max_batch_size: int,
-                 max_input_len: int,
-                 max_seq_len: int,
-                 max_beam_width: int,
-                 kv_cache_type: KVCacheType,
-                 lora_manager: Optional[LoraManager] = None) -> None:
+    def __init__(
+        self,
+        session: GenerationSession,
+        max_batch_size: int,
+        max_input_len: int,
+        max_seq_len: int,
+        max_beam_width: int,
+        kv_cache_type: KVCacheType,
+        lora_manager: Optional[LoraManager] = None,
+    ) -> None:
         """
         Create a ModelRunner instance.
         You are recommended to use the from_dir method to load the engine and create a ModelRunner instance.
@@ -533,17 +535,18 @@ class ModelRunner(ModelRunnerMixin):
 
     @classmethod
     def from_engine(
-            cls,
-            engine: Engine,
-            max_output_len: Optional[int] = None,
-            lora_dir: Optional[List[str]] = None,
-            rank: int = 0,
-            debug_mode: bool = False,
-            lora_ckpt_source: str = "hf",
-            medusa_choices: List[List[int]] = None,
-            stream: torch.cuda.Stream = None,
-            gpu_weights_percent: float = 1,
-            enable_context_fmha_fp32_acc: Optional[bool] = None
+        cls,
+        engine: Engine,
+        *,
+        max_output_len: Optional[int],
+        lora_dir: Optional[List[str]],
+        rank: int,
+        debug_mode: bool,
+        lora_ckpt_source: str,
+        medusa_choices: List[List[int]],
+        stream: torch.cuda.Stream,
+        gpu_weights_percent: float,
+        enable_context_fmha_fp32_acc: Optional[bool],
     ) -> 'ModelRunner':
         model_config = _engine_config_to_model_config(
             engine.config, gpu_weights_percent=gpu_weights_percent)
@@ -606,17 +609,18 @@ class ModelRunner(ModelRunnerMixin):
 
     @classmethod
     def from_dir(
-            cls,
-            engine_dir: str,
-            max_output_len: Optional[int] = None,
-            lora_dir: Optional[List[str]] = None,
-            rank: int = 0,
-            debug_mode: bool = False,
-            lora_ckpt_source: str = "hf",
-            medusa_choices: List[List[int]] = None,
-            stream: torch.cuda.Stream = None,
-            gpu_weights_percent: float = 1,
-            enable_context_fmha_fp32_acc: Optional[bool] = None
+        cls,
+        engine_dir: str,
+        *,
+        max_output_len: Optional[int] = None,
+        lora_dir: Optional[List[str]] = None,
+        rank: int = 0,
+        debug_mode: bool = False,
+        lora_ckpt_source: str = "hf",
+        medusa_choices: List[List[int]] = None,
+        stream: torch.cuda.Stream = None,
+        gpu_weights_percent: float = 1,
+        enable_context_fmha_fp32_acc: Optional[bool] = None,
     ) -> 'ModelRunner':
         """
         Create a ModelRunner instance from an engine directory.
@@ -722,10 +726,17 @@ class ModelRunner(ModelRunnerMixin):
                     ]
                     lora_ckpt_source = engine.config.build_config.lora_config.lora_ckpt_source
 
-            runner = ModelRunner.from_engine(engine, max_output_len, lora_dir,
-                                             rank, debug_mode, lora_ckpt_source,
-                                             medusa_choices, stream,
-                                             gpu_weights_percent)
+            runner = ModelRunner.from_engine(
+                engine=engine,
+                max_output_len=max_output_len,
+                lora_dir=lora_dir,
+                rank=rank,
+                debug_mode=debug_mode,
+                lora_ckpt_source=lora_ckpt_source,
+                medusa_choices=medusa_choices,
+                stream=stream,
+                gpu_weights_percent=gpu_weights_percent,
+                enable_context_fmha_fp32_acc=enable_context_fmha_fp32_acc)
             profiler.stop('load tensorrt_llm engine')
             loading_time = profiler.elapsed_time_in_sec(
                 "load tensorrt_llm engine")
