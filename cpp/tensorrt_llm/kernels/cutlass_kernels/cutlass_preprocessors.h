@@ -33,7 +33,8 @@ enum class QuantType
 {
     W8_A16,
     W4_A16,
-    W4_AFP8
+    W4_AFP8,
+    W2_A16
 };
 
 constexpr int get_weight_quant_bits(QuantType quant_type)
@@ -43,6 +44,7 @@ constexpr int get_weight_quant_bits(QuantType quant_type)
     case QuantType::W8_A16: return 8;
     case QuantType::W4_A16: return 4;
     case QuantType::W4_AFP8: return 4;
+    case QuantType::W2_A16: return 2;
     default: TLLM_CHECK_WITH_INFO(false, "Invalid quant_type"); return -1;
     }
 }

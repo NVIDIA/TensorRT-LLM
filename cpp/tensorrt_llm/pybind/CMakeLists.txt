@@ -23,6 +23,7 @@ else()
 endif()
 
 find_package(pybind11 REQUIRED)
+find_package(Python COMPONENTS Interpreter Development REQUIRED)
 
 set(SRCS
     bindings.cpp

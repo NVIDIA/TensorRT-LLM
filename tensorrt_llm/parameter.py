@@ -225,8 +225,8 @@ class Parameter:
     def _get_weights(self, network) -> trt.Weights | Tensor | None:
         tensor = network.get_parameter_tensor(self)
         if self.is_managed(network):
-            return tensor
-        elif tensor is not None:
+#            return tensor
+ #       elif tensor is not None:
             tensor.producer.__class__ = trt.IConstantLayer
             return tensor.producer.weights
         else:

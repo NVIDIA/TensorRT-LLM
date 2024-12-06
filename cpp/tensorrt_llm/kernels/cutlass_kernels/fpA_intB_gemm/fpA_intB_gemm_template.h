@@ -78,7 +78,8 @@ void generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType const
 
     static_assert(cutlass::platform::is_same<ActivationType, WeightType>::value
             || cutlass::platform::is_same<WeightType, uint8_t>::value
-            || cutlass::platform::is_same<WeightType, cutlass::uint4b_t>::value,
+            || cutlass::platform::is_same<WeightType, cutlass::uint4b_t>::value
+            || cutlass::platform::is_same<WeightType, cutlass::uint2b_t>::value,
         "");
 
     // The cutlass type for the input elements. This is needed to convert to cutlass::half_t if necessary.
@@ -256,6 +257,7 @@ void filter_and_run_mixed_gemm(ActivationType const* A, WeightType const* B, Sca
             + std::to_string(arch::kMinComputeCapability) + " with stages set to " + std::to_string(Stages);
         throw std::runtime_error("[TensorRT-LLm Error][filter_and_run_mixed_gemm] " + err_msg);
     }
+#ifdef ENABLE_FP8
     else if constexpr (cutlass::platform::is_same<ActivationType, __nv_fp8_e4m3>::value
         && arch::kMinComputeCapability < 89)
     {
@@ -264,6 +266,7 @@ void filter_and_run_mixed_gemm(ActivationType const* A, WeightType const* B, Sca
             + std::to_string(arch::kMinComputeCapability) + " with activation type set to FP8";
         throw std::runtime_error("[TensorRT-LLm Error][filter_and_run_mixed_gemm] " + err_msg);
     }
+#endif
     else
     {
         generic_mixed_gemm_kernelLauncher<ActivationType, WeightType, ScaleZeroType, BiasType, OutputType, arch,
@@ -309,7 +312,11 @@ void dispatch_gemm_config(ActivationType const* A, WeightType const* B, ScaleZer
 template <typename T>
 constexpr bool is_fp8()
 {
+#ifdef ENABLE_FP8
     return std::is_same_v<T, __nv_fp8_e4m3> || std::is_same_v<T, __nv_fp8_e5m2>;
+#else
+    return false;
+#endif
 }
 
 template <typename ActivationType, typename WeightType, typename ScaleZeroType, typename BiasType, typename OutputType,
