@@ -124,7 +124,13 @@ example:
 python3 ./scripts/build_wheel.py --cuda_architectures "80-real;86-real" --trt_root /usr/local/tensorrt
 ```
 
-Refer to the Refer to the {ref}`support-matrix-hardware` section for a list of architectures.
+To use the C++ benchmark scripts under [benchmark/cpp](/benchmarks/cpp/), for example `gptManagerBenchmark.cpp`, add the `--benchmarks` option:
+
+```bash
+python3 ./scripts/build_wheel.py --benchmarks --trt_root /usr/local/tensorrt
+```
+
+Refer to the {ref}`support-matrix-hardware` section for a list of architectures.
 
 ## Building the Python Bindings for the C++ Runtime
 

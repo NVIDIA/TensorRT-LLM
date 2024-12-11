@@ -8,6 +8,7 @@ from pydantic import AliasChoices, BaseModel, Field, model_validator
 
 class BenchmarkEnvironment(BaseModel):
     model: str
+    model_path: Optional[Path]
     workspace: Path
 
 

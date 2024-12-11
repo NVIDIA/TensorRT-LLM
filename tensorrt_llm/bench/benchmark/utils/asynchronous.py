@@ -2,34 +2,41 @@ from __future__ import annotations
 
 import asyncio
 import time
+from contextlib import asynccontextmanager
 from itertools import chain
-from typing import List, Set
+from typing import List, Optional, Set, Tuple
 
-import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import InferenceRequest
 from tensorrt_llm.bench.dataclasses.reporting import (NewRequestPerfItemTuple,
                                                       StatsKeeper,
+                                                      report_latency_statistics,
                                                       report_statistics)
 from tensorrt_llm.llmapi.llm import RequestOutput
-from tensorrt_llm.llmapi.llm_utils import LlmArgs
 from tensorrt_llm.logger import logger
 
 
 class LlmManager:
     """LLM Manager class for providing a high-level API for running benchmarks."""
 
-    def __init__(self, llm: LLM, outbox: asyncio.Queue[RequestOutput],
-                 streaming) -> None:
+    def __init__(self,
+                 llm: LLM,
+                 outbox: asyncio.Queue[NewRequestPerfItemTuple],
+                 streaming: bool,
+                 concurrency: Optional[int] = None) -> None:
         self.llm = llm
-        self._inbox = asyncio.Queue()
+        self._inbox: asyncio.Queue[Tuple[InferenceRequest,
+                                         SamplingParams]] = asyncio.Queue()
         self._outbox = outbox
 
         self._stop = asyncio.Event()
         self._running = asyncio.Event()
         self._tasks: Set[asyncio.Task] = set()
         self._backend_task = None
+        self.concurrency = concurrency
+        self._concurrency_semaphore = asyncio.Semaphore(
+            concurrency) if concurrency else None
         self.streaming = streaming
 
     async def process_request(self, request: InferenceRequest,
@@ -38,19 +45,21 @@ class LlmManager:
         sampling_params.max_tokens = request.output_tokens
         request_start_timestamp = time.perf_counter_ns()
         time_on_first_token = None
-        # Schedule the request in the LLM API (asynchronously)
-        output: RequestOutput = self.llm.generate_async(
-            request.input_ids,
-            sampling_params=sampling_params,
-            streaming=self.streaming)
-        if self.streaming:
-            async for stream_output in output:
-                if time_on_first_token is None:
-                    time_on_first_token = time.perf_counter_ns()
-            response = stream_output
-        else:
-            # Wait for the response to return to us.
-            response: RequestOutput = await output.aresult()
+
+        async with semaphore_guard(self._concurrency_semaphore):
+            # Schedule the request in the LLM API (asynchronously)
+            output: RequestOutput = self.llm.generate_async(
+                request.input_ids,
+                sampling_params=sampling_params,
+                streaming=self.streaming)
+            if self.streaming:
+                async for stream_output in output:
+                    if time_on_first_token is None:
+                        time_on_first_token = time.perf_counter_ns()
+                response = stream_output
+            else:
+                # Wait for the response to return to us.
+                response: RequestOutput = await output.aresult()
 
         # Mark that the response returned. Construct a record to send to statistics.
         tokens = list(chain(*[beam.token_ids for beam in response.outputs]))
@@ -67,9 +76,9 @@ class LlmManager:
 
     async def worker(self) -> None:
         while not self._stop.is_set():
-            request = await self._inbox.get()
+            request, sampling_params = await self._inbox.get()
             task = asyncio.create_task(
-                self.process_request(request[0], request[1]))
+                self.process_request(request, sampling_params=sampling_params))
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
 
@@ -95,6 +104,17 @@ class LlmManager:
         await self._inbox.put((request, sampling_params))
 
 
+@asynccontextmanager
+async def semaphore_guard(semaphore: Optional[asyncio.Semaphore] = None):
+    if semaphore is not None:
+        await semaphore.acquire()
+    try:
+        yield
+    finally:
+        if semaphore is not None:
+            semaphore.release()
+
+
 async def enqueue_messages(backend: LlmManager,
                            requests: List[InferenceRequest],
                            sampling_params: SamplingParams,
@@ -114,7 +134,9 @@ async def enqueue_messages(backend: LlmManager,
 
 async def async_benchmark(runtime_config: RuntimeConfig,
                           requests: List[InferenceRequest],
-                          streaming: bool) -> None:
+                          streaming: bool,
+                          concurrency: Optional[int] = None,
+                          for_latency: bool = False) -> None:
     outbox = asyncio.Queue()
     sampling_params = SamplingParams(end_id=-1, pad_id=-1, beam_width=1)
     statistics = StatsKeeper()
@@ -122,25 +144,9 @@ async def async_benchmark(runtime_config: RuntimeConfig,
 
     try:
         logger.info("Setting up throughput benchmark.")
-        llm_args = LlmArgs(
-            model=runtime_config.engine_dir,
-            skip_tokenizer_init=True,
-            pipeline_parallel_size=runtime_config.world_config.pp_size,
-            tensor_parallel_size=runtime_config.world_config.tp_size,
-            trust_remote_code=True,
-            scheduler_config=runtime_config.settings_config.
-            get_scheduler_config(),
-            kv_cache_config=runtime_config.settings_config.get_kvcache_config(),
-            decoding_config=runtime_config.decoding_config.get_decoding_config(
-            ),
-            enable_chunked_prefill=True,
-            batching_type=trtllm.BatchingType.INFLIGHT,
-            enable_processes_for_single_gpu=True,
-        )
+        llm = LLM(**runtime_config.get_llm_args().to_dict(), )
 
-        llm = LLM(**llm_args.to_dict())
-
-        backend = LlmManager(llm, outbox, streaming)
+        backend = LlmManager(llm, outbox, streaming, concurrency=concurrency)
         logger.info("Creating backend and request enqueue tasks.")
         backend.run()
         enqueue_task = asyncio.create_task(
@@ -151,14 +157,22 @@ async def async_benchmark(runtime_config: RuntimeConfig,
         while not submit_finished.is_set() or backend.busy or not outbox.empty(
         ):
             try:
-                item = await asyncio.wait_for(outbox.get(), timeout=1.0)
+                item: NewRequestPerfItemTuple = await asyncio.wait_for(
+                    outbox.get(), timeout=1.0)
                 statistics.register_request_perf_item(item)
             except asyncio.TimeoutError:
                 logger.debug("No items in queue. Continuing.")
+
         logger.info("Benchmark complete.")
-        report_statistics(statistics, runtime_config, logger, streaming)
+
+        if for_latency:
+            report_latency_statistics(statistics, runtime_config, logger)
+        else:
+            report_statistics(statistics, runtime_config, logger, streaming)
+
     except asyncio.CancelledError:
         enqueue_task.cancel()
+
     finally:
         backend.stop()
-        llm._shutdown()
+        llm.__exit__(None, None, None)

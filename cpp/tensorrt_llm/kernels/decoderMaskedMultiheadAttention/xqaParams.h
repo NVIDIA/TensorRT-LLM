@@ -90,7 +90,9 @@ struct XQAParams
     bool multi_block_mode;
     bool multi_query_tokens = false;
 
-    int32_t total_num_input_tokens;       // total number of input tokens. may differ from batch_size due to medusa.
+    float const* logn_scaling_ptr = nullptr; // for logn scaling in XQA
+
+    int32_t total_num_input_tokens;          // total number of input tokens. may differ from batch_size due to medusa.
     float const* fp8_out_scale = nullptr; // fp8 output scale in case we need post-processing to convert output to fp8.
                                           // nullptr means no conversion.
 };

@@ -86,6 +86,9 @@ struct QKVPreprocessingParams
     // for more details, refer to kvCacheUtils.h
     KVCacheBuffer kv_cache_buffer{};
     T const* qkv_bias{nullptr};
+
+    // Logn scaling pointer, of shape {max_position_embedding_length}
+    float const* logn_scaling{nullptr};
     // list of sequence lengths, of shape {batch_size + 1}
     int const* seq_lens{nullptr};
     // list sequence lengths for the cache, of shape {batch_size + 1}

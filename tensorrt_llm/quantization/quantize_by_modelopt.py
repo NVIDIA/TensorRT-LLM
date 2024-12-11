@@ -24,7 +24,6 @@ import sys
 import time
 
 import numpy as np
-import safetensors
 import torch
 from accelerate.hooks import remove_hook_from_module
 from datasets import load_dataset
@@ -119,6 +118,7 @@ MODEL_NAME_PATTERN_MAP = {
     "Bloom": "bloom",
     "ChatGLM": "chatglm",
     "QWen": "qwen",
+    "RecurrentGemma": "recurrentgemma",
     "Gemma2": "gemma2",
     "Gemma": "gemma",
     "MixtralForCausalLM": "llama",
@@ -682,19 +682,6 @@ def quantize_and_export(*,
             tensorrt_llm_config["quantization"]["kv_cache_quant_algo"] = None
             with open(f"{export_path}/config.json", "w") as f:
                 json.dump(tensorrt_llm_config, f, indent=4)
-
-        # Workaround for share_embedding_table
-        if pp_size == 1:
-            with safetensors.safe_open(f"{export_path}/rank0.safetensors",
-                                       framework='pt',
-                                       device='cpu') as f:
-                share_embedding_table = 'lm_head.weight' not in f.keys()
-            if share_embedding_table:
-                with open(f"{export_path}/config.json", "r") as f:
-                    tensorrt_llm_config = json.load(f)
-                tensorrt_llm_config["share_embedding_table"] = True
-                with open(f"{export_path}/config.json", "w") as f:
-                    json.dump(tensorrt_llm_config, f, indent=4)
 
         # Workaround for qwen version
         if model_type == 'qwen':

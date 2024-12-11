@@ -50,13 +50,6 @@ def parse_arguments():
         'To shard it along hidden dimension, set embedding_sharding_dim=1'
         'Note: embedding sharing is only enabled when embedding_sharding_dim = 0'
     )
-    parser.add_argument(
-        '--use_embedding_sharing',
-        action="store_true",
-        default=False,
-        help=
-        'Try to reduce the engine size by sharing the embedding lookup table between two layers.'
-        'Note: the flag might not take effect when the criteria are not met.')
 
     parser.add_argument(
         '--use_weight_only',
@@ -166,7 +159,6 @@ def convert_from_hf(hf_model,
                     mapping: Mapping,
                     dtype: str = 'float32',
                     use_parallel_embedding: bool = False,
-                    share_embedding_table: bool = False,
                     sharding_dim: int = 0,
                     use_weight_only: bool = False,
                     plugin_weight_only_quant_type: torch.dtype = torch.int8):
@@ -375,7 +367,6 @@ if __name__ == '__main__':
         'hidden_act': hf_config.hidden_act,
         'use_parallel_embedding': args.use_parallel_embedding,
         'embedding_sharding_dim': args.embedding_sharding_dim,
-        'share_embedding_table': args.use_embedding_sharing,
         'quantization': {
             'quant_algo': quant_algo,
         },
@@ -407,7 +398,6 @@ if __name__ == '__main__':
             dtype=args.dtype,
             use_parallel_embedding=args.use_parallel_embedding,
             sharding_dim=args.embedding_sharding_dim,
-            share_embedding_table=args.use_embedding_sharing,
             use_weight_only=args.use_weight_only,
             plugin_weight_only_quant_type=plugin_weight_only_quant_type)
         del hf_model

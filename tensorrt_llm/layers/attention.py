@@ -22,16 +22,16 @@ import torch
 from .._common import default_net, precision
 from .._utils import (fp32_array, int32_array, is_same_dtype, set_obj_attrs,
                       trt_dtype_to_np, trt_dtype_to_str)
-from ..functional import (ACT2FN, AllReduceParams, AttentionMaskType,
-                          Conditional, LayerNormType, PositionEmbeddingType,
-                          RopeEmbeddingUtils, RotaryScalingType, Tensor,
-                          allgather, arange, bert_attention, cast, clip, concat,
-                          constant, embedding, expand, expand_dims, expand_mask,
-                          generate_alibi_biases, generate_alibi_slopes,
-                          gpt_attention, gt, matmul)
-from ..functional import max as fmax
-from ..functional import (minimum, repeat_interleave, shape, slice, softmax,
-                          split, unsqueeze, where)
+
+# isort: off
+from ..functional import (
+    ACT2FN, AllReduceParams, AttentionMaskType, Conditional, LayerNormType,
+    PositionEmbeddingType, RopeEmbeddingUtils, RotaryScalingType, Tensor,
+    allgather, arange, bert_attention, cast, clip, concat, constant, embedding,
+    expand, expand_dims, expand_mask, generate_alibi_biases,
+    generate_alibi_slopes, generate_logn_scaling, gpt_attention, matmul,
+    minimum, repeat_interleave, shape, slice, softmax, split, unsqueeze, where)
+# isort: on
 from ..mapping import Mapping
 from ..module import Module
 from ..parameter import Parameter
@@ -177,14 +177,12 @@ class AttentionParams(object):
         self.embed_positions = None
         self.rotary_inv_freq = None
         self.embed_positions_for_gpt_attention = None
-        self.embed_positions_short_factors = None
-        self.embed_positions_long_factors = None
-        self.embed_positions_short_factors_for_attention_plugin = None
-        self.embed_positions_long_factors_for_attention_plugin = None
+        # long rope const parameters
+        self.long_rope_embed_positions = None
+        self.long_rope_rotary_inv_freq = None
+        self.long_rope_embed_positions_for_gpt_attention = None
         self.short_mscale = 1.0
         self.long_mscale = 1.0
-        self.short_inv_freq = None
-        self.long_inv_freq = None
 
     def fill_attention_const_params_for_rope(
             self,
@@ -197,18 +195,18 @@ class AttentionParams(object):
         return self
 
     def fill_attention_const_params_for_long_rope(
-            self, embed_positions_short_factors, embed_positions_long_factors,
-            embed_positions_short_factors_for_attention_plugin,
-            embed_positions_long_factors_for_attention_plugin, short_mscale,
-            long_mscale, short_inv_freq, long_inv_freq):
-        self.embed_positions_short_factors = embed_positions_short_factors
-        self.embed_positions_long_factors = embed_positions_long_factors
-        self.embed_positions_short_factors_for_attention_plugin = embed_positions_short_factors_for_attention_plugin
-        self.embed_positions_long_factors_for_attention_plugin = embed_positions_long_factors_for_attention_plugin
+            self, embed_positions, long_rope_embed_positions, rotary_inv_freq,
+            long_rope_rotary_inv_freq, embed_positions_for_gpt_attention,
+            long_rope_embed_positions_for_gpt_attention, short_mscale,
+            long_mscale):
+        self.embed_positions = embed_positions
+        self.long_rope_embed_positions = long_rope_embed_positions
+        self.rotary_inv_freq = rotary_inv_freq
+        self.long_rope_rotary_inv_freq = long_rope_rotary_inv_freq
+        self.embed_positions_for_gpt_attention = embed_positions_for_gpt_attention
+        self.long_rope_embed_positions_for_gpt_attention = long_rope_embed_positions_for_gpt_attention
         self.short_mscale = short_mscale
         self.long_mscale = long_mscale
-        self.short_inv_freq = short_inv_freq
-        self.long_inv_freq = long_inv_freq
         return self
 
     def is_valid_cross_attn(self, do_cross_attention):
@@ -389,7 +387,9 @@ class Attention(Module):
                  enable_qkv=True,
                  cp_group=[0],
                  cp_size=1,
-                 cp_rank=0):
+                 cp_rank=0,
+                 max_seqlen_for_logn_scaling=8192,
+                 use_logn_scaling=False):
         super().__init__()
 
         self.local_layer_idx = local_layer_idx
@@ -446,6 +446,8 @@ class Attention(Module):
         self.long_mscale = 1.0
         self.rotary_embedding_percentage = rotary_embedding_percentage
         self.use_implicit_relative_attention = self.relative_attention and use_implicit_relative_attention
+        self.max_seqlen_for_logn_scaling = max_seqlen_for_logn_scaling
+        self.use_logn_scaling = use_logn_scaling
         if rotary_embedding_scaling is not None:
             rotary_scaling_type = rotary_embedding_scaling.get(
                 "type", rotary_embedding_scaling.get("rope_type"))
@@ -470,6 +472,13 @@ class Attention(Module):
             self.register_parameter(
                 'alibi_slopes',
                 Parameter(alibi_slopes, dtype='float32', is_buffer=True))
+
+        if self.use_logn_scaling:
+            logn_scaling = generate_logn_scaling(
+                self.max_seqlen_for_logn_scaling, self.max_position_embeddings)
+            self.register_parameter(
+                'logn_scaling',
+                Parameter(logn_scaling, dtype='float32', is_buffer=True))
 
         self.quant_mode = quant_mode
         self.max_attn_value = max_attn_value
@@ -601,9 +610,10 @@ class Attention(Module):
                 if config.architecture == "Phi3SmallForCausalLM" or config.architecture == "PhiMoEForCausalLM":
                     rope_scaling_short_mscale = config.longrope_short_mscale
                     rope_scaling_long_mscale = config.longrope_long_mscale
-                embed_positions_short_factors, embed_positions_long_factors, \
-                (short_inv_freq, embed_positions_short_factors_for_attention_plugin), \
-                (long_inv_freq, embed_positions_long_factors_for_attention_plugin), mscale \
+
+                embed_positions, long_rope_embed_positions, \
+                (rotary_inv_freq, embed_positions_for_gpt_attention), \
+                (long_rope_rotary_inv_freq, long_rope_embed_positions_for_gpt_attention), mscale \
                     = RopeEmbeddingUtils.create_sinusoidal_positions_long_rope(
                     max_position_embeddings,
                     original_max_position_embeddings, rotary_embedding_dim,
@@ -617,38 +627,34 @@ class Attention(Module):
                 else:
                     short_mscale = long_mscale = mscale
 
-                short_inv_freq = short_inv_freq.reshape(1, -1)
-                long_inv_freq = long_inv_freq.reshape(1, -1)
-
                 model_cls.register_parameter(
-                    'embed_positions_short_factors',
-                    Parameter(embed_positions_short_factors,
+                    'embed_positions',
+                    Parameter(embed_positions, dtype='float32', is_buffer=True))
+                model_cls.register_parameter(
+                    'long_rope_embed_positions',
+                    Parameter(long_rope_embed_positions,
                               dtype='float32',
                               is_buffer=True))
                 model_cls.register_parameter(
-                    'embed_positions_long_factors',
-                    Parameter(embed_positions_long_factors,
+                    'rotary_inv_freq',
+                    Parameter(rotary_inv_freq, dtype='float32', is_buffer=True))
+                model_cls.register_parameter(
+                    'long_rope_rotary_inv_freq',
+                    Parameter(long_rope_rotary_inv_freq,
                               dtype='float32',
                               is_buffer=True))
                 model_cls.register_parameter(
-                    'embed_positions_short_factors_for_attention_plugin',
-                    Parameter(
-                        embed_positions_short_factors_for_attention_plugin,
-                        dtype='float32',
-                        is_buffer=True))
+                    'embed_positions_for_gpt_attention',
+                    Parameter(embed_positions_for_gpt_attention,
+                              dtype='float32',
+                              is_buffer=True))
                 model_cls.register_parameter(
-                    'embed_positions_long_factors_for_attention_plugin',
-                    Parameter(embed_positions_long_factors_for_attention_plugin,
+                    'long_rope_embed_positions_for_gpt_attention',
+                    Parameter(long_rope_embed_positions_for_gpt_attention,
                               dtype='float32',
                               is_buffer=True))
                 model_cls.short_mscale = short_mscale
                 model_cls.long_mscale = long_mscale
-                model_cls.register_parameter(
-                    'short_inv_freq',
-                    Parameter(short_inv_freq, dtype='float32', is_buffer=True))
-                model_cls.register_parameter(
-                    'long_inv_freq',
-                    Parameter(long_inv_freq, dtype='float32', is_buffer=True))
         else:
             # Rotary const weights.
             embed_positions = RopeEmbeddingUtils.create_sinusoidal_positions(
@@ -677,16 +683,14 @@ class Attention(Module):
             if attention_params is None:
                 attention_params = AttentionParams()
             if model_cls.position_embedding_type == PositionEmbeddingType.long_rope:
-                if hasattr(model_cls, "embed_positions_short_factors"):
-                    return attention_params.fill_attention_const_params_for_long_rope(
-                        model_cls.embed_positions_short_factors.value,
-                        model_cls.embed_positions_long_factors.value, model_cls.
-                        embed_positions_short_factors_for_attention_plugin.
-                        value, model_cls.
-                        embed_positions_long_factors_for_attention_plugin.value,
-                        model_cls.short_mscale, model_cls.long_mscale,
-                        model_cls.short_inv_freq.value,
-                        model_cls.long_inv_freq.value)
+                return attention_params.fill_attention_const_params_for_long_rope(
+                    model_cls.embed_positions.value,
+                    model_cls.long_rope_embed_positions.value,
+                    model_cls.rotary_inv_freq.value,
+                    model_cls.long_rope_rotary_inv_freq.value,
+                    model_cls.embed_positions_for_gpt_attention.value,
+                    model_cls.long_rope_embed_positions_for_gpt_attention.value,
+                    model_cls.short_mscale, model_cls.long_mscale)
             else:
                 return attention_params.fill_attention_const_params_for_rope(
                     model_cls.embed_positions.value,
@@ -721,6 +725,9 @@ class Attention(Module):
         ) if spec_decoding_params is None else spec_decoding_params
 
         mrope_params = MropeParams() if mrope_params is None else mrope_params
+        logn_scaling = None
+        if self.use_logn_scaling:
+            logn_scaling = self.logn_scaling.value
 
         alibi_slopes = None
         if self.position_embedding_type.is_alibi():
@@ -996,41 +1003,19 @@ class Attention(Module):
 
             attention_output_orig_quant_scale = self.attention_output_orig_quant_scale.value if self.attention_output_orig_quant_scale is not None else None
 
-            if self.position_embedding_type == PositionEmbeddingType.long_rope:
-                max_seq_length = fmax(attention_params.sequence_length, dim=0)
-                floor_seq_length = maximum(
-                    max_seq_length, self.original_max_position_embeddings)
+            # The rotary inv freq can be pre-computed.
+            rotary_inv_freq = getattr(attention_params, "rotary_inv_freq", None)
+            # Rotary cos/sin cache.
+            rotary_cos_sin = getattr(attention_params,
+                                     "embed_positions_for_gpt_attention", None)
 
-                short = attention_params.embed_positions_short_factors_for_attention_plugin
-                long = attention_params.embed_positions_long_factors_for_attention_plugin
+            long_rope_rotary_inv_freq = getattr(attention_params,
+                                                "long_rope_rotary_inv_freq",
+                                                None)
+            long_rope_rotary_cos_sin = getattr(
+                attention_params, "long_rope_embed_positions_for_gpt_attention",
+                None)
 
-                starts = concat([0, 0, 0])
-                shapes = concat(
-                    [floor_seq_length, self.rotary_embedding_dim // 2, 2])
-
-                short = slice(short, starts, shapes).view((1, -1))
-                long = slice(long, starts, shapes).view((1, -1))
-
-                use_long_factors = gt(max_seq_length,
-                                      self.original_max_position_embeddings)
-
-                cond = Conditional(use_long_factors)
-                true_val = cond.add_input(long)
-                false_val = cond.add_input(short)
-                rotary_cos_sin = cond.add_output(true_val, false_val)
-
-                cond = Conditional(use_long_factors)
-                true_val = cond.add_input(attention_params.long_inv_freq)
-                false_val = cond.add_input(attention_params.short_inv_freq)
-                rotary_inv_freq = cond.add_output(true_val, false_val)
-            else:
-                # The rotary inv freq can be pre-computed.
-                rotary_inv_freq = getattr(attention_params, "rotary_inv_freq",
-                                          None)
-                # Rotary cos/sin cache.
-                rotary_cos_sin = getattr(attention_params,
-                                         "embed_positions_for_gpt_attention",
-                                         None)
             if self.position_embedding_type == PositionEmbeddingType.learned_absolute:
                 rotary_inv_freq = None
                 rotary_cos_sin = None
@@ -1040,6 +1025,9 @@ class Attention(Module):
                 assert (rotary_inv_freq is not None) and (
                     rotary_cos_sin is not None
                 ), "rotary_inv_freq and embed_positions_for_gpt_attention must be provided."
+            if self.position_embedding_type == PositionEmbeddingType.long_rope:
+                assert long_rope_rotary_inv_freq is not None
+                assert long_rope_rotary_cos_sin is not None
 
             context, past_key_value = gpt_attention(
                 qkv=qkv,
@@ -1106,6 +1094,7 @@ class Attention(Module):
                 cross_kv=cross_kv,
                 cross_kv_length=attention_params.encoder_max_input_length,
                 encoder_input_lengths=attention_params.encoder_input_lengths,
+                logn_scaling=logn_scaling,
                 relative_attention_bias=self.rel_attn_table.value
                 if self.relative_attention else None,
                 max_distance=self.max_distance,
@@ -1121,6 +1110,8 @@ class Attention(Module):
                 spec_decoding_position_offsets,
                 spec_decoding_packed_mask=spec_decoding_params.
                 spec_decoding_packed_mask,
+                long_rope_rotary_inv_freq=long_rope_rotary_inv_freq,
+                long_rope_rotary_cos_sin=long_rope_rotary_cos_sin,
                 mrope_rotary_sin_cos=mrope_params.mrope_rotary_sin_cos,
                 mrope_position_deltas=mrope_params.mrope_position_deltas,
                 attn_logit_softcapping_scale=self.max_attn_value,
@@ -1135,6 +1126,8 @@ class Attention(Module):
         else:
             # plain TensorRT mode
             assert paged_kv_cache == False
+
+            assert logn_scaling is None, "plan TensorRT mode does not support logn scaling now"
 
             def transpose_for_scores(x,
                                      rotary: bool = False,
@@ -1181,10 +1174,9 @@ class Attention(Module):
                     starts = concat([0, 0, 0])
                     shapes = concat(
                         [1, floor_seq_length, self.rotary_embedding_dim])
-                    short = slice(
-                        attention_params.embed_positions_short_factors, starts,
-                        shapes)
-                    long = slice(attention_params.embed_positions_long_factors,
+                    short = slice(attention_params.embed_positions, starts,
+                                  shapes)
+                    long = slice(attention_params.long_rope_embed_positions,
                                  starts, shapes)
 
                     embed_positions = concat([short, long], dim=0)
@@ -1498,12 +1490,17 @@ class Attention(Module):
         self.rel_attn_table.value = precomputed_relative_attention
 
     def postprocess(self, tllm_key, weights, **kwargs):
-        if tllm_key.endswith("kv_cache_scaling_factor") and weights is None:
-            return {tllm_key: torch.ones(1, )}
-        elif isinstance(weights, torch.Tensor):
-            return {tllm_key: weights}
+        if tllm_key.endswith("kv_cache_scaling_factor"):
+            if weights is None:
+                return {tllm_key: torch.ones(1, )}
+            elif isinstance(weights, torch.Tensor):
+                return {tllm_key: weights}
+            elif None in weights:
+                return {tllm_key: torch.ones(1, )}
+            else:
+                return {tllm_key: max(weights)}
         else:
-            return {tllm_key: max(weights)}
+            return {tllm_key: weights}
 
 
 class BertAttention(Module):

@@ -489,6 +489,11 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
             }
             }
 
+            if (params.logn_scaling != nullptr)
+            {
+                float logn_scale = params.logn_scaling[token_idx_in_seq];
+                q = mmha::mul<VecType, float, VecType>(logn_scale, q);
+            }
             auto const channelIdx{tidx};
             auto const tokenIdxLowerBound
                 = max(cache_seq_len - params.cyclic_kv_cache_len + params.sink_token_len, params.sink_token_len);
@@ -825,6 +830,12 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
                     = valid_rotary_dim_idx ? rotary_coef_cache_buffer[elt_id] : masked_rotary_cos_sin;
                 mmha::apply_rotary_embedding_gptj(q_, k_, rotary_coef_cache);
             }
+        }
+
+        if (params.logn_scaling != nullptr)
+        {
+            float logn_scale = params.logn_scaling[token_idx_in_kv_cache];
+            q = mmha::mul<VecT, float, VecT>(logn_scale, q);
         }
 
         auto const channelIdx = head_dim_vec_idx;

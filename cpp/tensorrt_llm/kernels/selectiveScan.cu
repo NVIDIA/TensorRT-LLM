@@ -352,7 +352,7 @@ void invokeChunkScan(SSMParamsBase& params, cudaStream_t stream, tensorrt_llm::c
 
     bool dtsp = params.delta_softplus;
 
-    bool hopper = tensorrt_llm::common::getSMVersion() >= 90;
+    bool hopper = tensorrt_llm::common::getSMVersion() >= 90 && tensorrt_llm::common::getSMVersion() < 100;
 
     CudaType tp, wt;
 
@@ -494,9 +494,9 @@ __launch_bounds__(128, 2) __global__ void selective_scan_update_kernel(SSMParams
     int const dt_d_idx = MAMBA_V1 ? channel : head;
     int const bc_dim = MAMBA_V1 ? 2 * DSTATE : 2 * ngroups * DSTATE;
     int const x_dim = MAMBA_V1 ? num_channels : num_channels + bc_dim;
-    int const z_dim = MAMBA_V1 ? num_channels : 2 * num_channels + bc_dim + nheads;
+    int const z_dim = MAMBA_V1 ? num_channels : 2 * num_channels + bc_dim + (nheads + 7) / 8 * 8;
     int const dt_dim = MAMBA_V1 ? num_channels : (z ? z_dim : z_dim - num_channels);
-    int const dt_offset = MAMBA_V1 ? sample * dt_dim : sample * dt_dim + dt_dim - nheads;
+    int const dt_offset = MAMBA_V1 ? sample * dt_dim : sample * dt_dim + dt_dim - (nheads + 7) / 8 * 8;
     int const bc_offset = MAMBA_V1 ? sample * (bc_dim + params.dt_rank) : sample * (num_channels + bc_dim);
     int const b_offset = MAMBA_V1 ? params.dt_rank : num_channels + DSTATE * group;
     int const c_offset = MAMBA_V1 ? params.dt_rank + DSTATE : num_channels + DSTATE * (ngroups + group);

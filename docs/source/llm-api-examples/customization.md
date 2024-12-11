@@ -55,7 +55,7 @@ Refer to the [buildconfig documentation](https://github.com/NVIDIA/TensorRT-LLM/
 
 ## Runtime Customization
 
-Similar to `build_config`, you can also customize the runtime configuration with the `runtime_config`, `peft_cache_config` or other [arguments](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/llmapi/llm_utils.py#L186-L223) borrowed from the lower-level APIs.  These runtime configuration options provide additional flexibility with respect to KV cache management, GPU memory allocation and so on. Refer to the following example:
+Similar to `build_config`, you can also customize the runtime configuration with the `runtime_config`, `peft_cache_config` or other [arguments](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/llmapi/llm_utils.py#L186-L223) borrowed from the Executor APIs.  These runtime configuration options provide additional flexibility with respect to KV cache management, GPU memory allocation and so on. Refer to the following example:
 
 
 ```python
@@ -68,7 +68,7 @@ llm = LLM(<llama_model_path>,
 
 ## Tokenizer Customization
 
-By default, the high-level API uses transformers’ `AutoTokenizer`. You can override it with your own tokenizer by passing it when creating the LLM object. Refer to the following example:
+By default, the LLM API uses transformers’ `AutoTokenizer`. You can override it with your own tokenizer by passing it when creating the LLM object. Refer to the following example:
 
 ```python
 llm = LLM(<llama_model_path>, tokenizer=<my_faster_one>)

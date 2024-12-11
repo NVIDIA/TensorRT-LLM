@@ -23,7 +23,6 @@ from tensorrt_llm._utils import release_gc
 from tensorrt_llm.layers import MoeConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import DeepseekForCausalLM
-from tensorrt_llm.models.deepseek_v1.convert import load_hf_deepseek
 
 
 def parse_arguments():
@@ -76,13 +75,6 @@ def parse_arguments():
         'By default the embedding lookup table is sharded along vocab dimension (embedding_sharding_dim=0)'
         'To shard it along hidden dimension, set embedding_sharding_dim=1'
         'Note: embedding sharing is only enabled when embedding_sharding_dim=0')
-    parser.add_argument(
-        '--use_embedding_sharing',
-        action="store_true",
-        default=False,
-        help=
-        'Try to reduce the engine size by sharing the embedding lookup table between two layers'
-        'Note: the flag might not take effect when the criteria are not met')
     parser.add_argument('--output_dir',
                         type=str,
                         default='trtllm_checkpoint',
@@ -137,7 +129,6 @@ def args_to_build_options(args):
     return {
         'use_parallel_embedding': args.use_parallel_embedding,
         'embedding_sharding_dim': args.embedding_sharding_dim,
-        'share_embedding_table': args.use_embedding_sharing,
         'disable_weight_only_quant_plugin':
         args.disable_weight_only_quant_plugin
     }
@@ -163,15 +154,12 @@ def execute(workers, func, args):
 
 
 def convert_and_save_hf(args):
-    model_dir = args.model_dir
     world_size = args.tp_size * args.pp_size
     # Need to convert the cli args to the kay-value pairs and override them in the generate config dict.
     # Ideally these fields will be moved out of the config and pass them into build API, keep them here for compatibility purpose for now,
     # before the refactor is done.
     override_fields = {}
     override_fields.update(args_to_build_options(args))
-
-    hf_model = load_hf_deepseek(model_dir)
 
     def convert_and_save_rank(args, rank):
         mapping = Mapping(world_size=world_size,
@@ -181,7 +169,7 @@ def convert_and_save_hf(args):
                           moe_tp_size=args.moe_tp_size,
                           moe_ep_size=args.moe_ep_size)
         deepseekv1 = DeepseekForCausalLM.from_hugging_face(
-            hf_model, args.model_dir, args.dtype, mapping, **override_fields)
+            args.model_dir, args.dtype, mapping, **override_fields)
         deepseekv1.save_checkpoint(args.output_dir, save_config=(rank == 0))
         del deepseekv1
 

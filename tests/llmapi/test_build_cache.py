@@ -1,12 +1,9 @@
 import json
+from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from tensorrt_llm.llmapi.build_cache import *
-
-try:
-    pass
-except ImportError:
-    pass
+from tensorrt_llm.llmapi import BuildConfig
+from tensorrt_llm.llmapi.build_cache import BuildCache, BuildCacheConfig
 
 
 def test_BuildStep():

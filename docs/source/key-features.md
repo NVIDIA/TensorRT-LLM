@@ -6,5 +6,5 @@ This document lists key features supported in TensorRT-LLM.
 - [Inflight Batching](../source/advanced/gpt-attention.md#in-flight-batching)
 - [Chunked Context](../source/advanced/gpt-attention.md#chunked-context)
 - [LoRA](../source/advanced/lora.md)
-- [KV Cache Reuse](./kv_cache_reuse.md)
-- [Speculative Sampling](./speculative_decoding.md)
+- [KV Cache Reuse](../source/advanced/kv-cache-reuse.md)
+- [Speculative Sampling](../source/advanced/speculative-decoding.md)

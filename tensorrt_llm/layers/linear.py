@@ -37,6 +37,7 @@ def _gemm_plugin(input: Tensor,
                  transb: bool = False,
                  pad_lda: int = 0,
                  pad_ldb: int = 0,
+                 pad_ldc: int = 0,
                  use_fp8: bool = False,
                  alpha: Optional[np.ndarray] = None,
                  strict_dtype: Optional[trt.DataType] = None) -> Tensor:
@@ -72,6 +73,12 @@ def _gemm_plugin(input: Tensor,
             [N, K+pad_ldb] x [K, M] -> [N, M] if transb,
             [N+pad_ldb, K] x [K, M] -> [N, M] if not transb.
 
+        pad_ldc: int
+            Padding to the lead dimension of output tensor. It is used to
+            support the strided GEMM that only uses the sub-tensor for
+            computation. The GEMM plugin computation is
+            [N, K] x [K, M] -> [N+pad_ldc, M].
+
         use_fp8: bool
             Do we use fp8 GEMM.
 
@@ -104,6 +111,8 @@ def _gemm_plugin(input: Tensor,
                               trt.PluginFieldType.INT32)
     pad_ldb = trt.PluginField("pad_ldb", np.array(pad_ldb, dtype=np.int32),
                               trt.PluginFieldType.INT32)
+    pad_ldc = trt.PluginField("pad_ldc", np.array(pad_ldc, dtype=np.int32),
+                              trt.PluginFieldType.INT32)
     use_fp8 = 1 if use_fp8 else 0
     use_fp8 = trt.PluginField("use_fp8", np.array(use_fp8, dtype=np.int32),
                               trt.PluginFieldType.INT32)
@@ -120,7 +129,7 @@ def _gemm_plugin(input: Tensor,
     pf_type = trt.PluginField("type_id", np.array([int(p_dtype)], np.int32),
                               trt.PluginFieldType.INT32)
     pfc = trt.PluginFieldCollection(
-        [transa, transb, pad_lda, pad_ldb, pf_type, use_fp8, alpha])
+        [transa, transb, pad_lda, pad_ldb, pad_ldc, pf_type, use_fp8, alpha])
     gemm_plug = plg_creator.create_plugin("gemm", pfc)
     plug_inputs = [input.trt_tensor, mat2.trt_tensor]
 
@@ -142,6 +151,7 @@ class LinearBase(Module, metaclass=ABCMeta):
         share_weight=None,
         strict_dtype=False,
         pad_lda=0,
+        pad_ldc=0,
         prefer_managed_weight=True,
     ):
         super().__init__()
@@ -149,6 +159,7 @@ class LinearBase(Module, metaclass=ABCMeta):
         self.out_features = local_out_features
         self.dtype = dtype
         self.pad_lda = pad_lda
+        self.pad_ldc = pad_ldc
         self.prefer_managed_weight = prefer_managed_weight
 
         self.share_weight = share_weight
@@ -173,6 +184,7 @@ class LinearBase(Module, metaclass=ABCMeta):
 
         if bias:
             self.bias = Parameter(shape=(self.out_features, ), dtype=dtype)
+            assert pad_ldc == 0, "not support pad_ldc with bias"
         else:
             self.register_parameter("bias", None)
 
@@ -239,6 +251,7 @@ class LinearBase(Module, metaclass=ABCMeta):
                              weight,
                              transb=True,
                              pad_lda=self.pad_lda,
+                             pad_ldc=self.pad_ldc,
                              use_fp8=use_fp8,
                              alpha=alpha,
                              strict_dtype=strict_dtype)
@@ -310,6 +323,7 @@ class Linear(LinearBase):
         share_weight=None,
         strict_dtype=False,
         pad_lda=0,
+        pad_ldc=0,
         prefer_managed_weight=True,
         is_qkv=False,
     ):
@@ -323,6 +337,7 @@ class Linear(LinearBase):
             share_weight=share_weight,
             strict_dtype=strict_dtype,
             pad_lda=pad_lda,
+            pad_ldc=pad_ldc,
             prefer_managed_weight=prefer_managed_weight,
         )
         self.gather_output = gather_output

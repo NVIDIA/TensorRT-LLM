@@ -15,14 +15,12 @@
  */
 
 #include "eagleDecodingLayer.h"
+#include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/common/workspace.h"
-#include "tensorrt_llm/kernels/penaltyTypes.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/common.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/eagleDecodingKernels.h"
 #include "tensorrt_llm/layers/defaultDecodingParams.h"
 #include "tensorrt_llm/layers/layerUtils.h"
-
-#include <algorithm>
 
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::kernels;
@@ -125,6 +123,7 @@ void EagleDecodingLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> co
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(EagleDecodingLayer_forwardSyncCPU);
 
     auto inputs = std::dynamic_pointer_cast<EagleInputs>(baseInputs);
     auto outputs = std::dynamic_pointer_cast<EagleOutputs>(baseOutputs);

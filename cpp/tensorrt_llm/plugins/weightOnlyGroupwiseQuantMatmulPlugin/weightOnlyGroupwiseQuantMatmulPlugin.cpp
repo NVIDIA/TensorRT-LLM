@@ -231,16 +231,9 @@ void WeightOnlyGroupwiseQuantMatmulPlugin::init(nvinfer1::DataType type, int qua
             {
                 TLLM_THROW("W4A(fp)8 kernel is unsupported on pre-Ada (sm<89) architectures!");
             }
-            else if (mArch < 90)
-            {
-                assert(!(quant_algo & INT8_WEIGHT) && "W4A(fp)8 kernel requires INT4 weight!");
-                m_weightOnlyGroupwiseGemmRunner
-                    = selectGemmRunnerForZERO<__nv_fp8_e4m3, cutlass::uint4b_t, __nv_bfloat16, half>(quant_algo);
-            }
-            else
-            {
-                TLLM_THROW("FP8 is unsupported on with BF16 scales and zero-points!");
-            }
+            assert(!(quant_algo & INT8_WEIGHT) && "W4A(fp)8 kernel requires INT4 weight!");
+            m_weightOnlyGroupwiseGemmRunner
+                = selectGemmRunnerForZERO<__nv_fp8_e4m3, cutlass::uint4b_t, __nv_bfloat16, half>(quant_algo);
         }
         else
         {

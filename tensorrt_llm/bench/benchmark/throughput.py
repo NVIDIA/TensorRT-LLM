@@ -118,6 +118,7 @@ def throughput_command(
     request_rate: int = params.pop("request_rate")
     num_requests: int = params.pop("num_requests")
     model: str = bench_env.model
+    checkpoint_path: Path = bench_env.model_path or bench_env.model
     engine_dir: Path = params.pop("engine_dir")
     iteration_log: Path = params.pop("iteration_log")
 
@@ -159,7 +160,7 @@ def throughput_command(
     runtime_config = RuntimeConfig(**exec_settings)
 
     # Initialize the HF tokenizer for the specified model.
-    tokenizer = initialize_tokenizer(bench_env.model)
+    tokenizer = initialize_tokenizer(checkpoint_path)
 
     # Dataset Loading and Preparation
     with open(dataset_path, "r") as dataset:
@@ -185,27 +186,27 @@ def throughput_command(
         )
         del requests
 
-    logger.info("Setting up benchmarker and infrastructure.")
-    new_request_queue = mp.Queue()
-    response_queue = mp.Queue()
-    benchmark = ThroughputBenchmark(
-        dataset=executor_requests,
-        request_rate=request_rate,
-        runtime_cfg=runtime_config,
-        request_queue=new_request_queue,
-        response_queue=response_queue,
-        streaming=streaming,
-        iteration_log=iteration_log,
-    )
+        logger.info("Setting up benchmarker and infrastructure.")
+        new_request_queue = mp.Queue()
+        response_queue = mp.Queue()
+        benchmark = ThroughputBenchmark(
+            dataset=executor_requests,
+            request_rate=request_rate,
+            runtime_cfg=runtime_config,
+            request_queue=new_request_queue,
+            response_queue=response_queue,
+            streaming=streaming,
+            iteration_log=iteration_log,
+        )
 
-    try:
-        logger.info("Ready to start benchmark.")
-        benchmark.start_benchmark()
-        benchmark.wait()
-        benchmark.stop_benchmark()
-        benchmark.dump_extra_stats()
-        benchmark.report_statistics()
-    except KeyboardInterrupt:
-        benchmark.stop_benchmark()
-    finally:
-        benchmark.shutdown()
+        try:
+            logger.info("Ready to start benchmark.")
+            benchmark.start_benchmark()
+            benchmark.wait()
+            benchmark.stop_benchmark()
+            benchmark.dump_extra_stats()
+            benchmark.report_statistics()
+        except KeyboardInterrupt:
+            benchmark.stop_benchmark()
+        finally:
+            benchmark.shutdown()

@@ -1271,7 +1271,6 @@ def convert_checkpoint(args):
             },
             'use_parallel_embedding': args.use_parallel_embedding,
             'embedding_sharding_dim': args.embedding_sharding_dim,
-            'share_embedding_table': args.use_embedding_sharing,
             'max_position_embeddings': encoder_config.n_positions,
             'num_key_value_heads': encoder_config.n_head,
             'head_size': encoder_config.head_size,
@@ -1327,7 +1326,6 @@ def convert_checkpoint(args):
         },
         'use_parallel_embedding': args.use_parallel_embedding,
         'embedding_sharding_dim': args.embedding_sharding_dim,
-        'share_embedding_table': args.use_embedding_sharing,
         'max_position_embeddings': decoder_config.n_positions,
         'head_size': decoder_config.head_size,
         'has_position_embedding': decoder_config.has_position_embedding,
@@ -1492,13 +1490,6 @@ if __name__ == "__main__":
         'Define the precision for the weights when using weight-only quantization.'
         'You must also use --use_weight_only for that argument to have an impact.'
     )
-    parser.add_argument(
-        '--use_embedding_sharing',
-        action="store_true",
-        default=False,
-        help=
-        'Try to reduce the engine size by sharing the embedding lookup table between two layers.'
-        'Note: the flag might not take effect when the criteria are not met.')
     parser.add_argument(
         '--dtype',
         type=str,

@@ -59,6 +59,7 @@ struct FusedQKVMaskedAttentionDispatchParams
     T const* qkv_bias;
     T const* relative_attention_bias;
     bool const* attention_mask;
+    float const* logn_scaling_ptr;
     int const* cache_indir;
     void* context_buf;
     bool const* finished;
@@ -259,6 +260,7 @@ bool GPTAttentionPluginCommon::convertMMHAParamsToXQAParams(tensorrt_llm::kernel
     xqaParams.mrope_rotary_sin_cos = generationsParams.mrope_rotary_sin_cos;
     xqaParams.mrope_position_deltas = generationsParams.mrope_position_deltas;
 
+    xqaParams.logn_scaling_ptr = generationsParams.logn_scaling_ptr;
     xqaParams.total_num_input_tokens = generationsParams.total_num_input_tokens;
     xqaParams.fp8_out_scale = (mFP8ContextFMHA ? generationsParams.attention_output_orig_quant : nullptr);
     return true;
@@ -337,6 +339,7 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
     params.attn_logit_softcapping_scale = input_params.attn_logit_softcapping_scale;
     params.attn_logit_softcapping_inverse_scale = 1.0f / input_params.attn_logit_softcapping_scale;
 
+    params.logn_scaling_ptr = input_params.logn_scaling_ptr;
     params.relative_attention_bias = reinterpret_cast<DataType const*>(input_params.relative_attention_bias);
     params.relative_attention_bias_stride = input_params.relative_attention_bias_stride;
     params.max_distance = input_params.max_distance;
@@ -414,8 +417,9 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads,
     float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
     float rotary_embedding_scale, float rotary_embedding_short_m_scale, float rotary_embedding_long_m_scale,
     int rotary_embedding_max_positions, int rotary_embedding_original_max_positions, int tp_size,
-    int tp_rank,          // for ALiBi
-    bool unfuse_qkv_gemm, // for AutoPP
+    int tp_rank,           // for ALiBi
+    bool unfuse_qkv_gemm,  // for AutoPP
+    bool use_logn_scaling, // for LognScaling
     tensorrt_llm::kernels::ContextFMHAType context_fmha_type, int kv_cache_quant_mode, bool remove_input_padding,
     tensorrt_llm::kernels::AttentionMaskType mask_type, tensorrt_llm::kernels::BlockSparseParams block_sparse_params,
     bool paged_kv_cache, int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length,
@@ -459,6 +463,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads,
     , mTpSize(tp_size)
     , mTpRank(tp_rank)
     , mUnfuseQkvGemm(unfuse_qkv_gemm)
+    , mUseLognScaling(use_logn_scaling)
     , mMaxContextLength(max_context_length)
     , mQKVBiasEnabled(qkv_bias_enabled)
     , mCrossAttention(cross_attention)
@@ -584,6 +589,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(void const* data, size_t leng
     read(d, mTpSize);
     read(d, mTpRank);
     read(d, mUnfuseQkvGemm);
+    read(d, mUseLognScaling);
     read(d, mEnableContextFMHA);
     read(d, mFMHAForceFP32Acc);
     read(d, mMultiBlockMode);
@@ -1367,6 +1373,7 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T> const& para
         preprocessingParams.mrope_position_deltas = params.mrope_position_deltas;
         preprocessingParams.kvScaleOrigQuant = params.kv_scale_orig_quant;
         preprocessingParams.spec_decoding_position_offsets = nullptr;
+        preprocessingParams.logn_scaling = params.logn_scaling_ptr;
 
         // Scalars
         preprocessingParams.batch_size = params.batch_size;
@@ -1399,11 +1406,11 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T> const& para
 
         {
             std::string const beforeRopeStr = "ctx attention before RoPE at layer " + std::to_string(mLayerIdx);
-            TLLM_CHECK_DEBUG_WITH_INFO(tensorrt_llm::runtime::utils::tensorHasNan(params.num_tokens,
+            TLLM_CHECK_DEBUG_WITH_INFO(tensorrt_llm::runtime::utils::tensorHasInvalid(params.num_tokens,
                                            (local_hidden_units_qo + 2 * local_hidden_units_kv), mType,
                                            const_cast<T*>(attention_input), stream, beforeRopeStr)
                     == false,
-                "Found Nan in " + beforeRopeStr);
+                "Found invalid number (NaN or Inf) in " + beforeRopeStr);
         }
         if (mIsMLAEnabled)
         {
@@ -1416,11 +1423,11 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T> const& para
         }
         {
             std::string const afterRopeStr = "ctx attention after RoPE at layer " + std::to_string(mLayerIdx);
-            TLLM_CHECK_DEBUG_WITH_INFO(tensorrt_llm::runtime::utils::tensorHasNan(params.num_tokens,
+            TLLM_CHECK_DEBUG_WITH_INFO(tensorrt_llm::runtime::utils::tensorHasInvalid(params.num_tokens,
                                            (local_hidden_units_qo + 2 * local_hidden_units_kv), mType,
                                            const_cast<T*>(attention_input), stream, afterRopeStr)
                     == false,
-                "Found Nan in " + afterRopeStr);
+                "Found invalid number (NaN or Inf) in " + afterRopeStr);
         }
         sync_check_cuda_error();
         int64_t enable_context_fmha_fp32_acc_val = params.runtime_perf_knobs[1];
@@ -1557,6 +1564,7 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T> const& para
     }
     else
     {
+        TLLM_CHECK_DEBUG_WITH_INFO(params.logn_scaling_ptr == nullptr, "Unfused MHA does not support logn scaling");
         // FIXME: a temporary solution to make sure the padding part of key/value buffer is 0
         // NOTE: pointer subtraction is used below since there could be some extra gap due to alignment.
         //  Otherwise, we could do cudaMemsetAsync(k_buf_2_, 0, k_buf_2_size + v_buf_2_size, stream);
@@ -1861,6 +1869,7 @@ int GPTAttentionPluginCommon::enqueueGeneration(EnqueueGenerationParams<T> const
     int const local_hidden_units_kv = num_kv_heads * head_size;
     PositionEmbeddingType const position_embedding_type = mPositionEmbeddingType;
     float const q_scaling = mQScaling;
+    float const* logn_scaling_ptr = isLognScaling() ? params.logn_scaling_ptr : nullptr;
     T const* relative_attention_bias = isRelativePosition() ? params.relative_attention_bias : nullptr;
     int const relative_attention_bias_stride = isRelativePosition() ? params.relative_attention_bias_stride : 0;
     int const max_distance = mMaxDistance;
@@ -2050,6 +2059,7 @@ int GPTAttentionPluginCommon::enqueueGeneration(EnqueueGenerationParams<T> const
     dispatch_params.mUnfuseQkvGemm = mUnfuseQkvGemm;
     dispatch_params.qkv_buf = attention_input;
     dispatch_params.qkv_bias = params.qkv_bias;
+    dispatch_params.logn_scaling_ptr = logn_scaling_ptr;
     dispatch_params.relative_attention_bias = relative_attention_bias;
     dispatch_params.relative_attention_bias_stride = relative_attention_bias_stride;
     dispatch_params.attention_mask = params.attention_mask;
@@ -2434,9 +2444,10 @@ size_t GPTAttentionPluginCommon::getCommonSerializationSize() const noexcept
         + sizeof(mTokensPerBlock) + sizeof(mType) + sizeof(mMaxContextLength) + sizeof(mQKVBiasEnabled)
         + sizeof(mCrossAttention) + sizeof(mMaxDistance) + sizeof(mPosShiftEnabled) + sizeof(mDenseContextFMHA)
         + sizeof(mPagedContextFMHA) + sizeof(mFP8ContextFMHA) + sizeof(mHasFullAttentionMask) + sizeof(mUseKVCache)
-        + sizeof(mUnfuseQkvGemm) + sizeof(mIsSpecDecodingEnabled) + sizeof(mSpecDecodingIsGenerationLengthVariable)
-        + sizeof(mSpecDecodingMaxGenerationLength) + sizeof(mNbMultiBlockSemaphores) + sizeof(mIsMLAEnabled)
-        + sizeof(mMLAParams) + sizeof(mSkipAttn) + sizeof(uint32_t) // size of DecoderXQARunnerResource buffer.
+        + sizeof(mUnfuseQkvGemm) + sizeof(mUseLognScaling) + sizeof(mIsSpecDecodingEnabled)
+        + sizeof(mSpecDecodingIsGenerationLengthVariable) + sizeof(mSpecDecodingMaxGenerationLength)
+        + sizeof(mNbMultiBlockSemaphores) + sizeof(mIsMLAEnabled) + sizeof(mMLAParams) + sizeof(mSkipAttn)
+        + sizeof(uint32_t) // size of DecoderXQARunnerResource buffer.
         + sizeof(mCpSize) + sizeof(mCpRank) + sizeof(int32_t) * mCpGroup.size()
         + DecoderXQARunner::getResourceGlobal()->getSerializationSize();
 }
@@ -2466,6 +2477,7 @@ void GPTAttentionPluginCommon::serializeCommon(void* buffer) const noexcept
     write(d, mTpSize);
     write(d, mTpRank);
     write(d, mUnfuseQkvGemm);
+    write(d, mUseLognScaling);
     write(d, mEnableContextFMHA);
     write(d, mFMHAForceFP32Acc);
     write(d, mMultiBlockMode);

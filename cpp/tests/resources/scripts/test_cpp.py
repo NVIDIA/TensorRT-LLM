@@ -872,15 +872,20 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
     )
     run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
 
-    #Logits processor test in leader mode
+    #Logits processor and guided decoding test in leader mode
     new_env = copy.copy(cpp_env)
     new_env["RUN_LLAMA_MULTI_GPU"] = "true"
     xml_output_file = build_dir / "results-multi-gpu-logits-proc.xml"
     tp_pp_sizes = [(4, 1), (2, 2), (1, 4)]
-    gtest_filter = ":".join([
+    gtest_filter = [
         f"LlamaExecutorTest/LogitsProcParamsTest*tp{tp}_pp{pp}*"
         for tp, pp in tp_pp_sizes
+    ]
+    gtest_filter.extend([
+        f"LlamaExecutorGuidedDecodingTest/GuidedDecodingParamsTest*tp{tp}_pp{pp}*"
+        for tp, pp in tp_pp_sizes
     ])
+    gtest_filter = ":".join(gtest_filter)
     trt_model_test = produce_mpirun_command(
         global_commands=["mpirun", "--allow-run-as-root"],
         nranks=4,

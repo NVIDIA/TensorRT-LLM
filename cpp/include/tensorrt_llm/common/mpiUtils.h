@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/runtime/utils/multiDeviceUtils.h"
+#include <functional>
 #include <limits>
 
 #ifdef ENABLE_FP8
@@ -429,22 +430,25 @@ void initialize(MpiThreadSupport threadMode = MpiThreadSupport::THREAD_MULTIPLE,
 class MpiWaitThread
 {
 public:
-    explicit MpiWaitThread(std::unique_ptr<std::thread> thread);
+    explicit MpiWaitThread(std::string name, std::function<void()> funcWait, std::function<void()> funcSetup = nullptr);
     ~MpiWaitThread();
-    void exit();
-    [[nodiscard]] bool shouldExit() const;
 
-    void waitStart();
     void waitStop();
-
     void notifyStart();
-    void notifyStop();
 
 private:
+    void sideThread();
+
+    void waitStart();
+    void notifyStop();
+
+    std::string mName;
+    std::function<void()> mFuncWait;
+    std::function<void()> mFuncSetup;
     std::unique_ptr<std::thread> mThread;
     std::mutex mMutex;
     std::condition_variable mCondVar;
-    bool mRunning{false};
+    bool mRunning{true};
     std::atomic<bool> mShouldExit{false};
 };
 

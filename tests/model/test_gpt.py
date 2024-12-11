@@ -1078,7 +1078,6 @@ class TestGPT(unittest.TestCase):
                                  load_model_on_cpu=False,
                                  use_parallel_embedding=False,
                                  embedding_sharding_dim=0,
-                                 use_embedding_sharing=False,
                                  use_weight_only=False,
                                  int8_kv_cache=False,
                                  smoothquant=None,

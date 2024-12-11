@@ -39,7 +39,8 @@ foreach(target_name selective_scan_src)
     message(STATUS "MANUALLY APPENDING FLAG TO COMPILE FOR SM_90a.")
     target_compile_options(
       ${target_name}
-      PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_90a,code=sm_90a>)
+      PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_90a,code=sm_90a
+              -Xptxas=-w>)
 
     # Hopper kernels require cuda lib for TMA APIs
     target_link_libraries(${target_name} PRIVATE CUDA::cuda_driver)

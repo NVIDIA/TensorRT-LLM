@@ -30,9 +30,10 @@ from ...lora_manager import (LoraConfig,
                              get_default_trtllm_modules_to_hf_modules, use_lora)
 from ...mapping import Mapping
 from ...module import Module
+from ...quantization import QuantAlgo
 from ..model_weights_loader import ModelWeightsLoader
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
-                              QuantConfig, check_share_embedding)
+                              QuantConfig)
 from .config import QWenConfig
 from .convert import (load_hf_qwen, load_weights_from_hf_gptq_model,
                       load_weights_from_hf_model)
@@ -61,6 +62,7 @@ class QWenDecoderLayer(Module):
             attention_head_size=config.head_size,
             num_attention_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
+            max_seqlen_for_logn_scaling=config.seq_length,
             max_position_embeddings=config.max_position_embeddings,
             dtype=dtype,
             attention_mask_type=AttentionMaskType.causal,
@@ -71,6 +73,7 @@ class QWenDecoderLayer(Module):
             tp_group=self.tp_group,
             tp_size=self.tp_size,
             quant_mode=config.quant_mode,
+            use_logn_scaling=config.use_logn_attn,
             dense_bias=False)
 
         if config.moe.has_moe():
@@ -286,7 +289,7 @@ class QWenForCausalLM(DecoderModelForCausalLM):
         import transformers
 
         load_model_on_cpu = kwargs.pop('load_model_on_cpu', False)
-        use_hf_gptq_checkpoint = kwargs.pop('use_hf_gptq_checkpoint', False)
+        use_autoawq = kwargs.pop('use_autoawq', False)
 
         assert hf_model_or_dir is not None
         use_preloading = isinstance(hf_model_or_dir,
@@ -305,6 +308,7 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                                               **kwargs)
 
         if os.environ.get("TRTLLM_DISABLE_UNIFIED_CONVERTER") is None:
+            arg_dict = {"use_autoawq": True} if use_autoawq else {}
             custom_dict = {}
 
             if config.qwen_type == "qwen":
@@ -340,10 +344,7 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                     "transformer": "language_model.model",
                     "lm_head": "language_model.lm_head",
                 }
-            if config.tie_word_embeddings:
-                config.share_embedding_table = True
             loader = ModelWeightsLoader(hf_model_dir, custom_dict)
-            loader.check_share_embedding(config)
             model = cls(config)
 
             if config.qwen_type == "qwen" and model.config.mapping.has_tp():
@@ -358,7 +359,7 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                         weights = [weights]
 
                     for idx, w in enumerate(weights):
-                        if use_hf_gptq_checkpoint:
+                        if quant_config.quant_algo == QuantAlgo.W4A16_GPTQ:
                             w = w.reshape(-1, 3, w.shape[-1] // 3)
                             w = w.chunk(mapping.tp_size, 2)[mapping.tp_rank]
                             if w.shape[0] == 1:
@@ -382,9 +383,14 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                 for tllm_key, _ in tqdm(model.named_parameters()):
                     if "qkv" in tllm_key:
                         tllm_weights.update(
-                            loader.load(tllm_key, reshape_qkv, skip_tp=True))
+                            loader.load(tllm_key,
+                                        reshape_qkv,
+                                        skip_tp=True,
+                                        custom_postprocess_kwargs=arg_dict))
                     else:
-                        tllm_weights.update(loader.load(tllm_key))
+                        tllm_weights.update(
+                            loader.load(tllm_key,
+                                        custom_postprocess_kwargs=arg_dict))
                 loader.fill(tllm_weights)
             elif config.qwen_type == "qwen2_moe":
                 for tllm_key, _ in model.named_parameters():
@@ -419,13 +425,17 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                 for tllm_key, _ in tqdm(model.named_parameters()):
                     if tllm_key.endswith("shared_expert.fc.weight"):
                         tllm_weights.update(
-                            loader.load(tllm_key, concat_gate_up_proj))
+                            loader.load(tllm_key,
+                                        concat_gate_up_proj,
+                                        custom_postprocess_kwargs=arg_dict))
                     else:
-                        tllm_weights.update(loader.load(tllm_key))
+                        tllm_weights.update(
+                            loader.load(tllm_key,
+                                        custom_postprocess_kwargs=arg_dict))
                 loader.fill(tllm_weights)
             else:
                 # For Qwen1 w/o TP, Qwen1.5 and Qwen2 w/o MoE
-                loader.generate_tllm_weights(model)
+                loader.generate_tllm_weights(model, arg_dict)
         else:
             if not use_preloading:
                 hf_model = load_hf_qwen(hf_model_dir, load_model_on_cpu)
@@ -436,11 +446,10 @@ class QWenForCausalLM(DecoderModelForCausalLM):
 
             logger.debug(f"TensorRT-LLM model: {model}")
 
-            if use_hf_gptq_checkpoint:
+            if quant_config.quant_algo == QuantAlgo.W4A16_GPTQ:
                 weights = load_weights_from_hf_gptq_model(hf_model, config)
             else:
                 weights = load_weights_from_hf_model(hf_model, config)
-            check_share_embedding(weights, config)
             model.load(weights)
         return model
 

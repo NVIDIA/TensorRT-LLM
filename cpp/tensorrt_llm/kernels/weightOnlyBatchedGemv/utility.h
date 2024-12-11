@@ -141,7 +141,7 @@ __device__ __forceinline__ void dequantize(void* w, void* quantized_w, void* sca
             if constexpr (EnableZero)
             {
                 vec_zero = MathWrapper<typename Details::TypeDetailsA>::to_vec2(
-                    reinterpret_cast<Type*>(zeros)[n] * static_cast<Type>(alpha));
+                    static_cast<float>(reinterpret_cast<half*>(zeros)[n]) * alpha);
             }
         }
         else

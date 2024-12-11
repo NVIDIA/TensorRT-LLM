@@ -93,6 +93,10 @@ public:
         //! [maxBatchSize] or [numSequences]
         TensorPtr chunkedContextNextTokens;
 
+        // For Eagle-2
+        //! [1]
+        TensorPtr useDynamicTreeHost;
+
         void create(SizeType32 maxNumSequences, runtime::TllmRuntime const& runtime,
             runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig);
     };

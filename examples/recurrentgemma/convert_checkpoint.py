@@ -360,10 +360,9 @@ def convert_from_checkpoint(
                 add_trt_llm_weight(weights, trt_llm_name, param,
                                    trt_llm_config.dtype)
             elif "embedder.input_embedding" in name or "model.embed_tokens" in name:
-                if not trt_llm_config.share_embedding_table:
-                    lm_head = split_matrix_tp(param, tp_size, tp_rank, dim=0)
-                    add_trt_llm_weight(weights, "lm_head.weight",
-                                       np.copy(lm_head), trt_llm_config.dtype)
+                lm_head = split_matrix_tp(param, tp_size, tp_rank, dim=0)
+                add_trt_llm_weight(weights, "lm_head.weight", np.copy(lm_head),
+                                   trt_llm_config.dtype)
                 if trt_llm_config.emb_scale_by_sqrt_dim:
                     param = np.multiply(
                         param.astype(np.float32),

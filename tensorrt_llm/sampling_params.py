@@ -91,6 +91,7 @@ class SamplingParams:
         return_encoder_output (bool): Controls if Result should contain encoder output hidden states (for encoder-only and encoder-decoder models). Default is false.
         return_perf_metrics (bool): Controls if Result should contain the performance metrics for this request. Default is false.
 
+        lookahead_config (LookaheadDecodingConfig , optional): Lookahead decoding config. Defaults to None.
         guided_decoding (GuidedDecodingParams, optional): Guided decoding params. Defaults to None.
 
         ignore_eos (bool): Whether to ignore the EOS token and continue generating tokens after the EOS token is generated. Defaults to False.
@@ -163,6 +164,9 @@ class SamplingParams:
     exclude_input_from_output: bool = True
     return_encoder_output: bool = False
     return_perf_metrics: bool = False
+
+    # Lookahead decoding config
+    lookahead_config: Optional[tllme.LookaheadDecodingConfig] = None
 
     # Guided decoding params
     guided_decoding: Optional[GuidedDecodingParams] = None

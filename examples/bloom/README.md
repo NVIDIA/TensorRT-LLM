@@ -128,8 +128,7 @@ python convert_checkpoint.py --model_dir ./bloom/176B/ \
                 --output_dir ./bloom/176B/trt_ckpt/fp16/8-gpu/ \
                 --tp_size 8 \
                 --use_parallel_embedding \
-                --embedding_sharding_dim 0 \
-                --use_embedding_sharing
+                --embedding_sharding_dim 0
 trtllm-build --checkpoint_dir ./bloom/176B/trt_ckpt/fp16/8-gpu/ \
                 --output_dir ./bloom/176B/trt_engines/fp16/8-gpu/ \
                 --workers 2

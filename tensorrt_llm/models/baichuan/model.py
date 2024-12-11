@@ -21,8 +21,7 @@ from ...layers import (Attention, AttentionMaskType, ColumnLinear, Embedding,
 from ...mapping import Mapping
 from ...module import Module
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
-                              PretrainedConfig, QuantConfig,
-                              check_share_embedding)
+                              PretrainedConfig, QuantConfig)
 from .config import BaichuanConfig
 from .convert import load_weights_from_hf_model
 
@@ -198,7 +197,6 @@ class BaichuanForCausalLM(DecoderModelForCausalLM):
 
         weights = load_weights_from_hf_model(hf_model, config)
 
-        check_share_embedding(weights, config)
         model = cls(config)
         model.load(weights)
         return model

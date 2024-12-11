@@ -2077,6 +2077,18 @@ def test_getters_return_references():
     assert config.kv_cache_config.max_tokens == 42
 
 
+def test_allotted_time_ms():
+    allotted_time = datetime.timedelta(milliseconds=2)
+    input_tokens = [1, 2, 3, 4]
+
+    max_new_tokens = 5
+    request = trtllm.Request(input_tokens, max_tokens=max_new_tokens)
+
+    request.allotted_time_ms = allotted_time
+
+    assert request.allotted_time_ms == datetime.timedelta(milliseconds=2)
+
+
 def test_executor_version():
     assert trtllm.__version__ == trtllm_version.__version__
 

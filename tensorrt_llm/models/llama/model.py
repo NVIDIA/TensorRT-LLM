@@ -30,7 +30,7 @@ from ...module import Module
 from ..convert_utils import has_safetensors
 from ..model_weights_loader import ModelWeightsLoader
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
-                              QuantConfig, check_share_embedding)
+                              QuantConfig)
 from .config import LLaMAConfig
 from .convert import (load_hf_llama, load_weights_from_deepcompressor,
                       load_weights_from_gptq, load_weights_from_hf_by_shard,
@@ -430,7 +430,6 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
             arg_dict = {"use_autoawq": True} if use_autoawq else {}
 
             loader = ModelWeightsLoader(hf_model_dir, custom_dict)
-            loader.check_share_embedding(config)
             model = cls(config)
             loader.generate_tllm_weights(model, arg_dict)
         else:
@@ -455,7 +454,6 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
             else:
                 hf_model = load_hf_llama(hf_model_dir, load_model_on_cpu)
                 weights = load_weights_from_hf_model(hf_model, config)
-            check_share_embedding(weights, config)
             model = cls(config)
             model.load(weights)
         return model
@@ -481,7 +479,6 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
 
         weights = load_weights_from_meta_ckpt(meta_ckpt_dir, config)
 
-        check_share_embedding(weights, config)
         model = cls(config)
         model.load(weights)
         return model

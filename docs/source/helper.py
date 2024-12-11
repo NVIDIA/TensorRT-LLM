@@ -8,16 +8,11 @@ def underline(title: str, character: str = "=") -> str:
 
 
 def generate_title(filename: str) -> str:
-    # Turn filename into a title
-    title = filename.replace("_", " ").title()
-    # Underline title
-
-    title = ' '.join([
-        word.upper() if word.lower() == 'llm' else word
-        for word in title.split()
-    ])
-    title = underline(title)
-    return title
+    with open(filename) as f:
+        first_line = f.readline()
+        assert first_line.startswith("### ")
+        title = first_line[4:].strip()
+    return underline(title)
 
 
 def generate_examples():
@@ -45,7 +40,7 @@ def generate_examples():
 
         # Make script_path relative to doc_path and call it include_path
         include_path = '../../..' / script_path.relative_to(root_dir)
-        content = (f"{generate_title(doc_path.stem)}\n\n"
+        content = (f"{generate_title(script_path)}\n\n"
                    f"Source {script_url}.\n\n"
                    f".. literalinclude:: {include_path}\n"
                    "    :language: python\n"

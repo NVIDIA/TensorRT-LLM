@@ -153,6 +153,9 @@ struct Multihead_attention_params_base
     int relative_attention_bias_stride = 0;
     int max_distance = 0;
 
+    // If logn scaling is used
+    float const* logn_scaling_ptr = nullptr;
+
     // block sparse config
     bool block_sparse_attention = false;
     BlockSparseParams block_sparse_params{64, false, 16, 8};

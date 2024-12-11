@@ -828,17 +828,17 @@ __global__ void assembleDraftLogitsOffsets(T const** logitsPtrs, T const* logits
     TokenIdType* outputIds, bool* skipDecode, runtime::SizeType32 const* numValidLogits, SizeType32 batchSize,
     SizeType32 maxDecodingDraftTokens, SizeType32 vocabSizePadded)
 {
+    // logitsPtrs: shape [numInputLogits], each points to a [vocabSizePadded] buffer
+    // logits: shape [numInputLogits, vocabSizePadded]
+    // outputIdsPtrs: shape [numInputLogits], each points to a [maxDecodingDraftTokens] buffer
+    // outputIds: shape [numInputLogits * maxDecodingDraftTokens]
+
     auto const tix = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
     auto const isValid{tix < numValidLogits[0]};
 
     if (isValid)
     {
-        // logits: [numInputLogits, vocab_size]
-        // logitsPtrs: [numInputLogits][1, vocab_size]
         logitsPtrs[tix] = logits + tix * vocabSizePadded;
-
-        // outputIds: [numInputLogits * maxDecodingDraftTokens]
-        // outputIdsPtrs: [numInputLogits][maxDecodingDraftTokens]
         outputIdsPtrs[tix] = outputIds + tix * maxDecodingDraftTokens;
     }
 
@@ -870,8 +870,6 @@ template void invokeAssembleDraftLogitsOffsets(__half const** logitsPtrs, __half
     runtime::TokenIdType** outputIdsPtrs, runtime::TokenIdType* outputIds, bool* skipDecode,
     runtime::SizeType32 const* numValidLogits, runtime::SizeType32 numInputLogits, runtime::SizeType32 batchSize,
     runtime::SizeType32 maxDecodingDraftTokens, runtime::SizeType32 vocabSizePadded, cudaStream_t stream);
-
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace
 {
@@ -1044,7 +1042,7 @@ __global__ void copyOutputTokensIds(TokenIdType** tmpOutputIdsPtrs, SizeType32 c
     {
         // Output draft token ids offset
         TokenIdType* curPluginOutputDraftIdsPtrs = pluginOutputDraftIdsPtrs + tix * maxDecodingDraftTokens;
-        TokenIdType const* curPluginInputDraftIddsPtrs = pluginInputDraftIdsPtrs + tix * maxDecodingDraftTokens;
+        TokenIdType const* indicescurPluginInputDraftIdsPtrs = pluginInputDraftIdsPtrs + tix * maxDecodingDraftTokens;
 
         // The length of the existing draft token
         SizeType32 prevLen = layerId == 0 ? 0 : pluginInputDraftLens[tix];
@@ -1052,7 +1050,7 @@ __global__ void copyOutputTokensIds(TokenIdType** tmpOutputIdsPtrs, SizeType32 c
         // Copy exist tokens
         for (SizeType32 ii = 0; ii < prevLen; ii++)
         {
-            curPluginOutputDraftIdsPtrs[ii] = curPluginInputDraftIddsPtrs[ii];
+            curPluginOutputDraftIdsPtrs[ii] = indicescurPluginInputDraftIdsPtrs[ii];
         }
 
         SizeType32 curLen = prevLen;
@@ -1398,6 +1396,886 @@ void invokeAugmentBatchSlots(SizeType32* augmentedSeqSlots, SizeType32* augmente
         actualBatchSize <= BLOCK_SIZE, "Batch size larger than %d is not supported for EAGLE yet", batchSize);
     augmentBatchSlotsKernel<BLOCK_SIZE><<<1, BLOCK_SIZE, 0, stream>>>(augmentedSeqSlots, augmentedBatchSlots,
         chunkedContextNextTokens, lastDraftLens, seqSlots, batchSlots, actualBatchSize);
+}
+
+namespace
+{
+__global__ void setTopKsFromDyanmicTreeMaxTopK(SizeType32 layerIdx, SizeType32 numInputLogits, SizeType32 batchSize,
+    SizeType32* topKs, SizeType32* topKOffset, SizeType32 const dynamicTreeMaxTopK)
+{
+    // topKs: shape [numInputLogits]
+    // topKOffset: shape [batchSize]
+
+    auto const tix = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (tix < numInputLogits)
+    {
+        // Set topKs
+        // In Eagle-2, all logits have the same topK
+        topKs[tix] = dynamicTreeMaxTopK;
+    }
+
+    if (tix < batchSize)
+    {
+        // Set topKOffset
+        topKOffset[tix] = layerIdx == 0 ? tix : tix * dynamicTreeMaxTopK;
+    }
+}
+} // namespace
+
+void invokeSetTopKsFromDyanmicTreeMaxTopK(SizeType32 layerIdx, SizeType32 batchSize, SizeType32 numInputLogits,
+    SizeType32* topKs, SizeType32* topKOffset, SizeType32 const dynamicTreeMaxTopK, cudaStream_t stream)
+{
+    SizeType32 constexpr BLOCK_SIZE = 128;
+    setTopKsFromDyanmicTreeMaxTopK<<<divUp(numInputLogits, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(
+        layerIdx, numInputLogits, batchSize, topKs, topKOffset, dynamicTreeMaxTopK);
+
+    sync_check_cuda_error();
+}
+
+namespace
+{
+__global__ void copyScoresAndDraftTokenIds(SizeType32 layerIdx, SizeType32 mNumEagleLayers,
+    SizeType32 maxDecodingDraftTokens, SizeType32 batchSize, SizeType32 const dynamicTreeMaxTopK,
+    SizeType32* topKOffset, TokenIdType const* pluginInputCurrentExpandIndices, float const* pluginInputAllLayersScores,
+    TokenIdType const* pluginInputAllLayersDraftTokenIds,
+    TokenIdType const* pluginInputAllLayersDraftTokenIdsPredecessor, float* pluginOutputAllLayersScores,
+    TokenIdType* pluginOutputAllLayersDraftTokenIds, TokenIdType* pluginOutputAllLayersDraftTokenIdsPredecessor,
+    float* firstTopKOutputLogProbs, TokenIdType* firstTopKOutputIds)
+{
+    // topKOffset: [batchSize]
+    // pluginInputCurrentExpandIndices: [batchSize, maxDecodingDraftTokens]
+    // pluginInputAllLayersScores: [batchSize, mNumEagleLayers, maxDecodingDraftTokens x maxDecodingDraftTokens]
+    // pluginInputAllLayersDraftTokenIds: [batchSize, mNumEagleLayers, maxDecodingDraftTokens x maxDecodingDraftTokens]
+    // pluginInputAllLayersDraftTokenIdsPredecessor: [batchSize, mNumEagleLayers, maxDecodingDraftTokens x
+    // maxDecodingDraftTokens]
+
+    // pluginOutputAllLayersScores: [batchSize, mNumEagleLayers, maxDecodingDraftTokens x maxDecodingDraftTokens]
+    // pluginOutputAllLayersDraftTokenIds: [batchSize, mNumEagleLayers, maxDecodingDraftTokens x maxDecodingDraftTokens]
+    // pluginOutputAllLayersDraftTokenIdsPredecessor: [batchSize, mNumEagleLayers, maxDecodingDraftTokens x
+    // maxDecodingDraftTokens]
+
+    // firstTopKOutputLogProbs: [numInputLogits, maxDecodingDraftTokens]
+    // firstTopKOutputIds: [numInputLogits, maxDecodingDraftTokens]
+
+    auto const bix = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (bix < batchSize)
+    {
+        auto pluginInputCurrentExpandIndicesPtr = pluginInputCurrentExpandIndices + bix * maxDecodingDraftTokens;
+        auto pluginInputAllLayersScoresPtr
+            = pluginInputAllLayersScores + bix * mNumEagleLayers * maxDecodingDraftTokens * maxDecodingDraftTokens;
+        auto pluginInputAllLayersDraftTokenIdsPtr = pluginInputAllLayersDraftTokenIds
+            + bix * mNumEagleLayers * maxDecodingDraftTokens * maxDecodingDraftTokens;
+        auto pluginInputAllLayersDraftTokenIdsPredecessorPtr = pluginInputAllLayersDraftTokenIdsPredecessor
+            + bix * mNumEagleLayers * maxDecodingDraftTokens * maxDecodingDraftTokens;
+
+        auto pluginOutputAllLayersScoresPtr
+            = pluginOutputAllLayersScores + bix * mNumEagleLayers * maxDecodingDraftTokens * maxDecodingDraftTokens;
+        auto pluginOutputAllLayersDraftTokenIdsPtr = pluginOutputAllLayersDraftTokenIds
+            + bix * mNumEagleLayers * maxDecodingDraftTokens * maxDecodingDraftTokens;
+        auto pluginOutputAllLayersDraftTokenIdsPredecessorPtr = pluginOutputAllLayersDraftTokenIdsPredecessor
+            + bix * mNumEagleLayers * maxDecodingDraftTokens * maxDecodingDraftTokens;
+
+        // When layerIdx == 0, firstTopKOutputLogProbs/firstTopKOutputIds shape: [batchSize, maxDecodingDraftTokens]
+        // When layerIdx > 0, firstTopKOutputLogProbs/firstTopKOutputIds shape: [batchSize * dynamicTreeMaxTopK,
+        // maxDecodingDraftTokens]
+        auto firstTopKOutputOffset = layerIdx == 0 ? 1 : dynamicTreeMaxTopK;
+        auto firstTopKOutputLogProbsPtr
+            = firstTopKOutputLogProbs + bix * firstTopKOutputOffset * maxDecodingDraftTokens;
+        auto firstTopKOutputIdsPtr = firstTopKOutputIds + bix * firstTopKOutputOffset * maxDecodingDraftTokens;
+
+        // We save the scores and draft tokensIds continuously
+        auto startOffset
+            = layerIdx == 0 ? 0 : (layerIdx - 1) * (dynamicTreeMaxTopK * dynamicTreeMaxTopK) + dynamicTreeMaxTopK;
+
+        // 1) Copy all the previous scores and draft tokenIds from plugin input to plugin output
+        for (SizeType32 ii = 0; ii < startOffset; ++ii)
+        {
+            pluginOutputAllLayersScoresPtr[ii] = pluginInputAllLayersScoresPtr[ii];
+            pluginOutputAllLayersDraftTokenIdsPtr[ii] = pluginInputAllLayersDraftTokenIdsPtr[ii];
+            pluginOutputAllLayersDraftTokenIdsPredecessorPtr[ii] = pluginInputAllLayersDraftTokenIdsPredecessorPtr[ii];
+        }
+
+        // 2) Copy this layer's scores and draft tokenIds
+        // When layerIdx == 0, we only need to save dynamicTreeMaxTopK scores/draft tokens
+        // When layerIdx > 0, we need to save dynamicTreeMaxTopK * dynamicTreeMaxTopK scores/draft tokens
+        auto numExpandTokens = layerIdx == 0 ? 1 : dynamicTreeMaxTopK;
+        for (SizeType32 ii = 0; ii < numExpandTokens; ++ii)
+        {
+            for (SizeType32 jj = 0; jj < dynamicTreeMaxTopK; ++jj)
+            {
+                pluginOutputAllLayersScoresPtr[startOffset]
+                    = firstTopKOutputLogProbsPtr[ii * maxDecodingDraftTokens + jj];
+                pluginOutputAllLayersDraftTokenIdsPtr[startOffset]
+                    = firstTopKOutputIdsPtr[ii * maxDecodingDraftTokens + jj];
+
+                // Update the predecessor of this draft tokens
+                pluginOutputAllLayersDraftTokenIdsPredecessorPtr[startOffset] = pluginInputCurrentExpandIndicesPtr[ii];
+
+                startOffset++;
+            }
+        }
+    }
+}
+
+} // namespace
+
+void invokeCopyScoresAndDraftTokenIds(SizeType32 layerIdx, SizeType32 mNumEagleLayers,
+    SizeType32 maxDecodingDraftTokens, SizeType32 batchSize, SizeType32 numInputLogits,
+    SizeType32 const dynamicTreeMaxTopK, SizeType32* topKOffset, TokenIdType const* pluginInputCurrentExpandIndices,
+    float const* pluginInputAllLayersScores, TokenIdType const* pluginInputAllLayersDraftTokenIds,
+    TokenIdType const* pluginInputAllLayersDraftTokenIdsPredecessor, float* pluginOutputAllLayersScores,
+    TokenIdType* pluginOutputAllLayersDraftTokenIds, TokenIdType* pluginOutputAllLayersDraftTokenIdsPredecessor,
+    float* firstTopKOutputLogProbs, TokenIdType* firstTopKOutputIds, cudaStream_t stream)
+{
+    SizeType32 constexpr BLOCK_SIZE = 128;
+    copyScoresAndDraftTokenIds<<<divUp(batchSize, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(layerIdx, mNumEagleLayers,
+        maxDecodingDraftTokens, batchSize, dynamicTreeMaxTopK, topKOffset, pluginInputCurrentExpandIndices,
+        pluginInputAllLayersScores, pluginInputAllLayersDraftTokenIds, pluginInputAllLayersDraftTokenIdsPredecessor,
+        pluginOutputAllLayersScores, pluginOutputAllLayersDraftTokenIds, pluginOutputAllLayersDraftTokenIdsPredecessor,
+        firstTopKOutputLogProbs, firstTopKOutputIds);
+
+    sync_check_cuda_error();
+}
+
+namespace
+{
+__global__ void updateScores(SizeType32 batchSize, SizeType32 const dynamicTreeMaxTopK,
+    SizeType32 maxDecodingDraftTokens, float* curLogProbs, float const* prevLayerScores)
+{
+    // We update the current scores (curLogProbs, shape: [batchSize * dynamicTreeMaxTopK, maxDecodingDraftTokens])
+    // with the previous layer's scores (prevLayerScores, shape: [batchSize, maxDecodingDraftTokens])
+    // 'cu_scores = topk_p + scores[:, None]'
+    // Example: when topk_p = [[1, 2], [3, 4]], scores = [10, 20].
+    //          cu_scores = [[11, 12], [23, 24]]
+
+    // curLogProbs [numInputLogits(batchSize * dynamicTreeMaxTopK), maxDecodingDraftTokens]
+    // prevLayerScores [batchSize, maxDecodingDraftTokens]. for each request, only top 'dynamicTreeMaxTopK' is valuable.
+    auto const bix = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (bix < batchSize)
+    {
+        // This request's buffer
+        auto prevLayerScoresPtr = prevLayerScores + bix * maxDecodingDraftTokens;
+        auto curLogProbsPtr = curLogProbs + bix * dynamicTreeMaxTopK * maxDecodingDraftTokens;
+
+        for (SizeType32 ii = 0; ii < dynamicTreeMaxTopK; ++ii)
+        {
+            auto curDraftTokenLogProbsPtr = curLogProbsPtr + ii * maxDecodingDraftTokens;
+            auto scoreValue = prevLayerScoresPtr[ii];
+            for (SizeType32 jj = 0; jj < maxDecodingDraftTokens; ++jj)
+            {
+                if (jj < dynamicTreeMaxTopK)
+                {
+                    curDraftTokenLogProbsPtr[jj] += scoreValue;
+                }
+                else
+                {
+                    curDraftTokenLogProbsPtr[jj] = -std::numeric_limits<float>::infinity();
+                }
+            }
+        }
+    }
+}
+
+} // namespace
+
+void invokeUpdateScores(SizeType32 batchSize, SizeType32 numInputLogits, SizeType32 const dynamicTreeMaxTopK,
+    SizeType32 maxDecodingDraftTokens, float* curLogProbs, float const* prevLayerScores, cudaStream_t stream)
+{
+    // Only mLayerIdx > 0 will execute this function
+    TLLM_CHECK(batchSize * dynamicTreeMaxTopK == numInputLogits);
+
+    SizeType32 constexpr BLOCK_SIZE = 128;
+    updateScores<<<divUp(batchSize, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(
+        batchSize, dynamicTreeMaxTopK, maxDecodingDraftTokens, curLogProbs, prevLayerScores);
+
+    sync_check_cuda_error();
+}
+
+namespace
+{
+__global__ void assembleSecondTopKSamplingInputs(SizeType32 batchSize, SizeType32 const dynamicTreeMaxTopK,
+    SizeType32 maxDecodingDraftTokens, float* firstTopKOutputLogProbs, float** secondTopKInputScoresPtrs,
+    TokenIdType* secondTopKOutputIdsFlatten, TokenIdType** secondTopKOutputIdsPtrs)
+{
+    // firstTopKOutputLogProbs: shape [numInputLogits(batchSize * dynamicTreeMaxTopK), maxDecodingDraftTokens]
+    // secondTopKInputScoresPtrs: shape [batchSize]
+    // secondTopKOutputIdsFlatten: shape [batchSize, maxDecodingDraftTokens]
+    // secondTopKOutputIdsPtrs: shape [batchSize]
+    auto const bix = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (bix < batchSize)
+    {
+        secondTopKInputScoresPtrs[bix] = firstTopKOutputLogProbs + bix * dynamicTreeMaxTopK * maxDecodingDraftTokens;
+        secondTopKOutputIdsPtrs[bix] = secondTopKOutputIdsFlatten + bix * maxDecodingDraftTokens;
+    }
+}
+
+} // namespace
+
+void invokeAssembleSecondTopKSamplingInputs(SizeType32 batchSize, SizeType32 const dynamicTreeMaxTopK,
+    SizeType32 maxDecodingDraftTokens, float* firstTopKOutputLogProbs, float** secondTopKInputScoresPtrs,
+    TokenIdType* secondTopKOutputIdsFlatten, TokenIdType** secondTopKOutputIdsPtrs, cudaStream_t stream)
+{
+
+    SizeType32 constexpr BLOCK_SIZE = 128;
+    assembleSecondTopKSamplingInputs<<<divUp(batchSize, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(batchSize,
+        dynamicTreeMaxTopK, maxDecodingDraftTokens, firstTopKOutputLogProbs, secondTopKInputScoresPtrs,
+        secondTopKOutputIdsFlatten, secondTopKOutputIdsPtrs);
+
+    sync_check_cuda_error();
+}
+
+// The outputIds are almost ascending
+inline __device__ void insertionSortOutputIds(TokenIdType* outputIds, SizeType32 n)
+{
+    for (SizeType32 ii = 1; ii < n; ++ii)
+    {
+        TokenIdType key = outputIds[ii];
+        SizeType32 jj = ii - 1;
+
+        while (jj >= 0 && outputIds[jj] > key)
+        {
+            outputIds[jj + 1] = outputIds[jj];
+            jj--;
+        }
+        outputIds[jj + 1] = key;
+    }
+}
+
+inline __device__ SizeType32 findAncestorPathIndex(SizeType32 const* prevPaths, SizeType32 ancestorId,
+    SizeType32 ancestorLayerIdx, SizeType32 maxDecodingTokens, SizeType32 maxPathLen)
+{
+    if (ancestorLayerIdx == -1)
+    {
+        // Find the root layer
+        return 0;
+    }
+
+    // prevPaths: [maxDecodingTokens, maxPathLen]
+    for (SizeType32 ii = 0; ii < maxDecodingTokens; ++ii)
+    {
+        // '+1' because of the root node
+        if (prevPaths[ii * maxPathLen + ancestorLayerIdx + 1] == ancestorId)
+        {
+            return ii;
+        }
+    }
+    return -1;
+}
+
+namespace
+{
+
+__global__ void updatePath(SizeType32 layerIdx, SizeType32 batchSize, SizeType32 dynamicTreeMaxTopK,
+    SizeType32 maxDecodingTokens, SizeType32 maxPathLen, SizeType32 const* prevPaths, SizeType32* newPaths,
+    TokenIdType** secondTopKOutputIdsPtrs, TokenIdType* pluginOutputNextExpandIndices)
+{
+    // prevPaths: [batchSize, maxDecodingTokens, maxPathLen]
+    // newPaths: [batchSize, maxDecodingTokens, maxPathLen]
+    // secondTopKOutputIdsPtrs: [batchSize, maxDecodingDraftTokens]
+    // pluginOutputNextExpandIndices: [batchSize, maxDecodingDraftTokens]
+
+    auto const maxDecodingDraftTokens = maxDecodingTokens - 1;
+    auto const bix = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
+
+    if (bix < batchSize)
+    {
+        auto const prevPathPtr = prevPaths + bix * maxDecodingTokens * maxPathLen;
+        auto const newPathsPtr = newPaths + bix * maxDecodingTokens * maxPathLen;
+        auto const pluginOutputNextExpandIndicesPtr = pluginOutputNextExpandIndices + bix * maxDecodingDraftTokens;
+
+        // Init, all set to -1
+        for (SizeType32 ii = 0; ii < maxDecodingTokens * maxPathLen; ++ii)
+        {
+            newPathsPtr[ii] = -1;
+        }
+
+        if (layerIdx == 0)
+        {
+            // layer 0 is simple
+            // Example new paths: [[0, 1, -1, -1], [0, 2, -1, -1], ..., [0, dynamicTreeMaxTopK, -1, -1]]
+            for (SizeType32 ii = 0; ii < dynamicTreeMaxTopK; ++ii)
+            {
+                newPathsPtr[ii * maxPathLen + 0] = 0;
+                newPathsPtr[ii * maxPathLen + 1] = ii + 1;
+                // When layerIdx == 0, only expand 'dynamicTreeMaxTopK' draft tokens
+                // We '+1' here because we take the root node into consideration
+                pluginOutputNextExpandIndicesPtr[ii] = ii + 1;
+            }
+        }
+        else
+        {
+            // Find how many paths in the previous path
+            SizeType32 prevLayerNumPaths = 0;
+            for (SizeType32 ii = 0; ii < maxDecodingTokens; ++ii)
+            {
+                // Check the first value of each paths
+                if (prevPathPtr[ii * maxDecodingTokens] != -1)
+                {
+                    prevLayerNumPaths++;
+                }
+                else
+                {
+                    break;
+                }
+            }
+
+            auto secondTopKOutputIdsPtr = secondTopKOutputIdsPtrs[bix];
+
+            // For each request, we will generate 'dynamicTreeMaxTopK' new draft tokens
+            // auto newDraftTokensIdsPtr = secondTopKOutputIdsPtrs[bix];
+            // Sort the outputIds, ascending
+            insertionSortOutputIds(secondTopKOutputIdsPtr, dynamicTreeMaxTopK);
+
+            // Update the selected draft tokens to the pluginOutputNextExpandIndices
+            // Exclude the root node
+            SizeType32 offsetToTheFinalTree = layerIdx == 1
+                ? dynamicTreeMaxTopK + 1
+                : (layerIdx - 1) * dynamicTreeMaxTopK * dynamicTreeMaxTopK + dynamicTreeMaxTopK + 1;
+            for (SizeType32 ii = 0; ii < dynamicTreeMaxTopK; ++ii)
+            {
+                SizeType32 rowIdx = secondTopKOutputIdsPtr[ii] / maxDecodingDraftTokens;
+                SizeType32 columnIdx = secondTopKOutputIdsPtr[ii] % maxDecodingDraftTokens;
+
+                pluginOutputNextExpandIndicesPtr[ii] = rowIdx * dynamicTreeMaxTopK + columnIdx + offsetToTheFinalTree;
+            }
+
+            // The start index of the node in this layer
+            auto const startIndexOfCurrentLayer = layerIdx * dynamicTreeMaxTopK + 1;
+            // The start index of the node in previous layer
+            auto const startIndexOfPreviousLayer = startIndexOfCurrentLayer - dynamicTreeMaxTopK;
+
+            // Record the index of path that had been used to expand in this layer
+            SizeType32 usedPrevLayerPathsIndex = -1;
+
+            SizeType32 numNewPath = 0;
+            for (SizeType32 ii = 0; ii < dynamicTreeMaxTopK; ++ii)
+            {
+                // This draft token's new index in the whole tree
+                SizeType32 newIndex = ii + startIndexOfCurrentLayer;
+                // Find this draft token's ancestor node
+                SizeType32 ancestorIndex
+                    = secondTopKOutputIdsPtr[ii] / maxDecodingDraftTokens + startIndexOfPreviousLayer;
+
+                // Find the path index in the previous path that take this ancestor node as the leaf node
+                SizeType32 ancestorPathIdxInPrevPaths
+                    = findAncestorPathIndex(prevPathPtr, ancestorIndex, layerIdx - 1, maxDecodingTokens, maxPathLen);
+
+                // The correct 'ancestorPathIdxInPrevPaths' must be:
+                // 1) ancestorPathIdxInPrevPaths == usedPrevLayerPathsIndex: continue to expand this path
+                // 2) ancestorPathIdxInPrevPaths > usedPrevLayerPathsIndex:
+                //       2.1)  ancestorPathIdxInPrevPaths == usedPrevLayerPathsIndex + 1: expand a new path, next to the
+                //       previous one. 2.2) ancestorPathIdxInPrevPaths > usedPrevLayerPathsIndex + 1: there are multiple
+                //       path that do not have leaf at this layer, but we need to include as well.
+                if (ancestorPathIdxInPrevPaths == -1 || ancestorPathIdxInPrevPaths < usedPrevLayerPathsIndex)
+                {
+                    // Throw error when can not find ancestor's path.
+                    // Or ancestorPath had been finish expand.
+                    printf(
+                        "Throw error from updatePath kernel: bix: %d can not find the correct ancestorPath of "
+                        "ancestorIndex: %d in layerIdx: %d, usedPrevLayerPathsIndex: %d, "
+                        "ancestorPathIdxInPrevPaths:%d\n",
+                        bix, ancestorIndex, layerIdx - 1, usedPrevLayerPathsIndex, ancestorPathIdxInPrevPaths);
+                    asm volatile("brkpt;\n");
+                }
+                else if (ancestorPathIdxInPrevPaths == usedPrevLayerPathsIndex + 1)
+                {
+                    // Expand a new path, just behind the previous one.
+                    usedPrevLayerPathsIndex++;
+                }
+                else if (ancestorPathIdxInPrevPaths > usedPrevLayerPathsIndex + 1)
+                {
+                    // There are multiple path that will not be expand in this layer.
+                    // But we also need to include them, since they are part of the tree.
+                    while (ancestorPathIdxInPrevPaths > usedPrevLayerPathsIndex + 1)
+                    {
+                        // Insert the paths that do not have leaf in this layer
+                        usedPrevLayerPathsIndex++;
+                        for (SizeType32 jj = 0; jj < maxPathLen; jj++)
+                        {
+                            newPathsPtr[numNewPath * maxPathLen + jj]
+                                = prevPathPtr[usedPrevLayerPathsIndex * maxPathLen + jj];
+                        }
+                        numNewPath++;
+                    }
+                    usedPrevLayerPathsIndex++; // Point to the path that we will expand this time.
+                }
+
+                // Expand the path
+                // Copy the original path
+                for (SizeType32 jj = 0; jj <= layerIdx; ++jj)
+                {
+                    newPathsPtr[numNewPath * maxPathLen + jj]
+                        = prevPathPtr[ancestorPathIdxInPrevPaths * maxPathLen + jj];
+                }
+                // Add this layer's new draft token
+                newPathsPtr[numNewPath * maxPathLen + layerIdx + 1] = newIndex;
+                numNewPath++;
+            }
+
+            // Insert the paths that do not have leaf in this layer
+            while (usedPrevLayerPathsIndex < prevLayerNumPaths)
+            {
+                usedPrevLayerPathsIndex++;
+                for (SizeType32 jj = 0; jj < maxPathLen; jj++)
+                {
+                    newPathsPtr[numNewPath * maxPathLen + jj] = prevPathPtr[usedPrevLayerPathsIndex * maxPathLen + jj];
+                }
+                numNewPath++;
+            }
+        }
+    }
+}
+
+} // namespace
+
+void invokeUpdatePath(SizeType32 layerIdx, SizeType32 batchSize, SizeType32 dynamicTreeMaxTopK,
+    SizeType32 maxDecodingTokens, SizeType32 maxPathLen, SizeType32 const* prevPaths, SizeType32* newPaths,
+    TokenIdType** secondTopKOutputIdsPtrs, TokenIdType* pluginOutputNextExpandIndices, cudaStream_t stream)
+{
+    SizeType32 constexpr BLOCK_SIZE = 128;
+
+    updatePath<<<divUp(batchSize, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(layerIdx, batchSize, dynamicTreeMaxTopK,
+        maxDecodingTokens, maxPathLen, prevPaths, newPaths, secondTopKOutputIdsPtrs, pluginOutputNextExpandIndices);
+
+    sync_check_cuda_error();
+}
+
+namespace
+{
+
+__global__ void updateDraftTokensAndLensAndCurScores(SizeType32 layerIdx, SizeType32 batchSize,
+    SizeType32 dynamicTreeMaxTopK, SizeType32 maxDecodingDraftTokens, TokenIdType** curDraftIds,
+    TokenIdType const* pluginInputDraftIds, SizeType32 const* pluginInputDraftLens, TokenIdType* pluginOutputDraftIds,
+    SizeType32* pluginOutputDraftLens, float const* curLayerScores, float* pluginOutputCurrentScores)
+{
+    // curDraftIds: shape [batchSize][maxDecodingDraftTokens]
+    // pluginInputDraftIds: shape [batchSize, maxDecodingDraftTokens]
+    // pluginInputDraftLens: shape [batchSize]
+    // pluginOutputDraftIds: shape [batchSize, maxDecodingDraftTokens]
+    // pluginOutputDraftLens: shape [batchSize]
+    // curLayerScores: shape [batchSize, maxDecodingDraftTokens]
+    // pluginOutputCurrentScores: shape [batchSize, maxDecodingDraftTokens]
+
+    auto const bix = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (bix < batchSize)
+    {
+        // 1) Update draft tokenIds and draft lengths
+        // Output draft token ids offset
+        TokenIdType* curPluginOutputDraftIdsPtr = pluginOutputDraftIds + bix * maxDecodingDraftTokens;
+        TokenIdType const* indicescurPluginInputDraftIdsPtr = pluginInputDraftIds + bix * maxDecodingDraftTokens;
+
+        // The length of the existing draft token
+        SizeType32 prevLen = layerIdx == 0 ? 0 : pluginInputDraftLens[bix];
+
+        // Copy exist tokens
+        for (SizeType32 ii = 0; ii < prevLen; ii++)
+        {
+            curPluginOutputDraftIdsPtr[ii] = indicescurPluginInputDraftIdsPtr[ii];
+        }
+
+        SizeType32 curLen = prevLen;
+
+        SizeType32 startTopKOffset = bix;
+        SizeType32 endTopkOffset = bix + 1;
+
+        for (SizeType32 ii = startTopKOffset; ii < endTopkOffset; ii++)
+        {
+            for (SizeType32 jj = 0; jj < dynamicTreeMaxTopK; jj++)
+            {
+                curPluginOutputDraftIdsPtr[curLen] = curDraftIds[ii][jj];
+                curLen++;
+            }
+        }
+
+        // Update the output draft token length of this request
+        pluginOutputDraftLens[bix] = curLen;
+
+        // 2) Update this layer's scores
+        auto const* curLayerScoresPtr = curLayerScores + bix * maxDecodingDraftTokens;
+        auto pluginOutputCurrentScoresPtr = pluginOutputCurrentScores + bix * maxDecodingDraftTokens;
+        for (SizeType32 ii = 0; ii < maxDecodingDraftTokens; ii++)
+        {
+            pluginOutputCurrentScoresPtr[ii] = curLayerScoresPtr[ii];
+        }
+    }
+}
+} // namespace
+
+void invokeUpdateDraftTokensAndLensAndCurScores(SizeType32 layerIdx, SizeType32 batchSize,
+    SizeType32 dynamicTreeMaxTopK, SizeType32 maxDecodingDraftTokens, TokenIdType** curDraftIds,
+    TokenIdType const* pluginInputDraftIds, SizeType32 const* pluginInputDraftLens, TokenIdType* pluginOutputDraftIds,
+    SizeType32* pluginOutputDraftLens, float const* curLayerScores, float* pluginOutputCurrentScores,
+    cudaStream_t stream)
+{
+    SizeType32 constexpr BLOCK_SIZE = 128;
+    updateDraftTokensAndLensAndCurScores<<<divUp(batchSize, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(layerIdx, batchSize,
+        dynamicTreeMaxTopK, maxDecodingDraftTokens, curDraftIds, pluginInputDraftIds, pluginInputDraftLens,
+        pluginOutputDraftIds, pluginOutputDraftLens, curLayerScores, pluginOutputCurrentScores);
+
+    sync_check_cuda_error();
+}
+
+namespace
+{
+__global__ void extractScoresAndRealDraftTokensIds(SizeType32 batchSize, SizeType32 dynamicTreeMaxTopK,
+    SizeType32 maxDecodingDraftTokens, float** secondTopKInputScoresPtrs, TokenIdType** secondTopKOutputIdsPtrs,
+    TokenIdType* firstTopKOutputIds, float* secondTopKOutputLogProbs)
+{
+    // secondTopKInputScoresPtrs: shape [batchSize][dynamicTreeMaxTopK * maxDecodingDraftTokens]
+    // secondTopKOutputIdsPtrs: shape [batchSize][maxDecodingDraftTokens]
+    // firstTopKOutputIds: shape [batchSize * dynamicTreeMaxTopK * maxDecodingDraftTokens]
+    // secondTopKOutputLogProbs: shape [batchSize, maxDecodingDraftTokens]
+
+    auto const bix = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (bix < batchSize)
+    {
+
+        auto secondTopKOutputLogProbsPtr = secondTopKOutputLogProbs + bix * maxDecodingDraftTokens;
+        auto firstTopKOutputIdsPtr = firstTopKOutputIds + bix * dynamicTreeMaxTopK * maxDecodingDraftTokens;
+        for (SizeType32 ii = 0; ii < dynamicTreeMaxTopK; ii++)
+        {
+            // auto selectIndex = secondTopKOutputIdsPtrs[bix][ii];
+            // auto selectScore = secondTopKInputScoresPtrs[bix][selectIndex];
+            // secondTopKOutputLogProbsPtr[ii] = selectScore;
+
+            auto row = secondTopKOutputIdsPtrs[bix][ii] / maxDecodingDraftTokens;
+            auto column = secondTopKOutputIdsPtrs[bix][ii] % maxDecodingDraftTokens;
+
+            // Extract scores
+            secondTopKOutputLogProbsPtr[ii] = secondTopKInputScoresPtrs[bix][row * maxDecodingDraftTokens + column];
+            // Extract real draft tokenIds
+            secondTopKOutputIdsPtrs[bix][ii] = firstTopKOutputIdsPtr[row * maxDecodingDraftTokens + column];
+        }
+    }
+}
+
+} // namespace
+
+void invokeExtractScoresAndRealDraftTokensIds(SizeType32 batchSize, SizeType32 dynamicTreeMaxTopK,
+    SizeType32 maxDecodingDraftTokens, float** secondTopKInputScoresPtrs, TokenIdType** secondTopKOutputIdsPtrs,
+    TokenIdType* firstTopKOutputIds, float* secondTopKOutputLogProbs, cudaStream_t stream)
+{
+    SizeType32 constexpr BLOCK_SIZE = 128;
+    extractScoresAndRealDraftTokensIds<<<divUp(batchSize, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(batchSize,
+        dynamicTreeMaxTopK, maxDecodingDraftTokens, secondTopKInputScoresPtrs, secondTopKOutputIdsPtrs,
+        firstTopKOutputIds, secondTopKOutputLogProbs);
+
+    sync_check_cuda_error();
+}
+
+namespace
+{
+
+__global__ void assembleThridTopKSamplingInputs(SizeType32 batchSize, SizeType32 const dynamicTreeMaxTopK,
+    SizeType32 maxDecodingDraftTokens, SizeType32 mNumEagleLayers, float* pluginOutputAllLayersScores,
+    float** thirdTopKInputScoresPtrs, TokenIdType* thirdTopKOutputIds, TokenIdType** thirdTopKOutputIdsPtrs)
+{
+    // pluginOutputAllLayersScores: [batchSize, mNumEagleLayers, maxDecodingDraftTokens x maxDecodingDraftTokens]
+    // thirdTopKInputScoresPtrs: [batchSize]
+    // thirdTopKOutputIds: [batchSize, maxDecodingDraftTokens]
+    // thirdTopKOutputIdsPtrs: [batchSize]
+
+    auto const bix = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (bix < batchSize)
+    {
+        thirdTopKInputScoresPtrs[bix]
+            = pluginOutputAllLayersScores + bix * mNumEagleLayers * maxDecodingDraftTokens * maxDecodingDraftTokens;
+        thirdTopKOutputIdsPtrs[bix] = thirdTopKOutputIds + bix * maxDecodingDraftTokens;
+    }
+}
+
+} // namespace
+
+void invokeAssembleThridTopKSamplingInputs(SizeType32 batchSize, SizeType32 const dynamicTreeMaxTopK,
+    SizeType32 maxDecodingDraftTokens, SizeType32 mNumEagleLayers, float* pluginOutputAllLayersScores,
+    float** thirdTopKInputScoresPtrs, TokenIdType* thirdTopKOutputIds, TokenIdType** thirdTopKOutputIdsPtrs,
+    cudaStream_t stream)
+{
+    SizeType32 constexpr BLOCK_SIZE = 128;
+    assembleThridTopKSamplingInputs<<<divUp(batchSize, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(batchSize,
+        dynamicTreeMaxTopK, maxDecodingDraftTokens, mNumEagleLayers, pluginOutputAllLayersScores,
+        thirdTopKInputScoresPtrs, thirdTopKOutputIds, thirdTopKOutputIdsPtrs);
+
+    sync_check_cuda_error();
+}
+
+namespace
+{
+
+__device__ SizeType32 findIndexInPaths(
+    SizeType32* indexMap, SizeType32 maxDecodingTokens, SizeType32 indexAmongAllDraftTokens)
+{
+    for (SizeType32 ii = 0; ii < maxDecodingTokens; ++ii)
+    {
+        if (indexMap[ii] == indexAmongAllDraftTokens)
+        {
+            return ii;
+        }
+    }
+    return -1;
+}
+
+__global__ void reconstructFinalPath(SizeType32 batchSize, SizeType32 const dynamicTreeMaxTopK,
+    SizeType32 maxDecodingDraftTokens, SizeType32 maxDecodingTokens, SizeType32 maxPathLen, SizeType32 mNumEagleLayers,
+    TokenIdType** thirdTopKOutputIdsPtrs, TokenIdType* pluginOutputAllLayersDraftTokenIdsPredecessor,
+    SizeType32* finalOutputPaths)
+{
+    // thirdTopKOutputIdsPtrs: shape [batchSize], each element points to a [maxDecodingDraftTokens] buffer
+    // pluginOutputAllLayersDraftTokenIdsPredecessor: [batchSize, mNumEagleLayers, maxDecodingDraftTokens x
+    // maxDecodingDraftTokens] finalOutputPaths: [batchSize, maxDecodingTokens, maxPathLen]
+
+    auto const bix = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
+
+    extern __shared__ SizeType32 totalSmemPtr[];
+
+    // shape: [2 * batchSize * maxDecodingTokens, maxPathLen]
+    // '2' means ping-pong buffers
+    SizeType32* tempPingPongPaths = totalSmemPtr;
+
+    // shape: [batchSize * maxDecodingTokens]
+    SizeType32* indexMapPtr = totalSmemPtr + 2 * batchSize * maxDecodingTokens * maxPathLen;
+
+    SizeType32* tempSmemPtr[2];
+
+    if (bix < batchSize)
+    {
+        SizeType32* curIndexMap = indexMapPtr + bix * maxDecodingDraftTokens;
+        // Init, all set to '-1'
+        for (SizeType32 ii = 0; ii < maxDecodingTokens; ++ii)
+        {
+            curIndexMap[ii] = -1;
+        }
+
+        // Store the pointers to buffer
+        tempSmemPtr[0] = tempPingPongPaths + bix * maxDecodingTokens * maxPathLen;
+        tempSmemPtr[1] = tempPingPongPaths + (batchSize + bix) * maxDecodingTokens * maxPathLen;
+
+        // Init, all set to '-1'
+        for (SizeType32 ii = 0; ii < maxDecodingTokens * maxPathLen; ++ii)
+        {
+            tempSmemPtr[0][ii] = -1;
+            tempSmemPtr[1][ii] = -1;
+        }
+
+        // Offset to batch index
+        auto thirdTopKOutputIdsPtr = thirdTopKOutputIdsPtrs[bix];
+        auto pluginOutputAllLayersDraftTokenIdsPredecessorPtr = pluginOutputAllLayersDraftTokenIdsPredecessor
+            + bix * mNumEagleLayers * maxDecodingDraftTokens * maxDecodingDraftTokens;
+        auto finalOutputPathsPtr = finalOutputPaths + bix * maxDecodingTokens * maxPathLen;
+
+        // Sort the output draft token indices in ascending order
+        insertionSortOutputIds(thirdTopKOutputIdsPtr, maxDecodingDraftTokens);
+
+        // Init the root node
+        SizeType32* rooPathPtr = tempSmemPtr[0];
+        SizeType32 curLayerSmemPtrIndex = 0;
+        rooPathPtr[0] = 0;
+        SizeType32 curLayerNumPaths = 1; // The number of this layer's path
+        curIndexMap[0] = 0;
+
+        SizeType32 curTopKIndex = 0; // The index of the thirdTopKOutputIdsPtr
+        // Update the path layer by layer
+        for (SizeType32 li = 0; li < mNumEagleLayers; li++)
+        {
+            // Update previous layer's path information
+            SizeType32* prevLayerPathsPtr = tempSmemPtr[curLayerSmemPtrIndex];
+            SizeType32 prevLayerNumPaths = curLayerNumPaths;
+
+            curLayerSmemPtrIndex = (curLayerSmemPtrIndex + 1) % 2;            // Update curLayerSmemPtrIndex
+            SizeType32* curLayerPathsPtr = tempSmemPtr[curLayerSmemPtrIndex]; // Point to this layer's path buffer
+            curLayerNumPaths = 0; // Reset the number of path of current layer
+
+            SizeType32 usedPrevLayerPathsIndex
+                = -1; // Record the index of path that had been used to expand in this layer
+
+            // The index boundary of this layer. The 'index' is the output index after top-maxDecodingDraftTokens
+            // sampling.
+            SizeType32 curLayerStartIndex
+                = li == 0 ? 0 : (li - 1) * dynamicTreeMaxTopK * dynamicTreeMaxTopK + dynamicTreeMaxTopK;
+            SizeType32 curLayerEndIndex = li == 0 ? curLayerStartIndex + dynamicTreeMaxTopK
+                                                  : curLayerStartIndex + dynamicTreeMaxTopK * dynamicTreeMaxTopK;
+
+            // curProcessNode is the node index select from top-maxDecodingDraftTokens sampling (i.e., the third
+            // sampling)
+            SizeType32 curProcessNode = thirdTopKOutputIdsPtr[curTopKIndex];
+
+            while (curProcessNode < curLayerEndIndex) // This node belong to this layer
+            {
+                // The pluginOutputAllLayersDraftTokenIdsPredecessorPtr does not consider root node, so we need to '-1'
+                // Find the ancestor index of the current process node among all the history draft tokens
+                SizeType32 ancestorIdxAmongAllDraftTokens
+                    = pluginOutputAllLayersDraftTokenIdsPredecessorPtr[curProcessNode];
+                // Map the index from the index among all the history draft tokens to the index in path
+                SizeType32 ancestorIdxInPath
+                    = findIndexInPaths(curIndexMap, maxDecodingTokens, ancestorIdxAmongAllDraftTokens);
+
+                // Find the path that end with 'ancestorIdxInPath'
+                SizeType32 ancestorPathIdxInPrevPaths = findAncestorPathIndex(
+                    prevLayerPathsPtr, ancestorIdxInPath, li - 1, maxDecodingTokens, maxPathLen);
+
+                if (ancestorPathIdxInPrevPaths == -1)
+                {
+                    printf(
+                        "Throw error from reconstructFinalPath kernel: bix: %d can not find the correct ancestorPath "
+                        "of ancestorIdxAmongAllDraftTokens: %d, ancestorIdxInPath: %d in layerIdx: %d, "
+                        "usedPrevLayerPathsIndex: %d, ancestorPathIdxInPrevPaths: %d\n",
+                        bix, ancestorIdxAmongAllDraftTokens, ancestorIdxInPath, li - 1, usedPrevLayerPathsIndex,
+                        ancestorPathIdxInPrevPaths);
+
+                    asm volatile("brkpt;\n");
+                }
+                else if (ancestorPathIdxInPrevPaths == usedPrevLayerPathsIndex + 1)
+                {
+                    usedPrevLayerPathsIndex++;
+                }
+                else if (ancestorPathIdxInPrevPaths > usedPrevLayerPathsIndex + 1)
+                {
+                    // There are some paths that do not expand in this layer
+                    while (ancestorPathIdxInPrevPaths > usedPrevLayerPathsIndex + 1)
+                    {
+                        // Insert the paths that do not have leaf in this layer
+                        usedPrevLayerPathsIndex++;
+                        for (SizeType32 jj = 0; jj < maxPathLen; jj++)
+                        {
+                            curLayerPathsPtr[curLayerNumPaths * maxPathLen + jj]
+                                = prevLayerPathsPtr[usedPrevLayerPathsIndex * maxPathLen + jj];
+                        }
+                        curLayerNumPaths++;
+                    }
+                    usedPrevLayerPathsIndex++;
+                }
+
+                // Expand this node
+                for (SizeType32 jj = 0; jj < maxPathLen; jj++)
+                {
+                    curLayerPathsPtr[curLayerNumPaths * maxPathLen + jj]
+                        = prevLayerPathsPtr[ancestorPathIdxInPrevPaths * maxPathLen + jj];
+                }
+                curLayerPathsPtr[curLayerNumPaths * maxPathLen + li + 1]
+                    = curTopKIndex + 1; // '+1' is because the root node
+                curLayerNumPaths++;
+
+                // Update indexMap
+                curIndexMap[curTopKIndex + 1]
+                    = curProcessNode + 1; // '+1' because we will take root node into consideration
+
+                // Point to next top-maxDecodingDraftTokens node
+                curTopKIndex++;
+                if (curTopKIndex >= maxDecodingDraftTokens)
+                {
+                    break;
+                }
+                curProcessNode = thirdTopKOutputIdsPtr[curTopKIndex];
+            } // Finish the expand of this layer
+
+            // Insert the paths that do not have leaf in this layer
+            while (usedPrevLayerPathsIndex < prevLayerNumPaths)
+            {
+                usedPrevLayerPathsIndex++;
+                for (SizeType32 jj = 0; jj < maxPathLen; jj++)
+                {
+                    curLayerPathsPtr[curLayerNumPaths * maxPathLen + jj]
+                        = prevLayerPathsPtr[usedPrevLayerPathsIndex * maxPathLen + jj];
+                }
+                curLayerNumPaths++;
+            }
+
+            if (curTopKIndex >= maxDecodingDraftTokens)
+            {
+                break;
+            }
+        } // Finish all the layers
+
+        if (curTopKIndex != maxDecodingDraftTokens)
+        {
+            printf(
+                "Throw error from reconstructFinalPath kernel: curTopKIndex(%d) is not the same as "
+                "maxDecodingDraftTokens(%d)",
+                curTopKIndex, maxDecodingDraftTokens);
+            asm volatile("brkpt;\n");
+        }
+
+        // Copy the final paths from shared memory to global memory
+        SizeType32* smemPathsPtr = tempSmemPtr[curLayerSmemPtrIndex];
+        for (SizeType32 ii = 0; ii < maxDecodingTokens * maxPathLen; ii++)
+        {
+            finalOutputPathsPtr[ii] = smemPathsPtr[ii];
+            ;
+        }
+    }
+}
+
+} // namespace
+
+void invokeReconstructFinalPath(SizeType32 batchSize, SizeType32 const dynamicTreeMaxTopK,
+    SizeType32 maxDecodingDraftTokens, SizeType32 maxDecodingTokens, SizeType32 maxPathLen, SizeType32 mNumEagleLayers,
+    TokenIdType** thirdTopKOutputIdsPtrs, TokenIdType* pluginOutputAllLayersDraftTokenIdsPredecessor,
+    SizeType32* newPaths, cudaStream_t stream)
+{
+    SizeType32 constexpr BLOCK_SIZE = 32;
+    // Use ping-pong temporary buffers to update path
+    SizeType32 pingPongBufferSize = 2 * batchSize * maxDecodingTokens * maxPathLen * sizeof(SizeType32);
+
+    // Although we have pluginOutputAllLayersDraftTokenIdsPredecessor, but the indices are correspond to all the history
+    // draft tokens. During we select draft tokens into the path, the tokens' index starts from 1 and increases. We need
+    // a map from the index among all the history to the index in the constructed path.
+    SizeType32 indexMapSize = batchSize * maxDecodingTokens * sizeof(SizeType32);
+
+    SizeType32 smemSize = pingPongBufferSize + indexMapSize;
+
+    reconstructFinalPath<<<divUp(batchSize, BLOCK_SIZE), BLOCK_SIZE, smemSize, stream>>>(batchSize, dynamicTreeMaxTopK,
+        maxDecodingDraftTokens, maxDecodingTokens, maxPathLen, mNumEagleLayers, thirdTopKOutputIdsPtrs,
+        pluginOutputAllLayersDraftTokenIdsPredecessor, newPaths);
+
+    sync_check_cuda_error();
+}
+
+namespace
+{
+__global__ void copyFinalDraftTokens(SizeType32 batchSize, SizeType32 const dynamicTreeMaxTopK,
+    SizeType32 maxDecodingDraftTokens, SizeType32 mNumEagleLayers, TokenIdType** thirdTopKOutputIdsPtrs,
+    TokenIdType* pluginOutputAllLayersDraftTokenIds, TokenIdType* pluginOutputDraftTokenIds,
+    SizeType32* pluginOutputDraftLens)
+{
+    // thirdTopKOutputIdsPtrs: shape [batchSize], each points to [maxDecodingDraftTokens]
+    // pluginOutputAllLayersDraftTokenIds: shape [batchSize, mNumEagleLayers, maxDecodingDraftTokens x
+    // maxDecodingDraftTokens] pluginOutputDraftTokenIds: [batchSize, maxDecodingDraftTokens] pluginOutputDraftLens:
+    // [batchSize]
+    auto const bix = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
+
+    if (bix < batchSize)
+    {
+        // Update final selected draft tokenIds
+        auto thirdTopKOutputIdsPtr = thirdTopKOutputIdsPtrs[bix];
+        auto pluginOutputAllLayersDraftTokenIdsPtr = pluginOutputAllLayersDraftTokenIds
+            + bix * mNumEagleLayers * maxDecodingDraftTokens * maxDecodingDraftTokens;
+        auto pluginOutputDraftTokenIdsPtr = pluginOutputDraftTokenIds + bix * maxDecodingDraftTokens;
+
+        for (SizeType32 ii = 0; ii < maxDecodingDraftTokens; ++ii)
+        {
+            SizeType32 selectedNodeIndex = thirdTopKOutputIdsPtr[ii];
+            TokenIdType realDraftTokenId = pluginOutputAllLayersDraftTokenIdsPtr[selectedNodeIndex];
+            pluginOutputDraftTokenIdsPtr[ii] = realDraftTokenId;
+        }
+
+        // Update draft length
+        pluginOutputDraftLens[bix] = maxDecodingDraftTokens;
+    }
+}
+
+} // namespace
+
+void invokeCopyFinalDraftTokens(SizeType32 batchSize, SizeType32 const dynamicTreeMaxTopK,
+    SizeType32 maxDecodingDraftTokens, SizeType32 mNumEagleLayers, TokenIdType** thirdTopKOutputIdsPtrs,
+    TokenIdType* pluginOutputAllLayersDraftTokenIds, TokenIdType* pluginOutputDraftTokenIds,
+    SizeType32* pluginOutputDraftLens, cudaStream_t stream)
+{
+    SizeType32 constexpr BLOCK_SIZE = 128;
+    copyFinalDraftTokens<<<divUp(batchSize, BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(batchSize, dynamicTreeMaxTopK,
+        maxDecodingDraftTokens, mNumEagleLayers, thirdTopKOutputIdsPtrs, pluginOutputAllLayersDraftTokenIds,
+        pluginOutputDraftTokenIds, pluginOutputDraftLens);
+
+    sync_check_cuda_error();
 }
 
 } // namespace tensorrt_llm::kernels::speculative_decoding

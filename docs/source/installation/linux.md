@@ -2,15 +2,13 @@
 
 # Installing on Linux
 
-1. Install TensorRT-LLM on Ubuntu 22.04.
+1. Install TensorRT-LLM (tested on Ubuntu 22.04).
 
     ```bash
     sudo apt-get -y install libopenmpi-dev && pip3 install tensorrt_llm
-
-    python3 -c "import tensorrt_llm"
     ```
 
-2. Sanity check the installation.
+2. Sanity check the installation by running the following in Python (tested on Python 3.10):
 
     ```python3
     from tensorrt_llm import LLM, SamplingParams

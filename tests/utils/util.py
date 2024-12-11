@@ -133,7 +133,7 @@ def skip_num_gpus_less_than(num_gpus: int):
 skip_single_gpu = skip_num_gpus_less_than(2)
 
 
-def skip_less_than_memory(required_memory: int):
+def skip_gpu_memory_less_than(required_memory: int):
     memory = get_total_gpu_memory(0)
     return pytest.mark.skipif(
         required_memory > memory,
@@ -142,7 +142,8 @@ def skip_less_than_memory(required_memory: int):
     )
 
 
-skip_less_than_40gb_memory = skip_less_than_memory(40 * 1024 * 1024 * 1024)
+skip_gpu_memory_less_than_40gb = skip_gpu_memory_less_than(40 * 1024 * 1024 *
+                                                           1024)
 
 
 def modelopt_installed():

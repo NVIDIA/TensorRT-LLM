@@ -39,8 +39,6 @@ def main():
     # Prompt: 'The future of AI is', Generated text: 'an exciting time for us. We are constantly researching, developing, and improving our platform to create the most advanced and efficient model available. We are'
 
 
-# Due to the requirement of the underlying mpi4py, for multi-gpu, the main function must be placed inside the
-# `if __name__ == '__main__':` block.
-# Refer to https://mpi4py.readthedocs.io/en/stable/mpi4py.futures.html#mpipoolexecutor
+# The entry point of the program need to be protected for spawning processes.
 if __name__ == '__main__':
     main()

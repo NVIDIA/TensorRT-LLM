@@ -17,6 +17,7 @@
 
 #include "penaltyLayer.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/kernels/penaltyKernels.h"
 #include "tensorrt_llm/kernels/penaltyTypes.h"
 #include "tensorrt_llm/layers/defaultDecodingParams.h"
@@ -210,6 +211,7 @@ void PenaltyLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& b
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(PenaltyLayer_forwardAsync);
 
     auto outputs = std::dynamic_pointer_cast<BaseDecodingOutputs>(baseOutputs);
     auto params = std::dynamic_pointer_cast<DecodingInputs>(baseInputs);

@@ -46,7 +46,7 @@ __device__ inline void cp_shared_global(unsigned s_ptr, void const* g_ptr)
     else if constexpr (size_ == 4)
         asm volatile("cp.async.ca.shared.global [%0], [%1], %2;\n" ::"r"(s_ptr), "l"(g_ptr), "n"(size_));
 #elif defined(__CUDA_ARCH__)
-    register unsigned tmp[size_ / 4];
+    unsigned tmp[size_ / 4];
 
     if constexpr (size_ == 16)
     {
@@ -85,7 +85,7 @@ __device__ inline void cp_shared_global(unsigned s_ptr, void const* g_ptr, bool 
         asm volatile("cp.async.ca.shared.global [%0], [%1], %2, %3;\n" ::"r"(s_ptr), "l"(g_ptr), "n"(size_),
             "r"(valid_ ? size_ : 0));
 #elif defined(__CUDA_ARCH__)
-    register unsigned tmp[size_ / 4];
+    unsigned tmp[size_ / 4];
 
     if constexpr (size_ == 16)
     {
@@ -181,6 +181,29 @@ __device__ inline void mma(std::array<float, 4>& acc_, std::array<unsigned, 4> a
             "{%0, %1, %2, %3};\n"
             : "+f"(acc_[0]), "+f"(acc_[1]), "+f"(acc_[2]), "+f"(acc_[3])
             : "r"(a_[0]), "r"(a_[1]), "r"(a_[2]), "r"(a_[3]), "r"(b_[0]), "r"(b_[1]));
+#endif
+}
+
+template <class Tp_, bool aTrans_ = false, bool bTrans_ = false>
+__device__ inline void wgmma(std::array<std::array<float, 4>, 2>& acc_, uint64_t aDesc_, uint64_t bDesc_)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900 && defined(__CUDA_ARCH_FEAT_SM90_ALL)
+    if (std::is_same_v<Tp_, half>)
+        asm volatile(
+            "wgmma.mma_async.sync.aligned.m64n16k16.f32.f16.f16 \n"
+            "{ %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7},\n"
+            " %8, %9, 1,1,1, %10,%11;\n"
+            : "+f"(acc_[0][0]), "+f"(acc_[0][1]), "+f"(acc_[0][2]), "+f"(acc_[0][3]), "+f"(acc_[1][0]),
+            "+f"(acc_[1][1]), "+f"(acc_[1][2]), "+f"(acc_[1][3])
+            : "l"(aDesc_), "l"(bDesc_), "n"(aTrans_ ? 1 : 0), "n"(bTrans_ ? 1 : 0));
+    else
+        asm volatile(
+            "wgmma.mma_async.sync.aligned.m64n16k16.f32.bf16.bf16 \n"
+            "{ %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7},\n"
+            " %8, %9, 1,1,1, %10,%11;\n"
+            : "+f"(acc_[0][0]), "+f"(acc_[0][1]), "+f"(acc_[0][2]), "+f"(acc_[0][3]), "+f"(acc_[1][0]),
+            "+f"(acc_[1][1]), "+f"(acc_[1][2]), "+f"(acc_[1][3])
+            : "l"(aDesc_), "l"(bDesc_), "n"(aTrans_ ? 1 : 0), "n"(bTrans_ ? 1 : 0));
 #endif
 }
 

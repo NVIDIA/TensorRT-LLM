@@ -253,8 +253,7 @@ int LoraImpl::run(int64_t numTokens, int64_t numReqs, void const* input, int32_t
         std::vector<void*> ptrD_2;
         ptrD_2.reserve(numTokens * mNumLoraModules);
 
-        std::vector<int64_t> splitkBufferOffsets;
-        splitkBufferOffsets.push_back(0);
+        int minKN = mInHiddenSize; // Used to determine the alignment size
         for (int loraModuleIdx = 0; loraModuleIdx < mNumLoraModules; loraModuleIdx++)
         {
             int64_t const* loraWeightsPtrModule
@@ -286,6 +285,8 @@ int LoraImpl::run(int64_t numTokens, int64_t numReqs, void const* input, int32_t
                             "Invalid low_rank (%d). low_rank must be smaller than mMaxLowRank (%d)", N, mMaxLowRank));
 
                     auto const K = mInHiddenSize;
+                    minKN = std::min(minKN, N);
+                    minKN = std::min(minKN, K);
 
                     cutlass::gemm::GemmCoord problem(M, N, K);
                     problem_sizes.push_back(problem);
@@ -313,7 +314,6 @@ int LoraImpl::run(int64_t numTokens, int64_t numReqs, void const* input, int32_t
                 }
                 handled_token_num += M;
                 rowId += count;
-                splitkBufferOffsets.push_back(splitkBufferOffsets.at(splitkBufferOffsets.size() - 1) + M * N);
             }
             TLLM_CHECK(handled_token_num == numTokens);
         }
@@ -322,12 +322,14 @@ int LoraImpl::run(int64_t numTokens, int64_t numReqs, void const* input, int32_t
             TLLM_CHECK_WITH_INFO(mTransA == false && mTransB == true,
                 fmtstr("Invalid transA (%d) transB (%d). transA must be false, transB must be true", int(mTransA),
                     int(mTransB)));
+            // For the first GEMM, K is the "hidden size" and N is the "lora rank". So, K is often much larger than N.
+            // To improve the GPU utilization, we use splitK to handle the K dimension in multiple blocks in parallel.
             splitkGroupedGemm(problem_sizes, ptrA, ptrB, ptrC, ptrD, groupGemmParamsWorkSpace,
-                groupGemmParamsWorkSpaceSize, gemmWorkSpace, GemmWorkSpaceSize, splitkBufferOffsets, true, mType,
-                mSplitKSlices, stream);
+                groupGemmParamsWorkSpaceSize, gemmWorkSpace, GemmWorkSpaceSize, true, mType, mSplitKSlices, minKN,
+                stream);
             sync_check_cuda_error();
             groupedGemm(problem_sizes_2, ptrA_2, ptrB_2, ptrC_2, ptrD_2, groupGemmParamsWorkSpace,
-                groupGemmParamsWorkSpaceSize, gemmWorkSpace, GemmWorkSpaceSize, false, mType, stream);
+                groupGemmParamsWorkSpaceSize, gemmWorkSpace, GemmWorkSpaceSize, false, mType, minKN, stream);
             sync_check_cuda_error();
         }
     }

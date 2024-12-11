@@ -13,7 +13,6 @@ All published functionality in the Release Notes has been fully tested and verif
   - Added AutoQ (mixed precision) support.
   - Added a `trtllm-serve` command to start a FastAPI based server.
   - Added FP8 support for Nemotron NAS 51B. Refer to `examples/nemotron_nas/README.md`.
-  - Added FP8 support for Deepseek-v1. Refer to the “FP8 Quantization” section in `examples/deepseek_v1/README.md`.
   - Added INT8 support for GPTQ quantization.
   - Added TensorRT native support for INT8 Smooth Quantization.
   - Added quantization support for Exaone model. Refer to `examples/exaone/README.md`.

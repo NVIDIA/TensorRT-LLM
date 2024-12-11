@@ -9,6 +9,7 @@ from pydantic import (BaseModel, Field, PositiveFloat, field_validator,
 
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm.bench.dataclasses.enums import IFBSchedulingPolicy
+from tensorrt_llm.llmapi.llm_utils import LlmArgs
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 
 SPECULATIVE_MAP = {
@@ -40,6 +41,24 @@ class RuntimeConfig(BaseModel):
             parallel_config=self.world_config.get_parallel_config(),
             request_stats_max_iterations=0,
             scheduler_config=self.settings_config.get_scheduler_config(),
+        )
+
+    def get_llm_args(self) -> LlmArgs:
+        return LlmArgs(
+            scheduler_config=self.settings_config.get_scheduler_config(),
+            model=self.engine_dir,
+            skip_tokenizer_init=True,
+            pipeline_parallel_size=self.world_config.pp_size,
+            tensor_parallel_size=self.world_config.tp_size,
+            trust_remote_code=True,
+            kv_cache_config=self.settings_config.get_kvcache_config(),
+            enable_chunked_prefill=self.settings_config.chunking,
+            extended_runtime_perf_knob_config=self.performance_options.
+            get_perf_config(),
+            decoding_config=self.decoding_config.get_decoding_config(),
+            batching_type=trtllm.BatchingType.INFLIGHT,
+            runtime_max_batch_size=self.settings_config.max_batch_size,
+            runtime_max_num_tokens=self.settings_config.max_num_tokens,
         )
 
     @model_validator(mode="after")

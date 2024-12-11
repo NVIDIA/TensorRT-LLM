@@ -45,8 +45,9 @@ public:
         float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
         float rotary_embedding_scale, float rotary_embedding_short_m_scale, float rotary_embedding_long_m_scale,
         int rotary_embedding_max_positions, int rotary_embedding_original_max_positions, int tp_size,
-        int tp_rank,          // for ALiBi
-        bool unfuse_qkv_gemm, // for AutoPP
+        int tp_rank,           // for ALiBi
+        bool unfuse_qkv_gemm,  // for AutoPP
+        bool use_logn_scaling, // for LognScaling
         tensorrt_llm::kernels::ContextFMHAType context_fmha_type, int kv_cache_quant_mode, bool remove_input_padding,
         tensorrt_llm::kernels::AttentionMaskType mask_type,
         tensorrt_llm::kernels::BlockSparseParams block_sparse_params, bool paged_kv_cache, int tokens_per_block,
@@ -139,6 +140,8 @@ protected:
         float2 const* mrope_rotary_sin_cos = nullptr;
         int32_t const* mrope_position_deltas = nullptr;
 
+        // optional when logn scaling
+        float const* logn_scaling_ptr = nullptr;
         // optional when relative position
         T const* relative_attention_bias = nullptr;
         int relative_attention_bias_stride = 0;
@@ -189,6 +192,7 @@ protected:
             ss << "num_tokens: " << num_tokens << std::endl;
             ss << "max_blocks_per_sequence: " << max_blocks_per_sequence << std::endl;
             ss << "workspace: " << workspace << std::endl;
+            ss << "logn_scaling_ptr: " << logn_scaling_ptr << std::endl;
             ss << "relative_attention_bias: " << relative_attention_bias << std::endl;
             ss << "relative_attention_bias_stride: " << relative_attention_bias_stride << std::endl;
             ss << "cross_kv: " << cross_kv << std::endl;
@@ -244,6 +248,8 @@ protected:
         float2 const* mrope_rotary_sin_cos = nullptr;
         int32_t const* mrope_position_deltas = nullptr;
 
+        // optional when logn scaling
+        float const* logn_scaling_ptr = nullptr;
         // optional when relative position
         T const* relative_attention_bias = nullptr;
         int relative_attention_bias_stride = 0;
@@ -319,6 +325,11 @@ protected:
         return mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kROPE_M;
     }
 
+    bool isLognScaling() const
+    {
+        return mUseLognScaling;
+    }
+
     bool isCrossAttention() const
     {
         return mCrossAttention;
@@ -372,6 +383,7 @@ protected:
     int mRotaryEmbeddingMaxPositions;
     int mRotaryEmbeddingOriginalMaxPositions;
     tensorrt_llm::kernels::PositionEmbeddingType mPositionEmbeddingType;
+    bool mUseLognScaling = false;
     bool mRemovePadding = false;
     tensorrt_llm::kernels::AttentionMaskType mMaskType;
     tensorrt_llm::kernels::BlockSparseParams mBlockSparseParams;
@@ -462,6 +474,7 @@ protected:
         ss << "mRotaryEmbeddingScale: " << mRotaryEmbeddingScale << std::endl;
         ss << "mRotaryEmbeddingMaxPositions: " << mRotaryEmbeddingMaxPositions << std::endl;
         ss << "mPositionEmbeddingType: " << static_cast<int>(mPositionEmbeddingType) << std::endl;
+        ss << "mUseLognScaling: " << std::boolalpha << mUseLognScaling << std::endl;
         ss << "mRemovePadding: " << std::boolalpha << mRemovePadding << std::endl;
         ss << "mMaskType: " << static_cast<int>(mMaskType) << std::endl;
         ss << "mPagedKVCache: " << std::boolalpha << mPagedKVCache << std::endl;

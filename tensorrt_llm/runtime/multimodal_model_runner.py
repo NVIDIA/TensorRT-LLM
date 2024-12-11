@@ -460,7 +460,10 @@ class MultimodalModelRunner:
                 transforms.ConvertImageDtype(torch.bfloat16),
             ])
 
-        elif 'phi-3-vision' in self.model_type:
+        elif self.model_type in [
+                'phi-3-vision', 'pix2struct', 'llava_next', 'llava', 'fuyu',
+                'kosmos-2', 'mllama', 'llava_onevision', 'qwen2_vl'
+        ]:
             self.processor = AutoProcessor.from_pretrained(
                 self.args.hf_model_dir, trust_remote_code=True)
 
@@ -469,10 +472,6 @@ class MultimodalModelRunner:
             self.processor = CLIPImageProcessor.from_pretrained(
                 'OpenGVLab/InternViT-300M-448px'
             )  # You can change the InternViT model type according to your InternVL type
-
-        elif self.model_type == "pix2struct":
-            self.processor = AutoProcessor.from_pretrained(
-                self.args.hf_model_dir)
 
         elif self.model_type == "neva":
             image_size = 384
@@ -488,39 +487,25 @@ class MultimodalModelRunner:
         elif self.model_type == "video-neva":
             pass
 
-        elif self.model_type == "llava_next":
-            self.processor = AutoProcessor.from_pretrained(
-                self.args.hf_model_dir, trust_remote_code=True)
+        elif self.model_type == "vila":
+            sys.path.append(self.args.hf_model_dir + "/../VILA")
+            from llava.mm_utils import process_images
+            from llava.model import LlavaLlamaConfig  # noqa
+            from transformers import AutoModel
+            model = AutoModel.from_pretrained(
+                self.args.hf_model_dir,
+                device_map='auto',
+                trust_remote_code=True,
+            )
+            vision_tower = model.get_vision_tower()
+            vision_tower.image_processor
 
-        elif self.model_type in ['llava', 'vila', 'fuyu', 'kosmos-2']:
-            if self.model_type == "vila":
-                sys.path.append(self.args.hf_model_dir + "/../VILA")
-                from llava.mm_utils import process_images
-                from llava.model import LlavaLlamaConfig  # noqa
-                from transformers import AutoModel
-                model = AutoModel.from_pretrained(
-                    self.args.hf_model_dir,
-                    device_map='auto',
-                    trust_remote_code=True,
-                )
-                vision_tower = model.get_vision_tower()
-                vision_tower.image_processor
+            def processor(raw_image):
+                return process_images(raw_image, vision_tower.image_processor,
+                                      model.config).to(model.device,
+                                                       dtype=torch.float16)
 
-                def processor(raw_image):
-                    return process_images(raw_image,
-                                          vision_tower.image_processor,
-                                          model.config).to(model.device,
-                                                           dtype=torch.float16)
-
-                self.processor = processor
-
-            else:
-                self.processor = AutoProcessor.from_pretrained(
-                    self.args.hf_model_dir)
-
-        elif self.model_type in ['mllama']:
-            self.processor = AutoProcessor.from_pretrained(
-                self.args.hf_model_dir)
+            self.processor = processor
 
     def init_image_encoder(self):
         if self.model_type == "phi-3-vision":
@@ -576,7 +561,9 @@ class MultimodalModelRunner:
                     debug_mode=False,
                     stream=self.stream,
                     enable_context_fmha_fp32_acc=self.args.
-                    enable_context_fmha_fp32_acc)
+                    enable_context_fmha_fp32_acc,
+                    multi_block_mode=self.args.multi_block_mode,
+                )
                 self.model_config = self.model.session._model_config
             else:
                 logger.info(f'Running LLM with C++ runner')
@@ -589,7 +576,9 @@ class MultimodalModelRunner:
                     enable_context_fmha_fp32_acc,
                     kv_cache_free_gpu_memory_fraction=self.args.
                     kv_cache_free_gpu_memory_fraction,
-                    cross_kv_cache_fraction=cross_kv_cache_fraction)
+                    cross_kv_cache_fraction=cross_kv_cache_fraction,
+                    multi_block_mode=self.args.multi_block_mode,
+                )
                 self.model_config = self.model.model_config
             self.runtime_mapping = self.model.mapping
         else:
@@ -704,7 +693,6 @@ class MultimodalModelRunner:
             profiler.stop("Vision")
 
         if self.model_type == 'fuyu':
-            visual_features = visual_features.squeeze()
             input_ids = image['input_ids'].to(torch.int32)
             image_patches_indices = image['image_patches_indices'].to(
                 torch.int32)
@@ -718,6 +706,7 @@ class MultimodalModelRunner:
                                                 image_patches_indices)
             input_ids = torch.stack(input_ids, dim=0).to('cpu')
             length = input_ids.shape[1]
+            visual_features = visual_features.repeat(self.args.batch_size, 1, 1)
         elif self.model_type == 'qwen2_vl':
             length = input_ids.shape[1]
             input_lengths = torch.IntTensor([length] * self.args.batch_size).to(
@@ -1704,7 +1693,6 @@ class MultimodalModelRunner:
             from qwen_vl_utils import process_vision_info
             from transformers.models.qwen2_vl.modeling_qwen2_vl import \
                 VisionRotaryEmbedding
-            processor = AutoProcessor.from_pretrained(self.args.hf_model_dir)
             hf_config = AutoConfig.from_pretrained(self.args.hf_model_dir)
             if input_text is None:
                 input_text = "Question: Describe this image. Answer:"
@@ -1723,11 +1711,10 @@ class MultimodalModelRunner:
                 ],
             }]
 
-            text = processor.apply_chat_template(messages,
-                                                 tokenize=False,
-                                                 add_generation_prompt=True)
+            text = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True)
             image_inputs, video_inputs = process_vision_info(messages)
-            inputs = processor(
+            inputs = self.processor(
                 text=[text],
                 images=image_inputs,
                 videos=video_inputs,
@@ -1933,15 +1920,14 @@ class MultimodalModelRunner:
             post_prompt = f"\n{input_text}<|im_end|><|im_start|>assistant\n"
             prompt = pre_prompt + post_prompt
 
-            processor = AutoProcessor.from_pretrained(self.args.hf_model_dir)
             if self.args.video_path is None:
-                image = processor(images=raw_image,
-                                  text=prompt,
-                                  return_tensors="pt")
+                image = self.processor(images=raw_image,
+                                       text=prompt,
+                                       return_tensors="pt")
             else:
-                image = processor(videos=raw_image,
-                                  text=prompt,
-                                  return_tensors="pt")
+                image = self.processor(videos=raw_image,
+                                       text=prompt,
+                                       return_tensors="pt")
 
         # Repeat inputs to match batch size
         pre_prompt = [pre_prompt] * self.args.batch_size

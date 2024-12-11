@@ -54,7 +54,7 @@ class StatsKeeper:
     """A statistics keeper for benchmarking."""
 
     def __init__(self) -> None:
-        self.requests: Dict[RequestRecord] = defaultdict(RequestRecord)
+        self.requests: Dict[int, RequestRecord] = defaultdict(RequestRecord)
         self.num_complete: int = 0
 
     def register_request(
@@ -133,7 +133,8 @@ class StatsKeeper:
             start_time = min(entry.start_timestamp, start_time)
             end_time = max(entry.end_timestamp, end_time)
             last_queue_time = max(entry.start_timestamp, last_queue_time)
-            request_ar = entry.num_generated_tokens / entry.decode_iteration
+            request_ar = entry.num_generated_tokens / (entry.decode_iteration +
+                                                       1)
 
             request_latencies.append(entry.end_to_end_latency)
             generation_latencies.append(entry.generation_time)
@@ -141,7 +142,7 @@ class StatsKeeper:
             ttft_times.append(entry.time_to_first_token)
             intertoken_avg_latencies.append(entry.intertoken_latency)
             request_acceptance.append(request_ar)
-            total_decoding_iterations += entry.decode_iteration
+            total_decoding_iterations += entry.decode_iteration + 1
 
             total_output_tokens += entry.num_output_tokens
             total_input_tokens += entry.num_input_tokens
@@ -247,6 +248,100 @@ def report_statistics(statistics: StatsKeeper,
     logging_info = (
         f"{logging_info}"
         "\n===========================================================\n")
+
+    logger.info(logging_info)
+    return stats
+
+
+def report_latency_statistics(stats: StatsKeeper, rt_cfg: RuntimeConfig,
+                              logger: Logger) -> BenchmarkStatistics:
+    """Report internal statistics about low-latency.
+
+    Args:
+        statistics (StatsKeeper): A statistics container.
+        rt_cfg (RuntimeConfig): Configuration for the run.
+        logger (Logger): A logger for logging.
+        streaming (bool, optional): Streaming benchmark used. Defaults to False.
+
+    Returns:
+        BenchmarkStatistics: Benchmark statistics for the provided keeper.
+    """
+
+    config_path = rt_cfg.engine_dir / "config.json"
+    with open(config_path, "r") as config:
+        engine_config = json.load(config)
+
+    stats = stats.generate_statistics_summary()
+    build_cfg = engine_config["build_config"]
+    pretrain_cfg = engine_config["pretrained_config"]
+
+    logging_info = (
+        "\n\n===========================================================\n"
+        "= ENGINE DETAILS\n"
+        "===========================================================\n"
+        f"Model:\t\t\t{rt_cfg.model}\n"
+        f"Engine Directory:\t{rt_cfg.engine_dir}\n"
+        f"TensorRT-LLM Version:\t{rt_cfg.sw_version}\n"
+        f"Dtype:\t\t\t{pretrain_cfg['dtype']}\n"
+        f"KV Cache Dtype:\t\t{pretrain_cfg['quantization']['kv_cache_quant_algo']}\n"
+        f"Quantization:\t\t{pretrain_cfg['quantization']['quant_algo']}\n"
+        f"Max Input Length:\t{build_cfg['max_input_len']}\n"
+        f"Max Sequence Length:\t{build_cfg['max_seq_len']}\n"
+        f"\n"
+        "===========================================================\n"
+        "= WORLD + RUNTIME INFORMATION \n"
+        "===========================================================\n"
+        f"TP Size:\t\t{rt_cfg.world_config.tp_size}\n"
+        f"PP Size:\t\t{rt_cfg.world_config.pp_size}\n"
+        f"Max Runtime Batch Size:\t{rt_cfg.settings_config.max_batch_size}\n"
+        f"Max Runtime Tokens:\t{rt_cfg.settings_config.max_num_tokens}\n"
+        f"Scheduling Policy:\t{rt_cfg.settings_config.scheduler_policy.values[1]}\n"
+        f"KV Memory Percentage:\t{rt_cfg.settings_config.kv_cache_percent * 100.0:.2f}%\n"
+        f"\n"
+        "===========================================================\n"
+        "= GENERAL OVERVIEW \n"
+        "===========================================================\n"
+        f"Number of requests:\t\t{stats.num_requests}\n"
+        f"Average Input Length (tokens):\t{stats.average_input_length:.4f}\n"
+        f"Average Output Length (tokens):\t{stats.average_output_length:.4f}\n"
+        f"Average request latency (ms):\t{stats.request_latency_percentiles.average * 1.0e-6:.4f}\n"
+        f"\n"
+        "===========================================================\n"
+        "= THROUGHPUT OVERVIEW \n"
+        "===========================================================\n"
+        f"Request Throughput (req/sec):\t\t  {stats.request_throughput_ns * 1.0e9:.4f}\n"
+        f"Total Token Throughput (tokens/sec):\t  {stats.token_throughput_ns * 1.0e9:.4f}\n"
+        f"Generation Token Throughput (tokens/sec): {stats.generation_tp_percentiles.average * 1.0e9:.4f}\n"
+        f"\n"
+        "===========================================================\n"
+        "= LATENCY OVERVIEW \n"
+        "===========================================================\n"
+        f"Total Latency (ms):\t\t  {stats.total_latency_ns * 1.0e-6:.4f}\n"
+        f"Average time-to-first-token (ms): {stats.ttft_percentiles.average * 1.0e-6:.4f}\n"
+        f"Average inter-token latency (ms): {stats.itl_percentiles.average * 1.0e-6:.4f}\n"
+        f"Acceptance Rate (Speculative):\t  {stats.acceptance_rate:.2f}\n"
+        f"\n"
+        "===========================================================\n"
+        "= GENERATION LATENCY BREAKDOWN \n"
+        "===========================================================\n"
+        f"MIN (ms): {stats.generation_latency_percentiles.minimum * 1.0e-6:.4f}\n"
+        f"MAX (ms): {stats.generation_latency_percentiles.maximum * 1.0e-6:.4f}\n"
+        f"AVG (ms): {stats.generation_latency_percentiles.average * 1.0e-6:.4f}\n"
+        f"P90 (ms): {stats.generation_latency_percentiles.p50 * 1.0e-6:.4f}\n"
+        f"P95 (ms): {stats.generation_latency_percentiles.p95 * 1.0e-6:.4f}\n"
+        f"P99 (ms): {stats.generation_latency_percentiles.p99 * 1.0e-6:.4f}\n"
+        f"\n"
+        "===========================================================\n"
+        "= ACCEPTANCE BREAKDOWN \n"
+        "===========================================================\n"
+        f"MIN: {stats.acceptance_percentiles.minimum:.2f}\n"
+        f"MAX: {stats.acceptance_percentiles.maximum:.2f}\n"
+        f"AVG: {stats.acceptance_percentiles.average:.2f}\n"
+        f"P90: {stats.acceptance_percentiles.p50:.2f}\n"
+        f"P95: {stats.acceptance_percentiles.p95:.2f}\n"
+        f"P99: {stats.acceptance_percentiles.p99:.2f}\n"
+        f"\n"
+        "===========================================================\n")
 
     logger.info(logging_info)
     return stats

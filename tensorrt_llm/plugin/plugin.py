@@ -151,51 +151,267 @@ class PluginConfig(metaclass=PluginConfigMeta):
     _dtype: str = field(default="float16", init=False)
 
     # Plugins
-    _bert_attention_plugin: Optional[str] = field(default="auto", init=False)
-    _gpt_attention_plugin: Optional[str] = field(default="auto", init=False)
-    _gemm_plugin: Optional[str] = field(default=None, init=False)
-    _gemm_swiglu_plugin: Optional[str] = field(default=None, init=False)
-    _fp8_rowwise_gemm_plugin: Optional[str] = field(default=None, init=False)
-    _smooth_quant_gemm_plugin: Optional[str] = field(default=None, init=False)
-    _qserve_gemm_plugin: Optional[str] = field(default=None, init=False)
-    _identity_plugin: Optional[str] = field(default=None, init=False)
-    _layernorm_quantization_plugin: Optional[str] = field(default=None,
-                                                          init=False)
-    _rmsnorm_quantization_plugin: Optional[str] = field(default=None,
-                                                        init=False)
-    _nccl_plugin: Optional[str] = field(default="auto", init=False)
-    _lora_plugin: Optional[str] = field(default=None, init=False)
+    _bert_attention_plugin: Optional[str] = field(
+        default="auto",
+        init=False,
+        metadata={
+            "help":
+            "The plugin that uses efficient kernels and enables an in-place update of the KV cache for attention layer of BERT-like encoder models."
+        })
+    _gpt_attention_plugin: Optional[str] = field(
+        default="auto",
+        init=False,
+        metadata={
+            "help":
+            "The plugin that uses efficient kernels and enables an in-place update of the KV cache for attention layer of GPT-like decoder models."
+        })
+    _gemm_plugin: Optional[str] = field(
+        default=None,
+        init=False,
+        metadata={
+            "help":
+            "The GEMM plugin that utilizes NVIDIA cuBLASLt to perform GEMM operations. "
+            "Note: it's only affective for non-quantized gemm operations (except FP8)."
+            "Note: For FP8, it also requires same calibration in checkpoint."
+        })
+    _gemm_swiglu_plugin: Optional[str] = field(
+        default=None,
+        init=False,
+        metadata={
+            "help":
+            "The GEMM + SwiGLU fusion in Gated-MLP combines two Matmul operations and "
+            "one SwiGLU operation into a single kernel. Currently this is only supported for FP8 precision on Hopper."
+        })
+    _fp8_rowwise_gemm_plugin: Optional[str] = field(
+        default=None,
+        init=False,
+        metadata={
+            "help":
+            "The quantized GEMM for fp8, which uses per token dynamic scales for "
+            "activation and per channel static scales for weights."
+            "Note: It also requires same calibration in checkpoint."
+        })
+    _qserve_gemm_plugin: Optional[str] = field(
+        default=None,
+        init=False,
+        metadata={
+            "help":
+            "The quantized GEMM from [QServe](https://arxiv.org/abs/2405.04532), "
+            "which employs 4-bit quantization for weights and 8-bit quantization for activations."
+        })
+    _identity_plugin: Optional[str] = field(
+        default=None,
+        init=False,
+        metadata={
+            "help":
+            "The identity plugin simply copies inputs to outputs, it's used mostly for debugging purpose."
+        })
+    _nccl_plugin: Optional[str] = field(
+        default="auto",
+        init=False,
+        metadata={
+            "help":
+            "The NCCL plugin wraps NCCL operators to support multi-GPU and even multi-nodes."
+        })
+    _lora_plugin: Optional[str] = field(default=None,
+                                        init=False,
+                                        metadata={"help": "Enable LoRA."})
     _weight_only_groupwise_quant_matmul_plugin: Optional[str] = field(
-        default=None, init=False)
-    _weight_only_quant_matmul_plugin: Optional[str] = field(default=None,
-                                                            init=False)
+        default=None,
+        init=False,
+        metadata={
+            "help":
+            "Enable weight-only groupwise quantization matmul operators."
+        })
+    _weight_only_quant_matmul_plugin: Optional[str] = field(
+        default=None,
+        init=False,
+        metadata={"help": "Enable weight-only quantization matmul operators."})
     _smooth_quant_plugins: bool = field(
         default=True,
-        init=False)  # Always enable smooth quant plugins for external users
-    _quantize_per_token_plugin: bool = field(default=False, init=False)
-    _quantize_tensor_plugin: bool = field(default=False, init=False)
-    _moe_plugin: Optional[str] = field(default="auto", init=False)
-    _mamba_conv1d_plugin: Optional[str] = field(default="auto", init=False)
-    _low_latency_gemm_plugin: Optional[str] = field(default=None, init=False)
-    _low_latency_gemm_swiglu_plugin: Optional[str] = field(default=None,
-                                                           init=False)
+        init=False,
+        metadata={
+            "help": "Enable a group of plugins to support smooth quantization."
+        })
+    _smooth_quant_gemm_plugin: Optional[str] = field(
+        default=None,
+        init=False,
+        metadata={
+            "help":
+            "Enable plugin that supports smooth quantization gemm kernels."
+        })
+    _layernorm_quantization_plugin: Optional[str] = field(
+        default=None,
+        init=False,
+        metadata={
+            "help":
+            "Enable plugin that supports layernorm quantization kernels."
+        })
+    _rmsnorm_quantization_plugin: Optional[str] = field(
+        default=None,
+        init=False,
+        metadata={
+            "help": "Enable plugin that supports rmsnorm quantization kernels."
+        })
+    _quantize_per_token_plugin: bool = field(
+        default=False,
+        init=False,
+        metadata={
+            "help": "Enable plugin that supports per-token quantization."
+        })
+    _quantize_tensor_plugin: bool = field(
+        default=False,
+        init=False,
+        metadata={
+            "help": "Enable plugin that supports per-tensor quantization."
+        })
+    _moe_plugin: Optional[str] = field(
+        default="auto",
+        init=False,
+        metadata={
+            "help":
+            "Enable some customized kernels to speed up the MoE layer of MoE models."
+        })
+    _mamba_conv1d_plugin: Optional[str] = field(
+        default="auto",
+        init=False,
+        metadata={
+            "help":
+            "Enable customized kernels to speed up conv1d operator for Mamba."
+        })
+    _low_latency_gemm_plugin: Optional[str] = field(
+        default=None,
+        init=False,
+        metadata={
+            "help":
+            "The GEMM plugin that optimized specially for low latency scenarios."
+        })
+    _low_latency_gemm_swiglu_plugin: Optional[str] = field(
+        default=None,
+        init=False,
+        metadata={
+            "help":
+            "The GEMM + SwiGLU fusion plugin that optimized specially for low latency scenarios."
+        })
+
     # Features
-    _context_fmha: bool = field(default=True, init=False)
+    _context_fmha: bool = field(
+        default=True,
+        init=False,
+        metadata={
+            "help":
+            "Enable the fused multi-head attention during the context phase, "
+            "will trigger a kernel that performs the MHA/MQA/GQA block using a single kernel."
+        })
     _bert_context_fmha_fp32_acc: bool = field(
-        default=False, init=False)  # will use fp16 if disabled
-    _paged_kv_cache: Optional[bool] = field(default=None, init=False)
-    _remove_input_padding: bool = field(default=True, init=False)
-    _reduce_fusion: bool = field(default=False, init=False)
-    _user_buffer: bool = field(default=False, init=False)
-    _tokens_per_block: int = field(default=64, init=False)
-    _use_paged_context_fmha: bool = field(default=False, init=False)
-    _use_fp8_context_fmha: bool = field(default=False, init=False)
-    _multiple_profiles: bool = field(default=False, init=False)
-    _paged_state: bool = field(default=True, init=False)
-    _streamingllm: bool = field(default=False, init=False)
-    _manage_weights: bool = field(default=False, init=False)
-    _use_fused_mlp: bool = field(default=True, init=False)
-    _pp_reduce_scatter: bool = field(default=False, init=False)
+        default=False,
+        init=False,
+        metadata={
+            "help":
+            "Enable the FP32 accumulator for context FMHA in the bert_attention_plugin. "
+            "If disabled, FP16 is used, better performance but potentially worse accuracy is expected."
+        })
+    _paged_kv_cache: Optional[bool] = field(
+        default=None,
+        init=False,
+        metadata={
+            "help":
+            "Enable paged KV cache, which helps manage memory for the KV cache more efficiently, "
+            "and usually leads to an increase in the batch size and an improved efficiency."
+        })
+    _remove_input_padding: bool = field(
+        default=True,
+        init=False,
+        metadata={
+            "help":
+            "Pack different tokens together, which reduces both the amount of computations and memory consumption."
+        })
+    _reduce_fusion: bool = field(
+        default=False,
+        init=False,
+        metadata={
+            "help":
+            "Fuse the ResidualAdd and LayerNorm kernels after AllReduce into a single kernel, "
+            "resulting in improved end-to-end performance."
+        })
+    _user_buffer: bool = field(
+        default=False,
+        init=False,
+        metadata={
+            "help":
+            "Eliminate extra copies from the local buffer to the shared buffer "
+            "in the communication kernel, leading to improved end-to-end performance. "
+            "This feature must be enabled with `--reduce_fusion enable` and "
+            "is currently only supported for the FP8 LLAMA model."
+        })
+    _tokens_per_block: int = field(
+        default=64,
+        init=False,
+        metadata={
+            "help":
+            "Define how many tokens are contained in each paged kv cache block."
+        })
+    _use_paged_context_fmha: bool = field(
+        default=False,
+        init=False,
+        metadata={
+            "help":
+            "Allow advanced features like KV cache reuse and chunked context."
+        })
+    _use_fp8_context_fmha: bool = field(
+        default=False,
+        init=False,
+        metadata={
+            "help":
+            "When FP8 quantization is activated, the attention can be further accelerated by enabling FP8 Context FMHA"
+        })
+    _multiple_profiles: bool = field(
+        default=False,
+        init=False,
+        metadata={
+            "help":
+            "Enables multiple TensorRT optimization profiles in the built engines, "
+            "will benefits the performance especially when GEMM plugin is disabled, "
+            "because more optimization profiles help TensorRT have more chances to select better kernels. "
+            "Note: This feature increases engine build time but no other adverse effects are expected."
+        })
+    _paged_state: bool = field(
+        default=True,
+        init=False,
+        metadata={
+            "help":
+            "Enable paged state, which helps manage memory for the RNN state more efficiently."
+        })
+    _streamingllm: bool = field(
+        default=False,
+        init=False,
+        metadata={
+            "help":
+            "Enable [StreamingLLM](https://arxiv.org/abs/2309.17453), which uses a window attention to perform efficient and stable LLM on long texts."
+        })
+    _manage_weights: bool = field(
+        default=False,
+        init=False,
+        metadata={
+            "help":
+            "Enable TensorRT-LLM managed weights to speed up engine building process."
+        })
+    _use_fused_mlp: bool = field(
+        default=True,
+        init=False,
+        metadata={
+            "help":
+            "Enable horizontal fusion in Gated-MLP that combines two Matmul "
+            "operations into a single one followed by a separate SwiGLU kernel."
+        })
+    _pp_reduce_scatter: bool = field(
+        default=False,
+        init=False,
+        metadata={
+            "help":
+            "Enable a pipeline parallelism optimization with "
+            "ReduceScatter + AllGather targeting large MoE models."
+        })
 
     def update_from_dict(self, config: dict):
         for name in config.keys():
@@ -306,6 +522,8 @@ class PluginConfig(metaclass=PluginConfigMeta):
         return self
 
 
+# Only plugin configs in this list will be exposed as `trtllm-build` arguments,
+# others are automatically enabled when needed, no need for users to control.
 cli_plugin_args = [
     # Plugins
     "bert_attention_plugin",
@@ -344,6 +562,10 @@ def add_plugin_argument(parser: argparse.ArgumentParser):
         field_name = field.name.lstrip('_')
         if field_name not in cli_plugin_args:
             continue
+        if field.metadata and "help" in field.metadata:
+            help_message = field.metadata["help"]
+        else:
+            raise AttributeError(f"Please add help message for {field_name}.")
         if field.type in (str, Optional[str]):
             plugin_dtype_options = DEFAULT_PLUGIN_DTYPE_OPTIONS
             if field_name in PLUGIN_DTYPE_OPTIONS_MAP:
@@ -353,20 +575,19 @@ def add_plugin_argument(parser: argparse.ArgumentParser):
                 type=str,
                 default=field.default if field.default else "disable",
                 choices=[x if x else "disable" for x in plugin_dtype_options],
-                help=f"Whether to enable/disable ``{field_name}`` and the dtype."
-            )
+                help=help_message)
         elif field.type == bool:
             parser.add_argument(
                 "--" + field_name,
                 type=str,
                 default="enable" if field.default else "disable",
                 choices=["enable", "disable"],
-                help=f"Whether to enable/disable ``{field_name}``.")
+                help=help_message)
         else:
             parser.add_argument("--" + field_name,
                                 type=field.type,
                                 default=field.default,
-                                help=f"``{field_name}``.")
+                                help=help_message)
     return parser
 
 

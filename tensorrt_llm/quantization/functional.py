@@ -945,7 +945,7 @@ def postprocess_weight_only_groupwise(tllm_key, weights, torch_dtype, layer,
             weights = pad_like(weights, layer.bias.shape)
         if using_head_as_leading_dim:
             weights = change_qkv_leading_dim(weights, num_heads)
-        results = {tllm_key: weights}
+        results = {tllm_key: weights.to(torch_dtype)}
     elif tllm_key.endswith("weight"):
         if not USE_INT8_WEIGHT:
             # 4 bit quantization

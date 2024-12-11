@@ -94,6 +94,13 @@ Samples parseWorkloadJson(
         }
         samples.emplace_back(Sample{std::move(input_ids), sample["output_len"], taskId});
     }
+
+    if (samples.size() < maxNumSamples)
+    {
+        TLLM_LOG_WARNING(
+            "Dataset size %zu is smaller than given max_num_samples %d, max_num_samples will be ignored.\n",
+            samples.size(), maxNumSamples);
+    }
     return samples;
 }
 

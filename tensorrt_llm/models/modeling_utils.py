@@ -4,7 +4,6 @@ import dataclasses
 import json
 import os
 import re
-from collections import Counter
 from enum import IntFlag, auto
 from functools import cached_property
 from pathlib import Path
@@ -95,7 +94,6 @@ class SpeculativeDecodingMode(IntFlag):
         elif args.speculative_decoding_mode == "explicit_draft_tokens":
             return SpeculativeDecodingMode.EXPLICIT_DRAFT_TOKENS
         elif args.speculative_decoding_mode == "eagle":
-            logger.warning(f"EAGLE is not supported yet. Do not use it.")
             return SpeculativeDecodingMode.EAGLE
         else:
             assert False, "Unknown speculative_decoding_mode " + args.speculative_decoding_mode
@@ -310,7 +308,6 @@ class PretrainedConfig:
                  quantization: Optional[Union[QuantConfig, dict]] = None,
                  use_parallel_embedding: bool = False,
                  embedding_sharding_dim: int = 0,
-                 share_embedding_table: bool = False,
                  head_size: Optional[int] = None,
                  qk_layernorm: bool = False,
                  runtime_defaults: "RuntimeDefaultsIn" = None,
@@ -359,22 +356,6 @@ class PretrainedConfig:
 
         self.use_parallel_embedding = use_parallel_embedding
         self.embedding_sharding_dim = embedding_sharding_dim
-        self.share_embedding_table = share_embedding_table
-
-        if share_embedding_table and mapping.tp_size > 1:
-            if (not use_parallel_embedding) or (use_parallel_embedding and
-                                                embedding_sharding_dim == 1):
-                raise NotImplementedError(
-                    "For tensor parallelism, sharing the embedding table must set " \
-                        "use_parallel_embedding=True and embedding_sharding_dim=0"
-                )
-        if share_embedding_table and mapping.pp_size > 1:
-            raise NotImplementedError(
-                "Embedding table cannot be shared for pipeline parallelism")
-
-        if share_embedding_table and mapping.cp_size > 1:
-            raise NotImplementedError(
-                "Embedding table cannot be shared for context parallelism")
 
         if head_size is None:
             head_size = hidden_size // num_attention_heads
@@ -614,13 +595,10 @@ class PretrainedModel(Module,
         from ..quantization.quantize import quantize
         quantize(self, self.config.quantization)
 
-        # Currently, use_parallel_embedding and share_embedding_table must be enabled before weight loading;
+        # Currently, use_parallel_embedding must be enabled before weight loading;
         # otherwise, the model will be inconsistent with the weights loaded from checkpoint.
         optimize_model(
-            self,
-            use_parallel_embedding=self.config.use_parallel_embedding,
-            share_embedding_table=self.config.share_embedding_table,
-        )
+            self, use_parallel_embedding=self.config.use_parallel_embedding)
 
     def release(self):
         release_gc()
@@ -711,18 +689,13 @@ class PretrainedModel(Module,
             name: numpy_to_torch(param.raw_value)
             for name, param in self.named_parameters()
         }
-
         # If there are some tensors share memory, this will lead to error when we call "save_file". So, for repeated tensors, we
         # clone the tensors to prevent this issue.
-        weights_ptrs = [weights[key].data_ptr() for key in weights]
-        repeated_ptrs = [
-            key for key, value in dict(Counter(weights_ptrs)).items()
-            if value > 1
-        ]
-        for key in weights:
-            if weights[key].data_ptr() in repeated_ptrs:
-                weights[key] = weights[key].clone().detach()
-
+        data_ptrs = set()
+        for name, param in weights.items():
+            if param.data_ptr() in data_ptrs:
+                weights[name] = param.clone()
+            data_ptrs.add(weights[name].data_ptr())
         safetensors.torch.save_file(
             weights, os.path.join(output_dir, f'rank{rank}.safetensors'))
         if save_config:
@@ -1407,11 +1380,21 @@ def share_embedding(model: PretrainedModel) -> PretrainedModel:
         if lm_head is not None and vocab_embedding is not None:
             break
 
-    if lm_head is not None and vocab_embedding is not None:
-        lm_head.weight = vocab_embedding.weight
-        if (hasattr(vocab_embedding, "per_token_scale")
-                and vocab_embedding.per_token_scale is not None):
-            lm_head.per_channel_scale = vocab_embedding.per_token_scale
+    # Cannot find both lm_head and vocab_embedding, e.g., pipeline parallel
+    if lm_head is None or vocab_embedding is None:
+        return model
+
+    # The lm_head and vocab_embedding have different weights
+    lm_head_weight = numpy_to_torch(lm_head.weight.raw_value)
+    vocab_embed_weight = numpy_to_torch(vocab_embedding.weight.raw_value)
+    if lm_head_weight.size() != vocab_embed_weight.size() or (
+            lm_head_weight - vocab_embed_weight).abs().max().item() > 1e-6:
+        return model
+
+    lm_head.weight = vocab_embedding.weight
+    if getattr(lm_head, 'per_channel_scale', None) and getattr(
+            vocab_embedding, 'per_channel_scale', None):
+        lm_head.per_channel_scale = vocab_embedding.per_token_scale
     return model
 
 
@@ -1449,6 +1432,7 @@ def optimize_model(
     # before weight loading
     if use_parallel_embedding:
         model = parallelize_embedding(model)
+
     if share_embedding_table:
         # if share_embedding_table is enabled, only one copy of the embedding table is store in converted ckpt
         # this pass is required to make lm_head.weight and vocab_embedding.weight point to the same tensor
@@ -1695,27 +1679,7 @@ def preprocess_weights(weights: Dict[str, torch.Tensor],
                 if 'attention.dense.bias' in name or 'mlp.proj.bias' in name:
                     weights[name] = torch.zeros_like(param)
 
-    # For share_embedding_table
-    check_share_embedding(weights, model_config)
     return weights
-
-
-def check_share_embedding(weights: Dict[str, torch.Tensor],
-                          model_config: PretrainedConfig):
-    if model_config.share_embedding_table:
-        if "lm_head.weight" in weights:
-            if weights["lm_head.weight"] is None:
-                weights.pop("lm_head.weight")
-        if "lm_head.weight" in weights and "transformer.vocab_embedding.weight" in weights:
-            if (weights["lm_head.weight"] -
-                    weights["transformer.vocab_embedding.weight"]).any():
-                logger.warning(
-                    "lm_head.weight and transformer.vocab_embedding.weight are not identical, "
-                    "share_embedding_table cannot be enabled; setting share_embedding_table=False."
-                )
-                model_config.share_embedding_table = False
-            else:
-                weights.pop("lm_head.weight")
 
 
 def get_kv_cache_type_from_legacy(use_cache: bool,

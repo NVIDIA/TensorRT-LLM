@@ -1,18 +1,7 @@
-import os
-import sys
-
-try:
-    from .test_llm_models import (baichuan2_7b_model_path, falcon_model_path,
-                                  gemma_2b_model_path, gptj_model_path,
-                                  llm_test_harness, qwen2_model_path,
-                                  sampling_params)
-except ImportError:
-    from test_llm_models import (baichuan2_7b_model_path, falcon_model_path,
-                                 gemma_2b_model_path, gptj_model_path,
-                                 llm_test_harness, qwen2_model_path,
-                                 sampling_params)
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from test_llm_models import (baichuan2_7b_model_path, falcon_model_path,
+                             gemma_2b_model_path, gptj_model_path,
+                             llm_test_harness, qwen2_model_path,
+                             sampling_params)
 from utils.util import skip_single_gpu
 
 

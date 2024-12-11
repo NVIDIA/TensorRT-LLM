@@ -139,8 +139,11 @@ def build_engines(model_cache: _tp.Optional[str] = None, only_fp8=False):
         build_engine(
             fp8_ckpt_path,
             engine_dir / model_spec_obj.get_model_path() / tp_pp_cp_dir,
-            '--gpt_attention_plugin=float16', '--paged_kv_cache=enable',
-            '--remove_input_padding=enable', "--context_fmha=disable")
+            '--gpt_attention_plugin=float16',
+            '--paged_kv_cache=enable',
+            '--remove_input_padding=enable',
+            '--use_paged_context_fmha=enable',
+        )
     else:
         fp16_ckpt_path = engine_dir / 'fp16' / tp_pp_cp_dir
         get_ckpt_without_quatization(hf_dir, fp16_ckpt_path)

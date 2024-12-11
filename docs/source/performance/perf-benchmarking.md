@@ -27,6 +27,8 @@ TensorRT-LLM provides the `trtllm-bench` CLI, a packaged benchmarking utility.
 - [meta-llama/Llama-3.1-405B-Instruct](https://huggingface.co/meta-llama/Llama-3.1-405B-Instruct)
 - [mistralai/Mixtral-8x7B-v0.1-Instruct](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1-Instruct)
 
+> The `trtllm-bench` CLI tool can automatically download the model from Hugging Face Model Hub.
+Export your token in the `HF_TOKEN` environment variable.
 
 #### Support Quantization Modes
 
@@ -107,9 +109,10 @@ The workflow for `trtllm-bench` is composed of the following steps:
 
 1. Prepare a dataset to drive the inflight batching benchmark.
 2. Build a benchmark engine using `trtllm-bench build` subcommand.
-3. Run the max throughput benchmark using the `trtllm-bench throughput` subcommand.
+3. Run the max throughput benchmark using the `trtllm-bench throughput` subcommand or low latency benchmark using the `trtllm-bench latency` subcommand.
 
-#### Preparing a Dataset
+
+## Preparing a Dataset
 
 The inflight benchmark utilizes a fixed JSON schema so that it is simple and
 straightforward to specify requests. The schema is defined as follows:
@@ -147,7 +150,7 @@ can simply read a line and assume a complete entry. When creating a dataset, be 
 JSON entry is on every line.
 ```
 
-#### Using `prepare_dataset` to Create Synthetic Datasets
+### Using prepare_dataset.py to Create Synthetic Datasets
 
 In order to prepare a synthetic dataset, you can use the provided script in the `benchmarks/cpp`
 directory. For example, to generate a synthetic dataset of 1000 requests with a uniform ISL/OSL of
@@ -160,31 +163,54 @@ benchmarks/cpp/prepare_dataset.py --stdout --tokenizer meta-llama/Llama-2-7b-hf 
 You can pipe the above command to a file to reuse the same dataset, or simply pipe its output to the
 benchmark script (example below).
 
-### Building a Benchmark Engine
 
-The second thing you'll need once you have a dataset is an engine to benchmark against. In order to
-build a pre-configured engine for one of the supported ISL:OSL combinations, you can run the following
-using the dataset you generated with `prepare_dataset.py` to build an FP8 quantized engine:
+## Building a Benchmark Engine
+
+The `trtllm-bench` CLI tool provides the `build` subcommand to build the TRT-LLM engines for max throughput benchmark.
+
+
+### How to Build the Engine
+
+To build an engine for benchmarking, you can specify the dataset generated with `prepare_dataset.py` through `--dataset` option.
+The `trtllm-bench`'s tuning heuristic uses the high-level statistics of the dataset (average ISL/OSL, max sequence length) to optimize engine build settings.
+The following command builds an FP8 quantized engine optimized using the dataset's ISL/OSL.
 
 ```shell
-trtllm-bench --model meta-llama/Llama-2-7b-hf build --dataset /tmp/synthetic_128_128.txt --quantization FP8
+trtllm-bench --model meta-llama/Llama-2-7b-hf build --quantization FP8 --dataset /tmp/synthetic_128_128.txt
 ```
 
-or manually set a max sequence length that you plan to run with specifically:
+The build subcommand also provides other ways to build the engine where users have larger control over the tuning values.
+
+- Build engine with self-defined tuning values:
+You specify the tuning values to build the engine with by setting `--max_batch_size` and `--max_num_tokens` directly.
+`max_batch_size` and `max_num_tokens` control the maximum number of requests and tokens that can be scheduled in each iteration.
+If no value is specified, the default `max_batch_size` and `max_num_tokens` values of `2048` and `8192` are used.
+The following command builds an FP8 quantized engine by specifying the engine tuning values.
 
 ```shell
-trtllm-bench --model meta-llama/Llama-2-7b-hf build --max_seq_len 256 --quantization FP8
+trtllm-bench --model meta-llama/Llama-2-7b-hf build --quantization FP8 --max_seq_len 4096 --max_batch_size 1024 --max_num_tokens 2048
 ```
 
-> [!NOTE] `trtllm-bench build` reproduces benchmark engines for performance study. These engine
-configurations are not guaranteed to be optimal for all cases and should be viewed as reproducers
-for the benchmark data we provide on our [Performance Overview](./perf-overview.md).
+- [Experimental] Build engine with target ISL/OSL for optimization:
+In this experimental mode, you can provide hints to `trtllm-bench`'s tuning heuristic to optimize the engine on specific ISL and OSL targets.
+Generally, the target ISL and OSL aligns with the average ISL and OSL of the dataset, but you can experiment with different values to optimize the engine using this mode.
+The following command builds an FP8 quantized engine and optmizes for ISL:OSL targets of 128:128.
 
-Looking a little closer, the `build` sub-command
-will perform a lookup and build an engine using those reference settings. The
-look up table directly corresponds to the performance table found in our
-[Performance Overview](./perf-overview.md#throughput-measurements). The
-output of the `build` sub-command looks similar to the snippet below (for `meta-llama/Llama-2-7b-hf`):
+```shell
+trtllm-bench --model meta-llama/Llama-2-7b-hf build --quantization FP8 --max_seq_len 4096 --target_isl 128 --target_osl 128
+```
+
+
+### Parallelism Mapping Support
+The `trtllm-bench build` subcommand supports combinations of tensor-parallel (TP) and pipeline-parallel (PP) mappings as long as the world size (`tp_size x pp_size`) `<=` `8`. The parallelism mapping in build subcommad is controlled by `--tp_size` and `--pp_size` options. The following command builds an engine with TP2-PP2 mapping.
+
+```shell
+trtllm-bench --model meta-llama/Llama-2-7b-hf build --quantization FP8 --dataset /tmp/synthetic_128_128.txt --tp_size 2 --pp_size 2
+```
+
+
+### Example of Build Subcommand Output:
+The output of the `build` subcommand looks similar to the snippet below (for `meta-llama/Llama-2-7b-hf`):
 
 ```shell
 trtllm-bench --model meta-llama/Llama-2-7b-hf build --dataset /tmp/synthetic_128_128.txt --quantization FP8
@@ -244,13 +270,14 @@ ENGINE SAVED: /tmp/meta-llama/Llama-2-7b-hf/tp_1_pp_1
 
 The engine in this case will be written to `/tmp/meta-llama/Llama-2-7b-hf/tp_1_pp_1` (the end of the log).
 
-### Running a Max Throughput Benchmark
+
+## Max Throughput Benchmark
 
 The `trtllm-bench` command line tool provides a max throughput benchmark that is accessible via the
 `throughput` subcommand. This benchmark tests a TensorRT-LLM engine under maximum load to provide an
 upper bound throughput number.
 
-#### How the Benchmarker Works
+### How the Benchmarker Works
 
 The benchmarker reads a data file where a single line contains
 a complete JSON request entry as specified in [](#preparing-a-dataset).

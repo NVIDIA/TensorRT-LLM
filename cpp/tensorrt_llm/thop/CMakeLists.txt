@@ -27,6 +27,7 @@ add_library(
   fmhaPackMaskOp.cpp
   fp8Op.cpp
   gatherTreeOp.cpp
+  moeOp.cpp
   ncclCommunicatorOp.cpp
   parallelDecodeKVCacheUpdateOp.cpp
   redrafterCurandOp.cpp

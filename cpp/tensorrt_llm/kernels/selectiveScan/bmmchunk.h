@@ -39,7 +39,7 @@ typedef void (*BmmChunkKernelFunc)(int B_, int L_, int H_, int P_, int G_, int N
     //  const void *g_mxSt_, // float B*C*H*N*P
     //  const void *g_mxdc_, // float B*C*H*Q
     //  const void *g_mxdA_, // float B*C*H*Q
-    //  const void *g_mxdt_, // Tp_   B*L*((g_mxZ?2:1)*H*P+2*G+H)
+    //  const void *g_mxdt_, // Tp_   B*L*((g_mxZ?2:1)*H*P+2*G+round_up(H,8))
     //  const void *g_mxdb_, // Wt_       H
     //  const void *g_mxA_,  // Wt_       H
     void* g_mxCB_,      // Tp_   B*C*G*Q*Q
@@ -49,9 +49,8 @@ typedef void (*BmmChunkKernelFunc)(int B_, int L_, int H_, int P_, int G_, int N
     bool removePadding_, int const* lastTokenIdsPtr_);
 
 template <int Q_, int tileM_, int tileN_, int tileK_, // smem size, per sm
-    int wmmaM_, int wmmaN_, int wmmaK_,               // wmma size, per instruction
     int warpM_, int warpN_,                           // warp number
-    int pipeS_, class Tp_>
+    int pipeS_, int pipeR_, int group_, class Tp_>
 __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __nv_bfloat16>> bmm_chunk_kernel(int B_,
     int L_, int H_, int P_, int G_, int N_,
     //  const void *g_mxY_,  // Tp_   B*L*H*P
@@ -60,7 +59,7 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
     //  const void *g_mxSt_, // float B*C*H*N*P
     //  const void *g_mxdc_, // float B*C*H*Q
     //  const void *g_mxdA_, // float B*C*H*Q
-    //  const void *g_mxdt_, // Tp_   B*L*((g_mxZ?2:1)*H*P+2*G+H)
+    //  const void *g_mxdt_, // Tp_   B*L*((g_mxZ?2:1)*H*P+2*G+round_up(H,8))
     //  const void *g_mxdb_, // Wt_       H
     //  const void *g_mxA_,  // Wt_       H
     void* g_mxCB_,      // Tp_   B*C*G*Q*Q
@@ -71,6 +70,10 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     using namespace tensorrt_llm::common;
+
+    constexpr int wmmaM_ = 16; // wmma size, per instruction
+    constexpr int wmmaN_ = 8;
+    constexpr int wmmaK_ = 16;
 
     auto blockIdx_x = Rn<ID>{int(blockIdx.x)};
     auto blockIdx_y = Rn<ID>{int(blockIdx.y)};
@@ -110,9 +113,19 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
     if (blockIdx_y * Q >= L)
         return;
 
-    auto gStart = blockIdx_x / (Q / cn<tileN_>) / (Q / cn<tileM_>);
-    auto mStart = blockIdx_x / (Q / cn<tileN_>) % (Q / cn<tileM_>);
-    auto nStart = blockIdx_x % (Q / cn<tileN_>);
+    int numBlocks_m = G_ * (Q_ / tileM_);
+    int numBlocks_n = Q_ / tileN_;
+
+    int numBlocks_group = numBlocks_n * group_;
+    int blockIdx_0 = blockIdx.x / numBlocks_group * group_;
+    int group_m = std::min(group_, numBlocks_m - blockIdx_0);
+
+    int mStartInt = blockIdx.x % numBlocks_group % group_m + blockIdx_0;
+    int nStartInt = blockIdx.x % numBlocks_group / group_m;
+
+    auto gStart = Rn<ID>{mStartInt} / (Q / cn<tileM_>);
+    auto mStart = Rn<ID>{mStartInt} % (Q / cn<tileM_>);
+    auto nStart = Rn<ID>{nStartInt} % (Q / cn<tileN_>);
 
     //  const Tp_   *g_mxY  = (const Tp_   *)g_mxY_;
     //  const Tp_   *g_mxOs = (const Tp_   *)g_mxOs_;
@@ -142,11 +155,16 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 
     using std::array;
 
-    register array<array<array<float, wmmaM_ * wmmaN_ / 32>, tileN_ / wmmaN_ / warpN_>, tileM_ / wmmaM_ / warpM_>
-        r_mxAcc
+    array<array<array<float, wmmaM_ * wmmaN_ / 32>, tileN_ / wmmaN_ / warpN_>, tileM_ / wmmaM_ / warpM_> r_mxAcc
         = array<array<array<float, wmmaM_ * wmmaN_ / 32>, tileN_ / wmmaN_ / warpN_>, tileM_ / wmmaM_ / warpM_>();
-    register array<array<unsigned, wmmaM_ * wmmaK_ / 64>, tileM_ / wmmaM_ / warpM_> r_mxL;
-    register array<array<unsigned, wmmaK_ * wmmaN_ / 64>, tileN_ / wmmaN_ / warpN_> r_mxR;
+    array<array<array<unsigned, wmmaM_ * wmmaK_ / 64>, tileM_ / wmmaM_ / warpM_>, pipeR_> r_mxL;
+    array<array<array<unsigned, wmmaK_ * wmmaN_ / 64>, tileN_ / wmmaN_ / warpN_>, pipeR_> r_mxR;
+
+    if (pipeR_ == 2)
+    {
+        r_mxL = array<array<array<unsigned, wmmaM_ * wmmaK_ / 64>, tileM_ / wmmaM_ / warpM_>, pipeR_>();
+        r_mxR = array<array<array<unsigned, wmmaK_ * wmmaN_ / 64>, tileN_ / wmmaN_ / warpN_>, pipeR_>();
+    }
 
     constexpr int step = std::max(
         1, tileM_ / wmmaM_ / warpM_ * tileN_ / wmmaN_ / warpN_ / (tileM_ / wmmaM_ / warpM_ + tileN_ / wmmaN_ / warpN_));
@@ -213,7 +231,8 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
                         if (y1 >= 0 && y1 < tileM_ / wmmaM_ / warpM_)
                         {
                             if (wmmaK_ == 16)
-                                ldmatrix_x4<>(r_mxL[y1][0], r_mxL[y1][1], r_mxL[y1][2], r_mxL[y1][3],
+                                ldmatrix_x4<>(r_mxL[k % pipeR_][y1][0], r_mxL[k % pipeR_][y1][1],
+                                    r_mxL[k % pipeR_][y1][2], r_mxL[k % pipeR_][y1][3],
                                     b_mxL + iK % pipeS_ * (tileM_ * tileK_ * 2)
                                         + 2
                                             * swz<tileK_ * 2, tileK_>(y1 * warpM_ * wmmaM_ * tileK_ + k * wmmaK_
@@ -224,7 +243,8 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
                         if (x1 >= 0 && x1 < tileN_ / wmmaN_ / warpN_)
                         {
                             if (wmmaK_ == 16 && x1 % 2 == 0)
-                                ldmatrix_x4<>(r_mxR[x1][0], r_mxR[x1][1], r_mxR[x1 + 1][0], r_mxR[x1 + 1][1],
+                                ldmatrix_x4<>(r_mxR[k % pipeR_][x1][0], r_mxR[k % pipeR_][x1][1],
+                                    r_mxR[k % pipeR_][x1 + 1][0], r_mxR[k % pipeR_][x1 + 1][1],
                                     b_mxR + iK % pipeS_ * (tileK_ * tileN_ * 2)
                                         + 2
                                             * swz<tileK_ * 2, tileK_>(x1 * warpN_ * wmmaN_ * tileK_ + k * wmmaK_
@@ -233,6 +253,12 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
                                                 + threadIdx.x / wmmaK_ * warpN_ * wmmaN_ * tileK_));
                         }
                     }
+
+                    if (pipeR_ == 2)
+                    {
+                        if (wmmaK_ == 16)
+                            mma<Tp_>(r_mxAcc[y][x], r_mxL[(k + 1) % pipeR_][y], r_mxR[(k + 1) % pipeR_][x]);
+                    }
                 }
 
 #pragma unroll
@@ -240,7 +266,11 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 #pragma unroll
                 for (int x = 0; x < tileN_ / wmmaN_ / warpN_; x++)
                 {
-                    mma<Tp_>(r_mxAcc[y][x], r_mxL[y], r_mxR[x]);
+                    if (pipeR_ == 1)
+                    {
+                        if (wmmaK_ == 16)
+                            mma<Tp_>(r_mxAcc[y][x], r_mxL[(k + 1) % pipeR_][y], r_mxR[(k + 1) % pipeR_][x]);
+                    }
                 }
         }
 
@@ -290,6 +320,12 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 #pragma unroll
         for (int x = 0; x < tileN_ / wmmaN_ / warpN_; x++)
         {
+            if (pipeR_ == 2)
+            {
+                if (wmmaK_ == 16)
+                    mma<Tp_>(r_mxAcc[y][x], r_mxL[1][y], r_mxR[1][x]);
+            }
+
             if (std::is_same_v<Tp_, half>)
             {
                 *(half2*) &r_mxAcc[y][x][0] = __floats2half2_rn(r_mxAcc[y][x][0], r_mxAcc[y][x][1]);
@@ -334,9 +370,8 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 }
 
 template <int Q_, int tileM_, int tileN_, int tileK_, // smem size, per sm
-    int wmmaM_, int wmmaN_, int wmmaK_,               // wmma size, per instruction
     int warpM_, int warpN_,                           // warp number
-    int pipeS_, class Tp_>
+    int pipeS_, int pipeR_, int group_, class Tp_>
 __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __nv_bfloat16>> bmm_chunk_hopper(int B_,
     int L_, int H_, int P_, int G_, int N_,
     //  const void *g_mxY_,  // Tp_   B*L*H*P
@@ -345,7 +380,7 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
     //  const void *g_mxSt_, // float B*C*H*N*P
     //  const void *g_mxdc_, // float B*C*H*Q
     //  const void *g_mxdA_, // float B*C*H*Q
-    //  const void *g_mxdt_, // Tp_   B*L*((g_mxZ?2:1)*H*P+2*G+H)
+    //  const void *g_mxdt_, // Tp_   B*L*((g_mxZ?2:1)*H*P+2*G+round_up(H,8))
     //  const void *g_mxdb_, // Wt_       H
     //  const void *g_mxA_,  // Wt_       H
     void* g_mxCB_,      // Tp_   B*C*G*Q*Q
@@ -356,6 +391,10 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900 && defined(__CUDA_ARCH_FEAT_SM90_ALL)
     using namespace tensorrt_llm::common;
+
+    constexpr int wmmaM_ = 16; // wmma size, per instruction
+    constexpr int wmmaN_ = 8;
+    constexpr int wmmaK_ = 16;
 
     auto blockIdx_x = Rn<ID>{int(blockIdx.x)};
     auto blockIdx_y = Rn<ID>{int(blockIdx.y)};
@@ -393,9 +432,19 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
     if (blockIdx_y * Q >= L)
         return;
 
-    auto gStart = blockIdx_x / (Q / cn<tileN_>) / (Q / cn<tileM_>);
-    auto mStart = blockIdx_x / (Q / cn<tileN_>) % (Q / cn<tileM_>);
-    auto nStart = blockIdx_x % (Q / cn<tileN_>);
+    int numBlocks_m = G_ * (Q_ / tileM_);
+    int numBlocks_n = Q_ / tileN_;
+
+    int numBlocks_group = numBlocks_n * group_;
+    int blockIdx_0 = blockIdx.x / numBlocks_group * group_;
+    int group_m = std::min(group_, numBlocks_m - blockIdx_0);
+
+    int mStartInt = blockIdx.x % numBlocks_group % group_m + blockIdx_0;
+    int nStartInt = blockIdx.x % numBlocks_group / group_m;
+
+    auto gStart = Rn<ID>{mStartInt} / (Q / cn<tileM_>);
+    auto mStart = Rn<ID>{mStartInt} % (Q / cn<tileM_>);
+    auto nStart = Rn<ID>{nStartInt} % (Q / cn<tileN_>);
 
     //  const Tp_   *g_mxY  = (const Tp_   *)g_mxY_;
     //  const Tp_   *g_mxOs = (const Tp_   *)g_mxOs_;
@@ -442,8 +491,7 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 
     using std::array;
 
-    register array<array<array<float, wmmaM_ * wmmaN_ / 32>, tileN_ / wmmaN_ / warpN_>, tileM_ / wmmaM_ / warpM_>
-        r_mxAcc
+    array<array<array<float, wmmaM_ * wmmaN_ / 32>, tileN_ / wmmaN_ / warpN_>, tileM_ / wmmaM_ / warpM_> r_mxAcc
         = array<array<array<float, wmmaM_ * wmmaN_ / 32>, tileN_ / wmmaN_ / warpN_>, tileM_ / wmmaM_ / warpM_>();
 
     auto thread = [=](auto iStep)
@@ -623,7 +671,8 @@ BmmChunkKernelFunc getBmmChunkKernel(int B_, int L_, int H_, int P_, int G_, int
 
     int64_t compute = int64_t(numTokens_) * G * Q * Q * N;
 
-    auto setLaunchParams = [&](int tileM, int tileN, int tileK, int warpM, int warpN, int pipeS, int useTma)
+    auto set
+        = [&](int tileM, int tileN, int tileK, int warpM, int warpN, int pipeS, int useTma, BmmChunkKernelFunc func)
     {
         auto sharedMem = useTma * 1024 + std::max((tileM * tileK + tileK * tileN) * pipeS * 2, (tileM * tileN) * 2);
 
@@ -657,124 +706,152 @@ BmmChunkKernelFunc getBmmChunkKernel(int B_, int L_, int H_, int P_, int G_, int
                     CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
             }
         }
+
+        return func;
     };
 
-    if (isHopper_)
+    if (isHopper_) // Hopper kernel
     {
-        if (Q_ == 256)
+#ifndef FAST_BUILD
+        if (Q_ == 256 && N_ >= 256)
         {
-            if (compute >= (1LL << 41))
-                setLaunchParams(128, 128, 64, 4, 1, 2, 1);
-            else if (compute >= (1LL << 39))
-                setLaunchParams(256, 64, 32, 4, 1, 2, 1);
-            else if (compute >= (1LL << 35))
-                setLaunchParams(64, 128, 32, 1, 4, 2, 0);
+            if (compute >= (1LL << 38))
+                return set(128, 128, 64, 4, 1, 2, 1, bmm_chunk_hopper<256, 128, 128, 64, 4, 1, 2, 0, 2, Tp_>);
+            else if (compute >= (1LL << 37))
+                return set(64, 128, 64, 4, 1, 2, 1, bmm_chunk_hopper<256, 64, 128, 64, 4, 1, 2, 0, 8, Tp_>);
             else if (compute >= (1LL << 0))
-                setLaunchParams(64, 64, 32, 1, 2, 2, 0);
+                return set(64, 64, 64, 2, 2, 2, 0, bmm_chunk_kernel<256, 64, 64, 64, 2, 2, 2, 2, 2, Tp_>);
+        }
 
-            if (compute >= (1LL << 41))
-                return bmm_chunk_hopper<256, 128, 128, 64, 16, 8, 16, 4, 1, 2, Tp_>;
-            else if (compute >= (1LL << 39))
-                return bmm_chunk_hopper<256, 256, 64, 32, 16, 8, 16, 4, 1, 2, Tp_>;
-            else if (compute >= (1LL << 35))
-                return bmm_chunk_kernel<256, 64, 128, 32, 16, 8, 16, 1, 4, 2, Tp_>;
+        if (Q_ == 256 && N_ >= 128)
+        {
+            if (compute >= (1LL << 37))
+                return set(128, 128, 64, 4, 1, 2, 1, bmm_chunk_hopper<256, 128, 128, 64, 4, 1, 2, 0, 2, Tp_>);
             else if (compute >= (1LL << 0))
-                return bmm_chunk_kernel<256, 64, 64, 32, 16, 8, 16, 1, 2, 2, Tp_>;
+                return set(64, 64, 64, 2, 2, 2, 0, bmm_chunk_kernel<256, 64, 64, 64, 2, 2, 2, 2, 1, Tp_>);
+        }
+
+#endif
+        if (Q_ == 256 && N_ >= 64)
+        {
+            if (compute >= (1LL << 38))
+                return set(64, 256, 32, 4, 1, 2, 1, bmm_chunk_hopper<256, 64, 256, 32, 4, 1, 2, 0, 1, Tp_>);
+            else if (compute >= (1LL << 37))
+                return set(64, 128, 32, 4, 1, 2, 1, bmm_chunk_hopper<256, 64, 128, 32, 4, 1, 2, 0, 4, Tp_>);
+            else if (compute >= (1LL << 36))
+                return set(64, 128, 32, 4, 1, 2, 1, bmm_chunk_hopper<256, 64, 128, 32, 4, 1, 2, 0, 1, Tp_>);
+            else if (compute >= (1LL << 35))
+                return set(128, 64, 32, 2, 2, 2, 0, bmm_chunk_kernel<256, 128, 64, 32, 2, 2, 2, 2, 4, Tp_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 64, 32, 2, 2, 2, 0, bmm_chunk_kernel<256, 64, 64, 32, 2, 2, 2, 2, 1, Tp_>);
         }
 
 #ifndef FAST_BUILD
-        if (Q_ == 128)
+        if (Q_ == 128 && N_ >= 256)
         {
             if (compute >= (1LL << 39))
-                setLaunchParams(64, 128, 64, 1, 4, 2, 0);
+                return set(128, 128, 64, 8, 1, 2, 1, bmm_chunk_hopper<128, 128, 128, 64, 8, 1, 2, 0, 1, Tp_>);
+            else if (compute >= (1LL << 37))
+                return set(64, 128, 64, 4, 1, 2, 1, bmm_chunk_hopper<128, 64, 128, 64, 4, 1, 2, 0, 1, Tp_>);
+            else if (compute >= (1LL << 36))
+                return set(64, 128, 64, 4, 1, 2, 1, bmm_chunk_hopper<128, 64, 128, 64, 4, 1, 2, 0, 8, Tp_>);
             else if (compute >= (1LL << 35))
-                setLaunchParams(64, 128, 32, 1, 4, 2, 0);
+                return set(64, 128, 64, 4, 2, 2, 1, bmm_chunk_hopper<128, 64, 128, 64, 4, 2, 2, 0, 1, Tp_>);
             else if (compute >= (1LL << 0))
-                setLaunchParams(64, 64, 32, 1, 2, 2, 0);
-
-            if (compute >= (1LL << 39))
-                return bmm_chunk_kernel<128, 64, 128, 64, 16, 8, 16, 1, 4, 2, Tp_>;
-            else if (compute >= (1LL << 35))
-                return bmm_chunk_kernel<128, 64, 128, 32, 16, 8, 16, 1, 4, 2, Tp_>;
-            else if (compute >= (1LL << 0))
-                return bmm_chunk_kernel<128, 64, 64, 32, 16, 8, 16, 1, 2, 2, Tp_>;
+                return set(64, 64, 64, 2, 2, 2, 0, bmm_chunk_kernel<128, 64, 64, 64, 2, 2, 2, 1, 8, Tp_>);
         }
 
-        if (Q_ == 64)
+        if (Q_ == 128 && N_ >= 128)
         {
-            if (compute >= (1LL << 37))
-                setLaunchParams(64, 64, 64, 2, 4, 2, 0);
+            if (compute >= (1LL << 39))
+                return set(128, 128, 64, 8, 1, 2, 1, bmm_chunk_hopper<128, 128, 128, 64, 8, 1, 2, 0, 1, Tp_>);
+            else if (compute >= (1LL << 37))
+                return set(64, 128, 64, 4, 1, 2, 1, bmm_chunk_hopper<128, 64, 128, 64, 4, 1, 2, 0, 1, Tp_>);
             else if (compute >= (1LL << 35))
-                setLaunchParams(64, 64, 32, 4, 2, 2, 0);
+                return set(64, 128, 64, 4, 1, 2, 1, bmm_chunk_hopper<128, 64, 128, 64, 4, 1, 2, 0, 8, Tp_>);
             else if (compute >= (1LL << 0))
-                setLaunchParams(64, 64, 32, 1, 2, 2, 0);
-
-            if (compute >= (1LL << 37))
-                return bmm_chunk_kernel<64, 64, 64, 64, 16, 8, 16, 2, 4, 2, Tp_>;
-            else if (compute >= (1LL << 35))
-                return bmm_chunk_kernel<64, 64, 64, 32, 16, 8, 16, 4, 2, 2, Tp_>;
-            else if (compute >= (1LL << 0))
-                return bmm_chunk_kernel<64, 64, 64, 32, 16, 8, 16, 1, 2, 2, Tp_>;
+                return set(64, 64, 64, 2, 2, 2, 0, bmm_chunk_kernel<128, 64, 64, 64, 2, 2, 2, 2, 1, Tp_>);
         }
+
+        if (Q_ == 128 && N_ >= 64)
+        {
+            if (compute >= (1LL << 35))
+                return set(64, 128, 32, 4, 1, 2, 1, bmm_chunk_hopper<128, 64, 128, 32, 4, 1, 2, 0, 1, Tp_>);
+            else if (compute >= (1LL << 34))
+                return set(64, 64, 32, 4, 1, 2, 1, bmm_chunk_hopper<128, 64, 64, 32, 4, 1, 2, 0, 2, Tp_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 64, 32, 2, 2, 2, 0, bmm_chunk_kernel<128, 64, 64, 32, 2, 2, 2, 2, 1, Tp_>);
+        }
+
 #endif
     }
-    else
+    else // non Hopper kernel
     {
-        if (Q_ == 256)
+#ifndef FAST_BUILD
+        if (Q_ == 256 && N_ >= 256)
         {
-            if (compute >= (1LL << 41))
-                setLaunchParams(256, 64, 64, 4, 1, 2, 0);
-            else if (compute >= (1LL << 35))
-                setLaunchParams(128, 64, 32, 2, 2, 2, 0);
+            if (compute >= (1LL << 40))
+                return set(128, 128, 64, 2, 2, 2, 0, bmm_chunk_kernel<256, 128, 128, 64, 2, 2, 2, 1, 2, Tp_>);
+            else if (compute >= (1LL << 38))
+                return set(128, 128, 64, 2, 4, 2, 0, bmm_chunk_kernel<256, 128, 128, 64, 2, 4, 2, 1, 4, Tp_>);
+            else if (compute >= (1LL << 36))
+                return set(64, 64, 64, 2, 2, 2, 0, bmm_chunk_kernel<256, 64, 64, 64, 2, 2, 2, 2, 1, Tp_>);
             else if (compute >= (1LL << 0))
-                setLaunchParams(64, 64, 32, 1, 2, 2, 0);
+                return set(64, 64, 64, 2, 2, 3, 0, bmm_chunk_kernel<256, 64, 64, 64, 2, 2, 3, 2, 4, Tp_>);
+        }
 
-            if (compute >= (1LL << 41))
-                return bmm_chunk_kernel<256, 256, 64, 64, 16, 8, 16, 4, 1, 2, Tp_>;
-            else if (compute >= (1LL << 35))
-                return bmm_chunk_kernel<256, 128, 64, 32, 16, 8, 16, 2, 2, 2, Tp_>;
+        if (Q_ == 256 && N_ >= 128)
+        {
+            if (compute >= (1LL << 39))
+                return set(128, 128, 64, 2, 2, 2, 0, bmm_chunk_kernel<256, 128, 128, 64, 2, 2, 2, 1, 2, Tp_>);
+            else if (compute >= (1LL << 37))
+                return set(128, 64, 64, 2, 2, 2, 0, bmm_chunk_kernel<256, 128, 64, 64, 2, 2, 2, 2, 2, Tp_>);
             else if (compute >= (1LL << 0))
-                return bmm_chunk_kernel<256, 64, 64, 32, 16, 8, 16, 1, 2, 2, Tp_>;
+                return set(64, 64, 64, 2, 2, 2, 0, bmm_chunk_kernel<256, 64, 64, 64, 2, 2, 2, 2, 1, Tp_>);
+        }
+
+#endif
+        if (Q_ == 256 && N_ >= 64)
+        {
+            if (compute >= (1LL << 37))
+                return set(128, 128, 32, 2, 2, 2, 0, bmm_chunk_kernel<256, 128, 128, 32, 2, 2, 2, 2, 8, Tp_>);
+            else if (compute >= (1LL << 34))
+                return set(128, 64, 32, 2, 2, 2, 0, bmm_chunk_kernel<256, 128, 64, 32, 2, 2, 2, 2, 1, Tp_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 64, 32, 2, 2, 2, 0, bmm_chunk_kernel<256, 64, 64, 32, 2, 2, 2, 2, 8, Tp_>);
         }
 
 #ifndef FAST_BUILD
-        if (Q_ == 128)
+        if (Q_ == 128 && N_ >= 256)
         {
             if (compute >= (1LL << 39))
-                setLaunchParams(128, 128, 64, 2, 2, 2, 0);
-            else if (compute >= (1LL << 37))
-                setLaunchParams(64, 64, 32, 2, 2, 2, 0);
-            else if (compute >= (1LL << 33))
-                setLaunchParams(128, 64, 32, 2, 2, 2, 0);
+                return set(128, 128, 64, 2, 2, 2, 0, bmm_chunk_kernel<128, 128, 128, 64, 2, 2, 2, 1, 1, Tp_>);
+            else if (compute >= (1LL << 36))
+                return set(64, 128, 64, 1, 4, 2, 0, bmm_chunk_kernel<128, 64, 128, 64, 1, 4, 2, 1, 1, Tp_>);
+            else if (compute >= (1LL << 35))
+                return set(64, 64, 64, 2, 2, 2, 0, bmm_chunk_kernel<128, 64, 64, 64, 2, 2, 2, 2, 1, Tp_>);
             else if (compute >= (1LL << 0))
-                setLaunchParams(64, 64, 32, 2, 2, 2, 0);
-
-            if (compute >= (1LL << 39))
-                return bmm_chunk_kernel<128, 128, 128, 64, 16, 8, 16, 2, 2, 2, Tp_>;
-            else if (compute >= (1LL << 37))
-                return bmm_chunk_kernel<128, 64, 64, 32, 16, 8, 16, 2, 2, 2, Tp_>;
-            else if (compute >= (1LL << 33))
-                return bmm_chunk_kernel<128, 128, 64, 32, 16, 8, 16, 2, 2, 2, Tp_>;
-            else if (compute >= (1LL << 0))
-                return bmm_chunk_kernel<128, 64, 64, 32, 16, 8, 16, 2, 2, 2, Tp_>;
+                return set(64, 64, 64, 2, 2, 4, 0, bmm_chunk_kernel<128, 64, 64, 64, 2, 2, 4, 2, 8, Tp_>);
         }
 
-        if (Q_ == 64)
+        if (Q_ == 128 && N_ >= 128)
+        {
+            if (compute >= (1LL << 36))
+                return set(128, 128, 64, 4, 2, 2, 0, bmm_chunk_kernel<128, 128, 128, 64, 4, 2, 2, 1, 1, Tp_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 64, 64, 2, 2, 2, 0, bmm_chunk_kernel<128, 64, 64, 64, 2, 2, 2, 2, 1, Tp_>);
+        }
+
+        if (Q_ == 128 && N_ >= 64)
         {
             if (compute >= (1LL << 37))
-                setLaunchParams(64, 64, 64, 2, 2, 2, 0);
-            else if (compute >= (1LL << 35))
-                setLaunchParams(64, 64, 32, 2, 4, 2, 0);
+                return set(64, 128, 32, 1, 4, 2, 0, bmm_chunk_kernel<128, 64, 128, 32, 1, 4, 2, 2, 1, Tp_>);
+            else if (compute >= (1LL << 34))
+                return set(128, 128, 32, 2, 2, 2, 0, bmm_chunk_kernel<128, 128, 128, 32, 2, 2, 2, 2, 1, Tp_>);
             else if (compute >= (1LL << 0))
-                setLaunchParams(64, 64, 32, 2, 2, 2, 0);
-
-            if (compute >= (1LL << 37))
-                return bmm_chunk_kernel<64, 64, 64, 64, 16, 8, 16, 2, 2, 2, Tp_>;
-            else if (compute >= (1LL << 35))
-                return bmm_chunk_kernel<64, 64, 64, 32, 16, 8, 16, 2, 4, 2, Tp_>;
-            else if (compute >= (1LL << 0))
-                return bmm_chunk_kernel<64, 64, 64, 32, 16, 8, 16, 2, 2, 2, Tp_>;
+                return set(64, 64, 32, 2, 2, 2, 0, bmm_chunk_kernel<128, 64, 64, 32, 2, 2, 2, 2, 8, Tp_>);
         }
+
 #endif
     }
 

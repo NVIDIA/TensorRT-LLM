@@ -271,10 +271,7 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_fp8 \
 ```
 
 #### INT4-GPTQ
-You may find the official GPTQ quantized INT4 weights of Qwen-7B-Chat here: [Qwen-7B-Chat-Int4](https://huggingface.co/Qwen/Qwen-7B-Chat-Int4). And you need to first install auto-gptq:
-```bash
-pip install auto-gptq
-```
+You may find the official GPTQ quantized INT4 weights of Qwen-7B-Chat here: [Qwen-7B-Chat-Int4](https://huggingface.co/Qwen/Qwen-7B-Chat-Int4).
 
 Example of building engine for INT4 GPTQ quantized Qwen model:
 ```bash
@@ -283,7 +280,7 @@ python3 convert_checkpoint.py --model_dir ./tmp/Qwen-7B-Chat-Int4 \
                               --dtype float16 \
                               --use_weight_only \
                               --weight_only_precision int4_gptq \
-                              --per_group \
+                              --per_group
 
 trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_gptq \
                 --output_dir ./tmp/Qwen/7B/trt_engines/int4_GPTQ/1-gpu/ \
@@ -304,6 +301,13 @@ To run the AWQ Qwen example, the following steps are required:
                                        --awq_block_size 128 \
                                        --output_dir ./quantized_int4-awq \
                                        --calib_size 32
+    ```
+    HF checkpoints generated with [AutoAWQ](https://github.com/casper-hansen/AutoAWQ) are also supported through the following conversion script:
+
+    ```bash
+    # Convert AutoAWQ HF checkpoints into TRT-LLM checkpoint
+    python convert_checkpoint.py --model_dir ./tmp/Qwen2-7B-Instruct-AWQ \
+                                 --output_dir ./quantized_int4-awq
     ```
 
 2. Build TRT-LLM engine:

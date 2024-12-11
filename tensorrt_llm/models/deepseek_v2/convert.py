@@ -230,8 +230,7 @@ def convert_deepseekv2(hf_model,
                        mapping,
                        dtype='float32',
                        use_parallel_embedding=False,
-                       sharding_dim=0,
-                       share_embedding_table=False):
+                       sharding_dim=0):
 
     weights = {}
     tik = time.time()

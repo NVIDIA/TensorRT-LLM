@@ -465,10 +465,9 @@ class ModelRunnerMixin:
             task_vocab_size = torch.tensor([task_vocab_size], dtype=torch.int32)
             prompt_table_data = prompt_table_data.view(-1, hidden_size)
         else:
-            prompt_table_data = torch.empty([1, self.hidden_size],
-                                            dtype=self.dtype)
+            prompt_table_data = torch.empty(
+                [1, self.hidden_size * self.mapping.tp_size], dtype=self.dtype)
             task_vocab_size = torch.zeros([1], dtype=torch.int32)
-
         if tasks is not None:
             tasks = torch.tensor([int(t) for t in tasks.split(',')],
                                  dtype=torch.int32)
@@ -532,6 +531,7 @@ class ModelRunner(ModelRunnerMixin):
         self.lora_manager = lora_manager
         self.kv_cache_type = kv_cache_type
         self.enable_context_fmha_fp32_acc = False
+        self.multi_block_mode = True
 
     @classmethod
     def from_engine(
@@ -547,6 +547,7 @@ class ModelRunner(ModelRunnerMixin):
         stream: torch.cuda.Stream,
         gpu_weights_percent: float,
         enable_context_fmha_fp32_acc: Optional[bool],
+        multi_block_mode: Optional[bool],
     ) -> 'ModelRunner':
         model_config = _engine_config_to_model_config(
             engine.config, gpu_weights_percent=gpu_weights_percent)
@@ -605,6 +606,7 @@ class ModelRunner(ModelRunnerMixin):
                      kv_cache_type=model_config.kv_cache_type,
                      lora_manager=lora_manager)
         runner.enable_context_fmha_fp32_acc = enable_context_fmha_fp32_acc
+        runner.multi_block_mode = multi_block_mode
         return runner
 
     @classmethod
@@ -621,6 +623,7 @@ class ModelRunner(ModelRunnerMixin):
         stream: torch.cuda.Stream = None,
         gpu_weights_percent: float = 1,
         enable_context_fmha_fp32_acc: Optional[bool] = None,
+        multi_block_mode: Optional[bool] = None,
     ) -> 'ModelRunner':
         """
         Create a ModelRunner instance from an engine directory.
@@ -640,6 +643,8 @@ class ModelRunner(ModelRunnerMixin):
                 Medusa choices to use when in Medusa decoding
             stream (torch.cuda.Stream):
                 Stream to use.
+            multi_block_mode (bool):
+                Whether to distribute the work across multiple CUDA thread-blocks on the GPU for masked MHA kernel.
         Returns:
             ModelRunner: An instance of ModelRunner.
         """
@@ -714,6 +719,7 @@ class ModelRunner(ModelRunnerMixin):
                          kv_cache_type=KVCacheType.CONTINUOUS,
                          lora_manager=lora_manager)
             runner.enable_context_fmha_fp32_acc = enable_context_fmha_fp32_acc
+            runner.multi_block_mode = multi_block_mode
             return runner
         else:
             # the new engine format
@@ -736,7 +742,9 @@ class ModelRunner(ModelRunnerMixin):
                 medusa_choices=medusa_choices,
                 stream=stream,
                 gpu_weights_percent=gpu_weights_percent,
-                enable_context_fmha_fp32_acc=enable_context_fmha_fp32_acc)
+                enable_context_fmha_fp32_acc=enable_context_fmha_fp32_acc,
+                multi_block_mode=multi_block_mode,
+            )
             profiler.stop('load tensorrt_llm engine')
             loading_time = profiler.elapsed_time_in_sec(
                 "load tensorrt_llm engine")
@@ -915,6 +923,7 @@ class ModelRunner(ModelRunnerMixin):
             lora_uids=lora_uids,
             medusa_choices=medusa_choices,
             enable_context_fmha_fp32_acc=self.enable_context_fmha_fp32_acc,
+            multi_block_mode=self.multi_block_mode,
             encoder_max_input_length=encoder_max_input_length,
         )
 

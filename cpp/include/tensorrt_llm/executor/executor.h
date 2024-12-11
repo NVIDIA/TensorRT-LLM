@@ -309,10 +309,10 @@ struct LookaheadDecodingConfig
     [[nodiscard]] SizeType32 getVerificationSetSize() const;
 
     /// @brief return <maxDecodingTokens, maxPathLen, maxDraftTokens, maxDraftPathLen>
-    std::tuple<SizeType32, SizeType32, SizeType32, SizeType32> calculateSpeculativeResource() const;
+    [[nodiscard]] std::tuple<SizeType32, SizeType32, SizeType32, SizeType32> calculateSpeculativeResource() const;
 
     /// @brief return true when `this` can be executed on resources defined by `that`
-    bool isLE(LookaheadDecodingConfig const& that) const;
+    [[nodiscard]] bool isLE(LookaheadDecodingConfig const& that) const;
 
     /// @brief return true when the parameter combination is valid.
     static bool isLegal(SizeType32 windowSize, SizeType32 ngramSize, SizeType32 verificationSetSize) noexcept;
@@ -575,6 +575,9 @@ public:
     /// @param eagleConfig The EAGLE speculative decoding configuration
     /// @param skipCrossAttnBlocks Skip the cross attention transformer blocks or not.
     /// @param guidedDecodingParams The guided decoding parameters.
+    /// @param allottedTimeMs The allotted time in milliseconds after which the request is finished with a timedOut
+    /// finish reason. The request always will exceed this time slightly, but at most with 1 forward pass. A request can
+    /// be timed-out before ever being scheduled.
     Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming = false,
         SamplingConfig const& samplingConfig = SamplingConfig(), OutputConfig const& outputConfig = OutputConfig(),
         std::optional<SizeType32> const& endId = std::nullopt, std::optional<SizeType32> const& padId = std::nullopt,
@@ -596,7 +599,8 @@ public:
         std::optional<SizeType32> encoderOutputLength = std::nullopt,
         std::optional<Tensor> crossAttentionMask = std::nullopt, SizeType32 numReturnSequences = 1,
         std::optional<EagleConfig> eagleConfig = std::nullopt, std::optional<Tensor> skipCrossAttnBlocks = std::nullopt,
-        std::optional<GuidedDecodingParams> guidedDecodingParams = std::nullopt);
+        std::optional<GuidedDecodingParams> guidedDecodingParams = std::nullopt,
+        std::optional<MillisecondsType> allottedTimeMs = std::nullopt);
 
     /// @brief This logits postprocessor name will dispatch to the batched logits postprocessor
     static auto constexpr kBatchedPostProcessorName = "batched";
@@ -639,6 +643,7 @@ public:
     [[nodiscard]] std::optional<EagleConfig> getEagleConfig() const;
     [[nodiscard]] std::optional<Tensor> getSkipCrossAttnBlocks() const;
     [[nodiscard]] std::optional<GuidedDecodingParams> getGuidedDecodingParams() const;
+    [[nodiscard]] std::optional<MillisecondsType> getAllottedTimeMs() const;
 
     void setStreaming(bool streaming);
     void setSamplingConfig(SamplingConfig const& config);
@@ -669,6 +674,7 @@ public:
     void setEagleConfig(std::optional<EagleConfig> const& eagleConfig);
     void setSkipCrossAttnBlocks(Tensor skipCrossAttnBlocks);
     void setGuidedDecodingParams(GuidedDecodingParams const& guidedDecodingParams);
+    void setAllottedTimeMs(MillisecondsType allottedTimeMs);
 
 private:
     friend class Serialization;
@@ -1011,10 +1017,6 @@ private:
     SizeType32 mDebugTensorsMaxIterations;
 };
 
-SizeType32 const kDefaultIterStatsMaxIterations = 1000;
-// Per request stats may have additional overhead due to going through all requests. Turned off by default.
-SizeType32 const kDefaultRequestStatsMaxIterations = 0;
-
 class OrchestratorConfig
 {
 public:
@@ -1090,10 +1092,17 @@ private:
 class PeftCacheConfig
 {
 public:
+    static constexpr SizeType32 kDefaultOptimalAdapterSize = 8;
+    static constexpr SizeType32 kDefaultMaxAdapterSize = 64;
+    static constexpr SizeType32 kDefaultMaxPagesPerBlockHost = 24;
+    static constexpr SizeType32 kDefaultMaxPagesPerBlockDevice = 8;
+
     explicit PeftCacheConfig(SizeType32 numHostModuleLayer = 0, SizeType32 numDeviceModuleLayer = 0,
-        SizeType32 optimalAdapterSize = 8, SizeType32 maxAdapterSize = 64, SizeType32 numPutWorkers = 1,
-        SizeType32 numEnsureWorkers = 1, SizeType32 numCopyStreams = 1, SizeType32 maxPagesPerBlockHost = 24,
-        SizeType32 maxPagesPerBlockDevice = 8, std::optional<float> const& deviceCachePercent = std::nullopt,
+        SizeType32 optimalAdapterSize = kDefaultOptimalAdapterSize, SizeType32 maxAdapterSize = kDefaultMaxAdapterSize,
+        SizeType32 numPutWorkers = 1, SizeType32 numEnsureWorkers = 1, SizeType32 numCopyStreams = 1,
+        SizeType32 maxPagesPerBlockHost = kDefaultMaxPagesPerBlockHost,
+        SizeType32 maxPagesPerBlockDevice = kDefaultMaxPagesPerBlockDevice,
+        std::optional<float> const& deviceCachePercent = std::nullopt,
         std::optional<size_t> const& hostCacheSize = std::nullopt);
 
     bool operator==(PeftCacheConfig const& other) const;
@@ -1259,9 +1268,16 @@ private:
 class ExecutorConfig
 {
 public:
-    explicit ExecutorConfig(SizeType32 maxBeamWidth = 1, SchedulerConfig const& schedulerConfig = SchedulerConfig(),
-        KvCacheConfig const& kvCacheConfig = KvCacheConfig(), bool enableChunkedContext = false,
-        bool normalizeLogProbs = true, SizeType32 iterStatsMaxIterations = kDefaultIterStatsMaxIterations,
+    static constexpr uint64_t kDefaultMaxSeqIdleMicroseconds = 180000000;
+
+    static constexpr SizeType32 kDefaultIterStatsMaxIterations = 1000;
+
+    // Per request stats may have additional overhead due to going through all requests. Turned off by default.
+    static constexpr SizeType32 kDefaultRequestStatsMaxIterations = 0;
+
+    explicit ExecutorConfig(SizeType32 maxBeamWidth = 1, SchedulerConfig schedulerConfig = SchedulerConfig(),
+        KvCacheConfig kvCacheConfig = KvCacheConfig(), bool enableChunkedContext = true, bool normalizeLogProbs = true,
+        SizeType32 iterStatsMaxIterations = kDefaultIterStatsMaxIterations,
         SizeType32 requestStatsMaxIterations = kDefaultRequestStatsMaxIterations,
         BatchingType batchingType = BatchingType::kINFLIGHT, std::optional<SizeType32> maxBatchSize = std::nullopt,
         std::optional<SizeType32> maxNumTokens = std::nullopt,
@@ -1272,7 +1288,7 @@ public:
         std::optional<SizeType32> maxQueueSize = std::nullopt,
         ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig = ExtendedRuntimePerfKnobConfig(),
         std::optional<DebugConfig> debugConfig = std::nullopt, SizeType32 recvPollPeriodMs = 0,
-        uint64_t maxSeqIdleMicroseconds = 180000000,
+        uint64_t maxSeqIdleMicroseconds = kDefaultMaxSeqIdleMicroseconds,
         std::optional<SpeculativeDecodingConfig> specDecConfig = std::nullopt,
         std::optional<GuidedDecodingConfig> guidedDecodingConfig = std::nullopt);
 
@@ -1406,10 +1422,10 @@ struct KVCacheCreatedData
 struct KVCacheStoredBlockData
 {
 
-    KVCacheStoredBlockData(IdType blockHash, tensorrt_llm::runtime::VecUniqueTokens const& tokens,
+    KVCacheStoredBlockData(IdType blockHash, tensorrt_llm::runtime::VecUniqueTokens tokens,
         tensorrt_llm::runtime::LoraTaskIdType loraId, SizeType32 cacheLevel, SizeType32 priority)
         : blockHash{blockHash}
-        , tokens{tokens}
+        , tokens{std::move(tokens)}
         , loraId{loraId}
         , cacheLevel{cacheLevel}
         , priority{priority}
@@ -1533,6 +1549,10 @@ public:
         std::shared_ptr<Model> encoderModel, std::shared_ptr<Model> decoderModel, ExecutorConfig const& executorConfig);
 
     ~Executor();
+    Executor(Executor const& executor) = delete;
+    Executor& operator=(Executor const& executor) = delete;
+    Executor(Executor&&) = default;
+    Executor& operator=(Executor&&) = default;
 
     /// @brief Enqueue a new request
     /// @param request The LLM request which contains input tokens and request parameters

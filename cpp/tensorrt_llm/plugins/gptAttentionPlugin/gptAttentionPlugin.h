@@ -75,18 +75,20 @@ namespace tensorrt_llm::plugins
 //                                    packed_mask_dim = divUp(max_num_spec_decoding_tokens + 1, 32)
 //     22. spec_decoding_position_offsets (optional, required when medusa is enabled) (int32_t) [batch_size,
 //     max_num_spec_decoding_tokens + 1]
-//     23. host_runtime_perf_knobs (int64)
-//     24. host_context_progress (void*)
-//     25. position_id_tensor(MLA) [total_tokens], used for rope embedding in MLA
-//     26. q_a_proj_tensor(MLA) [hidden_dim, c_q_dim + c_k_dim + ropd_dim], used to proj compacted QKV
-//     27. q_a_layernorm_tensor(MLA) [c_q_dim], rmsnorm weight for compacted q
-//     28. q_b_proj_tensor(MLA) [c_q_dim, head_num * head_size], weight for companted q to q in context
-//     29. kv_a_proj_with_mqa_tensor(MLA) [c_q_dim, head_num * (c_k_dim + rope_dim)], weight for companted q to kdim in
+//     23. long_rope_rotary_inv_freq [head / 2] (float) (on device, optional)
+//     24. long_rope_rotary_cos_sin [max_num_embedding_positions, 2] (float) (on device, optional)
+//     25. host_runtime_perf_knobs (int64)
+//     26. host_context_progress (void*)
+//     27. position_id_tensor(MLA) [total_tokens], used for rope embedding in MLA
+//     28. q_a_proj_tensor(MLA) [hidden_dim, c_q_dim + c_k_dim + ropd_dim], used to proj compacted QKV
+//     29. q_a_layernorm_tensor(MLA) [c_q_dim], rmsnorm weight for compacted q
+//     30. q_b_proj_tensor(MLA) [c_q_dim, head_num * head_size], weight for companted q to q in context
+//     31. kv_a_proj_with_mqa_tensor(MLA) [c_q_dim, head_num * (c_k_dim + rope_dim)], weight for companted q to kdim in
 //     generation
-//     30. kv_a_layernorm_tensor(MLA) [c_k_dim], rmsnorm weight for compacted kv
-//     31. kv_b_proj_tensor(MLA) [c_k_dim, head_num * 2 * (head_size - rope_dim)], weight for compacted kv to kv in
+//     32. kv_a_layernorm_tensor(MLA) [c_k_dim], rmsnorm weight for compacted kv
+//     33. kv_b_proj_tensor(MLA) [c_k_dim, head_num * 2 * (head_size - rope_dim)], weight for compacted kv to kv in
 //     context
-//     32. skip_attn (optional, bool) [1]: If it is set as true, skip the atteniton plugin and return
+//     34. skip_attn (optional, bool) [1]: If it is set as true, skip the atteniton plugin and return
 //     directly.
 //
 // outputs
@@ -104,8 +106,9 @@ public:
         float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
         float rotary_embedding_scale, float rotary_embedding_short_m_scale, float rotary_embedding_long_m_scale,
         int rotary_embedding_max_positions, int rotary_embedding_original_max_positions, int tp_size,
-        int tp_rank,          // for ALiBi
-        bool unfuse_qkv_gemm, // for AutoPP
+        int tp_rank,           // for ALiBi
+        bool unfuse_qkv_gemm,  // for AutoPP
+        bool use_logn_scaling, // for LognScaling
         tensorrt_llm::kernels::ContextFMHAType context_fmha_type, int kv_cache_quant_mode, bool remove_input_padding,
         tensorrt_llm::kernels::AttentionMaskType mask_type,
         tensorrt_llm::kernels::BlockSparseParams block_sparse_params, bool paged_kv_cache, int tokens_per_block,
@@ -215,6 +218,8 @@ private:
         SPEC_DECODING_GENERATION_LENGTHS,
         SPEC_DECODING_PACKED_MASK,
         SPEC_DECODING_POSITION_OFFSETS,
+        LONG_ROPE_ROTARY_INV_FREQ,
+        LONG_ROPE_ROTARY_COS_SIN,
         MROPE_ROTARY_SIN_COS,
         MROPE_POSITION_DELTAS,
         HOST_RUNTIME_PERF_KNOBS,
@@ -223,6 +228,7 @@ private:
         MLA_Q_B_PROJ_TENSOR,
         MLA_KV_B_PROJ_TENSOR,
         SKIP_ATTN,
+        LOGN_SCALING,
         ENUM_SIZE, // Used to count the number of IdxEntry, must put in last
     };
 

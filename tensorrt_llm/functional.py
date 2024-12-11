@@ -4384,11 +4384,13 @@ class RopeEmbeddingUtils:
                 concat = np.expand_dims(concat, axis=0)
 
             mscale = short_mscale if is_short else long_mscale
+            concat = concat.astype(dtype) * mscale
+
             # gpt attention plugins also need inv_freq.
             if for_attention_plugin:
-                return inv_freq, concat.astype(dtype) * mscale
+                return inv_freq.reshape(1, -1), concat.reshape(1, -1)
             else:
-                return concat.astype(dtype) * mscale
+                return concat
 
         return _compute_sinusoidal_positions(
             scaling_short_factors, True, False), _compute_sinusoidal_positions(
@@ -4804,6 +4806,7 @@ def gpt_attention(
     cross_kv_length: Optional[Tensor] = None,  # for cross attention
     encoder_input_lengths: Optional[Tensor] = None,  # for cross attention
     relative_attention_bias: Optional[Tensor] = None,  # for relative attention
+    logn_scaling: Optional[Tensor] = None,  # for logn scaling
     max_distance: int = 0,  # for relative attention
     host_context_lengths: Optional[Tensor] = None,  # for pad-free input mode
     qkv_bias: Optional[Tensor] = None,
@@ -4813,6 +4816,8 @@ def gpt_attention(
     spec_decoding_generation_lengths: Tensor = None,
     spec_decoding_position_offsets: Tensor = None,
     spec_decoding_packed_mask: Tensor = None,
+    long_rope_rotary_inv_freq: Optional[Tensor] = None,
+    long_rope_rotary_cos_sin: Optional[Tensor] = None,
     mrope_rotary_sin_cos: Tensor = None,
     mrope_position_deltas: Tensor = None,
     host_runtime_perf_knobs: Optional[Tensor] = None,
@@ -5030,6 +5035,9 @@ def gpt_attention(
         encoder_input_lengths: Tensor
             The tensor that stores the length of each encoder input sequence. Its shape is [batch_size],
 
+        logn_scaling: Tensor = None
+            The logn scaling tensor [max_position_embedding_len], which is applied to q in order to help extrapolation
+
         relative_attention_bias: Tensor = None
             The relative attention bias [num_heads, max_seq_len, max_seq_len], or The relative attention embedding table for implicit mode, [num_heads, num_buckets].
 
@@ -5071,9 +5079,14 @@ def gpt_attention(
             remove_input_padding is True:
                 Shape: [sum(spec_decoding_generation_lengths), divUp(num_draft_tokens + 1, 32)].
 
+        long_rope_rotary_inv_freq: float Tensor
+            Additional rotary inv freq used for longer sequence lengths. Shape: [head_size / 2]
+
+        long_rope_rotary_cos_sin: float2(cos/sin) Tensor
+            Additional rotary cos/sin cache used for longer sequence lengths.
+
         is_mla_enable: bool = False
             Do we need to enable deepseekv2 mla?
-
 
         host_runtime_perf_knobs: Tensor = None,
             The runtime perf knobs bit mask, controls whether to use certain perf knob in the runtime.
@@ -5113,6 +5126,11 @@ def gpt_attention(
     default_net().plugin_config.context_fmha_type
     if do_cross_attention and not paged_kv_cache_flag:
         pass
+    if logn_scaling is not None:
+        use_logn_scaling = 1
+    else:
+        use_logn_scaling = 0
+
     unfuse_qkv_gemm = trt.PluginField(
         "unfuse_qkv_gemm", np.array(np.int8(is_unfuse_qkv_gemm), dtype=np.int8),
         trt.PluginFieldType.INT8)
@@ -5317,6 +5335,9 @@ def gpt_attention(
                               trt.PluginFieldType.INT32)
     cp_group = np.array(cp_group, dtype=np.int32)
     cp_group = trt.PluginField("cp_group", cp_group, trt.PluginFieldType.INT32)
+    use_logn_scaling = trt.PluginField(
+        "use_logn_scaling", np.array(np.int8(use_logn_scaling), dtype=np.int8),
+        trt.PluginFieldType.INT8)
 
     pfc = trt.PluginFieldCollection([
         layer_idx, nheads, vision_start, vision_length, num_kv_heads,
@@ -5337,7 +5358,7 @@ def gpt_attention(
         is_spec_decoding_enabled, spec_decoding_is_generation_length_variable,
         spec_decoding_max_generation_length, is_mla_enabled, q_lora_rank,
         kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim,
-        skip_attn_pf, cp_size, cp_rank, cp_group
+        skip_attn_pf, cp_size, cp_rank, cp_group, use_logn_scaling
     ])
 
     attn_plug = attn_plg_creator.create_plugin("causal_attn", pfc)
@@ -5415,6 +5436,11 @@ def gpt_attention(
             spec_decoding_generation_lengths, spec_decoding_packed_mask,
             spec_decoding_position_offsets
         ]
+
+    if long_rope_rotary_inv_freq is not None:
+        assert long_rope_rotary_cos_sin is not None
+        plug_inputs += [long_rope_rotary_inv_freq, long_rope_rotary_cos_sin]
+
     if mrope_rotary_sin_cos is not None:
         assert mrope_position_deltas is not None
         plug_inputs += [
@@ -5435,6 +5461,9 @@ def gpt_attention(
 
     if skip_attn is not None:
         plug_inputs += [skip_attn]
+
+    if logn_scaling is not None:
+        plug_inputs += [logn_scaling]
 
     for idx, i in enumerate(plug_inputs):
         assert i is not None, f"Found None input for {idx} th item in plugin inputs {plug_inputs}"
@@ -5635,6 +5664,27 @@ def repeat_interleave(tensor: Tensor, repeats: int, dim: int) -> Tensor:
     tile_reshape_size[dim] = tile_reshape_size[dim] * repeats
     tensor = tile.view(concat(tile_reshape_size))
     return tensor
+
+
+def generate_logn_scaling(seq_length: int = 8192,
+                          max_position_embeddings: int = 32768) -> np.ndarray:
+    '''
+    Compute the Log-N scaling vector for Qwen inference extrapolation
+
+    Parameters:
+        seq_length : int
+            The max seq length in training (default to 8192 in Qwen-1)
+        max_position_embeddings : int
+            The max position embeddings. (default to 32768 in Qwen-1)
+
+    Returns:
+        A constant np.ndarray that contains logn scaling vector
+    '''
+    logn_list = [
+        math.log(i, seq_length) if i > seq_length else 1
+        for i in range(1, max_position_embeddings + 1)
+    ]
+    return np.asarray(logn_list, dtype=np.float32)
 
 
 def generate_alibi_slopes(num_heads: int,

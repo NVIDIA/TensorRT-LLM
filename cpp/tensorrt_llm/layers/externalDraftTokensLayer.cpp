@@ -16,6 +16,7 @@
 
 #include "externalDraftTokensLayer.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
 #include "tensorrt_llm/kernels/samplingTopPKernels.h"
@@ -199,6 +200,7 @@ void ExternalDraftTokensLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutpu
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(ExternalDraftTokensLayer_forwardAsync);
 
     auto inputs = std::dynamic_pointer_cast<ExternalDraftTokensInputs>(baseInputs);
 
@@ -282,6 +284,8 @@ void ExternalDraftTokensLayer<T>::acceptDraftTokens(std::shared_ptr<BaseDecoding
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(ExternalDraftTokensLayer_acceptDraftTokens);
+
     auto inputs = std::dynamic_pointer_cast<ExternalDraftTokensInputs>(baseInputs);
 
     auto const draftLogitsShape = (*inputs->draftLogits).getShape();
@@ -362,6 +366,8 @@ void ExternalDraftTokensLayer<T>::multinomialSampling(std::shared_ptr<BaseDecodi
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(ExternalDraftTokensLayer_multinomialSampling);
+
     auto inputs = std::dynamic_pointer_cast<ExternalDraftTokensInputs>(baseInputs);
 
     auto const batchSize = inputs->logits.value()->getDimension<0>();
@@ -410,6 +416,8 @@ void ExternalDraftTokensLayer<T>::getAllTopKs(std::shared_ptr<BaseDecodingInputs
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(ExternalDraftTokensLayer_getAllTopKs);
+
     auto inputs = std::dynamic_pointer_cast<ExternalDraftTokensInputs>(baseInputs);
 
     auto logits = bufferCastOrNull<T>(inputs->logits);
@@ -461,6 +469,8 @@ void ExternalDraftTokensLayer<T>::getAllTopPs(std::shared_ptr<BaseDecodingInputs
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(ExternalDraftTokensLayer_getAllTopPs);
+
     auto inputs = std::dynamic_pointer_cast<ExternalDraftTokensInputs>(baseInputs);
 
     auto logits = bufferCastOrNull<T>(inputs->logits);
@@ -507,6 +517,8 @@ void ExternalDraftTokensLayer<T>::forwardAcceptedTokens(std::shared_ptr<BaseDeco
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(ExternalDraftTokensLayer_forwardAcceptedTokens);
+
     auto inputs = std::dynamic_pointer_cast<ExternalDraftTokensInputs>(baseInputs);
     auto const batchSize = inputs->logits.value()->getDimension<0>();
 

@@ -61,7 +61,6 @@ class CohereConfig(PretrainedConfig):
         dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
 
         if hf_config.tie_word_embeddings:
-            kwargs['share_embedding_table'] = True
             kwargs['use_parallel_embedding'] = True
             kwargs['embedding_sharding_dim'] = 0
 

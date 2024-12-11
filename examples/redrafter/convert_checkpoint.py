@@ -438,7 +438,6 @@ def convert_and_save(
         sharding_dim=embedding_sharding_dim,
         # use_weight_only=args.use_weight_only,
         # plugin_weight_only_quant_type=plugin_weight_only_quant_type,
-        # share_embedding_table=args.use_embedding_sharing,
         # use_smooth_quant=args.smoothquant,
         # per_channel=args.per_channel,
         # per_token=args.per_token,

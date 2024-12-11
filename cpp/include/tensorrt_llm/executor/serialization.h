@@ -37,13 +37,13 @@ class Serialization
 public:
     // TimePoint
     [[nodiscard]] static RequestPerfMetrics::TimePoint deserializeTimePoint(std::istream& is);
-    static void serialize(RequestPerfMetrics::TimePoint const& config, std::ostream& os);
+    static void serialize(RequestPerfMetrics::TimePoint const& tp, std::ostream& os);
     [[nodiscard]] static size_t serializedSize(RequestPerfMetrics::TimePoint const&);
 
     // RequestPerfMetrics
     [[nodiscard]] static RequestPerfMetrics deserializeRequestPerfMetrics(std::istream& is);
-    static void serialize(RequestPerfMetrics const& config, std::ostream& os);
-    [[nodiscard]] static size_t serializedSize(RequestPerfMetrics const& config);
+    static void serialize(RequestPerfMetrics const& metrics, std::ostream& os);
+    [[nodiscard]] static size_t serializedSize(RequestPerfMetrics const& metrics);
 
     // SamplingConfig
     [[nodiscard]] static SamplingConfig deserializeSamplingConfig(std::istream& is);
@@ -246,13 +246,13 @@ public:
 
     // DisServingStats
     [[nodiscard]] static DisServingRequestStats deserializeDisServingRequestStats(std::istream& is);
-    static void serialize(DisServingRequestStats const& state, std::ostream& os);
-    [[nodiscard]] static size_t serializedSize(DisServingRequestStats const& state);
+    static void serialize(DisServingRequestStats const& stats, std::ostream& os);
+    [[nodiscard]] static size_t serializedSize(DisServingRequestStats const& disServingRequestStats);
 
     // RequestStage
     [[nodiscard]] static RequestStage deserializeRequestStage(std::istream& is);
-    static void serialize(RequestStage const& state, std::ostream& os);
-    [[nodiscard]] static size_t serializedSize(RequestStage const& state);
+    static void serialize(RequestStage const& requestStage, std::ostream& os);
+    [[nodiscard]] static size_t serializedSize(RequestStage const& requestStage);
 
     // RequestStats
     [[nodiscard]] static RequestStats deserializeRequestStats(std::istream& is);
