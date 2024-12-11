@@ -3,6 +3,7 @@ on:
   issues:
     types:
       - labeled
+
 jobs:
   assign_issue:
     # Only run on module label colors.
@@ -11,6 +12,7 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v2
+
       - name: Get Assignee
         uses: actions/github-script@v6
         id: get-assignee
@@ -33,6 +35,7 @@ jobs:
             // Returning empty string in case a valid assignee is not found.
             return ""
           result-encoding: string
+
       - name: Assign
         run: gh issue edit ${{ github.event.issue.number }} --add-label "triaged" --add-label "investigating" --add-assignee ${{ steps.get-assignee.outputs.result }}
         env:
