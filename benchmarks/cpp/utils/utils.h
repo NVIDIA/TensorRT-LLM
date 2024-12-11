@@ -52,7 +52,7 @@ struct BenchmarkParams
     bool enableBatchSizeTuning{false};
     bool enableMaxNumTokensTuning{false};
     bool enableBlockReuse{false};
-    bool enableChunkedContext{false};
+    bool enableChunkedContext{true};
     bool streaming{false};
     bool enableExpDelays{false};
     std::optional<float> requestRate{std::nullopt};

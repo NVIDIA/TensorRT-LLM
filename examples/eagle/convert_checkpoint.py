@@ -141,13 +141,6 @@ def parse_arguments():
         'To shard it along hidden dimension, set embedding_sharding_dim=1'
         'Note: embedding sharing is only enabled when embedding_sharding_dim = 0'
     )
-    parser.add_argument(
-        '--use_embedding_sharing',
-        action="store_true",
-        default=False,
-        help=
-        'Try to reduce the engine size by sharing the embedding lookup table between two layers.'
-        'Note: the flag might not take effect when the criteria are not met.')
     parser.add_argument('--output_dir',
                         type=str,
                         default='tllm_checkpoint',
@@ -297,6 +290,8 @@ if __name__ == '__main__':
         args.n_kv_head = hf_config.num_key_value_heads
         args.rms_norm_eps = hf_config.rms_norm_eps
         args.vocab_size = hf_config.vocab_size
+        args.rotary_scaling = hf_config.rope_scaling
+        args.rotary_base = hf_config.rope_theta
         args.n_positions = hf_config.max_position_embeddings
         args.dtype = str(
             hf_config.torch_dtype)[6:] if args.dtype == 'auto' else args.dtype
@@ -344,11 +339,8 @@ if __name__ == '__main__':
     if args.rotary_scaling is not None:
         # assert args.use_gpt_attention_plugin, "RoPE scaling is only supported through GPT attention plugin."
         rotary_scaling = {
-            "type": args.rotary_scaling[0],
-            "factor": float(args.rotary_scaling[1])
+            "type": args.rotary_scaling["rope_type"],
         }
-        assert rotary_scaling["type"] in ["linear", "dynamic"]
-        assert rotary_scaling["factor"] > 1.0
         args.rotary_scaling = rotary_scaling
 
     eagle_net_config = {
@@ -378,7 +370,6 @@ if __name__ == '__main__':
         },
         'use_parallel_embedding': args.use_parallel_embedding,
         'embedding_sharding_dim': args.embedding_sharding_dim,
-        'share_embedding_table': args.use_embedding_sharing,
     }
 
     config = {
@@ -408,7 +399,6 @@ if __name__ == '__main__':
         },
         'use_parallel_embedding': args.use_parallel_embedding,
         'embedding_sharding_dim': args.embedding_sharding_dim,
-        'share_embedding_table': args.use_embedding_sharing,
         'max_draft_len': args.max_draft_len,
         'num_eagle_layers': args.num_eagle_layers,
         'max_non_leaves_per_layer': args.max_non_leaves_per_layer,

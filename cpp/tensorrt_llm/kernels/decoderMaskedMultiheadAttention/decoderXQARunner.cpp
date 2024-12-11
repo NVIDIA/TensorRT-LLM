@@ -75,8 +75,10 @@ constexpr inline T roundUp(T a, T b)
 size_t DecoderXQARunner::getWorkspaceSize(int max_num_tokens)
 {
     // buffer for RoPE / output quantization.
-    constexpr size_t kXQA_OUT_ELEM_SIZE = 2;                                             // fp16 or bf16.
-    size_t workspace_size = kXQA_OUT_ELEM_SIZE * mHeadSize * mNumHeads * max_num_tokens; // medusa
+    constexpr size_t kXQA_OUT_ELEM_SIZE = 2; // fp16 or bf16.
+    size_t workspace_size = roundUp<size_t>(kXQA_OUT_ELEM_SIZE * mHeadSize * mNumHeads * max_num_tokens, 128); // rope
+    // output conversion.
+    workspace_size = roundUp<size_t>(workspace_size + kXQA_OUT_ELEM_SIZE * mHeadSize * mNumHeads * max_num_tokens, 128);
     if (mMultiBlockMode)
     {
         int workspaces[4];

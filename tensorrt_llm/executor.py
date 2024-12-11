@@ -9,7 +9,6 @@ import json
 import multiprocessing
 import os
 import pickle  # nosec B403
-import secrets
 import signal
 import time
 import traceback
@@ -27,11 +26,13 @@ import numpy as np
 import torch
 import zmq
 
+from tensorrt_llm.logger import set_level
+
 from ._utils import mpi_rank, mpi_world_size
 from .bindings import executor as tllm
 from .builder import ConfigEncoder, Engine, EngineConfig
 from .llmapi.mpi_session import (MpiPoolSession, MpiSession,
-                                 external_mpi_comm_available, find_free_port,
+                                 external_mpi_comm_available,
                                  need_spawn_mpi_workers)
 from .llmapi.tracer import (VizTracer, enable_llm_tracer, get_tracer,
                             global_tracer, set_global_tracer)
@@ -642,7 +643,6 @@ class GenerationExecutor(ABC):
         world_size: int = 0,
         mpi_session: Optional[MpiSession] = None,
         reuse_mpi_comm: bool = False,
-        enable_processes_for_single_gpu: bool = False
     ) -> Union["ExecutorBindingsProxy", "ExecutorBindingsWorker"]:
 
         if world_size == 0:
@@ -673,19 +673,39 @@ class GenerationExecutor(ABC):
         # For single-gpu case:
         # Partition the workload to multiple process for performance. While this requires uses to protect their entrypoint
         # to `if __name__ == "__main__":`.
-        try:
-            if enable_processes_for_single_gpu:
-                ctx = multiprocessing.get_context("fork")
-                mpi_session = ProcessPoolExecutorSession(n_workers=1,
-                                                         mp_context=ctx)
-                return ExecutorBindingsProxy(worker_kwargs,
-                                             model_world_size=model_world_size,
-                                             mpi_session=mpi_session)
-        finally:
-            # If the user's entrypoint is not protected by `if __name__ == "__main__":`, it will fall back to the traditional
-            # single process way.
+        #
+        # The LogitsPostProcessorConfig cannot pickle, which cannot work with multi-process now
+        # TODO: Make logits_post_processor work with multi-process
+        if executor_config.logits_post_processor_config is None:
+            ctx = multiprocessing.get_context("spawn")
+            # The ProcessPoolExecutorSession is used to support Windows, as mpi4py cannot.
+            mpi_session = ProcessPoolExecutorSession(n_workers=1,
+                                                     mp_context=ctx)
+            return ExecutorBindingsProxy(worker_kwargs,
+                                         model_world_size=model_world_size,
+                                         mpi_session=mpi_session)
+        else:
             return ExecutorBindingsWorker(engine=engine,
                                           executor_config=executor_config)
+
+    def wait_first_completed(
+        self, futures: List[GenerationResult]
+    ) -> Generator[GenerationResult, None, None]:
+        wait_set = set(futures)
+
+        # clear already-finished requests
+        for f in futures:
+            if f._done:
+                wait_set.pop(f)
+                yield f
+
+        # wait remaining active requests
+        while len(wait_set) > 0:
+            fut = wait_set.pop()
+            if fut.request_id not in self._results:
+                yield fut
+            else:
+                wait_set.add(fut)
 
 
 class ProcessPoolExecutorSession(MpiSession):
@@ -982,6 +1002,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 request.sampling_params.end_id,
                 pad_id=request.sampling_params.pad_id,
                 output_config=request.sampling_params._get_output_config(),
+                lookahead_config=request.sampling_params.lookahead_config,
                 guided_decoding_params=request.sampling_params.
                 _get_guided_decoding_params(),
                 bad_words=request.sampling_params._get_bad_words(),
@@ -1072,55 +1093,39 @@ class ExecutorBindingsWorker(GenerationExecutor):
     def __del__(self):
         self.shutdown()
 
-    def wait_first_completed(
-        self, futures: List[GenerationResult]
-    ) -> Generator[GenerationResult, None, None]:
-        wait_set = set(futures)
-
-        # clear already-finished requests
-        for f in futures:
-            if f._done:
-                wait_set.pop(f)
-                yield f
-
-        # wait remaining active requests
-        while len(wait_set) > 0:
-            fut = wait_set.pop()
-            if fut.request_id not in self._results:
-                yield fut
-            else:
-                wait_set.add(fut)
-
 
 class ZeroMqQueue:
     ''' A Queue-like container for IPC using ZeroMQ. '''
 
-    def __init__(self,
-                 address: Optional[Tuple[str, int, str]] = None,
-                 *,
-                 is_server: bool):
-        # NOTE: The port could be occupied by other processes if run in parallel.
-        address = address or ('localhost', find_free_port(),
-                              secrets.token_bytes(512))
+    def __init__(self, address: Optional[str] = None, *, is_server: bool):
+        '''
+        Parameters:
+            address (Tuple[str, str], optional): The address (tcp-ip_port, authkey) for the IPC. Defaults to None.
+            is_server (bool): Whether the current process is the server or the client.
+        '''
 
-        self.host_port, self.authkey = (address[0], address[1]), address[2]
+        self.address = address or "tcp://127.0.0.1:*"
         self.is_server = is_server
         self.context = zmq.Context()
         self.poller = None
         self.socket = None
 
-    @property
-    def address(self):
-        return (self.host_port[0], self.host_port[1], self.authkey)
+        self._setup_done = False
 
-    def setup(self):
-        self.socket = self.context.socket(
-            zmq.PAIR)  # PAIR for bidir communication
+        self.socket = self.context.socket(zmq.PAIR)
         if self.is_server:
-            self.socket.bind(f'tcp://{self.host_port[0]}:{self.host_port[1]}')
-        else:
-            self.socket.connect(
-                f'tcp://{self.host_port[0]}:{self.host_port[1]}')
+            self.socket.bind(
+                self.address
+            )  # Binds to the address and occupy a port immediately
+            self.address = self.socket.getsockopt(zmq.LAST_ENDPOINT).decode()
+
+    def setup_lazily(self):
+        if self._setup_done:
+            return
+        self._setup_done = True
+
+        if not self.is_server:
+            self.socket.connect(self.address)
         self.poller = zmq.Poller()
         self.poller.register(self.socket, zmq.POLLIN)
 
@@ -1129,8 +1134,7 @@ class ZeroMqQueue:
         Parameters:
             timeout (int): Timeout in seconds
         """
-        if self.socket is None:
-            self.setup()
+        self.setup_lazily()
 
         events = dict(self.poller.poll(timeout=timeout * 1000))
         if self.socket in events and events[self.socket] == zmq.POLLIN:
@@ -1139,8 +1143,7 @@ class ZeroMqQueue:
             return False
 
     def put(self, obj: Any):
-        if self.socket is None:
-            self.setup()
+        self.setup_lazily()
 
         if isinstance(obj, GenerationExecutor.Response):
             tensors = self._store_tensors_in_shmm(obj.tensors)
@@ -1154,8 +1157,7 @@ class ZeroMqQueue:
         self.socket.send(message)
 
     def get(self) -> Any:
-        if self.socket is None:
-            self.setup()
+        self.setup_lazily()
 
         message = self.socket.recv()
         obj = pickle.loads(message)  # nosec B301
@@ -1241,7 +1243,7 @@ class FusedIpcQueue:
     ''' A Queue-like container for IPC with optional message batched. '''
 
     def __init__(self,
-                 address: Optional[Tuple[str, int, str]] = None,
+                 address: Optional[str] = None,
                  *,
                  is_server: bool,
                  fuse_message=False,

@@ -72,6 +72,10 @@ A [`sample.py`](./sample.py) is provided to generated images with the optimized 
 We can simply run `python sample.py`. After that, an image named `sample.png` will be generated:
 ![sample.png](./figs/sample.png).
 
+Image generated with quantized FP8 DiT:
+
+![sample.fp8.png](./figs/sample.fp8.png).
+
 By default, we set batch size to 2, you can set batch size up to `--max-batch-size`, e.g., `python sample.py --batch-size 8`
 
 We can also run `python sample.py --tllm_model_dir=</path/to/tllm_model>` to apply specific engines.

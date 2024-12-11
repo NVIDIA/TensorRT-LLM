@@ -136,7 +136,6 @@ def convert_hf_config(hf_config, dtype, args):
         'position_embedding_type': 'rope_gpt_neox',
         'max_position_embeddings': hf_config.max_position_embeddings,
         'hidden_act': hf_config.hidden_act,
-        'share_embedding_table': False,
         'mapping': {
             'world_size': args.tp_size * args.pp_size,
             'tp_size': args.tp_size,

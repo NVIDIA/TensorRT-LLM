@@ -23,7 +23,7 @@
 namespace tensorrt_llm::common
 {
 
-static std::optional<int32_t> getIntEnv(char const* name)
+std::optional<int32_t> getIntEnv(char const* name)
 {
     char const* const env = std::getenv(name);
     if (env == nullptr)
@@ -185,6 +185,12 @@ bool getEnvDisaggLayerwise()
 {
     static bool const disaggLayerwise = getBoolEnv("TRTLLM_DISAGG_LAYERWISE");
     return disaggLayerwise;
+}
+
+bool getEnvParallelCacheSend()
+{
+    static bool const parallelCacheSend = getBoolEnv("TRTLLM_PARALLEL_CACHE_SEND");
+    return parallelCacheSend;
 }
 
 } // namespace tensorrt_llm::common

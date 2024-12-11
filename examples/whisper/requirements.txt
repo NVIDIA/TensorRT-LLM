@@ -1,4 +1,4 @@
-tensorrt_llm==0.16.0.dev2024120300
+tensorrt_llm==0.16.0.dev2024121000
 tiktoken
 datasets
 kaldialign

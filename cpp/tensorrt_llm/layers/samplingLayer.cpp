@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/layers/topKSamplingLayer.h"
 #include "tensorrt_llm/layers/topPSamplingLayer.h"
@@ -122,6 +123,7 @@ void SamplingLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& 
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(SamplingLayer_forwardAsync);
 
     auto inputs = std::dynamic_pointer_cast<SamplingInputs>(baseInputs);
 

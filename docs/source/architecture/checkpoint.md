@@ -212,7 +212,6 @@ Here is the `config.json`:
     },
     "use_parallel_embedding": false,
     "embedding_sharding_dim": 0,
-    "share_embedding_table": false,
     "do_layer_norm_before": true,
 }
 ```

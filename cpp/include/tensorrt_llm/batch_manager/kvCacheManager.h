@@ -35,6 +35,7 @@
 #include <list>
 #include <memory>
 #include <optional>
+#include <set>
 #include <unordered_map>
 #include <vector>
 
@@ -52,6 +53,7 @@ static constexpr SizeType32 kSecondaryLevel = 1;
 
 class KVCacheBlock;
 class KVCacheManager;
+class KVCacheTransferManager;
 
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
 using TokenIdType = tensorrt_llm::runtime::TokenIdType;
@@ -622,13 +624,6 @@ private:
     void claimLeafBlock(BlockPtr block, std::optional<executor::RetentionPriority> priority = std::nullopt,
         std::optional<std::chrono::milliseconds> durationMs = std::nullopt);
 
-    //! \brief Compute pointer to raw KV block (K & V, all layers).
-    [[nodiscard]] runtime::ITensor::SharedPtr computeBlockPointer(
-        std::shared_ptr<KVCacheBlock> block, SizeType32 poolIdx) const;
-
-    //! \brief Copy content of src block to dst.
-    void copyBlock(BlockPtr src, BlockPtr dst);
-
 private:
     // Number of blocks in pools
     SizeType32 mNumPrimaryBlocks;
@@ -667,6 +662,8 @@ private:
     std::shared_ptr<BaseEvictionPolicy> mEvictionPolicy;
     // Event manager
     std::shared_ptr<KVCacheEventManager> mEventManager;
+    // Transfer manager
+    std::shared_ptr<KVCacheTransferManager> mTransferManager;
 
     // Statistics for block allocations/reuse
     // Total number of blocks allocated by all requests

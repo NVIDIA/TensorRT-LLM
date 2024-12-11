@@ -44,6 +44,7 @@ struct RuntimeOptions
     tle::SizeType32 numRequests;
 
     size_t hostCacheSize;
+    size_t maxTokensInPagedKvCache;
 };
 
 struct KVCacheBlock
@@ -95,8 +96,10 @@ int main(int argc, char* argv[])
     auto runtimeOpts = parseArgs(argc, argv);
 
     // Create the executor for this engine
-    auto executorConfig = tle::ExecutorConfig(1);         // Beam width 1 is required for cache block reuse
-    auto kvCacheConfig = tle::KvCacheConfig(true, 32768); // Enable cache block reuse
+    auto executorConfig = tle::ExecutorConfig(1); // Beam width 1 is required for cache block reuse
+    auto kvCacheConfig = tle::KvCacheConfig(true,
+        runtimeOpts.maxTokensInPagedKvCache ? std::optional(runtimeOpts.maxTokensInPagedKvCache)
+                                            : std::nullopt); // Enable cache block reuse
     kvCacheConfig.setHostCacheSize(runtimeOpts.hostCacheSize);
     kvCacheConfig.setEventBufferMaxSize(32768);
     executorConfig.setKvCacheConfig(kvCacheConfig);
@@ -155,6 +158,8 @@ RuntimeOptions parseArgs(int argc, char* argv[])
         "num_requests", "Amount of requests to send to the engine", cxxopts::value<int>()->default_value("100"));
     options.add_options()("host_cache_size", "Size of the KV Cache in host memory in bytes",
         cxxopts::value<size_t>()->default_value("0"));
+    options.add_options()("max_tokens_in_paged_kv_cache", "Amount of tokens in the kv cache",
+        cxxopts::value<size_t>()->default_value("0"));
 
     auto parsedOptions = options.parse(argc, argv);
 
@@ -186,6 +191,7 @@ RuntimeOptions parseArgs(int argc, char* argv[])
     runtimeOpts.maxTokensStddev = parsedOptions["max_tokens_stddev"].as<int>();
     runtimeOpts.numRequests = parsedOptions["num_requests"].as<int>();
     runtimeOpts.hostCacheSize = parsedOptions["host_cache_size"].as<size_t>();
+    runtimeOpts.maxTokensInPagedKvCache = parsedOptions["max_tokens_in_paged_kv_cache"].as<size_t>();
 
     return runtimeOpts;
 }

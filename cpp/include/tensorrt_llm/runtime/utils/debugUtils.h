@@ -21,9 +21,9 @@ namespace tensorrt_llm::runtime::utils
 {
 
 template <typename T>
-bool tensorHasNan(ITensor const& tensor, BufferManager const& manager, std::string const& infoStr);
+bool tensorHasInvalid(ITensor const& tensor, BufferManager const& manager, std::string const& infoStr);
 
-bool tensorHasNan(
+bool tensorHasInvalid(
     size_t M, size_t K, nvinfer1::DataType type, void const* data, cudaStream_t stream, std::string const& infoStr);
 
 int stallStream(

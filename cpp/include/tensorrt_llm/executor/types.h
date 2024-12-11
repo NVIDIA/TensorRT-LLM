@@ -56,6 +56,7 @@ using IterationType = std::uint64_t;
 using RandomSeedType = std::uint64_t;
 using VecLogProbs = std::vector<FloatType>;
 using StreamPtr = std::shared_ptr<tensorrt_llm::runtime::CudaStream>;
+using MillisecondsType = std::chrono::milliseconds;
 using LogitsPostProcessor
     = std::function<void(IdType, Tensor&, BeamTokens const&, StreamPtr const&, std::optional<IdType>)>;
 using LogitsPostProcessorMap = std::unordered_map<std::string, LogitsPostProcessor>;
@@ -475,6 +476,12 @@ enum class FinishReason
 
     /// @brief The request finished because the maximum number of tokens was reached.
     kLENGTH = 3,
+
+    /// @brief The request finished because it got timed out (via the mAllotedTime parameter)
+    kTIMED_OUT = 4,
+
+    /// @brief The request was cancelled by calling cancelRequest.
+    kCANCELLED = 5
 };
 
 /// @brief mode of the decoder

@@ -280,7 +280,7 @@ class AsyncQueue:
 
 class _SyncQueue:
     '''
-    A simplified Queue that provides a `get` method that is compatible with the asyncio event loop.
+    A simplified Queue that provides a `put` method that is compatible with the asyncio event loop.
     '''
 
     def __init__(self,
@@ -332,6 +332,15 @@ class _SyncQueue:
 
     def full(self) -> bool:
         return self._q.full()
+
+    def get(self, timeout=None):
+        # Here is the WAR for jupyter scenario where trt-llm detects the event loop existence.
+        # However, this event loop launched by jupyter rather than trt-llm. It led the GenerationResult initialized
+        # w/ AsyncQueue and call the get() unintentionally.
+        res = self._q.get()
+        if self._q.empty():
+            self._event.clear()
+        return res
 
 
 class _AsyncQueue:

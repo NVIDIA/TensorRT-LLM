@@ -1,16 +1,10 @@
-import os
-import sys
-
 from tensorrt_llm.llmapi.llm import LLM, SamplingParams
 from tensorrt_llm.llmapi.llm_utils import CalibConfig, QuantAlgo, QuantConfig
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+# isort: off
+from test_llm import cnn_dailymail_path, llama_model_path
 from utils.util import skip_pre_ampere, skip_pre_hopper
-
-try:
-    from .test_llm import cnn_dailymail_path, llama_model_path
-except ImportError:
-    from test_llm import cnn_dailymail_path, llama_model_path
+# isort: on
 
 
 @skip_pre_ampere

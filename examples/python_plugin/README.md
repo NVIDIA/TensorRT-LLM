@@ -1,20 +1,21 @@
-# TRT-LLM Python Plugin
+# TensorRT-LLM Python Plugin
 
-TRT-LLM provides an python plugin interface for users to integrate plugin to TRT-LLM with pure python.
+TensorRT-LLM provides a Python plugin interface to integrate TensorRT-LLM with pure Python.
 
 + `openai_triton_plugin`: plugin package
-+ `build_lookup.py`: Build a TensorRT engine with TRT-LLM plugin
-+ `run_lookup.py`: Run the engine and compare the result with pytorch
++ `build_lookup.py`: Build a TensorRT engine with TensorRT-LLM Python plugin
++ `run_lookup.py`: Run the engine and compare the result with PyTorch
 
 ## Plugin Definition
 
-The following code gives a simple example to create a look up plugin. We only need to do a few things to define a TRT-LLM plugin.
+The following code shows how to create a look-up plugin.
+We only need to do a few things to define a TensorRT-LLM plugin.
 
-1. Inherit the `PluginBase`
-2. Register the plugin class to TRT-LLM by using `@trtllm_plugin("your_plugin_name")`
-3. Define `__init__` function and initialize base class
-4. Define shape & dtype inference function
-5. Define the compute flow
+1. Inherit the `PluginBase`.
+2. Register the plugin class to TensorRT-LLM by using `@trtllm_plugin("your_plugin_name")`.
+3. Define an `__init__` function and initialize the base class.
+4. Define a shape and dtype inference function.
+5. Define the compute flow.
 
 ```python
 @trtllm_plugin("TritonLookUp")
@@ -54,9 +55,9 @@ class LookUpPlugin(PluginBase):
 
 ```
 
-## Adding a TRT-LLM Plugin to Network
+## Adding a TensorRT-LLM Plugin to a Network
 
-You only needs to instance a plugin object and then call it with `tensorrt_llm.Tensor` as input arguments.
+You only need an instance of the plugin object and then call it with `tensorrt_llm.Tensor` as input arguments.
 
 ```python
 builder = tensorrt_llm.Builder()
@@ -79,16 +80,17 @@ with tensorrt_llm.net_guard(network):
 
 ## Plugin Code Structure
 
-Since we do plugin registration when importing the custom TRT-LLM plugin, so there would be some convention on code structure for users to register the plugin at runtime.
+Because TensorRT-LLM performs plugin registration when importing the custom TensorRT-LLM plugin, there are some code structure conventions to register the plugin at runtime.
 
-```
+```text
 plugin_lib
 ├──__init__.py
 ├──lookup_plugin.py
 └──lookup_kernel.py
 ```
 
-Say we have such plugin package. The `__init__.py` should import all the plugins in the plugin packages, so that the plugin users only need to import the plugin package to register all the plugin, and no need to manually import them.
+The `__init__.py` file imports all the plugins in the plugin package.
+With this convention, users only need to import the plugin package to register the plugins and do not need to manually import them.
 
 ```python
 # __init__.py
@@ -97,9 +99,9 @@ from .lookup_plugin import LookUpPlugin
 __all__ = ["LookUpPlugin"]
 ```
 
-## Deserialize an Engine with TRT-LLM Plugin
+## Deserialize an Engine with TensorRT-LLM Plugin
 
-During the deserialization, TRT needs to find the user defined plugin. Thus, we need to import the plugin once to register them. If the plugin has the recommended code structure, users only need to import that package to register all the custom plugin.
+During deserialization, TensorRT needs to find the user-defined plugin. Thus, we need to import the plugin once to register them. If the plugin follows the code structure convention, users only need to import that package to register all the custom plugins.
 
 ```python
 from tensorrt_llm.runtime.session import Session, TensorInfo

@@ -5,15 +5,15 @@ import requests
 
 
 def download_wheel(args):
-    if not args.wheel_path.startswith(('http://', 'https://')):
-        args.wheel_path = 'https://' + args.wheel_path
+    if not args.wheel_path.startswith(("http://", "https://")):
+        args.wheel_path = "https://" + args.wheel_path
     res = requests.get(args.wheel_path)
     if res.status_code != 200:
         print(f"Fail to get the result of {args.wheel_path}")
         exit(1)
     wheel_name = None
     for line in res.text.split("\n"):
-        if not line.startswith("<a href=\""):
+        if not line.startswith('<a href="'):
             continue
         name = line.split('"')[1]
         if not name.endswith(".whl"):
@@ -23,7 +23,7 @@ def download_wheel(args):
     if not wheel_name:
         print(f"Fail to get the wheel name of {args.wheel_path}")
         exit(1)
-    if args.wheel_path[-1] == '/':
+    if args.wheel_path[-1] == "/":
         args.wheel_path = args.wheel_path[:-1]
     wheel_url = f"{args.wheel_path}/{wheel_name}"
     subprocess.check_call("rm *.whl || true", shell=True)
@@ -53,5 +53,5 @@ def test_pip_install():
                           shell=True)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     test_pip_install()

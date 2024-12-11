@@ -841,6 +841,7 @@ def optimize_model_with_config(model: PretrainedModel,
     is_fp8 = model.config.quantization.quant_algo == QuantAlgo.FP8
     model = optimize_model(
         model,
+        share_embedding_table=True,
         use_ootb_moe=build_config.plugin_config.moe_plugin is None,
         use_fused_mlp=(build_config.use_fused_mlp and not is_enc_dec
                        and not (is_recurrent_gemma and is_fp8)

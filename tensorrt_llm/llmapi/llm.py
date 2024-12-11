@@ -101,6 +101,7 @@ class LLM:
                  dtype: str = "auto",
                  revision: Optional[str] = None,
                  tokenizer_revision: Optional[str] = None,
+                 speculative_model: Optional[str] = None,
                  **kwargs: Any):
 
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
@@ -117,6 +118,7 @@ class LLM:
                 dtype=dtype,
                 revision=revision,
                 tokenizer_revision=tokenizer_revision,
+                speculative_model=speculative_model,
                 **kwargs)
         except Exception as e:
             logger.error(
@@ -386,12 +388,14 @@ class LLM:
         # It should also be before bindings ExecutorConfig, which may depend on tokenizer info.
         self._tokenizer = self._try_load_tokenizer()
 
+        max_batch_size = self.args.runtime_max_batch_size or self.args.build_config.max_batch_size
+        max_num_tokens = self.args.runtime_max_num_tokens or self.args.build_config.max_num_tokens
         executor_config = tllm.ExecutorConfig(
             max_beam_width=self.args.build_config.max_beam_width,
             scheduler_config=self.args.scheduler_config,
             batching_type=tllm.BatchingType.INFLIGHT,
-            max_batch_size=self.args.build_config.max_batch_size,
-            max_num_tokens=self.args.build_config.max_num_tokens)
+            max_batch_size=max_batch_size,
+            max_num_tokens=max_num_tokens)
         if self.args.kv_cache_config is not None:
             executor_config.kv_cache_config = self.args.kv_cache_config
         if self.args.peft_cache_config is not None:
@@ -427,6 +431,8 @@ class LLM:
         executor_config.normalize_log_probs = self.args.normalize_log_probs
         executor_config.enable_chunked_context = self.args.enable_chunked_prefill
         executor_config.max_beam_width = self.args.build_config.max_beam_width
+        if self.args.extended_runtime_perf_knob_config is not None:
+            executor_config.extended_runtime_perf_knob_config = self.args.extended_runtime_perf_knob_config
 
         trt_engine_dir = (self._engine_dir
                           if self._engine_dir is not None else None)
@@ -437,8 +443,7 @@ class LLM:
             mpi_session=self.mpi_session,
             reuse_mpi_comm=external_mpi_comm_available(
                 self.args.parallel_config.world_size),
-            enable_processes_for_single_gpu=self.args.
-            enable_processes_for_single_gpu)
+        )
 
     def _try_load_tokenizer(self) -> Optional[TokenizerBase]:
         if self.args.skip_tokenizer_init:

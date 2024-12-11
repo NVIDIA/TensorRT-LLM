@@ -12,7 +12,7 @@ This document shows how to build and run a LLaMA-3.2 Vision model in TensorRT-LL
 For LLaMA-3.2 text model, please refer to the [examples/llama/README.md](../llama/README.md) because it shares the model architecture of llama.
 
 ## Support Matrix
-  * BF16/FP16
+  * BF16
   * Tensor Parallel
   * INT8 & INT4 Weight-Only
 

@@ -50,6 +50,7 @@ class IdxEntry(Enum):
     MLA_FUSED_Q_PROJ_TENSOR = auto()
     MLA_Q_B_PROJ_TENSOR = auto()
     MLA_KV_B_PROJ_TENSOR = auto()
+    LOGN_SCALING = auto()
 
 
 class IdxEntryParser:
@@ -77,6 +78,8 @@ class IdxEntryParser:
         self.is_spec_decoding_enabled = bool(
             plugin_info.pfc_as_list['is_spec_decoding_enabled'][0])
         self.is_mla_enabled = bool(plugin_info.pfc_as_list['is_mla_enabled'][0])
+        self.use_logn_scaling = bool(
+            plugin_info.pfc_as_list['use_logn_scaling'][0])
         self.init_entry_to_index()
 
     # WARNING: Must in sync with GPTAttentionPlugin::isEntryUsed in cpp/tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.cpp
@@ -160,6 +163,8 @@ class IdxEntryParser:
             return self.is_mla_enabled
         elif entry == IdxEntry.MLA_KV_B_PROJ_TENSOR:
             return self.is_mla_enabled
+        elif entry == IdxEntry.LOGN_SCALING:
+            return self.use_logn_scaling
         else:
             return False
 

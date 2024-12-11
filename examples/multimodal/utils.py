@@ -40,10 +40,13 @@ def add_common_args(parser):
     parser.add_argument('--check_accuracy',
                         action='store_true',
                         help='Check correctness of text output')
-    parser.add_argument('--video_path',
-                        type=str,
-                        default=None,
-                        help='Path to your local video file')
+    parser.add_argument(
+        '--video_path',
+        type=str,
+        default=None,
+        help=
+        'Path to your local video file, using \'llava-onevision-accuracy\' to check the Llava-OneVision model accuracy'
+    )
     parser.add_argument(
         '--video_num_frames',
         type=int,
@@ -76,7 +79,7 @@ def add_common_args(parser):
     )
     parser.add_argument(
         '--kv_cache_free_gpu_memory_fraction',
-        default=0.7,
+        default=0.9,
         type=float,
         help='Specify the free gpu memory fraction.',
     )
@@ -86,5 +89,14 @@ def add_common_args(parser):
         type=float,
         help=
         'Specify the kv cache fraction reserved for cross attention. Only applicable for encoder-decoder models. By default 0.5 for self and 0.5 for cross.',
+    )
+    parser.add_argument(
+        '--multi_block_mode',
+        type=lambda s: s.lower() in
+        ("yes", "true", "t", "1"
+         ),  # custom boolean function to convert input string to boolean
+        default=True,
+        help=
+        "Distribute the work across multiple CUDA thread-blocks on the GPU for masked MHA kernel."
     )
     return parser

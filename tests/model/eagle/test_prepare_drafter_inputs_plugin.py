@@ -788,10 +788,11 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
             ref_last_token_indices, ref_num_output_tokens,
             ref_num_last_token_indices, ref_out_hidden_size_batch_level_starts
         ]]
+
         return test_cases
 
     @parameterized.expand(load_test_cases, name_func=unittest_name_func)
-    def test_sample_accept_draft_tokens_plugin(
+    def test_prepare_draft_inputs_plugin(
             self, layer_idx, num_layers, max_non_leaves_per_layer,
             sequence_lengths, context_lengths, input_ids,
             chunked_context_next_tokens, accepted_token_ids, accepted_lens,
@@ -1066,9 +1067,9 @@ class TestEaglePrepareDrafterInputsPlugin(unittest.TestCase):
             for bi in range(batch_size):
                 torch.testing.assert_close(
                     ref_spec_decoding_position_offsets[
-                        bi, ref_spec_decoding_generation_lengths[bi] + 1],
+                        bi, :ref_spec_decoding_generation_lengths[bi]],
                     outputs['spec_decoding_position_offsets'][
-                        bi, ref_spec_decoding_generation_lengths[bi] + 1],
+                        bi, :ref_spec_decoding_generation_lengths[bi]],
                     rtol=0,
                     atol=0)
 

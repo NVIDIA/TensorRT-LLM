@@ -107,13 +107,6 @@ def parse_arguments():
         'To shard it along hidden dimension, set embedding_sharding_dim=1'
         'Note: embedding sharing is only enabled when embedding_sharding_dim = 0'
     )
-    parser.add_argument(
-        '--use_embedding_sharing',
-        action="store_true",
-        default=False,
-        help=
-        'Try to reduce the engine size by sharing the embedding lookup table between two layers.'
-        'Note: the flag might not take effect when the criteria are not met.')
     parser.add_argument('--output_dir',
                         type=str,
                         default='tllm_checkpoint',
@@ -186,7 +179,6 @@ def args_to_build_options(args):
     return {
         'use_parallel_embedding': args.use_parallel_embedding,
         'embedding_sharding_dim': args.embedding_sharding_dim,
-        'share_embedding_table': args.use_embedding_sharing,
         'disable_weight_only_quant_plugin':
         args.disable_weight_only_quant_plugin
     }

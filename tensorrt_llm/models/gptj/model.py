@@ -21,8 +21,7 @@ from ...layers import (MLP, Attention, AttentionMaskType, ColumnLinear,
                        Embedding, LayerNorm)
 from ...mapping import Mapping
 from ...module import Module
-from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
-                              check_share_embedding)
+from ..modeling_utils import DecoderLayerList, DecoderModelForCausalLM
 from .config import GPTJConfig
 from .convert import load_weights_from_hf_model
 
@@ -200,7 +199,6 @@ class GPTJForCausalLM(DecoderModelForCausalLM):
                 trust_remote_code=trust_remote_code)
         weights = load_weights_from_hf_model(hf_model, config)
 
-        check_share_embedding(weights, config)
         model = GPTJForCausalLM(config)
         model.load(weights)
         return model

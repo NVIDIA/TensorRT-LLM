@@ -1,6 +1,6 @@
 # Multi-stage Dockerfile
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
-ARG BASE_TAG=24.10-py3
+ARG BASE_TAG=24.11-py3
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE}:${BASE_TAG} as base
@@ -16,8 +16,10 @@ SHELL ["/bin/bash", "-c"]
 
 FROM base as devel
 
+ARG PYTHON_VERSION="3.12.3"
+RUN echo "Using Python version: $PYTHON_VERSION"
 COPY docker/common/install_base.sh install_base.sh
-RUN bash ./install_base.sh && rm install_base.sh
+RUN bash ./install_base.sh $PYTHON_VERSION && rm install_base.sh
 
 COPY docker/common/install_cmake.sh install_cmake.sh
 RUN bash ./install_cmake.sh && rm install_cmake.sh

@@ -1076,9 +1076,8 @@ void GptDecoderBatched::updateFinished(decoder_batch::DecoderFinishedEvent const
         if (decoderFinishEvent.active[i] && !mFinished[i])
         {
             auto finishedSum = ITensor::slice(mJointDecodingOutput->finishedSum, i, 1);
-            mFinished[i] = mFinished[i]
-                // This condition requires the synchronization above
-                || bufferCast<SizeType32>(*finishedSum)[0] == static_cast<SizeType32>(mBeamWidths[i]);
+            mFinished[i]
+                = mFinished[i] || bufferCast<SizeType32>(*finishedSum)[0] == static_cast<SizeType32>(mBeamWidths[i]);
         }
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);

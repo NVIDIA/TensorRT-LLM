@@ -1,7 +1,5 @@
 import json
-import os
 import subprocess  # nosec B404
-import sys
 import tempfile
 import time
 from pathlib import Path
@@ -10,13 +8,10 @@ from tensorrt_llm.llmapi import BuildConfig, KvCacheConfig
 from tensorrt_llm.llmapi._perf_evaluator import (LLMPerfEvaluator,
                                                  MemoryContinuousMonitorThread)
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+# isort: off
+from test_llm import llama_model_path
 from utils.util import force_ampere
-
-try:
-    from test_llm import llama_model_path
-except ImportError:
-    from .test_llm import llama_model_path
+# isort: on
 
 
 def test_memory_thread():

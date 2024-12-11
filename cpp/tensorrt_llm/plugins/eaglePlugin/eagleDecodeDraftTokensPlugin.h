@@ -28,7 +28,7 @@ namespace tensorrt_llm::plugins
 class EagleDecodeDraftTokensPlugin : public BasePlugin
 {
 public:
-    EagleDecodeDraftTokensPlugin(nvinfer1::DataType type, int32_t layerIdx, bool topKSampling);
+    EagleDecodeDraftTokensPlugin(nvinfer1::DataType type, int32_t layerIdx, int32_t numEagleLayers, bool topKSampling);
 
     EagleDecodeDraftTokensPlugin(void const* data, size_t length);
 
@@ -64,6 +64,7 @@ public:
 private:
     enum class InputIdxEntry : int32_t
     {
+        // 13 inputs
         // [num_input_logits, vocab_size_padded]
         LOGITS = 0,
         // [num_input_logits]
@@ -72,19 +73,53 @@ private:
         PATHS,
         // [1]
         NUM_VALID_LOGITS,
+        // [1]
+        USE_DYNAMIC_TREE,
+        // [1]
+        DYNAMIC_TREE_MAX_TOPK,
 
         // [batch_size, max_decoding_draft_tokens]
         INPUT_DRAFT_TOKEN_IDS,
         // [batch_size]
-        INPUT_DRAFT_LENS
+        INPUT_DRAFT_LENS,
+
+        // [batch_size, max_decoding_draft_tokens]
+        INPUT_PREV_SCORES,
+
+        // [batch_size, max_decoding_draft_tokens]
+        INPUT_CURRENT_EXPAND_INDICES,
+
+        // [batch_size, num_eagle_layers, max_decoding_draft_tokens x max_decoding_draft_tokens]
+        INPUT_ALL_LAYERS_SCORES,
+        // [batch_size, num_eagle_layers, max_decoding_draft_tokens x max_decoding_draft_tokens]
+        INPUT_ALL_LAYERS_DRAFT_TOKEN_IDS,
+        // [batch_size, num_eagle_layers, max_decoding_draft_tokens x max_decoding_draft_tokens]
+        INPUT_ALL_LAYERS_DRAFT_TOKEN_IDS_PREDECESSOR
     };
 
     enum class OutputIdxEntry : int32_t
     {
+        // 8 outputs
         // [batch_size, max_decoding_draft_tokens]
         OUTPUT_DRAFT_TOKEN_IDS = 0,
         // [batch_size]
-        OUTPUT_DRAFT_LENS
+        OUTPUT_DRAFT_LENS,
+
+        // [batch_size, max_decoding_tokens, max_path_len]
+        OUTPUT_PATHS,
+
+        // [batch_size, max_decoding_draft_tokens]
+        OUTPUT_CURRENT_SCORES,
+
+        // [batch_size, max_decoding_draft_tokens]
+        OUTPUT_NEXT_EXPAND_INDICES,
+
+        // [batch_size, num_eagle_layers, max_decoding_draft_tokens x max_decoding_draft_tokens]
+        OUTPUT_ALL_LAYERS_SCORES,
+        // [batch_size, num_eagle_layers, max_decoding_draft_tokens x max_decoding_draft_tokens]
+        OUTPUT_ALL_LAYERS_DRAFT_TOKEN_IDS,
+        // [batch_size, num_eagle_layers, max_decoding_draft_tokens x max_decoding_draft_tokens]
+        OUTPUT_ALL_LAYERS_DRAFT_TOKEN_IDS_PREDECESSOR
     };
 
     int32_t getIdx(InputIdxEntry idx) const
@@ -111,9 +146,10 @@ private:
         void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept;
 
 private:
-    nvinfer1::DataType mDtype; // Logit datatype
-    int32_t mLayerIdx{-1};     // Index of eagle layer
-    bool mTopKSampling;        // Use TopK sampling or multinomial sampling
+    nvinfer1::DataType mDtype;   // Logit datatype
+    int32_t mLayerIdx{-1};       // Index of eagle layer
+    int32_t mNumEagleLayers{-1}; // Number of eagle layers
+    bool mTopKSampling;          // Use TopK sampling or multinomial sampling
 };
 
 class EagleDecodeDraftTokensPluginCreator : public BaseCreator

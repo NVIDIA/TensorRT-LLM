@@ -279,9 +279,7 @@ class DeepseekV2ForCausalLM(DecoderModelForCausalLM):
             mapping,
             dtype=dtype,
             use_parallel_embedding=config.get('use_parallel_embedding', False),
-            sharding_dim=config.get('embedding_sharding_dim', 0),
-            share_embedding_table=config.get('share_embedding_table', False))
-        #check_share_embedding(weights, config)
+            sharding_dim=config.get('embedding_sharding_dim', 0))
         deepseek.load(weights)
 
         return deepseek

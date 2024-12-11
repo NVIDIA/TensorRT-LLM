@@ -4,7 +4,6 @@ from pathlib import Path
 from typing import Tuple, get_args
 import click
 from click_option_group import AllOptionGroup, optgroup
-from transformers import PretrainedConfig as HFPretrainedConfig
 import yaml
 
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
@@ -17,17 +16,6 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.bench.build.dataclasses import ModelConfig
 from tensorrt_llm.bench.build.tuning import calc_engine_setting
-from .utils import DEFAULT_HF_MODEL_DIRS
-
-
-def derive_model_name(model_name):
-    model_dir = Path(model_name)
-    if model_dir.exists() and model_dir.is_dir():
-        hf_config = HFPretrainedConfig.from_pretrained(model_dir)
-        for arch in hf_config.architectures:
-            if arch in DEFAULT_HF_MODEL_DIRS.keys():
-                model_name = DEFAULT_HF_MODEL_DIRS[arch]
-    return model_name
 
 
 def get_benchmark_engine_settings(
@@ -259,7 +247,8 @@ def build_command(
     target_input_len: int = params.get("target_input_len")
     target_output_len: int = params.get("target_output_len")
 
-    model_name = derive_model_name(bench_env.model)
+    model_name = bench_env.model
+    checkpoint_path = bench_env.model_path or model_name
     model_config = get_model_config(model_name)
     engine_dir = Path(bench_env.workspace, model_name,
                       f"tp_{tp_size}_pp_{pp_size}")
@@ -273,7 +262,7 @@ def build_command(
         if quant_algo == QuantAlgo.FP8 else None
 
     # Initialize the HF tokenizer for the specified model.
-    tokenizer = initialize_tokenizer(bench_env.model)
+    tokenizer = initialize_tokenizer(checkpoint_path)
     # If we receive dataset from a path or stdin, parse and gather metadata.
     if dataset_path:
         logger.info("Found dataset.")
@@ -306,12 +295,6 @@ def build_command(
             target_output_len,
         )
 
-    # Construct the engine path and report the engine metadata.
-    model_name = derive_model_name(bench_env.model)
-    engine_dir = Path(bench_env.workspace, model_name,
-                      f"tp_{tp_size}_pp_{pp_size}")
-    engine_dir.mkdir(exist_ok=True, parents=True)
-
     # Construct a TRT-LLM build config.
     build_config = BuildConfig(max_batch_size=max_batch_size,
                                max_seq_len=max_seq_len,
@@ -335,6 +318,7 @@ def build_command(
         "= ENGINE BUILD INFO\n"
         "===========================================================\n"
         f"Model Name:\t\t{bench_env.model}\n"
+        f"Model Path:\t\t{bench_env.model_path}\n"
         f"Workspace Directory:\t{bench_env.workspace}\n"
         f"Engine Directory:\t{engine_dir}\n\n"
         "===========================================================\n"
@@ -348,7 +332,7 @@ def build_command(
 
     # Build the LLM engine with the LLMAPI.
     logger.set_level("error")
-    llm = LLM(bench_env.model,
+    llm = LLM(checkpoint_path,
               tokenizer,
               dtype=model_config.dtype,
               tensor_parallel_size=tp_size,

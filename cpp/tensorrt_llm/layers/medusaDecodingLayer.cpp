@@ -15,10 +15,10 @@
  */
 
 #include "medusaDecodingLayer.h"
+#include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/medusaDecodingKernels.h"
-#include "tensorrt_llm/layers/layerUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 
@@ -219,6 +219,7 @@ void MedusaDecodingLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> c
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(MedusaDecodingLayer_forwardAsync);
 
     auto inputs = std::dynamic_pointer_cast<MedusaDecodingInputs>(baseInputs);
     auto outputs = std::dynamic_pointer_cast<SpeculativeDecodingOutputs>(baseOutputs);

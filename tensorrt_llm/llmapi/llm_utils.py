@@ -11,6 +11,8 @@ __all__ = [
     'ExecutorConfig',
     'SchedulerConfig',
     'KvCacheConfig',
+    'LookaheadDecodingConfig',
+    'MedusaDecodingConfig',
     'ContextChunkingPolicy',
     'CapacitySchedulerPolicy',
     'BuildConfig',
@@ -42,14 +44,17 @@ from .._utils import mpi_barrier, mpi_broadcast, mpi_rank, release_gc
 from ..auto_parallel import AutoParallelConfig, infer_cluster_config
 from ..bindings.executor import (BatchingType, CapacitySchedulerPolicy,
                                  ContextChunkingPolicy, DecodingConfig,
-                                 ExecutorConfig, KvCacheConfig, PeftCacheConfig,
+                                 DecodingMode, ExecutorConfig,
+                                 ExtendedRuntimePerfKnobConfig, KvCacheConfig,
+                                 LookaheadDecodingConfig, PeftCacheConfig,
                                  SchedulerConfig)
 from ..builder import (BuildConfig, Engine, EngineConfig, _init_max_seq_len,
                        build)
 from ..logger import logger
 from ..mapping import Mapping
 from ..models.automodel import MODEL_MAP, AutoConfig, AutoModelForCausalLM
-from ..models.modeling_utils import PretrainedConfig, QuantAlgo, QuantConfig
+from ..models.modeling_utils import (PretrainedConfig, QuantAlgo, QuantConfig,
+                                     SpeculativeDecodingMode)
 from ..module import Module
 from .build_cache import (BuildCache, BuildCacheConfig, CachedStage,
                           get_build_cache_config_from_env)
@@ -188,6 +193,12 @@ class _ModelInfo:
 
 
 @dataclass
+class MedusaDecodingConfig:
+    medusa_choices: Optional[List[List[int]]] = None
+    num_medusa_heads: Optional[int] = None
+
+
+@dataclass
 class _ModelWrapper:
     model: Union[str, Path]
 
@@ -307,8 +318,6 @@ LLMARGS_DOCSTRING = r"""
 
         embedding_parallel_mode (str): The parallel mode for embeddings. Defaults to 'SHARDING_ALONG_VOCAB'.
 
-        share_embedding_table (bool): Whether to share the embedding table. Defaults to False.
-
         auto_parallel (bool): Enable auto parallel mode. Defaults to False.
 
         auto_parallel_world_size (int): The MPI world size for auto parallel. Defaults to 1.
@@ -327,12 +336,20 @@ LLMARGS_DOCSTRING = r"""
 
         scheduler_config (SchedulerConfig, optional): The scheduler configuration for the model. Defaults to None.
 
+        speculative_config (LookaheadDecodingConfig or other speculative configurations, optional): The speculative decoding configuration. Defaults to None.
+
         batching_type (BatchingType, optional): The batching type for the model. Defaults to None.
 
         normalize_log_probs (bool): Whether to normalize log probabilities for the model. Defaults to False.
 
         enable_processes_for_single_gpu (bool): Whether to enable processes for single GPU, Defaults to False.
             This helps to improve the streaming generation performance.
+
+        runtime_max_batch_size (int, optional): The maximum batch size for runtime. Defaults to None.
+
+        runtime_max_num_tokens (int, optional): The maximum number of tokens for runtime. Defaults to None.
+
+        extended_runtime_perf_knob_config (ExtendedRuntimePerfKnobConfig, optional): The extended runtime performance knob configuration for the model. Defaults to None.
 
 """
 
@@ -346,6 +363,8 @@ class LlmArgs:
     """
     # Explicit arguments
     model: Union[str, Path]
+
+    speculative_model: Optional[Union[str, Path]] = None
 
     tokenizer: Optional[Union[str, Path, TokenizerBase,
                               PreTrainedTokenizerBase]] = None
@@ -424,8 +443,6 @@ class LlmArgs:
     # A handful of options from PretrainedConfig
     embedding_parallel_mode: str = 'SHARDING_ALONG_VOCAB'
 
-    share_embedding_table: bool = False
-
     fast_build: bool = False
 
     # Once set, the model will reuse the build_cache
@@ -435,14 +452,24 @@ class LlmArgs:
 
     scheduler_config: Optional[SchedulerConfig] = None
 
+    # Speculative decoding parameters
+    speculative_config: Optional[Union[LookaheadDecodingConfig]] = None
+
     batching_type: Optional[BatchingType] = None
 
     normalize_log_probs: bool = False
 
+    extended_runtime_perf_knob_config: Optional[
+        ExtendedRuntimePerfKnobConfig] = None
+
+    # TODO: remove this option in the future
     use_runtime_defaults: bool = True
 
     # TODO[chunweiy]: Enable this by default and remove the option in the future
     enable_processes_for_single_gpu: bool = False
+
+    runtime_max_batch_size: Optional[int] = None
+    runtime_max_num_tokens: Optional[int] = None
 
 
     def __post_init__(self):
@@ -543,6 +570,9 @@ class LlmArgs:
                 raise ValueError(
                     f"Invalid build_cache_config: {self.enable_build_cache}")
         model_obj = _ModelWrapper(self.model)
+        speculative_model_obj = _ModelWrapper(
+            self.speculative_model
+        ) if self.speculative_model is not None else None
         if model_obj.is_local_model:
             # Load parallel_config from the engine.
             self.model_format = ModelLoader.get_model_format(self.model)
@@ -563,6 +593,9 @@ class LlmArgs:
                 self._load_config_from_ckpt(model_obj.model_dir)
         else:
             self.model_format = _ModelFormatKind.HF
+
+        if self.speculative_model and speculative_model_obj.is_local_model:
+            self.speculative_model_format = _ModelFormatKind.HF
 
         self.quant_config = self.quant_config or QuantConfig()
 
@@ -588,6 +621,26 @@ class LlmArgs:
 
         if self.perform_config_arbitration:
             self._perform_config_arbitration()
+
+        if self.speculative_config:
+            if isinstance(self.speculative_config, LookaheadDecodingConfig):
+                lookahead_config = self.speculative_config
+                # Update the build config
+                _, _, max_draft_tokens, _ = lookahead_config.calculate_speculative_resource(
+                )
+                self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.LOOKAHEAD_DECODING
+                if max_draft_tokens > self.build_config.max_draft_len:
+                    self.build_config.max_draft_len = max_draft_tokens
+
+                self.decoding_config = DecodingConfig(
+                    decoding_mode=DecodingMode.Lookahead(),
+                    lookahead_decoding_config=lookahead_config)
+            elif isinstance(self.speculative_config, MedusaDecodingConfig):
+                self.decoding_config = DecodingConfig(
+                    decoding_mode=DecodingMode.Medusa(),
+                    medusa_choices=self.speculative_config.medusa_choices)
+            else:
+                raise ValueError(f"Speculative config type not recognized")
 
     def _perform_config_arbitration(self):
         '''
@@ -705,9 +758,6 @@ class LlmArgs:
             raise ValueError(
                 f"Invalid embedding_parallel_mode: {self.llm_args.embedding_parallel_mode}"
             )
-
-        self._convert_checkpoint_options[
-            'share_embedding_table'] = self.share_embedding_table
 
     def _setup_build_config_into_config_arbitrator(self):
         # Setup the ConfigArbitrator with the plugin_config, the runtime configs such as KvCacheConfig should not be
@@ -953,6 +1003,9 @@ class ModelLoader:
         self.build_config = self.llm_args.build_config
 
         self.model_obj = _ModelWrapper(self.llm_args.model)
+        self.speculative_model_obj = _ModelWrapper(
+            self.llm_args.speculative_model
+        ) if self.llm_args.speculative_model is not None else None
         self.convert_checkpoint_options = self.llm_args._convert_checkpoint_options
         self.rank = mpi_rank() if llm_args.parallel_config.is_multi_gpu else 0
         if llm_args.parallel_config.is_multi_gpu and not llm_args.parallel_config.auto_parallel:
@@ -973,6 +1026,9 @@ class ModelLoader:
         # For model from hub, the _model_dir is None, and will updated once downloaded
         self._model_dir: Optional[
             Path] = self.model_obj.model_dir if self.model_obj.is_local_model else None
+
+        self._speculative_model_dir: Optional[
+            PATH] = self.speculative_model_obj.model_dir if self.speculative_model_obj is not None and self.model_obj.is_local_model else None
         self._model_info: Optional[_ModelInfo] = None
         self._model_format = self.llm_args.model_format
 
@@ -998,7 +1054,10 @@ class ModelLoader:
                  self._build_engine_from_inmemory_model))
             return
 
-        if self.model_obj.is_hub_model and self._model_format is not _ModelFormatKind.TLLM_ENGINE:
+        if (self.model_obj.is_hub_model
+                and self._model_format is not _ModelFormatKind.TLLM_ENGINE) or (
+                    self.speculative_model_obj
+                    and self.speculative_model_obj.is_hub_model):
             # Download HF model if necessary
             if self.model_obj.model_name is None:
                 raise ValueError(
@@ -1207,16 +1266,28 @@ class ModelLoader:
             model_dir = download_hf_model(self.model_obj.model_name,
                                           revision=self.llm_args.revision)
             print_colored(f"Downloaded model to {model_dir}\n", 'grey')
+            if self.speculative_model_obj:
+                speculative_model_dir = download_hf_model(
+                    self.speculative_model_obj.model_name)
+                print_colored(f"Downloaded model to {speculative_model_dir}\n",
+                              'grey')
         # Make all the processes got the same model_dir
         self._model_dir = mpi_broadcast(model_dir, root=0)
         self.model_obj.model_dir = self._model_dir  # mark as a local model
         assert self.model_obj.is_local_model
+        if self.speculative_model_obj:
+            self._speculative_model_dir = mpi_broadcast(speculative_model_dir,
+                                                        root=0)
+            self.speculative_model_dir = self._speculative_model_dir
+            assert self.speculative_model_obj.is_local_model
 
     def _load_model_from_hf(self):
         ''' Load a TRT-LLM model from a HF model. '''
         assert self._model_dir is not None
         model_cls = AutoModelForCausalLM.get_trtllm_model_class(
-            self._model_dir, self.llm_args.trust_remote_code)
+            self._model_dir, self.llm_args.trust_remote_code,
+            hasattr(self.llm_args, "speculative_model")
+            and self.llm_args.speculative_model)
         if self.llm_args.load_format == 'dummy':
             config = model_cls.config_class.from_hugging_face(
                 str(self._model_dir),
@@ -1252,6 +1323,10 @@ class ModelLoader:
                 load_model_on_cpu=
                 True,  # TODO:TRTLLM-195 to enhance the weights loading memory usage and chose best location
                 trust_remote_code=self.llm_args.trust_remote_code,
+                speculative_model=self._speculative_model_dir,
+                medusa_num_heads=self.llm_args.speculative_config.
+                num_medusa_heads if isinstance(self.llm_args.speculative_config,
+                                               MedusaDecodingConfig) else None,
                 **self.convert_checkpoint_options,
             )
 
@@ -1278,9 +1353,7 @@ class ModelLoader:
         self._model_info = _ModelInfo.from_pretrained_config(
             self.pretrained_config)
 
-        # load embedding sharing related options
-        self.convert_checkpoint_options[
-            'share_embedding_table'] = self.pretrained_config.share_embedding_table
+        # load parallel embedding related options
         self.convert_checkpoint_options[
             'use_parallel_embedding'] = self.pretrained_config.use_parallel_embedding
 

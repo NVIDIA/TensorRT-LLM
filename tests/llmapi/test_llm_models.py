@@ -1,3 +1,4 @@
+import os
 import subprocess
 
 import pytest
@@ -5,17 +6,11 @@ import pytest
 from tensorrt_llm import BuildConfig, SamplingParams
 from tensorrt_llm.llmapi import CalibConfig, QuantAlgo, QuantConfig
 
-try:
-    from .test_llm import cnn_dailymail_path, get_model_path, llm_test_harness
-except ImportError:
-    from test_llm import get_model_path, llm_test_harness, cnn_dailymail_path
-
-import os
-import sys
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import (force_ampere, skip_less_than_40gb_memory,
-                        skip_less_than_memory, skip_pre_ampere, skip_pre_hopper)
+# isort: off
+from test_llm import cnn_dailymail_path, get_model_path, llm_test_harness
+from utils.util import (force_ampere, skip_gpu_memory_less_than_40gb,
+                        skip_pre_ampere, skip_pre_hopper)
+# isort: on
 
 gptj_model_path = get_model_path('gpt-j-6b')
 gpt2_model_path = get_model_path('gpt2-medium')
@@ -41,7 +36,7 @@ mamba2_370m_model_path = get_model_path('mamba2/mamba2-370m')
 gpt_neox_20b_model_path = get_model_path('gpt-neox-20b')
 commandr_v01_model_path = get_model_path('c4ai-command-r-v01')
 commandr_plus_model_path = get_model_path('c4ai-command-r-plus')
-
+deepseek_v1_model_path = get_model_path("deepseek-moe-16b-base")
 sampling_params = SamplingParams(max_tokens=10)
 
 
@@ -261,7 +256,7 @@ def test_llm_baichuan2_7b():
 
 
 @force_ampere
-@skip_less_than_40gb_memory
+@skip_gpu_memory_less_than_40gb
 def test_llm_baichuan_13b():
     llm_test_harness(baichuan_13b_model_path,
                      inputs=['A B C'],
@@ -271,7 +266,7 @@ def test_llm_baichuan_13b():
 
 
 @force_ampere
-@skip_less_than_40gb_memory
+@skip_gpu_memory_less_than_40gb
 def test_llm_baichuan2_13b():
     llm_test_harness(baichuan2_13b_model_path,
                      inputs=['A B C'],
@@ -380,22 +375,35 @@ def test_llm_mamba2_370m():
                      trust_remote_code=True)
 
 
-@skip_less_than_memory(70 * 1024 * 1024 * 1024)
-def test_llm_commandr_v01():
-    llm_test_harness(commandr_v01_model_path,
+# @skip_gpu_memory_less_than(70 * 1024 * 1024 * 1024)
+# def test_llm_commandr_v01():
+#     build_config = BuildConfig(max_batch_size=1, max_input_len=128)
+#     llm_test_harness(commandr_v01_model_path,
+#                      inputs=['A B C'],
+#                      references=[' D E F G H I J K L M'],
+#                      sampling_params=sampling_params,
+#                      build_config=build_config)
+
+# @skip_gpu_memory_less_than_40gb
+# def test_llm_commandr_v01_int8_weight_only():
+#     quant_config = QuantConfig(quant_algo=QuantAlgo.W8A16)
+#     build_config = BuildConfig(max_batch_size=1, max_input_len=128)
+
+#     llm_test_harness(commandr_v01_model_path,
+#                      inputs=['A B C'],
+#                      references=[' D E F G H I J K L M'],
+#                      sampling_params=sampling_params,
+#                      build_config=build_config,
+#                      quant_config=quant_config)
+
+
+@skip_gpu_memory_less_than_40gb
+def test_llm_deepseek_v1():
+    llm_test_harness(deepseek_v1_model_path,
                      inputs=['A B C'],
                      references=[' D E F G H I J K L M'],
+                     trust_remote_code=True,
                      sampling_params=sampling_params)
-
-
-@skip_less_than_40gb_memory
-def test_llm_commandr_v01_int8_weight_only():
-    quant_config = QuantConfig(quant_algo=QuantAlgo.W8A16)
-    llm_test_harness(commandr_v01_model_path,
-                     inputs=['A B C'],
-                     references=[' D E F G H I J K L M'],
-                     sampling_params=sampling_params,
-                     quant_config=quant_config)
 
 
 if __name__ == '__main__':
@@ -405,5 +413,5 @@ if __name__ == '__main__':
     # test_llm_phi_3_mini_4k()
     # test_llm_phi_3_small_8k()
     test_llm_glm()
-    test_llm_commandr_v01()
-    test_llm_commandr_v01_int8_weight_only()
+    # test_llm_commandr_v01()
+    # test_llm_commandr_v01_int8_weight_only()

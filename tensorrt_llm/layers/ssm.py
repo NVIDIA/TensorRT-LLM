@@ -259,6 +259,9 @@ class Mamba2(Module):
         nheads = d_inner // headdim
         assert nheads % tp_size == 0
         self.nheads = nheads // tp_size
+        # conv1d needs alignment to 8 fp16s
+        self.pad_ldc = (self.nheads + 7) // 8 * 8 - self.nheads
+        pad_ldc = self.pad_ldc * tp_size
 
         self.A = Parameter(shape=(self.nheads, ), dtype="float32")
         self.D = Parameter(shape=(self.nheads, ), dtype="float32")
@@ -271,13 +274,14 @@ class Mamba2(Module):
                                     dtype=dtype,
                                     tp_group=tp_group,
                                     tp_size=tp_size,
-                                    gather_output=False)
+                                    gather_output=False,
+                                    pad_ldc=pad_ldc)
 
         self.conv_dim = (d_inner + 2 * ngroups * d_state) // tp_size
         self.conv1d = MambaConv1d(self.conv_dim,
                                   self.d_conv,
                                   pre_stride=self.d_inner,
-                                  post_stride=self.nheads,
+                                  post_stride=self.nheads + self.pad_ldc,
                                   dtype=self.dtype)
 
         if rmsnorm:

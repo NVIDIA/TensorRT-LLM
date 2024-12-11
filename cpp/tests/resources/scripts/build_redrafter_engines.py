@@ -50,6 +50,7 @@ def build_engine(base_model_dir: _pl.Path, drafter_model_dir: _pl.Path,
             '--max_seq_len=1024',
             '--log_level=error',
             '--paged_kv_cache=enable',
+            '--use_paged_context_fmha=enable',
             '--remove_input_padding=enable',
             '--speculative_decoding_mode=explicit_draft_tokens',
         ]

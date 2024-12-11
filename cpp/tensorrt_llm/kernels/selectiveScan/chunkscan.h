@@ -39,7 +39,7 @@ typedef void (*ChunkScanKernelFunc)(int B_, int L_, int H_, int P_, int G_, int 
                          //  const void *g_mxSt_, // float B*C*H*N*P
     void const* g_mxdc_, // float B*C*H*Q
     void const* g_mxdA_, // float B*C*H*Q
-                         //  const void *g_mxdt_, // Tp_   B*L*((g_mxZ?2:1)*H*P+2*G+H)
+                         //  const void *g_mxdt_, // Tp_   B*L*((g_mxZ?2:1)*H*P+2*G+round_up(H,8))
                          //  const void *g_mxdb_, // Wt_       H
                          //  const void *g_mxA_,  // Wt_       H
     void const* g_mxCB_, // Tp_   B*C*G*Q*Q
@@ -49,9 +49,8 @@ typedef void (*ChunkScanKernelFunc)(int B_, int L_, int H_, int P_, int G_, int 
     bool removePadding_, int const* lastTokenIdsPtr_);
 
 template <int Q_, int tileM_, int tileN_, int tileK_, // smem size, per sm
-    int wmmaM_, int wmmaN_, int wmmaK_,               // wmma size, per instruction
     int warpM_, int warpN_,                           // warp number
-    int pipeS_, class Tp_, class Wt_>
+    int pipeS_, int pipeR_, int group_, int bnChk_, class Tp_, class Wt_>
 __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __nv_bfloat16>> chunk_scan_kernel(int B_,
     int L_, int H_, int P_, int G_, int N_,
     void* g_mxY_,        // Tp_   B*L*H*P
@@ -60,7 +59,7 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
                          //  const void *g_mxSt_, // float B*C*H*N*P
     void const* g_mxdc_, // float B*C*H*Q
     void const* g_mxdA_, // float B*C*H*Q
-                         //  const void *g_mxdt_, // Tp_   B*L*((g_mxZ?2:1)*H*P+2*G+H)
+                         //  const void *g_mxdt_, // Tp_   B*L*((g_mxZ?2:1)*H*P+2*G+round_up(H,8))
                          //  const void *g_mxdb_, // Wt_       H
                          //  const void *g_mxA_,  // Wt_       H
     void const* g_mxCB_, // Tp_   B*C*G*Q*Q
@@ -71,6 +70,10 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     using namespace tensorrt_llm::common;
+
+    constexpr int wmmaM_ = 16; // wmma size, per instruction
+    constexpr int wmmaN_ = 8;
+    constexpr int wmmaK_ = 16;
 
     auto blockIdx_x = Rn<ID>{int(blockIdx.x)};
     auto blockIdx_y = Rn<ID>{int(blockIdx.y)};
@@ -90,7 +93,7 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
     auto C = Rn<ID>{div_up(L.var, Q_)};
 
     auto X_stride = Rn<ID>{H_ * P_ + 2 * G_ * N_};
-    auto Z_stride = Rn<ID>{(g_mxZ_ ? 2 : 1) * H_ * P_ + 2 * G_ * N_ + H_};
+    auto Z_stride = Rn<ID>{(g_mxZ_ ? 2 : 1) * H_ * P_ + 2 * G_ * N_ + round_up(H_, 8)};
 
     auto aStart = blockIdx_z * L;
     auto cStart = blockIdx_z * C;
@@ -108,9 +111,19 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
         C = Rn<ID>{div_up(L.var, Q_)};
     }
 
-    auto hStart = Rn<ID>{blockIdx_x.var / (P_ / cn<tileN_>) / (Q / cn<tileM_>) };
-    auto mStart = Rn<ID>{blockIdx_x.var / (P_ / cn<tileN_>) % (Q / cn<tileM_>) };
-    auto nStart = Rn<ID>{blockIdx_x.var % (P_ / cn<tileN_>) };
+    int numBlocks_m = H_ * (Q_ / tileM_);
+    int numBlocks_n = div_up(P_, tileN_);
+
+    int numBlocks_group = numBlocks_n * group_;
+    int blockIdx_0 = blockIdx.x / numBlocks_group * group_;
+    int group_m = std::min(group_, numBlocks_m - blockIdx_0);
+
+    int mStartInt = blockIdx.x % numBlocks_group % group_m + blockIdx_0;
+    int nStartInt = blockIdx.x % numBlocks_group / group_m;
+
+    auto hStart = Rn<ID>{mStartInt} / (Q / cn<tileM_>);
+    auto mStart = Rn<ID>{mStartInt} % (Q / cn<tileM_>);
+    auto nStart = Rn<ID>{nStartInt};
     auto gStart = Rn<ID>{hStart.var / (H_ / G_)};
 
     if (blockIdx_y * Q + mStart * cn<tileM_> >= L)
@@ -147,11 +160,16 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 
     using std::array;
 
-    register array<array<array<float, wmmaM_ * wmmaN_ / 32>, tileN_ / wmmaN_ / warpN_>, tileM_ / wmmaM_ / warpM_>
-        r_mxAcc
+    array<array<array<float, wmmaM_ * wmmaN_ / 32>, tileN_ / wmmaN_ / warpN_>, tileM_ / wmmaM_ / warpM_> r_mxAcc
         = array<array<array<float, wmmaM_ * wmmaN_ / 32>, tileN_ / wmmaN_ / warpN_>, tileM_ / wmmaM_ / warpM_>();
-    register array<array<unsigned, wmmaM_ * wmmaK_ / 64>, tileM_ / wmmaM_ / warpM_> r_mxL;
-    register array<array<unsigned, wmmaK_ * wmmaN_ / 64>, tileN_ / wmmaN_ / warpN_> r_mxR;
+    array<array<array<unsigned, wmmaM_ * wmmaK_ / 64>, tileM_ / wmmaM_ / warpM_>, pipeR_> r_mxL;
+    array<array<array<unsigned, wmmaK_ * wmmaN_ / 64>, tileN_ / wmmaN_ / warpN_>, pipeR_> r_mxR;
+
+    if (pipeR_ == 2)
+    {
+        r_mxL = array<array<array<unsigned, wmmaM_ * wmmaK_ / 64>, tileM_ / wmmaM_ / warpM_>, pipeR_>();
+        r_mxR = array<array<array<unsigned, wmmaK_ * wmmaN_ / 64>, tileN_ / wmmaN_ / warpN_>, pipeR_>();
+    }
 
     constexpr int step = std::max(
         1, tileM_ / wmmaM_ / warpM_ * tileN_ / wmmaN_ / warpN_ / (tileM_ / wmmaM_ / warpM_ + tileN_ / wmmaN_ / warpN_));
@@ -196,7 +214,8 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 
 #pragma unroll
         for (Rn<UNROLL, div_up(tileN_ * tileK_, warpM_ * warpN_ * 256)> iStep; iStep.var < iStep.size; iStep.var++)
-            if (thread(iStep) < cn<tileN_ * tileK_>)
+            if (thread(iStep) < cn<tileN_ * tileK_>
+                && (!bnChk_ || nStart * cn<tileN_> + thread(iStep) % cn<tileN_> < P))
                 cp_shared_global<16>(b_mxR + swizzle<tileN_ * 2, tileN_ * 2>(thread(iStep) * cn<2>, baseR(iK) * cn<2>),
                     g_mxOs
                         + get(hStart * N * P + (iK * cn<tileK_> + thread(iStep) / cn<tileN_>) *P + nStart * cn<tileN_>
@@ -209,7 +228,7 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 
     __syncthreads();
 
-    int Q1 = std::min(Q_, (mStart.var + 1) * tileM_);
+    int Q1 = std::min(Q_, (get(mStart) + 1) * tileM_);
 
     for (int iK = pipeS_; iK < (N_ + Q1) / tileK_ + pipeS_; iK++)
     {
@@ -241,7 +260,7 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
             for (Rn<UNROLL, div_up(tileM_ * tileK_, warpM_ * warpN_ * 256)> iStep; iStep.var < iStep.size; iStep.var++)
                 if (thread(iStep) < cn<tileM_ * tileK_>)
                 {
-                    register Tp_ tmpL[8];
+                    Tp_ tmpL[8];
 
                     *(int4*) &tmpL[0] = *(int4*) ((char*) s_mxL
                         + swizzle<tileK_ * 2, tileK_ * 2>(thread(iStep) * cn<2>, baseL(jK) * cn<2>));
@@ -300,7 +319,8 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
                         if (y1 >= 0 && y1 < tileM_ / wmmaM_ / warpM_)
                         {
                             if (wmmaK_ == 16)
-                                ldmatrix_x4<>(r_mxL[y1][0], r_mxL[y1][1], r_mxL[y1][2], r_mxL[y1][3],
+                                ldmatrix_x4<>(r_mxL[k % pipeR_][y1][0], r_mxL[k % pipeR_][y1][1],
+                                    r_mxL[k % pipeR_][y1][2], r_mxL[k % pipeR_][y1][3],
                                     b_mxL + iK % pipeS_ * (tileM_ * tileK_ * 2)
                                         + 2
                                             * swz<tileK_ * 2, tileK_>(y1 * warpM_ * wmmaM_ * tileK_ + k * wmmaK_
@@ -311,14 +331,20 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
                         if (x1 >= 0 && x1 < tileN_ / wmmaN_ / warpN_)
                         {
                             if (wmmaK_ == 16 && x1 % 2 == 0)
-                                ldmatrix_x4</* trans_ = */ true>(r_mxR[x1][0], r_mxR[x1][1], r_mxR[x1 + 1][0],
-                                    r_mxR[x1 + 1][1],
+                                ldmatrix_x4</* trans_ = */ true>(r_mxR[k % pipeR_][x1][0], r_mxR[k % pipeR_][x1][1],
+                                    r_mxR[k % pipeR_][x1 + 1][0], r_mxR[k % pipeR_][x1 + 1][1],
                                     b_mxR + iK % pipeS_ * (tileK_ * tileN_ * 2)
                                         + 2
                                             * swz<tileN_ * 2, tileN_>(x1 * warpN_ * wmmaN_ + k * wmmaK_ * tileN_
                                                 + threadIdx.y * wmmaN_ + threadIdx.x % wmmaK_ * tileN_
                                                 + threadIdx.x / wmmaK_ * warpN_ * wmmaN_));
                         }
+                    }
+
+                    if (pipeR_ == 2)
+                    {
+                        if (wmmaK_ == 16)
+                            mma<Tp_>(r_mxAcc[y][x], r_mxL[(k + 1) % pipeR_][y], r_mxR[(k + 1) % pipeR_][x]);
                     }
                 }
 
@@ -327,7 +353,11 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 #pragma unroll
                 for (int x = 0; x < tileN_ / wmmaN_ / warpN_; x++)
                 {
-                    mma<Tp_>(r_mxAcc[y][x], r_mxL[y], r_mxR[x]);
+                    if (pipeR_ == 1)
+                    {
+                        if (wmmaK_ == 16)
+                            mma<Tp_>(r_mxAcc[y][x], r_mxL[(k + 1) % pipeR_][y], r_mxR[(k + 1) % pipeR_][x]);
+                    }
                 }
         }
 
@@ -351,7 +381,8 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 
 #pragma unroll
             for (Rn<UNROLL, div_up(tileN_ * tileK_, warpM_ * warpN_ * 256)> iStep; iStep.var < iStep.size; iStep.var++)
-                if (thread(iStep) < cn<tileN_ * tileK_>)
+                if (thread(iStep) < cn<tileN_ * tileK_>
+                    && (!bnChk_ || nStart * cn<tileN_> + thread(iStep) % cn<tileN_> < P))
                     cp_shared_global<16>(
                         b_mxR + swizzle<tileN_ * 2, tileN_ * 2>(thread(iStep) * cn<2>, baseR(jK) * cn<2>),
                         g_mxOs
@@ -373,7 +404,8 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 #pragma unroll
             for (Rn<UNROLL, div_up(tileN_ * tileK_, warpM_ * warpN_ * 256)> iStep; iStep.var < iStep.size; iStep.var++)
                 if (thread(iStep) < cn<tileN_ * tileK_>
-                    && thread(iStep) / cn<tileN_> < L - blockIdx_y * Q - jK * cn<tileK_> + N)
+                    && thread(iStep) / cn<tileN_> < L - blockIdx_y * Q - jK * cn<tileK_> + N
+                    && (!bnChk_ || nStart * cn<tileN_> + thread(iStep) % cn<tileN_> < P))
                     cp_shared_global<16>(
                         b_mxR + swizzle<tileN_ * 2, tileN_ * 2>(thread(iStep) * cn<2>, baseR(jK) * cn<2>),
                         g_mxX
@@ -405,8 +437,12 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
                 float tmp32[4] = {0};
 
                 if (blockIdx_y * Q + mStart * cn<tileM_> + Rn<UNROLL>{y} * cn<warpM_ * wmmaM_>
-                        + threadIdx_z * cn<wmmaM_> + threadIdx_x / cn<4>
-                    < L)
+                            + threadIdx_z * cn<wmmaM_> + threadIdx_x / cn<4>
+                        < L
+                    && (!bnChk_
+                        || nStart * cn<tileN_> + Rn<UNROLL>{x} * cn<warpN_ * wmmaN_> + threadIdx_y * cn<wmmaN_>
+                                + threadIdx_x % cn<4> * cn<2>
+                            < P))
                 {
                     *(int*) &tmp16[0] = *(int*) (g_mxX
                         + get((mStart * cn<tileM_> + Rn<UNROLL>{y} * cn<warpM_ * wmmaM_> + threadIdx_z * cn<wmmaM_>
@@ -422,8 +458,12 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
                 }
 
                 if (blockIdx_y * Q + mStart * cn<tileM_> + Rn<UNROLL>{y} * cn<warpM_ * wmmaM_> + cn<8>
-                        + threadIdx_z * cn<wmmaM_> + threadIdx_x / cn<4>
-                    < L)
+                            + threadIdx_z * cn<wmmaM_> + threadIdx_x / cn<4>
+                        < L
+                    && (!bnChk_
+                        || nStart * cn<tileN_> + Rn<UNROLL>{x} * cn<warpN_ * wmmaN_> + threadIdx_y * cn<wmmaN_>
+                                + threadIdx_x % cn<4> * cn<2>
+                            < P))
                 {
                     *(int*) &tmp16[2] = *(int*) (g_mxX
                         + get((mStart * cn<tileM_> + Rn<UNROLL>{y} * cn<warpM_ * wmmaM_> + cn<8>
@@ -451,8 +491,12 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
                 float tmp32[4] = {0};
 
                 if (blockIdx_y * Q + mStart * cn<tileM_> + Rn<UNROLL>{y} * cn<warpM_ * wmmaM_>
-                        + threadIdx_z * cn<wmmaM_> + threadIdx_x / cn<4>
-                    < L)
+                            + threadIdx_z * cn<wmmaM_> + threadIdx_x / cn<4>
+                        < L
+                    && (!bnChk_
+                        || nStart * cn<tileN_> + Rn<UNROLL>{x} * cn<warpN_ * wmmaN_> + threadIdx_y * cn<wmmaN_>
+                                + threadIdx_x % cn<4> * cn<2>
+                            < P))
                 {
                     *(int*) &tmp16[0] = *(int*) (g_mxZ
                         + get((mStart * cn<tileM_> + Rn<UNROLL>{y} * cn<warpM_ * wmmaM_> + threadIdx_z * cn<wmmaM_>
@@ -463,13 +507,19 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
                     *(float2*) &tmp32[0] = std::is_same_v<Tp_, half> ? __half22float2(*(half2*) &tmp16[0])
                                                                      : bf1622float2(*(bf162*) &tmp16[0]);
 
-                    r_mxAcc[y][x][0] *= tmp32[0] > 32.f ? tmp32[0] : tmp32[0] / (1.f + expf(-tmp32[0]));
-                    r_mxAcc[y][x][1] *= tmp32[1] > 32.f ? tmp32[1] : tmp32[1] / (1.f + expf(-tmp32[1]));
+                    float cut0 = std::max(tmp32[0], -256.f);
+                    float cut1 = std::max(tmp32[1], -256.f);
+                    r_mxAcc[y][x][0] *= cut0 / (1.f + expf(-cut0));
+                    r_mxAcc[y][x][1] *= cut1 / (1.f + expf(-cut1));
                 }
 
                 if (blockIdx_y * Q + mStart * cn<tileM_> + Rn<UNROLL>{y} * cn<warpM_ * wmmaM_> + cn<8>
-                        + threadIdx_z * cn<wmmaM_> + threadIdx_x / cn<4>
-                    < L)
+                            + threadIdx_z * cn<wmmaM_> + threadIdx_x / cn<4>
+                        < L
+                    && (!bnChk_
+                        || nStart * cn<tileN_> + Rn<UNROLL>{x} * cn<warpN_ * wmmaN_> + threadIdx_y * cn<wmmaN_>
+                                + threadIdx_x % cn<4> * cn<2>
+                            < P))
                 {
                     *(int*) &tmp16[2] = *(int*) (g_mxZ
                         + get((mStart * cn<tileM_> + Rn<UNROLL>{y} * cn<warpM_ * wmmaM_> + cn<8>
@@ -480,8 +530,10 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
                     *(float2*) &tmp32[2] = std::is_same_v<Tp_, half> ? __half22float2(*(half2*) &tmp16[2])
                                                                      : bf1622float2(*(bf162*) &tmp16[2]);
 
-                    r_mxAcc[y][x][2] *= tmp32[2] > 32.f ? tmp32[2] : tmp32[2] / (1.f + expf(-tmp32[2]));
-                    r_mxAcc[y][x][3] *= tmp32[3] > 32.f ? tmp32[3] : tmp32[3] / (1.f + expf(-tmp32[3]));
+                    float cut2 = std::max(tmp32[2], -256.f);
+                    float cut3 = std::max(tmp32[3], -256.f);
+                    r_mxAcc[y][x][2] *= cut2 / (1.f + expf(-cut2));
+                    r_mxAcc[y][x][3] *= cut3 / (1.f + expf(-cut3));
                 }
             }
     }
@@ -491,6 +543,12 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 #pragma unroll
         for (int x = 0; x < tileN_ / wmmaN_ / warpN_; x++)
         {
+            if (pipeR_ == 2)
+            {
+                if (wmmaK_ == 16)
+                    mma<Tp_>(r_mxAcc[y][x], r_mxL[1][y], r_mxR[1][x]);
+            }
+
             if (std::is_same_v<Tp_, half>)
             {
                 *(half2*) &r_mxAcc[y][x][0] = __floats2half2_rn(r_mxAcc[y][x][0], r_mxAcc[y][x][1]);
@@ -526,8 +584,8 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 
 #pragma unroll
     for (Rn<UNROLL, div_up(tileM_ * tileN_, warpM_ * warpN_ * 256)> iStep; iStep.var < iStep.size; iStep.var++)
-        if (thread(iStep) < cn<tileM_ * tileN_>
-            && thread(iStep) / cn<tileN_> < L - blockIdx_y * Q - mStart * cn<tileM_>)
+        if (thread(iStep) < cn<tileM_ * tileN_> && thread(iStep) / cn<tileN_> < L - blockIdx_y * Q - mStart * cn<tileM_>
+            && (!bnChk_ || nStart * cn<tileN_> + thread(iStep) % cn<tileN_> < P))
             *(int4*) (g_mxY
                 + get((mStart * cn<tileM_> + thread(iStep) / cn<tileN_>) *H * P + hStart * P + nStart * cn<tileN_>
                     + thread(iStep) % cn<tileN_>))
@@ -536,9 +594,8 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 }
 
 template <int Q_, int tileM_, int tileN_, int tileK_, // smem size, per sm
-    int wmmaM_, int wmmaN_, int wmmaK_,               // wmma size, per instruction
     int warpM_, int warpN_,                           // warp number
-    int pipeS_, class Tp_, class Wt_>
+    int pipeS_, int pipeR_, int group_, int bnChk_, class Tp_, class Wt_>
 __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __nv_bfloat16>> chunk_scan_hopper(int B_,
     int L_, int H_, int P_, int G_, int N_,
     void* g_mxY_,        // Tp_   B*L*H*P
@@ -547,7 +604,7 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
                          //  const void *g_mxSt_, // float B*C*H*N*P
     void const* g_mxdc_, // float B*C*H*Q
     void const* g_mxdA_, // float B*C*H*Q
-                         //  const void *g_mxdt_, // Tp_   B*L*((g_mxZ?2:1)*H*P+2*G+H)
+                         //  const void *g_mxdt_, // Tp_   B*L*((g_mxZ?2:1)*H*P+2*G+round_up(H,8))
                          //  const void *g_mxdb_, // Wt_       H
                          //  const void *g_mxA_,  // Wt_       H
     void const* g_mxCB_, // Tp_   B*C*G*Q*Q
@@ -558,6 +615,10 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900 && defined(__CUDA_ARCH_FEAT_SM90_ALL)
     using namespace tensorrt_llm::common;
+
+    constexpr int wmmaM_ = 16; // wmma size, per instruction
+    constexpr int wmmaN_ = 8;
+    constexpr int wmmaK_ = 16;
 
     auto blockIdx_x = Rn<ID>{int(blockIdx.x)};
     auto blockIdx_y = Rn<ID>{int(blockIdx.y)};
@@ -577,7 +638,7 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
     auto C = Rn<ID>{div_up(L.var, Q_)};
 
     auto X_stride = Rn<ID>{H_ * P_ + 2 * G_ * N_};
-    auto Z_stride = Rn<ID>{(g_mxZ_ ? 2 : 1) * H_ * P_ + 2 * G_ * N_ + H_};
+    auto Z_stride = Rn<ID>{(g_mxZ_ ? 2 : 1) * H_ * P_ + 2 * G_ * N_ + round_up(H_, 8)};
 
     auto aStart = blockIdx_z * L;
     auto cStart = blockIdx_z * C;
@@ -595,9 +656,19 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
         C = Rn<ID>{div_up(L.var, Q_)};
     }
 
-    auto hStart = Rn<ID>{blockIdx_x.var / (P_ / cn<tileN_>) / (Q / cn<tileM_>) };
-    auto mStart = Rn<ID>{blockIdx_x.var / (P_ / cn<tileN_>) % (Q / cn<tileM_>) };
-    auto nStart = Rn<ID>{blockIdx_x.var % (P_ / cn<tileN_>) };
+    int numBlocks_m = H_ * (Q_ / tileM_);
+    int numBlocks_n = div_up(P_, tileN_);
+
+    int numBlocks_group = numBlocks_n * group_;
+    int blockIdx_0 = blockIdx.x / numBlocks_group * group_;
+    int group_m = std::min(group_, numBlocks_m - blockIdx_0);
+
+    int mStartInt = blockIdx.x % numBlocks_group % group_m + blockIdx_0;
+    int nStartInt = blockIdx.x % numBlocks_group / group_m;
+
+    auto hStart = Rn<ID>{mStartInt} / (Q / cn<tileM_>);
+    auto mStart = Rn<ID>{mStartInt} % (Q / cn<tileM_>);
+    auto nStart = Rn<ID>{nStartInt};
     auto gStart = Rn<ID>{hStart.var / (H_ / G_)};
 
     if (blockIdx_y * Q + mStart * cn<tileM_> >= L)
@@ -635,16 +706,17 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
     unsigned b_mbar = b_base;
 
     uint32_t formatL = tileK_ >= 64 ? 1 : (tileK_ == 32 ? 2 : 3);
-    uint32_t formatR = 1;
+    uint32_t formatR = tileN_ >= 64 ? 1 : (tileN_ == 32 ? 2 : 3);
     uint32_t baseOffsetL = 0;
     uint32_t baseOffsetR = 0;
     uint32_t strideDimL = tileK_ >= 64 ? warpM_ / 4 * 64 : warpM_ / 4 * tileK_;
-    uint32_t strideDimR = 64;
+    uint32_t strideDimR = tileN_ >= 64 ? 64 : tileN_;
     uint32_t leadingDimL = 0;
-    uint32_t leadingDimR = tileK_ * 8;
+    uint32_t leadingDimR = tileN_ >= 64 ? tileK_ * 8 : 0;
     uint32_t startAddrL = (b_mxL + threadIdx.y / 4 * 8 * tileK_ * 2) / 16;
-    uint32_t startAddrR
-        = (b_mxR + threadIdx.z * tileN_ / warpN_ % 64 * 2 + threadIdx.z * tileN_ / warpN_ / 64 * tileK_ * 128) / 16;
+    uint32_t startAddrR = (b_mxR + threadIdx.z * tileN_ / warpN_ % strideDimR * 2
+                              + threadIdx.z * tileN_ / warpN_ / strideDimR * tileK_ * strideDimR * 2)
+        / 16;
 
     uint64_t d_mxL = ((uint64_t) formatL << 62) + ((uint64_t) baseOffsetL << 49) + ((uint64_t) strideDimL << 32)
         + ((uint64_t) leadingDimL << 16) + ((uint64_t) startAddrL);
@@ -653,8 +725,7 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 
     using std::array;
 
-    register array<array<array<float, wmmaM_ * wmmaN_ / 32>, tileN_ / wmmaN_ / warpN_>, tileM_ / wmmaM_ / warpM_>
-        r_mxAcc
+    array<array<array<float, wmmaM_ * wmmaN_ / 32>, tileN_ / wmmaN_ / warpN_>, tileM_ / wmmaM_ / warpM_> r_mxAcc
         = array<array<array<float, wmmaM_ * wmmaN_ / 32>, tileN_ / wmmaN_ / warpN_>, tileM_ / wmmaM_ / warpM_>();
 
     auto baseL = [](auto iK) { return iK % cn<pipeS_> * cn<tileM_> * cn<tileK_>; };
@@ -720,7 +791,7 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 
     __syncthreads();
 
-    int Q1 = std::min(Q_, (mStart.var + 1) * tileM_);
+    int Q1 = std::min(Q_, (get(mStart) + 1) * tileM_);
 
     for (int iK = pipeS_; iK < (N_ + Q1) / tileK_ + pipeS_; iK++)
     {
@@ -766,7 +837,7 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
             for (Rn<UNROLL, div_up(tileM_ * tileK_, warpM_ * warpN_ * 256)> iStep; iStep.var < iStep.size; iStep.var++)
                 if (thread(iStep) < cn<tileM_ * tileK_>)
                 {
-                    register Tp_ tmpL[8];
+                    Tp_ tmpL[8];
 
                     *(int4*) &tmpL[0]
                         = *(int4*) ((char*) s_mxL + swizzle<tileK_ * 2, 128>(thread(iStep) * cn<2>, baseL(jK) * cn<2>));
@@ -819,8 +890,8 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 #pragma unroll
             for (int y = 0; y < tileM_ / wmmaM_ / warpM_; y++)
             {
-                wgmma<Tp_, 0, 1>(
-                    r_mxAcc[y], d_mxL0 + k * 2 + y * warpM_ * wmmaM_ * (tileK_ * 2 / 16), d_mxR0 + k * 128);
+                wgmma<Tp_, 0, 1>(r_mxAcc[y], d_mxL0 + k * 2 + y * warpM_ * wmmaM_ * (tileK_ * 2 / 16),
+                    d_mxR0 + k * (tileN_ >= 64 ? 128 : 64));
             }
         }
 
@@ -897,9 +968,13 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
                 float tmp32[4] = {0};
 
                 if (blockIdx_y * Q + mStart * cn<tileM_> + Rn<UNROLL>{y} * cn<warpM_ * wmmaM_>
-                        + threadIdx_y / cn<4> * cn<8> + threadIdx_y % cn<4> * cn<warpM_ / 4 * wmmaM_>
-                        + threadIdx_x / cn<4>
-                    < L)
+                            + threadIdx_y / cn<4> * cn<8> + threadIdx_y % cn<4> * cn<warpM_ / 4 * wmmaM_>
+                            + threadIdx_x / cn<4>
+                        < L
+                    && (!bnChk_
+                        || nStart * cn<tileN_> + Rn<UNROLL>{x} * cn<wmmaN_> + threadIdx_z * cn<tileN_ / warpN_>
+                                + threadIdx_x % cn<4> * cn<2>
+                            < P))
                 {
                     *(int*) &tmp16[0] = *(int*) (g_mxX
                         + get((mStart * cn<tileM_> + Rn<UNROLL>{y} * cn<warpM_ * wmmaM_> + threadIdx_y / cn<4> * cn<8>
@@ -915,9 +990,13 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
                 }
 
                 if (blockIdx_y * Q + mStart * cn<tileM_> + Rn<UNROLL>{y} * cn<warpM_ * wmmaM_> + cn<warpM_ / 4 * 8>
-                        + threadIdx_y / cn<4> * cn<8> + threadIdx_y % cn<4> * cn<warpM_ / 4 * wmmaM_>
-                        + threadIdx_x / cn<4>
-                    < L)
+                            + threadIdx_y / cn<4> * cn<8> + threadIdx_y % cn<4> * cn<warpM_ / 4 * wmmaM_>
+                            + threadIdx_x / cn<4>
+                        < L
+                    && (!bnChk_
+                        || nStart * cn<tileN_> + Rn<UNROLL>{x} * cn<wmmaN_> + threadIdx_z * cn<tileN_ / warpN_>
+                                + threadIdx_x % cn<4> * cn<2>
+                            < P))
                 {
                     *(int*) &tmp16[2] = *(int*) (g_mxX
                         + get((mStart * cn<tileM_> + Rn<UNROLL>{y} * cn<warpM_ * wmmaM_> + cn<warpM_ / 4 * 8>
@@ -946,9 +1025,13 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
                 float tmp32[4] = {0};
 
                 if (blockIdx_y * Q + mStart * cn<tileM_> + Rn<UNROLL>{y} * cn<warpM_ * wmmaM_>
-                        + threadIdx_y / cn<4> * cn<8> + threadIdx_y % cn<4> * cn<warpM_ / 4 * wmmaM_>
-                        + threadIdx_x / cn<4>
-                    < L)
+                            + threadIdx_y / cn<4> * cn<8> + threadIdx_y % cn<4> * cn<warpM_ / 4 * wmmaM_>
+                            + threadIdx_x / cn<4>
+                        < L
+                    && (!bnChk_
+                        || nStart * cn<tileN_> + Rn<UNROLL>{x} * cn<wmmaN_> + threadIdx_z * cn<tileN_ / warpN_>
+                                + threadIdx_x % cn<4> * cn<2>
+                            < P))
                 {
                     *(int*) &tmp16[0] = *(int*) (g_mxZ
                         + get((mStart * cn<tileM_> + Rn<UNROLL>{y} * cn<warpM_ * wmmaM_> + threadIdx_y / cn<4> * cn<8>
@@ -959,14 +1042,20 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
                     *(float2*) &tmp32[0] = std::is_same_v<Tp_, half> ? __half22float2(*(half2*) &tmp16[0])
                                                                      : bf1622float2(*(bf162*) &tmp16[0]);
 
-                    r_mxAcc[y][x][0] *= tmp32[0] > 32.f ? tmp32[0] : tmp32[0] / (1.f + expf(-tmp32[0]));
-                    r_mxAcc[y][x][1] *= tmp32[1] > 32.f ? tmp32[1] : tmp32[1] / (1.f + expf(-tmp32[1]));
+                    float cut0 = std::max(tmp32[0], -256.f);
+                    float cut1 = std::max(tmp32[1], -256.f);
+                    r_mxAcc[y][x][0] *= cut0 / (1.f + expf(-cut0));
+                    r_mxAcc[y][x][1] *= cut1 / (1.f + expf(-cut1));
                 }
 
                 if (blockIdx_y * Q + mStart * cn<tileM_> + Rn<UNROLL>{y} * cn<warpM_ * wmmaM_> + cn<warpM_ / 4 * 8>
-                        + threadIdx_y / cn<4> * cn<8> + threadIdx_y % cn<4> * cn<warpM_ / 4 * wmmaM_>
-                        + threadIdx_x / cn<4>
-                    < L)
+                            + threadIdx_y / cn<4> * cn<8> + threadIdx_y % cn<4> * cn<warpM_ / 4 * wmmaM_>
+                            + threadIdx_x / cn<4>
+                        < L
+                    && (!bnChk_
+                        || nStart * cn<tileN_> + Rn<UNROLL>{x} * cn<wmmaN_> + threadIdx_z * cn<tileN_ / warpN_>
+                                + threadIdx_x % cn<4> * cn<2>
+                            < P))
                 {
                     *(int*) &tmp16[2] = *(int*) (g_mxZ
                         + get((mStart * cn<tileM_> + Rn<UNROLL>{y} * cn<warpM_ * wmmaM_> + cn<warpM_ / 4 * 8>
@@ -978,8 +1067,10 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
                     *(float2*) &tmp32[2] = std::is_same_v<Tp_, half> ? __half22float2(*(half2*) &tmp16[2])
                                                                      : bf1622float2(*(bf162*) &tmp16[2]);
 
-                    r_mxAcc[y][x][2] *= tmp32[2] > 32.f ? tmp32[2] : tmp32[2] / (1.f + expf(-tmp32[2]));
-                    r_mxAcc[y][x][3] *= tmp32[3] > 32.f ? tmp32[3] : tmp32[3] / (1.f + expf(-tmp32[3]));
+                    float cut2 = std::max(tmp32[2], -256.f);
+                    float cut3 = std::max(tmp32[3], -256.f);
+                    r_mxAcc[y][x][2] *= cut2 / (1.f + expf(-cut2));
+                    r_mxAcc[y][x][3] *= cut3 / (1.f + expf(-cut3));
                 }
             }
     }
@@ -1028,8 +1119,8 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 
 #pragma unroll
     for (Rn<UNROLL, div_up(tileM_ * tileN_, warpM_ * warpN_ * 256)> iStep; iStep.var < iStep.size; iStep.var++)
-        if (thread(iStep) < cn<tileM_ * tileN_>
-            && thread(iStep) / cn<tileN_> < L - blockIdx_y * Q - mStart * cn<tileM_>)
+        if (thread(iStep) < cn<tileM_ * tileN_> && thread(iStep) / cn<tileN_> < L - blockIdx_y * Q - mStart * cn<tileM_>
+            && (!bnChk_ || nStart * cn<tileN_> + thread(iStep) % cn<tileN_> < P))
             *(int4*) (g_mxY
                 + get((mStart * cn<tileM_> + thread(iStep) / cn<tileN_>) *H * P + hStart * P + nStart * cn<tileN_>
                     + thread(iStep) % cn<tileN_>))
@@ -1049,20 +1140,21 @@ ChunkScanKernelFunc getChunkScanKernel(int B_, int L_, int H_, int P_, int G_, i
     int B = B_;
     int L = L_;
     int H = H_;
-    int P = P_;
+    int P = round_up(P_, 32);
     int G = G_;
     int N = N_;
     int Q = Q_;
     int C = div_up(L, Q);
 
-    int64_t compute = int64_t(numTokens_) * H * Q * P * (N + Q);
+    int64_t compute = int64_t(numTokens_) * H * P_ * (N + Q);
 
-    auto setLaunchParams = [&](int tileM, int tileN, int tileK, int warpM, int warpN, int pipeS, int useTma)
+    auto set
+        = [&](int tileM, int tileN, int tileK, int warpM, int warpN, int pipeS, int useTma, ChunkScanKernelFunc func)
     {
         auto sharedMem
             = useTma * 1024 + std::max((tileM * tileK + tileK * tileN) * pipeS * 2 + Q * 8, (tileM * tileN) * 2);
 
-        *blockDims_ = dim3(H * P / tileN * Q / tileM, C, B);
+        *blockDims_ = dim3(H * div_up(P, tileN) * Q / tileM, C, B);
         *threadDims_ = dim3(32, useTma ? warpM : warpN, useTma ? warpN : warpM);
         *sharedMem_ = sharedMem;
         *useTma_ = useTma;
@@ -1070,7 +1162,7 @@ ChunkScanKernelFunc getChunkScanKernel(int B_, int L_, int H_, int P_, int G_, i
         if (useTma)
         {
             {
-                std::array<uint64_t, 2> tensorStrides{2uL * N, 2uL * (H * P + 2 * G * N)};
+                std::array<uint64_t, 2> tensorStrides{2uL * N, 2uL * (H * P_ + 2 * G * N)};
                 std::array<uint64_t, 3> tensorSizes{1uL * N, 1uL * G, 1uL * numTokens_};
                 std::array<uint32_t, 3> traveralStrides{1u, 1u, 1u};
                 std::array<uint32_t, 3> boxSizes{(uint32_t) tileK, 1u, (uint32_t) tileM};
@@ -1081,15 +1173,16 @@ ChunkScanKernelFunc getChunkScanKernel(int B_, int L_, int H_, int P_, int G_, i
                     CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
             }
             {
-                std::array<uint64_t, 3> tensorStrides{2uL * P, 2uL * N * P, 2uL * H * N * P};
-                std::array<uint64_t, 4> tensorSizes{1uL * P, 1uL * N, 1uL * H, 1uL * div_up(numTokens_ + B * Q - Q, Q)};
+                std::array<uint64_t, 3> tensorStrides{2uL * P_, 2uL * N * P_, 2uL * H * N * P_};
+                std::array<uint64_t, 4> tensorSizes{
+                    1uL * P_, 1uL * N, 1uL * H, 1uL * div_up(numTokens_ + B * Q - Q, Q)};
                 std::array<uint32_t, 4> traveralStrides{1u, 1u, 1u, 1u};
-                std::array<uint32_t, 4> boxSizes{64u, (uint32_t) tileK, 1u, 1u};
+                std::array<uint32_t, 4> boxSizes{tileN >= 64 ? 64u : (uint32_t) tileN, (uint32_t) tileK, 1u, 1u};
 
                 cudaDriver_->cuTensorMapEncodeTiled(&descs_[1], CU_TENSOR_MAP_DATA_TYPE_FLOAT16, 4, nullptr,
                     &tensorSizes[0], &tensorStrides[0], &boxSizes[0], &traveralStrides[0],
-                    CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
-                    CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+                    CU_TENSOR_MAP_INTERLEAVE_NONE, tileN >= 64 ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_64B,
+                    CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
             }
             {
                 std::array<uint64_t, 3> tensorStrides{2uL * Q, 2uL * Q * Q, 2uL * G * Q * Q};
@@ -1103,375 +1196,709 @@ ChunkScanKernelFunc getChunkScanKernel(int B_, int L_, int H_, int P_, int G_, i
                     CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
             }
             {
-                std::array<uint64_t, 2> tensorStrides{2uL * P, 2uL * (H * P + 2 * G * N)};
-                std::array<uint64_t, 3> tensorSizes{1uL * P, 1uL * H, 1uL * numTokens_};
+                std::array<uint64_t, 2> tensorStrides{2uL * P_, 2uL * (H * P_ + 2 * G * N)};
+                std::array<uint64_t, 3> tensorSizes{1uL * P_, 1uL * H, 1uL * numTokens_};
                 std::array<uint32_t, 3> traveralStrides{1u, 1u, 1u};
-                std::array<uint32_t, 3> boxSizes{64u, 1u, (uint32_t) tileK};
+                std::array<uint32_t, 3> boxSizes{tileN >= 64 ? 64u : (uint32_t) tileN, 1u, (uint32_t) tileK};
 
                 cudaDriver_->cuTensorMapEncodeTiled(&descs_[3], CU_TENSOR_MAP_DATA_TYPE_FLOAT16, 3, nullptr,
                     &tensorSizes[0], &tensorStrides[0], &boxSizes[0], &traveralStrides[0],
-                    CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
-                    CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+                    CU_TENSOR_MAP_INTERLEAVE_NONE, tileN >= 64 ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_64B,
+                    CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
             }
         }
+
+        return func;
     };
 
-    if (isHopper_)
+    if (isHopper_) // Hopper kernel
     {
 #ifndef FAST_BUILD
-        if (Q_ == 256 && P_ % 256 == 0)
+        if (Q_ == 256 && P_ % 256 == 0 && N_ >= 256)
         {
-            if (compute >= (1LL << 44))
-                setLaunchParams(64, 128, 32, 4, 2, 2, 1);
-            else if (compute >= (1LL << 41))
-                setLaunchParams(64, 64, 32, 4, 1, 2, 1);
-            else if (compute >= (1LL << 38))
-                setLaunchParams(64, 64, 32, 4, 2, 2, 1);
-            else if (compute >= (1LL << 36))
-                setLaunchParams(64, 64, 32, 4, 1, 2, 0);
+            if (compute >= (1LL << 37))
+                return set(64, 128, 32, 4, 2, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 3, 0, 1, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 35))
+                return set(64, 128, 32, 4, 2, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 3, 0, 4, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 33))
+                return set(64, 256, 32, 2, 2, 4, 0, chunk_scan_kernel<256, 64, 256, 32, 2, 2, 4, 1, 4, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 31))
+                return set(64, 128, 64, 1, 4, 3, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 3, 1, 1, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 30))
+                return set(64, 256, 32, 1, 4, 3, 0, chunk_scan_kernel<256, 64, 256, 32, 1, 4, 3, 1, 4, 0, Tp_, Wt_>);
             else if (compute >= (1LL << 0))
-                setLaunchParams(64, 64, 32, 4, 2, 2, 0);
-
-            if (compute >= (1LL << 44))
-                return chunk_scan_hopper<256, 64, 128, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 41))
-                return chunk_scan_hopper<256, 64, 64, 32, 16, 8, 16, 4, 1, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 38))
-                return chunk_scan_hopper<256, 64, 64, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 36))
-                return chunk_scan_kernel<256, 64, 64, 32, 16, 8, 16, 4, 1, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 0))
-                return chunk_scan_kernel<256, 64, 64, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
+                return set(64, 128, 64, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 2, 1, 1, 0, Tp_, Wt_>);
         }
 
-        if (Q_ == 256 && P_ % 128 == 0)
+        if (Q_ == 256 && P_ % 256 == 0 && N_ >= 128)
         {
-            if (compute >= (1LL << 44))
-                setLaunchParams(64, 128, 32, 4, 2, 2, 1);
-            else if (compute >= (1LL << 41))
-                setLaunchParams(64, 64, 32, 4, 1, 2, 1);
-            else if (compute >= (1LL << 38))
-                setLaunchParams(64, 64, 32, 4, 2, 2, 1);
-            else if (compute >= (1LL << 36))
-                setLaunchParams(64, 64, 32, 4, 1, 2, 0);
+            if (compute >= (1LL << 35))
+                return set(64, 128, 32, 4, 2, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 3, 0, 4, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 33))
+                return set(64, 256, 32, 2, 2, 4, 0, chunk_scan_kernel<256, 64, 256, 32, 2, 2, 4, 1, 1, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 128, 64, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 2, 1, 1, 0, Tp_, Wt_>);
             else if (compute >= (1LL << 0))
-                setLaunchParams(64, 64, 32, 4, 2, 2, 0);
-
-            if (compute >= (1LL << 44))
-                return chunk_scan_hopper<256, 64, 128, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 41))
-                return chunk_scan_hopper<256, 64, 64, 32, 16, 8, 16, 4, 1, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 38))
-                return chunk_scan_hopper<256, 64, 64, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 36))
-                return chunk_scan_kernel<256, 64, 64, 32, 16, 8, 16, 4, 1, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 0))
-                return chunk_scan_kernel<256, 64, 64, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 1, 0, Tp_, Wt_>);
         }
+
+        if (Q_ == 256 && P_ % 256 == 0 && N_ >= 64)
+        {
+            if (compute >= (1LL << 35))
+                return set(64, 128, 32, 4, 2, 2, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 2, 0, 4, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 32))
+                return set(64, 256, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 256, 32, 2, 2, 2, 1, 4, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
+        }
+
+        if (Q_ == 256 && P_ % 128 == 0 && N_ >= 256)
+        {
+            if (compute >= (1LL << 35))
+                return set(64, 128, 32, 4, 2, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 3, 0, 4, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 30))
+                return set(64, 128, 64, 1, 4, 3, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 3, 1, 1, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 128, 64, 1, 4, 4, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 4, 1, 1, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 28))
+                return set(64, 128, 64, 4, 4, 3, 0, chunk_scan_kernel<256, 64, 128, 64, 4, 4, 3, 2, 2, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 128, 64, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 2, 1, 8, 0, Tp_, Wt_>);
+        }
+
+        if (Q_ == 256 && P_ % 128 == 0 && N_ >= 128)
+        {
+            if (compute >= (1LL << 34))
+                return set(64, 128, 32, 4, 2, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 3, 0, 4, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 28))
+                return set(64, 128, 64, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 2, 1, 1, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
+        }
+
+        if (Q_ == 256 && P_ % 128 == 0 && N_ >= 64)
+        {
+            if (compute >= (1LL << 34))
+                return set(64, 128, 32, 4, 2, 2, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 2, 0, 4, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 0, Tp_, Wt_>);
+        }
+
+        if (Q_ == 256 && P_ % 64 == 0 && N_ >= 256)
+        {
+            if (compute >= (1LL << 35))
+                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 64, 32, 4, 1, 2, 0, 8, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 33))
+                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 64, 32, 4, 1, 2, 0, 1, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 32))
+                return set(64, 64, 32, 2, 1, 4, 0, chunk_scan_kernel<256, 64, 64, 32, 2, 1, 4, 1, 1, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 1, 0, Tp_, Wt_>);
+        }
+
+        if (Q_ == 256 && P_ % 64 == 0 && N_ >= 128)
+        {
+            if (compute >= (1LL << 33))
+                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 64, 32, 4, 1, 2, 0, 2, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 30))
+                return set(64, 64, 32, 4, 1, 4, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 4, 1, 2, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 1, 0, Tp_, Wt_>);
+        }
+
+        if (Q_ == 256 && P_ % 64 == 0 && N_ >= 64)
+        {
+            if (compute >= (1LL << 33))
+                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 64, 32, 4, 1, 2, 0, 2, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 0, Tp_, Wt_>);
+        }
+
+        if (Q_ == 256 && P % 256 == 0 && N_ >= 256)
+        {
+            if (compute >= (1LL << 36))
+                return set(64, 128, 32, 4, 1, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 1, 3, 0, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 31))
+                return set(64, 128, 32, 4, 2, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 3, 0, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 30))
+                return set(64, 256, 64, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 256, 64, 1, 4, 2, 1, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 128, 64, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+
+        if (Q_ == 256 && P % 256 == 0 && N_ >= 128)
+        {
+            if (compute >= (1LL << 34))
+                return set(64, 128, 32, 4, 1, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 1, 3, 0, 4, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 31))
+                return set(64, 128, 32, 4, 2, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 3, 0, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 256, 32, 2, 4, 4, 0, chunk_scan_kernel<256, 64, 256, 32, 2, 4, 4, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 128, 64, 2, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 2, 4, 2, 1, 8, 1, Tp_, Wt_>);
+        }
+
+        if (Q_ == 256 && P % 256 == 0 && N_ >= 64)
+        {
+            if (compute >= (1LL << 35))
+                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 31))
+                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 1, 2, 0, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 256, 32, 2, 4, 2, 0, chunk_scan_kernel<256, 64, 256, 32, 2, 4, 2, 1, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 64, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+
+        if (Q_ == 256 && P % 128 == 0 && N_ >= 256)
+        {
+            if (compute >= (1LL << 36))
+                return set(64, 128, 32, 4, 1, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 1, 3, 0, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 34))
+                return set(64, 128, 32, 4, 2, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 3, 0, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 31))
+                return set(64, 128, 32, 4, 2, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 3, 0, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 128, 64, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+
+        if (Q_ == 256 && P % 128 == 0 && N_ >= 128)
+        {
+            if (compute >= (1LL << 34))
+                return set(64, 128, 32, 4, 1, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 1, 3, 0, 4, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 31))
+                return set(64, 128, 32, 4, 2, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 3, 0, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 128, 64, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 2, 1, 2, 1, Tp_, Wt_>);
+        }
+
+        if (Q_ == 256 && P % 128 == 0 && N_ >= 64)
+        {
+            if (compute >= (1LL << 32))
+                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 1, 2, 0, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 30))
+                return set(64, 128, 32, 4, 2, 2, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 2, 0, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+
+        if (Q_ == 256 && P % 64 == 0 && N_ >= 256)
+        {
+            if (compute >= (1LL << 36))
+                return set(64, 128, 32, 4, 1, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 1, 3, 0, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 35))
+                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 64, 32, 4, 1, 2, 0, 4, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 31))
+                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 64, 32, 4, 1, 2, 0, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 27))
+                return set(64, 64, 64, 2, 2, 3, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 3, 1, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 64, 64, 2, 2, 4, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 4, 1, 4, 1, Tp_, Wt_>);
+        }
+
+        if (Q_ == 256 && P % 64 == 0 && N_ >= 128)
+        {
+            if (compute >= (1LL << 36))
+                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 31))
+                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 64, 32, 4, 1, 2, 0, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 64, 32, 4, 1, 4, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 4, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+
+        if (Q_ == 256 && P % 64 == 0 && N_ >= 64)
+        {
+            if (compute >= (1LL << 36))
+                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 31))
+                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 64, 32, 4, 1, 2, 0, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+
+        if (Q_ == 256 && P % 32 == 0 && N_ >= 256)
+        {
+            if (compute >= (1LL << 36))
+                return set(64, 128, 32, 4, 1, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 1, 3, 0, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 31))
+                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 64, 32, 4, 1, 2, 0, 4, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 64, 64, 2, 2, 3, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 3, 1, 2, 1, Tp_, Wt_>);
+        }
+
+        if (Q_ == 256 && P % 32 == 0 && N_ >= 128)
+        {
+            if (compute >= (1LL << 36))
+                return set(64, 128, 32, 4, 1, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 1, 3, 0, 4, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 31))
+                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 64, 32, 4, 1, 2, 0, 4, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 64, 32, 4, 1, 4, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 4, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+
 #endif
-
-        if (Q_ == 256 && P_ % 64 == 0)
+        if (Q_ == 256 && P % 32 == 0 && N_ >= 64)
         {
-            if (compute >= (1LL << 45))
-                setLaunchParams(64, 64, 32, 4, 1, 3, 1);
-            else if (compute >= (1LL << 41))
-                setLaunchParams(64, 64, 32, 4, 1, 2, 1);
-            else if (compute >= (1LL << 38))
-                setLaunchParams(64, 64, 32, 4, 2, 2, 1);
-            else if (compute >= (1LL << 36))
-                setLaunchParams(64, 64, 32, 4, 1, 2, 0);
+            if (compute >= (1LL << 30))
+                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 64, 32, 4, 1, 2, 0, 2, 1, Tp_, Wt_>);
             else if (compute >= (1LL << 0))
-                setLaunchParams(64, 64, 32, 4, 2, 2, 0);
-
-            if (compute >= (1LL << 45))
-                return chunk_scan_hopper<256, 64, 64, 32, 16, 8, 16, 4, 1, 3, Tp_, Wt_>;
-            else if (compute >= (1LL << 41))
-                return chunk_scan_hopper<256, 64, 64, 32, 16, 8, 16, 4, 1, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 38))
-                return chunk_scan_hopper<256, 64, 64, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 36))
-                return chunk_scan_kernel<256, 64, 64, 32, 16, 8, 16, 4, 1, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 0))
-                return chunk_scan_kernel<256, 64, 64, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
         }
 
 #ifndef FAST_BUILD
-        if (Q_ == 128 && P_ % 256 == 0)
+        if (Q_ == 128 && P % 256 == 0 && N_ >= 256)
         {
-            if (compute >= (1LL << 43))
-                setLaunchParams(64, 128, 32, 4, 2, 2, 1);
-            else if (compute >= (1LL << 41))
-                setLaunchParams(128, 64, 32, 4, 2, 2, 1);
-            else if (compute >= (1LL << 36))
-                setLaunchParams(64, 64, 32, 4, 2, 2, 1);
-            else if (compute >= (1LL << 35))
-                setLaunchParams(64, 64, 32, 2, 2, 2, 0);
-            else if (compute >= (1LL << 33))
-                setLaunchParams(64, 64, 32, 4, 2, 2, 0);
-            else if (compute >= (1LL << 31))
-                setLaunchParams(64, 64, 32, 2, 4, 3, 0);
+            if (compute >= (1LL << 35))
+                return set(64, 128, 32, 4, 1, 3, 1, chunk_scan_hopper<128, 64, 128, 32, 4, 1, 3, 0, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 32))
+                return set(64, 128, 32, 4, 2, 3, 1, chunk_scan_hopper<128, 64, 128, 32, 4, 2, 3, 0, 4, 1, Tp_, Wt_>);
             else if (compute >= (1LL << 0))
-                setLaunchParams(64, 64, 32, 4, 2, 2, 0);
-
-            if (compute >= (1LL << 43))
-                return chunk_scan_hopper<128, 64, 128, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 41))
-                return chunk_scan_hopper<128, 128, 64, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 36))
-                return chunk_scan_hopper<128, 64, 64, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 35))
-                return chunk_scan_kernel<128, 64, 64, 32, 16, 8, 16, 2, 2, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 33))
-                return chunk_scan_kernel<128, 64, 64, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 31))
-                return chunk_scan_kernel<128, 64, 64, 32, 16, 8, 16, 2, 4, 3, Tp_, Wt_>;
-            else if (compute >= (1LL << 0))
-                return chunk_scan_kernel<128, 64, 64, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
+                return set(64, 256, 32, 2, 4, 4, 0, chunk_scan_kernel<128, 64, 256, 32, 2, 4, 4, 1, 2, 1, Tp_, Wt_>);
         }
 
-        if (Q_ == 128 && P_ % 128 == 0)
+        if (Q_ == 128 && P % 256 == 0 && N_ >= 128)
         {
-            if (compute >= (1LL << 43))
-                setLaunchParams(64, 128, 32, 4, 2, 2, 1);
-            else if (compute >= (1LL << 41))
-                setLaunchParams(128, 64, 32, 4, 2, 2, 1);
-            else if (compute >= (1LL << 36))
-                setLaunchParams(64, 64, 32, 4, 2, 2, 1);
-            else if (compute >= (1LL << 35))
-                setLaunchParams(64, 64, 32, 2, 2, 2, 0);
-            else if (compute >= (1LL << 33))
-                setLaunchParams(64, 64, 32, 4, 2, 2, 0);
+            if (compute >= (1LL << 35))
+                return set(64, 128, 32, 4, 1, 3, 1, chunk_scan_hopper<128, 64, 128, 32, 4, 1, 3, 0, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 32))
+                return set(64, 128, 32, 4, 2, 3, 1, chunk_scan_hopper<128, 64, 128, 32, 4, 2, 3, 0, 4, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 256, 32, 2, 4, 3, 0, chunk_scan_kernel<128, 64, 256, 32, 2, 4, 3, 1, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 128, 64, 1, 4, 2, 0, chunk_scan_kernel<128, 64, 128, 64, 1, 4, 2, 1, 2, 1, Tp_, Wt_>);
+        }
+
+        if (Q_ == 128 && P % 256 == 0 && N_ >= 64)
+        {
+            if (compute >= (1LL << 34))
+                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 128, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
             else if (compute >= (1LL << 31))
-                setLaunchParams(64, 64, 32, 2, 4, 3, 0);
+                return set(64, 128, 32, 4, 2, 2, 1, chunk_scan_hopper<128, 64, 128, 32, 4, 2, 2, 0, 4, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 28))
+                return set(64, 256, 32, 2, 4, 2, 0, chunk_scan_kernel<128, 64, 256, 32, 2, 4, 2, 1, 8, 1, Tp_, Wt_>);
             else if (compute >= (1LL << 0))
-                setLaunchParams(64, 64, 32, 4, 2, 2, 0);
+                return set(64, 64, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+        }
 
-            if (compute >= (1LL << 43))
-                return chunk_scan_hopper<128, 64, 128, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 41))
-                return chunk_scan_hopper<128, 128, 64, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 36))
-                return chunk_scan_hopper<128, 64, 64, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 35))
-                return chunk_scan_kernel<128, 64, 64, 32, 16, 8, 16, 2, 2, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 33))
-                return chunk_scan_kernel<128, 64, 64, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
+        if (Q_ == 128 && P % 128 == 0 && N_ >= 256)
+        {
+            if (compute >= (1LL << 34))
+                return set(64, 128, 32, 4, 1, 3, 1, chunk_scan_hopper<128, 64, 128, 32, 4, 1, 3, 0, 2, 1, Tp_, Wt_>);
             else if (compute >= (1LL << 31))
-                return chunk_scan_kernel<128, 64, 64, 32, 16, 8, 16, 2, 4, 3, Tp_, Wt_>;
+                return set(64, 128, 32, 4, 2, 3, 1, chunk_scan_hopper<128, 64, 128, 32, 4, 2, 3, 0, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 128, 64, 1, 4, 2, 0, chunk_scan_kernel<128, 64, 128, 64, 1, 4, 2, 1, 1, 1, Tp_, Wt_>);
             else if (compute >= (1LL << 0))
-                return chunk_scan_kernel<128, 64, 64, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
+                return set(64, 128, 64, 2, 4, 2, 0, chunk_scan_kernel<128, 64, 128, 64, 2, 4, 2, 1, 2, 1, Tp_, Wt_>);
         }
 
-        if (Q_ == 128 && P_ % 64 == 0)
+        if (Q_ == 128 && P % 128 == 0 && N_ >= 128)
         {
-            if (compute >= (1LL << 41))
-                setLaunchParams(128, 64, 32, 4, 2, 2, 1);
-            else if (compute >= (1LL << 36))
-                setLaunchParams(64, 64, 32, 4, 2, 2, 1);
-            else if (compute >= (1LL << 35))
-                setLaunchParams(64, 64, 32, 2, 2, 2, 0);
-            else if (compute >= (1LL << 33))
-                setLaunchParams(64, 64, 32, 4, 2, 2, 0);
+            if (compute >= (1LL << 33))
+                return set(64, 128, 32, 4, 2, 3, 1, chunk_scan_hopper<128, 64, 128, 32, 4, 2, 3, 0, 8, 1, Tp_, Wt_>);
             else if (compute >= (1LL << 31))
-                setLaunchParams(64, 64, 32, 2, 4, 3, 0);
+                return set(64, 128, 32, 4, 2, 3, 1, chunk_scan_hopper<128, 64, 128, 32, 4, 2, 3, 0, 4, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 30))
+                return set(64, 128, 32, 4, 2, 3, 0, chunk_scan_kernel<128, 64, 128, 32, 4, 2, 3, 1, 1, 1, Tp_, Wt_>);
             else if (compute >= (1LL << 0))
-                setLaunchParams(64, 64, 32, 4, 2, 2, 0);
-
-            if (compute >= (1LL << 41))
-                return chunk_scan_hopper<128, 128, 64, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 36))
-                return chunk_scan_hopper<128, 64, 64, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 35))
-                return chunk_scan_kernel<128, 64, 64, 32, 16, 8, 16, 2, 2, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 33))
-                return chunk_scan_kernel<128, 64, 64, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 31))
-                return chunk_scan_kernel<128, 64, 64, 32, 16, 8, 16, 2, 4, 3, Tp_, Wt_>;
-            else if (compute >= (1LL << 0))
-                return chunk_scan_kernel<128, 64, 64, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
+                return set(64, 128, 64, 1, 4, 2, 0, chunk_scan_kernel<128, 64, 128, 64, 1, 4, 2, 1, 1, 1, Tp_, Wt_>);
         }
 
-        if (Q_ == 64 && P_ % 256 == 0)
+        if (Q_ == 128 && P % 128 == 0 && N_ >= 64)
         {
-            if (compute >= (1LL << 42))
-                setLaunchParams(64, 64, 32, 4, 2, 4, 1);
-            else if (compute >= (1LL << 36))
-                setLaunchParams(64, 64, 32, 4, 2, 2, 1);
+            if (compute >= (1LL << 34))
+                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 128, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 30))
+                return set(64, 128, 32, 4, 2, 2, 1, chunk_scan_hopper<128, 64, 128, 32, 4, 2, 2, 0, 4, 1, Tp_, Wt_>);
             else if (compute >= (1LL << 0))
-                setLaunchParams(64, 64, 32, 4, 2, 2, 0);
-
-            if (compute >= (1LL << 42))
-                return chunk_scan_hopper<64, 64, 64, 32, 16, 8, 16, 4, 2, 4, Tp_, Wt_>;
-            else if (compute >= (1LL << 36))
-                return chunk_scan_hopper<64, 64, 64, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 0))
-                return chunk_scan_kernel<64, 64, 64, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
         }
 
-        if (Q_ == 64 && P_ % 128 == 0)
+        if (Q_ == 128 && P % 64 == 0 && N_ >= 256)
         {
-            if (compute >= (1LL << 42))
-                setLaunchParams(64, 64, 32, 4, 2, 4, 1);
-            else if (compute >= (1LL << 36))
-                setLaunchParams(64, 64, 32, 4, 2, 2, 1);
+            if (compute >= (1LL << 31))
+                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 64, 32, 4, 1, 2, 0, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 64, 32, 4, 1, 4, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 4, 1, 4, 1, Tp_, Wt_>);
             else if (compute >= (1LL << 0))
-                setLaunchParams(64, 64, 32, 4, 2, 2, 0);
-
-            if (compute >= (1LL << 42))
-                return chunk_scan_hopper<64, 64, 64, 32, 16, 8, 16, 4, 2, 4, Tp_, Wt_>;
-            else if (compute >= (1LL << 36))
-                return chunk_scan_hopper<64, 64, 64, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 0))
-                return chunk_scan_kernel<64, 64, 64, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
+                return set(64, 64, 64, 2, 2, 3, 0, chunk_scan_kernel<128, 64, 64, 64, 2, 2, 3, 1, 1, 1, Tp_, Wt_>);
         }
 
-        if (Q_ == 64 && P_ % 64 == 0)
+        if (Q_ == 128 && P % 64 == 0 && N_ >= 128)
         {
-            if (compute >= (1LL << 42))
-                setLaunchParams(64, 64, 32, 4, 2, 4, 1);
-            else if (compute >= (1LL << 36))
-                setLaunchParams(64, 64, 32, 4, 2, 2, 1);
+            if (compute >= (1LL << 31))
+                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 64, 32, 4, 1, 2, 0, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 28))
+                return set(64, 64, 32, 4, 1, 4, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 4, 1, 4, 1, Tp_, Wt_>);
             else if (compute >= (1LL << 0))
-                setLaunchParams(64, 64, 32, 4, 2, 2, 0);
-
-            if (compute >= (1LL << 42))
-                return chunk_scan_hopper<64, 64, 64, 32, 16, 8, 16, 4, 2, 4, Tp_, Wt_>;
-            else if (compute >= (1LL << 36))
-                return chunk_scan_hopper<64, 64, 64, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 0))
-                return chunk_scan_kernel<64, 64, 64, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
+                return set(64, 64, 64, 4, 2, 2, 0, chunk_scan_kernel<128, 64, 64, 64, 4, 2, 2, 1, 1, 1, Tp_, Wt_>);
         }
+
+        if (Q_ == 128 && P % 64 == 0 && N_ >= 64)
+        {
+            if (compute >= (1LL << 30))
+                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 64, 32, 4, 1, 2, 0, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 2, 1, Tp_, Wt_>);
+        }
+
+        if (Q_ == 128 && P % 32 == 0 && N_ >= 256)
+        {
+            if (compute >= (1LL << 31))
+                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 64, 32, 4, 1, 2, 0, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 64, 32, 4, 1, 4, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 4, 1, 4, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 64, 64, 2, 2, 3, 0, chunk_scan_kernel<128, 64, 64, 64, 2, 2, 3, 1, 1, 1, Tp_, Wt_>);
+        }
+
+        if (Q_ == 128 && P % 32 == 0 && N_ >= 128)
+        {
+            if (compute >= (1LL << 31))
+                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 64, 32, 4, 1, 2, 0, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 64, 32, 4, 1, 4, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 4, 1, 4, 1, Tp_, Wt_>);
+        }
+
+        if (Q_ == 128 && P % 32 == 0 && N_ >= 64)
+        {
+            if (compute >= (1LL << 30))
+                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 64, 32, 4, 1, 2, 0, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+
 #endif
     }
-    else
+    else // non Hopper kernel
     {
 #ifndef FAST_BUILD
-        if (Q_ == 256 && P_ % 256 == 0)
+        if (Q_ == 256 && P_ % 256 == 0 && N_ >= 256)
         {
-            if (compute >= (1LL << 44))
-                setLaunchParams(64, 128, 32, 2, 4, 2, 0);
-            else if (compute >= (1LL << 37))
-                setLaunchParams(64, 64, 32, 2, 2, 2, 0);
+            if (compute >= (1LL << 37))
+                return set(64, 256, 32, 2, 2, 3, 0, chunk_scan_kernel<256, 64, 256, 32, 2, 2, 3, 1, 1, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 35))
+                return set(64, 128, 32, 2, 2, 3, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 3, 1, 2, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 34))
+                return set(64, 256, 32, 2, 2, 3, 0, chunk_scan_kernel<256, 64, 256, 32, 2, 2, 3, 1, 1, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 32))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
             else if (compute >= (1LL << 0))
-                setLaunchParams(64, 64, 32, 4, 2, 2, 0);
-
-            if (compute >= (1LL << 44))
-                return chunk_scan_kernel<256, 64, 128, 32, 16, 8, 16, 2, 4, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 37))
-                return chunk_scan_kernel<256, 64, 64, 32, 16, 8, 16, 2, 2, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 0))
-                return chunk_scan_kernel<256, 64, 64, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
+                return set(64, 256, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 256, 32, 2, 2, 2, 1, 4, 0, Tp_, Wt_>);
         }
 
-        if (Q_ == 256 && P_ % 128 == 0)
+        if (Q_ == 256 && P_ % 256 == 0 && N_ >= 128)
         {
-            if (compute >= (1LL << 44))
-                setLaunchParams(64, 128, 32, 2, 4, 2, 0);
-            else if (compute >= (1LL << 37))
-                setLaunchParams(64, 64, 32, 2, 2, 2, 0);
+            if (compute >= (1LL << 34))
+                return set(64, 256, 32, 2, 2, 3, 0, chunk_scan_kernel<256, 64, 256, 32, 2, 2, 3, 1, 1, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 32))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 8, 0, Tp_, Wt_>);
             else if (compute >= (1LL << 0))
-                setLaunchParams(64, 64, 32, 4, 2, 2, 0);
-
-            if (compute >= (1LL << 44))
-                return chunk_scan_kernel<256, 64, 128, 32, 16, 8, 16, 2, 4, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 37))
-                return chunk_scan_kernel<256, 64, 64, 32, 16, 8, 16, 2, 2, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 0))
-                return chunk_scan_kernel<256, 64, 64, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
+                return set(64, 128, 32, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 1, 4, 2, 1, 2, 0, Tp_, Wt_>);
         }
+
+        if (Q_ == 256 && P_ % 256 == 0 && N_ >= 64)
+        {
+            if (compute >= (1LL << 37))
+                return set(64, 256, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 256, 32, 2, 2, 2, 1, 1, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 35))
+                return set(64, 256, 32, 2, 4, 2, 0, chunk_scan_kernel<256, 64, 256, 32, 2, 4, 2, 1, 2, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 33))
+                return set(64, 128, 32, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 1, 4, 2, 1, 8, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 32))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 4, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 128, 32, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 1, 4, 2, 1, 2, 0, Tp_, Wt_>);
+        }
+
+        if (Q_ == 256 && P_ % 128 == 0 && N_ >= 256)
+        {
+            if (compute >= (1LL << 37))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 35))
+                return set(64, 128, 32, 2, 2, 3, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 3, 1, 2, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 33))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 8, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 31))
+                return set(64, 128, 32, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 1, 4, 2, 1, 1, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 30))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 4, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 128, 64, 2, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 2, 4, 2, 1, 4, 0, Tp_, Wt_>);
+        }
+
+        if (Q_ == 256 && P_ % 128 == 0 && N_ >= 128)
+        {
+            if (compute >= (1LL << 33))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 8, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 31))
+                return set(64, 128, 32, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 1, 4, 2, 1, 1, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 4, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
+        }
+
+        if (Q_ == 256 && P_ % 128 == 0 && N_ >= 64)
+        {
+            if (compute >= (1LL << 34))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 8, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 128, 32, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 1, 4, 2, 1, 2, 0, Tp_, Wt_>);
+        }
+
+        if (Q_ == 256 && P_ % 64 == 0 && N_ >= 256)
+        {
+            if (compute >= (1LL << 34))
+                return set(128, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 128, 64, 32, 4, 1, 2, 1, 1, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 32))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 2, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
+        }
+
+        if (Q_ == 256 && P_ % 64 == 0 && N_ >= 128)
+        {
+            if (compute >= (1LL << 36))
+                return set(128, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 128, 64, 32, 4, 1, 2, 1, 1, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 33))
+                return set(128, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 128, 64, 32, 4, 1, 2, 1, 8, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 30))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
+        }
+
+        if (Q_ == 256 && P_ % 64 == 0 && N_ >= 64)
+        {
+            if (compute >= (1LL << 34))
+                return set(128, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 128, 64, 32, 4, 1, 2, 1, 8, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 4, 0, Tp_, Wt_>);
+        }
+
+        if (Q_ == 256 && P % 256 == 0 && N_ >= 256)
+        {
+            if (compute >= (1LL << 38))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 36))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 35))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 4, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 32))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 128, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 2, 2, 2, 1, 2, 1, Tp_, Wt_>);
+        }
+
+        if (Q_ == 256 && P % 256 == 0 && N_ >= 128)
+        {
+            if (compute >= (1LL << 36))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 35))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 4, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 256, 32, 2, 4, 3, 0, chunk_scan_kernel<256, 64, 256, 32, 2, 4, 3, 2, 4, 1, Tp_, Wt_>);
+        }
+
+        if (Q_ == 256 && P % 256 == 0 && N_ >= 64)
+        {
+            if (compute >= (1LL << 36))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 35))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 4, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+
+        if (Q_ == 256 && P % 128 == 0 && N_ >= 256)
+        {
+            if (compute >= (1LL << 36))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 31))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 4, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 128, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 2, 2, 2, 1, 2, 1, Tp_, Wt_>);
+        }
+
+        if (Q_ == 256 && P % 128 == 0 && N_ >= 128)
+        {
+            if (compute >= (1LL << 34))
+                return set(64, 128, 32, 2, 2, 3, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 3, 1, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 31))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 128, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 2, 2, 2, 1, 2, 1, Tp_, Wt_>);
+        }
+
+        if (Q_ == 256 && P % 128 == 0 && N_ >= 64)
+        {
+            if (compute >= (1LL << 0))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 2, 1, Tp_, Wt_>);
+        }
+
+        if (Q_ == 256 && P % 64 == 0 && N_ >= 256)
+        {
+            if (compute >= (1LL << 36))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 31))
+                return set(64, 64, 32, 2, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 2, 1, 2, 1, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 28))
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 4, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 64, 64, 2, 2, 4, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 4, 1, 2, 1, Tp_, Wt_>);
+        }
+
+        if (Q_ == 256 && P % 64 == 0 && N_ >= 128)
+        {
+            if (compute >= (1LL << 36))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 4, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 32))
+                return set(64, 64, 32, 2, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 2, 1, 2, 1, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 2, 1, Tp_, Wt_>);
+        }
+
+        if (Q_ == 256 && P % 64 == 0 && N_ >= 64)
+        {
+            if (compute >= (1LL << 36))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 4, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 32))
+                return set(64, 64, 32, 2, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 2, 1, 2, 1, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+
+        if (Q_ == 256 && P % 32 == 0 && N_ >= 256)
+        {
+            if (compute >= (1LL << 36))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 4, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 31))
+                return set(64, 64, 32, 2, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 2, 1, 2, 1, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+        }
+
+        if (Q_ == 256 && P % 32 == 0 && N_ >= 128)
+        {
+            if (compute >= (1LL << 36))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 4, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 32))
+                return set(64, 64, 32, 2, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 2, 1, 2, 1, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 2, 1, Tp_, Wt_>);
+        }
+
 #endif
-
-        if (Q_ == 256 && P_ % 64 == 0)
+        if (Q_ == 256 && P % 32 == 0 && N_ >= 64)
         {
-            if (compute >= (1LL << 37))
-                setLaunchParams(64, 64, 32, 2, 2, 2, 0);
+            if (compute >= (1LL << 31))
+                return set(64, 64, 32, 2, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 2, 1, 2, 1, 1, 1, Tp_, Wt_>);
             else if (compute >= (1LL << 0))
-                setLaunchParams(64, 64, 32, 4, 2, 2, 0);
-
-            if (compute >= (1LL << 37))
-                return chunk_scan_kernel<256, 64, 64, 32, 16, 8, 16, 2, 2, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 0))
-                return chunk_scan_kernel<256, 64, 64, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 2, 1, Tp_, Wt_>);
         }
 
 #ifndef FAST_BUILD
-        if (Q_ == 128 && P_ % 256 == 0)
+        if (Q_ == 128 && P % 256 == 0 && N_ >= 256)
         {
-            if (compute >= (1LL << 35))
-                setLaunchParams(64, 64, 32, 2, 2, 2, 0);
-            else if (compute >= (1LL << 0))
-                setLaunchParams(64, 64, 32, 4, 2, 2, 0);
-
-            if (compute >= (1LL << 35))
-                return chunk_scan_kernel<128, 64, 64, 32, 16, 8, 16, 2, 2, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 0))
-                return chunk_scan_kernel<128, 64, 64, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
+            if (compute >= (1LL << 0))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
         }
 
-        if (Q_ == 128 && P_ % 128 == 0)
+        if (Q_ == 128 && P % 256 == 0 && N_ >= 128)
         {
-            if (compute >= (1LL << 35))
-                setLaunchParams(64, 64, 32, 2, 2, 2, 0);
-            else if (compute >= (1LL << 0))
-                setLaunchParams(64, 64, 32, 4, 2, 2, 0);
-
-            if (compute >= (1LL << 35))
-                return chunk_scan_kernel<128, 64, 64, 32, 16, 8, 16, 2, 2, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 0))
-                return chunk_scan_kernel<128, 64, 64, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
+            if (compute >= (1LL << 0))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
         }
 
-        if (Q_ == 128 && P_ % 64 == 0)
+        if (Q_ == 128 && P % 256 == 0 && N_ >= 64)
         {
-            if (compute >= (1LL << 35))
-                setLaunchParams(64, 64, 32, 2, 2, 2, 0);
-            else if (compute >= (1LL << 0))
-                setLaunchParams(64, 64, 32, 4, 2, 2, 0);
-
-            if (compute >= (1LL << 35))
-                return chunk_scan_kernel<128, 64, 64, 32, 16, 8, 16, 2, 2, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 0))
-                return chunk_scan_kernel<128, 64, 64, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
+            if (compute >= (1LL << 0))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
         }
 
-        if (Q_ == 64 && P_ % 256 == 0)
+        if (Q_ == 128 && P % 128 == 0 && N_ >= 256)
         {
-            if (compute >= (1LL << 36))
-                setLaunchParams(64, 64, 32, 2, 2, 2, 0);
-            else if (compute >= (1LL << 0))
-                setLaunchParams(64, 64, 32, 4, 2, 2, 0);
-
-            if (compute >= (1LL << 36))
-                return chunk_scan_kernel<64, 64, 64, 32, 16, 8, 16, 2, 2, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 0))
-                return chunk_scan_kernel<64, 64, 64, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
+            if (compute >= (1LL << 0))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
         }
 
-        if (Q_ == 64 && P_ % 128 == 0)
+        if (Q_ == 128 && P % 128 == 0 && N_ >= 128)
         {
-            if (compute >= (1LL << 36))
-                setLaunchParams(64, 64, 32, 2, 2, 2, 0);
-            else if (compute >= (1LL << 0))
-                setLaunchParams(64, 64, 32, 4, 2, 2, 0);
-
-            if (compute >= (1LL << 36))
-                return chunk_scan_kernel<64, 64, 64, 32, 16, 8, 16, 2, 2, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 0))
-                return chunk_scan_kernel<64, 64, 64, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
+            if (compute >= (1LL << 0))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
         }
 
-        if (Q_ == 64 && P_ % 64 == 0)
+        if (Q_ == 128 && P % 128 == 0 && N_ >= 64)
         {
-            if (compute >= (1LL << 36))
-                setLaunchParams(64, 64, 32, 2, 2, 2, 0);
-            else if (compute >= (1LL << 0))
-                setLaunchParams(64, 64, 32, 4, 2, 2, 0);
-
-            if (compute >= (1LL << 36))
-                return chunk_scan_kernel<64, 64, 64, 32, 16, 8, 16, 2, 2, 2, Tp_, Wt_>;
-            else if (compute >= (1LL << 0))
-                return chunk_scan_kernel<64, 64, 64, 32, 16, 8, 16, 4, 2, 2, Tp_, Wt_>;
+            if (compute >= (1LL << 0))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
         }
+
+        if (Q_ == 128 && P % 64 == 0 && N_ >= 256)
+        {
+            if (compute >= (1LL << 31))
+                return set(64, 64, 32, 2, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 2, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 64, 64, 2, 2, 2, 1, 4, 1, Tp_, Wt_>);
+        }
+
+        if (Q_ == 128 && P % 64 == 0 && N_ >= 128)
+        {
+            if (compute >= (1LL << 32))
+                return set(64, 64, 32, 2, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 2, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 64, 64, 2, 2, 2, 1, 4, 1, Tp_, Wt_>);
+        }
+
+        if (Q_ == 128 && P % 64 == 0 && N_ >= 64)
+        {
+            if (compute >= (1LL << 32))
+                return set(64, 64, 32, 2, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 2, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 8, 1, Tp_, Wt_>);
+        }
+
+        if (Q_ == 128 && P % 32 == 0 && N_ >= 256)
+        {
+            if (compute >= (1LL << 31))
+                return set(64, 64, 32, 2, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 2, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 2, 1, Tp_, Wt_>);
+        }
+
+        if (Q_ == 128 && P % 32 == 0 && N_ >= 128)
+        {
+            if (compute >= (1LL << 31))
+                return set(64, 64, 32, 2, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 2, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 2, 1, Tp_, Wt_>);
+        }
+
+        if (Q_ == 128 && P % 32 == 0 && N_ >= 64)
+        {
+            if (compute >= (1LL << 31))
+                return set(64, 64, 32, 2, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 2, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 0))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 2, 1, Tp_, Wt_>);
+        }
+
 #endif
     }
 

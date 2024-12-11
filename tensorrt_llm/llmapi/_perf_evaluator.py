@@ -282,7 +282,6 @@ class LLMPerfEvaluator:
             llm = LLM(model,
                       skip_tokenizer_init=True,
                       enable_chunked_prefill=enable_chunked_prefill,
-                      enable_processes_for_single_gpu=True,
                       **kwargs)
         except Exception as e:
             logger.error(f"Failed to create LLM with {model} and {kwargs}")

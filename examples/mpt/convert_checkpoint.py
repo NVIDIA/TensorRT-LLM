@@ -61,13 +61,6 @@ def parse_arguments():
         'To shard it along hidden dimension, set embedding_sharding_dim=1'
         'Note: embedding sharing is only enabled when embedding_sharding_dim = 0'
     )
-    parser.add_argument(
-        '--use_embedding_sharing',
-        action="store_true",
-        default=False,
-        help=
-        'Try to reduce the engine size by sharing the embedding lookup table between two layers.'
-        'Note: the flag might not take effect when the criteria are not met.')
 
     parser.add_argument(
         '--calib_dataset',
@@ -468,7 +461,6 @@ def convert_hf_mpt_legacy(hf_model,
                           dtype='float32',
                           use_parallel_embedding: bool = False,
                           sharding_dim: int = 0,
-                          share_embedding_table: bool = False,
                           use_weight_only=False,
                           plugin_weight_only_quant_type='int8',
                           use_smooth_quant=False,
@@ -658,11 +650,10 @@ def convert_hf_mpt_legacy(hf_model,
                 embed_w, mapping.tp_size, mapping.tp_rank, sharding_dim)
     if mapping.is_last_pp_rank():
         # lm_head weight and bias
-        if not share_embedding_table:
-            weights['lm_head.weight'] = split_matrix(embed_w.clone(),
-                                                     mapping.tp_size,
-                                                     mapping.tp_rank,
-                                                     dim=0)
+        weights['lm_head.weight'] = split_matrix(embed_w.clone(),
+                                                 mapping.tp_size,
+                                                 mapping.tp_rank,
+                                                 dim=0)
         ln_f_w = get_weight(model_params, 'transformer.norm_f', dtype)
         # ln_f weight and bias
         weights['transformer.ln_f.weight'] = ln_f_w
@@ -679,7 +670,6 @@ def convert_hf_mpt(hf_model: MptForCausalLM,
                    dtype: str = 'float32',
                    use_parallel_embedding: bool = False,
                    sharding_dim: int = 0,
-                   share_embedding_table: bool = False,
                    use_weight_only: bool = False,
                    plugin_weight_only_quant_type: torch.dtype = torch.int8):
 
@@ -761,11 +751,10 @@ def convert_hf_mpt(hf_model: MptForCausalLM,
                 embed_w, mapping.tp_size, mapping.tp_rank, sharding_dim)
     if mapping.is_last_pp_rank():
         # lm_head weight and bias
-        if not share_embedding_table:
-            weights['lm_head.weight'] = split_matrix(embed_w.clone(),
-                                                     mapping.tp_size,
-                                                     mapping.tp_rank,
-                                                     dim=0)
+        weights['lm_head.weight'] = split_matrix(embed_w.clone(),
+                                                 mapping.tp_size,
+                                                 mapping.tp_rank,
+                                                 dim=0)
         ln_f_w = get_weight(model_params, 'transformer.norm_f', dtype)
         # ln_f weight and bias
         weights['transformer.ln_f.weight'] = ln_f_w
@@ -833,7 +822,6 @@ if __name__ == '__main__':
         'hidden_act': 'gelu',
         'use_parallel_embedding': args.use_parallel_embedding,
         'embedding_sharding_dim': args.embedding_sharding_dim,
-        'share_embedding_table': args.use_embedding_sharing,
         'quantization': {
             'quant_algo': quant_algo,
             'kv_cache_quant_algo': kv_cache_quant_algo,
@@ -886,7 +874,6 @@ if __name__ == '__main__':
                 dtype=args.dtype,
                 use_parallel_embedding=args.use_parallel_embedding,
                 sharding_dim=args.embedding_sharding_dim,
-                share_embedding_table=args.use_embedding_sharing,
                 use_weight_only=args.use_weight_only,
                 plugin_weight_only_quant_type=plugin_weight_only_quant_type,
                 use_smooth_quant=(args.smoothquant is not None),
@@ -904,7 +891,6 @@ if __name__ == '__main__':
                 dtype=args.dtype,
                 use_parallel_embedding=args.use_parallel_embedding,
                 sharding_dim=args.embedding_sharding_dim,
-                share_embedding_table=args.use_embedding_sharing,
                 use_weight_only=args.use_weight_only,
                 plugin_weight_only_quant_type=plugin_weight_only_quant_type)
 

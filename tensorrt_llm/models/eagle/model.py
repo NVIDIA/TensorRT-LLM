@@ -35,8 +35,17 @@ from .config import EagleConfig
 
 class TreeParams(object):
 
-    def __init__(self, paths: Tensor = None):
-        self.paths = paths
+    def __init__(self,
+                 paths: Tensor = None,
+                 use_dynamic_tree: Tensor = None,
+                 dynamic_tree_max_topK: Tensor = None):
+        self.paths = paths  # on GPU
+        # When 'use_dynamic_tree' is False, which means use Eagle-1;
+        # When 'use_dynamic_tree' is True, which means use Eagle-2;
+        self.use_dynamic_tree = use_dynamic_tree  # bool, on CPU
+        # Indicates how many new draft tokens are expanded for each draft token of each request.
+        # For Eagle-2, dynamic_tree_max_topK is equal to max_non_leaf_nodes_per_level in the internal EagleNets.
+        self.dynamic_tree_max_topK = dynamic_tree_max_topK  # int, on CPU
 
 
 def eagle_sample_and_accept_draft_plugin(lm_logits: Tensor = None,
@@ -156,15 +165,21 @@ def eagle_sample_and_accept_draft_plugin(lm_logits: Tensor = None,
     ])
 
 
-def eagle_draft_decoder_plugin(layer_idx: int, top_k_sampling: bool,
-                               logits: Tensor, num_last_token_indices: Tensor,
-                               rand_sample: Tensor, tree_params: TreeParams,
-                               input_draft_token_ids: Tensor,
-                               input_draft_lens: Tensor):
+def eagle_draft_decoder_plugin(
+        layer_idx: int, num_eagle_layers: int, top_k_sampling: bool,
+        logits: Tensor, num_last_token_indices: Tensor, rand_sample: Tensor,
+        tree_params: TreeParams, input_draft_token_ids: Tensor,
+        input_draft_lens: Tensor, input_prev_scores: Tensor,
+        input_current_expand_indices: Tensor, input_all_layers_scores: Tensor,
+        input_all_layers_draft_token_ids: Tensor,
+        input_all_layers_draft_token_ids_predecessor: Tensor):
     '''
     Parameters:
         layer_idx : int
             The index of the EagleNet.
+
+        num_eagle_layers: int
+            The total number of eagle layers.
 
         top_k_sampling: bool
             Whether to use top K sampling. Otherwise, use multinomial sampling.
@@ -192,6 +207,27 @@ def eagle_draft_decoder_plugin(layer_idx: int, top_k_sampling: bool,
             [batch_size]
             Number of draft tokens for each request.
 
+        input_prev_scores: Tensor
+            [batch_size, max_decoding_draft_tokens]
+            Last layer's scores
+
+        input_current_expand_indices: Tensor
+            [batch_size, max_decoding_draft_tokens]
+            The indices of the nodes that expand in this layer.
+            The index is related to the final output tree, which has max_decoding_draft_tokens draft tokens.
+
+        input_all_layers_scores: Tensor
+            [batch_size, num_eagle_layers, max_decoding_draft_tokens x max_decoding_draft_tokens]
+            For Eagle-2, record scores from all EagleNets
+
+        input_all_layers_draft_token_ids: Tensor
+            [batch_size, num_eagle_layers, max_decoding_draft_tokens x max_decoding_draft_tokens]
+            For Eagle-2, record all draft tokens from all EagleNets
+
+        input_all_layers_draft_token_ids_predecessor: Tensor
+            [batch_size, num_eagle_layers, max_decoding_draft_tokens x max_decoding_draft_tokens]
+            For Eagle-2, record all draft tokens' predecessor
+
     Return:
         output_draft_token_ids: Tensor
             [batch_size, max_decoding_draft_tokens]
@@ -200,6 +236,31 @@ def eagle_draft_decoder_plugin(layer_idx: int, top_k_sampling: bool,
         output_draft_draft_lens: Tensor
             [batch_size]
             Number of draft tokens for each request.
+
+        output_paths: Tensor
+            [batch_size, max_decoding_draft_tokens, max_path_len]
+            The latest path.
+
+        output_current_scores: Tensor
+            [batch_size, max_decoding_draft_tokens]
+            This layer's scores, which will be used in next layer.
+
+        output_next_expand_indices:
+            [batch_size, max_decoding_draft_tokens]
+            The indices of the nodes that expand in next layer.
+            The index is related to the final output tree, which has max_decoding_draft_tokens draft tokens.
+
+        output_all_layers_scores:
+            [batch_size, num_eagle_layers, max_decoding_draft_tokens x max_decoding_draft_tokens]
+            For Eagle-2, record scores from all EagleNets
+
+        output_all_layers_draft_token_ids: Tensor
+            [batch_size, num_eagle_layers, max_decoding_draft_tokens x max_decoding_draft_tokens]
+            For Eagle-2, record all draft tokens from all EagleNets
+
+        output_all_layers_draft_token_ids_predecessor: Tensor
+            [batch_size, num_eagle_layers, max_decoding_draft_tokens x max_decoding_draft_tokens]
+            For Eagle-2, record all draft tokens' predecessor
 
     '''
 
@@ -215,17 +276,26 @@ def eagle_draft_decoder_plugin(layer_idx: int, top_k_sampling: bool,
                                   np.array(layer_idx, dtype=np.int32),
                                   trt.PluginFieldType.INT32)
 
+    num_eagle_layers_t = trt.PluginField(
+        "num_eagle_layers", np.array(num_eagle_layers, dtype=np.int32),
+        trt.PluginFieldType.INT32)
+
     top_k_sampling_t = 1 if top_k_sampling else 0
     top_k_sampling_t = trt.PluginField(
         "top_k_sampling", np.array(top_k_sampling_t, dtype=np.int32),
         trt.PluginFieldType.INT32)
 
-    pfc = trt.PluginFieldCollection([pf_type, layer_idx_t, top_k_sampling_t])
+    pfc = trt.PluginFieldCollection(
+        [pf_type, layer_idx_t, num_eagle_layers_t, top_k_sampling_t])
     plugin = plg_creator.create_plugin("eagle_draft_decoder_plugin", pfc)
 
     plug_inputs = [
         logits, rand_sample, tree_params.paths, num_last_token_indices,
-        input_draft_token_ids, input_draft_lens
+        tree_params.use_dynamic_tree, tree_params.dynamic_tree_max_topK,
+        input_draft_token_ids, input_draft_lens, input_prev_scores,
+        input_current_expand_indices, input_all_layers_scores,
+        input_all_layers_draft_token_ids,
+        input_all_layers_draft_token_ids_predecessor
     ]
 
     plug_inputs = [i.trt_tensor for i in plug_inputs]
@@ -233,7 +303,20 @@ def eagle_draft_decoder_plugin(layer_idx: int, top_k_sampling: bool,
 
     output_draft_token_ids = _create_tensor(layer.get_output(0), layer)
     output_draft_lens = _create_tensor(layer.get_output(1), layer)
-    return tuple([output_draft_token_ids, output_draft_lens])
+    output_paths = _create_tensor(layer.get_output(2), layer)
+    output_current_scores = _create_tensor(layer.get_output(3), layer)
+    output_next_expand_indices = _create_tensor(layer.get_output(4), layer)
+    output_all_layers_scores = _create_tensor(layer.get_output(5), layer)
+    output_all_layers_draft_token_ids = _create_tensor(layer.get_output(6),
+                                                       layer)
+    output_all_layers_draft_token_ids_predecessor = _create_tensor(
+        layer.get_output(7), layer)
+    return tuple([
+        output_draft_token_ids, output_draft_lens, output_paths,
+        output_current_scores, output_next_expand_indices,
+        output_all_layers_scores, output_all_layers_draft_token_ids,
+        output_all_layers_draft_token_ids_predecessor
+    ])
 
 
 def eagle_prepare_drafter_inputs_plugin(
@@ -749,10 +832,22 @@ class EagleForCausalLM(LLaMAForCausalLM):
                 # Decode draft tokens
                 # FIXME We need to take top_k_sampling as an input
                 top_k_sampling = True
-                next_draft_tokens, next_draft_lens = eagle_draft_decoder_plugin(
-                    li, top_k_sampling, logits, num_last_token_indices,
-                    rand_data_sample, input_tree_params, next_draft_tokens,
-                    next_draft_lens)
+                next_draft_tokens, next_draft_lens, _, _, _, _, _, _ = eagle_draft_decoder_plugin(
+                    li,
+                    self.num_eagle_layers,
+                    top_k_sampling,
+                    logits,
+                    num_last_token_indices,
+                    rand_data_sample,
+                    input_tree_params,
+                    next_draft_tokens,
+                    next_draft_lens,
+                    rand_data_sample,  # dummy input_prev_scores
+                    next_draft_tokens,  # dummy input_current_expand_indices
+                    rand_data_sample,  # dummy input_all_layers_scores
+                    next_draft_tokens,  # dummy input_all_layers_draft_token_ids
+                    next_draft_tokens,  # dummy input_all_layers_draft_token_ids_predecessor
+                )
 
                 return next_draft_tokens, next_draft_lens, hidden_states
 
@@ -845,10 +940,9 @@ class EagleForCausalLM(LLaMAForCausalLM):
         ).plugin_config.gpt_attention_plugin
         use_gemm_plugin = default_net().plugin_config.gemm_plugin
         paged_kv_cache = default_net().plugin_config.paged_kv_cache
+        multiple_profiles = default_net().plugin_config.multiple_profiles
         max_batch_size = kwargs['max_batch_size']
         assert max_batch_size is not None
-        bb_range = default_range(max_batch_size)
-        bb0_range = default_range(max_batch_size, min_range=0, opt_offset=1)
         gt_range = default_range(max_batch_size * (self.max_draft_len + 1),
                                  min_range=0,
                                  opt_offset=1)
@@ -864,26 +958,35 @@ class EagleForCausalLM(LLaMAForCausalLM):
 
         assert inputs['spec_decoding_params'] is not None
 
-        enable_two_optimization_profiles = GenerationMixin.has_ctx_gen_opt_profiles(
+        kv_cache_type = KVCacheType.PAGED if paged_kv_cache else KVCacheType.CONTINUOUS
+        enable_ctx_gen_opt_profiles = GenerationMixin.has_ctx_gen_opt_profiles(
             use_gpt_attention_plugin=use_gpt_attention_plugin,
             use_gemm_plugin=use_gemm_plugin,
             remove_input_padding=remove_input_padding,
-            kv_cache_type=KVCacheType.PAGED
-            if paged_kv_cache else KVCacheType.CONTINUOUS)
-        if enable_two_optimization_profiles:
-            bb_range = [bb_range, bb_range]
-            bb0_range = [bb0_range, bb0_range]
-            draft_len_range = [self.max_draft_len]
-            decoding_len_range = [self.max_draft_len + 1]
-            path_len_range = [self.num_eagle_layers + 1]
-            gen_tokens_range = [gt_range, gt_range]
-        else:
-            bb_range = [bb_range]
-            bb0_range = [bb0_range]
-            draft_len_range = [self.max_draft_len]
-            decoding_len_range = [self.max_draft_len + 1]
-            path_len_range = [self.num_eagle_layers + 1]
-            gen_tokens_range = [gt_range]
+            kv_cache_type=kv_cache_type)
+
+        num_profiles, ranges = GenerationMixin.get_profiles_ranges(
+            max_batch_size=max_batch_size,
+            max_beam_width=kwargs['max_beam_width'],
+            max_input_len=kwargs['max_input_len'],
+            max_num_tokens=kwargs['max_num_tokens'],
+            max_draft_len=self.max_draft_len,
+            opt_batch_size=None
+            if 'opt_batch_size' not in kwargs else kwargs['opt_batch_size'],
+            opt_num_tokens=None
+            if 'opt_num_tokens' not in kwargs else kwargs['opt_num_tokens'],
+            enable_ctx_gen_opt_profiles=enable_ctx_gen_opt_profiles,
+            multiple_profiles=multiple_profiles,
+            kv_cache_type=kv_cache_type)
+
+        bb_range = ranges['bb_range']
+
+        draft_len_range = [self.max_draft_len for _ in range(len(bb_range))]
+        decoding_len_range = [(self.max_draft_len + 1)
+                              for _ in range(len(bb_range))]
+        path_len_range = [(self.num_eagle_layers + 1)
+                          for _ in range(len(bb_range))]
+        gen_tokens_range = [gt_range for _ in range(len(bb_range))]
 
         draft_tokens = Tensor(name='draft_tokens',
                               dtype=trt.int32,
@@ -1001,7 +1104,15 @@ class EagleForCausalLM(LLaMAForCausalLM):
                                      ('greedy_sampling_flag', [1]),
                                  ]))
 
-        tree_params = TreeParams(paths=draft_paths)
+        use_dynamic_tree = Tensor(name='use_dynamic_tree',
+                                  dtype=trt.bool,
+                                  shape=[1])
+
+        tree_params = TreeParams(
+            paths=draft_paths,
+            use_dynamic_tree=use_dynamic_tree,
+            dynamic_tree_max_topK=host_ctx_eagle_net_request_types  # dummy
+        )
 
         inputs['draft_tokens'] = draft_tokens
         inputs['draft_lens'] = draft_lens

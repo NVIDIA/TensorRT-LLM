@@ -321,6 +321,8 @@ def generate_sm90_mixed_gemm_operations():
     # Takes the form (activation_type, weight_type, scalezero_type, bias_type, output_type)
     supported_dtypes = [
         (DataType.e4m3, DataType.u4, DataType.f16, DataType.f16, DataType.f16),
+        (DataType.e4m3, DataType.u4, DataType.f16, DataType.bf16,
+         DataType.bf16),
         (DataType.f16, DataType.u4, DataType.f16, DataType.f16, DataType.f16),
         (DataType.bf16, DataType.u4, DataType.bf16, DataType.bf16,
          DataType.bf16),

@@ -124,7 +124,7 @@ case "$ID" in
     ;;
   centos)
     init_centos_mirror
-    install_python_centos "3.10.12"
+    install_python_centos $1
     install_pyp_centos
     install_gcc_centos
     install_devtoolset_centos

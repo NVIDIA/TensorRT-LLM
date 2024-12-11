@@ -219,22 +219,6 @@ class GemmaForCausalLM(DecoderModelForCausalLM):
         vocab_size_padded = pad_vocab_size(config.vocab_size,
                                            config.mapping.tp_size)
 
-        try:
-            import modelopt
-            major, minor, patch = modelopt.__version__.split(".")
-            major = int(major)
-            minor = int(minor)
-            patch = int(patch)
-            if major == 0 and minor == 11 and patch < 1:
-                # modelopt=0.11.0 won't force this field to True, this is a hot fix
-                # TODO: can remove after modelop=0.11.1 is out
-                # TRT LLM forces the embedding table to be shared for gemma.
-                config.share_embedding_table = True
-            assert config.share_embedding_table, "Gemma only supports share_embedding_table"
-        except:
-            # Not find modelopt, assume not use modelopt quantized model
-            assert config.share_embedding_table, "Gemma only supports share_embedding_table"
-
         if config.mapping.is_last_pp_rank():
             lm_head = ColumnLinear(config.hidden_size,
                                    vocab_size_padded,

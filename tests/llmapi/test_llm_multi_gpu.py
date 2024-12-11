@@ -1,46 +1,32 @@
 import asyncio
+import json
 import os
 import subprocess  # nosec B404
-import sys
 import tempfile
 
 import pytest
-import torch
 from parameterized import parameterized
 
 from tensorrt_llm._utils import release_gc
 from tensorrt_llm.executor import ExecutorBindingsProxy
 from tensorrt_llm.llmapi import LLM, KvCacheConfig, SamplingParams
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
-from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models import PretrainedConfig
 from tensorrt_llm.models.llama.model import LLaMAForCausalLM
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import (skip_num_gpus_less_than, skip_single_gpu,
-                        unittest_name_func)
-
 # isort: off
-try:
-    from .test_llm import (
-        DummyError, DummyExecutorWorker3, _test_llm_generate_async,
-        check_llm_return_context_logits, check_llm_return_generation_logits,
-        default_model_name, get_model_path, llama_7b_multi_lora_test_harness,
-        llama_model_path, llama_v2_7b_prompt_adapter_test_harness,
-        llama_v2_13b_lora_test_harness, llm_check_output, llm_test_harness,
-        mixtral_model_name, prompts, test_llm_get_stats,
-        test_llm_get_stats_async, test_mixtral_8x7b_moe_tp_and_moe_ep,
-        tinyllama_guided_decoding_test_harness, _test_llm_capture_request_error)
-except ImportError:
-    from test_llm import (
-        DummyError, DummyExecutorWorker3, _test_llm_generate_async,
-        check_llm_return_context_logits, check_llm_return_generation_logits,
-        default_model_name, get_model_path, llama_7b_multi_lora_test_harness,
-        llama_model_path, llama_v2_7b_prompt_adapter_test_harness,
-        llama_v2_13b_lora_test_harness, llm_check_output, llm_test_harness,
-        mixtral_model_name, prompts, test_llm_get_stats,
-        test_llm_get_stats_async, test_mixtral_8x7b_moe_tp_and_moe_ep,
-        tinyllama_guided_decoding_test_harness, _test_llm_capture_request_error)
+from test_llm import (
+    DummyError, DummyExecutorWorker3, _test_llm_capture_request_error,
+    _test_llm_generate_async, check_llm_return_context_logits,
+    check_llm_return_generation_logits, default_model_name, get_model_path,
+    llama_7b_multi_lora_test_harness, llama_model_path,
+    llama_v2_7b_prompt_adapter_test_harness, llama_v2_13b_lora_test_harness,
+    llm_check_output, llm_get_stats_async_test_harness,
+    llm_get_stats_test_harness, llm_test_harness, mixtral_model_name, prompts,
+    tinyllama_guided_decoding_test_harness)
+from utils.util import (skip_gpu_memory_less_than, skip_num_gpus_less_than,
+                        skip_single_gpu, unittest_name_func)
 # isort: on
 
 
@@ -135,22 +121,8 @@ def test_llm_generate_async_tp2(
                              tokenizer=tokenizer)
 
 
-# TODO[chunweiy]: Move mixtral test to the e2e test
-def is_memory_enough_for_mixtral():
-    if torch.cuda.device_count() < 2:
-        return False
-    try:
-        total_memory = get_total_gpu_memory(0) + get_total_gpu_memory(1)
-        if total_memory >= 160 * 1024**3:
-            return True
-    except:
-        return False
-
-
-# NOTE: This is not activated in CI due to resource constraints
 @skip_single_gpu
-@pytest.mark.skipif(not is_memory_enough_for_mixtral(),
-                    reason="The test needs at least 160GB memory, skipping")
+@skip_gpu_memory_less_than(70 * 1024**3)
 def test_llm_generate_mixtral_for_tp2():
     llm = LLM(get_model_path(mixtral_model_name),
               tensor_parallel_size=2,
@@ -159,10 +131,29 @@ def test_llm_generate_mixtral_for_tp2():
         print(output)
 
 
-@pytest.mark.skip_less_device(2)
-@pytest.mark.skip_less_host_memory(480000)
-def test_llm_mixtral_8x7b_moe_ep_and_moe_tp():
-    test_mixtral_8x7b_moe_tp_and_moe_ep()
+@skip_single_gpu
+@skip_gpu_memory_less_than(70 * 1024**3)
+def test_llm_generate_mixtral_for_ep2():
+    llm = LLM(get_model_path(mixtral_model_name),
+              tensor_parallel_size=2,
+              moe_expert_parallel_size=2,
+              moe_tensor_parallel_size=1,
+              kv_cache_config=global_kv_cache_config)
+    for output in llm.generate(prompts):
+        print(output)
+
+    tmpdir = tempfile.TemporaryDirectory()
+    llm.save(tmpdir.name)
+
+    with open(os.path.join(tmpdir.name, "config.json"), "r") as f:
+        # read the build_config and check if the parameters are correctly saved
+        engine_config = json.load(f)
+
+        pretrained_config = PretrainedConfig.from_dict(
+            engine_config["pretrained_config"])
+
+        assert pretrained_config.mapping.moe_tp_size == 1
+        assert pretrained_config.mapping.moe_ep_size == 2
 
 
 def test_llm_pp2():
@@ -178,10 +169,6 @@ def llm_end2end_tp2_cases():
     yield ({}, )  # Default options
     yield ({'embedding_parallel_mode': 'NONE'}, )
     yield ({'embedding_parallel_mode': 'SHARDING_ALONG_HIDDEN'}, )
-    yield ({
-        'embedding_parallel_mode': 'SHARDING_ALONG_VOCAB',
-        'share_embedding_table': True
-    }, )
 
 
 @parameterized.expand(llm_end2end_tp2_cases(), name_func=unittest_name_func)
@@ -210,14 +197,6 @@ def test_llm_end2end_tp2(llm_additional_options):
             'use_parallel_embedding'] is True
         assert llm.args._convert_checkpoint_options[
             'embedding_sharding_dim'] == 1
-
-    if 'share_embedding_table' in llm_additional_options:
-        assert llm.args._convert_checkpoint_options[
-            'share_embedding_table'] == llm_additional_options.pop(
-                'share_embedding_table')
-    else:
-        assert llm.args._convert_checkpoint_options[
-            'share_embedding_table'] is False
 
     assert not llm_additional_options
 
@@ -375,13 +354,16 @@ DummyExecutor3 = DummyExecutorMeta("DummyExecutor3", (), {},
                                    proxy_class=DummyExecutorProxy3)
 
 
-# Temporarily disabled due to https://nvbugspro.nvidia.com/bug/4955607
-def _test_llm_get_stats_tp2():
-    test_llm_get_stats(tp_size=2)
+@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/4955607")
+@skip_single_gpu
+def test_llm_get_stats_tp2():
+    llm_get_stats_test_harness(tp_size=2)
 
 
+@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/4955607")
+@skip_single_gpu
 def test_llm_get_stats_async_tp2():
-    test_llm_get_stats_async(tp_size=2)
+    llm_get_stats_async_test_harness(tp_size=2)
 
 
 def test_llm_capture_request_error():
@@ -390,4 +372,6 @@ def test_llm_capture_request_error():
 
 if __name__ == '__main__':
 
-    test_llm_capture_request_error()
+    #test_llm_capture_request_error()
+
+    test_llm_generate_tp2()

@@ -91,6 +91,10 @@ void sm90_generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType 
                 || std::is_same_v<CutlassWeightType, cutlass::float_e5m2_t>,
             "Weight type must be fp8, uint8_t or uint4_t");
 
+        static_assert(!std::is_same_v<CutlassActivationType, cutlass::float_e4m3_t>
+                || std::is_same_v<CutlassScaleZeroType, cutlass::half_t>,
+            "Scale/Zero type must be half for fp8 activation");
+
         using LayoutA = cutlass::layout::RowMajor; // Layout type for A matrix operand
         constexpr int AlignmentA = 128 / cutlass::sizeof_bits<CutlassActivationType>::value;
 

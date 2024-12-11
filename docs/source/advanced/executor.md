@@ -80,6 +80,28 @@ Note: Neither callback variant is supported with the `STATIC` batching type for 
 
 In a multi-GPU run, the callback is invoked on all ranks in the first tensor-parallel group, by default. To ensure correct execution, replicate the client-side state that is accessed by the callback on these ranks. If replication is expensive or infeasible, use `LogitsPostProcessorConfig::setReplicate(false)` to invoke the callback only on rank 0. The executor broadcasts the sampled tokens internally to ensure correct execution.
 
+### Structured output with guided decoding
+Guided decoding controls the generation outputs to be amenable to pre-defined structured formats, e.g., JSON or XML. Currently, guided decoding is supported with the [XGrammar](https://github.com/mlc-ai/xgrammar) backend.
+
+To enable guided decoding, a valid instance of `GuidedDecodingConfig` must be provided when constructing `Executor`. `GuidedDecodingConfig` should be constructed with some tokenizer information, including `encodedVocab`, `tokenizerStr` (optional) and `stopTokenIds` (optional). Given a Hugging Face tokenizer, these can be extracted by:
+
+```python
+encoded_vocab = tokenizer.get_vocab()
+encoded_vocab = [token for token, _ in sorted(encoded_vocab.items(), key=lambda x: x[1])]
+tokenizer_str = tokenizer.backend_tokenizer.to_str()
+stop_token_ids = [tokenizer.eos_token_id]
+```
+
+Refer to [`tensorrt_llm/llmapi/tokenizer.py`](source:tensorrt_llm/llmapi/tokenizer.py) for more details. You may dump these materials to disk, and reload them to C++ runtime for use.
+
+Each request can be optionally specified with a `GuidedDecodingParams`, which defines the desired structured format. Currently, it supports four types:
+* `GuidedDecodingParams::GuideType::kJSON`: The generated text is amenable to JSON format;
+* `GuidedDecodingParams::GuideType::kJSON_SCHEMA`: The generated text is amenable to JSON format with additional restrictions;
+* `GuidedDecodingParams::GuideType::kREGEX`: The generated text is amenable to regular expression;
+* `GuidedDecodingParams::GuideType::kEBNF_GRAMMAR`: The generated text is amenable to the extended Backus-Naur form (EBNF) grammar.
+
+The latter three types should be used with the schema/regex/grammar provided to `GuidedDecodingParams`.
+
 ## C++ Executor API Example
 
 Two C++ examples are provided that shows how to use the Executor API and can be found in the [`examples/cpp/executor`](source:examples/cpp/executor/) folder.

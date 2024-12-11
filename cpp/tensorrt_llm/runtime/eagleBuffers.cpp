@@ -132,6 +132,11 @@ EagleBuffers::EagleBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, run
     engineInputs.chunkedContextNextTokens = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kINT32);
     chunkedContextNextTokensHost = manager.emptyTensor(runtime::MemoryType::kPINNEDPOOL, nvinfer1::DataType::kINT32);
 
+    // Eagle-2, not fully supported yet
+    engineInputs.useDynamicTreeHost = manager.cpu(ITensor::makeShape({1}), nvinfer1::DataType::kBOOL);
+    auto useDynamicTreeHostPtr = bufferCast<bool>(*(engineInputs.useDynamicTreeHost));
+    useDynamicTreeHostPtr[0] = 0;
+
     // output tensors
     engineOutputs.nextDraftTokens
         = manager.gpu(ITensor::makeShape({maxNumSequences, numPaths, pathLen}), TRTTokenIdType);
@@ -480,6 +485,8 @@ void EagleBuffers::insertInputTensors(
         "host_gen_eagle_net_past_key_value_lengths", engineInputs.eagleNetGenPastKeyValueLengthsHost);
     inputBuffers.insert_or_assign("input_gen_tokens", engineInputs.inputGenTokensHost);
     inputBuffers.insert_or_assign("chunked_context_next_tokens", engineInputs.chunkedContextNextTokens);
+    // For Eagle-2
+    inputBuffers.insert_or_assign("use_dynamic_tree", engineInputs.useDynamicTreeHost);
 
     // outputs
     outputBuffers.insert_or_assign("next_draft_tokens", engineOutputs.nextDraftTokens);

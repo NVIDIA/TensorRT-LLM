@@ -17,15 +17,15 @@ from typing import Optional
 
 from ..._utils import pad_vocab_size
 from ...functional import Tensor, non_gated_version, recv, send
-from ...layers import (MOE, Attention, AttentionMaskType, ColumnLinear,
-                       Embedding, GatedMLP, MoeConfig, PositionEmbeddingType,
-                       RmsNorm, SharedMoE)
+from ...layers import (Attention, AttentionMaskType, ColumnLinear, Embedding,
+                       GatedMLP, PositionEmbeddingType, RmsNorm, SharedMoE)
 from ...mapping import Mapping
 from ...module import Module
 from ...plugin import init_all_reduce_helper
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
                               PretrainedConfig)
-from .convert import convert_deepseek, create_trt_config_from_hf
+from .config import DeepSeekV1Config
+from .convert import convert_deepseek, load_hf_deepseek
 
 
 class DeepseekDecoderLayer(Module):
@@ -61,7 +61,9 @@ class DeepseekDecoderLayer(Module):
             tp_rank=config.mapping.tp_rank,
             quant_mode=config.quant_mode)
 
-        moe_config = MoeConfig.from_dict(config.moe)
+        ClsMLP = GatedMLP
+        moe_config = config.moe
+
         if moe_config.num_experts > 0 and layer_idx > 0:
             mlp_hidden_size = config.moe_intermediate_size
             hidden_act = config.hidden_act
@@ -189,6 +191,7 @@ class DeepseekModel(Module):
 
 
 class DeepseekForCausalLM(DecoderModelForCausalLM):
+    config_class = DeepSeekV1Config
 
     def __init__(self, config: PretrainedConfig):
         transformer = DeepseekModel(config)
@@ -209,33 +212,27 @@ class DeepseekForCausalLM(DecoderModelForCausalLM):
 
     @classmethod
     def from_hugging_face(cls,
-                          hf_model,
                           model_dir,
                           dtype: str = 'auto',
                           mapping: Optional[Mapping] = None,
                           override_fields={},
                           **kwargs):
-        assert hf_model is not None
         if mapping is None:
             mapping = Mapping()
-        config = create_trt_config_from_hf(model_dir,
-                                           dtype,
-                                           mapping=mapping,
-                                           override_fields=override_fields)
-        print(config)
-        pretrained_config = PretrainedConfig.from_dict(config)
-        pretrained_config.set_rank(mapping.rank)  # TODO:remove this hack
 
+        pretrained_config = DeepSeekV1Config.from_hugging_face(model_dir,
+                                                               dtype=dtype,
+                                                               mapping=mapping,
+                                                               **kwargs)
         deepseek = cls.from_config(pretrained_config)
+        hf_model = load_hf_deepseek(model_dir)
         weights = convert_deepseek(
             hf_model,
-            config,
+            pretrained_config,
             mapping=pretrained_config.mapping,
             dtype=pretrained_config.dtype,
-            use_parallel_embedding=config.get('use_parallel_embedding', False),
-            sharding_dim=config.get('embedding_sharding_dim', 0),
-            share_embedding_table=config.get('share_embedding_table', False))
-        #check_share_embedding(weights, config)
+            use_parallel_embedding=pretrained_config.use_parallel_embedding,
+            sharding_dim=pretrained_config.embedding_sharding_dim)
         deepseek.load(weights)
 
         return deepseek

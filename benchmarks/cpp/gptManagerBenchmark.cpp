@@ -259,6 +259,9 @@ public:
                 const std::lock_guard<std::mutex> lock(mRequestBenchInfosMutex);
                 mRequestBenchInfos[requestId].outputLength = outSeqLen;
                 mRequestBenchInfos[requestId].decodingIter = response.getResult().decodingIter;
+
+                // We record the first beam for the response file
+                mResponseTensors[requestId] = outputTokenIds[0];
             }
             else
             {
@@ -492,14 +495,19 @@ public:
         nlohmann::json jsonResponses = nlohmann::json::array();
         for (auto const& [respId, respTokensTensor] : mResponseTensors)
         {
-            int inputLength = mRequestBenchInfos[respId].inputLength;
-            int outputLength = mRequestBenchInfos[respId].outputLength;
-            std::vector<int32_t> outputTokens(outputLength);
+            auto respTokens = mResponseTensors[respId];
+            int respLength = respTokens.size();
+            int* respBufferPtr = respTokens.data();
 
-            int32_t* outputToksBufferPtr = bufferCast<int32_t>(*respTokensTensor);
             if (mOutputHasInput)
-                outputToksBufferPtr += inputLength;
-            std::copy(outputToksBufferPtr, outputToksBufferPtr + outputLength, outputTokens.begin());
+            {
+                int inputSeqLen = mRequestBenchInfos[respId].inputLength;
+                respBufferPtr += inputSeqLen;
+                respLength -= inputSeqLen;
+            }
+
+            std::vector<int32_t> outputTokens(respLength);
+            std::copy(respBufferPtr, respBufferPtr + respLength, outputTokens.begin());
 
             nlohmann::json currResp;
             currResp["response_id"] = respId;
@@ -552,7 +560,7 @@ private:
     bool mStreaming;
     int mBeamWidth;
     std::string mRespJsonFile;
-    std::unordered_map<uint64_t, TensorPtr> mResponseTensors;
+    std::unordered_map<uint64_t, texec::VecTokens> mResponseTensors;
     bool mOutputHasInput;
     std::mutex mRequestBenchInfosMutex;
 
@@ -792,7 +800,8 @@ void benchmarkExecutor(std::optional<std::filesystem::path> const& decoderEngine
     std::optional<int32_t> const& eosId, std::optional<int32_t> const& padId, BenchmarkParams const& benchmarkParams,
     texec::CapacitySchedulerPolicy capacitySchedulerPolicy, std::chrono::milliseconds waitSleep,
     bool returnContextLogits, bool returnGenerationLogits, std::optional<int> const staticEmulatedBatchSize,
-    bool logIterationData, std::optional<SizeType32> const maxPromptLen, texec::ModelType executorModelType)
+    bool logIterationData, std::optional<SizeType32> const maxPromptLen, texec::ModelType executorModelType,
+    std::string const& responsesJsonFile)
 {
     auto const& world = tensorrt_llm::mpi::MpiComm::world();
     auto worldRank = world.getRank();
@@ -801,7 +810,7 @@ void benchmarkExecutor(std::optional<std::filesystem::path> const& decoderEngine
     auto const samples = parseWorkloadJson(datasetPath, maxNumSamples, maxPromptLen);
     auto const numSamples = samples.size();
 
-    auto recorder = std::make_shared<Recorder>(opCsvFile, benchmarkParams.streaming, beamWidth);
+    auto recorder = std::make_shared<Recorder>(opCsvFile, benchmarkParams.streaming, beamWidth, responsesJsonFile);
     int32_t decoderStartTokenId = 0;
     std::shared_ptr<ExecutorServer> executorServer;
 
@@ -989,6 +998,7 @@ void benchmarkExecutor(std::optional<std::filesystem::path> const& decoderEngine
         recorder->calculateMetrics();
         recorder->report();
         recorder->writeOpMetricsToCsv();
+        recorder->dumpResponseSeqs();
         // Send terminateReqId to terminate servers on all ranks
         // Sever on rank 0 will broadcast the terminate signal to other servers on multi-GPU cases
         // gptServer->enqueue(std::make_shared<InferenceRequest>(terminateReqId));
@@ -1047,11 +1057,13 @@ int main(int argc, char* argv[])
         cxxopts::value<bool>()->default_value("false"));
     options.add_options()("enable_exp_delays", "Enables exponential delay distr to mimic real world request arrival",
         cxxopts::value<bool>()->default_value("false"));
-    options.add_options()("streaming", "Operate in streaming mode", cxxopts::value<bool>()->default_value("false"));
+    options.add_options()("streaming",
+        "Operate in streaming mode. Note: it reflects time-to-first-token and inter-token-latency",
+        cxxopts::value<bool>()->default_value("false"));
     options.add_options()(
         "enable_kv_cache_reuse", "Enables the KV cache reuse.", cxxopts::value<bool>()->default_value("false"));
-    options.add_options()("enable_chunked_context", "Whether to enable context chunking.",
-        cxxopts::value<bool>()->default_value("false"));
+    options.add_options()(
+        "enable_chunked_context", "Whether to enable context chunking.", cxxopts::value<bool>()->default_value("true"));
     options.add_options()(
         "return_context_logits", "Whether to return context logits.", cxxopts::value<bool>()->default_value("false"));
     options.add_options()("return_generation_logits", "Whether to return generation logits.",
@@ -1064,7 +1076,7 @@ int main(int argc, char* argv[])
     options.add_options()("static_emulated_batch_size",
         "Emulate static batching performance with the provided batch size.", cxxopts::value<SizeType32>());
     options.add_options()("log_level", "Choose log level between verbose/info/warning/error/internal_error.",
-        cxxopts::value<std::string>()->default_value("error"));
+        cxxopts::value<std::string>()->default_value("warning"));
     options.add_options()("log_iteration_data", "On each decoder iteration, print batch state metadata.",
         cxxopts::value<bool>()->default_value("false"));
     options.add_options()("wait_sleep", "Specify how many milliseconds to sleep each iteration of waitForEmpty loop.",
@@ -1111,6 +1123,8 @@ int main(int argc, char* argv[])
         "lookahead config in the format of [max_window_size, max_ngram_size, max_verification_set_size], and each <= "
         "executor lookahead config",
         cxxopts::value<std::string>());
+    options.add_options()("responses_json", "Write output response sequences to a json file",
+        cxxopts::value<std::string>()->default_value(""));
 
     auto result = options.parse(argc, argv);
 
@@ -1136,6 +1150,12 @@ int main(int argc, char* argv[])
         if (type == "V1")
         {
             TLLM_LOG_WARNING("type option \"V1\" is going to be renamed to \"static\".");
+        }
+        bool streaming = result["streaming"].as<bool>();
+        if (streaming)
+        {
+            TLLM_LOG_ERROR("Streaming is not supported in static batching.\n");
+            return 1;
         }
         batchingType = texec::BatchingType::kSTATIC;
     }
@@ -1419,6 +1439,9 @@ int main(int argc, char* argv[])
 
     initTrtLlmPlugins(logger.get());
 
+    // Argument: output sequences JSON
+    auto const responsesJsonFile = result["responses_json"].as<std::string>();
+
     // Argument: API
     auto const api = result["api"].as<std::string>();
     if (api == "executor")
@@ -1449,7 +1472,7 @@ int main(int argc, char* argv[])
             benchmarkExecutor(decoderEngineDir, encoderEngineDir, batchingType, datasetPath, opCsvFile, maxNumSamples,
                 beamWidth, result["warm_up"].as<int>(), eosId, padId, benchmarkParams, capacitySchedulerPolicy,
                 waitSleep, returnContextLogits, returnGenerationLogits, staticEmulatedBatchSize, logIterationData,
-                maxPromptLen, executorModelType);
+                maxPromptLen, executorModelType, responsesJsonFile);
         }
         catch (std::exception const& e)
         {

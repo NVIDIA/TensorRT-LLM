@@ -27,7 +27,7 @@ from ...layers import (MLP, Attention, AttentionMaskType, AttentionParams,
 from ...mapping import Mapping
 from ...module import Module
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
-                              QuantConfig, check_share_embedding)
+                              QuantConfig)
 from .config import GLM_ARCH1_VERSIONS, GLM_ARCH2_VERSIONS, ChatGLMConfig
 from .convert import load_weights_from_hf_model
 
@@ -305,7 +305,6 @@ class ChatGLMForCausalLM(DecoderModelForCausalLM):
             device_map=device_map)
         weights = load_weights_from_hf_model(hf_model, config)
 
-        check_share_embedding(weights, config)
         model = cls(config)
         model.load(weights)
         return model

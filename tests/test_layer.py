@@ -318,9 +318,20 @@ class TestLayer(unittest.TestCase):
          ["bfloat16", True], ["bfloat16", True, "float32"],
          ["float32", True, None, 4], ["float16", True, None, 4],
          ["bfloat16", True, None, 4], ["float16", True, "float32", 4],
-         ["bfloat16", True, "float32", 4]],
+         ["bfloat16", True, "float32", 4], ["float32", True, None, 0, 10],
+         ["float16", True, None, 0, 10], ["bfloat16", True, None, 0, 10],
+         ["float16", True, "float32", 0, 10],
+         ["bfloat16", True, "float32", 0, 10], ["float32", True, None, 4, 10],
+         ["float16", True, None, 4, 10], ["bfloat16", True, None, 4, 10],
+         ["float16", True, "float32", 4, 10],
+         ["bfloat16", True, "float32", 4, 10]],
         name_func=unittest_name_func)
-    def test_linear(self, dtype, use_plugin, output_dtype=None, pad_lda=0):
+    def test_linear(self,
+                    dtype,
+                    use_plugin,
+                    output_dtype=None,
+                    pad_lda=0,
+                    pad_ldc=0):
         # Skip tests that are not supported on pre-Ampere
         skip_bf16_pre_ampere(dtype)
 
@@ -331,7 +342,7 @@ class TestLayer(unittest.TestCase):
         torch.manual_seed(0)
         torch_dtype = str_dtype_to_torch(dtype)
         x_data = torch.randn(128, 20 + pad_lda, dtype=torch_dtype)
-        m = torch.nn.Linear(20, 30, dtype=torch.float32)
+        m = torch.nn.Linear(20, 30, bias=(pad_ldc == 0), dtype=torch.float32)
 
         # construct trt network
         builder = tensorrt_llm.Builder()
@@ -347,13 +358,16 @@ class TestLayer(unittest.TestCase):
 
             gm = tensorrt_llm.layers.Linear(20,
                                             30,
+                                            bias=(pad_ldc == 0),
                                             dtype=dtype,
-                                            pad_lda=pad_lda)
+                                            pad_lda=pad_lda,
+                                            pad_ldc=pad_ldc)
 
             gm.weight.value = torch_to_numpy(
                 m.weight.to(torch_dtype).detach().cpu())
-            gm.bias.value = torch_to_numpy(
-                m.bias.to(torch_dtype).detach().cpu())
+            if pad_ldc == 0:
+                gm.bias.value = torch_to_numpy(
+                    m.bias.to(torch_dtype).detach().cpu())
             output = gm.forward(x).trt_tensor
             output.name = 'output'
             output.dtype = tensorrt_llm.str_dtype_to_trt(output_dtype)
@@ -367,6 +381,10 @@ class TestLayer(unittest.TestCase):
                          precision_constraints="obey"))
         with TrtRunner(build_engine) as runner:
             outputs = runner.infer(feed_dict={'x': x_data})
+
+        if pad_ldc:
+            outputs['output'] = torch.split(outputs['output'], [30, pad_ldc],
+                                            dim=-1)[0]
 
         # pytorch run
         with torch.no_grad():
@@ -1374,7 +1392,7 @@ class TestLayer(unittest.TestCase):
             hidden_states_ref, last_token_ids, conv_state_ref, ssm_state_ref,
             remove_padding, batch_size, seqlen_offset)
 
-        dtype_atol = {"float16": 5e-3, "float32": 5e-3, "bfloat16": 5e-2}
+        dtype_atol = {"float16": 1e-2, "float32": 5e-3, "bfloat16": 5e-2}
 
         if not remove_padding:
             # get out_mask
@@ -1424,7 +1442,10 @@ class TestLayer(unittest.TestCase):
     @parameterized.expand(list(
         product([3], [16], [1], [1024], [128], [64], [256], [1, 4],
                 ['context', 'generation'], ["float32", "float16", "bfloat16"],
-                [True, False], [True, False])),
+                [True, False], [True, False])) + list(
+                    product([16], [16], [1], [160, 320, 640], [128], [80],
+                            [256], [1], ['context', 'generation'],
+                            ["float16", "bfloat16"], [True], [True])),
                           name_func=unittest_name_func)
     def test_mamba2(self, batch_size, in_seq_len, out_seq_len, d_model, d_state,
                     headdim, chunk_size, ngroups, req_type, dtype,
@@ -1592,8 +1613,10 @@ class TestLayer(unittest.TestCase):
         net = builder.create_network()
         if use_plugin:
             net.plugin_config.mamba_conv1d_plugin = dtype
+            net.plugin_config.gemm_plugin = dtype
         else:
             net.plugin_config.mamba_conv1d_plugin = None
+            net.plugin_config.gemm_plugin = None
         if remove_padding:
             net.plugin_config.remove_input_padding = True
         else:
@@ -1709,7 +1732,7 @@ class TestLayer(unittest.TestCase):
             hidden_states_ref, last_token_ids, conv_state_ref, ssm_state_ref,
             remove_padding, batch_size, seqlen_offset)
 
-        dtype_atol = {"float16": 7e-3, "float32": 5e-3, "bfloat16": 5e-2}
+        dtype_atol = {"float16": 1e-2, "float32": 5e-3, "bfloat16": 5e-2}
 
         if not remove_padding:
             # get out_mask

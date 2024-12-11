@@ -106,14 +106,19 @@ def build_engines(model_cache: str, only_multi_gpu: bool):
                 f'--cp_size={cp_size}'
             ], [])
 
-    ## build lookahead engine
-    model_spec_obj.use_lookahead_decoding()
-    build_engine(
-        hf_dir,
-        engine_dir / model_spec_obj.get_model_path() / 'tp1-pp1-cp1-gpu', [], [
-            '--max_draft_len=39',
-            '--speculative_decoding_mode=lookahead_decoding'
-        ])
+    if not only_multi_gpu:
+        print(f"\nBuilding lookahead engine")
+        model_spec_obj.use_tensor_parallelism(1)
+        model_spec_obj.use_pipeline_parallelism(1)
+        model_spec_obj.use_context_parallelism(1)
+        model_spec_obj.use_lookahead_decoding()
+        build_engine(
+            hf_dir,
+            engine_dir / model_spec_obj.get_model_path() / 'tp1-pp1-cp1-gpu',
+            [], [
+                '--max_draft_len=39',
+                '--speculative_decoding_mode=lookahead_decoding'
+            ])
 
     print("Done.")
 

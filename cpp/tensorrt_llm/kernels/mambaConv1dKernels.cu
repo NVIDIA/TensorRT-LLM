@@ -37,35 +37,49 @@ __device__ static inline int swizzle(int x_)
     return x_ ^ x_ / line_ % (mode_ / 16) * (16 / sizeof(T_));
 }
 
-template <int size_>
+template <int size_, bool aligned_ = true>
 __device__ static inline void cp_shared_global(uint32_t s_ptr, void const* g_ptr)
 {
     static_assert(size_ == 4 || size_ == 8 || size_ == 16);
 
+    if constexpr (aligned_)
+    {
 #if __CUDA_ARCH__ >= 800
-    asm volatile("cp.async.cg.shared.global [%0], [%1], %2;\n" ::"r"(s_ptr), "l"(g_ptr), "n"(size_));
+        asm volatile("cp.async.cg.shared.global [%0], [%1], %2;\n" ::"r"(s_ptr), "l"(g_ptr), "n"(size_));
 #else
-    register uint32_t tmp[size_ / 4];
+        uint32_t tmp[size_ / 4];
 
-    if constexpr (size_ == 16)
-    {
-        asm volatile("ld.global.v4.b32 {%0, %1, %2, %3}, [%4];\n"
-                     : "=r"(tmp[0]), "=r"(tmp[1]), "=r"(tmp[2]), "=r"(tmp[3])
-                     : "l"(g_ptr));
-        asm volatile("st.shared.v4.b32 [%0], {%1, %2, %3, %4};\n" ::"r"(s_ptr), "r"(tmp[0]), "r"(tmp[1]), "r"(tmp[2]),
-            "r"(tmp[3]));
-    }
-    else if constexpr (size_ == 8)
-    {
-        asm volatile("ld.global.v2.b32 {%0, %1}, [%2];\n" : "=r"(tmp[0]), "=r"(tmp[1]) : "l"(g_ptr));
-        asm volatile("st.shared.v2.b32 [%0], {%1, %2};\n" ::"r"(s_ptr), "r"(tmp[0]), "r"(tmp[1]));
-    }
-    else if constexpr (size_ == 4)
-    {
-        asm volatile("ld.global.b32 %0, [%1];\n" : "=r"(tmp[0]) : "l"(g_ptr));
-        asm volatile("st.shared.b32 [%0], %1;\n" ::"r"(s_ptr), "r"(tmp[0]));
-    }
+        if constexpr (size_ == 16)
+        {
+            asm volatile("ld.global.v4.b32 {%0, %1, %2, %3}, [%4];\n"
+                         : "=r"(tmp[0]), "=r"(tmp[1]), "=r"(tmp[2]), "=r"(tmp[3])
+                         : "l"(g_ptr));
+            asm volatile("st.shared.v4.b32 [%0], {%1, %2, %3, %4};\n" ::"r"(s_ptr), "r"(tmp[0]), "r"(tmp[1]),
+                "r"(tmp[2]), "r"(tmp[3]));
+        }
+        else if constexpr (size_ == 8)
+        {
+            asm volatile("ld.global.v2.b32 {%0, %1}, [%2];\n" : "=r"(tmp[0]), "=r"(tmp[1]) : "l"(g_ptr));
+            asm volatile("st.shared.v2.b32 [%0], {%1, %2};\n" ::"r"(s_ptr), "r"(tmp[0]), "r"(tmp[1]));
+        }
+        else if constexpr (size_ == 4)
+        {
+            asm volatile("ld.global.b32 %0, [%1];\n" : "=r"(tmp[0]) : "l"(g_ptr));
+            asm volatile("st.shared.b32 [%0], %1;\n" ::"r"(s_ptr), "r"(tmp[0]));
+        }
 #endif
+    }
+    else
+    {
+        uint32_t tmp[size_ / 4];
+
+#pragma unroll
+        for (int i = 0; i < size_ / 4; i++)
+        {
+            asm volatile("ld.global.b32 %0, [%1];\n" : "=r"(tmp[i]) : "l"((int*) g_ptr + i));
+            asm volatile("st.shared.b32 [%0], %1;\n" ::"r"(s_ptr + i * 4), "r"(tmp[i]));
+        }
+    }
 }
 
 __device__ static inline void cp_commit_group()
@@ -190,7 +204,7 @@ __device__ __forceinline__ void packed_zero(T* to_ptr)
     packed_move<T, N>(&tmp_data[0], to_ptr);
 }
 
-template <int K_, int tileL_, int tileD_, int warpL_, int warpD_, int laneD_, int pipe_, typename T_>
+template <int K_, int tileL_, int tileD_, int warpL_, int warpD_, int laneD_, int pipe_, bool aligned_, typename T_>
 __global__
     std::enable_if_t<std::is_same_v<T_, half>
 #ifdef ENABLE_BF16
@@ -207,15 +221,15 @@ __global__
 
     constexpr int laneL = 32 / laneD_;
 
-    register float weight[K_][tileD_ / warpD_ / laneD_][8];
-    register float bias[tileD_ / warpD_ / laneD_][8];
+    float weight[K_][tileD_ / warpD_ / laneD_][8];
+    float bias[tileD_ / warpD_ / laneD_][8];
 
 #pragma unroll
     for (int iK = 0; iK < K_; iK++)
 #pragma unroll
         for (int iD = 0; iD < tileD_ / (warpD_ * laneD_ * 8); iD++)
         {
-            register T_ tmp[8];
+            T_ tmp[8];
 
             *(int4*) &tmp = *(int4*) &g_mxW_[iK * D_ + blockIdx.x * tileD_ + iD * warpD_ * laneD_ * 8
                 + threadIdx.y * laneD_ * 8 + threadIdx.x % laneD_ * 8];
@@ -233,7 +247,7 @@ __global__
 #pragma unroll
     for (int iD = 0; iD < tileD_ / (warpD_ * laneD_ * 8); iD++)
     {
-        register T_ tmp[8];
+        T_ tmp[8];
 
         *(int4*) &tmp = *(int4*) &g_mxB_[blockIdx.x * tileD_ + iD * warpD_ * laneD_ * 8 + threadIdx.y * laneD_ * 8
             + threadIdx.x % laneD_ * 8];
@@ -294,7 +308,7 @@ __global__
 #pragma unroll
         for (int i = 0; i < (K_ - 1) * tileD_; i += STEP)
             if (i + STEP <= (K_ - 1) * tileD_ || i + thread * 8 < (K_ - 1) * tileD_)
-                cp_shared_global<16>(b_mxX
+                cp_shared_global<16, aligned_>(b_mxX
                         + 2
                             * swizzle<tileD_ * 2, tileD_, T_>(
                                 i + thread * 8 + (warpL_ * laneL * pipe_ + 1 - K_) * tileD_),
@@ -306,7 +320,7 @@ __global__
 #pragma unroll
         for (int i = 0; i < (K_ - 1) * tileD_; i += STEP)
             if (i + STEP <= (K_ - 1) * tileD_ || i + thread * 8 < (K_ - 1) * tileD_)
-                cp_shared_global<16>(b_mxX
+                cp_shared_global<16, aligned_>(b_mxX
                         + 2
                             * swizzle<tileD_ * 2, tileD_, T_>(
                                 i + thread * 8 + (warpL_ * laneL * pipe_ + 1 - K_) * tileD_),
@@ -332,7 +346,7 @@ __global__
 #pragma unroll
             for (int i = 0; i < warpL_ * laneL * tileD_; i += STEP)
                 if (i + STEP <= warpL_ * laneL * tileD_ || i + thread * 8 < warpL_ * laneL * tileD_)
-                    cp_shared_global<16>(
+                    cp_shared_global<16, aligned_>(
                         b_mxX + 2 * swizzle<tileD_ * 2, tileD_, T_>(i + thread * 8 + iL * warpL_ * laneL * tileD_),
                         g_mxXa_ + aIStart + iL * warpL_ * laneL * DS_ + (lStart + thread * 8 / tileD_) * DS_ + S_pre_
                             + i * (D_ / tileD_) + dStart + thread * 8 % tileD_);
@@ -342,7 +356,7 @@ __global__
 #pragma unroll
             for (int i = 0; i < warpL_ * laneL * tileD_; i += STEP)
                 if (i + thread * 8 < (L - lStart - iL * warpL_ * laneL) * tileD_)
-                    cp_shared_global<16>(
+                    cp_shared_global<16, aligned_>(
                         b_mxX + 2 * swizzle<tileD_ * 2, tileD_, T_>(i + thread * 8 + iL * warpL_ * laneL * tileD_),
                         g_mxXa_ + aIStart + iL * warpL_ * laneL * DS_ + (lStart + thread * 8 / tileD_) * DS_ + S_pre_
                             + i * (D_ / tileD_) + dStart + thread * 8 % tileD_);
@@ -361,8 +375,8 @@ __global__
 #pragma unroll
         for (int iD = 0; iD < tileD_ / (warpD_ * laneD_ * 8); iD++)
         {
-            register float sum[8];
-            register T_ tmp[8];
+            float sum[8];
+            T_ tmp[8];
 
 #pragma unroll
             for (int i = 0; i < 8; i += 4)
@@ -435,7 +449,7 @@ __global__
 #pragma unroll
             for (int i = 0; i < warpL_ * laneL * tileD_; i += STEP)
                 if (i + STEP <= warpL_ * laneL * tileD_ || i + thread * 8 < warpL_ * laneL * tileD_)
-                    cp_shared_global<16>(b_mxX
+                    cp_shared_global<16, aligned_>(b_mxX
                             + 2
                                 * swizzle<tileD_ * 2, tileD_, T_>(
                                     i + thread * 8 + jL % pipe_ * warpL_ * laneL * tileD_),
@@ -447,7 +461,7 @@ __global__
 #pragma unroll
             for (int i = 0; i < warpL_ * laneL * tileD_; i += STEP)
                 if (i + thread * 8 < (L - lStart - jL * warpL_ * laneL) * tileD_)
-                    cp_shared_global<16>(b_mxX
+                    cp_shared_global<16, aligned_>(b_mxX
                             + 2
                                 * swizzle<tileD_ * 2, tileD_, T_>(
                                     i + thread * 8 + jL % pipe_ * warpL_ * laneL * tileD_),
@@ -503,7 +517,7 @@ __global__
     }
 }
 
-template <int K_, int tileL_, int tileD_, int warpL_, int warpD_, int laneD_, int pipe_, typename T_>
+template <int K_, int tileL_, int tileD_, int warpL_, int warpD_, int laneD_, int pipe_, bool aligned_, typename T_>
 __global__ std::enable_if_t<std::is_same_v<T_, float>> mambaConv1dContextKernel(int B_, int L_, int D_, int S_pre_,
     int S_post_, T_* g_mxYa_, T_* g_mxYs_, T_ const* g_mxXa_, T_ const* g_mxXs_, T_ const* g_mxW_, T_ const* g_mxB_,
     bool removePadding_, bool applySilu_, int const* lastTokenIdsPtr_, int const* stateSlotMappingPtr_ = nullptr)
@@ -512,8 +526,8 @@ __global__ std::enable_if_t<std::is_same_v<T_, float>> mambaConv1dContextKernel(
 
     constexpr int laneL = 32 / laneD_;
 
-    register float weight[K_][tileD_ / warpD_ / laneD_][4];
-    register float bias[tileD_ / warpD_ / laneD_][4];
+    float weight[K_][tileD_ / warpD_ / laneD_][4];
+    float bias[tileD_ / warpD_ / laneD_][4];
 
 #pragma unroll
     for (int iK = 0; iK < K_; iK++)
@@ -577,7 +591,7 @@ __global__ std::enable_if_t<std::is_same_v<T_, float>> mambaConv1dContextKernel(
 #pragma unroll
         for (int i = 0; i < (K_ - 1) * tileD_; i += STEP)
             if (i + STEP <= (K_ - 1) * tileD_ || i + thread * 4 < (K_ - 1) * tileD_)
-                cp_shared_global<16>(b_mxX
+                cp_shared_global<16, aligned_>(b_mxX
                         + 4
                             * swizzle<tileD_ * 4, tileD_, T_>(
                                 i + thread * 4 + (warpL_ * laneL * pipe_ + 1 - K_) * tileD_),
@@ -589,7 +603,7 @@ __global__ std::enable_if_t<std::is_same_v<T_, float>> mambaConv1dContextKernel(
 #pragma unroll
         for (int i = 0; i < (K_ - 1) * tileD_; i += STEP)
             if (i + STEP <= (K_ - 1) * tileD_ || i + thread * 4 < (K_ - 1) * tileD_)
-                cp_shared_global<16>(b_mxX
+                cp_shared_global<16, aligned_>(b_mxX
                         + 4
                             * swizzle<tileD_ * 4, tileD_, T_>(
                                 i + thread * 4 + (warpL_ * laneL * pipe_ + 1 - K_) * tileD_),
@@ -615,7 +629,7 @@ __global__ std::enable_if_t<std::is_same_v<T_, float>> mambaConv1dContextKernel(
 #pragma unroll
             for (int i = 0; i < warpL_ * laneL * tileD_; i += STEP)
                 if (i + STEP <= warpL_ * laneL * tileD_ || i + thread * 4 < warpL_ * laneL * tileD_)
-                    cp_shared_global<16>(
+                    cp_shared_global<16, aligned_>(
                         b_mxX + 4 * swizzle<tileD_ * 4, tileD_, T_>(i + thread * 4 + iL * warpL_ * laneL * tileD_),
                         g_mxXa_ + aIStart + iL * warpL_ * laneL * DS_ + (lStart + thread * 4 / tileD_) * DS_ + S_pre_
                             + i * (D_ / tileD_) + dStart + thread * 4 % tileD_);
@@ -625,7 +639,7 @@ __global__ std::enable_if_t<std::is_same_v<T_, float>> mambaConv1dContextKernel(
 #pragma unroll
             for (int i = 0; i < warpL_ * laneL * tileD_; i += STEP)
                 if (i + thread * 4 < (L - lStart - iL * warpL_ * laneL) * tileD_)
-                    cp_shared_global<16>(
+                    cp_shared_global<16, aligned_>(
                         b_mxX + 4 * swizzle<tileD_ * 4, tileD_, T_>(i + thread * 4 + iL * warpL_ * laneL * tileD_),
                         g_mxXa_ + aIStart + iL * warpL_ * laneL * DS_ + (lStart + thread * 4 / tileD_) * DS_ + S_pre_
                             + i * (D_ / tileD_) + dStart + thread * 4 % tileD_);
@@ -644,8 +658,8 @@ __global__ std::enable_if_t<std::is_same_v<T_, float>> mambaConv1dContextKernel(
 #pragma unroll
         for (int iD = 0; iD < tileD_ / (warpD_ * laneD_ * 4); iD++)
         {
-            register float sum[4];
-            register T_ tmp[4];
+            float sum[4];
+            T_ tmp[4];
 
 #pragma unroll
             for (int i = 0; i < 4; i += 4)
@@ -686,7 +700,7 @@ __global__ std::enable_if_t<std::is_same_v<T_, float>> mambaConv1dContextKernel(
 #pragma unroll
             for (int i = 0; i < warpL_ * laneL * tileD_; i += STEP)
                 if (i + STEP <= warpL_ * laneL * tileD_ || i + thread * 4 < warpL_ * laneL * tileD_)
-                    cp_shared_global<16>(b_mxX
+                    cp_shared_global<16, aligned_>(b_mxX
                             + 4
                                 * swizzle<tileD_ * 4, tileD_, T_>(
                                     i + thread * 4 + jL % pipe_ * warpL_ * laneL * tileD_),
@@ -698,7 +712,7 @@ __global__ std::enable_if_t<std::is_same_v<T_, float>> mambaConv1dContextKernel(
 #pragma unroll
             for (int i = 0; i < warpL_ * laneL * tileD_; i += STEP)
                 if (i + thread * 4 < (L - lStart - jL * warpL_ * laneL) * tileD_)
-                    cp_shared_global<16>(b_mxX
+                    cp_shared_global<16, aligned_>(b_mxX
                             + 4
                                 * swizzle<tileD_ * 4, tileD_, T_>(
                                     i + thread * 4 + jL % pipe_ * warpL_ * laneL * tileD_),
@@ -763,6 +777,8 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
     int K = params.dconv;
     int S_pre = params.pre_stride;
     int S_post = params.post_stride;
+    int DS = D + S_pre + S_post;
+    bool aligned = DS * sizeof(input_t) % 16 == 0;
 
     int tileL = 32;
     int tileD = 128;
@@ -785,15 +801,21 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
                 warpD = 8;
                 laneD = 1;
                 pipe = 2;
-                f = mambaConv1dContextKernel<4, 32, 32, 1, 8, 1, 2>;
+                if (aligned)
+                    f = mambaConv1dContextKernel<4, 32, 32, 1, 8, 1, 2, true>;
+                else
+                    f = mambaConv1dContextKernel<4, 32, 32, 1, 8, 1, 2, false>;
             }
-            else if (B * L * D <= 524288)
+            else if (B * L * D <= 524288 || D % 64 == 32)
             {
                 tileD = 32;
                 warpD = 4;
                 laneD = 1;
                 pipe = 2;
-                f = mambaConv1dContextKernel<4, 32, 32, 1, 4, 1, 2>;
+                if (aligned)
+                    f = mambaConv1dContextKernel<4, 32, 32, 1, 4, 1, 2, true>;
+                else
+                    f = mambaConv1dContextKernel<4, 32, 32, 1, 4, 1, 2, false>;
             }
             else if (B * L * D <= 1048576)
             {
@@ -801,7 +823,10 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
                 warpD = 4;
                 laneD = 4;
                 pipe = 4;
-                f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 4, 4>;
+                if (aligned)
+                    f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 4, 4, true>;
+                else
+                    f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 4, 4, false>;
             }
             else if (B * L * D <= 4194304)
             {
@@ -811,7 +836,10 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
                     warpD = 4;
                     laneD = 4;
                     pipe = 4;
-                    f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 4, 4>;
+                    if (aligned)
+                        f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 4, 4, true>;
+                    else
+                        f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 4, 4, false>;
                 }
                 else
                 {
@@ -819,7 +847,10 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
                     warpD = 4;
                     laneD = 8;
                     pipe = 4;
-                    f = mambaConv1dContextKernel<4, 32, 128, 1, 4, 8, 4>;
+                    if (aligned)
+                        f = mambaConv1dContextKernel<4, 32, 128, 1, 4, 8, 4, true>;
+                    else
+                        f = mambaConv1dContextKernel<4, 32, 128, 1, 4, 8, 4, false>;
                 }
             }
             else
@@ -828,7 +859,10 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
                 warpD = 4;
                 laneD = 2;
                 pipe = 4;
-                f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 2, 4>;
+                if (aligned)
+                    f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 2, 4, true>;
+                else
+                    f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 2, 4, false>;
             }
         }
         else if (tensorrt_llm::common::getSMVersion() >= 80)
@@ -839,15 +873,21 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
                 warpD = 8;
                 laneD = 1;
                 pipe = 2;
-                f = mambaConv1dContextKernel<4, 32, 32, 1, 8, 1, 2>;
+                if (aligned)
+                    f = mambaConv1dContextKernel<4, 32, 32, 1, 8, 1, 2, true>;
+                else
+                    f = mambaConv1dContextKernel<4, 32, 32, 1, 8, 1, 2, false>;
             }
-            else if (B * L * D <= 524288)
+            else if (B * L * D <= 524288 || D % 64 == 32)
             {
                 tileD = 32;
                 warpD = 4;
                 laneD = 1;
                 pipe = 2;
-                f = mambaConv1dContextKernel<4, 32, 32, 1, 4, 1, 2>;
+                if (aligned)
+                    f = mambaConv1dContextKernel<4, 32, 32, 1, 4, 1, 2, true>;
+                else
+                    f = mambaConv1dContextKernel<4, 32, 32, 1, 4, 1, 2, false>;
             }
             else if (B * L * D <= 1048576)
             {
@@ -855,7 +895,10 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
                 warpD = 4;
                 laneD = 4;
                 pipe = 4;
-                f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 4, 4>;
+                if (aligned)
+                    f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 4, 4, true>;
+                else
+                    f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 4, 4, false>;
             }
             else if (B * L * D <= 4194304)
             {
@@ -865,7 +908,10 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
                     warpD = 4;
                     laneD = 4;
                     pipe = 4;
-                    f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 4, 4>;
+                    if (aligned)
+                        f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 4, 4, true>;
+                    else
+                        f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 4, 4, false>;
                 }
                 else
                 {
@@ -873,7 +919,10 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
                     warpD = 4;
                     laneD = 8;
                     pipe = 4;
-                    f = mambaConv1dContextKernel<4, 32, 128, 1, 4, 8, 4>;
+                    if (aligned)
+                        f = mambaConv1dContextKernel<4, 32, 128, 1, 4, 8, 4, true>;
+                    else
+                        f = mambaConv1dContextKernel<4, 32, 128, 1, 4, 8, 4, false>;
                 }
             }
             else
@@ -884,7 +933,10 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
                     warpD = 4;
                     laneD = 2;
                     pipe = 4;
-                    f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 2, 4>;
+                    if (aligned)
+                        f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 2, 4, true>;
+                    else
+                        f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 2, 4, false>;
                 }
                 else
                 {
@@ -892,7 +944,10 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
                     warpD = 4;
                     laneD = 4;
                     pipe = 4;
-                    f = mambaConv1dContextKernel<4, 32, 128, 1, 4, 4, 4>;
+                    if (aligned)
+                        f = mambaConv1dContextKernel<4, 32, 128, 1, 4, 4, 4, true>;
+                    else
+                        f = mambaConv1dContextKernel<4, 32, 128, 1, 4, 4, 4, false>;
                 }
             }
         }
@@ -904,15 +959,21 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
                 warpD = 4;
                 laneD = 1;
                 pipe = 2;
-                f = mambaConv1dContextKernel<4, 32, 32, 1, 4, 1, 2>;
+                if (aligned)
+                    f = mambaConv1dContextKernel<4, 32, 32, 1, 4, 1, 2, true>;
+                else
+                    f = mambaConv1dContextKernel<4, 32, 32, 1, 4, 1, 2, false>;
             }
-            else if (B * L * D <= 524288)
+            else if (B * L * D <= 524288 || D % 64 == 32)
             {
                 tileD = 32;
                 warpD = 4;
                 laneD = 1;
                 pipe = 2;
-                f = mambaConv1dContextKernel<4, 32, 32, 1, 4, 1, 2>;
+                if (aligned)
+                    f = mambaConv1dContextKernel<4, 32, 32, 1, 4, 1, 2, true>;
+                else
+                    f = mambaConv1dContextKernel<4, 32, 32, 1, 4, 1, 2, false>;
             }
             else if (B * L * D <= 1048576)
             {
@@ -922,7 +983,10 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
                     warpD = 4;
                     laneD = 4;
                     pipe = 2;
-                    f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 4, 2>;
+                    if (aligned)
+                        f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 4, 2, true>;
+                    else
+                        f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 4, 2, false>;
                 }
                 else
                 {
@@ -930,7 +994,10 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
                     warpD = 4;
                     laneD = 8;
                     pipe = 2;
-                    f = mambaConv1dContextKernel<4, 32, 128, 1, 4, 8, 2>;
+                    if (aligned)
+                        f = mambaConv1dContextKernel<4, 32, 128, 1, 4, 8, 2, true>;
+                    else
+                        f = mambaConv1dContextKernel<4, 32, 128, 1, 4, 8, 2, false>;
                 }
             }
             else
@@ -939,7 +1006,10 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
                 warpD = 4;
                 laneD = 1;
                 pipe = 2;
-                f = mambaConv1dContextKernel<4, 32, 32, 1, 4, 1, 2>;
+                if (aligned)
+                    f = mambaConv1dContextKernel<4, 32, 32, 1, 4, 1, 2, true>;
+                else
+                    f = mambaConv1dContextKernel<4, 32, 32, 1, 4, 1, 2, false>;
             }
         }
         else
@@ -950,15 +1020,21 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
                 warpD = 8;
                 laneD = 1;
                 pipe = 2;
-                f = mambaConv1dContextKernel<4, 32, 32, 1, 8, 1, 2>;
+                if (aligned)
+                    f = mambaConv1dContextKernel<4, 32, 32, 1, 8, 1, 2, true>;
+                else
+                    f = mambaConv1dContextKernel<4, 32, 32, 1, 8, 1, 2, false>;
             }
-            else if (B * L * D <= 524288)
+            else if (B * L * D <= 524288 || D % 64 == 32)
             {
                 tileD = 32;
                 warpD = 4;
                 laneD = 2;
                 pipe = 2;
-                f = mambaConv1dContextKernel<4, 32, 32, 1, 4, 2, 2>;
+                if (aligned)
+                    f = mambaConv1dContextKernel<4, 32, 32, 1, 4, 2, 2, true>;
+                else
+                    f = mambaConv1dContextKernel<4, 32, 32, 1, 4, 2, 2, false>;
             }
             else if (B * L * D <= 1048576)
             {
@@ -966,7 +1042,10 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
                 warpD = 4;
                 laneD = 4;
                 pipe = 2;
-                f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 4, 2>;
+                if (aligned)
+                    f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 4, 2, true>;
+                else
+                    f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 4, 2, false>;
             }
             else
             {
@@ -974,7 +1053,10 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
                 warpD = 4;
                 laneD = 1;
                 pipe = 2;
-                f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 1, 2>;
+                if (aligned)
+                    f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 1, 2, true>;
+                else
+                    f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 1, 2, false>;
             }
         }
     }
@@ -982,13 +1064,16 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
     {
         if (tensorrt_llm::common::getSMVersion() >= 80)
         {
-            if (B * L * D <= 262144)
+            if (B * L * D <= 262144 || D % 64 == 32)
             {
                 tileD = 32;
                 warpD = 4;
                 laneD = 1;
                 pipe = 4;
-                f = mambaConv1dContextKernel<4, 32, 32, 1, 4, 1, 4>;
+                if (aligned)
+                    f = mambaConv1dContextKernel<4, 32, 32, 1, 4, 1, 4, true>;
+                else
+                    f = mambaConv1dContextKernel<4, 32, 32, 1, 4, 1, 4, false>;
             }
             else if (B * L * D <= 1048576)
             {
@@ -996,7 +1081,10 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
                 warpD = 4;
                 laneD = 2;
                 pipe = 4;
-                f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 2, 4>;
+                if (aligned)
+                    f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 2, 4, true>;
+                else
+                    f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 2, 4, false>;
             }
             else
             {
@@ -1006,7 +1094,10 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
                     warpD = 4;
                     laneD = 2;
                     pipe = 4;
-                    f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 2, 4>;
+                    if (aligned)
+                        f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 2, 4, true>;
+                    else
+                        f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 2, 4, false>;
                 }
                 else
                 {
@@ -1014,19 +1105,25 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
                     warpD = 4;
                     laneD = 4;
                     pipe = 4;
-                    f = mambaConv1dContextKernel<4, 32, 128, 1, 4, 4, 4>;
+                    if (aligned)
+                        f = mambaConv1dContextKernel<4, 32, 128, 1, 4, 4, 4, true>;
+                    else
+                        f = mambaConv1dContextKernel<4, 32, 128, 1, 4, 4, 4, false>;
                 }
             }
         }
         else
         {
-            if (B * L * D <= 262144)
+            if (B * L * D <= 262144 || D % 64 == 32)
             {
                 tileD = 32;
                 warpD = 4;
                 laneD = 1;
                 pipe = 2;
-                f = mambaConv1dContextKernel<4, 32, 32, 1, 4, 1, 2>;
+                if (aligned)
+                    f = mambaConv1dContextKernel<4, 32, 32, 1, 4, 1, 2, true>;
+                else
+                    f = mambaConv1dContextKernel<4, 32, 32, 1, 4, 1, 2, false>;
             }
             else if (B * L * D <= 1048576)
             {
@@ -1034,7 +1131,10 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
                 warpD = 4;
                 laneD = 2;
                 pipe = 2;
-                f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 2, 2>;
+                if (aligned)
+                    f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 2, 2, true>;
+                else
+                    f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 2, 2, false>;
             }
             else
             {
@@ -1044,7 +1144,10 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
                     warpD = 4;
                     laneD = 2;
                     pipe = 2;
-                    f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 2, 2>;
+                    if (aligned)
+                        f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 2, 2, true>;
+                    else
+                        f = mambaConv1dContextKernel<4, 32, 64, 1, 4, 2, 2, false>;
                 }
                 else
                 {
@@ -1052,7 +1155,10 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
                     warpD = 4;
                     laneD = 4;
                     pipe = 2;
-                    f = mambaConv1dContextKernel<4, 32, 128, 1, 4, 4, 2>;
+                    if (aligned)
+                        f = mambaConv1dContextKernel<4, 32, 128, 1, 4, 4, 2, true>;
+                    else
+                        f = mambaConv1dContextKernel<4, 32, 128, 1, 4, 4, 2, false>;
                 }
             }
         }
@@ -1060,7 +1166,7 @@ void invokeMambaConv1dContext(MambaConv1dParamsBase& params, cudaStream_t stream
 
     int shmem = warpL * (32 / laneD) * (pipe + 1) * tileD * 4;
 
-    TLLM_CHECK_WITH_INFO(D % 64 == 0, "Channels should be multiple of 64.");
+    TLLM_CHECK_WITH_INFO(D % 32 == 0, "Channels should be multiple of 32.");
     TLLM_CHECK_WITH_INFO(K == 4, "Only dconv == 4 is supported.");
 
     input_t* ya = (input_t*) params.out_ptr;

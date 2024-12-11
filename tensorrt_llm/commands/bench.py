@@ -17,10 +17,18 @@ from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
     help="The Huggingface name of the model to benchmark.",
 )
 @click.option(
+    "--model_path",
+    required=False,
+    default=None,
+    type=click.Path(writable=False, readable=True, path_type=Path),
+    help=
+    "Path to a Huggingface checkpoint directory for loading model components.",
+)
+@click.option(
     "--workspace",
     "-w",
     required=False,
-    type=click.Path(writable=True, readable=True),
+    type=click.Path(writable=True, readable=True, path_type=Path),
     default="/tmp",  # nosec B108
     help="The directory to store benchmarking intermediate files.",
 )
@@ -28,9 +36,12 @@ from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 def main(
     ctx,
     model: str,
+    model_path: Path,
     workspace: Path,
 ) -> None:
-    ctx.obj = BenchmarkEnvironment(model=model, workspace=workspace)
+    ctx.obj = BenchmarkEnvironment(model=model,
+                                   model_path=model_path,
+                                   workspace=workspace)
 
     # Create the workspace where we plan to store intermediate files.
     ctx.obj.workspace.mkdir(parents=True, exist_ok=True)

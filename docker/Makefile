@@ -40,6 +40,7 @@ TRT_VERSION        ?=
 GIT_COMMIT         ?= $(shell git rev-parse HEAD)
 TRT_LLM_VERSION    ?= $(shell grep '^__version__' ../tensorrt_llm/version.py | grep -o '=.*' | tr -d '= "')
 GITHUB_MIRROR      ?=
+PYTHON_VERSION     ?=
 
 define add_local_user
 	docker build \
@@ -77,6 +78,7 @@ endef
 		$(if $(DEVEL_IMAGE), --build-arg DEVEL_IMAGE="$(DEVEL_IMAGE)") \
 		$(if $(GIT_COMMIT), --build-arg GIT_COMMIT="$(GIT_COMMIT)") \
 		$(if $(GITHUB_MIRROR), --build-arg GITHUB_MIRROR="$(GITHUB_MIRROR)") \
+		$(if $(PYTHON_VERSION), --build-arg PYTHON_VERSION="$(PYTHON_VERSION)") \
 		$(if $(STAGE), --target $(STAGE)) \
 		--file Dockerfile.multi \
 		--tag $(IMAGE_WITH_TAG) \
@@ -143,11 +145,17 @@ jenkins_%: IMAGE_WITH_TAG = $(shell grep 'LLM_DOCKER_IMAGE = ' ../jenkins/L0_Mer
 jenkins_%: STAGE = devel
 
 # For aarch64
-jenkins-aarch64_%: IMAGE_WITH_TAG = $(shell grep 'LLM_SBSA_DOCKER_IMAGE = ' ../jenkins/GH200Builder.groovy | grep -o '".*"' | tr -d '"')
+jenkins-aarch64_%: IMAGE_WITH_TAG = $(shell grep 'LLM_SBSA_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
 jenkins-aarch64_%: STAGE = devel
 
 # For x86_64
-centos7_%: IMAGE_WITH_TAG = $(shell grep 'LLM_CENTOS7_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
+jenkins-centos7_%: IMAGE_WITH_TAG = $(shell grep 'LLM_CENTOS7_DOCKER_IMAGE = ' ../jenkins/L0_MergeRequest.groovy | grep -o '".*"' | tr -d '"')
+jenkins-centos7_%: STAGE = devel
+jenkins-centos7_%: BASE_IMAGE = nvidia/cuda
+# Latest NGC centos7 CUDA image tag is 12.4.0. It also looks like no further update.
+# We need to reinstall the new CUDA toolkit when using this base image.
+jenkins-centos7_%: BASE_TAG = 12.4.0-devel-centos7
+
 centos7_%: STAGE = devel
 centos7_%: BASE_IMAGE = nvidia/cuda
 # Latest NGC centos7 CUDA image tag is 12.4.0. It also looks like no further update.
@@ -157,7 +165,7 @@ centos7_%: BASE_TAG = 12.4.0-devel-centos7
 # For x86_64 and aarch64
 ubuntu22_%: STAGE = devel
 ubuntu22_%: BASE_IMAGE = nvidia/cuda
-ubuntu22_%: BASE_TAG = 12.6.2-devel-ubuntu22.04
+ubuntu22_%: BASE_TAG = 12.6.3-devel-ubuntu22.04
 
 trtllm_%: STAGE = release
 trtllm_%: PUSH_TO_STAGING := 0

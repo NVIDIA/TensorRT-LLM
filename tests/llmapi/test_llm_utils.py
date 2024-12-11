@@ -6,10 +6,9 @@ import pytest
 from tensorrt_llm.builder import PluginConfig
 from tensorrt_llm.llmapi.llm_utils import *
 
-try:
-    from test_llm import llama_model_path
-except ImportError:
-    from .test_llm import llama_model_path
+# isort: off
+from test_llm import llama_model_path
+# isort: on
 
 
 def test_ConfigArbitrator_basic():
