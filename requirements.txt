@@ -11,7 +11,7 @@ onnx_graphsurgeon>=0.5.2
 openai==1.54.3
 polygraphy
 psutil
-pynvml>=11.5.0
+pynvml>=11.5.0,<12.0.0
 pulp
 pandas
 h5py==3.12.1
