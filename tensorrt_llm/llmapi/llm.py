@@ -340,7 +340,8 @@ class LLM:
                     raise ValueError(
                         "tokenizer is required to reset end_id if it is None, or you can explicitly specify the end_id for sampling_params"
                     )
-            return sampling_params.setup(self.tokenizer)
+                sampling_params.setup(self.tokenizer)
+            return sampling_params
         else:
             raise TypeError(
                 f"The sampling_params must be type SamplingParams or None, but got {type(sampling_params)}"
