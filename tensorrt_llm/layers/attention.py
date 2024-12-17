@@ -41,8 +41,6 @@ from .linear import ColumnLinear, RowLinear
 from .lora import LoraRuntimeParams
 from .normalization import GroupNorm, LayerNorm, RmsNorm
 
-from ..functional import maximum  # isort:skip
-
 layernorm_map = {
     LayerNormType.LayerNorm: LayerNorm,
     LayerNormType.RmsNorm: RmsNorm,
@@ -249,23 +247,25 @@ class SpecDecodingParams:
                  spec_decoding_max_generation_length: int = 1,
                  spec_decoding_generation_lengths: Tensor = None,
                  spec_decoding_position_offsets: Tensor = None,
-                 spec_decoding_packed_mask: Tensor = None):
+                 spec_decoding_packed_mask: Tensor = None,
+                 spec_decoding_use: Tensor = None):
 
         self.spec_decoding_is_generation_length_variable = spec_decoding_is_generation_length_variable
         self.spec_decoding_max_generation_length = spec_decoding_max_generation_length
         self.spec_decoding_generation_lengths = spec_decoding_generation_lengths
         self.spec_decoding_position_offsets = spec_decoding_position_offsets
         self.spec_decoding_packed_mask = spec_decoding_packed_mask
+        self.spec_decoding_use = spec_decoding_use
 
 
 class MropeParams:
 
     def __init__(
         self,
-        mrope_rotary_sin_cos: Tensor = None,
+        mrope_rotary_cos_sin: Tensor = None,
         mrope_position_deltas: Tensor = None,
     ):
-        self.mrope_rotary_sin_cos = mrope_rotary_sin_cos
+        self.mrope_rotary_cos_sin = mrope_rotary_cos_sin
         self.mrope_position_deltas = mrope_position_deltas
 
 
@@ -1110,9 +1110,10 @@ class Attention(Module):
                 spec_decoding_position_offsets,
                 spec_decoding_packed_mask=spec_decoding_params.
                 spec_decoding_packed_mask,
+                spec_decoding_use=spec_decoding_params.spec_decoding_use,
                 long_rope_rotary_inv_freq=long_rope_rotary_inv_freq,
                 long_rope_rotary_cos_sin=long_rope_rotary_cos_sin,
-                mrope_rotary_sin_cos=mrope_params.mrope_rotary_sin_cos,
+                mrope_rotary_cos_sin=mrope_params.mrope_rotary_cos_sin,
                 mrope_position_deltas=mrope_params.mrope_position_deltas,
                 attn_logit_softcapping_scale=self.max_attn_value,
                 host_runtime_perf_knobs=attention_params.
@@ -1181,8 +1182,8 @@ class Attention(Module):
 
                     embed_positions = concat([short, long], dim=0)
                     select = where(
-                        sequence_length <=
-                        self.original_max_position_embeddings, 0, 1)
+                        sequence_length
+                        <= self.original_max_position_embeddings, 0, 1)
                     embed_positions = slice(embed_positions,
                                             concat([select, 0, 0]),
                                             sizes=shape(short))
@@ -1459,10 +1460,14 @@ class Attention(Module):
             dense_lora_params = lora_layer_params.get_runtime_params(
                 0, "attn_dense")
 
-        if skip_attn is not None:
+        if skip_attn is not None and not default_net(
+        ).plugin_config.use_fp8_context_fmha:
             # This case is used when we can skip this attention layer directly.
             # The output would be undefined and not used if skip_attn is not None
             # and set skip_attn as True during runtime
+            # But when use_fp8_context_fmha is enabled, the output data type of
+            # attention_plugin is fp8. Since TRT's conditional layer does not support
+            # FP8 data type yet, we cannot use it to skip the computation in such case.
 
             dense_conditional = Conditional(skip_attn)
             skip_case = dense_conditional.add_input(attention_input)
@@ -1474,7 +1479,8 @@ class Attention(Module):
                              lora_runtime_params=dense_lora_params,
                              all_reduce_params=all_reduce_params)
 
-        if skip_attn is not None:
+        if skip_attn is not None and not default_net(
+        ).plugin_config.use_fp8_context_fmha:
             context = dense_conditional.add_output(skip_case, context)
 
         if use_cache:
@@ -1870,7 +1876,7 @@ class CogVLMAttention(Attention):
                 use_cache=use_cache,
                 spec_decoding_position_offsets=None,
                 spec_decoding_packed_mask=None,
-                mrope_rotary_sin_cos=None,
+                mrope_rotary_cos_sin=None,
                 mrope_position_deltas=None,
                 host_runtime_perf_knobs=attention_params.
                 host_runtime_perf_knobs,
@@ -2178,6 +2184,7 @@ class DeepseekV2Attention(Attention):
                 spec_decoding_position_offsets,
                 spec_decoding_packed_mask=spec_decoding_params.
                 spec_decoding_packed_mask,
+                spec_decoding_use=spec_decoding_params.spec_decoding_use,
                 attn_logit_softcapping_scale=self.max_attn_value,
                 host_runtime_perf_knobs=attention_params.
                 host_runtime_perf_knobs,

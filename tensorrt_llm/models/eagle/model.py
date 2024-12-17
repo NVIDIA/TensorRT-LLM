@@ -614,7 +614,7 @@ class EagleForCausalLM(LLaMAForCausalLM):
             host_gen_eagle_net_context_lengths,
             host_gen_eagle_net_past_key_value_lengths,
             hidden_size_batch_level_starts, input_gen_tokens,
-            input_spec_decoding_generation_lengths):
+            input_spec_decoding_generation_lengths, spec_decoding_use):
 
         drafter_inputs = eagle_prepare_drafter_inputs_plugin(
             layer_idx, self.num_eagle_layers, self.max_non_leaves_per_layer,
@@ -648,7 +648,8 @@ class EagleForCausalLM(LLaMAForCausalLM):
         if layer_idx > 0:
             spec_decoding_params = SpecDecodingParams(
                 True, self.max_draft_len, spec_decoding_generation_lengths,
-                spec_decoding_position_offsets, spec_decoding_packed_mask)
+                spec_decoding_position_offsets, spec_decoding_packed_mask,
+                spec_decoding_use)
 
         # Get hidden states for accepted ids
         hidden_states = self._slice_hidden_states(hidden_states,
@@ -820,7 +821,8 @@ class EagleForCausalLM(LLaMAForCausalLM):
                 hidden_size_batch_level_starts=hidden_size_batch_level_starts,
                 input_gen_tokens=input_gen_tokens,
                 input_spec_decoding_generation_lengths=spec_decoding_params.
-                spec_decoding_generation_lengths)
+                spec_decoding_generation_lengths,
+                spec_decoding_use=spec_decoding_params.spec_decoding_use)
 
             def single_eagle_net_iter(next_draft_tokens, next_draft_lens):
                 # Run EAGLE Net

@@ -18,8 +18,6 @@
 
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/common.h"
-#include "tensorrt_llm/runtime/modelConfig.h"
-#include "tensorrt_llm/runtime/request.h"
 #include "tensorrt_llm/runtime/speculativeDecodingModule.h"
 #include <memory>
 

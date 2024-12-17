@@ -359,9 +359,10 @@ public:
         mStream->synchronize();
 
         // get kv cache
-        const int32_t batchBeam = batchSize * beamWidth;
+        int32_t const batchBeam = batchSize * beamWidth;
         auto const elemSize = sizeof(T);
         auto const sizePerToken = numHeads * headSize * elemSize;
+        bool const canUseOneMoreBlock = beamWidth > 1;
 
         auto shiftKCacheBuffer = KVLinearBuffer(batchBeam, maxAttentionWindow, sizePerToken, maxAttentionWindow,
             sinkTokenLength, true, reinterpret_cast<int8_t*>(bufferCast<T>(*mOutputDataDevice)));
@@ -378,8 +379,8 @@ public:
             auto inputDataDevicePtr = bufferCast<T>(*mInputDataDevice);
 
             auto const kvCacheBuffer = KVBlockArray(batchBeam, maxBlocksPerSeq, tokensPerBlock, sizePerToken,
-                maxAttentionWindow, sinkTokenLength, inputDataDevicePtr, nullptr,
-                bufferCast<KVBlockArray::DataType>(*mInputBlockOffsetsDevice));
+                maxAttentionWindow, maxAttentionWindow, sinkTokenLength, canUseOneMoreBlock, inputDataDevicePtr,
+                nullptr, bufferCast<KVBlockArray::DataType>(*mInputBlockOffsetsDevice));
             invokeShiftKCache<DataType, KVBlockArray>(kvCacheBuffer, shiftKCacheBuffer, kv_cache_type, headSize,
                 pastKCacheLength, batchBeam, numHeads, beamWidth, maxAttentionWindow, sinkTokenLength,
                 bufferCast<float>(*mKScaleQuantOrigDevice), bufferCast<int32_t>(*mSeqLengthsDevice),

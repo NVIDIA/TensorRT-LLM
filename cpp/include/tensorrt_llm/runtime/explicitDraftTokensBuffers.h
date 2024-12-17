@@ -67,6 +67,8 @@ public:
         TensorPtr maxGenLengthHost;
         // [maxBatchSize]
         TensorPtr generationLengthsHost;
+        // [1], on cpu
+        TensorPtr useSpecDecoding;
 
         void create(SizeType32 maxNumSequences, runtime::TllmRuntime const& runtime,
             runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig);

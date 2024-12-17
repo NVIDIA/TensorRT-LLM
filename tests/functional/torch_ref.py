@@ -1158,9 +1158,15 @@ class recurrent_ref(nn.Module):
             else:
                 x_i = x[i:i + 1, start_id:end_id, :]
             segment_pos_i = segment_pos[i:i + 1, 0:end_id - start_id]
-            conv_state_i = None if conv_state is None else conv_state[i:i + 1, ]
-            lru_state_i = None if lru_state is None else lru_state[i:i + 1, ]
-            conv_idx_i = None if conv_idx is None else conv_idx[i:i + 1, ]
+            conv_state_i = None if conv_state is None else conv_state[
+                i:i + 1,
+            ]
+            lru_state_i = None if lru_state is None else lru_state[
+                i:i + 1,
+            ]
+            conv_idx_i = None if conv_idx is None else conv_idx[
+                i:i + 1,
+            ]
             out_i, conv_state_i, lru_state_i = self.forward_impl(
                 x_i, segment_pos_i, conv_state_i, lru_state_i, conv_idx_i)
             if remove_padding:

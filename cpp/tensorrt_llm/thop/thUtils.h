@@ -77,4 +77,10 @@ tensorrt_llm::runtime::ITensor::UniquePtr convert_tensor(torch::Tensor tensor);
 
 size_t sizeBytes(torch::Tensor tensor);
 
+// from: cpp/tensorrt_llm/plugins/common/gemmPluginProfiler.h
+int nextPowerOfTwo(int v);
+
+// from: cpp/tensorrt_llm/plugins/lowLatencyGemmPlugin/lowLatencyGemmPlugin.cpp
+std::optional<float> getFloatEnv(char const* name);
+
 } // namespace torch_ext

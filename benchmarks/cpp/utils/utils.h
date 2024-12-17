@@ -55,6 +55,7 @@ struct BenchmarkParams
     bool enableChunkedContext{true};
     bool streaming{false};
     bool enableExpDelays{false};
+    std::vector<std::optional<bool>> enableChunekedContextVec{std::nullopt};
     std::optional<float> requestRate{std::nullopt};
     std::optional<int> concurrency{std::nullopt};
     std::optional<SizeType32> maxBatchSize{std::nullopt};

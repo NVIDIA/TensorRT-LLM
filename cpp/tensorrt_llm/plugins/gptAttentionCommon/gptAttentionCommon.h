@@ -119,6 +119,8 @@ protected:
         int32_t max_attention_window;
         // Cyclic kv cache capacity (used to get the cyclic kv cache position for new tokens)
         int32_t cyclic_attention_window_size;
+        int32_t max_cyclic_attention_window_size;
+        bool can_use_one_more_block;
         int32_t sink_token_length;
         int32_t const* q_seq_lengths;
         int32_t const* kv_seq_lengths;
@@ -137,8 +139,7 @@ protected:
         int32_t max_blocks_per_sequence;
         int32_t const* host_context_lengths;
         void* workspace;
-        float2 const* mrope_rotary_sin_cos = nullptr;
-        int32_t const* mrope_position_deltas = nullptr;
+        float2 const* mrope_rotary_cos_sin = nullptr;
 
         // optional when logn scaling
         float const* logn_scaling_ptr = nullptr;
@@ -169,6 +170,8 @@ protected:
             ss << "max_past_kv_len: " << max_past_kv_len << std::endl;
             ss << "max_attention_window: " << max_attention_window << std::endl;
             ss << "cyclic_attention_window_size: " << cyclic_attention_window_size << std::endl;
+            ss << "max_cyclic_attention_window_size: " << max_cyclic_attention_window_size << std::endl;
+            ss << "can_use_one_more_block: " << (can_use_one_more_block ? "true" : "false") << std::endl;
             ss << "sink_token_length: " << sink_token_length << std::endl;
             ss << "q_seq_lengths: "
                << *(runtime::ITensor::wrap(
@@ -238,6 +241,8 @@ protected:
         int32_t max_attention_window;
         // Cyclic kv cache capacity (used to get the cyclic kv cache position for new tokens)
         int32_t cyclic_attention_window_size;
+        int32_t max_cyclic_attention_window_size;
+        bool can_use_one_more_block;
         int32_t sink_token_length;
         int32_t num_requests;
         int32_t max_blocks_per_sequence;
@@ -245,7 +250,6 @@ protected:
         int32_t* semaphores;
         void* workspace;
         int32_t const* host_past_key_value_lengths;
-        float2 const* mrope_rotary_sin_cos = nullptr;
         int32_t const* mrope_position_deltas = nullptr;
 
         // optional when logn scaling
@@ -406,6 +410,7 @@ protected:
     bool mDenseContextFMHA = false;
     bool mHasFullAttentionMask = false;
     bool mIsSpecDecodingEnabled = false;
+    bool mUseSpecDecoding = false;
     bool mSpecDecodingIsGenerationLengthVariable = false;
     int32_t mSpecDecodingMaxGenerationLength = 1;
     bool mIsMLAEnabled = false;

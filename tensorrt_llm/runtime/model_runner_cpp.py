@@ -818,11 +818,11 @@ class ModelRunnerCpp(ModelRunnerMixin):
     def _prepare_mrope_executor(self, batch_input_ids_list, mrope: MropeParams):
         mrope_configs = len(batch_input_ids_list) * [None]
         if mrope != None:
-            mrope_rotary_sin_cos = mrope.mrope_rotary_sin_cos
+            mrope_rotary_cos_sin = mrope.mrope_rotary_cos_sin
             assert isinstance(
-                mrope_rotary_sin_cos,
-                torch.Tensor), "mrope_rotary_sin_cos should be torch.Tensor"
-            mrope_rotary_sin_cos_data = mrope_rotary_sin_cos.to(
+                mrope_rotary_cos_sin,
+                torch.Tensor), "mrope_rotary_cos_sin should be torch.Tensor"
+            mrope_rotary_cos_sin_data = mrope_rotary_cos_sin.to(
                 dtype=torch.float32).to(torch.device('cpu'))
 
             mrope_position_deltas = mrope.mrope_position_deltas
@@ -834,7 +834,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
 
             mrope_configs = [
                 trtllm.MropeConfig(
-                    mrope_rotary_sin_cos=mrope_rotary_sin_cos_data[i],
+                    mrope_rotary_cos_sin=mrope_rotary_cos_sin_data[i],
                     mrope_position_deltas=mrope_position_deltas_data[i])
                 for i in range(len(batch_input_ids_list))
             ]

@@ -378,6 +378,10 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
         // Even on SM90, we use ampere-style kernel, will be optimized later
         mLaunchParams.warp_specialization = false;
         mLaunchParams.useKernelWithoutAlibi = false;
+        // Deepseek-V2 kernel is not hooper style right now.
+        mLaunchParams.useBase2ExpTrick = false;
+        mLaunchParams.use_tma = false;
+        mLaunchParams.dynamic_scheduler = false;
     }
 }
 

@@ -58,8 +58,9 @@ def init_cache(config: TransformerConfig, cache_size: int,
                batch_size: int) -> Cache:
     """Initializes a new Transformer cache."""
     return {
-        f'layer_{i}': modules.init_layer_cache(cache_size, config.num_heads,
-                                               config.head_dim, batch_size)
+        f'layer_{i}':
+        modules.init_layer_cache(cache_size, config.num_heads, config.head_dim,
+                                 batch_size)
         for i in range(config.num_layers)
     }
 

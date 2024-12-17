@@ -92,6 +92,8 @@ public:
         TensorPtr inputGenTokensHost;
         //! [maxBatchSize] or [numSequences]
         TensorPtr chunkedContextNextTokens;
+        //! [1]
+        TensorPtr useSpecDecoding;
 
         // For Eagle-2
         //! [1]

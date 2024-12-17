@@ -27,6 +27,11 @@
 #include <memory>
 #include <vector>
 
+namespace tensorrt_llm::batch_manager
+{
+class LlmRequest;
+}
+
 namespace tensorrt_llm::runtime
 {
 
@@ -35,6 +40,8 @@ class GptDecoderBatched : public IGptDecoderBatched
 {
 public:
     using CudaStreamPtr = std::shared_ptr<CudaStream>;
+    using LlmRequestPtr = std::shared_ptr<tensorrt_llm::batch_manager::LlmRequest>;
+    using RequestVector = std::vector<LlmRequestPtr>;
     using TensorPtr = ITensor::SharedPtr;
     using SharedConstPtr = ITensor::SharedConstPtr;
 
@@ -57,6 +64,8 @@ public:
     void setupEagle(EagleBuffers::Inputs eagleBuffers) override;
 
     void setupLookahead(LookaheadDecodingBuffers lookaheadDecodingBuffers) override;
+
+    void disableLookahead(SizeType32 maxBatchSize, RequestVector const& genRequests) override;
 
     void newBatch(GenerationInput const& inputs, GenerationOutput const& outputs, SamplingConfig const& samplingConfig,
         ModelConfig const& modelConfig) override;

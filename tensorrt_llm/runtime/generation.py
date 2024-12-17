@@ -1017,7 +1017,7 @@ class GenerationSession(object):
             expected_tensor_names += [
                 'spec_decoding_generation_lengths',
                 'spec_decoding_position_offsets', 'spec_decoding_packed_mask',
-                'medusa_logits'
+                'spec_decoding_use', 'medusa_logits'
             ]
 
         if self.is_redrafter_mode:
@@ -1600,6 +1600,7 @@ class GenerationSession(object):
         # Note: spec_decoding_packed_mask has no paddings in the first dimension.
         self.spec_decoding_packed_mask = medusa_info.medusa_packed_mask.unsqueeze(
             0).expand(target_shape).reshape(-1, target_shape[-1]).cuda()
+        self.spec_decoding_use = medusa_info.medusa_spec_decoding_use
 
         self.medusa_paths = medusa_info.medusa_paths
         self.medusa_tree_ids = medusa_info.medusa_tree_ids
@@ -1953,6 +1954,7 @@ class GenerationSession(object):
                 'spec_decoding_position_offsets'] = self.spec_decoding_position_offsets
             self.buffer[
                 'spec_decoding_generation_lengths'] = self.spec_decoding_generation_lengths
+            self.buffer['spec_decoding_use'] = self.spec_decoding_use
         self.buffer_allocated = True
         if self.is_medusa_mode:
             return self.num_draft_tokens
@@ -2306,6 +2308,7 @@ class GenerationSession(object):
                        'spec_decoding_position_offsets')
             add_tensor(self.buffer['spec_decoding_generation_lengths'],
                        'spec_decoding_generation_lengths')
+            add_tensor(self.buffer['spec_decoding_use'], 'spec_decoding_use')
 
         return tensors
 
@@ -2648,6 +2651,7 @@ class GenerationSession(object):
                        'spec_decoding_position_offsets')
             add_tensor(self.buffer['spec_decoding_generation_lengths'],
                        'spec_decoding_generation_lengths')
+            add_tensor(self.buffer['spec_decoding_use'], 'spec_decoding_use')
 
         if self.is_redrafter_mode:
             set_redrafter_gen_tensors(self, batch_size, add_tensor,
@@ -3087,11 +3091,11 @@ class GenerationSession(object):
                 b, :self.accept_lengths[b]] == self.end_ids[b]
             should_stop_with_end_id = torch.any(end_id_mask)
             self.medusa_should_stop[b] = self.medusa_should_stop[b] or (
-                prev_total_output_length + self.accept_lengths[b] >=
-                self.max_new_tokens) or should_stop_with_end_id
+                prev_total_output_length + self.accept_lengths[b]
+                >= self.max_new_tokens) or should_stop_with_end_id
             # update accept lengths for the current step.
-            if (prev_total_output_length + self.accept_lengths[b] >=
-                    self.max_new_tokens):
+            if (prev_total_output_length + self.accept_lengths[b]
+                    >= self.max_new_tokens):
                 self.accept_lengths[b] = min(
                     self.max_new_tokens - prev_total_output_length,
                     self.accept_lengths[b])

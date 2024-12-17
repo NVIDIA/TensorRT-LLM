@@ -158,6 +158,11 @@ public:
         PYBIND11_OVERLOAD_PURE(bool, tbk::BaseKVCacheManager, isEnableBlockReuse);
     }
 
+    bool isUseOneMoreBlock() const override
+    {
+        PYBIND11_OVERLOAD_PURE(bool, tbk::BaseKVCacheManager, isUseOneMoreBlock);
+    }
+
     void rewindKVCache(tb::LlmRequest::RequestIdType requestId, SizeType32 rewindLengths) override
     {
         PYBIND11_OVERLOAD_PURE(void, tbk::BaseKVCacheManager, rewindKVCache, requestId, rewindLengths);
@@ -189,6 +194,13 @@ public:
     {
         PYBIND11_OVERLOAD_PURE(
             std::vector<std::vector<SizeType32>> const&, tbk::BaseKVCacheManager, getCacheBlockIds, requestId);
+    }
+
+    std::vector<std::vector<std::vector<SizeType32>>> getBatchCacheBlockIds(
+        std::vector<tb::LlmRequest::RequestIdType> const& requestIds) const
+    {
+        PYBIND11_OVERLOAD_PURE(std::vector<std::vector<std::vector<SizeType32>>>, tbk::BaseKVCacheManager,
+            getBatchCacheBlockIds, requestIds);
     }
 
     SizeType32 getUsedNumBlocks() const override
@@ -360,11 +372,13 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
                 return maxBlockCount;
             })
         .def_property_readonly("enable_block_reuse", &BaseKVCacheManager::isEnableBlockReuse)
+        .def_property_readonly("use_one_more_block", &BaseKVCacheManager::isUseOneMoreBlock)
         .def("rewind_kv_cache", &BaseKVCacheManager::rewindKVCache)
         .def_property_readonly("cross_kv", &BaseKVCacheManager::isCrossKv)
         .def("store_context_blocks", &BaseKVCacheManager::storeContextBlocks)
         .def("scheduling_has_free_blocks", &BaseKVCacheManager::schedulingHasFreeBlocks)
-        .def("get_cache_block_ids", &BaseKVCacheManager::getCacheBlockIds);
+        .def("get_cache_block_ids", &BaseKVCacheManager::getCacheBlockIds)
+        .def("get_batch_cache_block_ids", &BaseKVCacheManager::getBatchCacheBlockIds);
 
     py::enum_<tbk::CacheType>(m, "CacheType")
         .value("SELF", tbk::CacheType::kSELF)

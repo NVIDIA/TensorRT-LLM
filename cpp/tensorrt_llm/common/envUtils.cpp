@@ -193,4 +193,22 @@ bool getEnvParallelCacheSend()
     return parallelCacheSend;
 }
 
+bool getEnvRequestKVCacheSerial()
+{
+    static bool const requestKVCacheSerial = getBoolEnv("TRTLLM_REQUEST_KV_CACHE_SERIAL");
+    return requestKVCacheSerial;
+}
+
+bool getEnvDisableKVCacheTransferOverlap()
+{
+    static bool const disableKVCacheTransferOverlap = getBoolEnv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP");
+    return disableKVCacheTransferOverlap;
+}
+
+bool getEnvDisableReceiveKVCacheParallel()
+{
+    static bool const disableReceiveParallel = getBoolEnv("TRTLLM_DISABLE_KVCACHE_RECEIVE_PARALLEL");
+    return disableReceiveParallel;
+}
+
 } // namespace tensorrt_llm::common

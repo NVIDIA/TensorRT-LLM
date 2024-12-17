@@ -315,10 +315,98 @@ __global__ void rms_norm_kernel(AllReduceParams params)
 }
 
 template <typename T, bool Bias = false, bool Residual = false, bool Affine = false>
-void rms_norm_kernel_launcher(AllReduceParams& params, cudaStream_t stream)
+__global__ void rms_pre_post_norm_kernel(AllReduceParams params) // for gemma2 pre residual + post residual norm
+{
+    static constexpr int kPackedSize = details::kBytesPerAccess / sizeof(T);
+    using PackedStruct = typename PackedOn16Bytes<T>::Type;
+
+    int bid = blockIdx.x, tid = threadIdx.x;
+
+    T const* bias_buffer = reinterpret_cast<T const*>(params.fusion_params.bias_buffer);
+    T const* residual_buffer = reinterpret_cast<T const*>(params.fusion_params.residual_buffer);
+    T const* weight_buffer = reinterpret_cast<T const*>(params.fusion_params.weight_buffer);
+    T const* weight_buffer_pre_residual_norm
+        = reinterpret_cast<T const*>(params.fusion_params.weight_buffer_pre_residual_norm);
+    T* local_final_output_buffer = reinterpret_cast<T*>(params.local_output_buffer_ptr);
+    T* intermediate_buffer = reinterpret_cast<T*>(params.fusion_params.intermediate_buffer);
+
+    int block_offset = bid * params.fusion_params.hidden_size;
+    int thread_offset = tid * kPackedSize;
+
+    if constexpr (Residual)
+    {
+        residual_buffer += block_offset;
+    }
+    local_final_output_buffer += block_offset;
+    intermediate_buffer += block_offset;
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
+
+    PackedStruct inter_vec, weight_vec, weight_vec_pre_residual_norm, bias_vec;
+    float acc = 0.f;
+    float acc_pre_residual_norm = 0.f;
+    for (int offset = thread_offset; offset < params.fusion_params.hidden_size; offset += blockDim.x * kPackedSize)
+    {
+        inter_vec.packed = *reinterpret_cast<int4 const*>(intermediate_buffer + offset);
+        if constexpr (Bias)
+        {
+            bias_vec.packed = *reinterpret_cast<int4 const*>(bias_buffer + offset);
+        }
+
+        if constexpr (Bias)
+        {
+            inter_vec.packed = add128b(inter_vec, bias_vec);
+        }
+
+        // pre-residual norm.
+        acc_pre_residual_norm = accumulate<T>(acc_pre_residual_norm, inter_vec);
+        acc_pre_residual_norm = block_reduce_sum(acc_pre_residual_norm);
+        float denom_pre_residual_norm = __fsqrt_rn(
+            __fdividef(acc_pre_residual_norm, params.fusion_params.hidden_size) + params.fusion_params.eps);
+
+        if constexpr (Affine)
+        {
+            weight_vec_pre_residual_norm.packed
+                = *reinterpret_cast<int4 const*>(weight_buffer_pre_residual_norm + thread_offset);
+        }
+        inter_vec.packed = rms_norm<T, Affine>(denom_pre_residual_norm, inter_vec, weight_vec_pre_residual_norm);
+
+        if constexpr (Residual)
+        {
+            PackedStruct residual_vec;
+            residual_vec.packed = *reinterpret_cast<int4 const*>(residual_buffer + offset);
+            inter_vec.packed = add128b(inter_vec, residual_vec);
+            *reinterpret_cast<int4*>(intermediate_buffer + offset) = inter_vec.packed;
+        }
+        acc = accumulate<T>(acc, inter_vec);
+    }
+    acc = block_reduce_sum(acc);
+    float denom = __fsqrt_rn(__fdividef(acc, params.fusion_params.hidden_size) + params.fusion_params.eps);
+    for (int offset = thread_offset; offset < params.fusion_params.hidden_size; offset += blockDim.x * kPackedSize)
+    {
+        if constexpr (Affine)
+        {
+            weight_vec.packed = *reinterpret_cast<int4 const*>(weight_buffer + offset);
+        }
+        inter_vec.packed = rms_norm<T, Affine>(denom, inter_vec, weight_vec);
+        *reinterpret_cast<int4*>(&local_final_output_buffer[offset]) = inter_vec.packed;
+    }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+template <typename T, bool Bias = false, bool Residual = false, bool Affine = false>
+void rms_norm_kernel_launcher(AllReduceParams& params, cudaStream_t stream, AllReduceFusionOp fusionOp)
 {
     static constexpr int kPackedSize = details::kBytesPerAccess / sizeof(T);
     TLLM_CHECK(params.fusion_params.hidden_size % kPackedSize == 0);
+    if (fusionOp == AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM)
+    {
+        TLLM_CHECK(params.fusion_params.hidden_size <= 8192);
+    }
     int need_threads = params.fusion_params.hidden_size / kPackedSize;
     int cta_size;
     if (need_threads <= details::kMaxCtaSize)
@@ -349,12 +437,27 @@ void rms_norm_kernel_launcher(AllReduceParams& params, cudaStream_t stream)
             kernelConfig.attrs = attribute;
             kernelConfig.numAttrs = 1;
 
-            TLLM_CUDA_CHECK(
-                cudaLaunchKernelEx(&kernelConfig, rms_norm_kernel<T, Bias, Residual, Affine, true>, params));
+            if (fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
+            {
+                TLLM_CUDA_CHECK(
+                    cudaLaunchKernelEx(&kernelConfig, rms_norm_kernel<T, Bias, Residual, Affine, true>, params));
+            }
+            else
+            { // AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM
+                TLLM_CUDA_CHECK(
+                    cudaLaunchKernelEx(&kernelConfig, rms_pre_post_norm_kernel<T, Bias, Residual, Affine>, params));
+            }
         }
         else
         {
-            rms_norm_kernel<T, Bias, Residual, Affine, true><<<cta_num, cta_size, smem_size, stream>>>(params);
+            if (fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
+            {
+                rms_norm_kernel<T, Bias, Residual, Affine, true><<<cta_num, cta_size, smem_size, stream>>>(params);
+            }
+            else
+            { // AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM
+                rms_pre_post_norm_kernel<T, Bias, Residual, Affine><<<cta_num, cta_size, smem_size, stream>>>(params);
+            }
         }
     }
     else
@@ -374,12 +477,27 @@ void rms_norm_kernel_launcher(AllReduceParams& params, cudaStream_t stream)
             kernelConfig.attrs = attribute;
             kernelConfig.numAttrs = 1;
 
-            TLLM_CUDA_CHECK(
-                cudaLaunchKernelEx(&kernelConfig, rms_norm_kernel<T, Bias, Residual, Affine, false>, params));
+            if (fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
+            {
+                TLLM_CUDA_CHECK(
+                    cudaLaunchKernelEx(&kernelConfig, rms_norm_kernel<T, Bias, Residual, Affine, false>, params));
+            }
+            else
+            { // AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM
+                TLLM_CUDA_CHECK(
+                    cudaLaunchKernelEx(&kernelConfig, rms_pre_post_norm_kernel<T, Bias, Residual, Affine>, params));
+            }
         }
         else
         {
-            rms_norm_kernel<T, Bias, Residual, Affine, false><<<cta_num, cta_size, smem_size, stream>>>(params);
+            if (fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
+            {
+                rms_norm_kernel<T, Bias, Residual, Affine, false><<<cta_num, cta_size, smem_size, stream>>>(params);
+            }
+            else
+            { // AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM
+                rms_pre_post_norm_kernel<T, Bias, Residual, Affine><<<cta_num, cta_size, smem_size, stream>>>(params);
+            }
         }
     }
 }
@@ -888,6 +1006,119 @@ static __global__ void __launch_bounds__(1024, 1) one_shot_all_reduce_norm_kerne
 #endif
 }
 
+template <typename T, int RanksPerNode, bool Bias = false, bool Affine = false>
+static __global__ void __launch_bounds__(1024, 1) one_shot_prenorm_all_reduce_norm_kernel(AllReduceParams params)
+{
+    static constexpr int kPackedSize = details::kBytesPerAccess / sizeof(T);
+    using PackedStruct = typename PackedOn16Bytes<T>::Type;
+
+    int bid = blockIdx.x, tid = threadIdx.x;
+    int norm_num = params.elts_total / params.fusion_params.hidden_size;
+    int norm_per_block = (norm_num + gridDim.x - 1) / gridDim.x;
+    int norm_this_block = std::min(norm_per_block, norm_num - bid * norm_per_block);
+
+    T const* local_input_buffer = reinterpret_cast<T const*>(params.local_input_buffer_ptr);
+    T const* bias_buffer = reinterpret_cast<T const*>(params.fusion_params.bias_buffer);
+    T const* residual_buffer = reinterpret_cast<T const*>(params.fusion_params.residual_buffer);
+    T const* weight_buffer = reinterpret_cast<T const*>(params.fusion_params.weight_buffer);
+    T const* weight_buffer_pre_residual_norm
+        = reinterpret_cast<T const*>(params.fusion_params.weight_buffer_pre_residual_norm);
+    T* local_shared_buffer = reinterpret_cast<T*>(params.peer_comm_buffer_ptrs[params.local_rank]);
+    T* local_final_output_buffer = reinterpret_cast<T*>(params.local_output_buffer_ptr);
+    T* intermediate_buffer = reinterpret_cast<T*>(params.fusion_params.intermediate_buffer);
+
+    int block_offset = bid * norm_per_block * params.fusion_params.hidden_size;
+    int thread_offset = tid * kPackedSize;
+
+    local_input_buffer += block_offset;
+    residual_buffer += block_offset;
+    local_shared_buffer += block_offset;
+    local_final_output_buffer += block_offset;
+    intermediate_buffer += block_offset;
+
+    T* buffers[RanksPerNode];
+#pragma unroll
+    for (int ii = 0; ii < RanksPerNode; ++ii)
+    {
+        int rank = (params.local_rank + ii) % RanksPerNode;
+        buffers[ii] = reinterpret_cast<T*>(params.peer_comm_buffer_ptrs[rank]);
+    }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
+
+    for (int offset = thread_offset; offset < norm_this_block * params.fusion_params.hidden_size;
+         offset += blockDim.x * kPackedSize)
+    {
+        *reinterpret_cast<int4*>(&local_shared_buffer[offset])
+            = *reinterpret_cast<int4 const*>(&local_input_buffer[offset]);
+    }
+    block_barrier(
+        params.peer_barrier_ptrs_in, params.barrier_flag, params.local_rank, RanksPerNode, tid, bid, gridDim.x);
+    for (int norm_idx = 0; norm_idx < norm_this_block; ++norm_idx)
+    {
+        int norm_offset = norm_idx * params.fusion_params.hidden_size;
+        float acc = 0.f;
+        float acc_pre_residual_norm = 0.f;
+        PackedStruct sum_vec, weight_vec, bias_vec, residual_vec, weight_vec_pre_residual_norm;
+        for (int offset = thread_offset; offset < params.fusion_params.hidden_size; offset += blockDim.x * kPackedSize)
+        {
+            PackedStruct vals[RanksPerNode];
+            sum_vec.packed = {0, 0, 0, 0};
+            if constexpr (Bias)
+            {
+                bias_vec.packed = *reinterpret_cast<int4 const*>(&bias_buffer[offset]);
+            }
+            residual_vec.packed = *reinterpret_cast<int4 const*>(&residual_buffer[norm_offset + offset]);
+#pragma unroll
+            for (int ii = 0; ii < RanksPerNode; ++ii)
+            {
+                vals[ii].packed = *reinterpret_cast<int4 const*>(&buffers[ii][block_offset + norm_offset + offset]);
+            }
+#pragma unroll
+            for (int ii = 0; ii < RanksPerNode; ++ii)
+            {
+                sum_vec.packed = add128b(sum_vec, vals[ii]);
+            }
+
+            if constexpr (Bias)
+            {
+                sum_vec.packed = add128b(sum_vec, bias_vec);
+            }
+
+            // norm1 is pre-residual norm.
+            acc_pre_residual_norm = accumulate<T>(acc_pre_residual_norm, sum_vec);
+
+            acc_pre_residual_norm = block_reduce_sum(acc_pre_residual_norm);
+
+            float denom_pre_residual_norm = __fsqrt_rn(
+                __fdividef(acc_pre_residual_norm, params.fusion_params.hidden_size) + params.fusion_params.eps);
+            if constexpr (Affine)
+            {
+                weight_vec_pre_residual_norm.packed
+                    = *reinterpret_cast<int4 const*>(weight_buffer_pre_residual_norm + thread_offset);
+            }
+            sum_vec.packed = rms_norm<T, Affine>(denom_pre_residual_norm, sum_vec, weight_vec_pre_residual_norm);
+
+            sum_vec.packed = add128b(sum_vec, residual_vec);
+            *reinterpret_cast<int4*>(&intermediate_buffer[norm_offset + offset]) = sum_vec.packed;
+            acc = accumulate<T>(acc, sum_vec);
+        }
+        acc = block_reduce_sum(acc);
+        float denom = __fsqrt_rn(__fdividef(acc, params.fusion_params.hidden_size) + params.fusion_params.eps);
+        if constexpr (Affine)
+        {
+            weight_vec.packed = *reinterpret_cast<int4 const*>(weight_buffer + thread_offset);
+        }
+        sum_vec.packed = rms_norm<T, Affine>(denom, sum_vec, weight_vec);
+        *reinterpret_cast<int4*>(&local_final_output_buffer[norm_offset + thread_offset]) = sum_vec.packed;
+    }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
 template <typename T>
 bool is_lamport_supported(int token_num, int hidden_size)
 {
@@ -929,10 +1160,17 @@ bool is_lamport_supported(nvinfer1::DataType dataType, int token_num, int hidden
 }
 
 template <typename T, int RanksPerNode, bool Bias, bool Affine>
-void one_shot_all_reduce_norm_kernel_launcher(AllReduceParams& params, cudaStream_t stream)
+void one_shot_all_reduce_norm_kernel_launcher(AllReduceParams& params, cudaStream_t stream, AllReduceFusionOp fusionOp)
 {
     int token_num = params.elts_total / params.fusion_params.hidden_size;
-    if (is_lamport_supported<T>(token_num, params.fusion_params.hidden_size))
+
+    if (fusionOp == AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM)
+    {
+        TLLM_CHECK(params.fusion_params.hidden_size <= 8192);
+    }
+
+    if (is_lamport_supported<T>(token_num, params.fusion_params.hidden_size)
+        && (fusionOp != AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM))
     {
         lamport_style_one_shot_all_reduce_norm_kernel_launcher<T, RanksPerNode, Bias, Affine>(params, stream);
     }
@@ -972,14 +1210,29 @@ void one_shot_all_reduce_norm_kernel_launcher(AllReduceParams& params, cudaStrea
                 attribute[0].val.programmaticStreamSerializationAllowed = 1;
                 kernelConfig.attrs = attribute;
                 kernelConfig.numAttrs = 1;
-
-                TLLM_CUDA_CHECK(cudaLaunchKernelEx(
-                    &kernelConfig, one_shot_all_reduce_norm_kernel<T, RanksPerNode, Bias, Affine, true>, params));
+                if (fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
+                {
+                    TLLM_CUDA_CHECK(cudaLaunchKernelEx(
+                        &kernelConfig, one_shot_all_reduce_norm_kernel<T, RanksPerNode, Bias, Affine, true>, params));
+                }
+                else
+                { // fusionOp == AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM
+                    TLLM_CUDA_CHECK(cudaLaunchKernelEx(
+                        &kernelConfig, one_shot_prenorm_all_reduce_norm_kernel<T, RanksPerNode, Bias, Affine>, params));
+                }
             }
             else
             {
-                one_shot_all_reduce_norm_kernel<T, RanksPerNode, Bias, Affine, true>
-                    <<<cta_num, cta_size, smem_size, stream>>>(params);
+                if (fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
+                {
+                    one_shot_all_reduce_norm_kernel<T, RanksPerNode, Bias, Affine, true>
+                        <<<cta_num, cta_size, smem_size, stream>>>(params);
+                }
+                else
+                {
+                    one_shot_prenorm_all_reduce_norm_kernel<T, RanksPerNode, Bias, Affine>
+                        <<<cta_num, cta_size, smem_size, stream>>>(params);
+                }
             }
         }
         else
@@ -999,13 +1252,29 @@ void one_shot_all_reduce_norm_kernel_launcher(AllReduceParams& params, cudaStrea
                 kernelConfig.numAttrs = 1;
 
                 TLLM_LOG_DEBUG("Enable PDL in one_shot_all_reduce_norm_kernel");
-                TLLM_CUDA_CHECK(cudaLaunchKernelEx(
-                    &kernelConfig, one_shot_all_reduce_norm_kernel<T, RanksPerNode, Bias, Affine, false>, params));
+                if (fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
+                {
+                    TLLM_CUDA_CHECK(cudaLaunchKernelEx(
+                        &kernelConfig, one_shot_all_reduce_norm_kernel<T, RanksPerNode, Bias, Affine, false>, params));
+                }
+                else
+                { // fusionOp == AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM
+                    TLLM_CUDA_CHECK(cudaLaunchKernelEx(
+                        &kernelConfig, one_shot_prenorm_all_reduce_norm_kernel<T, RanksPerNode, Bias, Affine>, params));
+                }
             }
             else
             {
-                one_shot_all_reduce_norm_kernel<T, RanksPerNode, Bias, Affine, false>
-                    <<<cta_num, cta_size, smem_size, stream>>>(params);
+                if (fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
+                {
+                    one_shot_all_reduce_norm_kernel<T, RanksPerNode, Bias, Affine, false>
+                        <<<cta_num, cta_size, smem_size, stream>>>(params);
+                }
+                else
+                {
+                    one_shot_prenorm_all_reduce_norm_kernel<T, RanksPerNode, Bias, Affine>
+                        <<<cta_num, cta_size, smem_size, stream>>>(params);
+                }
             }
         }
     }
@@ -1423,11 +1692,13 @@ template <typename T, int RANKS_PER_NODE, bool PUSH_MODE = false, bool USE_MEMCP
 void AllReduceNormKernelLaunch(AllReduceStrategyType algo, AllReduceStrategyConfig config, AllReduceFusionOp fusionOp,
     AllReduceParams& params, cudaStream_t stream)
 {
-    TLLM_CHECK_WITH_INFO(fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM, "Unsupported AllReduceFusionOp: %d",
-        static_cast<int>(fusionOp));
+    TLLM_CHECK_WITH_INFO(
+        (fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM),
+        "Unsupported AllReduceFusionOp: %d", static_cast<int>(fusionOp));
     if (algo == AllReduceStrategyType::ONESHOT)
     {
-        reduce_fusion::one_shot_all_reduce_norm_kernel_launcher<T, RANKS_PER_NODE, Bias, Affine>(params, stream);
+        reduce_fusion::one_shot_all_reduce_norm_kernel_launcher<T, RANKS_PER_NODE, Bias, Affine>(
+            params, stream, fusionOp);
     }
     else
     {
@@ -1466,7 +1737,7 @@ void AllReduceNormKernelLaunch(AllReduceStrategyType algo, AllReduceStrategyConf
                 <<<blocks_per_grid, threads_per_block, 0, stream>>>(params);
         }
         params.local_output_buffer_ptr = output_ptr;
-        reduce_fusion::rms_norm_kernel_launcher<T, false, false, Affine>(params, stream);
+        reduce_fusion::rms_norm_kernel_launcher<T, false, false, Affine>(params, stream, fusionOp);
     }
 }
 
@@ -1527,10 +1798,12 @@ void AllReduceDispatchMemcpy(AllReduceStrategyType algo, AllReduceStrategyConfig
 {
     if (fusionOp == AllReduceFusionOp::NONE)
     {
+        TLLM_LOG_DEBUG("AllReduceDispatch enabled");
         AllReduceDispatch<T, RANKS_PER_NODE, PUSH_MODE, USE_MEMCPY>(algo, config, fusionOp, params, stream);
     }
     else
     {
+        TLLM_LOG_DEBUG("AllReduceNormDispatch enabled");
         AllReduceNormDispatch<T, RANKS_PER_NODE, PUSH_MODE, USE_MEMCPY>(algo, config, fusionOp, params, stream);
     }
 }
@@ -1647,35 +1920,36 @@ void customAllReduce(kernels::AllReduceParams& params, nvinfer1::DataType dataTy
 }
 
 template <typename T>
-void launchResidualRmsNormKernel(kernels::AllReduceParams& params, cudaStream_t stream)
+void launchResidualRmsNormKernel(kernels::AllReduceParams& params, cudaStream_t stream, AllReduceFusionOp fusionOp)
 {
     if (params.fusion_params.bias_buffer && params.fusion_params.weight_buffer)
     {
-        reduce_fusion::rms_norm_kernel_launcher<T, true, true, true>(params, stream);
+        reduce_fusion::rms_norm_kernel_launcher<T, true, true, true>(params, stream, fusionOp);
     }
     else if (params.fusion_params.bias_buffer && !params.fusion_params.weight_buffer)
     {
-        reduce_fusion::rms_norm_kernel_launcher<T, true, true, false>(params, stream);
+        reduce_fusion::rms_norm_kernel_launcher<T, true, true, false>(params, stream, fusionOp);
     }
     else if (!params.fusion_params.bias_buffer && params.fusion_params.weight_buffer)
     {
-        reduce_fusion::rms_norm_kernel_launcher<T, false, true, true>(params, stream);
+        reduce_fusion::rms_norm_kernel_launcher<T, false, true, true>(params, stream, fusionOp);
     }
     else
     {
-        reduce_fusion::rms_norm_kernel_launcher<T, false, true, false>(params, stream);
+        reduce_fusion::rms_norm_kernel_launcher<T, false, true, false>(params, stream, fusionOp);
     }
 }
 
-void residualRmsNorm(kernels::AllReduceParams& params, nvinfer1::DataType dataType, cudaStream_t stream)
+void residualRmsNorm(
+    kernels::AllReduceParams& params, nvinfer1::DataType dataType, cudaStream_t stream, AllReduceFusionOp fusionOp)
 {
     sync_check_cuda_error();
     switch (dataType)
     {
-    case nvinfer1::DataType::kFLOAT: launchResidualRmsNormKernel<float>(params, stream); break;
-    case nvinfer1::DataType::kHALF: launchResidualRmsNormKernel<half>(params, stream); break;
+    case nvinfer1::DataType::kFLOAT: launchResidualRmsNormKernel<float>(params, stream, fusionOp); break;
+    case nvinfer1::DataType::kHALF: launchResidualRmsNormKernel<half>(params, stream, fusionOp); break;
 #ifdef ENABLE_BF16
-    case nvinfer1::DataType::kBF16: launchResidualRmsNormKernel<__nv_bfloat16>(params, stream); break;
+    case nvinfer1::DataType::kBF16: launchResidualRmsNormKernel<__nv_bfloat16>(params, stream, fusionOp); break;
 #endif
     default: TLLM_THROW("Unsupported dataType for customAllReduce");
     }

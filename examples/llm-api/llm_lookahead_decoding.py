@@ -10,7 +10,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument(
     '--model',
     type=str,
-    default="meta-llama/Llama-2-7b",
+    default="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
     help=
     "Path to a TensorRT-LLM engine, a Huggingface model or the name of a Huggingface model to download (for example \"TinyLlama/TinyLlama-1.1B-Chat-v1.0\""
 )

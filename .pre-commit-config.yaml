@@ -7,8 +7,8 @@ repos:
     rev: v1.1.13
     hooks:
     -   id: remove-crlf
--   repo: https://github.com/pre-commit/mirrors-yapf
-    rev: v0.32.0
+-   repo:  https://github.com/google/yapf
+    rev: v0.43.0
     hooks:
     -   id: yapf
 -   repo: https://github.com/pre-commit/pre-commit-hooks

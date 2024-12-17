@@ -881,13 +881,10 @@ def test_llm_api_medusa():
         print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
 
 
-# We are skipping on A30 since it OOM in CI
-def llama_lookahead_decoding_test_harness(**llm_kwargs):
+def tinyllama_lookahead_decoding_test_harness(**llm_kwargs):
     prompts = [
         "A B C",
     ]
-    hf_model_dir = get_model_path("llama-models/llama-7b-hf")
-
     lookahead_config = LookaheadDecodingConfig(max_window_size=3,
                                                max_ngram_size=3,
                                                max_verification_set_size=3)
@@ -907,7 +904,7 @@ def llama_lookahead_decoding_test_harness(**llm_kwargs):
     references = [
         'D E F G H I J K',
     ]
-    llm_test_harness(hf_model_dir,
+    llm_test_harness(llama_model_path,
                      prompts,
                      references,
                      sampling_params=sampling_params,
@@ -917,9 +914,9 @@ def llama_lookahead_decoding_test_harness(**llm_kwargs):
                      **llm_kwargs)
 
 
-@skip_gpu_memory_less_than_40gb
-def test_llama_lookahead_decoding():
-    llama_lookahead_decoding_test_harness()
+@force_ampere
+def test_tinyllama_lookahead_decoding():
+    tinyllama_lookahead_decoding_test_harness()
 
 
 @force_ampere
@@ -1362,6 +1359,9 @@ def llm_get_stats_test_harness(tp_size: int = 1):
             break
 
 
+# The LLM._get_stats/_async is temporary APIs, and we don't plan to have a public one in the short run.
+# TODO Introduce some dedicated DS similar to executor.GenerationResult, that should be more stable
+@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5000903")
 def test_llm_get_stats():
     llm_get_stats_test_harness(tp_size=1)
 
@@ -1393,6 +1393,7 @@ def llm_get_stats_async_test_harness(tp_size: int = 1):
     asyncio.run(main())
 
 
+@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5000903")
 def test_llm_get_stats_async():
     llm_get_stats_async_test_harness(tp_size=1)
 

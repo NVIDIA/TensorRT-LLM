@@ -444,9 +444,11 @@ class TestMamba(unittest.TestCase):
         d_inner = tensorrt_llm_mamba.backbone.layers[
             l].ssm.in_proj_x.weight.raw_value.shape[0]
         in_proj_x_hf = hf_mamba.backbone.layers[l].mixer.in_proj.weight[
-            0:d_inner, ]
+            0:d_inner,
+        ]
         in_proj_z_hf = hf_mamba.backbone.layers[l].mixer.in_proj.weight[
-            d_inner:, ]
+            d_inner:,
+        ]
         np.testing.assert_allclose(tensorrt_llm_mamba.backbone.layers[l].ssm.
                                    in_proj_x.weight.raw_value,
                                    in_proj_x_hf.cpu().detach(),

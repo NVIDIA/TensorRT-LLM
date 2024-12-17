@@ -312,8 +312,8 @@ def qserve_quantize_weight_per_group(linear_weight: torch.HalfTensor,
         s1_scales.reshape(out_features, 1).to(linear_weight.device))
     linear_weight = linear_weight.round()
     # assert linear_weight.min() >= -119 and linear_weight.max() <= 119, "Stage 1: Quantized weight out of range" # 119 is the "magic" number
-    assert (linear_weight.min() >= -128 and linear_weight.max() <= 127
-            ), "Stage 1: Quantized weight out of range"
+    assert (linear_weight.min() >= -128 and linear_weight.max()
+            <= 127), "Stage 1: Quantized weight out of range"
 
     # Step 2: Quantize the weights to int4
     linear_weight = linear_weight.reshape(out_features,
@@ -323,8 +323,8 @@ def qserve_quantize_weight_per_group(linear_weight: torch.HalfTensor,
     s2_scales = s2_scales.reshape(out_features, in_features // group_size,
                                   1).to(torch.float16).to(linear_weight.device)
     linear_weight = linear_weight.add(s2_szeros).div(s2_scales).round()
-    assert (linear_weight.min() >= 0 and
-            linear_weight.max() <= 15), "Stage 2: Quantized weight out of range"
+    assert (linear_weight.min() >= 0 and linear_weight.max()
+            <= 15), "Stage 2: Quantized weight out of range"
 
     qweight = linear_weight.reshape(out_features, in_features).to(torch.int8)
     return qweight

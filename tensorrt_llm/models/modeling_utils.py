@@ -654,21 +654,30 @@ class PretrainedModel(Module,
         return model
 
     def load(self, weights, from_pruned=False):
-        expected_names = set()
         required_names = set()
         for name, param in self.named_parameters():
-            expected_names.add(name)
-            if not param.is_inited():
-                required_names.add(name)
+            if param.is_inited():
+                continue
+            if name not in weights:
+                # Exemption for embedding sharing
+                if name.endswith('lm_head.weight') and any(
+                        k.endswith('vocab_embedding.weight')
+                        for k in weights.keys()):
+                    continue
+                if name.endswith('lm_head.per_channel_scale') and any(
+                        k.endswith('vocab_embedding.per_channel_scale')
+                        for k in weights.keys()):
+                    continue
+            required_names.add(name)
 
         provided_names = set(weights.keys())
         if not required_names.issubset(provided_names):
             raise RuntimeError(
                 f"Required but not provided tensors:{required_names.difference(provided_names)}"
             )
-        if not provided_names.issubset(expected_names):
+        if not provided_names.issubset(required_names):
             logger.warning(
-                f"Provided but not expected tensors: {provided_names.difference(expected_names)}"
+                f"Provided but not required tensors: {provided_names.difference(required_names)}"
             )
 
         for name, param in self.named_parameters():
@@ -720,7 +729,7 @@ class PretrainedModel(Module,
         lora_target_modules: List[str] = None,
         opt_batch_size: int = 0,
         num_hidden_layers: int = None,
-        mrope_rotary_sin_cos_size: int = None,
+        mrope_rotary_cos_sin_size: int = None,
     ):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
@@ -785,7 +794,7 @@ class PretrainedModel(Module,
             streamingllm=streamingllm,
             opt_batch_size=opt_batch_size,
             pp_reduce_scatter=pp_reduce_scatter,
-            mrope_rotary_sin_cos_size=mrope_rotary_sin_cos_size)
+            mrope_rotary_cos_sin_size=mrope_rotary_cos_sin_size)
 
         result = {
             'input_ids':
@@ -1380,16 +1389,17 @@ def share_embedding(model: PretrainedModel) -> PretrainedModel:
         if lm_head is not None and vocab_embedding is not None:
             break
 
-    # Cannot find both lm_head and vocab_embedding, e.g., pipeline parallel
+    # Cannot find either lm_head or vocab_embedding, e.g., pipeline parallel
     if lm_head is None or vocab_embedding is None:
         return model
 
-    # The lm_head and vocab_embedding have different weights
-    lm_head_weight = numpy_to_torch(lm_head.weight.raw_value)
-    vocab_embed_weight = numpy_to_torch(vocab_embedding.weight.raw_value)
-    if lm_head_weight.size() != vocab_embed_weight.size() or (
-            lm_head_weight - vocab_embed_weight).abs().max().item() > 1e-6:
-        return model
+    if lm_head.weight.is_inited():
+        lm_head_weight = numpy_to_torch(lm_head.weight.raw_value)
+        vocab_embed_weight = numpy_to_torch(vocab_embedding.weight.raw_value)
+        # The lm_head and vocab_embedding have different weights
+        if lm_head_weight.size() != vocab_embed_weight.size() or (
+                lm_head_weight - vocab_embed_weight).abs().max().item() > 1e-6:
+            return model
 
     lm_head.weight = vocab_embedding.weight
     if getattr(lm_head, 'per_channel_scale', None) and getattr(
@@ -1476,16 +1486,18 @@ def optimize_cross_qkv(model):
         (type(attn.qkv) == ColumnLinear or type(attn.qkv) == FP8Linear):
             old_qkv = attn.qkv
             linear_class = type(old_qkv)
-            new_kv = linear_class(in_features=attn.hidden_size,
-                                  out_features=2 * attn.tp_size *
-                                  attn.num_attention_kv_heads *
-                                  attn.attention_head_size,
-                                  bias=old_qkv.bias,
-                                  dtype=old_qkv.dtype,
-                                  tp_group=old_qkv.tp_group,
-                                  tp_size=old_qkv.tp_size,
-                                  gather_output=old_qkv.gather_output,
-                                  is_qkv=False)
+            new_kv = linear_class(
+                in_features=attn.hidden_size,
+                out_features=2 * attn.tp_size * attn.num_attention_kv_heads *
+                attn.attention_head_size,
+                bias=old_qkv.bias,
+                dtype=old_qkv.dtype,
+                tp_group=old_qkv.tp_group,
+                tp_size=old_qkv.tp_size,
+                gather_output=old_qkv.gather_output,
+                prefer_managed_weight=old_qkv.prefer_managed_weight,
+                is_qkv=old_qkv.is_qkv,
+            )
 
             old_qkv_weight_value = old_qkv.weight.raw_value
             if (old_qkv_weight_value.shape == np.asarray([

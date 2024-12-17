@@ -1320,16 +1320,24 @@ class TestLayer(unittest.TestCase):
             mamba_layer.D.value = torch_to_numpy(D.detach().cpu())
             mamba_layer.dt_bias.value = torch_to_numpy(dt_bias.detach().cpu())
             mamba_layer.in_proj_x.weight.value = torch_to_numpy(
-                mamba_torch.in_proj.weight[0:d_inner, ].detach().cpu())
+                mamba_torch.in_proj.weight[
+                    0:d_inner,
+                ].detach().cpu())
             mamba_layer.in_proj_z.weight.value = torch_to_numpy(
-                mamba_torch.in_proj.weight[d_inner:, ].detach().cpu())
+                mamba_torch.in_proj.weight[
+                    d_inner:,
+                ].detach().cpu())
             mamba_layer.out_proj.weight.value = torch_to_numpy(
                 mamba_torch.out_proj.weight.detach().cpu())
             if bias:
                 mamba_layer.in_proj_x.bias.value = torch_to_numpy(
-                    mamba_torch.in_proj.bias[0:d_inner, ].detach().cpu())
+                    mamba_torch.in_proj.bias[
+                        0:d_inner,
+                    ].detach().cpu())
                 mamba_layer.in_proj_z.bias.value = torch_to_numpy(
-                    mamba_torch.in_proj.bias[d_inner:, ].detach().cpu())
+                    mamba_torch.in_proj.bias[
+                        d_inner:,
+                    ].detach().cpu())
                 mamba_layer.out_proj.bias.value = torch_to_numpy(
                     mamba_torch.out_proj.bias.detach().cpu())
             mamba_layer.conv1d.weight.value = torch_to_numpy(

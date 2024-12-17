@@ -141,7 +141,7 @@ int create_communicator_grouped2(communicator** comm, int pipegpus, int pipenode
     (*comm)->myrank = myrank;
     (*comm)->free_region = 0;
     (*comm)->launch_mode = LAUNCH_GPU | LAUNCH_CPU;
-    (*comm)->pdl_launch = 0;
+    (*comm)->pdl_launch = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
 
     cudaDeviceProp device_prop;
     TLLM_CUDA_CHECK(cudaGetDevice(&cur_dev));

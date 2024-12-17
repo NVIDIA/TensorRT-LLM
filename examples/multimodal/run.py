@@ -57,6 +57,8 @@ def print_result(model, input_text, output_text, args):
                 else:
                     assert 'the video is funny because the child\'s actions are' in output_text[
                         0][0].lower()
+            elif model.model_type == "qwen2_vl":
+                assert 'woman' in output_text[0][0].lower()
             else:
                 assert output_text[0][0].lower() == 'singapore'
 

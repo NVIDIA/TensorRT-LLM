@@ -187,9 +187,22 @@ private:
 class OutputConfig
 {
 public:
+    /// @brief Additional output that should be gathered.
+    /// @details By default gather output of shape [beamWidth, x] from each generation phase.
+    ///          If gatherContext is true, also gather output of shape [promptLen, x] from context phase.
+    class AdditionalModelOutput
+    {
+    public:
+        explicit AdditionalModelOutput(std::string name, bool gatherContext = false);
+
+        std::string name;
+        bool gatherContext{false};
+    };
+
     explicit OutputConfig(bool returnLogProbs = false, bool returnContextLogits = false,
         bool returnGenerationLogits = false, bool excludeInputFromOutput = false, bool returnEncoderOutput = false,
-        bool returnPerfMetrics = false);
+        bool returnPerfMetrics = false,
+        std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs = std::nullopt);
 
     /// @brief Controls if Result should contain log probabilities. Default is false.
     bool returnLogProbs;
@@ -204,6 +217,9 @@ public:
     bool returnEncoderOutput;
     /// @brief Controls if Result should contain performance metrics
     bool returnPerfMetrics;
+
+    /// @brief The additional outputs to gather from the model.
+    std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs;
 };
 
 /// @brief Configuration for speculative decoding with external draft tokens.
@@ -259,14 +275,14 @@ class MropeConfig
 public:
     explicit MropeConfig(Tensor mropeRoratySinCos, SizeType32 mropePositionDeltas);
 
-    [[nodiscard]] Tensor getMRopeRotarySinCos() const;
+    [[nodiscard]] Tensor getMRopeRotaryCosSin() const;
     [[nodiscard]] SizeType32 getMRopePositionDeltas() const;
 
 private:
     friend class Serialization;
     /// @brief The mrope rotary sin and cos cache. Expected shape: [maxPositionEmbeddings*rotaryEmbeddingDim],Data type
     /// must float32
-    Tensor mMRopeRotarySinCos;
+    Tensor mMRopeRotaryCosSin;
     /// @brief The mrope position deltas
     SizeType32 mMRopePositionDeltas;
 };
@@ -298,7 +314,8 @@ struct LookaheadDecodingConfig
     LookaheadDecodingConfig(SizeType32 windowSize, SizeType32 ngramSize, SizeType32 verificationSetSize);
 
     explicit LookaheadDecodingConfig()
-        : LookaheadDecodingConfig(1, 1, 0)
+        : LookaheadDecodingConfig(
+            kDefaultLookaheadDecodingWindow, kDefaultLookaheadDecodingNgram, kDefaultLookaheadDecodingVerificationSet)
     {
     }
 
@@ -319,6 +336,10 @@ struct LookaheadDecodingConfig
 
 private:
     friend class Serialization;
+
+    static constexpr SizeType32 kDefaultLookaheadDecodingWindow = 4;
+    static constexpr SizeType32 kDefaultLookaheadDecodingNgram = 3;
+    static constexpr SizeType32 kDefaultLookaheadDecodingVerificationSet = 4;
 
     // Number of NGrams in lookahead branch per step.
     SizeType32 mWindowSize;
@@ -644,6 +665,7 @@ public:
     [[nodiscard]] std::optional<Tensor> getSkipCrossAttnBlocks() const;
     [[nodiscard]] std::optional<GuidedDecodingParams> getGuidedDecodingParams() const;
     [[nodiscard]] std::optional<MillisecondsType> getAllottedTimeMs() const;
+    [[nodiscard]] std::optional<std::vector<std::string>> getAdditionalOutputNames() const;
 
     void setStreaming(bool streaming);
     void setSamplingConfig(SamplingConfig const& config);
@@ -675,6 +697,7 @@ public:
     void setSkipCrossAttnBlocks(Tensor skipCrossAttnBlocks);
     void setGuidedDecodingParams(GuidedDecodingParams const& guidedDecodingParams);
     void setAllottedTimeMs(MillisecondsType allottedTimeMs);
+    void setAdditionalOutputNames(std::optional<std::vector<std::string>> additionalOutputNames);
 
 private:
     friend class Serialization;
@@ -693,6 +716,18 @@ struct SpeculativeDecodingFastLogitsInfo
 
     /// @brief Returns the struct serialized into a tensor that can be used as generation logits input
     [[nodiscard]] Tensor toTensor() const;
+};
+
+struct AdditionalOutput
+{
+    AdditionalOutput(std::string name, Tensor output)
+        : name(std::move(name))
+        , output(std::move(output))
+    {
+    }
+
+    std::string name;
+    Tensor output;
 };
 
 /// @brief Struct that holds the generation result
@@ -748,6 +783,9 @@ struct Result
 
     /// @brief Performance metrics if returnPerfMetrics is set in OutputConfig
     std::optional<RequestPerfMetrics> requestPerfMetrics;
+
+    /// @brief The additional outputs
+    std::vector<AdditionalOutput> additionalOutputs;
 };
 
 /// @brief Class that holds either an error or a result
@@ -1165,7 +1203,9 @@ public:
     // Lookahead methods.
     /// @brief Sets lookahead decoding mode and config.
     void setLookaheadDecoding(LookaheadDecodingConfig const& lookaheadDecodingConfig);
+    void enableSeamlessLookaheadDecoding();
     [[nodiscard]] std::optional<LookaheadDecodingConfig> getLookaheadDecodingConfig() const;
+    [[nodiscard]] SizeType32 getLookaheadDecodingMaxNumRequest() const;
 
     // Medusa methods.
     /// @brief Sets medusa mode and config.
@@ -1188,6 +1228,8 @@ private:
     std::optional<MedusaChoices> mMedusaChoices;
     // Eagle config.
     std::optional<EagleConfig> mEagleConfig;
+    // The max number of requests that can support running with lookahead decoding
+    static constexpr SizeType32 mLookaheadDecodingMaxNumRequest = 8;
 };
 
 /// @brief Guided decoding configurations for executor.
@@ -1290,7 +1332,8 @@ public:
         std::optional<DebugConfig> debugConfig = std::nullopt, SizeType32 recvPollPeriodMs = 0,
         uint64_t maxSeqIdleMicroseconds = kDefaultMaxSeqIdleMicroseconds,
         std::optional<SpeculativeDecodingConfig> specDecConfig = std::nullopt,
-        std::optional<GuidedDecodingConfig> guidedDecodingConfig = std::nullopt);
+        std::optional<GuidedDecodingConfig> guidedDecodingConfig = std::nullopt,
+        std::optional<std::vector<std::string>> additionalOutputNames = std::nullopt);
 
     [[nodiscard]] SizeType32 getMaxBeamWidth() const;
     [[nodiscard]] SchedulerConfig getSchedulerConfig() const;
@@ -1319,6 +1362,7 @@ public:
     [[nodiscard]] uint64_t getMaxSeqIdleMicroseconds() const;
     [[nodiscard]] std::optional<SpeculativeDecodingConfig> getSpecDecConfig() const;
     [[nodiscard]] std::optional<GuidedDecodingConfig> getGuidedDecodingConfig() const;
+    [[nodiscard]] std::optional<std::vector<std::string>> getAdditionalOutputNames() const;
 
     void setMaxBeamWidth(SizeType32 maxBeamWidth);
     void setMaxBatchSize(SizeType32 maxBatchSize);
@@ -1342,6 +1386,7 @@ public:
     void setMaxSeqIdleMicroseconds(uint64_t maxNumTokens);
     void setSpecDecConfig(SpeculativeDecodingConfig const& specDecConfig);
     void setGuidedDecodingConfig(GuidedDecodingConfig const& guidedDecodingConfig);
+    void setAdditionalOutputNames(std::vector<std::string> const& additionalOutputNames);
 
 private:
     friend class Serialization;
@@ -1410,6 +1455,9 @@ private:
 
     /// @brief The guided decoding configuration
     std::optional<GuidedDecodingConfig> mGuidedDecodingConfig;
+
+    /// @brief The additional output tensor names
+    std::optional<std::vector<std::string>> mAdditionalOutputNames;
 };
 
 struct KVCacheCreatedData

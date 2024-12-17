@@ -43,20 +43,21 @@ namespace tensorrt_llm::batch_manager
  */
 enum class LlmRequestState : int32_t
 {
-    kUNKNOWN = 0,                             ///< Unknown state
-    kENCODER_INIT = 1,                        ///< Encoder phase starts (for encoder-decoder models)
-    kCONTEXT_INIT = 2,                        ///< Context phase starts
-    kGENERATION_IN_PROGRESS = 3,              ///< Generation phase is in progress
-    kGENERATION_TO_COMPLETE = 4,              ///< Generation phase is to be completed
-    kGENERATION_COMPLETE = 5,                 ///< Generation phase completed
-    kDISAGG_GENERATION_INIT = 6,              ///< For disaggregated serving only:
-                                              /// new Generation request arrived at generation model
-    kDISAGG_CONTEXT_TRANS_IN_PROGRESS = 7,    ///< For disaggregated serving only:
-                                              /// Waiting context-only request transmitting the kv cache
-    kDISAGG_CONTEXT_COMPLETE = 8,             ///< Context-only request finished kv cache transmission.
-    kDISAGG_GENERATION_TRANS_IN_PROGRESS = 9, ///< For disaggregated serving only: transmitting the kv cache
-    kDISAGG_CONTEXT_INIT_AND_TRANS = 10,      ///< For disaggregated serving only:
-                                              /// Context phase starts and cache transmission is in progress
+    kUNKNOWN = 0,                              ///< Unknown state
+    kENCODER_INIT = 1,                         ///< Encoder phase starts (for encoder-decoder models)
+    kCONTEXT_INIT = 2,                         ///< Context phase starts
+    KDISAGG_GENERATION_TRANS_COMPLETE = 3,     ///< For disaggrgated
+    kGENERATION_IN_PROGRESS = 4,               ///< Generation phase is in progress
+    kGENERATION_TO_COMPLETE = 5,               ///< Generation phase is to be completed
+    kGENERATION_COMPLETE = 6,                  ///< Generation phase completed
+    kDISAGG_GENERATION_INIT = 7,               ///< For disaggregated serving only:
+                                               /// new Generation request arrived at generation model
+    kDISAGG_CONTEXT_TRANS_IN_PROGRESS = 8,     ///< For disaggregated serving only:
+                                               /// Waiting context-only request transmitting the kv cache
+    kDISAGG_CONTEXT_COMPLETE = 9,              ///< Context-only request finished kv cache transmission.
+    kDISAGG_GENERATION_TRANS_IN_PROGRESS = 10, ///< For disaggregated serving only: transmitting the kv cache
+    kDISAGG_CONTEXT_INIT_AND_TRANS = 11,       ///< For disaggregated serving only:
+                                               /// Context phase starts and cache transmission is in progress
 };
 
 enum LlmRequestType
@@ -71,6 +72,8 @@ class ContextProgress;
 template <typename TTensor, typename TStream = runtime::BufferManager::CudaStreamPtr>
 class GenericLlmRequest
 {
+    using TensorMap = runtime::StringPtrMap<runtime::ITensor>;
+
 public:
     using SizeType32 = runtime::SizeType32;
     using TokenIdType = runtime::TokenIdType;
@@ -97,7 +100,7 @@ public:
         std::optional<std::shared_ptr<std::vector<SizeType32>>> positionIds = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
-        std::optional<TensorPtr> mropeRotarySinCos = std::nullopt,
+        std::optional<TensorPtr> mropeRotaryCosSin = std::nullopt,
         std::optional<SizeType32> mropePositionDeltas = std::nullopt,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
         std::optional<TensorPtr> loraConfig = std::nullopt,
@@ -140,7 +143,7 @@ public:
         , mPositionIds(std::move(positionIds))
         , mPromptEmbeddingTable(std::move(promptEmbeddingTable))
         , mPromptVocabSize(promptVocabSize)
-        , mMropeRotarySinCos(std::move(mropeRotarySinCos))
+        , mMropeRotaryCosSin(std::move(mropeRotaryCosSin))
         , mMropePositionDeltas(mropePositionDeltas)
         , mLoraTaskId(loraTaskId)
         , mLoraWeights(std::move(loraWeights))
@@ -282,7 +285,7 @@ public:
         , mPositionIds(std::nullopt)
         , mPromptEmbeddingTable(std::nullopt)
         , mPromptVocabSize(std::nullopt)
-        , mMropeRotarySinCos(std::nullopt)
+        , mMropeRotaryCosSin(std::nullopt)
         , mMropePositionDeltas(std::nullopt)
         , mLoraTaskId(std::nullopt)
         , mLoraWeights(std::nullopt)
@@ -387,7 +390,7 @@ public:
         auto mRopeConfig = req.getMropeConfig();
         if (mRopeConfig)
         {
-            mMropeRotarySinCos = executor::detail::toITensor(mRopeConfig.value().getMRopeRotarySinCos());
+            mMropeRotaryCosSin = executor::detail::toITensor(mRopeConfig.value().getMRopeRotaryCosSin());
             mMropePositionDeltas = mRopeConfig.value().getMRopePositionDeltas();
         }
 
@@ -421,6 +424,23 @@ public:
             }
 
             // NOTE: Draft acceptance threshold is stored in mSamplingConfig
+        }
+
+        if (req.getOutputConfig().additionalModelOutputs.has_value())
+        {
+            auto const additionalModelOutputs
+                = req.getOutputConfig()
+                      .additionalModelOutputs.value(); // Explicit copy is needed. Something shady is going on,
+                                                       // somewhere, which makes it behave unpredictably without it.
+                                                       // Separate investigation needed.
+            for (auto const& modelOutput : additionalModelOutputs)
+            {
+                if (modelOutput.gatherContext)
+                {
+                    mAdditionalContextOutputTensors.emplace(modelOutput.name, TensorPtr{});
+                }
+                mAdditionalGenerationOutputTensors.emplace(modelOutput.name, TensorPtr{});
+            }
         }
 
         auto const& encoderInputFeatures = req.getEncoderInputFeatures();
@@ -737,12 +757,14 @@ public:
     /// @brief Add new generated tokens to the vector of tokens and set mLastTokens
     /// @param token The token to add
     /// @param beam The beam to which to add the new token
-    void addNewToken(TokenIdType token, SizeType32 beam)
+    /// @return  The number of tokens after the new token is added
+    SizeType32 addNewToken(TokenIdType token, SizeType32 beam)
     {
         mLastTokens[beam] = token;
         mTokens.at(beam).push_back(token);
         // New token's extra id is 0
         mUniqueTokens.at(beam).push_back({token, 0});
+        return getNumTokens(beam);
     }
 
     /// @brief Add new generated tokens to the vector of tokens and set mLastTokens
@@ -911,9 +933,9 @@ public:
         return mPromptVocabSize;
     }
 
-    [[nodiscard]] std::optional<TensorPtr> getMropeRotarySinCos() const
+    [[nodiscard]] std::optional<TensorPtr> getMropeRotaryCosSin() const
     {
-        return mMropeRotarySinCos;
+        return mMropeRotaryCosSin;
     }
 
     [[nodiscard]] std::optional<SizeType32> getMropePositionDeltas() const
@@ -1372,6 +1394,50 @@ public:
         mGenerationLogitsFragments.clear();
     }
 
+    bool hasAdditionalOutputs()
+    {
+        return !mAdditionalContextOutputTensors.empty() || !mAdditionalGenerationOutputTensors.empty();
+    }
+
+    [[nodiscard]] TensorMap const& getAdditionalContextOutputs() const
+    {
+        return mAdditionalContextOutputTensors;
+    }
+
+    [[nodiscard]] TensorMap const& getAdditionalGenerationOutputs() const
+    {
+        return mAdditionalGenerationOutputTensors;
+    }
+
+    template <typename TypeFunc, typename ShapeFunc>
+    void allocAdditionalOutputs(TypeFunc getTensorDataType, ShapeFunc getTensorShape)
+    {
+        for (auto& outputTensor : mAdditionalContextOutputTensors)
+        {
+            auto const& outputTensorName = outputTensor.first;
+            auto const dataType = getTensorDataType(outputTensorName);
+            auto shape = getTensorShape(outputTensorName);
+            TLLM_CHECK_WITH_INFO(shape.d[0] == -1, "First dimension of additional output tensor '%s' must be dynamic",
+                outputTensorName.c_str());
+            shape.d[0] = mPromptLen;
+            auto tensor = runtime::BufferManager::pinnedPool(shape, dataType);
+            outputTensor.second = std::move(tensor);
+        }
+        for (auto& outputTensor : mAdditionalGenerationOutputTensors)
+        {
+            auto const& outputTensorName = outputTensor.first;
+            auto const dataType = getTensorDataType(outputTensorName);
+            auto shape = getTensorShape(outputTensorName);
+            TLLM_CHECK_WITH_INFO(shape.d[0] == -1, "First dimension of additional output tensor '%s' must be dynamic",
+                outputTensorName.c_str());
+            shape.d[0] = mMaxNewTokens - 1;
+            shape = runtime::ITensor::unsqueeze(shape, 0);
+            shape.d[0] = mSamplingConfig.beamWidth;
+            auto tensor = runtime::BufferManager::pinnedPool(shape, dataType);
+            outputTensor.second = std::move(tensor);
+        }
+    }
+
     [[nodiscard]] bool hasReachedState(LlmRequestState state) const noexcept
     {
         return mState >= state;
@@ -1389,7 +1455,8 @@ public:
 
     [[nodiscard]] bool isGenerationInProgressState() const noexcept
     {
-        return mState == LlmRequestState::kGENERATION_IN_PROGRESS || mState == LlmRequestState::kGENERATION_TO_COMPLETE;
+        return mState == LlmRequestState::kGENERATION_IN_PROGRESS || mState == LlmRequestState::kGENERATION_TO_COMPLETE
+            || mState == LlmRequestState::KDISAGG_GENERATION_TRANS_COMPLETE;
     }
 
     [[nodiscard]] bool isGenerationCompleteState() const noexcept
@@ -1400,6 +1467,16 @@ public:
     [[nodiscard]] bool isDisaggGenerationInitState() const noexcept
     {
         return mState == LlmRequestState::kDISAGG_GENERATION_INIT;
+    }
+
+    [[nodiscard]] bool isDisaggGenerationTransmissionComplete() const noexcept
+    {
+        return mState == LlmRequestState::KDISAGG_GENERATION_TRANS_COMPLETE;
+    }
+
+    [[nodiscard]] bool isDisaggGenerationTransmissionInProgress() const noexcept
+    {
+        return mState == LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS;
     }
 
     [[nodiscard]] bool isDisaggContextTransmissionState() const noexcept
@@ -1417,7 +1494,8 @@ public:
     /// is still different from the unchunked state, which indicates the initial status.
     [[nodiscard]] bool isFullContextRequest() const noexcept
     {
-        return (isContextInitState() || isDisaggGenerationInitState()) && !mContextChunkSize;
+        return (isContextInitState() || isDisaggGenerationInitState() || isDisaggGenerationTransmissionComplete())
+            && !mContextChunkSize;
     }
 
     [[nodiscard]] bool isContextOnlyRequest() const noexcept
@@ -1450,7 +1528,8 @@ public:
 
     [[nodiscard]] SizeType32 getContextChunkSize() const
     {
-        TLLM_CHECK_WITH_INFO(isContextInitState() || isDisaggGenerationInitState(),
+        TLLM_CHECK_WITH_INFO(
+            isContextInitState() || isDisaggGenerationInitState() || isDisaggGenerationTransmissionComplete(),
             "getContextChunkSize is only possible during the context phase.");
         return mContextChunkSize;
     }
@@ -1468,7 +1547,8 @@ public:
     /// Determines whether the current position is only one chunk away from the end of the context.
     [[nodiscard]] bool isLastContextChunk() const noexcept
     {
-        return isDisaggGenerationInitState() || getContextCurrentPosition() + getContextChunkSize() == mPromptLen;
+        return isDisaggGenerationInitState() || isDisaggGenerationTransmissionComplete()
+            || getContextCurrentPosition() + getContextChunkSize() == mPromptLen;
     }
 
     /// Returns whether the position is at the beginning of the context.
@@ -1653,6 +1733,22 @@ public:
         result.finishReasons = sliceBeams(mFinishReasons);
         result.decodingIter = mDecodingIter;
 
+        if (hasAdditionalOutputs())
+        {
+            std::string prefix = "context_";
+            for (auto const& outputTensorMap : {mAdditionalContextOutputTensors, mAdditionalGenerationOutputTensors})
+            {
+                for (auto const& outputTensor : outputTensorMap)
+                {
+                    TLLM_LOG_DEBUG("Adding tensor %s with shape %s to result.", outputTensor.first.c_str(),
+                        runtime::ITensor::toString(outputTensor.second->getShape()).c_str());
+                    result.additionalOutputs.emplace_back(
+                        prefix + outputTensor.first, executor::detail::ofITensor(outputTensor.second));
+                }
+                prefix = "generation_";
+            }
+        }
+
         // Update position of last sent response
         setMaxSentTokenLen(maxNbTokens);
 
@@ -1824,7 +1920,7 @@ protected:
 
     std::optional<TensorPtr> mPromptEmbeddingTable;
     std::optional<SizeType32> mPromptVocabSize;
-    std::optional<TensorPtr> mMropeRotarySinCos;
+    std::optional<TensorPtr> mMropeRotaryCosSin;
     std::optional<SizeType32> mMropePositionDeltas;
 
     std::optional<LoraTaskIdType> mLoraTaskId;
@@ -1903,6 +1999,9 @@ protected:
     std::chrono::steady_clock::time_point mStartTime;
     // Time in milliseconds after which the model is finished with a `timeout` finishReason.
     std::optional<MillisecondsType> mAllottedTimeMs;
+
+    TensorMap mAdditionalContextOutputTensors;    // Tensors containing the additional context output.
+    TensorMap mAdditionalGenerationOutputTensors; // Tensors containing the additional generation output.
 
 private:
     void initialize(VecTokens const& inputTokens, bool outputLogProbs)
@@ -2050,7 +2149,7 @@ public:
         std::optional<std::shared_ptr<std::vector<SizeType32>>> positionIds = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
-        std::optional<TensorPtr> mropeRotarySinCos = std::nullopt,
+        std::optional<TensorPtr> mropeRotaryCosSin = std::nullopt,
         std::optional<SizeType32> mropePositionDeltas = std::nullopt,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
         std::optional<TensorPtr> loraConfig = std::nullopt,
@@ -2075,15 +2174,14 @@ public:
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt)
         : Base(requestId, maxNewTokens, std::move(inputTokens), samplingConfig, isStreaming, endId, padId,
             std::move(embeddingBias), std::move(badWordsList), std::move(stopWordsList), std::move(positionIds),
-            std::move(promptEmbeddingTable), promptVocabSize, std::move(mropeRotarySinCos),
-            std::move(mropePositionDeltas), loraTaskId, std::move(loraWeights), std::move(loraConfig),
-            std::move(lookaheadConfig), std::move(kvCacheRetentionConfig), returnLogProbs, returnContextLogits,
-            returnGenerationLogits, std::move(draftTokens), std::move(draftLogits), excludeInputFromOutput,
-            std::move(logitsPostProcessor), applyLogitsPostProcessorBatched, std::move(encoderInputTokens),
-            returnEncoderOutput, clientId, priority, std::move(encoderInputFeatures), std::move(encoderOutputLength),
-            std::move(crossAttentionMask), llmRequestType, std::move(inputTokenExtraIds), numReturnSequences,
-            std::move(eagleConfig), std::move(skipCrossAttnBlocks), returnPerfMetrics, std::move(guidedDecodingParams),
-            allottedTimeMs)
+            std::move(promptEmbeddingTable), promptVocabSize, std::move(mropeRotaryCosSin), mropePositionDeltas,
+            loraTaskId, std::move(loraWeights), std::move(loraConfig), std::move(lookaheadConfig),
+            std::move(kvCacheRetentionConfig), returnLogProbs, returnContextLogits, returnGenerationLogits,
+            std::move(draftTokens), std::move(draftLogits), excludeInputFromOutput, std::move(logitsPostProcessor),
+            applyLogitsPostProcessorBatched, std::move(encoderInputTokens), returnEncoderOutput, clientId, priority,
+            std::move(encoderInputFeatures), std::move(encoderOutputLength), std::move(crossAttentionMask),
+            llmRequestType, std::move(inputTokenExtraIds), numReturnSequences, std::move(eagleConfig),
+            std::move(skipCrossAttnBlocks), returnPerfMetrics, std::move(guidedDecodingParams), allottedTimeMs)
     {
     }
 
@@ -2094,7 +2192,7 @@ public:
         std::optional<std::vector<SizeType32>> positionIds = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
-        std::optional<TensorPtr> mropeRotarySinCos = std::nullopt,
+        std::optional<TensorPtr> mropeRotaryCosSin = std::nullopt,
         std::optional<SizeType32> mropePositionDeltas = std::nullopt,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
         std::optional<TensorPtr> loraConfig = std::nullopt,
@@ -2120,7 +2218,7 @@ public:
             std::move(stopWordsList),
             positionIds.has_value() ? std::make_shared<std::vector<SizeType32>>(std::move(positionIds.value()))
                                     : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),
-            std::move(promptEmbeddingTable), promptVocabSize, std::move(mropeRotarySinCos), mropePositionDeltas,
+            std::move(promptEmbeddingTable), promptVocabSize, std::move(mropeRotaryCosSin), mropePositionDeltas,
             loraTaskId, std::move(loraWeights), std::move(loraConfig), lookaheadConfig,
             std::move(kvCacheRetentionConfig), returnLogProbs, returnContextLogits, returnGenerationLogits,
             draftTokens.has_value() ? std::make_shared<VecTokens>(std::move(draftTokens.value()))

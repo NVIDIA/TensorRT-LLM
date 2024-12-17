@@ -217,7 +217,7 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         xqaParams.logn_scaling_ptr, xqaParams.spec_decoding_generation_lengths, xqaParams.sequence_lengths,
         /* encoder_seqlens */ nullptr, xqaParams.multi_query_tokens ? launchParams.cu_seq_lens : nullptr,
         /* cu_kv_seqlens */ nullptr, launchParams.rotary_inv_freq_buf, (float2 const*) nullptr,
-        xqaParams.kv_scale_orig_quant, xqaParams.spec_decoding_position_offsets, xqaParams.mrope_rotary_sin_cos,
+        xqaParams.kv_scale_orig_quant, xqaParams.spec_decoding_position_offsets, (float2 const*) nullptr,
         xqaParams.mrope_position_deltas, int(batch_beam_size), xqaParams.generation_input_length, xqaParams.timestep,
         xqaParams.cyclic_attention_window_size, xqaParams.sink_token_length,
         int(xqaParams.batch_size * beam_width * xqaParams.generation_input_length),

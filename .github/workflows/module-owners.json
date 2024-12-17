@@ -9,5 +9,6 @@
     "Performance": ["kaiyux", "jiahanc", "hypdeb"],
     "Lora/P-tuning":["byshiue", "Naveassaf"],
     "Disaggregated Serving":["Shixiaowei02", "joyang-nv", "chuangz0", "schetlur-nv"],
-    "Documentation":["nv-guomingz", "mikemckiernan"]
+    "Documentation":["nv-guomingz", "mikemckiernan"],
+    "Windows":["pamelap-nvidia"]
 }

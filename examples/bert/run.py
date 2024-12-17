@@ -192,9 +192,10 @@ if __name__ == '__main__':
         ])
 
     outputs = {
-        t.name: torch.empty(tuple(t.shape),
-                            dtype=trt_dtype_to_torch(t.dtype),
-                            device='cuda')
+        t.name:
+        torch.empty(tuple(t.shape),
+                    dtype=trt_dtype_to_torch(t.dtype),
+                    device='cuda')
         for t in output_info
     }
     assert output_name in outputs, f'{output_name} not found in outputs, check if build.py set output name correctly'

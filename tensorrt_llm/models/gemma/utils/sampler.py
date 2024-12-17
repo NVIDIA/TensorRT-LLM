@@ -115,7 +115,8 @@ class Sampler:
     def init_cache(self, bsz) -> dict[str, modules.LayerCache]:
         """Initializes the attention cache for each layer."""
         return {
-            f'layer_{i}': modules.init_layer_cache(
+            f'layer_{i}':
+            modules.init_layer_cache(
                 self.cache_size,
                 self.transformer.config.num_heads,
                 self.transformer.config.head_dim,

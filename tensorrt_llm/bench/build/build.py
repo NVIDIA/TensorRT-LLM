@@ -82,10 +82,11 @@ def load_predefined_config():
     return configs
 
 
-def get_model_config(model_name: str) -> ModelConfig:
+def get_model_config(model_name: str, model_path: Path = None) -> ModelConfig:
     """ Obtain the model-related parameters from Hugging Face.
     Args:
         model_name (str): Huggingface model name.
+        model_path (Path): Path to a local Huggingface checkpoint.
 
     Raises:
         ValueError: When model is not supported.
@@ -95,7 +96,7 @@ def get_model_config(model_name: str) -> ModelConfig:
     if model_name not in configs:
         raise ValueError(f"'{model_name}' is not supported for now.")
 
-    model_config = ModelConfig.from_hf(model_name)
+    model_config = ModelConfig.from_hf(model_name, model_path)
 
     return model_config
 
@@ -249,7 +250,7 @@ def build_command(
 
     model_name = bench_env.model
     checkpoint_path = bench_env.model_path or model_name
-    model_config = get_model_config(model_name)
+    model_config = get_model_config(model_name, bench_env.model_path)
     engine_dir = Path(bench_env.workspace, model_name,
                       f"tp_{tp_size}_pp_{pp_size}")
 

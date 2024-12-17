@@ -51,7 +51,7 @@ public:
         uint64_t maxSeqIdleMicroseconds = executor::ExecutorConfig::kDefaultMaxSeqIdleMicroseconds,
         std::optional<executor::SpeculativeDecodingConfig> specDecConfig = std::nullopt,
         std::optional<executor::GuidedDecodingConfig> guidedDecodingConfig = std::nullopt,
-        bool isLeaderInOrchMode = false)
+        bool isLeaderInOrchMode = false, std::optional<std::vector<std::string>> additionalOutputNames = std::nullopt)
         : kvCacheConfig{std::move(kvCacheConfig)}
         , enableTrtOverlap{enableTrtOverlap}
         , deviceIds(std::move(deviceIds))
@@ -70,6 +70,7 @@ public:
         , speculativeDecodingConfig{specDecConfig}
         , guidedDecodingConfig{std::move(guidedDecodingConfig)}
         , isLeaderInOrchMode{isLeaderInOrchMode}
+        , additionalOutputNames{std::move(additionalOutputNames)}
     {
         if (guidedDecodingConfig)
         {
@@ -87,7 +88,7 @@ public:
             executorConfig.getMaxNumTokens(), executorConfig.getSchedulerConfig(),
             executorConfig.getExtendedRuntimePerfKnobConfig(), executorConfig.getDebugConfig(),
             executorConfig.getMaxSeqIdleMicroseconds(), executorConfig.getSpecDecConfig(),
-            executorConfig.getGuidedDecodingConfig(), isLeaderInOrchMode)
+            executorConfig.getGuidedDecodingConfig(), isLeaderInOrchMode, executorConfig.getAdditionalOutputNames())
     {
     }
 
@@ -110,6 +111,7 @@ public:
             && speculativeDecodingConfig == other.speculativeDecodingConfig         //
             && guidedDecodingConfig == other.guidedDecodingConfig                   //
             && isLeaderInOrchMode == other.isLeaderInOrchMode                       //
+            && additionalOutputNames == other.additionalOutputNames                 //
             ;
     }
 
@@ -137,6 +139,7 @@ public:
     std::optional<executor::GuidedDecodingConfig> guidedDecodingConfig;
     // This rank is the leader worker in orchestrator mode
     bool isLeaderInOrchMode;
+    std::optional<std::vector<std::string>> additionalOutputNames;
 };
 
 } // namespace tensorrt_llm::batch_manager

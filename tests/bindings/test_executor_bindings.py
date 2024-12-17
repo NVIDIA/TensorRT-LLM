@@ -848,12 +848,23 @@ def test_output_config():
     assert config.return_context_logits == False
     assert config.return_generation_logits == False
     assert config.exclude_input_from_output == False
+    assert config.return_encoder_output == False
+    assert config.return_perf_metrics == False
+    assert config.additional_model_outputs == None
 
-    config = trtllm.OutputConfig(True, False, True, False)
+    config = trtllm.OutputConfig(
+        True, False, True, False, True, False,
+        list([trtllm.AdditionalModelOutput("topKLogits", True)]))
     assert config.return_log_probs == True
     assert config.return_context_logits == False
     assert config.return_generation_logits == True
     assert config.exclude_input_from_output == False
+    assert config.return_encoder_output == True
+    assert config.return_perf_metrics == False
+    assert len(config.additional_model_outputs) == 1
+    additional_model_output = config.additional_model_outputs[0]
+    assert additional_model_output.name == "topKLogits"
+    assert additional_model_output.gather_context == True
 
 
 def test_external_draft_tokens_config():
@@ -882,10 +893,10 @@ def test_prompt_tuning_config():
 
 
 def test_mrope_config():
-    mrope_rotary_sin_cos = torch.ones(1, 4194304)
+    mrope_rotary_cos_sin = torch.ones(1, 4194304)
     mrope_position_deltas = torch.tensor([-50])
-    config = trtllm.MropeConfig(mrope_rotary_sin_cos, mrope_position_deltas)
-    assert (config.mrope_rotary_sin_cos == mrope_rotary_sin_cos).all()
+    config = trtllm.MropeConfig(mrope_rotary_cos_sin, mrope_position_deltas)
+    assert (config.mrope_rotary_cos_sin == mrope_rotary_cos_sin).all()
     assert (config.mrope_position_deltas == mrope_position_deltas).all()
 
 
@@ -1032,6 +1043,9 @@ def test_result():
     result.finish_reasons = [trtllm.FinishReason.LENGTH]
     result.sequence_index = 1
     result.is_sequence_final = True
+    result.additional_outputs = [
+        trtllm.AdditionalOutput("topKLogits", torch.ones(1, 4, 100))
+    ]
     assert result.is_final is True
     assert result.output_token_ids == [[1, 2, 3]]
     assert result.cum_log_probs == [1.0, 2.0, 3.0]
@@ -1042,6 +1056,10 @@ def test_result():
     assert result.finish_reasons == [trtllm.FinishReason.LENGTH]
     assert result.sequence_index == 1
     assert result.is_sequence_final is True
+    assert len(result.additional_outputs) == 1
+    additional_output = result.additional_outputs[0]
+    assert additional_output.name == "topKLogits"
+    assert (additional_output.output == torch.ones(1, 4, 100)).all()
 
 
 def test_response():
@@ -1438,6 +1456,7 @@ def test_executor_config():
         trtllm.GuidedDecodingConfig(
             trtllm.GuidedDecodingConfig.GuidedDecodingBackend.XGRAMMAR,
             encoded_vocab=["eos", "a", "b", "c", "d"]),
+        "additional_output_names": ["topKLogits"]
     }
     config = trtllm.ExecutorConfig(**kwargs)
     for k, v in kwargs.items():
@@ -1455,6 +1474,9 @@ def test_executor_config():
     assert isinstance(config.spec_dec_config, trtllm.SpeculativeDecodingConfig)
     assert isinstance(config.guided_decoding_config,
                       trtllm.GuidedDecodingConfig)
+    assert isinstance(config.additional_output_names, list)
+    assert len(config.additional_output_names) == 1
+    assert config.additional_output_names[0] == "topKLogits"
 
 
 def test_parallel_config():

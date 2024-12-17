@@ -56,4 +56,36 @@ template tensorrt_llm::runtime::ITensor::UniquePtr convert_tensor<__nv_bfloat16>
 #endif
 template tensorrt_llm::runtime::ITensor::UniquePtr convert_tensor<bool>(torch::Tensor tensor);
 
+std::optional<float> getFloatEnv(char const* name)
+{
+    char const* const env = std::getenv(name);
+    if (env == nullptr)
+    {
+        return std::nullopt;
+    }
+    try
+    {
+        float value = std::stof(env);
+        return {value};
+    }
+    catch (std::invalid_argument const& e)
+    {
+        return std::nullopt;
+    }
+    catch (std::out_of_range const& e)
+    {
+        return std::nullopt;
+    }
+};
+
+int nextPowerOfTwo(int v)
+{
+    --v;
+    v |= v >> 1;
+    v |= v >> 2;
+    v |= v >> 4;
+    v |= v >> 8;
+    v |= v >> 16;
+    return ++v;
+}
 } // namespace torch_ext

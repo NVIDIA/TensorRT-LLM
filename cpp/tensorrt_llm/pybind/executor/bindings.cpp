@@ -312,31 +312,40 @@ void InitBindings(pybind11::module_& m)
             &tle::SamplingConfig::setNumReturnSequences)
         .def(py::pickle(samplingConfigGetstate, samplingConfigSetstate));
 
+    py::class_<tle::OutputConfig::AdditionalModelOutput>(m, "AdditionalModelOutput")
+        .def(py::init<std::string, bool>(), py::arg("name"), py::arg("gather_context") = false)
+        .def_readwrite("name", &tle::OutputConfig::AdditionalModelOutput::name)
+        .def_readwrite("gather_context", &tle::OutputConfig::AdditionalModelOutput::gatherContext);
+
     auto outputConfigGetstate = [](tle::OutputConfig const& self)
     {
         return py::make_tuple(self.returnLogProbs, self.returnContextLogits, self.returnGenerationLogits,
-            self.excludeInputFromOutput, self.returnEncoderOutput, self.returnPerfMetrics);
+            self.excludeInputFromOutput, self.returnEncoderOutput, self.returnPerfMetrics, self.additionalModelOutputs);
     };
     auto outputConfigSetstate = [](py::tuple const& state)
     {
-        if (state.size() != 6)
+        if (state.size() != 7)
         {
             throw std::runtime_error("Invalid OutputConfig state!");
         }
         return tle::OutputConfig(state[0].cast<bool>(), state[1].cast<bool>(), state[2].cast<bool>(),
-            state[3].cast<bool>(), state[4].cast<bool>(), state[5].cast<bool>());
+            state[3].cast<bool>(), state[4].cast<bool>(), state[5].cast<bool>(),
+            state[6].cast<std::optional<std::vector<tle::OutputConfig::AdditionalModelOutput>>>());
     };
     py::class_<tle::OutputConfig>(m, "OutputConfig")
-        .def(py::init<bool, bool, bool, bool, bool, bool>(), py::arg("return_log_probs") = false,
-            py::arg("return_context_logits") = false, py::arg("return_generation_logits") = false,
-            py::arg("exclude_input_from_output") = false, py::arg("return_encoder_output") = false,
-            py::arg("return_perf_metrics") = false)
+        .def(py::init<bool, bool, bool, bool, bool, bool,
+                 std::optional<std::vector<tle::OutputConfig::AdditionalModelOutput>>>(),
+            py::arg("return_log_probs") = false, py::arg("return_context_logits") = false,
+            py::arg("return_generation_logits") = false, py::arg("exclude_input_from_output") = false,
+            py::arg("return_encoder_output") = false, py::arg("return_perf_metrics") = false,
+            py::arg("additional_model_outputs") = py::none())
         .def_readwrite("return_log_probs", &tle::OutputConfig::returnLogProbs)
         .def_readwrite("return_context_logits", &tle::OutputConfig::returnContextLogits)
         .def_readwrite("return_generation_logits", &tle::OutputConfig::returnGenerationLogits)
         .def_readwrite("exclude_input_from_output", &tle::OutputConfig::excludeInputFromOutput)
         .def_readwrite("return_encoder_output", &tle::OutputConfig::returnEncoderOutput)
         .def_readwrite("return_perf_metrics", &tle::OutputConfig::returnPerfMetrics)
+        .def_readwrite("additional_model_outputs", &tle::OutputConfig::additionalModelOutputs)
         .def(py::pickle(outputConfigGetstate, outputConfigSetstate));
 
     auto externalDraftTokensConfigGetstate = [](tle::ExternalDraftTokensConfig const& self)
@@ -397,7 +406,7 @@ void InitBindings(pybind11::module_& m)
         .def(py::pickle(loraConfigGetstate, loraConfigSetstate));
 
     auto MropeConfigGetstate = [](tle::MropeConfig const& self)
-    { return py::make_tuple(self.getMRopeRotarySinCos(), self.getMRopePositionDeltas()); };
+    { return py::make_tuple(self.getMRopeRotaryCosSin(), self.getMRopePositionDeltas()); };
     auto MropeConfigSetstate = [](py::tuple const& state)
     {
         if (state.size() != 2)
@@ -407,8 +416,8 @@ void InitBindings(pybind11::module_& m)
         return tle::MropeConfig(state[0].cast<tle::Tensor>(), state[1].cast<SizeType32>());
     };
     py::class_<tle::MropeConfig>(m, "MropeConfig")
-        .def(py::init<Tensor, SizeType32>(), py::arg("mrope_rotary_sin_cos"), py::arg("mrope_position_deltas"))
-        .def_property_readonly("mrope_rotary_sin_cos", &tle::MropeConfig::getMRopeRotarySinCos)
+        .def(py::init<Tensor, SizeType32>(), py::arg("mrope_rotary_cos_sin"), py::arg("mrope_position_deltas"))
+        .def_property_readonly("mrope_rotary_cos_sin", &tle::MropeConfig::getMRopeRotaryCosSin)
         .def_property_readonly("mrope_position_deltas", &tle::MropeConfig::getMRopePositionDeltas)
         .def(py::pickle(MropeConfigGetstate, MropeConfigSetstate));
 
@@ -732,6 +741,12 @@ void InitBindings(pybind11::module_& m)
         .def_readwrite("last_iter", &tle::RequestPerfMetrics::lastIter)
         .def_readwrite("iter", &tle::RequestPerfMetrics::iter);
 
+    py::class_<tle::AdditionalOutput>(m, "AdditionalOutput")
+        .def(py::init([](std::string const& name, tle::Tensor const& output)
+            { return std::make_unique<tle::AdditionalOutput>(name, output); }))
+        .def_readwrite("name", &tle::AdditionalOutput::name)
+        .def_readwrite("output", &tle::AdditionalOutput::output);
+
     py::class_<tle::Result>(m, "Result")
         .def(py::init<>())
         .def_readwrite("is_final", &tle::Result::isFinal)
@@ -749,7 +764,8 @@ void InitBindings(pybind11::module_& m)
         .def_readwrite("context_phase_params", &tle::Result::contextPhaseParams)
         .def_readwrite("sequence_index", &tle::Result::sequenceIndex)
         .def_readwrite("is_sequence_final", &tle::Result::isSequenceFinal)
-        .def_readwrite("request_perf_metrics", &tle::Result::requestPerfMetrics);
+        .def_readwrite("request_perf_metrics", &tle::Result::requestPerfMetrics)
+        .def_readwrite("additional_outputs", &tle::Result::additionalOutputs);
 
     py::class_<tle::Response>(m, "Response")
         .def(py::init<IdType, std::string, std::optional<IdType>>(), py::arg("request_id"), py::arg("error_msg"),
@@ -1073,7 +1089,8 @@ void InitBindings(pybind11::module_& m)
             c.getRequestStatsMaxIterations(), c.getBatchingType(), c.getMaxBatchSize(), c.getMaxNumTokens(),
             c.getParallelConfig(), c.getPeftCacheConfig(), c.getLogitsPostProcessorConfig(), c.getDecodingConfig(),
             c.getGpuWeightsPercent(), c.getMaxQueueSize(), c.getExtendedRuntimePerfKnobConfig(), c.getDebugConfig(),
-            c.getRecvPollPeriodMs(), c.getMaxSeqIdleMicroseconds(), c.getSpecDecConfig(), c.getGuidedDecodingConfig());
+            c.getRecvPollPeriodMs(), c.getMaxSeqIdleMicroseconds(), c.getSpecDecConfig(), c.getGuidedDecodingConfig(),
+            c.getAdditionalOutputNames());
         auto pickle_tuple = py::make_tuple(cpp_states, py::getattr(self, "__dict__"));
         return pickle_tuple;
     };
@@ -1086,7 +1103,7 @@ void InitBindings(pybind11::module_& m)
 
         // Restore C++ data
         auto cpp_states = state[0].cast<py::tuple>();
-        if (cpp_states.size() != 22)
+        if (cpp_states.size() != 23)
         {
             throw std::runtime_error("Invalid cpp_states!");
         }
@@ -1102,7 +1119,8 @@ void InitBindings(pybind11::module_& m)
             cpp_states[15].cast<std::optional<SizeType32>>(), cpp_states[16].cast<tle::ExtendedRuntimePerfKnobConfig>(),
             cpp_states[17].cast<std::optional<tle::DebugConfig>>(), cpp_states[18].cast<SizeType32>(),
             cpp_states[19].cast<uint64_t>(), cpp_states[20].cast<std::optional<tle::SpeculativeDecodingConfig>>(),
-            cpp_states[21].cast<std::optional<tle::GuidedDecodingConfig>>());
+            cpp_states[21].cast<std::optional<tle::GuidedDecodingConfig>>(),
+            cpp_states[22].cast<std::optional<std::vector<std::string>>>());
 
         auto py_state = state[1].cast<py::dict>();
 
@@ -1116,7 +1134,7 @@ void InitBindings(pybind11::module_& m)
                  std::optional<tle::LogitsPostProcessorConfig>, std::optional<tle::DecodingConfig>, float,
                  std::optional<SizeType32>, tle::ExtendedRuntimePerfKnobConfig const&, std::optional<tle::DebugConfig>,
                  SizeType32, uint64_t, std::optional<tle::SpeculativeDecodingConfig>,
-                 std::optional<tle::GuidedDecodingConfig>>(),
+                 std::optional<tle::GuidedDecodingConfig>, std::optional<std::vector<std::string>>>(),
             py::arg("max_beam_width") = 1, py::arg_v("scheduler_config", tle::SchedulerConfig(), "SchedulerConfig()"),
             py::arg_v("kv_cache_config", tle::KvCacheConfig(), "KvCacheConfig()"),
             py::arg("enable_chunked_context") = false, py::arg("normalize_log_probs") = true,
@@ -1132,7 +1150,8 @@ void InitBindings(pybind11::module_& m)
                 "ExtendedRuntimePerfKnobConfig()"),
             py::arg("debug_config") = py::none(), py::arg("recv_poll_period_ms") = 0,
             py::arg("max_seq_idle_microseconds") = tle::ExecutorConfig::kDefaultMaxSeqIdleMicroseconds,
-            py::arg("spec_dec_config") = py::none(), py::arg("guided_decoding_config") = py::none())
+            py::arg("spec_dec_config") = py::none(), py::arg("guided_decoding_config") = py::none(),
+            py::arg("additional_output_names") = py::none())
         .def_property("max_beam_width", &tle::ExecutorConfig::getMaxBeamWidth, &tle::ExecutorConfig::setMaxBeamWidth)
         .def_property("max_batch_size", &tle::ExecutorConfig::getMaxBatchSize, &tle::ExecutorConfig::setMaxBatchSize)
         .def_property("max_num_tokens", &tle::ExecutorConfig::getMaxNumTokens, &tle::ExecutorConfig::setMaxNumTokens)
@@ -1170,6 +1189,8 @@ void InitBindings(pybind11::module_& m)
         .def_property("spec_dec_config", &tle::ExecutorConfig::getSpecDecConfig, &tle::ExecutorConfig::setSpecDecConfig)
         .def_property("guided_decoding_config", &tle::ExecutorConfig::getGuidedDecodingConfig,
             &tle::ExecutorConfig::setGuidedDecodingConfig)
+        .def_property("additional_output_names", &tle::ExecutorConfig::getAdditionalOutputNames,
+            &tle::ExecutorConfig::setAdditionalOutputNames)
         .def(py::pickle(executorConfigGetState, executorConfigSetState));
 
     py::module_ executor_kv_cache = m.def_submodule("kv_cache", "Executor KV Cache Manager");

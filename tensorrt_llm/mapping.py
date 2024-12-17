@@ -118,6 +118,7 @@ class Mapping(object):
             gpus_per_node=8,
             *,
             cp_size=1,
+            cp_config={},
             tp_size=1,
             pp_size=1,
             moe_tp_size=-1,  # -1 means no moe
@@ -143,6 +144,7 @@ class Mapping(object):
 
         self.tp_size = tp_size
         self.cp_size = cp_size
+        self.cp_config = cp_config
         self.pp_size = pp_size
         self.moe_tp_size = moe_tp_size
         self.moe_ep_size = moe_ep_size

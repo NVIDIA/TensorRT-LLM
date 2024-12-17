@@ -171,6 +171,7 @@ void testTransposeBatch4dPaged(bool multiQueryMode, bool int8KVCache, bool fp8KV
     constexpr int32_t maxAttentionWindow = maxSeqLen;
     constexpr int32_t sinkTokenLen{0};
     constexpr int32_t onlyKorV{false};
+    constexpr bool canUseOneMoreBlock{true};
 
     TLLM_CHECK_WITH_INFO(batchSize <= maxSeq, "Batch size is larger than max number of allowed sequence");
     TLLM_CHECK_WITH_INFO(headsNum * seqLen <= maxBlocksPerSeq * tokensPerBlock,
@@ -213,7 +214,7 @@ void testTransposeBatch4dPaged(bool multiQueryMode, bool int8KVCache, bool fp8KV
     cudaMemcpy(offsetsArray, offsets.data(), offsetsArraySize, cudaMemcpyHostToDevice);
 
     auto blockArray = KVBlockArray(maxSeq, maxBlocksPerSeq, tokensPerBlock, bytesPerToken, maxAttentionWindow,
-        sinkTokenLen, kvMemoryPool, nullptr, offsetsArray);
+        maxAttentionWindow, sinkTokenLen, canUseOneMoreBlock, kvMemoryPool, nullptr, offsetsArray);
 
     float kvScaleOrigQuant = 1.0f;
     float* kvScaleOrigQuantPtr = nullptr;

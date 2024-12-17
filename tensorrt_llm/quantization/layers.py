@@ -2358,7 +2358,7 @@ class SmoothQuantAttention(Module):
                 spec_decoding_position_offsets,
                 spec_decoding_packed_mask=spec_decoding_params.
                 spec_decoding_packed_mask,
-                mrope_rotary_sin_cos=mrope_params.mrope_rotary_sin_cos,
+                mrope_rotary_cos_sin=mrope_params.mrope_rotary_cos_sin,
                 mrope_position_deltas=mrope_params.mrope_position_deltas,
                 host_runtime_perf_knobs=attention_params.
                 host_runtime_perf_knobs,

@@ -110,14 +110,18 @@ class GenerationRequest:
         prompt_token_ids: Union[torch.Tensor, np.ndarray,
                                 Union[List[int], List[List[int]]]],
         sampling_params: SamplingParams,
+        query_token_ids: Optional[Union[torch.Tensor, np.ndarray, list]] = None,
         lora_request: Optional[LoRARequest] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         streaming: bool = False,
     ):
         if isinstance(prompt_token_ids, list):
             self.prompt_token_ids = prompt_token_ids
+            self.query_token_ids = query_token_ids
         elif isinstance(prompt_token_ids, (torch.Tensor, np.ndarray)):
             self.prompt_token_ids = prompt_token_ids.tolist()
+            if query_token_ids:
+                self.query_token_ids = query_token_ids.tolist()
         else:
             raise TypeError(
                 f"prompt_token_ids ({prompt_token_ids}) should be an instance of torch.Tensor, np.ndarray or list"
@@ -477,6 +481,7 @@ class GenerationExecutor(ABC):
         self,
         prompt_token_ids: List[int],
         sampling_params: SamplingParams,
+        query_token_ids: Optional[Union[torch.Tensor, np.ndarray, list]] = None,
         lora_request: Optional[LoRARequest] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         streaming: bool = False,
@@ -489,6 +494,7 @@ class GenerationExecutor(ABC):
         result = self.submit(
             GenerationRequest(prompt_token_ids,
                               sampling_params=sampling_params,
+                              query_token_ids=query_token_ids,
                               lora_request=lora_request,
                               prompt_adapter_request=prompt_adapter_request,
                               streaming=streaming))
@@ -498,6 +504,7 @@ class GenerationExecutor(ABC):
         self,
         prompt_token_ids: Union[List[int], List[List[int]]],
         sampling_params: Union[SamplingParams, List[SamplingParams]],
+        query_token_ids: Optional[Union[torch.Tensor, np.ndarray, list]] = None,
         lora_request: Optional[Union[LoRARequest, List[LoRARequest]]] = None,
         prompt_adapter_request: Optional[Union[
             PromptAdapterRequest, List[PromptAdapterRequest]]] = None,
@@ -509,6 +516,8 @@ class GenerationExecutor(ABC):
 
         if unbatched:
             prompt_token_ids = [prompt_token_ids]
+            if query_token_ids:
+                query_token_ids = [query_token_ids]
 
         futures = []
         for i, p in enumerate(prompt_token_ids):
@@ -526,6 +535,7 @@ class GenerationExecutor(ABC):
                 pa_req = prompt_adapter_request
             future = self.generate_async(p,
                                          sampling_params=sp,
+                                         query_token_ids=query_token_ids,
                                          lora_request=lora_req,
                                          prompt_adapter_request=pa_req,
                                          streaming=False)
@@ -1015,7 +1025,13 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 logits_post_processor_name=request.sampling_params.
                 logits_post_processor_name,
             )
-            req_id = self.engine.enqueue_request(executor_request)
+            if request.query_token_ids is not None:
+                # pytorch star attention workflow
+                # a workaround to avoid public interface update
+                req_id = self.engine.enqueue_request(executor_request,
+                                                     request.query_token_ids)
+            else:
+                req_id = self.engine.enqueue_request(executor_request)
             return req_id
         except Exception as e:
             raise RequestError(str(e))

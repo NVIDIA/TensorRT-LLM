@@ -159,6 +159,7 @@ set(LOOKAHEAD_DECODING_TEST_SRC layers/randomLlm.cpp
                                 layers/lookaheadDecodingLayerTest.cpp)
 add_gtest(lookaheadDecodingLayerTest "${LOOKAHEAD_DECODING_TEST_SRC}")
 add_gtest(eagleLayerTest layers/eagleLayerTest.cpp)
+add_gtest(testUtilsTest utils/utilsTest.cpp)
 
 add_gtest(
   gemmSwigluRunnerTest

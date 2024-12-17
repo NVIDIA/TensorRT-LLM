@@ -200,7 +200,7 @@ public:
                 params.fusion_params.hidden_size = input.size(-1);
                 params.fusion_params.eps = mEps;
                 params.fusion_params.intermediate_buffer = output.mutable_data_ptr();
-                tensorrt_llm::kernels::residualRmsNorm(params, mType, stream);
+                tensorrt_llm::kernels::residualRmsNorm(params, mType, stream, mOp);
             }
             else
             {

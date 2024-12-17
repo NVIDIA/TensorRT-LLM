@@ -43,33 +43,34 @@ def cli():
     "--cpp-executable",
     type=str,
     default=None,
-    help="Path to the cpp executable, set it if you want to run the cpp benchmark"
-)
+    help=
+    "Path to the cpp executable, set it if you want to run the cpp benchmark")
 @click.option("--return-context-logits", type=bool, default=False)
 @click.option("--return-generation-logits", type=bool, default=False)
 @click.option("--kv-cache-free-gpu-mem-fraction", type=float, default=None)
 @click.option("--log-level", type=str, default="warning", show_default=True)
 @click.option("--chunked-context/--no-chunked-context", type=bool, default=True)
 def benchmark_main(
-        model_path: str,
-        samples_path: str,
-        report_path_prefix: str,
-        num_samples: Optional[int] = None,
-        tp_size: int = 1,
-        streaming: bool = False,
-        warmup: int = 2,
-        concurrency: Optional[int] = None,
-        max_num_tokens: int = 2048,
-        max_input_length: int = 200,
-        max_seq_length: int = 400,
-        max_batch_size: int = 128,
-        engine_output_dir: str = "",
-        cpp_executable: Optional[str] = None,
-        return_context_logits=False,
-        return_generation_logits=False,
-        kv_cache_free_gpu_mem_fraction: Optional[float] = None,
-        log_level: str = "warning",
-        chunked_context: bool = True):
+    model_path: str,
+    samples_path: str,
+    report_path_prefix: str,
+    num_samples: Optional[int] = None,
+    tp_size: int = 1,
+    streaming: bool = False,
+    warmup: int = 2,
+    concurrency: Optional[int] = None,
+    max_num_tokens: int = 2048,
+    max_input_length: int = 200,
+    max_seq_length: int = 400,
+    max_batch_size: int = 128,
+    engine_output_dir: str = "",
+    cpp_executable: Optional[str] = None,
+    return_context_logits=False,
+    return_generation_logits=False,
+    kv_cache_free_gpu_mem_fraction: Optional[float] = None,
+    log_level: str = "warning",
+    chunked_context: bool = True,
+):
     ''' Run the benchmark on LLM API.
     If `cpp_executable_path` is provided, it will run the cpp benchmark as well.
     '''

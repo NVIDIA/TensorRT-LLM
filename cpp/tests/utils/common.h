@@ -20,6 +20,7 @@
 
 #include <cmath>
 #include <filesystem>
+#include <random>
 #include <utility>
 #include <vector>
 
@@ -141,5 +142,52 @@ std::tuple<SizeType32, SizeType32> getRequestGivenInputIdxLength(
 
 std::tuple<std::vector<SizeType32>, SizeType32, SizeType32> getGivenInputLengths(
     ITensor const& givenInput, SizeType32 padId);
+
+/// @brief Generates a vector of floating point values summing to 1, that can be used as logits.
+///
+/// @tparam TEngine The type of the random engine.
+/// @tparam TLogits The type of floating point values.
+/// @param vocabSize The vocabulary size, i.e. the size of the vector.
+/// @param engine A random engine.
+/// @return std::vector<TLogits> A vector of floating point values, summing to 1.
+template <typename TEngine, typename TLogits>
+std::vector<TLogits> randomLogits(runtime::SizeType32 vocabSize, TEngine* engine)
+{
+    if constexpr (std::disjunction_v<std::is_floating_point<TLogits>, std::is_same<TLogits, half>>)
+    {
+        // This algorithm ensures the resulting values sum to 1 by:
+        // 1. Sampling in the interval 0..1
+        // 2. Sorting the sampled values and adding a last value equal to 1
+        // 3. Calculating the adjacent differences of the sorted values
+        // Since the values are sorted and the last value is 1, we get that all the differences are positive and must
+        // sum to 1. It can be proven recursively by seeing that the first value sums to itself, and the n-1 first
+        // values must sum to the value at n, minus the difference between the n-th and n-1-th values.
+        // It is also helpful to convince yourself of it with a quick drawing.
+        auto distribution = std::uniform_real_distribution<float>(0, 1);
+        std::vector<float> samples(vocabSize);
+        samples.back() = 1.0;
+        std::transform(samples.begin(), samples.end() - 1, samples.begin(),
+            [&](auto const /*i*/) { return distribution(*engine); });
+        std::sort(samples.begin(), samples.end() - 1);
+        std::vector<float> result(vocabSize);
+        std::adjacent_difference(samples.begin(), samples.end(), result.begin());
+        if constexpr (std::is_same_v<TLogits, float>)
+        {
+            return result;
+        }
+
+        if constexpr (std::is_same_v<TLogits, half>)
+        {
+            std::vector<half> halfResults(vocabSize);
+            std::transform(
+                result.begin(), result.end(), halfResults.begin(), [&](auto const f) { return __float2half(f); });
+            return halfResults;
+        }
+    }
+    TLLM_THROW("Unsupported logits type.");
+}
+
+std::vector<tensorrt_llm::executor::TokenIdType> createConsecutiveTokenSequence(
+    tensorrt_llm::runtime::SizeType32 length, tensorrt_llm::runtime::TokenIdType vocabLength);
 
 } // namespace tensorrt_llm::testing

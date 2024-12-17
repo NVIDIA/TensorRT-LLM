@@ -58,6 +58,7 @@ void ExplicitDraftTokensBuffers::Inputs::create(SizeType32 maxNumSequences, Tllm
         = manager.gpu(ITensor::makeShape({maxNumSequences, maxDecodingTokens, common::ceilDiv(maxDecodingTokens, 32)}),
             nvinfer1::DataType::kINT32);
     positionIds = manager.gpu(ITensor::makeShape({maxNumSequences * maxDecodingTokens}), nvinfer1::DataType::kINT32);
+    useSpecDecoding = manager.cpu(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
 }
 
 ExplicitDraftTokensBuffers::ExplicitDraftTokensBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
@@ -100,6 +101,8 @@ ExplicitDraftTokensBuffers::ExplicitDraftTokensBuffers(SizeType32 maxBatchSize, 
     engineInputs.randomDataSample = manager.emptyTensor(runtime::MemoryType::kGPU, dtype);
     engineInputs.randomDataValidation = manager.emptyTensor(runtime::MemoryType::kGPU, dtype);
     engineInputs.positionIdsBase = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kINT32);
+    engineInputs.useSpecDecoding = manager.cpu(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
+    bufferCast<SizeType32>(*engineInputs.useSpecDecoding)[0] = 1;
 
     // output tensors
     engineOutputs.nextDraftTokens
@@ -358,6 +361,7 @@ void ExplicitDraftTokensBuffers::insertInputTensors(
     inputBuffers.insert_or_assign("rand_data_validation", engineInputs.randomDataValidation);
     inputBuffers.insert_or_assign("position_ids_base", engineInputs.positionIdsBase);
     inputBuffers.insert_or_assign("position_ids", engineInputs.positionIds);
+    inputBuffers.insert_or_assign("spec_decoding_use", engineInputs.useSpecDecoding);
 
     // outputs
     outputBuffers.insert_or_assign("next_spec_decoding_generation_lengths", engineOutputs.nextGenerationLengths);

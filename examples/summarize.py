@@ -414,8 +414,8 @@ def main(args):
         ppls = [[] for _ in range(batch_size)]
         if eval_ppl and batch_size == 1:
             # Only for batch size of 1
-            seq_lens = (output_ids != end_id).logical_and(
-                output_ids != pad_id).sum(dim=-1)
+            seq_lens = (output_ids
+                        != end_id).logical_and(output_ids != pad_id).sum(dim=-1)
             context_logits = context_outputs['logits']
             # Remove the first generation logits which are same to last context logits
             generation_logits = outputs['scores'][1:]

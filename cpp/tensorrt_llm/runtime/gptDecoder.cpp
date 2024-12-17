@@ -43,6 +43,8 @@ GptDecoder<T>::GptDecoder(executor::DecodingMode const& mode, size_t maxBatchSiz
     std::shared_ptr<SpeculativeDecodingModule const> speculativeDecodingModule)
     : mManager{std::make_shared<BufferManager>(stream)}
     , mMaxBatchSize(maxBatchSize)
+    , mVocabSize(vocabSize)
+    , mVocabSizePadded(vocabSizePadded)
     , mDecodingMode{mode}
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -52,6 +54,66 @@ GptDecoder<T>::GptDecoder(executor::DecodingMode const& mode, size_t maxBatchSiz
 
     mDecodingLayerWorkspace = std::make_unique<tensorrt_llm::runtime::DecodingLayerWorkspace>(
         mManager, decodingDomain, TRTDataType<T>::value, mDynamicDecodeLayer->getWorkspaceSize());
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+template <typename T>
+void GptDecoder<T>::disableLookahead(
+    std::optional<SamplingConfig> const& samplingConfig, SizeType32 batchSize, TensorConstPtr batchSlots)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    mDecodingMode = executor::DecodingMode::TopKTopP();
+    auto const decodingDomain
+        = tensorrt_llm::layers::DecoderDomain(mMaxBatchSize, 1, mVocabSize, mVocabSizePadded, nullptr);
+
+    auto setupParams = std::make_shared<layers::DynamicDecodeSetupParams>();
+
+    if (batchSize == 0)
+    {
+        mDynamicDecodeLayer->disableLookahead(
+            decodingDomain, batchSize, batchSlots, setupParams, mDecodingLayerWorkspace);
+        return;
+    }
+
+    mSamplingConfig = samplingConfig.value();
+    TLLM_CHECK_WITH_INFO(mSamplingConfig.validate(), "Sampling config is invalid");
+    TLLM_CHECK_WITH_INFO(batchSlots != nullptr, "Batch slots are mandatory to set up the decoder.");
+    // penalty parameters
+    auto penaltyParams = std::make_shared<tl::PenaltySetupParams>();
+    penaltyParams->repetitionPenalty = mSamplingConfig.repetitionPenalty;
+    penaltyParams->presencePenalty = mSamplingConfig.presencePenalty;
+    penaltyParams->frequencyPenalty = mSamplingConfig.frequencyPenalty;
+    penaltyParams->temperature = mSamplingConfig.temperature;
+    penaltyParams->minLength = mSamplingConfig.minLength;
+
+    // banwords parameters
+    auto banWordsParams = std::make_shared<tl::BanWordsSetupParams>();
+    banWordsParams->noRepeatNgramSize = mSamplingConfig.noRepeatNgramSize;
+
+    // sampling parameters
+    auto samplingParams = std::make_shared<tl::SamplingSetupParams>();
+    samplingParams->normalizeLogProbs = mSamplingConfig.normalizeLogProbs;
+    if (mSamplingConfig.topK)
+    {
+        auto const& topK = mSamplingConfig.topK.value();
+        samplingParams->runtimeTopK = std::vector<SizeType32>(std::begin(topK), std::end(topK));
+    }
+    samplingParams->runtimeTopP = mSamplingConfig.topP;
+    samplingParams->topPDecay = mSamplingConfig.topPDecay;
+    samplingParams->topPMin = mSamplingConfig.topPMin;
+    samplingParams->topPResetIds = mSamplingConfig.topPResetIds;
+    samplingParams->outputLogProbs = mSamplingConfig.outputLogProbs;
+    samplingParams->cumLogProbs = mSamplingConfig.cumLogProbs;
+
+    // get setup parameters
+    setupParams->penaltyParams = std::move(penaltyParams);
+    setupParams->banWordsParams = std::move(banWordsParams);
+    setupParams->decodingParams = std::move(samplingParams);
+
+    mDecodingLayerWorkspace->setDeviceBatchSlots(batchSlots);
+    mDynamicDecodeLayer->disableLookahead(decodingDomain, batchSize, batchSlots, setupParams, mDecodingLayerWorkspace);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -461,7 +523,7 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
         prepareExplicitDraftTokensInput(input, forwardParams);
     }
 
-    if (input.lookaheadInputs)
+    if (decodingMode.isLookahead() && input.lookaheadInputs)
     {
         prepareLookaheadInputs(input, maxBatchSize, forwardParams);
         forwardParams->localBatchSize = input.batchSize;

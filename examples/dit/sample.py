@@ -189,9 +189,10 @@ def vae_decode(samples, engine_path):
     output_info = session_vae.infer_shapes(
         [TensorInfo('input', trt.DataType.FLOAT, samples.shape)])
     outputs = {
-        t.name: torch.empty(tuple(t.shape),
-                            dtype=trt_dtype_to_torch(t.dtype),
-                            device='cuda')
+        t.name:
+        torch.empty(tuple(t.shape),
+                    dtype=trt_dtype_to_torch(t.dtype),
+                    device='cuda')
         for t in output_info
     }
     stream = torch.cuda.current_stream().cuda_stream

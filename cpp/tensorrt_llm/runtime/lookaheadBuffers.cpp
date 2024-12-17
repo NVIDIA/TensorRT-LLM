@@ -63,6 +63,9 @@ LookaheadRuntimeBuffers::LookaheadRuntimeBuffers(SizeType32 maxBatchSize, SizeTy
 
     batchSlotsHostCopy = manager.cpu(generationLengthsDevice->getShape(), nvinfer1::DataType::kINT32);
 
+    useSpecDecoding = manager.cpu(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
+    bufferCast<SizeType32>(*useSpecDecoding)[0] = 1;
+
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -176,6 +179,27 @@ void LookaheadRuntimeBuffers::reshape(SizeType32 numCtxSequences, SizeType32 num
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
+void LookaheadRuntimeBuffers::enableLookaheadDecoding(SizeType32 maxBatchSize, SizeType32 tokensPerStep)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    auto const numPackedMasks = static_cast<ITensor::DimType64>(tensorrt_llm::common::divUp(tokensPerStep, 32));
+    packedMasksDevice->reshape(ITensor::makeShape({maxBatchSize * tokensPerStep, numPackedMasks}));
+    generationLengthsDevice->reshape(ITensor::makeShape({maxBatchSize}));
+    positionOffsetsDevice->reshape(ITensor::makeShape({maxBatchSize, tokensPerStep}));
+    bufferCast<SizeType32>(*useSpecDecoding)[0] = 1;
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void LookaheadRuntimeBuffers::disableLookaheadDecoding()
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    packedMasksDevice->reshape(ITensor::makeShape({1, 1}));
+    generationLengthsDevice->reshape(ITensor::makeShape({1}));
+    positionOffsetsDevice->reshape(ITensor::makeShape({1, 1}));
+    bufferCast<SizeType32>(*useSpecDecoding)[0] = 0;
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
 void LookaheadRuntimeBuffers::insertInputTensors(
     TensorMap& inputBuffers, TensorMap& /* outputBuffers */, runtime::WorldConfig const& /* worldConfig */) const
 {
@@ -183,6 +207,7 @@ void LookaheadRuntimeBuffers::insertInputTensors(
     inputBuffers.insert_or_assign("spec_decoding_packed_mask", packedMasksDevice);
     inputBuffers.insert_or_assign("spec_decoding_generation_lengths", generationLengthsDevice);
     inputBuffers.insert_or_assign("spec_decoding_position_offsets", positionOffsetsDevice);
+    inputBuffers.insert_or_assign("spec_decoding_use", useSpecDecoding);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
