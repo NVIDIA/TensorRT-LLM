@@ -183,9 +183,10 @@ class SafetensorsWeightsLoader(WeightsLoader):
         self.shard_files = sorted(list(shard_files))
 
         self.safetensors_files = {
-            shard_file: safetensors.safe_open(model_dir / shard_file,
-                                              framework="pt",
-                                              device="cpu")
+            shard_file:
+            safetensors.safe_open(model_dir / shard_file,
+                                  framework="pt",
+                                  device="cpu")
             for shard_file in shard_files
         }
 

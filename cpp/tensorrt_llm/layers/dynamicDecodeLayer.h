@@ -47,6 +47,10 @@ public:
     //! @returns workspace needed for this layer in bytes
     [[nodiscard]] size_t getWorkspaceSize() const noexcept override;
 
+    void disableLookahead(DecoderDomain const& decoderDomain, SizeType32 batchSize, TensorConstPtr batchSlots,
+        std::shared_ptr<BaseSetupParams> const& baseSetupParams,
+        std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace);
+
 private:
     void allocateBuffer();
 

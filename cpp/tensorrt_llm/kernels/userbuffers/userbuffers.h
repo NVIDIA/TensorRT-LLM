@@ -17,6 +17,7 @@
 #include "cuda_runtime.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/dataType.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/mpiUtils.h"
 #include <cuda.h>
 #if defined(__aarch64__) || defined(_M_ARM64)

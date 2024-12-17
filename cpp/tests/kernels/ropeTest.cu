@@ -569,6 +569,7 @@ protected:
         auto const totalSize = this->batch_size * 2
             * (this->mCrossAttention ? this->cross_qkv_length : this->max_attention_window) * this->mNumKVHeads
             * this->mHeadSize * elemSize;
+        bool constexpr canUseOneMoreBlock{true};
         keyValueCacheBuffer = BufferManager::pinned(totalSize);
         void* key_value_cache = static_cast<void*>(keyValueCacheBuffer->data());
 
@@ -580,8 +581,9 @@ protected:
         {
             TLLM_THROW("Paged KV Cache currently not supported in ropeTest");
             keyValueCache = KVBlockArray(this->batch_size, this->max_blocks_per_sequence, this->mTokensPerBlock,
-                sizePerToken, this->cyclic_attention_window_size, this->sink_token_length,
-                this->host_primary_pool_pointer, this->host_secondary_pool_pointer, this->block_offsets);
+                sizePerToken, this->cyclic_attention_window_size, this->cyclic_attention_window_size,
+                this->sink_token_length, canUseOneMoreBlock, this->host_primary_pool_pointer,
+                this->host_secondary_pool_pointer, this->block_offsets);
             // hostKvCacheBlockOffsets = host_block_offsets;
         }
         else if constexpr (std::is_same_v<KVCacheBuffer, KVLinearBuffer>)

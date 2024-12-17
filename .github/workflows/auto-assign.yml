@@ -13,7 +13,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v2
 
-      - name: Get Assignee
+      - name: Get assignee
         uses: actions/github-script@v6
         id: get-assignee
         with:

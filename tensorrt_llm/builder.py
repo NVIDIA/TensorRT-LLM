@@ -1027,7 +1027,7 @@ def deserialize_managed_weights(path: str | Path) -> dict[str, np.ndarray]:
 
 def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
     '''Build engine from given model and optimization options specified in the build_config
-       WARNING: this function may change the given \p model object state in some optimization passes
+       WARNING: this function may change the given model object state in some optimization passes
        to avoid cloning a model since normally the LLM models consumes large memory.
        Create a new fresh model object if you need to build with different options.
     '''
@@ -1040,8 +1040,10 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
     _init_max_seq_len(model.config, build_config)
 
     if build_config.plugin_config.reduce_fusion and (
-            model.config.mapping.tp_size == 1 or
+            model.config.mapping.tp_size == 1
+            or model.config.mapping.pp_size != 1 or
         (model.config.architecture != "LlamaForCausalLM"
+         and model.config.architecture != "Gemma2ForCausalLM"
          and model.config.architecture != "MedusaForCausalLM")):
         logger.warning('Overriding reduce_fusion to False')
         build_config.plugin_config.reduce_fusion = False
@@ -1203,7 +1205,8 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
             build_config.lora_config.lora_target_modules
         }
 
-        if model.config.architecture == "DecoderModel" or model.config.architecture == "MllamaForConditionalGeneration":
+        if model.config.architecture == "DecoderModel" or "mllama" in model.config.architecture.lower(
+        ):
             prepare_input_args["max_seq_len"] = build_config.max_seq_len
             prepare_input_args[
                 "max_decoder_input_len"] = build_config.max_input_len
@@ -1227,7 +1230,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
                 "spec_decoding_is_generation_length_variable"] = True
         if model.config.architecture == "Qwen2VLForConditionalGeneration":
             prepare_input_args[
-                'mrope_rotary_sin_cos_size'] = model.config.max_position_embeddings * model.config.rotary_embedding_dim
+                'mrope_rotary_cos_sin_size'] = model.config.max_position_embeddings * model.config.rotary_embedding_dim
         if build_config.speculative_decoding_mode == SpeculativeDecodingMode.EAGLE and not build_config.plugin_config.use_paged_context_fmha:
             logger.warning(
                 "Paged Context FMHA is required for EAGLE. Turning it on")

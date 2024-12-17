@@ -13,5 +13,6 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
-add_library(testingUtils common.cpp)
-target_link_libraries(testingUtils PUBLIC gtest_main)
+add_library(testingUtils common.cpp engines.cpp executorUtils.cpp)
+target_link_libraries(testingUtils PUBLIC gtest_main ${SHARED_TARGET})
+target_include_directories(testingUtils PRIVATE ${MPI_C_INCLUDE_DIRS})

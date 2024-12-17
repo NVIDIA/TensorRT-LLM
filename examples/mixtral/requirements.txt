@@ -1,3 +1,3 @@
-tensorrt_llm==0.16.0.dev2024121000
+tensorrt_llm==0.17.0.dev2024121700
 transformers==4.38.2
 accelerate==0.25.0

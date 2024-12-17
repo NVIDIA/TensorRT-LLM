@@ -51,4 +51,10 @@ bool getEnvDisaggLayerwise();
 
 bool getEnvParallelCacheSend();
 
+bool getEnvRequestKVCacheSerial();
+
+bool getEnvDisableKVCacheTransferOverlap();
+
+bool getEnvDisableReceiveKVCacheParallel();
+
 } // namespace tensorrt_llm::common

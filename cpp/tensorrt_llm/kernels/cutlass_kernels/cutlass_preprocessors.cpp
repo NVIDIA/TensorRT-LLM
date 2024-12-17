@@ -594,13 +594,16 @@ void preprocess_weights_for_mixed_gemm(int8_t* preprocessed_quantized_weight, in
         src_buf.swap(dst_buf);
     }
 
-    if (details.columns_interleaved > 1 && arch < 90)
+    if (details.columns_interleaved > 1)
     {
         interleave_column_major_tensor(dst_buf.data(), src_buf.data(), shape, quant_type, details);
         src_buf.swap(dst_buf);
     }
 
-    add_bias_and_interleave_quantized_tensor_inplace(src_buf.data(), num_elts, quant_type);
+    if (arch >= 70 && arch < 90)
+    {
+        add_bias_and_interleave_quantized_tensor_inplace(src_buf.data(), num_elts, quant_type);
+    }
     std::copy(src_buf.begin(), src_buf.end(), preprocessed_quantized_weight);
 }
 

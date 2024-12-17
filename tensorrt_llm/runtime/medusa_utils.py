@@ -169,6 +169,7 @@ def _medusa_setup(choices_or_paths, num_medusa_heads=None):
     medusa_position_offsets = torch.tensor([-1] + medusa_position_offsets) + 1
     medusa_mask = get_medusa_mask(medusa_tree_ids, medusa_paths)
     medusa_packed_mask = get_packed_mask(num_medusa_tokens, medusa_mask[1:, 1:])
+    medusa_spec_decoding_use = torch.tensor([1], device="cpu")
 
     return Namespace(
         medusa_mask=medusa_mask.cuda(),
@@ -177,4 +178,5 @@ def _medusa_setup(choices_or_paths, num_medusa_heads=None):
         medusa_paths=medusa_paths.cuda(),
         medusa_tree_ids=medusa_tree_ids.cuda(),
         medusa_position_offsets=medusa_position_offsets.cuda(),
+        medusa_spec_decoding_use=medusa_spec_decoding_use,
     )

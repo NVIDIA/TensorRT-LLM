@@ -15,13 +15,9 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/batch_manager/GptManager.h"
-#include "tensorrt_llm/batch_manager/inferenceRequest.h"
-#include "tensorrt_llm/batch_manager/namedTensor.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/mpiUtils.h"
-#include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/tensor.h"
 #include "tensorrt_llm/executor/types.h"
@@ -41,7 +37,6 @@
 #include <nlohmann/json.hpp>
 #include <numeric>
 #include <optional>
-#include <random>
 #include <string>
 #include <thread>
 #include <utility>
@@ -49,10 +44,9 @@
 using namespace tensorrt_llm::batch_manager;
 using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::benchmark;
-namespace tc = tensorrt_llm::common;
 namespace texec = tensorrt_llm::executor;
-namespace mpi = tensorrt_llm::mpi;
 namespace trt = nvinfer1;
+namespace fs = std::filesystem;
 
 namespace
 {
@@ -1001,7 +995,6 @@ void benchmarkExecutor(std::optional<std::filesystem::path> const& decoderEngine
         recorder->dumpResponseSeqs();
         // Send terminateReqId to terminate servers on all ranks
         // Sever on rank 0 will broadcast the terminate signal to other servers on multi-GPU cases
-        // gptServer->enqueue(std::make_shared<InferenceRequest>(terminateReqId));
     }
 }
 

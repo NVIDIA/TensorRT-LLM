@@ -103,12 +103,14 @@ def convert_and_save_hf(args):
     hf_config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
     assert hf_config is not None, "Failed to load huggingface config, please check!"
 
-    def convert_and_save_rank(
-        args, rank,
-        tllm_class: Union[BertModel, RobertaModel, BertForQuestionAnswering,
-                          RobertaForQuestionAnswering,
-                          BertForSequenceClassification,
-                          RobertaForSequenceClassification, ]):
+    def convert_and_save_rank(args, rank, tllm_class: Union[
+        BertModel,
+        RobertaModel,
+        BertForQuestionAnswering,
+        RobertaForQuestionAnswering,
+        BertForSequenceClassification,
+        RobertaForSequenceClassification,
+    ]):
         mapping = Mapping(
             world_size=world_size,
             rank=rank,

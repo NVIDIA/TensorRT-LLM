@@ -123,7 +123,8 @@ struct KVBlockArray : public KVBlockArrayForContextFMHA
     }
 
     KVBlockArray(int32_t batchSize, int32_t maxBlocksPerSeq, int32_t tokensPerBlock, int32_t bytesPerToken,
-        int32_t maxAttentionWindow, int32_t sinkTokenLen, void* primaryPoolPtr, void* secondaryPoolPtr, DataType* data)
+        int32_t maxAttentionWindow, int32_t maxAttentionWindowAllLayer, int32_t sinkTokenLen, bool canUseOneMoreBlock,
+        void* primaryPoolPtr, void* secondaryPoolPtr, DataType* data)
         : KVBlockArrayForContextFMHA(batchSize, maxBlocksPerSeq, tokensPerBlock, bytesPerToken, primaryPoolPtr, data)
         , mSecondaryPoolPtr{secondaryPoolPtr}
         , mMaxAttentionWindow(maxAttentionWindow)
@@ -131,7 +132,8 @@ struct KVBlockArray : public KVBlockArrayForContextFMHA
     {
         auto sinkTokensInLastBlock = mSinkTokens % mTokensPerBlock;
         mBubbleLen = sinkTokensInLastBlock == 0 ? 0 : mTokensPerBlock - sinkTokensInLastBlock;
-        mEnableOneMoreBlock = (maxBlocksPerSeq - 1) * tokensPerBlock >= mMaxAttentionWindow + mBubbleLen;
+        mEnableOneMoreBlock = (maxBlocksPerSeq - 1) * tokensPerBlock >= maxAttentionWindowAllLayer + mBubbleLen;
+        mEnableOneMoreBlock &= canUseOneMoreBlock;
         mCyclicCacheLen = (mEnableOneMoreBlock) ? mMaxAttentionWindow + mTokensPerBlock - mSinkTokens
                                                 : mMaxAttentionWindow - mSinkTokens;
     }

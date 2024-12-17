@@ -498,9 +498,10 @@ def vit_process(image_path, vit_engine_path, stream):
     visual_output_info = session_vit.infer_shapes(
         [TensorInfo("input", trt.DataType.FLOAT, images.shape)])
     visual_outputs = {
-        t.name: torch.empty(tuple(t.shape),
-                            dtype=trt_dtype_to_torch(t.dtype),
-                            device="cuda")
+        t.name:
+        torch.empty(tuple(t.shape),
+                    dtype=trt_dtype_to_torch(t.dtype),
+                    device="cuda")
         for t in visual_output_info
     }
     profiler.start("ViT")

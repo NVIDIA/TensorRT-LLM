@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "tensorrt_llm/runtime/gptDecoderBatched.h"
+#include "tensorrt_llm/batch_manager/llmRequest.h"
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/executor/types.h"
@@ -244,6 +245,48 @@ void GptDecoderBatched::setupEagle(EagleBuffers::Inputs eagleBuffers)
 
     TLLM_CHECK(mSpeculativeDecodingMode.isEagle());
     mJointDecodingOutput->eagleBuffers = std::move(eagleBuffers);
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void GptDecoderBatched::disableLookahead(SizeType32 maxBatchSize, RequestVector const& genRequests)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    mSpeculativeDecodingMode = SpeculativeDecodingMode::None();
+    mMaxDecodingEngineTokens = 1;
+    mMaxDecodingDecoderTokens = 1;
+    mDecodingMode = executor::DecodingMode::TopKTopP();
+    mJointDecodingInput->lookaheadInputs.reset();
+    mJointDecodingOutput->newTokensSteps->reshape(ITensor::makeShape({1, maxBatchSize, 1}));
+    mFinishedSteps->reshape(ITensor::makeShape({1, maxBatchSize, 1}));
+    mBatchSlotsDecoder->reshape(ITensor::makeShape({1, maxBatchSize}));
+    mNumDecodingEngineTokens.clear();
+    mNumDecodingEngineTokens.resize(maxBatchSize, 0);
+
+    std::vector<SamplingConfig> samplingConfigs;
+    auto batchSlotsPtr = bufferCast<SizeType32>(*mBatchSlotsSetup);
+    SizeType32 bi = 0;
+    for (auto const& llmReq : genRequests)
+    {
+        mNumDecodingEngineTokens[llmReq->mSeqSlot.value()] = 1;
+        mMaxNewTokens[llmReq->mSeqSlot.value()] = mMaxSequenceLength - llmReq->getPromptLen();
+        samplingConfigs.push_back(llmReq->mSamplingConfig);
+        batchSlotsPtr[bi] = llmReq->mSeqSlot.value();
+        bi += 1;
+    }
+    std::optional<SamplingConfig> samplingConfig;
+    if (bi > 0)
+    {
+        samplingConfig = SamplingConfig(samplingConfigs);
+    }
+    TensorPtr batchSlotsView = ITensor::slice(mBatchSlotsSetup, 0, bi);
+    mDecoder->disableLookahead(samplingConfig, bi, batchSlotsView);
+
+    auto const& stream = mDecoderStream;
+    CudaEvent event{};
+    stream->record(event);
+    mRuntimeStream->wait(event);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

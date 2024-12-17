@@ -61,6 +61,10 @@ public:
     void insertInputTensors(
         TensorMap& inputBuffers, TensorMap& outputBuffers, runtime::WorldConfig const& worldConfig) const;
 
+    void enableLookaheadDecoding(SizeType32 maxBatchSize, SizeType32 tokensPerStep);
+
+    void disableLookaheadDecoding();
+
 public:
     TensorPtr cumSumLength;            // [1] the cumulative sum of generation length, on pinned
     TensorPtr packedMasksDevice;       // [forwardBatchSize, tokensPerStep, numPackedMasks], on gpu
@@ -77,6 +81,7 @@ public:
     TensorPtr generationLengthsHostCopy;
     TensorPtr positionOffsetsHostCopy;
     TensorPtr positionIdsHostCopy;
+    TensorPtr useSpecDecoding;
 
     TensorPtr batchSlotsHostCopy;
 };

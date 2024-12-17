@@ -15,6 +15,7 @@
  */
 
 #pragma once
+#pragma nv_diag_suppress 177, 550
 
 #include <numeric>
 

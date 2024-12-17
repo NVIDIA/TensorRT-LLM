@@ -130,7 +130,7 @@ This example is only relevant for Draft-Target-Model model method. For all other
     + If both draft and target model can be placed in one GPU (for example, llama-7B-FP8 + llama-30B-FP8, totally 40GiB in one H100-80GiB GPU), `DRAFT_GPU_DEVICE_IDS` and `TARGET_GPU_DEVICE_IDS` can be the same, `0` as example. It appears better performance than placing on two separate GPUs.
     + Elsewise, the draft and target models can be placed in different GPUs, `DRAFT_GPU_DEVICE_IDS="0"` and `TARGET_GPU_DEVICE_IDS="1"` as example.
     + Furthermore, if TP mode is used, the value of `GPU_DEVICE_IDS` can be a list, `DRAFT_GPU_DEVICE_IDS="0"` and `TARGET_GPU_DEVICE_IDS="1,2,3,4"` as example.
-    + For more configuration of launching models with Tritonserver, please visit [TensorRT-LLM Backed repo](https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/README.md).
+    + For more configuration of launching models with Tritonserver, please visit [TensorRT-LLM Backend repo](https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/README.md).
 
     ```bash
     ACCUMULATE_TOKEN="false"

@@ -1796,8 +1796,8 @@ def load_weights_from_gptq(quant_ckpt_path: str, config: LLaMAConfig):
             if not USE_UINT4_INPUT:
                 # Correcting UINT4 values back to INT4 order
                 mask_negative = qzeros_unpacked_int32[qzeros_unpacked_int32 < 0]
-                mask_positive = qzeros_unpacked_int32[
-                    qzeros_unpacked_int32 >= 0]
+                mask_positive = qzeros_unpacked_int32[qzeros_unpacked_int32 >=
+                                                      0]
                 qzeros_unpacked_int32 = qzeros_unpacked_int32 + 16 * mask_negative - 16 * mask_positive
             zeros_x_scales_fp16 = (-qzeros_unpacked_int32 + 8 * USE_UINT4_INPUT
                                    - USE_GPTQ_FOR_LLAMA) * scales_fp16

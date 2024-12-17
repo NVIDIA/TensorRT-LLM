@@ -75,6 +75,7 @@ class _ParallelConfig:
     cp_size: int = 1
     moe_tp_size: int = 1
     moe_ep_size: int = 1
+    cp_config: dict = field(default_factory=dict)
     auto_parallel: bool = False
 
     _world_size: int = field(default=1, init=False)
@@ -96,6 +97,7 @@ class _ParallelConfig:
 
     @property
     def world_size(self) -> bool:
+
         if self.auto_parallel:
             if self.tp_size > 1 or self.pp_size > 1 or self.cp_size > 1:
                 raise RuntimeError(
@@ -115,9 +117,7 @@ class _ParallelConfig:
         elif (not self.auto_parallel
               ) and world_size != self.tp_size * self.pp_size * self.cp_size:
             raise ValueError(
-                f"world_size {world_size} should be equal to tp_size * pp_size * cp_size {self.tp_size * self.pp_size * self.cp_size} "
-                "in non-auto_parallel mode.\n"
-                "For non-auto-parallel mode, the world_size is not needed to set"
+                f"world_size {world_size} should be equal to tp_size * pp_size {self.tp_size * self.pp_size * self.cp_size} "
             )
 
     @property
@@ -345,9 +345,9 @@ LLMARGS_DOCSTRING = r"""
         enable_processes_for_single_gpu (bool): Whether to enable processes for single GPU, Defaults to False.
             This helps to improve the streaming generation performance.
 
-        runtime_max_batch_size (int, optional): The maximum batch size for runtime. Defaults to None.
+        max_batch_size (int, optional): The maximum batch size for runtime. Defaults to None.
 
-        runtime_max_num_tokens (int, optional): The maximum number of tokens for runtime. Defaults to None.
+        max_num_tokens (int, optional): The maximum number of tokens for runtime. Defaults to None.
 
         extended_runtime_perf_knob_config (ExtendedRuntimePerfKnobConfig, optional): The extended runtime performance knob configuration for the model. Defaults to None.
 
@@ -391,6 +391,8 @@ class LlmArgs:
     moe_tensor_parallel_size: Optional[int] = None
 
     moe_expert_parallel_size: Optional[int] = None
+
+    cp_config: Optional[dict] = field(default_factory=dict)
 
     auto_parallel: bool = False
 
@@ -468,8 +470,8 @@ class LlmArgs:
     # TODO[chunweiy]: Enable this by default and remove the option in the future
     enable_processes_for_single_gpu: bool = False
 
-    runtime_max_batch_size: Optional[int] = None
-    runtime_max_num_tokens: Optional[int] = None
+    max_batch_size: Optional[int] = None
+    max_num_tokens: Optional[int] = None
 
 
     def __post_init__(self):
@@ -504,6 +506,7 @@ class LlmArgs:
             cp_size=self.context_parallel_size,
             moe_tp_size=self.moe_tensor_parallel_size,
             moe_ep_size=self.moe_expert_parallel_size,
+            cp_config=self.cp_config,
             auto_parallel=self.auto_parallel)
         if self.parallel_config.auto_parallel:
             self.parallel_config.world_size = self.auto_parallel_world_size
@@ -1555,7 +1558,8 @@ class CachedModelLoader:
             mapping=Mapping(world_size=self.llm_args.parallel_config.world_size,
                             tp_size=self.llm_args.parallel_config.tp_size,
                             pp_size=self.llm_args.parallel_config.pp_size,
-                            cp_size=self.llm_args.parallel_config.cp_size),
+                            cp_size=self.llm_args.parallel_config.cp_size,
+                            cp_config=self.llm_args.parallel_config.cp_config),
             quant_config=self.llm_args.quant_config,
             dtype=self.llm_args.dtype)
 

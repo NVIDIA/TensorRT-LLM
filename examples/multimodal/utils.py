@@ -1,5 +1,5 @@
 def add_common_args(parser):
-    parser.add_argument('--max_new_tokens', type=int, default=30)
+    parser.add_argument('--max_new_tokens', type=int, default=128)
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--log_level', type=str, default='info')
     parser.add_argument('--visual_engine_dir',
@@ -20,6 +20,7 @@ def add_common_args(parser):
                         help="Directory containing tokenizer")
     parser.add_argument('--input_text',
                         type=str,
+                        nargs='+',
                         default=None,
                         help='Text prompt to LLM')
     parser.add_argument('--num_beams',
@@ -55,6 +56,7 @@ def add_common_args(parser):
         default=None)
     parser.add_argument("--image_path",
                         type=str,
+                        nargs='+',
                         default=None,
                         help='List of input image paths, separated by symbol')
     parser.add_argument("--path_sep",

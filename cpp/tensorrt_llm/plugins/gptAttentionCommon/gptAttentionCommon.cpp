@@ -200,7 +200,7 @@ bool GPTAttentionPluginCommon::convertMMHAParamsToXQAParams(tensorrt_llm::kernel
     xqaParams.max_distance = mMaxDistance;
     xqaParams.multi_block_mode = mMultiBlockMode;
     // Medusa mode will have multiple query tokens.
-    xqaParams.multi_query_tokens = mIsSpecDecodingEnabled;
+    xqaParams.multi_query_tokens = mIsSpecDecodingEnabled && mUseSpecDecoding;
 
     if (mKVCacheQuantMode.hasInt8KvCache())
     {
@@ -247,7 +247,8 @@ bool GPTAttentionPluginCommon::convertMMHAParamsToXQAParams(tensorrt_llm::kernel
     if (!forConfigurePlugin)
     {
         // Speculative decoding (need to take new generated ids into consideration).
-        TLLM_CHECK_WITH_INFO(!mIsSpecDecodingEnabled || generationsParams.spec_decoding_packed_mask != nullptr,
+        TLLM_CHECK_WITH_INFO(
+            !(mIsSpecDecodingEnabled && mUseSpecDecoding) || generationsParams.spec_decoding_packed_mask != nullptr,
             "Speculative decoding mode needs a valid packed_mask input tensor.");
     }
     xqaParams.spec_decoding_packed_mask = generationsParams.spec_decoding_packed_mask;
@@ -256,8 +257,6 @@ bool GPTAttentionPluginCommon::convertMMHAParamsToXQAParams(tensorrt_llm::kernel
     xqaParams.spec_decoding_is_generation_length_variable
         = generationsParams.spec_decoding_is_generation_length_variable;
     xqaParams.spec_decoding_max_generation_length = generationsParams.spec_decoding_max_generation_length;
-
-    xqaParams.mrope_rotary_sin_cos = generationsParams.mrope_rotary_sin_cos;
     xqaParams.mrope_position_deltas = generationsParams.mrope_position_deltas;
 
     xqaParams.logn_scaling_ptr = generationsParams.logn_scaling_ptr;
@@ -612,6 +611,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(void const* data, size_t leng
     read(d, mHasFullAttentionMask);
     read(d, mUseKVCache);
     read(d, mIsSpecDecodingEnabled);
+    read(d, mUseSpecDecoding);
     read(d, mSpecDecodingIsGenerationLengthVariable);
     read(d, mSpecDecodingMaxGenerationLength);
     read(d, mIsMLAEnabled);
@@ -877,9 +877,10 @@ int GPTAttentionPluginCommon::mlaGeneration(
     if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
     {
         kv_cache_buffer = KVBlockArray(batch_beam, generation_params.max_blocks_per_sequence, mTokensPerBlock,
-            sizePerToken, generation_params.cyclic_attention_window_size, generation_params.sink_token_length,
-            generation_params.host_primary_pool_pointer, generation_params.host_secondary_pool_pointer,
-            generation_params.block_offsets);
+            sizePerToken, generation_params.cyclic_attention_window_size,
+            generation_params.max_cyclic_attention_window_size, generation_params.sink_token_length,
+            generation_params.can_use_one_more_block, generation_params.host_primary_pool_pointer,
+            generation_params.host_secondary_pool_pointer, generation_params.block_offsets);
     }
     else if constexpr (std::is_same_v<KVCacheBuffer, KVLinearBuffer>)
     {
@@ -1039,8 +1040,9 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T> const& para
         if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
         {
             kv_cache_buffer = KVBlockArray(params.batch_size, params.max_blocks_per_sequence, mTokensPerBlock,
-                sizePerToken, params.cyclic_attention_window_size, params.sink_token_length,
-                params.host_primary_pool_pointer, params.host_secondary_pool_pointer, params.block_offsets);
+                sizePerToken, params.cyclic_attention_window_size, params.max_cyclic_attention_window_size,
+                params.sink_token_length, params.can_use_one_more_block, params.host_primary_pool_pointer,
+                params.host_secondary_pool_pointer, params.block_offsets);
             hostKvCacheBlockOffsets = params.host_block_offsets;
         }
         else if constexpr (std::is_same_v<KVCacheBuffer, KVLinearBuffer>)
@@ -1369,8 +1371,7 @@ int GPTAttentionPluginCommon::enqueueContext(EnqueueContextParams<T> const& para
         preprocessingParams.cu_kv_seq_lens = cu_kv_seqlens;
         preprocessingParams.rotary_embedding_inv_freq = rotary_inv_freq_buf;
         preprocessingParams.rotary_coef_cache_buffer = params.rotary_cos_sin;
-        preprocessingParams.mrope_rotary_sin_cos = params.mrope_rotary_sin_cos;
-        preprocessingParams.mrope_position_deltas = params.mrope_position_deltas;
+        preprocessingParams.mrope_rotary_cos_sin = params.mrope_rotary_cos_sin;
         preprocessingParams.kvScaleOrigQuant = params.kv_scale_orig_quant;
         preprocessingParams.spec_decoding_position_offsets = nullptr;
         preprocessingParams.logn_scaling = params.logn_scaling_ptr;
@@ -1894,8 +1895,9 @@ int GPTAttentionPluginCommon::enqueueGeneration(EnqueueGenerationParams<T> const
         {
             using BufferDataType = typename KVCacheBuffer::DataType;
             kv_cache_buffer = KVBlockArray(batch_beam, params.max_blocks_per_sequence, mTokensPerBlock, sizePerToken,
-                params.cyclic_attention_window_size, params.sink_token_length, params.host_primary_pool_pointer,
-                params.host_secondary_pool_pointer, reinterpret_cast<BufferDataType*>(params.block_offsets));
+                params.cyclic_attention_window_size, params.max_cyclic_attention_window_size, params.sink_token_length,
+                params.can_use_one_more_block, params.host_primary_pool_pointer, params.host_secondary_pool_pointer,
+                reinterpret_cast<BufferDataType*>(params.block_offsets));
         }
         else if constexpr (std::is_same_v<KVCacheBuffer, KVLinearBuffer>)
         {
@@ -1912,7 +1914,7 @@ int GPTAttentionPluginCommon::enqueueGeneration(EnqueueGenerationParams<T> const
 #endif
 
     // Medusa doesn't support multi-block mode.
-    if (!mIsSpecDecodingEnabled)
+    if (!(mIsSpecDecodingEnabled && mUseSpecDecoding))
     {
         int64_t multi_block_mode_val = params.runtime_perf_knobs[0];
         mMultiBlockMode = multi_block_mode_val == 1;
@@ -1941,7 +1943,7 @@ int GPTAttentionPluginCommon::enqueueGeneration(EnqueueGenerationParams<T> const
             mDecoderXQARunner->template dispatch<KVCacheBuffer>(xqaParams, kv_cache_buffer, stream);
             return 0;
         }
-        else if (mIsSpecDecodingEnabled)
+        else if (mIsSpecDecodingEnabled && mUseSpecDecoding)
         {
             TLLM_CHECK_WITH_INFO(false, "No available XQA kernels are found for speculative decoding mode.");
         }
@@ -2444,7 +2446,7 @@ size_t GPTAttentionPluginCommon::getCommonSerializationSize() const noexcept
         + sizeof(mTokensPerBlock) + sizeof(mType) + sizeof(mMaxContextLength) + sizeof(mQKVBiasEnabled)
         + sizeof(mCrossAttention) + sizeof(mMaxDistance) + sizeof(mPosShiftEnabled) + sizeof(mDenseContextFMHA)
         + sizeof(mPagedContextFMHA) + sizeof(mFP8ContextFMHA) + sizeof(mHasFullAttentionMask) + sizeof(mUseKVCache)
-        + sizeof(mUnfuseQkvGemm) + sizeof(mUseLognScaling) + sizeof(mIsSpecDecodingEnabled)
+        + sizeof(mUnfuseQkvGemm) + sizeof(mUseLognScaling) + sizeof(mIsSpecDecodingEnabled) + sizeof(mUseSpecDecoding)
         + sizeof(mSpecDecodingIsGenerationLengthVariable) + sizeof(mSpecDecodingMaxGenerationLength)
         + sizeof(mNbMultiBlockSemaphores) + sizeof(mIsMLAEnabled) + sizeof(mMLAParams) + sizeof(mSkipAttn)
         + sizeof(uint32_t) // size of DecoderXQARunnerResource buffer.
@@ -2500,6 +2502,7 @@ void GPTAttentionPluginCommon::serializeCommon(void* buffer) const noexcept
     write(d, mHasFullAttentionMask);
     write(d, mUseKVCache);
     write(d, mIsSpecDecodingEnabled);
+    write(d, mUseSpecDecoding);
     write(d, mSpecDecodingIsGenerationLengthVariable);
     write(d, mSpecDecodingMaxGenerationLength);
     write(d, mIsMLAEnabled);

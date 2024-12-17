@@ -57,8 +57,8 @@ class RuntimeConfig(BaseModel):
             get_perf_config(),
             decoding_config=self.decoding_config.get_decoding_config(),
             batching_type=trtllm.BatchingType.INFLIGHT,
-            runtime_max_batch_size=self.settings_config.max_batch_size,
-            runtime_max_num_tokens=self.settings_config.max_num_tokens,
+            max_batch_size=self.settings_config.max_batch_size,
+            max_num_tokens=self.settings_config.max_num_tokens,
         )
 
     @model_validator(mode="after")

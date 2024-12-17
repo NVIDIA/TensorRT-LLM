@@ -810,18 +810,6 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
                 env=cpp_env,
                 timeout=600)
 
-    # UCX transceiver tests, the test may not be built if ENABLE_UCX is 0
-    if _os.path.exists(
-            _os.path.join(tests_dir, "batch_manager/ucxDataTransceiverTest")):
-        ucx_trans_test = [
-            "mpirun",
-            "-n",
-            "2",
-            "--allow-run-as-root",
-            "batch_manager/ucxDataTransceiverTest",
-        ]
-        run_command(ucx_trans_test, cwd=tests_dir, env=cpp_env, timeout=300)
-
     xml_output_file = build_dir / "results-multi-gpu-real-decoder.xml"
     trt_model_test = produce_mpirun_command(
         global_commands=["mpirun", "--allow-run-as-root"],
@@ -984,6 +972,20 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
         ],
         leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
     run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
+
+    # UCX transceiver tests, the test may not be built if ENABLE_UCX is 0
+    if _os.path.exists(
+            _os.path.join(tests_dir, "batch_manager/ucxDataTransceiverTest")):
+        new_env = copy.copy(cpp_env)
+        new_env["UCX_MEMTYPE_CACHE"] = "n"
+        ucx_trans_test = [
+            "mpirun",
+            "-n",
+            "2",
+            "--allow-run-as-root",
+            "batch_manager/ucxDataTransceiverTest",
+        ]
+        run_command(ucx_trans_test, cwd=tests_dir, env=new_env, timeout=300)
 
 
 def run_benchmarks(model_name: str, python_exe: str, root_dir: _pl.Path,

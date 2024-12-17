@@ -431,7 +431,10 @@ class MultimodalModelRunner:
         else:
             use_fast = self.model_type in ["phi-3-vision", "internvl"]
             self.tokenizer = AutoTokenizer.from_pretrained(
-                self.args.hf_model_dir, use_fast=use_fast, use_legacy=False)
+                self.args.hf_model_dir,
+                use_fast=use_fast,
+                use_legacy=False,
+                trust_remote_code=True)
 
         self.tokenizer.padding_side = "right"
 
@@ -909,7 +912,7 @@ class MultimodalModelRunner:
             input_ids, input_lengths, ptuning_args, visual_features, mrope_args = self.preprocess(
                 warmup, pre_prompt, post_prompt, image, other_vision_inputs)
             mrope_params = MropeParams(
-                mrope_rotary_sin_cos=mrope_args[0],
+                mrope_rotary_cos_sin=mrope_args[0],
                 mrope_position_deltas=mrope_args[1],
             )
         else:
@@ -1136,9 +1139,10 @@ class MultimodalModelRunner:
             tensor_info)
         self.visual_encoder_session.set_shapes(visual_features)
         visual_outputs = {
-            t.name: torch.empty(tuple(t.shape),
-                                dtype=trt_dtype_to_torch(t.dtype),
-                                device=image.device)
+            t.name:
+            torch.empty(tuple(t.shape),
+                        dtype=trt_dtype_to_torch(t.dtype),
+                        device=image.device)
             for t in visual_output_info
         }
 
@@ -1436,14 +1440,16 @@ class MultimodalModelRunner:
             attention_mask=attention_mask,
         )
 
-        mask = (input_ids == self.image_token_id) | (
-            input_ids == self.vision_token_id) | (input_ids
-                                                  == self.video_token_id)
-        indices = torch.nonzero(mask, as_tuple=False)
-        value = self.model_config.vocab_size
-        for idx in indices:
-            input_ids[tuple(idx)] = value
-            value += 1
+        for idx in range(input_ids.size(0)):
+            input_id = input_ids[idx]
+            mask = (input_id == self.image_token_id) | (
+                input_id == self.vision_token_id) | (input_id
+                                                     == self.video_token_id)
+            indices = torch.nonzero(mask, as_tuple=False)
+            value = self.model_config.vocab_size
+            for idx in indices:
+                input_id[tuple(idx)] = value
+                value += 1
 
         if self.decoder_llm or self.runtime_mapping.is_first_pp_rank():
             ptuning_args = self.ptuning_setup(visual_features, input_ids,
@@ -1637,15 +1643,20 @@ class MultimodalModelRunner:
             else:
                 images = Image.open(self.args.image_path).convert('RGB')
         elif "qwen2_vl" in self.model_type:
+            images = []
             if self.args.image_path is None:
                 img_url = 'https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg'
-                images = Image.open(
+                image = Image.open(
                     requests.get(img_url, stream=True,
                                  timeout=5).raw).convert('RGB')
-                images = images.resize(
-                    (images.size[0] // 2, images.size[1] // 2))
+                image = image.resize((504, 504))
+                images.append(image)
             else:
-                images = Image.open(self.args.image_path).convert('RGB')
+                images = []
+                for image_path in self.args.image_path:
+                    image = Image.open(image_path).convert('RGB')
+                    image = image.resize((504, 504))
+                    images.append(image)
         elif "llava_onevision" in self.model_type and self.args.video_path is not None:
             if self.args.video_path == 'llava-onevision-accuracy':
                 self.args.video_path = hf_hub_download(
@@ -1681,7 +1692,9 @@ class MultimodalModelRunner:
         from ..tools.multimodal_builder import compute_rotary_pos_emb
         other_vision_inputs = {}
         other_decoder_inputs = {}
-
+        if 'qwen2_vl' not in self.model_type:
+            input_text = input_text[0] if isinstance(input_text,
+                                                     list) else input_text
         if 'blip2' in self.model_type:
             image = self.processor(raw_image, input_text,
                                    return_tensors="pt")['pixel_values']
@@ -1696,26 +1709,30 @@ class MultimodalModelRunner:
             hf_config = AutoConfig.from_pretrained(self.args.hf_model_dir)
             if input_text is None:
                 input_text = "Question: Describe this image. Answer:"
-            messages = [{
+            messages = [[{
                 "role":
                 "user",
                 "content": [
                     {
                         "type": "image",
-                        "image": raw_image,
+                        "image": raw_image[idx],
                     },
                     {
                         "type": "text",
-                        "text": input_text
+                        "text": input_text[idx],
                     },
                 ],
-            }]
+            }] for idx in range(self.args.batch_size)]
 
-            text = self.processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True)
+            texts = [
+                processor.apply_chat_template(msg,
+                                              tokenize=False,
+                                              add_generation_prompt=True)
+                for msg in messages
+            ]
             image_inputs, video_inputs = process_vision_info(messages)
-            inputs = self.processor(
-                text=[text],
+            inputs = processor(
+                text=texts,
                 images=image_inputs,
                 videos=video_inputs,
                 padding=True,

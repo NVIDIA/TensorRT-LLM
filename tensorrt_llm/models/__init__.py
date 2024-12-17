@@ -45,7 +45,7 @@ from .llama.model import LLaMAForCausalLM, LLaMAModel
 from .mamba.model import MambaForCausalLM
 from .medusa.config import MedusaConfig
 from .medusa.model import MedusaForCausalLm
-from .mllama.model import MLLaMAModel
+from .mllama.model import MLLaMAForCausalLM
 from .modeling_utils import (PretrainedConfig, PretrainedModel,
                              SpeculativeDecodingMode)
 from .mpt.model import MPTForCausalLM, MPTModel
@@ -121,7 +121,7 @@ __all__ = [
     'EagleForCausalLM',
     'SpeculativeDecodingMode',
     'CohereForCausalLM',
-    'MLLaMAModel',
+    'MLLaMAForCausalLM',
 ]
 
 MODEL_MAP = {
@@ -183,7 +183,9 @@ MODEL_MAP = {
     'DeepseekV2ForCausalLM': DeepseekV2ForCausalLM,
     'EagleForCausalLM': EagleForCausalLM,
     'CohereForCausalLM': CohereForCausalLM,
-    'MllamaForConditionalGeneration': MLLaMAModel,
+    'MLLaMAModel': MLLaMAForCausalLM,  # For modelopt
+    'MllamaForConditionalGeneration':
+    MLLaMAForCausalLM,  # For mllama load by Auto
     'BertForQuestionAnswering': BertForQuestionAnswering,
     'BertForSequenceClassification': BertForSequenceClassification,
     'BertModel': BertModel,

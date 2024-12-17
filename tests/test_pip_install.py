@@ -1,7 +1,15 @@
 import argparse
 import subprocess
+import sys
 
 import requests
+
+
+def get_cpython_version():
+    python_version = sys.version_info[:]
+    assert python_version[0] == 3
+    assert python_version[1] in [10, 12]
+    return "cp{}{}".format(python_version[0], python_version[1])
 
 
 def download_wheel(args):
@@ -17,6 +25,8 @@ def download_wheel(args):
             continue
         name = line.split('"')[1]
         if not name.endswith(".whl"):
+            continue
+        if get_cpython_version() not in name:
             continue
         wheel_name = name
         break

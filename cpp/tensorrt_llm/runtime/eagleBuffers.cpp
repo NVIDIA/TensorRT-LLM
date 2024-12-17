@@ -73,6 +73,7 @@ void EagleBuffers::Inputs::create(SizeType32 maxNumSequences, TllmRuntime const&
     inputGenTokensHost
         = manager.pinnedPool(ITensor::makeShape({maxNumSequences * maxDecodingTokens}), nvinfer1::DataType::kINT32);
     chunkedContextNextTokens = manager.gpu(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
+    useSpecDecoding = manager.cpu(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
 }
 
 EagleBuffers::EagleBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, runtime::BufferManager const& manager,
@@ -130,6 +131,8 @@ EagleBuffers::EagleBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, run
         = manager.emptyTensor(runtime::MemoryType::kPINNEDPOOL, nvinfer1::DataType::kINT32);
     engineInputs.inputGenTokensHost = manager.emptyTensor(runtime::MemoryType::kPINNEDPOOL, nvinfer1::DataType::kINT32);
     engineInputs.chunkedContextNextTokens = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kINT32);
+    engineInputs.useSpecDecoding = manager.cpu(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
+    bufferCast<SizeType32>(*engineInputs.useSpecDecoding)[0] = 1;
     chunkedContextNextTokensHost = manager.emptyTensor(runtime::MemoryType::kPINNEDPOOL, nvinfer1::DataType::kINT32);
 
     // Eagle-2, not fully supported yet
@@ -487,6 +490,7 @@ void EagleBuffers::insertInputTensors(
     inputBuffers.insert_or_assign("chunked_context_next_tokens", engineInputs.chunkedContextNextTokens);
     // For Eagle-2
     inputBuffers.insert_or_assign("use_dynamic_tree", engineInputs.useDynamicTreeHost);
+    inputBuffers.insert_or_assign("spec_decoding_use", engineInputs.useSpecDecoding);
 
     // outputs
     outputBuffers.insert_or_assign("next_draft_tokens", engineOutputs.nextDraftTokens);

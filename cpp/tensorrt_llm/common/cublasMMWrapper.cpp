@@ -47,7 +47,7 @@ CublasMMWrapper::CublasMMWrapper(CublasMMWrapper const& wrapper)
 }
 
 void CublasMMWrapper::createDescriptors(cublasOperation_t transa, cublasOperation_t transb, int const m, int const n,
-    int const k, int const lda, int const ldb, int const ldc)
+    int const k, int const lda, int const ldb, int const ldc, int8_t fastAcc)
 {
     // --------------------------------------
     // Create descriptors for the original matrices
@@ -61,6 +61,16 @@ void CublasMMWrapper::createDescriptors(cublasOperation_t transa, cublasOperatio
         mOperationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(cublasOperation_t)));
     check_cuda_error(cublasLtMatmulDescSetAttribute(
         mOperationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(cublasOperation_t)));
+    check_cuda_error(
+        cublasLtMatmulDescSetAttribute(mOperationDesc, CUBLASLT_MATMUL_DESC_FAST_ACCUM, &fastAcc, sizeof(int8_t)));
+}
+
+void CublasMMWrapper::setScaleDescriptors(void* scale_a, void* scale_b)
+{
+    check_cuda_error(
+        cublasLtMatmulDescSetAttribute(mOperationDesc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &scale_a, sizeof(void*)));
+    check_cuda_error(
+        cublasLtMatmulDescSetAttribute(mOperationDesc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &scale_b, sizeof(void*)));
 }
 
 void CublasMMWrapper::destroyDescriptors()

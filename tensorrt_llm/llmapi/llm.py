@@ -177,6 +177,7 @@ class LLM:
                                      Sequence[LoRARequest]]] = None,
         prompt_adapter_request: Optional[Union[
             PromptAdapterRequest, Sequence[PromptAdapterRequest]]] = None,
+        queries: Optional[Union[PromptInputs, Sequence[PromptInputs]]] = None,
     ) -> Union[RequestOutput, List[RequestOutput]]:
         """Generate output for the given prompts in the synchronous mode.
         Synchronous generation accepts either single prompt or batched prompts.
@@ -191,7 +192,8 @@ class LLM:
                 if any. Defaults to None.
             prompt_adapter_request (PromptAdapterRequest, Sequence[PromptAdapterRequest], optional):
                 Prompt Adapter request to use for generation, if any. Defaults to None.
-
+            queries (PromptInputs or Sequence[PromptInputs]): The query text or token ids.
+                it can be single prompt or batched prompts. it is used for star attention to run long context tasks.
         Returns:
             Union[RequestOutput, List[RequestOutput]]: The output data of the completion request to the LLM.
         """
@@ -202,6 +204,8 @@ class LLM:
 
         if unbatched:
             inputs = [inputs]
+            if queries:
+                queries = [queries]
 
         futures = []
         for i, request_inputs in enumerate(inputs):
@@ -217,7 +221,9 @@ class LLM:
                 pa_req = prompt_adapter_request[i]
             else:
                 pa_req = prompt_adapter_request
+            request_queries = None if queries is None else queries[i]
             future = self.generate_async(request_inputs,
+                                         queries=request_queries,
                                          sampling_params=sp,
                                          lora_request=lora_req,
                                          prompt_adapter_request=pa_req,
@@ -242,6 +248,7 @@ class LLM:
         lora_request: Optional[LoRARequest] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         streaming: bool = False,
+        queries: Optional[PromptInputs] = None,
     ) -> RequestOutput:
         """Generate output for the given prompt in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -256,27 +263,40 @@ class LLM:
                 use for generation, if any. Defaults to None.
             streaming (bool): Whether to use the streaming mode for the generation. Defaults to
                 False.
+            queries (PromptInputs or Sequence[PromptInputs]): The query text or token ids.
+                it can be single prompt or batched prompts. it is used for star attention to run long context tasks.
 
         Returns:
             RequestOutput: The output data of the completion request to the LLM.
         """
         sampling_params = self._prepare_sampling_params(sampling_params)
-
+        query_token_ids = None
         if isinstance(inputs, str):
             prompt_token_ids = self._prepare_prompt_token_ids(
                 inputs, sampling_params)
             prompt = inputs
+            if queries is not None:
+                query_token_ids = self._prepare_prompt_token_ids(
+                    queries, sampling_params)
+
         elif isinstance(inputs, list) and isinstance(inputs[0], int):
             prompt_token_ids = inputs
             prompt = None
+            if queries is not None:
+                query_token_ids = queries
+
         else:
             raise TypeError(
                 f"The inputs must be type str or list of int, but got {type(inputs)}"
             )
 
-        self._check_arguments(prompt_token_ids, sampling_params)
+        self._check_arguments(
+            len(prompt_token_ids),
+            len(query_token_ids) if query_token_ids is not None else 0,
+            sampling_params)
         result = self._executor.generate_async(
             prompt_token_ids,
+            query_token_ids=query_token_ids,
             sampling_params=sampling_params,
             lora_request=lora_request,
             prompt_adapter_request=prompt_adapter_request,
@@ -349,7 +369,7 @@ class LLM:
                 f"The sampling_params must be type SamplingParams or None, but got {type(sampling_params)}"
             )
 
-    def _check_arguments(self, prompt_token_ids: List[int],
+    def _check_arguments(self, prompt_len: int, query_len: int,
                          sampling_params: SamplingParams) -> None:
 
         build_config = self.args.build_config
@@ -359,14 +379,14 @@ class LLM:
             built_enging_cfg = json.load(f)
         max_seq_len = built_enging_cfg['build_config'][
             'max_seq_len'] if 'build_config' in built_enging_cfg else build_config.max_seq_len
-
-        prompt_len = len(prompt_token_ids)
-
         # TODO: Remove this check and left the request verification to cpp runtime
-        if (not self.args.enable_chunked_prefill
-            ) and prompt_len + sampling_params.max_tokens > max_seq_len:
+
+        # NOTE: [yuhangh] the meaning of max_seq_len should be for the all sequence. It's about position embedding.
+        if (not self.args.enable_chunked_prefill) and (
+                prompt_len / self.args.parallel_config.cp_size + query_len +
+                sampling_params.max_tokens > max_seq_len):
             raise ValueError(
-                f"The sum of prompt length ({prompt_len}) and max_tokens ({sampling_params.max_tokens}) should not exceed "
+                f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}) and query length ({query_len}) max_tokens ({sampling_params.max_tokens}) should not exceed "
                 f"max_seq_len ({build_config.max_seq_len})")
 
         if sampling_params.beam_width > build_config.max_beam_width:
@@ -388,8 +408,8 @@ class LLM:
         # It should also be before bindings ExecutorConfig, which may depend on tokenizer info.
         self._tokenizer = self._try_load_tokenizer()
 
-        max_batch_size = self.args.runtime_max_batch_size or self.args.build_config.max_batch_size
-        max_num_tokens = self.args.runtime_max_num_tokens or self.args.build_config.max_num_tokens
+        max_batch_size = self.args.max_batch_size or self.args.build_config.max_batch_size
+        max_num_tokens = self.args.max_num_tokens or self.args.build_config.max_num_tokens
         executor_config = tllm.ExecutorConfig(
             max_beam_width=self.args.build_config.max_beam_width,
             scheduler_config=self.args.scheduler_config,

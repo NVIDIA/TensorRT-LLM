@@ -23,10 +23,7 @@ namespace kernels
 namespace weight_only
 {
 INSTANTIATE_WEIGHT_ONLY_CUDA_DISPATCHERS(
-    KernelType::BF16Int4Groupwise, BF16DetailsA, Int4DetailsW, ColumnMajorInterleavedForHopper, true, 64);
-// For W4A8, tile size is 128
-INSTANTIATE_WEIGHT_ONLY_CUDA_DISPATCHERS(
-    KernelType::BF16Int4Groupwise, BF16DetailsA, Int4DetailsW, ColumnMajorInterleavedForHopper, true, 128);
+    KernelType::FP16Int4PerChannel, FP16DetailsA, Int4DetailsW, ColumnMajor, false, 64);
 } // namespace weight_only
 } // namespace kernels
 } // namespace tensorrt_llm

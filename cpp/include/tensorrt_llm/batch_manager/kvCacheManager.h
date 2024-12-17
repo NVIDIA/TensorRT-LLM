@@ -763,6 +763,8 @@ public:
 
     [[nodiscard]] virtual bool isEnableBlockReuse() const = 0;
 
+    [[nodiscard]] virtual bool isUseOneMoreBlock() const = 0;
+
     // void removeToken(SizeType32 seqSlotIdx);
     virtual void rewindKVCache(LlmRequest::RequestIdType requestId, SizeType32 rewindLengths) = 0;
 
@@ -783,6 +785,10 @@ public:
     virtual bool schedulingHasFreeBlocks(SizeType32 numRequired = 1) const = 0;
 
     virtual std::vector<std::vector<SizeType32>> const& getCacheBlockIds(LlmRequest::RequestIdType requestId) const = 0;
+
+    virtual std::vector<std::vector<std::vector<SizeType32>>> getBatchCacheBlockIds(
+        std::vector<LlmRequest::RequestIdType> const& requestIds) const
+        = 0;
 
     virtual runtime::ITensor::SharedPtr getPrimaryPool(SizeType32 layer_idx) const = 0;
     virtual SizeType32 getPoolLayerIdx(SizeType32 layer_idx) const = 0;
@@ -991,6 +997,11 @@ public:
         return mEnableBlockReuse;
     }
 
+    [[nodiscard]] bool isUseOneMoreBlock() const override
+    {
+        return mUseOneMoreBlock;
+    }
+
     void removeToken(LlmRequest::RequestIdType requestId);
     void rewindKVCache(LlmRequest::RequestIdType requestId, SizeType32 rewindLengths) override;
 
@@ -1039,6 +1050,9 @@ public:
     bool schedulingHasFreeBlocks(SizeType32 numRequired = 1) const override;
 
     std::vector<std::vector<SizeType32>> const& getCacheBlockIds(LlmRequest::RequestIdType requestId) const override;
+
+    std::vector<std::vector<std::vector<SizeType32>>> getBatchCacheBlockIds(
+        std::vector<LlmRequest::RequestIdType> const& requestIds) const override;
 
     runtime::ITensor::SharedPtr getPrimaryPool(SizeType32 layer_idx) const override;
 
@@ -1107,6 +1121,8 @@ private:
     std::unordered_map<LlmRequest::RequestIdType, GenerationRequest> mSequences;
     // Whether to cache KV pages for reuse
     bool mEnableBlockReuse;
+    // Whether use one more block for each sequence
+    bool mUseOneMoreBlock;
     // buffers for static tensors, will be created after allocating pools
     runtime::ITensor::SharedPtr mBlockPoolPointers;
     runtime::ITensor::SharedPtr mLayerToPoolMapping;

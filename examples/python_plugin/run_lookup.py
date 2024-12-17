@@ -41,9 +41,10 @@ if __name__ == "__main__":
         ])
         logger.debug(f'output info {output_info}')
         outputs = {
-            t.name: torch.empty(tuple(t.shape),
-                                dtype=trt_dtype_to_torch(t.dtype),
-                                device='cuda')
+            t.name:
+            torch.empty(tuple(t.shape),
+                        dtype=trt_dtype_to_torch(t.dtype),
+                        device='cuda')
             for t in output_info
         }
 

@@ -94,8 +94,9 @@ def test_single_chat_session(client: openai.OpenAI, model_name: str):
         extra_body=dict(use_beam_search=True),
     )
     assert len(chat_completion.choices) == 2
-    assert chat_completion.choices[0].message.content != chat_completion.choices[
-        1].message.content, "beam search should be different"
+    assert chat_completion.choices[
+        0].message.content != chat_completion.choices[
+            1].message.content, "beam search should be different"
 
 
 @pytest.mark.asyncio(loop_scope="module")

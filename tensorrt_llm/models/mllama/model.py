@@ -40,6 +40,7 @@ from tensorrt_llm.models.model_weights_loader import ModelWeightsLoader
 from tensorrt_llm.models.modeling_utils import PretrainedModel, QuantConfig
 from tensorrt_llm.module import Module, ModuleList
 from tensorrt_llm.parameter import Parameter
+from tensorrt_llm.quantization import QuantMode
 
 from .config import MLLaMAConfig
 
@@ -61,35 +62,36 @@ ADD_DEBUG_TENSOR = False
 class CrossAttentionTransformerBlock(Module):
 
     def __init__(
-        self,
-        *,
-        local_layer_idx,
-        hidden_size,
-        ffn_hidden_size,
-        num_attention_heads,
-        num_kv_heads,
-        head_size,
-        max_position_embeddings=None,
-        q_scaling=1.0,
-        has_attention_qkvo_bias=False,
-        has_mlp_bias=False,
-        layernorm_position=LayerNormPositionType.pre_layernorm,
-        layernorm_type=LayerNormType.RmsNorm,
-        layernorm_eps=1e-5,
-        hidden_act="gated-silu",
-        mlp_type=MLPType.GatedMLP,
-        mapping=Mapping(),
-        dtype=None,
-        residual_scaling=1.0,
-        relative_attention=False,
-        max_distance=0,
-        num_buckets=0,
-        fp16_clamping=False,
-        skip_cross_kv=False,
-        use_implicit_relative_attention=False,
-        rotary_embedding_base=None,
-        rotary_embedding_scaling=None,
-        layer_idx_in_cache_pool=None,
+            self,
+            *,
+            local_layer_idx,
+            hidden_size,
+            ffn_hidden_size,
+            num_attention_heads,
+            num_kv_heads,
+            head_size,
+            max_position_embeddings=None,
+            q_scaling=1.0,
+            has_attention_qkvo_bias=False,
+            has_mlp_bias=False,
+            layernorm_position=LayerNormPositionType.pre_layernorm,
+            layernorm_type=LayerNormType.RmsNorm,
+            layernorm_eps=1e-5,
+            hidden_act="gated-silu",
+            mlp_type=MLPType.GatedMLP,
+            mapping=Mapping(),
+            dtype=None,
+            residual_scaling=1.0,
+            relative_attention=False,
+            max_distance=0,
+            num_buckets=0,
+            fp16_clamping=False,
+            skip_cross_kv=False,
+            use_implicit_relative_attention=False,
+            rotary_embedding_base=None,
+            rotary_embedding_scaling=None,
+            layer_idx_in_cache_pool=None,
+            quant_mode=QuantMode(0),
     ):
         super().__init__()
         self.local_layer_idx = local_layer_idx
@@ -124,6 +126,7 @@ class CrossAttentionTransformerBlock(Module):
             qk_layernorm=True,
             layernorm_type=layernorm_type,
             layer_idx_in_cache_pool=layer_idx_in_cache_pool,
+            quant_mode=quant_mode,
         )
 
         self.input_layernorm = ln_type(normalized_shape=hidden_size,
@@ -291,35 +294,36 @@ class CrossAttentionTransformerBlock(Module):
 class TransformerBlock(Module):
 
     def __init__(
-        self,
-        *,
-        local_layer_idx,
-        hidden_size,
-        ffn_hidden_size,
-        num_attention_heads,
-        num_kv_heads,
-        head_size,
-        max_position_embeddings=None,
-        q_scaling=1.0,
-        has_attention_qkvo_bias=False,
-        has_mlp_bias=False,
-        layernorm_position=LayerNormPositionType.pre_layernorm,
-        layernorm_type=LayerNormType.RmsNorm,
-        layernorm_eps=1e-5,
-        hidden_act="gated-silu",
-        mlp_type=MLPType.GatedMLP,
-        mapping=Mapping(),
-        dtype=None,
-        residual_scaling=1.0,
-        relative_attention=False,
-        max_distance=0,
-        num_buckets=0,
-        fp16_clamping=False,
-        skip_cross_kv=False,
-        use_implicit_relative_attention=False,
-        rotary_embedding_base=None,
-        rotary_embedding_scaling=None,
-        layer_idx_in_cache_pool=None,
+            self,
+            *,
+            local_layer_idx,
+            hidden_size,
+            ffn_hidden_size,
+            num_attention_heads,
+            num_kv_heads,
+            head_size,
+            max_position_embeddings=None,
+            q_scaling=1.0,
+            has_attention_qkvo_bias=False,
+            has_mlp_bias=False,
+            layernorm_position=LayerNormPositionType.pre_layernorm,
+            layernorm_type=LayerNormType.RmsNorm,
+            layernorm_eps=1e-5,
+            hidden_act="gated-silu",
+            mlp_type=MLPType.GatedMLP,
+            mapping=Mapping(),
+            dtype=None,
+            residual_scaling=1.0,
+            relative_attention=False,
+            max_distance=0,
+            num_buckets=0,
+            fp16_clamping=False,
+            skip_cross_kv=False,
+            use_implicit_relative_attention=False,
+            rotary_embedding_base=None,
+            rotary_embedding_scaling=None,
+            layer_idx_in_cache_pool=None,
+            quant_mode=QuantMode(0),
     ):
         super().__init__()
         self.local_layer_idx = local_layer_idx
@@ -353,6 +357,7 @@ class TransformerBlock(Module):
             rotary_embedding_base=rotary_embedding_base,
             rotary_embedding_scaling=rotary_embedding_scaling,
             layer_idx_in_cache_pool=layer_idx_in_cache_pool,
+            quant_mode=quant_mode,
         )
 
         self.input_layernorm = ln_type(normalized_shape=hidden_size,
@@ -466,19 +471,14 @@ class TransformerBlock(Module):
         return hidden_states
 
 
-class MLLaMAModel(PretrainedModel):
-    config_class = MLLaMAConfig
+class MLLaMAModel(Module):
 
-    def __init__(self, config: MLLaMAConfig):
-        super().__init__(config)
-        Attention.create_attention_const_params(self, config)
+    def __init__(self, config: MLLaMAConfig) -> None:
+        super().__init__()
+        self.config = config
         self.position_embedding_type = config.position_embedding_type
 
         self.mapping = self.config.mapping
-
-        type_vocab_size = self.config.type_vocab_size
-        self.has_token_type_embedding = (type_vocab_size is not None)
-        self.rescale_before_lm_head = self.config.rescale_before_lm_head
 
         self.layernorm_type = self.config.layernorm_type
         ln_type = layernorm_map[self.layernorm_type]
@@ -504,8 +504,6 @@ class MLLaMAModel(PretrainedModel):
             num_kv_heads = self.num_heads
         self.num_kv_heads = num_kv_heads
         self.head_size = self.hidden_size // self.num_heads if self.config.head_size is None else self.config.head_size
-
-        self.has_token_type_embedding = type_vocab_size is not None
 
         self.fp16_clamping = False
 
@@ -555,6 +553,7 @@ class MLLaMAModel(PretrainedModel):
                 "skip_cross_kv": self.skip_cross_kv,
                 "rotary_embedding_base": self.config.rotary_base,
                 "rotary_embedding_scaling": self.config.rotary_scaling,
+                "quant_mode": self.config.quant_mode,
             }
             if layer_idx in self.cross_attention_layers:
                 assert layers_range[0] == 0, "not support PP now"
@@ -571,35 +570,14 @@ class MLLaMAModel(PretrainedModel):
                                      num_kv_heads_per_layer[:local_layer_idx].
                                      count(num_kv_heads)))
 
-        self.decoder_layers = ModuleList(_layers)
+        self.layers = ModuleList(_layers)
+
         if self.mapping.is_last_pp_rank():
+            self.ln_f = None
             if self.has_model_final_layernorm:
                 self.ln_f = ln_type(normalized_shape=self.config.hidden_size,
                                     eps=self.config.norm_epsilon,
                                     dtype=self.config.dtype)
-
-            self.lm_head = ColumnLinear(
-                self.config.hidden_size,
-                self.config.vocab_size,
-                bias=False if not hasattr(self.config, "has_lm_head_bias") else
-                self.config.has_lm_head_bias,
-                dtype=self.config.dtype,
-                tp_group=self.config.mapping.tp_group,
-                tp_size=self.config.mapping.tp_size,
-                gather_output=True,
-            )
-
-        self.trtllm_modules_to_hf_modules = {
-            **get_default_trtllm_modules_to_hf_modules(),
-            "attn_q": "self_attn.q_proj",
-            "attn_k": "self_attn.k_proj",
-            "attn_v": "self_attn.v_proj",
-            "attn_dense": "self_attn.o_proj",
-            "cross_attn_q": "encoder_attn.q_proj",
-            "cross_attn_k": "encoder_attn.k_proj",
-            "cross_attn_v": "encoder_attn.v_proj",
-            "cross_attn_dense": "encoder_attn.o_proj",
-        }
 
         if self.config.relative_attention and not self.use_implicit_relative_attention:
             self.rel_attn_table = Parameter(
@@ -630,19 +608,15 @@ class MLLaMAModel(PretrainedModel):
         else:
             assert isinstance(hidden_states, Tensor)
 
-        attention_params = Attention.fill_attention_params(
-            self, attention_params)
-
         # In PP, layer 0 has ids as inputs, all other layers have hidden_states as inputs
         if self.mapping.is_first_pp_rank():
             hidden_states = self.vocab_embedding(decoder_input_ids)
             self.register_network_output('embedding_layer_output',
                                          hidden_states)
-
         else:
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
 
-        kv_cache_params.fill_none_tensor_list(len(self.decoder_layers))
+        kv_cache_params.fill_none_tensor_list(len(self.layers))
 
         full_text_row_masked_out_mask = reduce(
             (attention_mask_params.cross_attention_mask).cast(
@@ -659,7 +633,7 @@ class MLLaMAModel(PretrainedModel):
         if use_cache:
             presents = []
         for i, (decoder_layer, past) in enumerate(
-                zip(self.decoder_layers, kv_cache_params.past_key_value)):
+                zip(self.layers, kv_cache_params.past_key_value)):
 
             lora_layer_params = None
             if lora_params is not None and lora_params.lora_ranks is not None:
@@ -710,14 +684,130 @@ class MLLaMAModel(PretrainedModel):
                 hidden_states = hidden_states[0]
 
         if self.mapping.is_last_pp_rank():
-            if self.has_model_final_layernorm:
+            if self.ln_f:
                 hidden_states = self.ln_f(hidden_states)
+        else:
+            hidden_states = send(hidden_states, self.mapping.next_pp_rank())
 
+        if use_cache:
+            return (hidden_states, tuple(presents))
+        return hidden_states
+
+    def precompute_relative_attention_bias(self, build_config):
+        if self.config.relative_attention and not self.use_implicit_relative_attention:
+            relative_attention_bias_builder = torch.ops.tensorrt_llm.relative_attention_bias
+            rel_attn_precomputed = torch.zeros(
+                (self.config.num_attention_heads // self.mapping.tp_size,
+                 build_config.max_seq_len + 1, build_config.max_seq_len + 1),
+                dtype=str_dtype_to_torch(self.config.dtype),
+                device='cuda')
+            rel_attn_table = numpy_to_torch(
+                self.rel_attn_table.raw_value).to('cuda')
+            relative_attention_bias_builder(
+                rel_attn_precomputed,
+                rel_attn_table,
+                self.config.num_attention_heads // self.mapping.tp_size,
+                build_config.max_seq_len,
+                self.config.num_buckets,
+                False,
+                self.config.max_distance,
+            )
+            for layer_idx in range(self.num_layers):
+                self.layers[layer_idx].self_attention.set_rel_attn_table(
+                    build_config.max_seq_len, rel_attn_precomputed)
+
+
+# TODO try to inherit the DecoderModelForCausalLM
+class MLLaMAForCausalLM(PretrainedModel):
+
+    def __init__(self, config: MLLaMAConfig):
+        super().__init__(config)
+        Attention.create_attention_const_params(self, config)
+        self.position_embedding_type = config.position_embedding_type
+        self.transformer = MLLaMAModel(config)
+
+        self.mapping = self.config.mapping
+
+        self.has_model_final_layernorm = self.config.has_model_final_layernorm
+        self._dtype = self.config.dtype
+        self._kv_dtype = self._dtype
+        self._logits_dtype = self.config.logits_dtype
+
+        if self.mapping.is_last_pp_rank():
+            self.lm_head = ColumnLinear(
+                self.config.hidden_size,
+                self.config.vocab_size,
+                bias=False if not hasattr(self.config, "has_lm_head_bias") else
+                self.config.has_lm_head_bias,
+                dtype=self.config.dtype,
+                tp_group=self.config.mapping.tp_group,
+                tp_size=self.config.mapping.tp_size,
+                gather_output=True,
+            )
+
+        self.trtllm_modules_to_hf_modules = {
+            **get_default_trtllm_modules_to_hf_modules(),
+            "attn_q": "self_attn.q_proj",
+            "attn_k": "self_attn.k_proj",
+            "attn_v": "self_attn.v_proj",
+            "attn_dense": "self_attn.o_proj",
+            "cross_attn_q": "encoder_attn.q_proj",
+            "cross_attn_k": "encoder_attn.k_proj",
+            "cross_attn_v": "encoder_attn.v_proj",
+            "cross_attn_dense": "encoder_attn.o_proj",
+        }
+
+    def forward(
+        self,
+        decoder_input_ids: Tensor,
+        encoder_output: Tensor,
+        use_cache=False,
+        attention_mask_params=None,
+        last_token_ids=None,
+        kv_cache_params=None,
+        attention_params=None,
+        hidden_states=None,
+        lora_params: LoraParams = None,
+        cross_kv_cache_gen: Optional[Tensor] = None,
+        cross_kv_reuse: Optional[Tensor] = None,
+        prompt_embedding_table: Optional[Tensor] = None,
+        prompt_tasks: Optional[Tensor] = None,
+        prompt_vocab_size: Optional[Tensor] = None,
+        skip_cross_attn_blocks: Optional[Tensor] = None,
+    ):
+        if self.mapping.is_first_pp_rank():
+            assert isinstance(decoder_input_ids, Tensor)
+        else:
+            assert isinstance(hidden_states, Tensor)
+        attention_params = Attention.fill_attention_params(
+            self, attention_params)
+        hidden_states = self.transformer(
+            decoder_input_ids=decoder_input_ids,
+            encoder_output=encoder_output,
+            use_cache=use_cache,
+            attention_mask_params=attention_mask_params,
+            last_token_ids=last_token_ids,
+            kv_cache_params=kv_cache_params,
+            attention_params=attention_params,
+            hidden_states=hidden_states,
+            lora_params=lora_params,
+            cross_kv_cache_gen=cross_kv_cache_gen,
+            cross_kv_reuse=cross_kv_reuse,
+            prompt_embedding_table=prompt_embedding_table,
+            prompt_tasks=prompt_tasks,
+            prompt_vocab_size=prompt_vocab_size,
+            skip_cross_attn_blocks=skip_cross_attn_blocks,
+        )
+
+        if use_cache:
+            hidden_states, presents = hidden_states
+
+        if self.mapping.is_last_pp_rank():
+            pass
             # [bs, seq, hidden_size] or [num_tokens, hidden_size] -> [bs, hidden_size]
             hidden_states = gather_last_token_logits(
                 hidden_states, last_token_ids,
                 default_net().plugin_config.remove_input_padding)
-            self.register_network_output('logits_before_lmhead', hidden_states)
 
             # [bs, hidden_size] -> [bs, vocab_size]
             lm_logits = self.lm_head(hidden_states)
@@ -763,15 +853,11 @@ class MLLaMAModel(PretrainedModel):
         # Prepare inputs
         max_output_len = max_decoder_input_len + max_seq_len
 
-        head_size = self.head_size
-        num_kv_heads = (self.num_kv_heads + self.mapping.tp_size -
+        head_size = self.transformer.head_size
+        num_kv_heads = (self.transformer.num_kv_heads + self.mapping.tp_size -
                         1) // self.mapping.tp_size
 
-        # TODO check
-        # encoder_head_size = self.encoder_head_size
-        # encoder_num_kv_heads = (self.encoder_num_kv_heads + self.mapping.tp_size
-        #                         - 1) // self.mapping.tp_size
-        encoder_head_size = self.head_size
+        encoder_head_size = head_size
         encoder_num_kv_heads = num_kv_heads
 
         bb_range = [
@@ -1033,7 +1119,7 @@ class MLLaMAModel(PretrainedModel):
             ]),
         )
 
-        layers_range = self.mapping.pp_layers(self.total_num_layers)
+        layers_range = self.mapping.pp_layers(self.transformer.total_num_layers)
         num_pp_layers = len(layers_range)
 
         host_max_attention_window_sizes = None
@@ -1318,10 +1404,10 @@ class MLLaMAModel(PretrainedModel):
                                         ('boolean', [1]),
                                     ]))
         cross_kv_reuse = None
-        num_heads = (self.num_heads + self.mapping.tp_size -
+        num_heads = (self.transformer.num_heads + self.mapping.tp_size -
                      1) // self.mapping.tp_size
-        cross_kv_out_dim = 2 * num_kv_heads * self.head_size
-        if self.skip_cross_kv:
+        cross_kv_out_dim = 2 * num_kv_heads * self.transformer.head_size
+        if self.transformer.skip_cross_kv:
             if remove_input_padding:
                 cross_kv_reuse = Tensor(
                     name="cross_kv_reuse",
@@ -1362,15 +1448,14 @@ class MLLaMAModel(PretrainedModel):
                 1, prompt_embedding_table_size // 2, prompt_embedding_table_size
             ]]
 
-            prompt_embedding_table = Tensor(name='prompt_embedding_table',
-                                            dtype=self._dtype,
-                                            shape=[-1, self.hidden_size],
-                                            dim_range=OrderedDict([
-                                                ('prompt_embedding_table_size',
-                                                 p_embedding_range),
-                                                ('hidden_size',
-                                                 [self.hidden_size]),
-                                            ]))
+            prompt_embedding_table = Tensor(
+                name='prompt_embedding_table',
+                dtype=self._dtype,
+                shape=[-1, self.transformer.hidden_size],
+                dim_range=OrderedDict([
+                    ('prompt_embedding_table_size', p_embedding_range),
+                    ('hidden_size', [self.transformer.hidden_size]),
+                ]))
             if remove_input_padding:
                 num_tokens_range = [
                     1,
@@ -1420,30 +1505,6 @@ class MLLaMAModel(PretrainedModel):
     def use_lora(self, lora_config: LoraConfig):
         use_lora(self, lora_config, self.trtllm_modules_to_hf_modules)
 
-    def precompute_relative_attention_bias(self, build_config):
-        if self.config.relative_attention and not self.use_implicit_relative_attention:
-            relative_attention_bias_builder = torch.ops.tensorrt_llm.relative_attention_bias
-            rel_attn_precomputed = torch.zeros(
-                (self.config.num_attention_heads // self.mapping.tp_size,
-                 build_config.max_seq_len + 1, build_config.max_seq_len + 1),
-                dtype=str_dtype_to_torch(self.config.dtype),
-                device='cuda')
-            rel_attn_table = numpy_to_torch(
-                self.rel_attn_table.raw_value).to('cuda')
-            relative_attention_bias_builder(
-                rel_attn_precomputed,
-                rel_attn_table,
-                self.config.num_attention_heads // self.mapping.tp_size,
-                build_config.max_seq_len,
-                self.config.num_buckets,
-                False,
-                self.config.max_distance,
-            )
-            for layer_idx in range(self.num_layers):
-                self.decoder_layers[
-                    layer_idx].self_attention.set_rel_attn_table(
-                        build_config.max_seq_len, rel_attn_precomputed)
-
     @classmethod
     def from_hugging_face(
             cls,
@@ -1452,7 +1513,7 @@ class MLLaMAModel(PretrainedModel):
             mapping: Optional[Mapping] = None,
             quant_config: Optional[QuantConfig] = None,
             **kwargs):
-        ''' Create a MLLaMAModel object from give parameters
+        ''' Create a MLLaMAForCausalLM object from give parameters
         '''
         import transformers
 
@@ -1478,11 +1539,11 @@ class MLLaMAModel(PretrainedModel):
 
         custom_dict = {
             "lm_head": "language_model.lm_head",
-            "ln_f": "language_model.model.norm",
-            "decoder_layers": "language_model.model.layers",
+            "transformer.ln_f": "language_model.model.norm",
+            "transformer": "language_model.model",
             "self_attention": "self_attn",
             "cross_attention": "cross_attn",
-            "vocab_embedding": "language_model.model.embed_tokens",
+            "vocab_embedding": "embed_tokens",
             "gate_attn": "cross_attn_attn_gate",
             "gate_ffwd": "cross_attn_mlp_gate",
             "q_layernorm": "q_norm",

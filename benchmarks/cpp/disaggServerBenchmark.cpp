@@ -18,9 +18,7 @@
 #include "cxxopts.hpp"
 #include "tensorrt_llm/batch_manager/GptManager.h"
 #include "tensorrt_llm/batch_manager/common.h"
-#include "tensorrt_llm/batch_manager/inferenceRequest.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
-#include "tensorrt_llm/batch_manager/namedTensor.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/mpiUtils.h"
@@ -596,8 +594,8 @@ public:
             texec::ExtendedRuntimePerfKnobConfig extendedRuntimePerfKnobConfig(benchmarkParams.multiBlockMode,
                 benchmarkParams.enableContextFMHAFP32Acc, benchmarkParams.cudaGraphMode,
                 benchmarkParams.cudaGraphCacheSize);
-            texec::ExecutorConfig executorConfig(
-                maxBeamWidth, schedulerConfig, kvCacheConfig, benchmarkParams.enableChunkedContext);
+            texec::ExecutorConfig executorConfig(maxBeamWidth, schedulerConfig, kvCacheConfig,
+                benchmarkParams.enableChunekedContextVec.at(in).value_or(false));
             executorConfig.setGpuWeightsPercent(benchmarkParams.gpuWeightsPercent);
             texec::OrchestratorConfig orchestratorConfig{mIsOrchestrator, "", nullptr, false};
             texec::ParallelConfig parallelConfig{tensorrt_llm::executor::CommunicationType::kMPI,
@@ -854,32 +852,33 @@ public:
                     }
                 }
             }
-            if (!mEnableCollectKvCacheTransferTime)
+
+            if (mEnableCollectKvCacheTransferTime)
             {
-                continue;
-            }
-            for (std::size_t i = 0; i < generationRequestStatsPerIteration.size(); i++)
-            {
-                auto const& stats = generationRequestStatsPerIteration.at(i);
-                for (auto const& stat : stats)
+
+                for (std::size_t i = 0; i < generationRequestStatsPerIteration.size(); i++)
                 {
-                    std::vector<float> kvCacheTransferMs;
-                    for (auto const& requestStat : stat.requestStats)
+                    auto const& stats = generationRequestStatsPerIteration.at(i);
+                    for (auto const& stat : stats)
                     {
-                        if (requestStat.stage == tensorrt_llm::executor::RequestStage::kGENERATION_COMPLETE)
+                        std::vector<float> kvCacheTransferMs;
+                        for (auto const& requestStat : stat.requestStats)
                         {
-                            kvCacheTransferMs.push_back(
-                                static_cast<float>(requestStat.disServingStats->kvCacheTransferMS));
+                            if (requestStat.stage == tensorrt_llm::executor::RequestStage::kGENERATION_COMPLETE)
+                            {
+                                kvCacheTransferMs.push_back(
+                                    static_cast<float>(requestStat.disServingStats->kvCacheTransferMS));
+                            }
                         }
-                    }
-                    if (kvCacheTransferMs.size() > 0)
-                    {
-                        mRecorder->recordKvCacheTransferLatency(kvCacheTransferMs);
-                    }
-                    if (mLogIterationData)
-                    {
-                        TLLM_LOG_INFO(
-                            "gen_id %d, gen_req_stat: %s", i, texec::JsonSerialization::toJsonStr(stat).c_str());
+                        if (kvCacheTransferMs.size() > 0)
+                        {
+                            mRecorder->recordKvCacheTransferLatency(kvCacheTransferMs);
+                        }
+                        if (mLogIterationData)
+                        {
+                            TLLM_LOG_INFO(
+                                "gen_id %d, gen_req_stat: %s", i, texec::JsonSerialization::toJsonStr(stat).c_str());
+                        }
                     }
                 }
             }
@@ -979,28 +978,39 @@ void benchmark(std::vector<std::filesystem::path> const& contextEngineDirs,
     {
         { // warmup
             TLLM_LOG_INFO("Warmup start");
-            std::vector<tensorrt_llm::executor::Request> contextRequests;
-            contextRequests.reserve(warmUp);
-            for (int i = 0; i < warmUp; ++i)
+
+            size_t contextNum = contextEngineDirs.size();
+            size_t generationNum = generationEngineDirs.size();
+            for (auto con = 0; con < contextNum; con++)
             {
-                contextRequests.emplace_back(makeExecutorContextRequest(samples[0], beamWidth, eosId, padId,
-                    benchmarkParams.streaming, returnContextLogits, returnGenerationLogits, std::nullopt,
-                    benchmarkParams.requestLookaheadConfig));
+                for (auto gen = 0; gen < generationNum; gen++)
+                {
+                    std::vector<tensorrt_llm::executor::Request> contextRequests;
+                    contextRequests.reserve(warmUp);
+                    for (int i = 0; i < warmUp; ++i)
+                    {
+                        contextRequests.emplace_back(makeExecutorContextRequest(samples[0], beamWidth, eosId, padId,
+                            benchmarkParams.streaming, returnContextLogits, returnGenerationLogits, std::nullopt,
+                            benchmarkParams.requestLookaheadConfig));
+                    }
+                    auto reqIds = disaggExecutor->enqueueContext(contextRequests, con, true);
+                    fillRequestMap(reqIds, std::move(contextRequests));
+                    auto contextResponse = disaggExecutor->waitForContextResponse(warmUp, true);
+                    auto&& [genRequests, gids] = makeGenRequest(std::move(contextResponse));
+                    disaggExecutor->enqueueGeneration(genRequests, gids, gen, true);
+                    disaggExecutor->waitForGenResponse(warmUp, true);
+                    disaggExecutor->resetNumFinished();
+                    disaggExecutor->resetNumActive();
+                }
             }
-            auto reqIds = disaggExecutor->enqueueContext(contextRequests, std::nullopt, true);
-            fillRequestMap(reqIds, std::move(contextRequests));
-            auto contextResponse = disaggExecutor->waitForContextResponse(warmUp, true);
-            auto&& [genRequests, gids] = makeGenRequest(std::move(contextResponse));
-            disaggExecutor->enqueueGeneration(genRequests, gids, std::nullopt, true);
-            disaggExecutor->waitForGenResponse(warmUp, true);
+
             auto const warmUpWaitSleep = std::chrono::milliseconds(50);
             std::this_thread::sleep_for(warmUpWaitSleep);
             TLLM_LOG_INFO("Warmup done");
         }
 
         {
-            recorder->reserve(numSamples);
-            recorder->initialize();
+
             auto timeDelays = computeTimeDelays(benchmarkParams, numSamples - 1);
 
             std::vector<texec::Request> contextRequests;
@@ -1018,6 +1028,8 @@ void benchmark(std::vector<std::filesystem::path> const& contextEngineDirs,
             disaggExecutor->resetNumFinished();
             disaggExecutor->resetNumActive();
 
+            recorder->reserve(numSamples);
+            recorder->initialize();
             if (!staticEmulatedBatchSize)
             {
 
@@ -1078,7 +1090,7 @@ void benchmark(std::vector<std::filesystem::path> const& contextEngineDirs,
                         std::make_move_iterator(contextRequests.begin() + req + static_cast<int64_t>(batchSize)));
                     // Enqueue in batches
 
-                    auto reqIds = disaggExecutor->enqueueContext(requestsBatch, std::nullopt, false, true);
+                    auto reqIds = disaggExecutor->enqueueContext(requestsBatch);
                     fillRequestMap(reqIds, std::move(requestsBatch));
                     auto contextResponse = disaggExecutor->waitForContextResponse(static_cast<SizeType32>(batchSize));
                     auto&& [genRequests, genReqIds] = makeGenRequest(std::move(contextResponse));
@@ -1150,8 +1162,8 @@ int main(int argc, char* argv[])
     options.add_options()("streaming", "Operate in streaming mode", cxxopts::value<bool>()->default_value("false"));
     options.add_options()(
         "enable_kv_cache_reuse", "Enables the KV cache reuse.", cxxopts::value<bool>()->default_value("false"));
-    options.add_options()("enable_chunked_context", "Whether to enable context chunking.",
-        cxxopts::value<bool>()->default_value("false"));
+    options.add_options()("enable_chunked_context_per_instance", "Whether to enable context chunking for per instance",
+        cxxopts::value<std::vector<bool>>()->default_value("false"));
     options.add_options()(
         "return_context_logits", "Whether to return context logits.", cxxopts::value<bool>()->default_value("false"));
     options.add_options()("return_generation_logits", "Whether to return generation logits.",
@@ -1216,6 +1228,36 @@ int main(int argc, char* argv[])
         TLLM_LOG_ERROR("Please specify context engine and generation engine directory.");
         return 1;
     }
+    // Argument: Log level
+    auto logger = std::make_shared<TllmLogger>();
+    auto const logLevel = result["log_level"].as<std::string>();
+    if (logLevel == "verbose")
+    {
+        logger->setLevel(trt::ILogger::Severity::kVERBOSE);
+    }
+    else if (logLevel == "info")
+    {
+        logger->setLevel(trt::ILogger::Severity::kINFO);
+    }
+    else if (logLevel == "warning")
+    {
+        logger->setLevel(trt::ILogger::Severity::kWARNING);
+    }
+    else if (logLevel == "error")
+    {
+        logger->setLevel(trt::ILogger::Severity::kERROR);
+    }
+    else if (logLevel == "internal_error")
+    {
+        logger->setLevel(trt::ILogger::Severity::kINTERNAL_ERROR);
+    }
+    else
+    {
+        TLLM_LOG_ERROR("Unexpected log level: " + logLevel);
+        return 1;
+    }
+
+    initTrtLlmPlugins(logger.get());
 
     // Argument: Dataset
     auto const datasetPath = result["dataset"].as<std::string>();
@@ -1303,19 +1345,9 @@ int main(int argc, char* argv[])
         auto fractions = result["kv_cache_free_gpu_mem_fractions"].as<std::vector<float>>();
         TLLM_CHECK_WITH_INFO(fractions.size() == instanceNum || fractions.size() == 1,
             "the number of fraction should be equal to the number of instances or equal to 1");
-        if (fractions.size() == 1)
+        for (int i = 0; i < instanceNum; i++)
         {
-            for (int i = 0; i < instanceNum; i++)
-            {
-                benchmarkParams.freeGpuMemoryFractions[i] = fractions[0];
-            }
-        }
-        else
-        {
-            for (int i = 0; i < instanceNum; i++)
-            {
-                benchmarkParams.freeGpuMemoryFractions[i] = fractions[i];
-            }
+            benchmarkParams.freeGpuMemoryFractions.at(i) = fractions.size() == 1 ? fractions[0] : fractions[i];
         }
     }
 
@@ -1350,19 +1382,9 @@ int main(int argc, char* argv[])
         auto batchSizes = result["max_batch_sizes"].as<std::vector<int>>();
         TLLM_CHECK_WITH_INFO(batchSizes.size() == instanceNum || batchSizes.size() == 1,
             "the number of batch size should be equal to the number of instances or equal to 1");
-        if (batchSizes.size() == 1)
+        for (int i = 0; i < instanceNum; i++)
         {
-            for (int i = 0; i < instanceNum; i++)
-            {
-                benchmarkParams.maxBatchSizes[i] = batchSizes[0];
-            }
-        }
-        else
-        {
-            for (int i = 0; i < instanceNum; i++)
-            {
-                benchmarkParams.maxBatchSizes[i] = batchSizes[i];
-            }
+            benchmarkParams.maxBatchSizes.at(i) = batchSizes.size() == 1 ? batchSizes[0] : batchSizes[i];
         }
     }
 
@@ -1373,19 +1395,10 @@ int main(int argc, char* argv[])
         auto maxNumTokensVec = result["max_num_tokens_per_instance"].as<std::vector<int>>();
         TLLM_CHECK_WITH_INFO(maxNumTokensVec.size() == instanceNum || maxNumTokensVec.size() == 1,
             "the number of max_num_tokens should be equal to the number of instances or equal to 1");
-        if (maxNumTokensVec.size() == 1)
+        for (int i = 0; i < instanceNum; i++)
         {
-            for (int i = 0; i < instanceNum; i++)
-            {
-                benchmarkParams.maxNumTokensVec[i] = maxNumTokensVec[0];
-            }
-        }
-        else
-        {
-            for (int i = 0; i < instanceNum; i++)
-            {
-                benchmarkParams.maxNumTokensVec[i] = maxNumTokensVec[i];
-            }
+            benchmarkParams.maxNumTokensVec.at(i)
+                = maxNumTokensVec.size() == 1 ? maxNumTokensVec[0] : maxNumTokensVec[i];
         }
     }
 
@@ -1395,8 +1408,20 @@ int main(int argc, char* argv[])
     bool logIterationData = result["log_iteration_data"].as<bool>();
 
     // Argument: Enable chunked context
-    benchmarkParams.enableChunkedContext = result["enable_chunked_context"].as<bool>();
+    benchmarkParams.enableChunekedContextVec.resize(instanceNum);
+    if (result.count("enable_chunked_context_per_instance"))
+    {
+        auto enableChunkedContextVec = result["enable_chunked_context_per_instance"].as<std::vector<bool>>();
 
+        TLLM_CHECK_WITH_INFO(enableChunkedContextVec.size() == instanceNum || enableChunkedContextVec.size() == 1,
+            "the number of enable_chunked_context_per_instance should be equal to the number of instances or equal to "
+            "1");
+        for (int i = 0; i < instanceNum; i++)
+        {
+            benchmarkParams.enableChunekedContextVec.at(i)
+                = enableChunkedContextVec.size() == 1 ? enableChunkedContextVec[0] : enableChunkedContextVec[i];
+        }
+    }
     // Argument: Enable return context logits
     bool returnContextLogits = result["return_context_logits"].as<bool>();
     TLLM_CHECK_WITH_INFO(returnContextLogits == false, "Currently disaggServer don't support returnContextLogits!");
@@ -1521,37 +1546,6 @@ int main(int argc, char* argv[])
         return 1;
     }
     benchmarkParams.gpuWeightsPercent = gpuWeightsPercent;
-
-    // Argument: Log level
-    auto logger = std::make_shared<TllmLogger>();
-    auto const logLevel = result["log_level"].as<std::string>();
-    if (logLevel == "verbose")
-    {
-        logger->setLevel(trt::ILogger::Severity::kVERBOSE);
-    }
-    else if (logLevel == "info")
-    {
-        logger->setLevel(trt::ILogger::Severity::kINFO);
-    }
-    else if (logLevel == "warning")
-    {
-        logger->setLevel(trt::ILogger::Severity::kWARNING);
-    }
-    else if (logLevel == "error")
-    {
-        logger->setLevel(trt::ILogger::Severity::kERROR);
-    }
-    else if (logLevel == "internal_error")
-    {
-        logger->setLevel(trt::ILogger::Severity::kINTERNAL_ERROR);
-    }
-    else
-    {
-        TLLM_LOG_ERROR("Unexpected log level: " + logLevel);
-        return 1;
-    }
-
-    initTrtLlmPlugins(logger.get());
 
     std::optional<std::vector<std::vector<int>>> deviceIdsForInstance = std::nullopt;
     if (result.count("device_ids_for_instances"))

@@ -123,6 +123,7 @@ std::string GPTAttentionPlugin::toString(IdxEntry const& entry) const
     case IdxEntry::SPEC_DECODING_GENERATION_LENGTHS: return "SPEC_DECODING_GENERATION_LENGTHS";
     case IdxEntry::SPEC_DECODING_PACKED_MASK: return "SPEC_DECODING_PACKED_MASK";
     case IdxEntry::SPEC_DECODING_POSITION_OFFSETS: return "SPEC_DECODING_POSITION_OFFSETS";
+    case IdxEntry::SPEC_DECODING_USE: return "SPEC_DECODING_USE";
     case IdxEntry::LONG_ROPE_ROTARY_INV_FREQ: return "LONG_ROPE_ROTARY_INV_FREQ";
     case IdxEntry::LONG_ROPE_ROTARY_COS_SIN: return "LONG_ROPE_ROTARY_COS_SIN";
     case IdxEntry::HOST_RUNTIME_PERF_KNOBS: return "HOST_RUNTIME_PERF_KNOBS";
@@ -171,9 +172,10 @@ bool GPTAttentionPlugin::isEntryUsed(IdxEntry const& entry) const
     case IdxEntry::SPEC_DECODING_GENERATION_LENGTHS: return mIsSpecDecodingEnabled;
     case IdxEntry::SPEC_DECODING_PACKED_MASK: return mIsSpecDecodingEnabled;
     case IdxEntry::SPEC_DECODING_POSITION_OFFSETS: return mIsSpecDecodingEnabled;
+    case IdxEntry::SPEC_DECODING_USE: return mIsSpecDecodingEnabled;
     case IdxEntry::LONG_ROPE_ROTARY_INV_FREQ: return isLongRoPE();
     case IdxEntry::LONG_ROPE_ROTARY_COS_SIN: return isLongRoPE();
-    case IdxEntry::MROPE_ROTARY_SIN_COS: return isMRoPE();
+    case IdxEntry::MROPE_ROTARY_COS_SIN: return isMRoPE();
     case IdxEntry::MROPE_POSITION_DELTAS: return isMRoPE();
     case IdxEntry::HOST_RUNTIME_PERF_KNOBS: return true;
     case IdxEntry::HOST_CONTEXT_PROGRESS: return true;
@@ -221,7 +223,7 @@ int GPTAttentionPlugin::getGenerationInputSequenceLength(
     if (mRemovePadding)
     {
         // Speculative decoding mode might need variable generation input sequence length.
-        if (mIsSpecDecodingEnabled)
+        if (mIsSpecDecodingEnabled && mUseSpecDecoding)
         {
             TLLM_CHECK_WITH_INFO(mCpSize <= 1, "Context Parallel does not support speculative decoding mode for now");
             // SPEC_DECODING_POSITION_OFFSETS: [batch_size, max_generation_input_length].
@@ -285,12 +287,13 @@ bool GPTAttentionPlugin::supportsFormatCombination(
         || (isEntryUsed(IdxEntry::SPEC_DECODING_POSITION_OFFSETS)
             && pos == getIdx(IdxEntry::SPEC_DECODING_POSITION_OFFSETS))
         || (isEntryUsed(IdxEntry::SPEC_DECODING_GENERATION_LENGTHS)
-            && pos == getIdx(IdxEntry::SPEC_DECODING_GENERATION_LENGTHS)))
+            && pos == getIdx(IdxEntry::SPEC_DECODING_GENERATION_LENGTHS))
+        || (isEntryUsed(IdxEntry::SPEC_DECODING_USE) && pos == getIdx(IdxEntry::SPEC_DECODING_USE)))
     {
         posCaseLine = __LINE__;
         result = inOut[pos].type == nvinfer1::DataType::kINT32;
     }
-    else if (isMRoPE() && (pos == getIdx(IdxEntry::MROPE_ROTARY_SIN_COS)))
+    else if (isMRoPE() && (pos == getIdx(IdxEntry::MROPE_ROTARY_COS_SIN)))
     {
         return inOut[pos].type == nvinfer1::DataType::kFLOAT;
     }
@@ -475,13 +478,14 @@ void GPTAttentionPlugin::configurePluginImpl(nvinfer1::DynamicPluginTensorDesc c
         /*attention_mask_stride*/ 0,
         max_attention_window_size,
         cyclic_attention_window_size,
+        cyclic_attention_window_size,
+        /*can_use_one_more_block=*/false,
         sink_token_length,
         num_requests,
         /*max_blocks_per_sequence=*/0,
         /*cache_indir=*/nullptr,
         /*workspace=*/nullptr,
         /*max_context_kv_len_list=*/nullptr,
-        /*mrope_rotary_sin_cos*/ nullptr,
         /*mrope_position_deltas*/ nullptr,
 
     };
@@ -722,6 +726,17 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         + inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims.d[getPackedTensorHiddenDimIndex(mRemovePadding)]
             * size_t(tokenIdxBeg);
 
+    bool changeSpecDecodingMode = false;
+    if (mIsSpecDecodingEnabled)
+    {
+        bool useSpecDecoding
+            = static_cast<bool>(reinterpret_cast<int const*>(inputs[getIdx(IdxEntry::SPEC_DECODING_USE)])[0]);
+        changeSpecDecodingMode = mUseSpecDecoding != useSpecDecoding;
+        mUseSpecDecoding = useSpecDecoding;
+        // change mMultiBlockMode to default
+        mMultiBlockMode = mUseSpecDecoding ? false : true;
+    }
+
     [[maybe_unused]] mlaParams<T> mla_params;
     if (mIsMLAEnabled)
     {
@@ -777,8 +792,8 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         rotary_cos_sin = reinterpret_cast<float2 const*>(inputs[getIdx(inputName)]);
     }
 
-    auto const mrope_rotary_sin_cos
-        = isMRoPE() ? reinterpret_cast<float2 const*>(inputs[getIdx(IdxEntry::MROPE_ROTARY_SIN_COS)]) : nullptr;
+    auto const mrope_rotary_cos_sin
+        = isMRoPE() ? reinterpret_cast<float2 const*>(inputs[getIdx(IdxEntry::MROPE_ROTARY_COS_SIN)]) : nullptr;
 
     auto const mrope_position_deltas
         = isMRoPE() ? reinterpret_cast<int32_t const*>(inputs[getIdx(IdxEntry::MROPE_POSITION_DELTAS)]) : nullptr;
@@ -840,10 +855,16 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         : (useKVCache() ? inputDesc[getIdx(IdxEntry::CACHE_INDIR)].dims.d[2] : 0);
     // The cyclic_attention_window_size will determine the cyclic kv cache position of new tokens.
     // Note that this cyclic_attention_window_size might be smaller than the actual kv cache capactity.
-    int const cyclic_attention_window_size = isCrossAttention()
-        ? max_encoder_context_len
-        : reinterpret_cast<int const*>(inputs[getIdx(IdxEntry::HOST_MAX_ATTENTION_WINDOW)])[mLayerIdx];
+    int const* cyclic_attention_window_sizes
+        = reinterpret_cast<int const*>(inputs[getIdx(IdxEntry::HOST_MAX_ATTENTION_WINDOW)]);
+    int const cyclic_attention_window_size
+        = isCrossAttention() ? max_encoder_context_len : cyclic_attention_window_sizes[mLayerIdx];
     int const sink_token_length = reinterpret_cast<int const*>(inputs[getIdx(IdxEntry::HOST_SINK_TOKEN_LENGTH)])[0];
+    int const num_attn_layer = inputDesc[getIdx(IdxEntry::HOST_MAX_ATTENTION_WINDOW)].dims.d[0];
+    int const max_cyclic_attention_window_size = isCrossAttention()
+        ? max_encoder_context_len
+        : *std::max_element(cyclic_attention_window_sizes, cyclic_attention_window_sizes + num_attn_layer);
+    bool const can_use_one_more_block = beamWidth > 1;
 
     float const* kv_scale_orig_quant = nullptr;
     float const* kv_scale_quant_orig = nullptr;
@@ -944,7 +965,7 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
     int const* spec_decoding_position_offsets = nullptr;
     int const* spec_decoding_generation_lengths = nullptr;
     int num_decoding_draft_tokens = 0;
-    if (mIsSpecDecodingEnabled)
+    if (mIsSpecDecodingEnabled && mUseSpecDecoding)
     {
         // Second dimension of spec_decoding_position_offsets is num_decoding_draft_tokens + 1.
         // [batch_size, num_decoding_draft_tokens + 1]
@@ -1002,11 +1023,11 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
 
         EnqueueContextParams<T> enqueue_params{attention_input, qkv_bias, attention_mask, attention_packed_mask,
             rotary_inv_freq, rotary_cos_sin, max_context_q_len, max_context_kv_len, max_attention_window_size,
-            cyclic_attention_window_size, sink_token_length, context_q_lengths, sequence_kv_length, kv_scale_orig_quant,
-            kv_scale_quant_orig, attention_output_orig_quant, alibi_slopes, context_buf_, key_value_cache,
-            block_offsets, host_block_offsets, host_primary_pool_pointer, host_secondary_pool_pointer, batch_size,
-            localNbTokens, max_blocks_per_sequence, host_context_lengths, workspace, mrope_rotary_sin_cos,
-            mrope_position_deltas};
+            cyclic_attention_window_size, max_cyclic_attention_window_size, can_use_one_more_block, sink_token_length,
+            context_q_lengths, sequence_kv_length, kv_scale_orig_quant, kv_scale_quant_orig,
+            attention_output_orig_quant, alibi_slopes, context_buf_, key_value_cache, block_offsets, host_block_offsets,
+            host_primary_pool_pointer, host_secondary_pool_pointer, batch_size, localNbTokens, max_blocks_per_sequence,
+            host_context_lengths, workspace, mrope_rotary_cos_sin};
 
         enqueue_params.runtime_perf_knobs = runtime_perf_knobs;
         if (isRelativePosition())
@@ -1080,7 +1101,7 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         int const input_seq_length = getGenerationInputSequenceLength(inputDesc, localNbSeq, localNbTokens);
         int const max_past_kv_length = isCrossAttention() ? max_encoder_context_len : max_context_kv_len;
         auto qkvDims = inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims;
-        TLLM_CHECK_WITH_INFO(input_seq_length == 1 || mIsSpecDecodingEnabled,
+        TLLM_CHECK_WITH_INFO(input_seq_length == 1 || (mIsSpecDecodingEnabled && mUseSpecDecoding),
             "Only speculative decoding mode supports input length > 1 in the generation phase, input_seq_length=%d, "
             "mIsSpecDecodingEnabled=%s, nDims=%d, (" FMT_DIM ", " FMT_DIM ", " FMT_DIM ")",
             input_seq_length, mIsSpecDecodingEnabled ? "true" : "false", qkvDims.nbDims, qkvDims.d[0], qkvDims.d[1],
@@ -1091,9 +1112,9 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
             input_seq_length, sequence_kv_length, max_past_kv_length, beamWidth, context_q_lengths, kv_scale_orig_quant,
             kv_scale_quant_orig, attention_output_orig_quant, alibi_slopes, context_buf_, key_value_cache,
             block_offsets, host_primary_pool_pointer, host_secondary_pool_pointer, attention_mask_stride,
-            max_attention_window_size, cyclic_attention_window_size, sink_token_length, num_requests,
-            max_blocks_per_sequence, cache_indir, mMultiBlockSemaphores.get(), workspace, max_context_kv_len_list,
-            mrope_rotary_sin_cos, mrope_position_deltas};
+            max_attention_window_size, cyclic_attention_window_size, max_cyclic_attention_window_size,
+            can_use_one_more_block, sink_token_length, num_requests, max_blocks_per_sequence, cache_indir,
+            mMultiBlockSemaphores.get(), workspace, max_context_kv_len_list, mrope_position_deltas};
         enqueue_params.host_context_lengths = host_context_lengths;
         enqueue_params.runtime_perf_knobs = runtime_perf_knobs;
         if (isRelativePosition())
@@ -1112,7 +1133,7 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
             enqueue_params.encoder_input_lengths
                 = reinterpret_cast<int const*>(inputs[getIdx(IdxEntry::ENCODER_INPUT_LENGTH)]) + seqIdxBeg;
         }
-        if (mIsSpecDecodingEnabled)
+        if (mIsSpecDecodingEnabled && mUseSpecDecoding)
         {
             enqueue_params.spec_decoding_packed_mask = spec_decoding_packed_mask;
             enqueue_params.spec_decoding_position_offsets = spec_decoding_position_offsets;
@@ -1121,6 +1142,12 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
             enqueue_params.spec_decoding_max_generation_length = mSpecDecodingMaxGenerationLength;
         }
         enqueue_params.total_num_input_tokens = localNbTokens;
+
+        if (changeSpecDecodingMode)
+        {
+            // mUseSpecDecoding is changed, need to re-prepare the DecoderXQARunner
+            prepareEnqueueGeneration<T, KVCacheBuffer>(enqueue_params);
+        }
 
         // Current mlaGeneration will using fmha to do attention, so we don't go into enqueueGeneration
         if (mIsMLAEnabled)

@@ -120,6 +120,8 @@ bool AllreducePlugin::supportsFormatCombination(
         ++fusion_op_extra_inputs;
         if (mAffine)
         {
+            if (mOp == AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM)
+                ++fusion_op_extra_inputs;
             ++fusion_op_extra_inputs;
         }
         if (mBias)
@@ -302,7 +304,7 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
 
     if (runtimeStrategy == AllReduceStrategyType::NCCL)
     {
-        if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
+        if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM || mOp == AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM)
         {
             NCCLCHECK(ncclAllReduce(inputs[0], outputs[1], size, (*getDtypeMap())[mType], ncclSum, *mNcclComm, stream));
             tensorrt_llm::kernels::AllReduceParams params;
@@ -318,12 +320,17 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
             params.fusion_params.bias_buffer = mBias ? inputs[fusion_ptr_idx++] : nullptr;
             params.fusion_params.residual_buffer = inputs[fusion_ptr_idx++];
             params.fusion_params.weight_buffer = mAffine ? inputs[fusion_ptr_idx++] : nullptr;
+            if (mOp == AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM)
+            {
+                params.fusion_params.weight_buffer_pre_residual_norm = mAffine ? inputs[fusion_ptr_idx++] : nullptr;
+            }
             params.local_output_buffer_ptr = outputs[0];
             params.elts_total = size;
             params.fusion_params.hidden_size = inputDesc[0].dims.d[inputDesc[0].dims.nbDims - 1];
             params.fusion_params.eps = mEps;
             params.fusion_params.intermediate_buffer = outputs[1];
-            tensorrt_llm::kernels::residualRmsNorm(params, mType, stream);
+            TLLM_LOG_DEBUG("residualRmsNorm called");
+            tensorrt_llm::kernels::residualRmsNorm(params, mType, stream, mOp);
         }
         else
         {
@@ -394,16 +401,18 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
         params.local_output_buffer_ptr = outputs[0];
         params.local_input_buffer_ptr = inputs[0];
         params.elts_total = size;
+
+        int fusion_ptr_idx = 2;
+        params.fusion_params.bias_buffer = mBias ? inputs[fusion_ptr_idx++] : nullptr;
+        params.fusion_params.residual_buffer = inputs[fusion_ptr_idx++];
+        params.fusion_params.weight_buffer = mAffine ? inputs[fusion_ptr_idx++] : nullptr;
+        if (mOp == AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM)
+            params.fusion_params.weight_buffer_pre_residual_norm = mAffine ? inputs[fusion_ptr_idx++] : nullptr;
+        params.fusion_params.hidden_size = hidden_size;
+        params.fusion_params.eps = mEps;
+        params.fusion_params.intermediate_buffer = outputs[1];
         if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
         {
-
-            int fusion_ptr_idx = 2;
-            params.fusion_params.bias_buffer = mBias ? inputs[fusion_ptr_idx++] : nullptr;
-            params.fusion_params.residual_buffer = inputs[fusion_ptr_idx++];
-            params.fusion_params.weight_buffer = mAffine ? inputs[fusion_ptr_idx++] : nullptr;
-            params.fusion_params.hidden_size = hidden_size;
-            params.fusion_params.eps = mEps;
-            params.fusion_params.intermediate_buffer = outputs[1];
             for (int i = 0; i < tpSize; ++i)
             {
                 params.fusion_params.lamport_peer_comm_buffer_ptrs[i]
@@ -414,6 +423,7 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
                     = reinterpret_cast<void**>(const_cast<void*>(inputs[1]))[tpSize * 6 + i];
             }
         }
+        TLLM_LOG_DEBUG("customAllReduce called");
         tensorrt_llm::kernels::customAllReduce(params, mType, runtimeStrategy, mConfig, mOp, stream);
     }
 

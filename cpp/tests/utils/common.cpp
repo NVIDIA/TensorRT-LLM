@@ -232,4 +232,12 @@ std::tuple<std::vector<SizeType32>, SizeType32, SizeType32> getGivenInputLengths
     return {givenInputLengths, nbGivenInputs, maxInputLength};
 }
 
+std::vector<tensorrt_llm::executor::TokenIdType> createConsecutiveTokenSequence(
+    tensorrt_llm::runtime::SizeType32 length, tensorrt_llm::runtime::TokenIdType vocabLength)
+{
+    auto result = std::vector<tensorrt_llm::executor::TokenIdType>(static_cast<size_t>(length), 0);
+    std::iota(result.begin(), result.end(), 0);
+    std::transform(result.begin(), result.end(), result.begin(), [&](auto const i) { return i % vocabLength; });
+    return result;
+}
 } // namespace tensorrt_llm::testing

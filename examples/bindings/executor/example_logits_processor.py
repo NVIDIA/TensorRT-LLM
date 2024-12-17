@@ -71,8 +71,10 @@ def wait_for_responses(args: argparse.Namespace, request_ids: list[int],
                        executor: trtllm.Executor) -> dict[dict[list[int]]]:
 
     output_tokens = {
-        req_id: {beam: []
-                 for beam in range(args.beam_width)}
+        req_id: {
+            beam: []
+            for beam in range(args.beam_width)
+        }
         for req_id in request_ids
     }
     num_finished = 0

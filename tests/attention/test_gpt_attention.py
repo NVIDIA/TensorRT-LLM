@@ -1194,9 +1194,9 @@ class TestFunctional(unittest.TestCase):
                         tgt_len=in_len)
                     # source shape = (b, 1, s_query, s_key)
                     # target shape = (b, s_query, h, s_key)
-                    attention_mask = (attention_mask >= 0).permute(
-                        [0, 2, 1, 3]).expand(batch_size, in_len, num_heads,
-                                             in_len)
+                    attention_mask = (attention_mask
+                                      >= 0).permute([0, 2, 1, 3]).expand(
+                                          batch_size, in_len, num_heads, in_len)
                     torch_output, torch_present = attention(
                         input_tensor,
                         layer_past=None,
@@ -1337,9 +1337,9 @@ class TestFunctional(unittest.TestCase):
                     # source shape = (b, 1, 1, s_key)
                     # target shape = (b, 1, h, s_key)
                     key_seqlen = in_len + step  # ctx_attention_mask.shape[1]
-                    attention_mask = (attention_mask >= 0).permute(
-                        [0, 2, 1, 3]).expand(batch_size, 1, num_heads,
-                                             key_seqlen)
+                    attention_mask = (attention_mask
+                                      >= 0).permute([0, 2, 1, 3]).expand(
+                                          batch_size, 1, num_heads, key_seqlen)
                     torch_output, torch_present = attention(
                         input_tensor,
                         layer_past=torch_present,

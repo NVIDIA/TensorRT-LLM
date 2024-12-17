@@ -20,6 +20,7 @@ We first describe how to run each model on a single GPU. We then provide general
 - [InternVL2](#internvl2)
 - [Qwen2-VL](#qwen2-vl)
 - [Enabling tensor parallelism for multi-GPU](#enabling-tensor-parallelism-for-multi-gpu)
+- [MLLaMA](#mllama)
 
 ## BLIP2
 
@@ -831,8 +832,7 @@ Firstly, please install transformers with 4.37.2
 
 Firstly, please install transformers and qwen-vl-utils
 ```bash
-    pip install git+https://github.com/huggingface/transformers@21fac7abba2a37fae86106f87fcf9974fd1e3830 accelerate
-    pip install qwen-vl-utils
+    pip install -r requirements-qwen2vl.txt
 ```
 1. Download Huggingface weights
     ```bash
@@ -853,7 +853,7 @@ Firstly, please install transformers and qwen-vl-utils
         --gpt_attention_plugin=float16 \
         --max_batch_size=4 \
         --max_input_len=2048 --max_seq_len=3072 \
-        --max_prompt_embedding_table_size=14208
+        --max_multimodal_len=1296 #(max_batch_size) * 324 (num_visual_features), this's for image_shape=[504,504]
     ```
 
 3. Generate TensorRT engines for visual components and combine everything into final pipeline.
@@ -904,3 +904,173 @@ The full set of commands to enable 2-way tensor parallelism for LLaVA is:
         --visual_engine_dir tmp/trt_engines/${MODEL_NAME}/vision_encoder \
         --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/fp16/2-gpu \
     ```
+
+## Dataset Evaluation
+
+This section explains how to evaluate datasets using our provided script, including supported models and configurations.
+
+### Evaluation Command
+To run an evaluation, use the following command:
+
+```bash
+python ./examples/multimodal/eval.py \
+    --model_type <model_type> \
+    --visual_engine_dir <visual_engine_dir> \
+    --llm_engine_dir <llm_engine_dir> \
+    --hf_model_dir <hf_model_dir> \
+    --dataset_dir <dataset_dir> \
+    --test_trtllm (or --test_hf, or both) \
+    --accuracy_threshold <threshold> \
+    --eval_task <eval_task> \
+    --max_ite 20 \
+    --visual_engine_name <visual_engine_name>
+```
+
+### Parameters
+- `--model_type`: Specify the model type to evaluate.
+- `--visual_engine_dir`: Path to the visual engine directory.
+- `--llm_engine_dir`: Path to the LLM engine directory.
+- `--hf_model_dir`: Path to the Hugging Face model directory.
+- `--dataset_dir`: Path to the dataset directory. If not specified, will load the dataset from HF with the `--eval_task` as dataset tag.
+- `--test_trtllm` or `--test_hf`: Specify which evaluation framework to use. Both can be used simultaneously.
+- `--accuracy_threshold`: Set the accuracy threshold for evaluation.
+- `--eval_task`: Specify the evaluation task. Supported tasks: `['lmms-lab/ai2d', 'lmms-lab/VQAv2', 'lmms-lab/MME']`. Default to `'lmms-lab/VQAv2'`.
+- `--max_ite`: Maximum number of iterations, default to 20.
+- `--visual_engine_name`: Name of the visual engine.
+
+### Supported Evaluation Tasks
+The following evaluation tasks are supported:
+- `lmms-lab/ai2d`
+- `lmms-lab/VQAv2`
+- `lmms-lab/MME`
+
+### Supported Model Types
+The script supports the following model types:
+- `blip2`
+- `fuyu`
+- `kosmos-2`
+- `llava`
+- `llava_next`
+- `llava_onevision`
+- `phi-3-vision`
+- `qwen2_vl`
+- `mllama`
+- `vila`
+- `cogvlm`
+- `neva`
+- `internvl`
+
+**Note:** The models `vila`, `cogvlm`, `neva`, and `internvl` do not support the `--test_hf` evaluation framework.
+
+## MLLaMA
+
+This section shows how to build and run a LLaMA-3.2 Vision model in TensorRT-LLM. We use [Llama-3.2-11B-Vision/](https://huggingface.co/meta-llama/Llama-3.2-11B-Vision) as an example.
+
+For LLaMA-3.2 text model, please refer to the [examples/llama/README.md](../llama/README.md) because it shares the model architecture of llama.
+
+### Support data types
+  * BF16
+  * Tensor Parallel
+  * INT8 & INT4 Weight-Only
+  * FP8
+
+### Build and run vision model
+
+* build engine of vision encoder model
+
+```bash
+python examples/multimodal/build_visual_engine.py --model_type mllama \
+                                                  --model_path Llama-3.2-11B-Vision/ \
+                                                  --output_dir /tmp/mllama/trt_engines/encoder/
+```
+
+* build engine of decoder model
+
+```bash
+python examples/mllama/convert_checkpoint.py --model_dir Llama-3.2-11B-Vision/ \
+                              --output_dir /tmp/mllama/trt_ckpts \
+                              --dtype bfloat16
+
+python3 -m tensorrt_llm.commands.build \
+            --checkpoint_dir /tmp/mllama/trt_ckpts \
+            --output_dir /tmp/mllama/trt_engines/decoder/ \
+            --max_num_tokens 4096 \
+            --max_seq_len 2048 \
+            --workers 1 \
+            --gemm_plugin auto \
+            --max_batch_size 4 \
+            --max_encoder_input_len 4100 \
+            --input_timing_cache model.cache
+```
+
+Note that for instruct Vision model, please set the `max_encoder_input_len` as `6404`.
+
+* Run test on multimodal/run.py with C++ runtime
+
+```bash
+python3 examples/multimodal/run.py --visual_engine_dir /tmp/mllama/trt_engines/encoder/ \
+                                   --visual_engine_name visual_encoder.engine \
+                                   --llm_engine_dir /tmp/mllama/trt_engines/decoder/ \
+                                   --hf_model_dir Llama-3.2-11B-Vision/ \
+                                   --image_path https://huggingface.co/datasets/huggingface/documentation-images/resolve/0052a70beed5bf71b92610a43a52df6d286cd5f3/diffusers/rabbit.jpg \
+                                   --input_text "<|image|><|begin_of_text|>If I had to write a haiku for this one" \
+                                   --max_new_tokens 50 \
+                                   --batch_size 2
+
+Use model_runner_cpp by default. To switch to model_runner, set `--use_py_session` in the command mentioned above.
+
+python3 examples/multimodal/eval.py --visual_engine_dir /tmp/mllama/trt_engines/encoder/ \
+                                   --visual_engine_name visual_encoder.engine \
+                                   --llm_engine_dir /tmp/mllama/trt_engines/decoder/ \
+                                   --hf_model_dir Llama-3.2-11B-Vision/ \
+                                   --test_trtllm \
+                                   --accuracy_threshold 65 \
+                                   --eval_task lmms-lab/ai2d
+```
+
+### Run MLLaMA decoder part by FP8
+
+```bash
+# install modelopt 0.21.0
+pip install nvidia-modelopt[torch]~=0.21.0
+
+python ./examples/quantization/quantize.py --model_dir Llama-3.2-11B-Vision/ \
+                                           --dtype bfloat16 \
+                                           --qformat fp8 \
+                                           --output_dir /tmp/llama-3.2-11B-Vision/fp8/ \
+                                           --kv_cache_dtype fp8 \
+                                           --calib_size 512 \
+                                           --calib_dataset scienceqa
+
+python3 -m tensorrt_llm.commands.build \
+            --checkpoint_dir /tmp/llama-3.2-11B-Vision/fp8/ \
+            --output_dir /tmp/trt_engines/llama-3.2-11B-Vision/decoder/fp8/ \
+            --max_num_tokens 4096 \
+            --max_seq_len 2048 \
+            --workers 1 \
+            --gemm_plugin auto \
+            --max_batch_size 4 \
+            --max_encoder_input_len 4100 \
+            --input_timing_cache model.cache \
+            --use_paged_context_fmha enable \
+            --use_fp8_context_fmha enable
+
+python3 examples/multimodal/run.py --visual_engine_dir /tmp/mllama/trt_engines/encoder/ \
+                                   --visual_engine_name visual_encoder.engine \
+                                   --llm_engine_dir /tmp/trt_engines/llama-3.2-11B-Vision/decoder/fp8/ \
+                                   --hf_model_dir Llama-3.2-11B-Vision/ \
+                                   --image_path https://huggingface.co/datasets/huggingface/documentation-images/resolve/0052a70beed5bf71b92610a43a52df6d286cd5f3/diffusers/rabbit.jpg \
+                                   --input_text "<|image|><|begin_of_text|>If I had to write a haiku for this one" \
+                                   --max_new_tokens 50 \
+                                   --batch_size 2
+
+python3 examples/multimodal/eval.py --visual_engine_dir /tmp/mllama/trt_engines/encoder/ \
+                                   --visual_engine_name visual_encoder.engine \
+                                   --llm_engine_dir /tmp/trt_engines/llama-3.2-11B-Vision/decoder/fp8/ \
+                                   --hf_model_dir Llama-3.2-11B-Vision/ \
+                                   --test_trtllm \
+                                   --accuracy_threshold 65 \
+                                   --eval_task lmms-lab/ai2d
+```
+
+Note that for instruct Vision model, please set the `max_encoder_input_len` as `6404`.
