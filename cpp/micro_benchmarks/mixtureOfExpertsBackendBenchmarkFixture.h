@@ -46,6 +46,7 @@ static BufferManager::CudaStreamPtr streamPtr;
 static std::unique_ptr<BufferManager> bufferManager;
 static int deviceCount;
 static char* workloadFile = nullptr;
+static bool useCudaGraph = true;
 
 enum VERBOSE_LEVEL
 {
@@ -503,6 +504,34 @@ public:
         check_cuda_error(cudaStreamSynchronize(streamPtr->get()));
     }
 
+    cudaGraph_t mGraph{};
+    cudaGraphExec_t mGraphInstance{};
+
+    void createGraph(MOEParallelismConfig parallelism_config)
+    {
+        if (!useCudaGraph)
+            return;
+
+        NVTX3_SCOPED_RANGE(BuildGraph);
+
+        check_cuda_error(cudaGraphCreate(&mGraph, 0));
+        check_cuda_error(cudaStreamBeginCapture(streamPtr->get(), cudaStreamCaptureModeThreadLocal));
+        runMoEPermute(parallelism_config);
+        check_cuda_error(cudaStreamEndCapture(streamPtr->get(), &mGraph));
+        check_cuda_error(cudaGraphInstantiate(&mGraphInstance, mGraph, nullptr, nullptr, 0));
+    }
+
+    void destroyGraph()
+    {
+        if (!useCudaGraph)
+            return;
+
+        NVTX3_SCOPED_RANGE(DestroyGraph);
+
+        check_cuda_error(cudaGraphExecDestroy(mGraphInstance));
+        check_cuda_error(cudaGraphDestroy(mGraph));
+    }
+
     float benchmarkLoop(MOEParallelismConfig parallelism_config)
     {
         auto tactic = routingConfigCache.at(mRoutingConfigIndex);
@@ -514,7 +543,14 @@ public:
         {
             NVTX3_SCOPED_RANGE(BenchmarkLoopIteration);
             check_cuda_error(cudaEventRecord(mStartEvent, streamPtr->get()));
-            runMoEPermute(parallelism_config);
+            if (useCudaGraph)
+            {
+                cudaGraphLaunch(mGraphInstance, streamPtr->get());
+            }
+            else
+            {
+                runMoEPermute(parallelism_config);
+            }
             check_cuda_error(cudaEventRecord(mEndEvent, streamPtr->get()));
             check_cuda_error(cudaStreamSynchronize(streamPtr->get()));
         }
@@ -714,6 +750,8 @@ void MixtureOfExpertsBenchmark<TypeTuple_>::runBenchmark(benchmark::State& state
     state.counters["tactic_idx1"] = tactic_idx1;
     state.counters["tactic_idx2"] = tactic_idx2;
 
+    createGraph(parallelism_config);
+
     {
         NVTX3_SCOPED_RANGE(BenchmarkRun);
         for (auto _ : state)
@@ -722,6 +760,8 @@ void MixtureOfExpertsBenchmark<TypeTuple_>::runBenchmark(benchmark::State& state
             state.SetIterationTime(ms / 1000.f);
         }
     }
+
+    destroyGraph();
 
     state.SetItemsProcessed(state.iterations() * num_tokens);
 

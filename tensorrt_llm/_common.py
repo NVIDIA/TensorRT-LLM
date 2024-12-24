@@ -70,6 +70,7 @@ def _init(log_level: object = None) -> None:
         ft_decoder_lib = project_dir + '/libs/libth_common.so'
     try:
         torch.classes.load_library(ft_decoder_lib)
+        register_fake()
     except Exception as e:
         msg = '\nFATAL: Decoding operators failed to load. This may be caused by the incompatibility between PyTorch and TensorRT-LLM. Please rebuild and install TensorRT-LLM.'
         raise ImportError(str(e) + msg)
@@ -77,6 +78,21 @@ def _init(log_level: object = None) -> None:
     MpiComm.local_init()
 
     logger.info('TensorRT-LLM inited.')
+
+
+def register_fake():
+
+    @torch.library.register_fake("trtllm::allreduce")
+    def _(input, workspace, reduce_fusion_inputs, group, strategy, config, op,
+          eps, affine, bias):
+        final_output = torch.empty_like(input)
+        inter_output = torch.empty_like(input)
+        return final_output, inter_output
+
+    @torch.library.register_fake("trtllm::allgather")
+    def _(input, group):
+        output_shape = (len(group), *input.shape)
+        return input.new_empty(output_shape)
 
 
 def default_net() -> Network:

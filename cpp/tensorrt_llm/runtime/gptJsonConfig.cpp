@@ -46,7 +46,10 @@ FieldType parseJsonFieldOr(Json const& json, std::string_view name, FieldType de
     auto value = defaultValue;
     try
     {
-        value = json.at(name).template get<FieldType>();
+        if (json.find(name) != json.end() && !json.at(name).is_null())
+        {
+            value = json.at(name).template get<FieldType>();
+        }
     }
     catch (nlohmann::json::out_of_range& e)
     {
@@ -216,17 +219,23 @@ ModelConfig createModelConfig(
     // Set logits datatype
     auto logitsDtype = nvinfer1::DataType::kFLOAT;
     if (logitsDtypeStr == "float32")
+    {
         logitsDtype = nvinfer1::DataType::kFLOAT;
+    }
     else if (logitsDtypeStr == "float16")
+    {
         logitsDtype = nvinfer1::DataType::kHALF;
+    }
     else
+    {
         TLLM_THROW("Unsupported logits data type");
+    }
     modelConfig.setLogitsDtype(logitsDtype);
 
     // only enable cross attention for the decoder in encoder-decoder model
     // TODO: add cross_attention and has_token_type_embedding as fields in pretrained config
     auto const useCrossAttention
-        = (arch == std::string("DecoderModel") || parseJsonFieldOr(config, "cross_attention", false)) ? true : false;
+        = arch == std::string("DecoderModel") || parseJsonFieldOr(config, "cross_attention", false);
     if (useCrossAttention)
     {
         // For an encoder-decoder model, this would be overwritten in executorImpl.cpp with correct encoder config
@@ -244,6 +253,15 @@ ModelConfig createModelConfig(
     modelConfig.setUseCrossAttention(useCrossAttention);
     modelConfig.setUsePositionEmbedding(usePositionEmbedding);
     modelConfig.setUseTokenTypeEmbedding(useTokenTypeEmbedding);
+    if (json.count("pretrained_config"))
+    {
+        auto const maxPositionEmbeddings
+            = parseJsonFieldOr<SizeType32>(json.at("pretrained_config"), "max_position_embeddings", 0);
+        modelConfig.setMaxPositionEmbeddings(maxPositionEmbeddings);
+        auto const rotaryEmbeddingDim
+            = parseJsonFieldOr<SizeType32>(json.at("pretrained_config"), "rotary_embedding_dim", 0);
+        modelConfig.setRotaryEmbeddingDim(rotaryEmbeddingDim);
+    }
     modelConfig.setSkipCrossAttnBlocks(skipCrossAttnBlocks);
 
     if (mlpHiddenSize.has_value())
@@ -269,6 +287,7 @@ void parseBuilderConfig(ModelConfig& modelConfig, Json const& builderConfig)
         = parseJsonFieldOptional<SpeculativeDecodingMode::UnderlyingType>(builderConfig, "speculative_decoding_mode");
     auto const kvCacheTypeStr = parseJsonFieldOr<std::string>(builderConfig, "kv_cache_type", "continuous");
     auto const kvCacheType = ModelConfig::KVCacheTypeFromString(kvCacheTypeStr);
+    auto const useMrope = parseJsonFieldOr(builderConfig, "use_mrope", false);
 
     auto it = builderConfig.find("kv_cache_type");
     if (it == builderConfig.end())
@@ -290,6 +309,7 @@ void parseBuilderConfig(ModelConfig& modelConfig, Json const& builderConfig)
             ? SpeculativeDecodingMode(speculativeDecodingModeOpt.value())
             : SpeculativeDecodingMode::None());
     modelConfig.setKVCacheType(kvCacheType);
+    modelConfig.setUseMrope(useMrope);
 }
 
 void parsePluginConfig(ModelConfig& modelConfig, Json const& pluginConfig)
@@ -303,7 +323,6 @@ void parsePluginConfig(ModelConfig& modelConfig, Json const& pluginConfig)
     auto const contextFMHA = pluginConfig.at("context_fmha").template get<bool>();
     auto const pagedContextFMHA = pluginConfig.at("use_paged_context_fmha").template get<bool>();
     auto const pagedState = parseJsonFieldOr(pluginConfig, "paged_state", false);
-    auto const useXQA = parseJsonFieldOr(pluginConfig, "enable_xqa", false);
     auto const manageWeightsType = parseJsonFieldOr<bool>(pluginConfig, "manage_weights", false)
         ? ModelConfig::ManageWeightsType::kEnabled
         : ModelConfig::ManageWeightsType::kDisabled;
@@ -323,7 +342,6 @@ void parsePluginConfig(ModelConfig& modelConfig, Json const& pluginConfig)
     modelConfig.setTokensPerBlock(tokensPerBlock);
     modelConfig.setContextFMHA(contextFMHA);
     modelConfig.setPagedContextFMHA(pagedContextFMHA);
-    modelConfig.useXQA(useXQA);
     modelConfig.setManageWeightsType(manageWeightsType);
     modelConfig.setPpReduceScatter(ppReduceScatter);
 }
@@ -404,6 +422,9 @@ GptJsonConfig parseJson(InputType&& input)
     auto const pipelineParallelism = engineVersionNone
         ? parseJsonFieldOr(builderConfig, "pipeline_parallel", 1)
         : parseJsonFieldOr(json.at("pretrained_config").at("mapping"), "pp_size", 1);
+    auto const contextParallelism = engineVersionNone
+        ? parseJsonFieldOr(builderConfig, "context_parallel", 1)
+        : parseJsonFieldOr(json.at("pretrained_config").at("mapping"), "cp_size", 1);
     auto const gpusPerNode = engineVersionNone ? WorldConfig::kDefaultGpusPerNode
                                                : parseJsonFieldOr(json.at("pretrained_config").at("mapping"),
                                                    "gpus_per_node", WorldConfig::kDefaultGpusPerNode);
@@ -413,14 +434,19 @@ GptJsonConfig parseJson(InputType&& input)
 
     auto const dataType = [&precision]()
     {
-        if (!precision.compare("float32"))
+        if (precision == "float32")
+        {
             return nvinfer1::DataType::kFLOAT;
-        else if (!precision.compare("float16"))
+        }
+        if (precision == "float16")
+        {
             return nvinfer1::DataType::kHALF;
-        else if (!precision.compare("bfloat16"))
+        }
+        if (precision == "bfloat16")
+        {
             return nvinfer1::DataType::kBF16;
-        else
-            TLLM_THROW("Model data type '%s' not supported", precision.c_str());
+        }
+        TLLM_THROW("Model data type '%s' not supported", precision.c_str());
     }();
 
     auto modelConfig = createModelConfig(json, engineVersionNone, tensorParallelism, dataType);
@@ -537,10 +563,15 @@ GptJsonConfig parseJson(InputType&& input)
                 auto const numEagleLayers = parseJsonFieldOr(pretrainedConfig, "num_eagle_layers", 0);
                 auto const& eagleConfig = pretrainedConfig.at("eagle_net_config");
                 auto const numEagleNetLayers = eagleConfig.at("num_hidden_layers").template get<SizeType32>();
+                auto const maxNonLeafNodesPerLayer
+                    = pretrainedConfig.at("max_non_leaves_per_layer").template get<SizeType32>();
 
                 TLLM_CHECK_WITH_INFO(maxDraftLen > 0, "max_draft_len has to be larger than 0 for eagle decoding");
                 TLLM_CHECK_WITH_INFO(numEagleLayers > 0, "num_eagle_layers has to be larger than 0 for eagle decoding");
-                auto eagleModule = std::make_shared<EagleModule>(numEagleLayers, maxDraftLen, numEagleNetLayers);
+                TLLM_CHECK_WITH_INFO(
+                    maxNonLeafNodesPerLayer > 0, "max_non_leaves_per_layer has to be larger than 0 for eagle decoding");
+                auto eagleModule = std::make_shared<EagleModule>(
+                    numEagleLayers, maxDraftLen, numEagleNetLayers, maxNonLeafNodesPerLayer);
                 modelConfig.setSpeculativeDecodingModule(eagleModule);
             }
         }
@@ -607,8 +638,8 @@ GptJsonConfig parseJson(InputType&& input)
             modelConfig.setRnnConfig(rnnConfig);
         }
     }
-    return GptJsonConfig{name, engineVersion, precision, tensorParallelism, pipelineParallelism, gpusPerNode,
-        modelConfig, runtimeDefaults};
+    return GptJsonConfig{name, engineVersion, precision, tensorParallelism, pipelineParallelism, contextParallelism,
+        gpusPerNode, modelConfig, runtimeDefaults};
 }
 
 } // namespace
@@ -618,16 +649,17 @@ std::string GptJsonConfig::engineFilename(WorldConfig const& worldConfig, std::s
     TLLM_CHECK_WITH_INFO(getTensorParallelism() == worldConfig.getTensorParallelism(), "tensor parallelism mismatch");
     TLLM_CHECK_WITH_INFO(
         getPipelineParallelism() == worldConfig.getPipelineParallelism(), "pipeline parallelism mismatch");
+    TLLM_CHECK_WITH_INFO(
+        getContextParallelism() == worldConfig.getContextParallelism(), "Context parallelism mismatch");
     auto pp = worldConfig.isPipelineParallel() ? "_pp" + std::to_string(worldConfig.getPipelineParallelism()) : "";
+    auto cp = worldConfig.isContextParallel() ? "_cp" + std::to_string(worldConfig.getContextParallelism()) : "";
     if (getVersion() == std::string("none"))
     {
-        return model + "_" + getPrecision() + "_tp" + std::to_string(worldConfig.getTensorParallelism()) + pp + "_rank"
-            + std::to_string(worldConfig.getRank()) + ".engine";
+        return model + "_" + getPrecision() + "_tp" + std::to_string(worldConfig.getTensorParallelism()) + pp + cp
+            + "_rank" + std::to_string(worldConfig.getRank()) + ".engine";
     }
-    else
-    {
-        return "rank" + std::to_string(worldConfig.getRank()) + ".engine";
-    }
+
+    return "rank" + std::to_string(worldConfig.getRank()) + ".engine";
 }
 
 GptJsonConfig GptJsonConfig::parse(std::string const& json)

@@ -19,6 +19,7 @@
 
 #include <memory>
 
+#include "tensorrt_llm/layers/externalDraftTokensLayer.h"
 #include "tensorrt_llm/layers/samplingLayer.h"
 #include "tensorrt_llm/layers/topKSamplingLayer.h"
 #include "tensorrt_llm/layers/topPSamplingLayer.h"
@@ -87,6 +88,9 @@ struct TestSamplingParams
     std::vector<int32_t> topPResetIds;
     int32_t batchSize = 6;
     bool useBias = false;
+    bool isExternalDraftTokensLayerTest = false;
+    bool useDraftLogits = false;
+    bool isAirTopPExternalDraftTokensLayer = false;
 };
 
 template <typename T>
@@ -95,6 +99,8 @@ class BaseSamplingLayerTest : public testing::Test
 protected:
     using TensorPtr = tensorrt_llm::runtime::ITensor::SharedPtr;
     using BufferPtr = tensorrt_llm::runtime::IBuffer::SharedPtr;
+
+    static int32_t constexpr kDoubleBatchIdx = 2;
 
     int32_t seed = 0;
     int32_t mBatchSize = -1; // setup by runTest
@@ -107,6 +113,8 @@ protected:
     int32_t const mMaxInputLen = 0; // has no effect.
     int32_t const mMaxOutputLen = 4;
     int32_t const mMaxSeqLen = mMaxInputLen + mMaxOutputLen;
+    int32_t const mMaxTokensPerEngineStep = mMaxOutputLen;
+
     int32_t mEndId = mVocabSize;
 
     bool mComputeProbs = false;
@@ -137,7 +145,7 @@ protected:
 
     int32_t maxBatchSize() const
     {
-        return 2 * mBatchSize;
+        return kDoubleBatchIdx * mBatchSize;
     }
 
     int32_t batchBeam() const
@@ -149,7 +157,7 @@ protected:
 
     virtual void initLayer(TestSamplingParams const& params) = 0;
 
-    std::shared_ptr<tensorrt_llm::layers::SamplingInputs> createInputTensors(int32_t step);
+    virtual std::shared_ptr<tensorrt_llm::layers::DecodingInputs> createInputTensors(int32_t step);
 
     std::shared_ptr<tensorrt_llm::layers::BaseDecodingOutputs> createOutputTensors();
 

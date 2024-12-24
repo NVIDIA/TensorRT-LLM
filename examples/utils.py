@@ -397,6 +397,13 @@ def add_common_args(parser):
         "   E.g.: [[0, 0, 0, 0], [0, 1, 0], [1, 0], [1, 1]] for 9 draft tokens."
     )
     parser.add_argument(
+        '--eagle_posterior_threshold',
+        type=float,
+        default=None,
+        help="Minimum token probability threshold for typical acceptance. "
+        "Enables typical acceptance in Eagle. "
+        "Corresponds to epsilon in https://arxiv.org/pdf/2401.10774.")
+    parser.add_argument(
         '--lookahead_config',
         type=str,
         default=None,

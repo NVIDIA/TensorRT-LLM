@@ -1,7 +1,8 @@
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from transformers import AutoTokenizer, PreTrainedTokenizerBase
+from transformers import (AutoTokenizer, PreTrainedTokenizerBase,
+                          PreTrainedTokenizerFast)
 
 
 class TokenizerBase(PreTrainedTokenizerBase):
@@ -35,6 +36,12 @@ class TransformersTokenizer(TokenizerBase):
 
     def batch_encode_plus(self, texts: List[str], *args, **kwargs) -> dict:
         return self.tokenizer.batch_encode_plus(texts, *args, **kwargs)
+
+    def apply_chat_template(
+            self, conversation: Union[List[Dict[str, str]],
+                                      List[List[Dict[str, str]]]], *args,
+            **kwargs) -> Union[str, List[int], List[str], List[List[int]]]:
+        return self.tokenizer.apply_chat_template(conversation, *args, **kwargs)
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}({self.tokenizer})"
@@ -187,3 +194,39 @@ def tokenizer_factory(obj: Optional[Union[str, Path, PreTrainedTokenizerBase,
         return TransformersTokenizer(obj)
     else:
         raise TypeError(f"Unrecognized tokenizer {obj}")
+
+
+def _xgrammar_tokenizer_info(tokenizer):
+    # Reference: https://github.com/mlc-ai/xgrammar/blob/b9a16de54e1e0eff58da14c65750414cceaf1a6f/python/xgrammar/tokenizer_info.py#L133
+    if isinstance(tokenizer, TokenizerBase):
+        tokenizer = tokenizer.tokenizer
+
+    stop_token_ids = [tokenizer.eos_token_id]
+
+    try:
+        encoded_vocab = tokenizer.get_vocab()
+        encoded_vocab = [
+            token
+            for token, _ in sorted(encoded_vocab.items(), key=lambda x: x[1])
+        ]
+    except AttributeError as e:
+        msg = (
+            f"Cannot get the vocabulary of the tokenizer {type(tokenizer)}. The tokenizer "
+            "should have a get_vocab method.")
+        raise ValueError(msg) from e
+
+    if isinstance(tokenizer, PreTrainedTokenizerFast):
+        backend_str = tokenizer.backend_tokenizer.to_str()
+        return {
+            "encoded_vocab": encoded_vocab,
+            "tokenizer_str": backend_str,
+            "stop_token_ids": stop_token_ids
+        }
+    elif ("vocab_file" in tokenizer.vocab_files_names
+          and "tiktoken" in tokenizer.vocab_files_names["vocab_file"]):
+        return {
+            "encoded_vocab": encoded_vocab,
+            "stop_token_ids": stop_token_ids
+        }
+    else:
+        raise ValueError(f"Unsupported tokenizer type: {type(tokenizer)}")

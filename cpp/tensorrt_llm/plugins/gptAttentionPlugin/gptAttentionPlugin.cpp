@@ -14,7 +14,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 #include "gptAttentionPlugin.h"
+
 #include "tensorrt_llm/batch_manager/contextProgress.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention.h"
@@ -24,10 +26,10 @@
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include "tensorrt_llm/plugins/gptAttentionCommon/gptAttentionCommon.h"
 #include "tensorrt_llm/plugins/gptAttentionCommon/gptAttentionCommonImpl.h"
-#include "tensorrt_llm/runtime/bufferManager.h"
+#include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
-#include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/utils/debugUtils.h"
+
 #include <NvInferRuntimeBase.h>
 #include <algorithm>
 #include <cstdint>
@@ -45,7 +47,7 @@ static char const* GPT_ATTENTION_PLUGIN_NAME{"GPTAttention"};
 
 GPTAttentionPlugin::GPTAttentionPlugin(int layer_idx, int num_heads, int vision_start, int vision_length,
     int num_kv_heads, int layer_idx_in_cache_pool, int head_size, int unidirectional, float q_scaling,
-    float qk_tanh_scale, tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
+    float attn_logit_softcapping_scale, tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
     int rotary_embedding_dim, // for RoPE. 0 for non-RoPE
     float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
     float rotary_embedding_scale, float rotary_embedding_short_m_scale,
@@ -53,24 +55,28 @@ GPTAttentionPlugin::GPTAttentionPlugin(int layer_idx, int num_heads, int vision_
     int rotary_embedding_max_positions, int rotary_embedding_original_max_positions, int tp_size,
     int tp_rank,                         // for ALiBi
     bool unfuse_qkv_gemm,                // for AutoPP
-    tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool enable_xqa, int kv_cache_quant_mode,
-    bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type,
-    tensorrt_llm::kernels::BlockSparseParams block_sparse_params, bool paged_kv_cache, int tokens_per_block,
-    nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled, bool cross_attention, int max_distance,
-    bool pos_shift_enabled, bool dense_context_fmha, bool use_paged_context_fmha, bool use_fp8_context_fmha,
-    bool has_full_attention_mask, bool use_cache, bool is_spec_decoding_enabled,
-    bool spec_decoding_is_generation_length_variable, int spec_decoding_max_generation_length, bool is_mla_enabled,
-    int q_lora_rank, int kv_lora_rank, int qk_nope_head_dim, int qk_rope_head_dim, int v_head_dim, bool skip_attn)
+    bool use_logn_scaling,               // for LognScaling
+    tensorrt_llm::kernels::ContextFMHAType context_fmha_type, int kv_cache_quant_mode, bool remove_input_padding,
+    tensorrt_llm::kernels::AttentionMaskType mask_type, tensorrt_llm::kernels::BlockSparseParams block_sparse_params,
+    bool paged_kv_cache, int tokens_per_block, nvinfer1::DataType type, int32_t max_context_length,
+    bool qkv_bias_enabled, bool cross_attention, int max_distance, bool pos_shift_enabled, bool dense_context_fmha,
+    bool use_paged_context_fmha, bool use_fp8_context_fmha, bool has_full_attention_mask, bool use_cache,
+    bool is_spec_decoding_enabled, bool spec_decoding_is_generation_length_variable,
+    int spec_decoding_max_generation_length, bool is_mla_enabled, int q_lora_rank, int kv_lora_rank,
+    int qk_nope_head_dim, int qk_rope_head_dim, int v_head_dim, bool skip_attn, int cp_size, int cp_rank,
+    std::set<int32_t> cp_group)
     : GPTAttentionPluginCommon(layer_idx, num_heads, vision_start, vision_length, num_kv_heads, layer_idx_in_cache_pool,
-        head_size, unidirectional, q_scaling, qk_tanh_scale, position_embedding_type, rotary_embedding_dim,
-        rotary_embedding_base, rotary_embedding_scale_type, rotary_embedding_scale, rotary_embedding_short_m_scale,
-        rotary_embedding_long_m_scale, rotary_embedding_max_positions, rotary_embedding_original_max_positions, tp_size,
-        tp_rank, unfuse_qkv_gemm, context_fmha_type, enable_xqa, kv_cache_quant_mode, remove_input_padding, mask_type,
-        block_sparse_params, paged_kv_cache, tokens_per_block, type, max_context_length, qkv_bias_enabled,
-        cross_attention, max_distance, pos_shift_enabled, dense_context_fmha, use_paged_context_fmha,
-        use_fp8_context_fmha, has_full_attention_mask, use_cache, is_spec_decoding_enabled,
-        spec_decoding_is_generation_length_variable, spec_decoding_max_generation_length, is_mla_enabled, q_lora_rank,
-        kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim, skip_attn)
+        head_size, unidirectional, q_scaling, attn_logit_softcapping_scale, position_embedding_type,
+        rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale_type, rotary_embedding_scale,
+        rotary_embedding_short_m_scale, rotary_embedding_long_m_scale, rotary_embedding_max_positions,
+        rotary_embedding_original_max_positions, tp_size, tp_rank, unfuse_qkv_gemm, use_logn_scaling, context_fmha_type,
+        kv_cache_quant_mode, remove_input_padding, mask_type, block_sparse_params, paged_kv_cache, tokens_per_block,
+        type, max_context_length, qkv_bias_enabled, cross_attention, max_distance, pos_shift_enabled,
+        dense_context_fmha, use_paged_context_fmha, use_fp8_context_fmha, has_full_attention_mask, use_cache,
+        is_spec_decoding_enabled, spec_decoding_is_generation_length_variable, spec_decoding_max_generation_length,
+        is_mla_enabled, q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim, skip_attn, cp_size,
+
+        cp_rank, cp_group)
 {
     initEntryIdx();
 }
@@ -117,6 +123,8 @@ std::string GPTAttentionPlugin::toString(IdxEntry const& entry) const
     case IdxEntry::SPEC_DECODING_GENERATION_LENGTHS: return "SPEC_DECODING_GENERATION_LENGTHS";
     case IdxEntry::SPEC_DECODING_PACKED_MASK: return "SPEC_DECODING_PACKED_MASK";
     case IdxEntry::SPEC_DECODING_POSITION_OFFSETS: return "SPEC_DECODING_POSITION_OFFSETS";
+    case IdxEntry::LONG_ROPE_ROTARY_INV_FREQ: return "LONG_ROPE_ROTARY_INV_FREQ";
+    case IdxEntry::LONG_ROPE_ROTARY_COS_SIN: return "LONG_ROPE_ROTARY_COS_SIN";
     case IdxEntry::HOST_RUNTIME_PERF_KNOBS: return "HOST_RUNTIME_PERF_KNOBS";
     case IdxEntry::HOST_CONTEXT_PROGRESS: return "HOST_CONTEXT_PROGRESS";
     case IdxEntry::SKIP_ATTN: return "SKIP_ATTN";
@@ -156,12 +164,17 @@ bool GPTAttentionPlugin::isEntryUsed(IdxEntry const& entry) const
     case IdxEntry::RELATIVE_ATTENTION_BIAS: return isRelativePosition();
     case IdxEntry::CROSS_KV: return isCrossAttention();
     case IdxEntry::CROSS_KV_LENGTH: return isCrossAttention();
+    case IdxEntry::LOGN_SCALING: return isLognScaling();
     case IdxEntry::ENCODER_INPUT_LENGTH: return isCrossAttention();
     case IdxEntry::HOST_CONTEXT_LENGTH: return mRemovePadding;
     case IdxEntry::QKV_BIAS_TENSOR: return mQKVBiasEnabled;
     case IdxEntry::SPEC_DECODING_GENERATION_LENGTHS: return mIsSpecDecodingEnabled;
     case IdxEntry::SPEC_DECODING_PACKED_MASK: return mIsSpecDecodingEnabled;
     case IdxEntry::SPEC_DECODING_POSITION_OFFSETS: return mIsSpecDecodingEnabled;
+    case IdxEntry::LONG_ROPE_ROTARY_INV_FREQ: return isLongRoPE();
+    case IdxEntry::LONG_ROPE_ROTARY_COS_SIN: return isLongRoPE();
+    case IdxEntry::MROPE_ROTARY_SIN_COS: return isMRoPE();
+    case IdxEntry::MROPE_POSITION_DELTAS: return isMRoPE();
     case IdxEntry::HOST_RUNTIME_PERF_KNOBS: return true;
     case IdxEntry::HOST_CONTEXT_PROGRESS: return true;
     case IdxEntry::MLA_FUSED_Q_PROJ_TENSOR: return mIsMLAEnabled;
@@ -210,11 +223,22 @@ int GPTAttentionPlugin::getGenerationInputSequenceLength(
         // Speculative decoding mode might need variable generation input sequence length.
         if (mIsSpecDecodingEnabled)
         {
+            TLLM_CHECK_WITH_INFO(mCpSize <= 1, "Context Parallel does not support speculative decoding mode for now");
             // SPEC_DECODING_POSITION_OFFSETS: [batch_size, max_generation_input_length].
             return inputDesc[getIdx(IdxEntry::SPEC_DECODING_POSITION_OFFSETS)].dims.d[1];
         }
         else
         {
+            if (mCpSize > 1)
+            {
+                // Given that localNbTokens == (beamSize * localNbSeq + mCpSize - 1) / mCpSize, but when mCpSize - 1 >
+                // localNbSeq, there are multiple choices for beamSize. Assume beamSize == 1 here.
+                TLLM_CHECK_WITH_INFO(localNbTokens == (localNbSeq + mCpSize - 1) / mCpSize,
+                    "Context Parallel does not support beamSize > 1 for non-speculative decoding mode, "
+                    "localNbTokens=%d, localNbSeq=%d",
+                    localNbTokens, localNbSeq);
+                return 1;
+            }
             // [num_tokens, local_hidden_size] where num_tokens = batch_size * generation_input_length
             TLLM_CHECK_WITH_INFO(localNbTokens % localNbSeq == 0,
                 "seq_len should be same for all generation requests, localNbTokens=%d, localNbSeq=%d", localNbTokens,
@@ -266,6 +290,14 @@ bool GPTAttentionPlugin::supportsFormatCombination(
         posCaseLine = __LINE__;
         result = inOut[pos].type == nvinfer1::DataType::kINT32;
     }
+    else if (isMRoPE() && (pos == getIdx(IdxEntry::MROPE_ROTARY_SIN_COS)))
+    {
+        return inOut[pos].type == nvinfer1::DataType::kFLOAT;
+    }
+    else if (isMRoPE() && (pos == getIdx(IdxEntry::MROPE_POSITION_DELTAS)))
+    {
+        return inOut[pos].type == nvinfer1::DataType::kINT32;
+    }
     else if (pos == getIdx(IdxEntry::HOST_RUNTIME_PERF_KNOBS) || pos == getIdx(IdxEntry::HOST_CONTEXT_PROGRESS))
     {
         posCaseLine = __LINE__;
@@ -284,6 +316,12 @@ bool GPTAttentionPlugin::supportsFormatCombination(
         result = inOut[pos].type == nvinfer1::DataType::kFLOAT;
     }
     else if (mIsMLAEnabled && (pos == getIdx(IdxEntry::ROTARY_COS_SIN)))
+    {
+        posCaseLine = __LINE__;
+        result = inOut[pos].type == nvinfer1::DataType::kFLOAT;
+    }
+    else if (isLongRoPE()
+        && (pos == getIdx(IdxEntry::LONG_ROPE_ROTARY_INV_FREQ) || pos == getIdx(IdxEntry::LONG_ROPE_ROTARY_COS_SIN)))
     {
         posCaseLine = __LINE__;
         result = inOut[pos].type == nvinfer1::DataType::kFLOAT;
@@ -355,6 +393,10 @@ bool GPTAttentionPlugin::supportsFormatCombination(
         posCaseLine = __LINE__;
         result = inOut[pos].type == nvinfer1::DataType::kINT32;
     }
+    else if (isLognScaling() && pos == getIdx(IdxEntry::LOGN_SCALING))
+    {
+        return inOut[pos].type == nvinfer1::DataType::kFLOAT;
+    }
     else if (pos == nbInputs && mFP8ContextFMHA)
     {
         // Output tensor now supports fp8 data type.
@@ -411,13 +453,15 @@ void GPTAttentionPlugin::configurePluginImpl(nvinfer1::DynamicPluginTensorDesc c
     int const num_requests = 256;
     int const sink_token_length = 0;
 
-    EnqueueGenerationParams<T> enqueueParams{/*attention_input=*/nullptr,
+    EnqueueGenerationParams<T> enqueueParams{
+        /*attention_input=*/nullptr,
         /*qkv_bias=*/nullptr,
         /*attention_mask*/ nullptr,
         /*rotary_inv_freq*/ nullptr,
         /*input_seq_length=*/0,
         /*sequence_lengths=*/nullptr,
-        /*past_kv_length=*/0, beamWidth,
+        /*past_kv_length=*/0,
+        beamWidth,
         /*context_lengths=*/nullptr,
         /*kv_scale_orig_quant=*/nullptr,
         /*kv_scale_quant_orig=*/nullptr,
@@ -428,12 +472,21 @@ void GPTAttentionPlugin::configurePluginImpl(nvinfer1::DynamicPluginTensorDesc c
         /*block_offsets=*/nullptr,
         /*host_primary_pool_pointer=*/nullptr,
         /*host_secondary_pool_pointer=*/nullptr,
-        /*attention_mask_stride*/ 0, max_attention_window_size, cyclic_attention_window_size, sink_token_length,
+        /*attention_mask_stride*/ 0,
+        max_attention_window_size,
+        cyclic_attention_window_size,
+        cyclic_attention_window_size,
+        /*can_use_one_more_block=*/false,
+        sink_token_length,
         num_requests,
         /*max_blocks_per_sequence=*/0,
         /*cache_indir=*/nullptr,
         /*workspace=*/nullptr,
-        /*max_context_kv_len_list=*/nullptr};
+        /*max_context_kv_len_list=*/nullptr,
+        /*mrope_rotary_sin_cos*/ nullptr,
+        /*mrope_position_deltas*/ nullptr,
+
+    };
 
     prepareEnqueueGeneration<T, KVCacheBuffer>(enqueueParams);
 
@@ -539,12 +592,16 @@ int GPTAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc,
     cudaStream_t stream)
 {
     TLLM_LOG_TRACE("Attention plugin start at layer %d", mLayerIdx);
+
+    using runtime::RequestType;
+
     int32_t const nbSeq = inputDesc[getIdx(IdxEntry::CONTEXT_LENGTHS)].dims.d[0];
     int32_t const beam_width = useKVCache() ? inputDesc[getIdx(IdxEntry::CACHE_INDIR)].dims.d[1] : 1;
     RequestType const* reqTypes = static_cast<RequestType const*>(inputs[getIdx(IdxEntry::REQUEST_TYPES)]);
 
     int32_t nbContextRequests = 0;
     int32_t contextTokenIdxEnd = 0;
+    int32_t contextTokenIdxEndForCp = 0;
     // count context requests
     for (int32_t seqIdx = 0; seqIdx < nbSeq; seqIdx++)
     {
@@ -556,6 +613,10 @@ int GPTAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc,
         contextTokenIdxEnd += mRemovePadding
             ? static_cast<int32_t const*>(inputs[getIdx(IdxEntry::HOST_CONTEXT_LENGTH)])[seqIdx]
             : inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims.d[1];
+        contextTokenIdxEndForCp += mRemovePadding
+            ? (static_cast<int32_t const*>(inputs[getIdx(IdxEntry::HOST_CONTEXT_LENGTH)])[seqIdx] + mCpSize - 1)
+                / mCpSize
+            : (inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims.d[1] + mCpSize - 1) / mCpSize;
     }
 
     for (int32_t seqIdx = nbContextRequests; seqIdx < nbSeq; seqIdx++)
@@ -581,12 +642,12 @@ int GPTAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc,
     if (auto nbGenerationSeq = nbSeq - nbContextRequests; nbGenerationSeq > 0)
     {
         auto seqIdxBeg = nbContextRequests;
-        auto tokenIdxBeg = contextTokenIdxEnd;
+        auto tokenIdxBeg = mCpSize > 1 ? contextTokenIdxEndForCp : contextTokenIdxEnd;
         // if mRemovePadding is true, we may have IFB, and need to remove context tokens.
         // if mRemovePadding is false, it is only generation requests, so just multiply batch_beam and seq_len (May not
         // 1 for Parallel Decoding)
         auto localNbTokens = mRemovePadding
-            ? inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims.d[0] - contextTokenIdxEnd
+            ? inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims.d[0] - tokenIdxBeg
             : inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims.d[0] * inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims.d[1];
         enqueueSome<T, AttentionOutT, KVCacheBuffer>(seqIdxBeg, nbGenerationSeq, tokenIdxBeg, localNbTokens, inputDesc,
             outputDesc, inputs, outputs, workspace, stream);
@@ -653,7 +714,10 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
     //     cross_kv_length [int] max encoder input context length (optional in cross attention mode)
     //     encoder_input_lengths [batch_size] raw sequence lengths (optional in cross attention mode)
 
-    auto const reqTypeInBatchPtr = static_cast<RequestType const*>(inputs[getIdx(IdxEntry::REQUEST_TYPES)]) + seqIdxBeg;
+    using runtime::RequestType;
+
+    auto const* const reqTypeInBatchPtr
+        = static_cast<RequestType const*>(inputs[getIdx(IdxEntry::REQUEST_TYPES)]) + seqIdxBeg;
     bool const is_context = (reqTypeInBatchPtr[0] == RequestType::kCONTEXT);
 
     T const* attention_input = static_cast<T const*>(inputs[getIdx(IdxEntry::QKV_TENSOR)])
@@ -686,18 +750,40 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
     {
         qkv_bias = reinterpret_cast<T const*>(inputs[getIdx(IdxEntry::QKV_BIAS_TENSOR)]);
     }
+
+    // Note we still need context length during generation for MMHA optimization.
+    int32_t const max_context_q_len = [&]()
+    {
+        if (!mRemovePadding)
+        {
+            return static_cast<int>(inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims.d[1]);
+        }
+        auto const host_context_lengths
+            = static_cast<int32_t const*>(inputs[getIdx(IdxEntry::HOST_CONTEXT_LENGTH)]) + seqIdxBeg;
+        return *std::max_element(host_context_lengths, host_context_lengths + localNbSeq);
+    }();
+
     // Rotary inv_freq, cos_sin cache to avoid re-computing.
     float const* rotary_inv_freq = nullptr;
     float2 const* rotary_cos_sin = nullptr;
 
+    bool const useLongRoPECache = isLongRoPE() && max_context_q_len > mRotaryEmbeddingOriginalMaxPositions;
     if (isRoPE())
     {
-        rotary_inv_freq = reinterpret_cast<float const*>(inputs[getIdx(IdxEntry::ROTARY_INV_FREQ)]);
+        auto inputName = useLongRoPECache ? IdxEntry::LONG_ROPE_ROTARY_INV_FREQ : IdxEntry::ROTARY_INV_FREQ;
+        rotary_inv_freq = reinterpret_cast<float const*>(inputs[getIdx(inputName)]);
     }
     if (isRoPE() || mIsMLAEnabled)
     {
-        rotary_cos_sin = reinterpret_cast<float2 const*>(inputs[getIdx(IdxEntry::ROTARY_COS_SIN)]);
+        auto inputName = useLongRoPECache ? IdxEntry::LONG_ROPE_ROTARY_COS_SIN : IdxEntry::ROTARY_COS_SIN;
+        rotary_cos_sin = reinterpret_cast<float2 const*>(inputs[getIdx(inputName)]);
     }
+
+    auto const mrope_rotary_sin_cos
+        = isMRoPE() ? reinterpret_cast<float2 const*>(inputs[getIdx(IdxEntry::MROPE_ROTARY_SIN_COS)]) : nullptr;
+
+    auto const mrope_position_deltas
+        = isMRoPE() ? reinterpret_cast<int32_t const*>(inputs[getIdx(IdxEntry::MROPE_POSITION_DELTAS)]) : nullptr;
 
     if (mUnfuseQkvGemm)
     {
@@ -735,17 +821,6 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
     int const* sequence_kv_length = useKVCache()
         ? static_cast<int const*>(inputs[getIdx(IdxEntry::SEQUENCE_LENGTH)]) + seqIdxBeg
         : context_q_lengths;
-    // Note we still need context length during generation for MMHA optimization.
-    int32_t const max_context_q_len = [&]()
-    {
-        if (!mRemovePadding)
-        {
-            return static_cast<int>(inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims.d[1]);
-        }
-        auto const host_context_lengths
-            = static_cast<int32_t const*>(inputs[getIdx(IdxEntry::HOST_CONTEXT_LENGTH)]) + seqIdxBeg;
-        return *std::max_element(host_context_lengths, host_context_lengths + localNbSeq);
-    }();
 
     int max_encoder_context_len = isCrossAttention() ? inputDesc[getIdx(IdxEntry::CROSS_KV_LENGTH)].dims.d[0] : 0;
     // for enc-dec model, since decoder_input_ids could be longer than 1,
@@ -767,10 +842,16 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         : (useKVCache() ? inputDesc[getIdx(IdxEntry::CACHE_INDIR)].dims.d[2] : 0);
     // The cyclic_attention_window_size will determine the cyclic kv cache position of new tokens.
     // Note that this cyclic_attention_window_size might be smaller than the actual kv cache capactity.
-    int const cyclic_attention_window_size = isCrossAttention()
-        ? max_encoder_context_len
-        : reinterpret_cast<int const*>(inputs[getIdx(IdxEntry::HOST_MAX_ATTENTION_WINDOW)])[mLayerIdx];
+    int const* cyclic_attention_window_sizes
+        = reinterpret_cast<int const*>(inputs[getIdx(IdxEntry::HOST_MAX_ATTENTION_WINDOW)]);
+    int const cyclic_attention_window_size
+        = isCrossAttention() ? max_encoder_context_len : cyclic_attention_window_sizes[mLayerIdx];
     int const sink_token_length = reinterpret_cast<int const*>(inputs[getIdx(IdxEntry::HOST_SINK_TOKEN_LENGTH)])[0];
+    int const num_attn_layer = inputDesc[getIdx(IdxEntry::HOST_MAX_ATTENTION_WINDOW)].dims.d[0];
+    int const max_cyclic_attention_window_size = isCrossAttention()
+        ? max_encoder_context_len
+        : *std::max_element(cyclic_attention_window_sizes, cyclic_attention_window_sizes + num_attn_layer);
+    bool const can_use_one_more_block = beamWidth > 1;
 
     float const* kv_scale_orig_quant = nullptr;
     float const* kv_scale_quant_orig = nullptr;
@@ -929,10 +1010,12 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
 
         EnqueueContextParams<T> enqueue_params{attention_input, qkv_bias, attention_mask, attention_packed_mask,
             rotary_inv_freq, rotary_cos_sin, max_context_q_len, max_context_kv_len, max_attention_window_size,
-            cyclic_attention_window_size, sink_token_length, context_q_lengths, sequence_kv_length, kv_scale_orig_quant,
-            kv_scale_quant_orig, attention_output_orig_quant, alibi_slopes, context_buf_, key_value_cache,
-            block_offsets, host_block_offsets, host_primary_pool_pointer, host_secondary_pool_pointer, batch_size,
-            localNbTokens, max_blocks_per_sequence, host_context_lengths, workspace};
+            cyclic_attention_window_size, max_cyclic_attention_window_size, can_use_one_more_block, sink_token_length,
+            context_q_lengths, sequence_kv_length, kv_scale_orig_quant, kv_scale_quant_orig,
+            attention_output_orig_quant, alibi_slopes, context_buf_, key_value_cache, block_offsets, host_block_offsets,
+            host_primary_pool_pointer, host_secondary_pool_pointer, batch_size, localNbTokens, max_blocks_per_sequence,
+            host_context_lengths, workspace, mrope_rotary_sin_cos, mrope_position_deltas};
+
         enqueue_params.runtime_perf_knobs = runtime_perf_knobs;
         if (isRelativePosition())
         {
@@ -941,6 +1024,10 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
             enqueue_params.relative_attention_bias_stride
                 = inputDesc[getIdx(IdxEntry::RELATIVE_ATTENTION_BIAS)].dims.d[1]; // max_seq_len or num_buckets
         }
+        if (isLognScaling())
+        {
+            enqueue_params.logn_scaling_ptr = static_cast<float const*>(inputs[getIdx(IdxEntry::LOGN_SCALING)]);
+        }
         if (isCrossAttention())
         {
             enqueue_params.cross_kv = static_cast<T const*>(inputs[getIdx(IdxEntry::CROSS_KV)]);
@@ -948,6 +1035,12 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
             enqueue_params.encoder_input_lengths
                 = reinterpret_cast<int const*>(inputs[getIdx(IdxEntry::ENCODER_INPUT_LENGTH)]) + seqIdxBeg;
             enqueue_params.num_encoder_tokens = num_encoder_tokens;
+        }
+        if (mCpSize > 1)
+        {
+            enqueue_params.host_context_lengths = mRemovePadding
+                ? reinterpret_cast<int const*>(inputs[getIdx(IdxEntry::HOST_CONTEXT_LENGTH)])
+                : nullptr;
         }
 
         if (mIsMLAEnabled)
@@ -1006,8 +1099,10 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
             input_seq_length, sequence_kv_length, max_past_kv_length, beamWidth, context_q_lengths, kv_scale_orig_quant,
             kv_scale_quant_orig, attention_output_orig_quant, alibi_slopes, context_buf_, key_value_cache,
             block_offsets, host_primary_pool_pointer, host_secondary_pool_pointer, attention_mask_stride,
-            max_attention_window_size, cyclic_attention_window_size, sink_token_length, num_requests,
-            max_blocks_per_sequence, cache_indir, mMultiBlockSemaphores.get(), workspace, max_context_kv_len_list};
+            max_attention_window_size, cyclic_attention_window_size, max_cyclic_attention_window_size,
+            can_use_one_more_block, sink_token_length, num_requests, max_blocks_per_sequence, cache_indir,
+            mMultiBlockSemaphores.get(), workspace, max_context_kv_len_list, mrope_rotary_sin_cos,
+            mrope_position_deltas};
         enqueue_params.host_context_lengths = host_context_lengths;
         enqueue_params.runtime_perf_knobs = runtime_perf_knobs;
         if (isRelativePosition())
@@ -1016,6 +1111,10 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
                 = static_cast<T const*>(inputs[getIdx(IdxEntry::RELATIVE_ATTENTION_BIAS)]);
             enqueue_params.relative_attention_bias_stride
                 = inputDesc[getIdx(IdxEntry::RELATIVE_ATTENTION_BIAS)].dims.d[1]; // max_seq_len or num_buckets
+        }
+        if (isLognScaling())
+        {
+            enqueue_params.logn_scaling_ptr = static_cast<float const*>(inputs[getIdx(IdxEntry::LOGN_SCALING)]);
         }
         if (isCrossAttention())
         {
@@ -1203,7 +1302,7 @@ IPluginV2* GPTAttentionPluginCreator::createPlugin(char const* name, PluginField
             p.getScalar<int32_t>("vision_length").value(), p.getScalar<int32_t>("num_kv_heads").value(),
             p.getScalar<int32_t>("layer_idx_in_cache_pool").value(), p.getScalar<int32_t>("head_size").value(),
             p.getScalar<int32_t>("unidirectional").value(), p.getScalar<float>("q_scaling").value(),
-            p.getScalar<float>("qk_tanh_scale").value(),
+            p.getScalar<float>("attn_logit_softcapping_scale").value(),
             static_cast<PositionEmbeddingType>(p.getScalar<int8_t>("position_embedding_type").value()),
             p.getScalar<int32_t>("rotary_embedding_dim").value(), p.getScalar<float>("rotary_embedding_base").value(),
             static_cast<RotaryScalingType>(p.getScalar<int8_t>("rotary_embedding_scale_type").value()),
@@ -1215,8 +1314,8 @@ IPluginV2* GPTAttentionPluginCreator::createPlugin(char const* name, PluginField
             static_cast<int32_t>(p.getScalar<int32_t>("tp_size").value()),
             static_cast<int32_t>(p.getScalar<int32_t>("tp_rank").value()),
             static_cast<bool>(p.getScalar<int8_t>("unfuse_qkv_gemm").value()),
+            static_cast<bool>(p.getScalar<int8_t>("use_logn_scaling").value()),
             static_cast<ContextFMHAType>(p.getScalar<int8_t>("context_fmha_type").value()),
-            static_cast<bool>(p.getScalar<int8_t>("enable_xqa").value()),
             p.getScalar<int32_t>("kv_cache_quant_mode").value(),
             static_cast<bool>(p.getScalar<int8_t>("remove_input_padding").value()),
             static_cast<AttentionMaskType>(p.getScalar<int32_t>("mask_type").value()),
@@ -1246,7 +1345,10 @@ IPluginV2* GPTAttentionPluginCreator::createPlugin(char const* name, PluginField
             static_cast<int32_t>(p.getScalar<int32_t>("qk_nope_head_dim").value()),
             static_cast<int32_t>(p.getScalar<int32_t>("qk_rope_head_dim").value()),
             static_cast<int32_t>(p.getScalar<int32_t>("v_head_dim").value()),
-            static_cast<bool>(p.getScalar<int8_t>("skip_attn").value()));
+            static_cast<bool>(p.getScalar<int8_t>("skip_attn").value()),
+            static_cast<int32_t>(p.getScalar<int32_t>("cp_size").value()),
+            static_cast<int32_t>(p.getScalar<int32_t>("cp_rank").value()),
+            static_cast<std::set<int32_t>>(p.getSet<int32_t>("cp_group").value()));
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }

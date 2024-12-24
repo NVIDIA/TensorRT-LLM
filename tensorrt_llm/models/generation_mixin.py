@@ -20,7 +20,7 @@ import tensorrt as trt
 
 from ..bindings import KVCacheType
 from ..functional import Tensor
-from ..layers import SpecDecodingParams
+from ..layers import MropeParams, SpecDecodingParams
 from ..mapping import Mapping
 from ..plugin import current_all_reduce_helper
 
@@ -509,40 +509,42 @@ class GenerationMixin:
         }
 
     def prepare_basic_inputs(
-            self,
-            *,
-            max_batch_size,
-            max_beam_width,
-            max_input_len,
-            max_seq_len,
-            max_num_tokens,
-            hidden_size,
-            num_kv_heads,
-            head_size,
-            num_layers,
-            kv_dtype,
-            kv_cache_type: KVCacheType,
-            remove_input_padding=False,
-            use_gpt_attention_plugin=False,
-            use_gemm_plugin=False,
-            tokens_per_block=64,
-            gather_context_logits=False,
-            gather_generation_logits=False,
-            dtype=None,
-            num_heads=None,
-            mapping=Mapping(),
-            opt_num_tokens=None,
-            prompt_embedding_table_size: int = 0,
-            position_encoding_2d=False,
-            use_lora_plugin: bool = False,
-            lora_target_modules: List[str] = None,
-            speculative_decoding_draft_tokens_external: bool = False,
-            spec_decoding_is_generation_length_variable: bool = False,
-            max_draft_len=0,
-            multiple_profiles: bool = False,
-            streamingllm: bool = False,
-            opt_batch_size=None,
-            pp_reduce_scatter: bool = False):
+        self,
+        *,
+        max_batch_size,
+        max_beam_width,
+        max_input_len,
+        max_seq_len,
+        max_num_tokens,
+        hidden_size,
+        num_kv_heads,
+        head_size,
+        num_layers,
+        kv_dtype,
+        kv_cache_type: KVCacheType,
+        remove_input_padding=False,
+        use_gpt_attention_plugin=False,
+        use_gemm_plugin=False,
+        tokens_per_block=64,
+        gather_context_logits=False,
+        gather_generation_logits=False,
+        dtype=None,
+        num_heads=None,
+        mapping=Mapping(),
+        opt_num_tokens=None,
+        prompt_embedding_table_size: int = 0,
+        position_encoding_2d=False,
+        use_lora_plugin: bool = False,
+        lora_target_modules: List[str] = None,
+        speculative_decoding_draft_tokens_external: bool = False,
+        spec_decoding_is_generation_length_variable: bool = False,
+        max_draft_len=0,
+        multiple_profiles: bool = False,
+        streamingllm: bool = False,
+        opt_batch_size=None,
+        pp_reduce_scatter: bool = False,
+        mrope_rotary_sin_cos_size: int = None,
+    ):
 
         enable_ctx_gen_opt_profiles = GenerationMixin.has_ctx_gen_opt_profiles(
             use_gpt_attention_plugin=use_gpt_attention_plugin,
@@ -819,6 +821,30 @@ class GenerationMixin:
                 spec_decoding_position_offsets=spec_decoding_position_offsets,
                 spec_decoding_packed_mask=spec_decoding_packed_mask)
 
+        mrope_params = None
+        if mrope_rotary_sin_cos_size is not None:
+            mrope_rotary_sin_cos = Tensor(
+                name='mrope_rotary_sin_cos',
+                dtype=trt.float32,
+                shape=[-1, mrope_rotary_sin_cos_size],
+                dim_range=OrderedDict([
+                    ('batch_size_beam_width', bb_range),
+                    ('mult_dim', [mrope_rotary_sin_cos_size] * num_profiles),
+                ]),
+            )
+            mrope_position_deltas = Tensor(
+                name='mrope_position_deltas',
+                dtype=trt.int32,
+                shape=[-1, 1],
+                dim_range=OrderedDict([('batch_size_beam_width', bb_range),
+                                       ('mult_dim_delta', [1] * num_profiles)]),
+            )
+
+            mrope_params = MropeParams(
+                mrope_rotary_sin_cos=mrope_rotary_sin_cos,
+                mrope_position_deltas=mrope_position_deltas,
+            )
+
         basic_inputs = {
             'input_ids': input_ids,
             'hidden_states_input': hidden_states,
@@ -829,7 +855,8 @@ class GenerationMixin:
             'prompt_vocab_size': prompt_vocab_size,
             'lora_ranks': lora_ranks,
             'lora_weights_pointers': lora_weights_pointers,
-            'spec_decoding_params': spec_decoding_params
+            'spec_decoding_params': spec_decoding_params,
+            'mrope_params': mrope_params,
         }
 
         attention_inputs = self.prepare_attention_inputs(

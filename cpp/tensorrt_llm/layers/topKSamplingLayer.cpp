@@ -17,6 +17,7 @@
 
 #include "topKSamplingLayer.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
 #include "tensorrt_llm/layers/defaultDecodingParams.h"
@@ -130,6 +131,7 @@ void TopKSamplingLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> con
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(TopKSamplingLayer_forwardAsync);
 
     auto inputs = std::dynamic_pointer_cast<SamplingInputs>(baseInputs);
 

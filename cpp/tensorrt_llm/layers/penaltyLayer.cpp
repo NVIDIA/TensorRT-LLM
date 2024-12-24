@@ -17,7 +17,9 @@
 
 #include "penaltyLayer.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/kernels/penaltyKernels.h"
+#include "tensorrt_llm/kernels/penaltyTypes.h"
 #include "tensorrt_llm/layers/defaultDecodingParams.h"
 #include "tensorrt_llm/layers/layerUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
@@ -209,6 +211,7 @@ void PenaltyLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& b
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(PenaltyLayer_forwardAsync);
 
     auto outputs = std::dynamic_pointer_cast<BaseDecodingOutputs>(baseOutputs);
     auto params = std::dynamic_pointer_cast<DecodingInputs>(baseInputs);
@@ -293,16 +296,28 @@ void PenaltyLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& b
     penaltyParams.batchSlots = workspace->getDeviceBatchSlotsPtr();
     penaltyParams.maxTokensPerStep = mDecoderDomain.getMaxDecodingTokens();
     penaltyParams.tokensPerStep = tokensPerStep;
+    penaltyParams.finished = (params->finished)
+        ? reinterpret_cast<FinishedState const*>(bufferCast<FinishedState::UnderlyingType>(*params->finished.value()))
+        : nullptr;
     penaltyParams.stream = getStream();
 
     if (penaltyParams.beamWidth > 1)
     {
-        T** logits = const_cast<T**>(penaltyParams.inputLogits);
-        // `BeamSearch` needs converting logits into logProbs before penalties, but `Sampling` doesn't
-        invokeAddBiasSoftMax((T*) nullptr, logits, (T*) nullptr, penaltyParams.biases, penaltyParams.endIds, nullptr,
-            penaltyParams.batchSlots, penaltyParams.batchSize, mDecoderDomain.getBatchSize(), penaltyParams.beamWidth,
-            penaltyParams.vocabSize, penaltyParams.vocabSizePadded, /*skipSoftMax*/ false,
-            /*batchSlotsLogits*/ penaltyParams.batchSlots != nullptr, penaltyParams.stream);
+        // Convert logits into logProbs before penalties, only necessary in Beam-Search.
+        BiasSoftmaxParams<T> biasSoftmaxParams;
+        biasSoftmaxParams.logitsPtrs = const_cast<T**>(penaltyParams.inputLogits);
+        biasSoftmaxParams.bias = penaltyParams.biases;
+        biasSoftmaxParams.endIds = penaltyParams.endIds;
+        biasSoftmaxParams.batchSlots = penaltyParams.batchSlots;
+        biasSoftmaxParams.batchSize = penaltyParams.batchSize;
+        biasSoftmaxParams.maxBatchSize = mDecoderDomain.getBatchSize();
+        biasSoftmaxParams.maxBeamWidth = penaltyParams.beamWidth;
+        biasSoftmaxParams.vocabSize = penaltyParams.vocabSize;
+        biasSoftmaxParams.vocabSizePadded = penaltyParams.vocabSizePadded;
+        biasSoftmaxParams.skipSoftMax = false;
+        biasSoftmaxParams.batchSlotsLogits = penaltyParams.batchSlots != nullptr;
+        biasSoftmaxParams.checkParams();
+        invokeAddBiasSoftMax(biasSoftmaxParams, penaltyParams.stream);
     }
 
     invokeBatchApplyPenalty(penaltyParams);

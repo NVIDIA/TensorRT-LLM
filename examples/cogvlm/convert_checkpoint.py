@@ -184,13 +184,6 @@ def parse_arguments():
         'To shard it along hidden dimension, set embedding_sharding_dim=1'
         'Note: embedding sharing is only enabled when embedding_sharding_dim = 0'
     )
-    parser.add_argument(
-        '--use_embedding_sharing',
-        action="store_true",
-        default=False,
-        help=
-        'Try to reduce the engine size by sharing the embedding lookup table between two layers.'
-        'Note: the flag might not take effect when the criteria are not met.')
     parser.add_argument('--use_prompt_tuning',
                         action="store_true",
                         default=False)
@@ -284,7 +277,6 @@ def create_config_from_args(args: argparse.Namespace):
         },
         'use_parallel_embedding': args.use_parallel_embedding,
         'embedding_sharding_dim': args.embedding_sharding_dim,
-        'share_embedding_table': args.use_embedding_sharing,
         'use_prompt_tuning': args.use_prompt_tuning,
         'enable_pos_shift': args.enable_pos_shift,
         'dense_context_fmha': args.dense_context_fmha,
@@ -467,7 +459,6 @@ def main():
                     plugin_weight_only_quant_type=plugin_weight_only_quant_type,
                     use_parallel_embedding=args.use_parallel_embedding,
                     sharding_dim=args.embedding_sharding_dim,
-                    share_embedding_table=args.use_embedding_sharing,
                     use_smooth_quant=args.smoothquant,
                     per_channel=args.per_channel,
                     per_token=args.per_token,

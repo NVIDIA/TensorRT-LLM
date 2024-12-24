@@ -42,7 +42,8 @@ def generate_output(
     hf_path = model_path / model_name
     tp_size = 1
     pp_size = 1
-    tp_pp_dir = f"tp{tp_size}-pp{pp_size}-gpu/"
+    cp_size = 1
+    tp_pp_cp_dir = f"tp{tp_size}-pp{pp_size}-cp{cp_size}-gpu/"
     input_file = f"input_tokens_{model_name}.npy"
 
     data_input_file_name = resources_dir / "data" / input_file
@@ -62,7 +63,7 @@ def generate_output(
 
     for model_spec_obj in model_spec_obj_list:
         engine_dir = model_path / 'rt_engine' / model_name / model_spec_obj.get_model_path(
-        ) / tp_pp_dir
+        ) / tp_pp_cp_dir
         base_output_name = os.path.splitext(
             model_spec_obj.get_results_file())[0]
         output_npy_file_name = output_dir / f'{base_output_name}.npy'

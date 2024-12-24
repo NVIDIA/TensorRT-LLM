@@ -730,7 +730,7 @@ class TestNemotronNas(unittest.TestCase):
                                                                    ),
             ).cuda(),
             atol=
-            0.9,  # We've observed that on a real checkpoint with the current code, fp8 MMLU is on par with BF16, and this is the observed threshold, though it may seem high.
+            0.92,  # We've observed that on a real checkpoint with the current code, fp8 MMLU is on par with BF16, and this is the observed threshold, though it may seem high.
         )
 
     @pytest.mark.skipif(

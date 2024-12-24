@@ -30,7 +30,7 @@ namespace tensorrt_llm::plugins
 class EagleSampleAndAcceptDraftTokensPlugin : public BasePlugin
 {
 public:
-    EagleSampleAndAcceptDraftTokensPlugin(nvinfer1::DataType type, bool greedySampling);
+    EagleSampleAndAcceptDraftTokensPlugin(nvinfer1::DataType type);
 
     EagleSampleAndAcceptDraftTokensPlugin(void const* data, size_t length);
 
@@ -74,10 +74,16 @@ private:
         DRAFT_LENS,
         //! [batch_size]
         TEMPERATURE,
-        //! []?
+        //! [batch_size, max_decoding_tokens]
         RAND_VALIDATION,
+        //! [batch_size]
+        POSTERIOR_ALPHA,
+        //! [batch_size]
+        POSTERIOR_THRESHOLD,
         //! [batch_size, max_decoding_tokens, max_path_len]
-        PATHS
+        PATHS,
+        //! [1]
+        GREEDY_SAMPLING
     };
 
     enum class OutputIdxEntry : int32_t
@@ -119,11 +125,11 @@ private:
         cudaStream_t stream) noexcept;
 
     template <typename T>
-    void acceptDraftTokens(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
+    void doTypicalAcceptance(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
         void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept;
 
     template <typename T>
-    void doGreedy(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
+    void acceptDraftTokens(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
         void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept;
 
     template <typename T>
@@ -132,7 +138,7 @@ private:
 
 private:
     nvinfer1::DataType mDtype;
-    bool mGreedySampling;
+    int32_t mSmCnt{0};
 };
 
 class EagleSampleAndAcceptDraftTokensPluginCreator : public BaseCreator

@@ -13,7 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+from typing import Optional, Union
+
+from transformers import AutoModelForCausalLM
+
 from tensorrt_llm.models.llama.model import LLaMAForCausalLM
+from tensorrt_llm.models.medusa.weight import load_medusa_hf
 from tensorrt_llm.models.qwen.model import QWenForCausalLM
 
 from ..._common import default_net
@@ -22,8 +28,9 @@ from ...functional import ACT2FN, stack
 from ...layers import ColumnLinear
 from ...mapping import Mapping
 from ...module import Module, ModuleList
-from ..modeling_utils import PretrainedModel
+from ..modeling_utils import PretrainedModel, QuantConfig
 from .config import MedusaConfig
+from .weight import convert_hf_llama
 
 
 class MedusaLayer(Module):
@@ -89,7 +96,10 @@ class MedusaForCausalLm(PretrainedModel):
 
     def __init__(self, config: MedusaConfig):
         super().__init__(config)
-        BaseLM = QWenForCausalLM if "qwen" in config.model_type else LLaMAForCausalLM
+
+        BaseLM = QWenForCausalLM if hasattr(
+            config,
+            "model_type") and "qwen" in config.model_type else LLaMAForCausalLM
 
         class GenericMedusaForCausalLM(BaseLM):
 
@@ -168,3 +178,64 @@ class MedusaForCausalLm(PretrainedModel):
     # Override specialized __setattr__ defined in Module
     def __setattr__(self, name, value) -> None:
         object.__setattr__(self, name, value)
+
+    @classmethod
+    def from_hugging_face(
+            cls,
+            hf_model_or_dir: Union[str, 'transformers.PreTrainedModel'],
+            dtype: str = 'auto',
+            mapping: Optional[Mapping] = None,
+            quant_config: Optional[QuantConfig] = None,
+            **kwargs):
+        import transformers
+
+        assert hf_model_or_dir is not None
+        speculative_model_dir = kwargs.pop('speculative_model', None)
+
+        use_preloading = isinstance(hf_model_or_dir,
+                                    transformers.PreTrainedModel)
+        if use_preloading:
+            hf_model = hf_model_or_dir
+            hf_config_or_dir = hf_model.config
+        else:
+            hf_model_dir = hf_model_or_dir
+            hf_config_or_dir = hf_model_or_dir
+
+        config = MedusaConfig.from_hugging_face(
+            hf_config_or_dir,
+            dtype=dtype,
+            mapping=mapping,
+            quant_config=quant_config,
+            speculative_model=speculative_model_dir,
+            **kwargs)
+
+        if not use_preloading:
+            trust_remote_code = kwargs.pop('trust_remote_code', True)
+
+            hf_model = AutoModelForCausalLM.from_pretrained(
+                hf_model_dir,
+                torch_dtype="auto",
+                trust_remote_code=trust_remote_code)
+
+        assert isinstance(hf_model, transformers.PreTrainedModel)
+
+        weights = convert_hf_llama(hf_model, config.mapping, dtype='float16')
+
+        model = cls(config)
+
+        config_file = speculative_model_dir / "config.json"
+        with open(config_file) as fp:
+            model_config = json.load(fp)
+
+        num_medusa_heads = kwargs[
+            'medusa_num_heads'] if 'medusa_num_heads' in kwargs else model_config.get(
+                'medusa_num_heads', None)
+        num_medusa_layers = model_config.get('medusa_num_layers', None)
+        medusa_weights = load_medusa_hf(medusa_path=speculative_model_dir,
+                                        num_medusa_heads=num_medusa_heads,
+                                        num_medusa_layers=num_medusa_layers,
+                                        mapping=mapping,
+                                        dtype="float16")
+        weights.update(medusa_weights)
+        model.load(weights)
+        return model

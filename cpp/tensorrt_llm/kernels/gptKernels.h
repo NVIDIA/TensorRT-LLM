@@ -59,6 +59,7 @@ enum class PositionEmbeddingType : int8_t
     kRELATIVE = 6,
     kCHATGLM = 7,
     kYARN = 8,
+    kROPE_M = 9,
 };
 
 enum class RotaryScalingType : int8_t
@@ -116,6 +117,8 @@ struct BuildDecoderInfoParams
     int* encoderPaddingOffsets;
     // The offsets to the 1st row in each sequence of packed mask buffer. Shape: [batchSize+1].
     int* packedMaskRowOffsets;
+    // The cumulative average partial sequence lengths for context parallel. Shape: [batchSize+1].
+    int* seqCpPartialOffsets;
 
     // The mask to mark invalid tokens in Attention - that's not used by the plugins as it can be
     // computed on-the-fly. When it's not needed, simply use nullptr.
@@ -126,6 +129,8 @@ struct BuildDecoderInfoParams
     int const* seqQLengths;
     // The KV length of each sequence in the batch. Shape: [batchSize].
     int const* seqKVLengths;
+    // context parallel size
+    int cpSize;
 
     // The fmha tile counter ptr (set to 0 before fmha).
     uint32_t* fmhaTileCounter;

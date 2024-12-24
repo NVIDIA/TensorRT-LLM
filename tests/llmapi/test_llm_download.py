@@ -2,10 +2,9 @@ from tensorrt_llm.llmapi import LLM
 from tensorrt_llm.llmapi.utils import (download_hf_model,
                                        download_hf_pretrained_config)
 
-try:
-    from test_llm import llama_model_path
-except ImportError:
-    from .test_llm import llama_model_path
+# isort: off
+from test_llm import llama_model_path
+# isort: on
 
 prompts = ["A B C"]
 

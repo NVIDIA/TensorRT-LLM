@@ -85,7 +85,7 @@ public:
     std::optional<SizeType32> sinkTokenLength;
     std::optional<float> freeGpuMemoryFraction;
     bool enableBlockReuse;
-    static constexpr auto kDefaultGpuMemFraction = 0.9f;
+    static constexpr auto kDefaultGpuMemFraction = 0.9F;
     bool useUvm;
     std::optional<size_t> hostCacheSize;
     bool onboardBlocks;

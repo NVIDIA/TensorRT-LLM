@@ -14,10 +14,10 @@
  * limitations under the License.
  */
 
-#ifndef _WIN32
+#ifdef __GNUC__ // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
-#endif // #ifndef _WIN32
+#endif // __GNUC__
 
 // clang-format off
 #include <cutlass/gemm/device/default_gemm_configuration.h>
@@ -36,9 +36,9 @@
 #include "cutlass_extensions/gemm/kernel/default_int8_traits.h"
 #include "cutlass_extensions/gemm/kernel/gemm_with_epilogue_visitor.h"
 
-#ifndef _WIN32
+#ifdef __GNUC__ // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic pop
-#endif // #ifndef _WIN32
+#endif          // __GNUC__
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.h"
@@ -80,7 +80,7 @@ void genericInt8GemmKernelLauncher(int8_t const* A, int8_t const* B, tk::QuantMo
     using ElementAccumulator = int32_t;
     using ElementCompute = float;
 
-    using ThreadblockSwizzle = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>;
+    using ThreadblockSwizzle = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<8>;
 
     using OperatorClass = typename cutlass::gemm::kernel::Int8GemmArchTraits<arch>::OperatorClass;
     using InstructionShape = typename cutlass::gemm::kernel::Int8GemmArchTraits<arch>::InstructionShape;
@@ -324,12 +324,7 @@ void CutlassInt8GemmRunner<T>::dispatchToArch(int8_t const* A, int8_t const* B, 
     char* workspacePtr, size_t const workspaceBytes, cudaStream_t stream, int* occupancy)
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-    if (mSm >= 70 && mSm < 72)
-    {
-        dispatchGemmToCutlass<T, cutlass::arch::Sm70>(A, B, quantOption, alphaCol, alphaRow, C, m, n, k, workspacePtr,
-            workspaceBytes, gemmConfig, stream, occupancy);
-    }
-    else if (mSm >= 72 && mSm < 75)
+    if (mSm >= 72 && mSm < 75)
     {
         dispatchGemmToCutlass<T, cutlass::arch::Sm72>(A, B, quantOption, alphaCol, alphaRow, C, m, n, k, workspacePtr,
             workspaceBytes, gemmConfig, stream, occupancy);
@@ -368,8 +363,8 @@ std::vector<tkc::CutlassGemmConfig> CutlassInt8GemmRunner<T>::getConfigs() const
     auto config_type_param = tkc::CutlassGemmConfig::CandidateConfigTypeParam::INT8_ONLY;
     if (mSm <= 70)
     {
-        config_type_param = static_cast<tkc::CutlassGemmConfig::CandidateConfigTypeParam>(
-            config_type_param | tkc::CutlassGemmConfig::CandidateConfigTypeParam::SIMT_ONLY);
+        throw std::runtime_error(
+            "[TensorRT-LLM Error][CutlassInt8GemmRunner][GEMM Dispatch] Arch unsupported for CUTLASS int8 GEMM");
     }
 
     std::vector<tkc::CutlassGemmConfig> candidateConfigs = get_candidate_configs(mSm, SPLIT_K_LIMIT, config_type_param);

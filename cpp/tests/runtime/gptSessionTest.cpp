@@ -160,8 +160,8 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
     auto const modelConfig = json.getModelConfig();
     verifyModelConfig(modelConfig, modelSpec);
 
-    int const worldSize = modelSpec.mTPSize * modelSpec.mPPSize;
-    auto const worldConfig = WorldConfig::mpi(worldSize, modelSpec.mTPSize, modelSpec.mPPSize);
+    int const worldSize = modelSpec.mTPSize * modelSpec.mPPSize * modelSpec.mCPSize;
+    auto const worldConfig = WorldConfig::mpi(worldSize, modelSpec.mTPSize, modelSpec.mPPSize, modelSpec.mCPSize);
     auto enginePath = modelPath / json.engineFilename(worldConfig);
     ASSERT_TRUE(fs::exists(enginePath));
 
@@ -450,7 +450,7 @@ TEST_P(ParamTest, Test)
     }
 
     std::ostringstream gpuSizePath;
-    gpuSizePath << "tp" << modelSpec.mTPSize << "-pp" << modelSpec.mPPSize << "-gpu";
+    gpuSizePath << "tp" << modelSpec.mTPSize << "-pp" << modelSpec.mPPSize << "-cp" << modelSpec.mCPSize << "-gpu";
     auto const modelPath{ENGINE_PATH / modelDir / modelSpec.getModelPath() / gpuSizePath.str()};
     auto const resultsPath
         = DATA_PATH / modelDir / ((beamWidth == 1) ? "sampling" : "beam_search_" + std::to_string(beamWidth));

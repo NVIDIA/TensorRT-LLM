@@ -45,6 +45,12 @@ bool getEnvEnablePDL();
 
 bool getEnvUseUCXKvCache();
 
+bool getEnvUseMPIKvCache();
+
 std::string getEnvUCXInterface();
+
+bool getEnvDisaggLayerwise();
+
+bool getEnvParallelCacheSend();
 
 } // namespace tensorrt_llm::common

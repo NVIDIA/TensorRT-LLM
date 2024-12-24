@@ -465,10 +465,9 @@ class ModelRunnerMixin:
             task_vocab_size = torch.tensor([task_vocab_size], dtype=torch.int32)
             prompt_table_data = prompt_table_data.view(-1, hidden_size)
         else:
-            prompt_table_data = torch.empty([1, self.hidden_size],
-                                            dtype=self.dtype)
+            prompt_table_data = torch.empty(
+                [1, self.hidden_size * self.mapping.tp_size], dtype=self.dtype)
             task_vocab_size = torch.zeros([1], dtype=torch.int32)
-
         if tasks is not None:
             tasks = torch.tensor([int(t) for t in tasks.split(',')],
                                  dtype=torch.int32)
@@ -496,14 +495,16 @@ class ModelRunner(ModelRunnerMixin):
     An interface class that wraps GenerationSession and provides generation methods.
     """
 
-    def __init__(self,
-                 session: GenerationSession,
-                 max_batch_size: int,
-                 max_input_len: int,
-                 max_seq_len: int,
-                 max_beam_width: int,
-                 kv_cache_type: KVCacheType,
-                 lora_manager: Optional[LoraManager] = None) -> None:
+    def __init__(
+        self,
+        session: GenerationSession,
+        max_batch_size: int,
+        max_input_len: int,
+        max_seq_len: int,
+        max_beam_width: int,
+        kv_cache_type: KVCacheType,
+        lora_manager: Optional[LoraManager] = None,
+    ) -> None:
         """
         Create a ModelRunner instance.
         You are recommended to use the from_dir method to load the engine and create a ModelRunner instance.
@@ -533,12 +534,21 @@ class ModelRunner(ModelRunnerMixin):
         self.multi_block_mode = True
 
     @classmethod
-    def from_engine(cls, engine: Engine, max_output_len: Optional[int],
-                    lora_dir: Optional[List[str]], rank: int, debug_mode: bool,
-                    lora_ckpt_source: str, medusa_choices: List[List[int]],
-                    stream: torch.cuda.Stream, gpu_weights_percent: float,
-                    enable_context_fmha_fp32_acc: Optional[bool],
-                    multi_block_mode: Optional[bool]) -> 'ModelRunner':
+    def from_engine(
+        cls,
+        engine: Engine,
+        *,
+        max_output_len: Optional[int],
+        lora_dir: Optional[List[str]],
+        rank: int,
+        debug_mode: bool,
+        lora_ckpt_source: str,
+        medusa_choices: List[List[int]],
+        stream: torch.cuda.Stream,
+        gpu_weights_percent: float,
+        enable_context_fmha_fp32_acc: Optional[bool],
+        multi_block_mode: Optional[bool],
+    ) -> 'ModelRunner':
         model_config = _engine_config_to_model_config(
             engine.config, gpu_weights_percent=gpu_weights_percent)
 
@@ -603,6 +613,7 @@ class ModelRunner(ModelRunnerMixin):
     def from_dir(
         cls,
         engine_dir: str,
+        *,
         max_output_len: Optional[int] = None,
         lora_dir: Optional[List[str]] = None,
         rank: int = 0,

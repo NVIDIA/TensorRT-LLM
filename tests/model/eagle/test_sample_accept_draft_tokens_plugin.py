@@ -39,9 +39,7 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
 
     def load_test_cases():
         test_cases = []
-        ################# CASE 0 ##########################
-        # BS=1, greedy sampling, gen request
-        # 7 draft tokens
+
         logits = torch.tensor(
             [
                 [0, -100, -100, -100, -100, -100, -100, -100
@@ -62,6 +60,9 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
             ],
             dtype=torch.float32,
             device="cuda")
+        ################# CASE 0 ##########################
+        # BS=1, greedy sampling, gen request
+        # 7 draft tokens
         draft_tokens = torch.tensor([[0, 1, 2, 3, 4, 5, 6]],
                                     dtype=torch.int32,
                                     device="cuda")
@@ -69,9 +70,13 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
         eagle_temperature = torch.tensor([0.0],
                                          dtype=torch.float,
                                          device="cuda")
-        rand_data_validation = torch.tensor([[0.0]],
+        rand_data_validation = torch.tensor([[0.0 for _ in range(8)]],
                                             dtype=torch.float,
                                             device="cuda")
+        posterior_alpha = torch.tensor([0.1], dtype=torch.float, device="cuda")
+        posterior_threshold = torch.tensor([0.1],
+                                           dtype=torch.float,
+                                           device="cuda")
         paths = torch.tensor(
             [[
                 [0, 1, 4, 6],  # Draft seq [0, 3, 5],  Target seq [0, 1, 3, 1]
@@ -85,7 +90,7 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
             ]],
             dtype=torch.int32,
             device="cuda")
-        greedy_sampling = True
+        greedy_sampling = torch.tensor([1], dtype=torch.int32, device="cpu")
         ref_accepted_tokens = torch.tensor([[0, 1]],
                                            dtype=torch.int32,
                                            device="cuda")
@@ -96,8 +101,9 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
 
         test_cases += [[
             logits, draft_tokens, draft_lens, eagle_temperature,
-            rand_data_validation, paths, greedy_sampling, ref_accepted_tokens,
-            ref_num_accepted_tokens, ref_accepted_paths
+            rand_data_validation, posterior_alpha, posterior_threshold, paths,
+            greedy_sampling, ref_accepted_tokens, ref_num_accepted_tokens,
+            ref_accepted_paths
         ]]
 
         ################# CASE 1 ##########################
@@ -136,7 +142,7 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
             ]],
             dtype=torch.int32,
             device="cuda")
-        greedy_sampling = True
+        greedy_sampling = torch.tensor([1], dtype=torch.int32, device="cpu")
         ref_accepted_tokens = torch.tensor([[2, 5, 6, 7]],
                                            dtype=torch.int32,
                                            device="cuda")
@@ -147,8 +153,9 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
 
         test_cases += [[
             logits, draft_tokens, draft_lens, eagle_temperature,
-            rand_data_validation, paths, greedy_sampling, ref_accepted_tokens,
-            ref_num_accepted_tokens, ref_accepted_paths
+            rand_data_validation, posterior_alpha, posterior_threshold, paths,
+            greedy_sampling, ref_accepted_tokens, ref_num_accepted_tokens,
+            ref_accepted_paths
         ]]
 
         ################# CASE 2 ##########################
@@ -181,9 +188,16 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
         eagle_temperature = torch.tensor([0.0, 0.0],
                                          dtype=torch.float,
                                          device="cuda")
-        rand_data_validation = torch.tensor([[0.0], [0.0]],
-                                            dtype=torch.float,
-                                            device="cuda")
+        rand_data_validation = torch.tensor(
+            [[0.0 for _ in range(5)], [0.0 for _ in range(5)]],
+            dtype=torch.float,
+            device="cuda")
+        posterior_alpha = torch.tensor([0.1, 0.1],
+                                       dtype=torch.float,
+                                       device="cuda")
+        posterior_threshold = torch.tensor([0.1, 0.1],
+                                           dtype=torch.float,
+                                           device="cuda")
         paths = torch.tensor(
             [
                 [
@@ -203,7 +217,7 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
             ],
             dtype=torch.int32,
             device="cuda")
-        greedy_sampling = True
+        greedy_sampling = torch.tensor([1], dtype=torch.int32, device="cpu")
         ref_accepted_tokens = torch.tensor([[0, 1, -1, -1], [3, 2, -1, -1]],
                                            dtype=torch.int32,
                                            device="cuda")
@@ -216,8 +230,9 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
 
         test_cases += [[
             logits, draft_tokens, draft_lens, eagle_temperature,
-            rand_data_validation, paths, greedy_sampling, ref_accepted_tokens,
-            ref_num_accepted_tokens, ref_accepted_paths
+            rand_data_validation, posterior_alpha, posterior_threshold, paths,
+            greedy_sampling, ref_accepted_tokens, ref_num_accepted_tokens,
+            ref_accepted_paths
         ]]
 
         ################# CASE 3 ##########################
@@ -230,9 +245,18 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
         eagle_temperature = torch.tensor([0.0, 0.0, 0.0],
                                          dtype=torch.float,
                                          device="cuda")
-        rand_data_validation = torch.tensor([[0.0], [0.0], [0.0]],
-                                            dtype=torch.float,
-                                            device="cuda")
+        rand_data_validation = torch.tensor(
+            [[0.0
+              for _ in range(6)], [0.0
+                                   for _ in range(6)], [0.0 for _ in range(6)]],
+            dtype=torch.float,
+            device="cuda")
+        posterior_alpha = torch.tensor([0.1, 0.1, 0.1],
+                                       dtype=torch.float,
+                                       device="cuda")
+        posterior_threshold = torch.tensor([0.1, 0.1, 0.1],
+                                           dtype=torch.float,
+                                           device="cuda")
         paths = torch.tensor(
             [
                 [
@@ -263,7 +287,7 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
             ],
             dtype=torch.int32,
             device="cuda")
-        greedy_sampling = True
+        greedy_sampling = torch.tensor([1], dtype=torch.int32, device="cpu")
         ref_accepted_tokens = torch.tensor(
             [[0, -1, -1, -1], [1, -1, -1, -1], [2, 2, -1, -1]],
             dtype=torch.int32,
@@ -277,16 +301,292 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
 
         test_cases += [[
             logits, draft_tokens, draft_lens, eagle_temperature,
-            rand_data_validation, paths, greedy_sampling, ref_accepted_tokens,
-            ref_num_accepted_tokens, ref_accepted_paths
+            rand_data_validation, posterior_alpha, posterior_threshold, paths,
+            greedy_sampling, ref_accepted_tokens, ref_num_accepted_tokens,
+            ref_accepted_paths
         ]]
+
+        ################# CASE 4 ##########################
+        # BS=1, typical sampling, temperature = 0.f -- same as greedy sampling, gen request
+        # 7 draft tokens
+        draft_tokens = torch.tensor([[0, 1, 2, 3, 4, 5, 6]],
+                                    dtype=torch.int32,
+                                    device="cuda")
+        draft_lens = torch.tensor([7], dtype=torch.int32, device="cuda")
+        eagle_temperature = torch.tensor([0.0],
+                                         dtype=torch.float,
+                                         device="cuda")
+        rand_data_validation = torch.tensor([[0.0 for _ in range(8)]],
+                                            dtype=torch.float,
+                                            device="cuda")
+        posterior_alpha = torch.tensor([0.1], dtype=torch.float, device="cuda")
+        posterior_threshold = torch.tensor([0.1],
+                                           dtype=torch.float,
+                                           device="cuda")
+        paths = torch.tensor(
+            [[
+                [0, 1, 4, 6],  # Draft seq [0, 3, 5],  Target seq [0, 1, 3, 1]
+                [0, 1, 4, 7],  # Draft seq [0, 3, 6],  Target seq [0, 1, 3, 0]
+                [0, 2, -1, -1],  # Draft seq [1],        Target seq [0, 2]
+                [0, 3, 5, -1],  # Draft seq [2, 4],     Target seq [0, 3, 2]
+                [-1, -1, -1, -1],
+                [-1, -1, -1, -1],
+                [-1, -1, -1, -1],
+                [-1, -1, -1, -1]
+            ]],
+            dtype=torch.int32,
+            device="cuda")
+        greedy_sampling = torch.tensor([0], dtype=torch.int32, device="cpu")
+        ref_accepted_tokens = torch.tensor([[0, 1]],
+                                           dtype=torch.int32,
+                                           device="cuda")
+        ref_num_accepted_tokens = torch.tensor([2],
+                                               dtype=torch.int32,
+                                               device="cuda")
+        ref_accepted_paths = torch.tensor([0], dtype=torch.int32, device="cuda")
+
+        test_cases += [[
+            logits, draft_tokens, draft_lens, eagle_temperature,
+            rand_data_validation, posterior_alpha, posterior_threshold, paths,
+            greedy_sampling, ref_accepted_tokens, ref_num_accepted_tokens,
+            ref_accepted_paths
+        ]]
+
+        ################# CASE 5 ##########################
+        # BS=1, typical sampling, temperature = 1.f, gen request
+        # Very conservative posterior_threshold
+        # 7 draft tokens
+        logits = torch.tensor(
+            [
+                [-0.9163, -1.2040, -1.6094, -2.3026, -1e9, -1e9, -1e9, -1e9
+                 ],  # t0: Top4 id = 0, 1, 2, 3
+                [-1e9, -0.9163, -1.2040, -1.6094, -2.3026, -1e9, -1e9, -1e9
+                 ],  # t1: Top4 id = 1, 2, 3,4
+                [-1e9, -1e9, -0.9163, -1.2040, -1.6094, -2.3026, -1e9, -1e9
+                 ],  # t2: Top5 id = 2, 3, 4, 5
+                [-1e9, -1e9, -1e9, -0.9163, -1.2040, -1.6094, -2.3026, -1e9
+                 ],  # t3: Top4 id = 3, 4, 5, 6
+                [-1e9, -1e9, -1e9, -0.9163, -1.2040, -1.6094, -2.3026, -1e9
+                 ],  # t4: Top4 id = 3, 4, 5, 6
+                [-1e9, -1e9, -0.9163, -1.2040, -1.6094, -2.3026, -1e9, -1e9
+                 ],  # t5: Top4 id = 2, 3, 4, 5
+                [-1e9, -0.9163, -1.2040, -1.6094, -2.3026, -1e9, -1e9, -1e9
+                 ],  # t6: Top4 id = 2, 3, 4, 5
+                [-0.9163, -1.2040, -1.6094, -2.3026, -1e9, -1e9, -1e9, -1e9
+                 ]  # t7: Top1 id = 0, 1, 2, 3
+            ],
+            dtype=torch.float32,
+            device="cuda")
+
+        draft_tokens = torch.tensor([[0, 1, 2, 3, 4, 5, 6]],
+                                    dtype=torch.int32,
+                                    device="cuda")
+        draft_lens = torch.tensor([7], dtype=torch.int32, device="cuda")
+        eagle_temperature = torch.tensor([1.0],
+                                         dtype=torch.float,
+                                         device="cuda")
+        rand_data_validation = torch.tensor(
+            [[0.1, 0.8, 0.5, 0.5, 0.1, 0.2, 0.8, 0.1]],
+            dtype=torch.float,
+            device="cuda")
+        posterior_alpha = torch.tensor([0.9999],
+                                       dtype=torch.float,
+                                       device="cuda")
+        posterior_threshold = torch.tensor([0.99],
+                                           dtype=torch.float,
+                                           device="cuda")
+        paths = torch.tensor(
+            [[
+                [0, 1, 4, 6],  # Draft seq [0, 3, 5],  Target seq [0, 2, 3, 1]
+                [0, 1, 4, 7],  # Draft seq [0, 3, 6],  Target seq [0, 2, 3, 2]
+                [0, 2, -1, -1],  # Draft seq [1],        Target seq [0, 3]
+                [0, 3, 5, -1],  # Draft seq [2, 4],     Target seq [0, 4, 2]
+                [-1, -1, -1, -1],
+                [-1, -1, -1, -1],
+                [-1, -1, -1, -1],
+                [-1, -1, -1, -1]
+            ]],
+            dtype=torch.int32,
+            device="cuda")
+        greedy_sampling = torch.tensor([0], dtype=torch.int32, device="cpu")
+        ref_accepted_tokens = torch.tensor([[0, 1]],
+                                           dtype=torch.int32,
+                                           device="cuda")
+        ref_num_accepted_tokens = torch.tensor([2],
+                                               dtype=torch.int32,
+                                               device="cuda")
+        ref_accepted_paths = torch.tensor([0], dtype=torch.int32, device="cuda")
+
+        test_cases += [[
+            logits, draft_tokens, draft_lens, eagle_temperature,
+            rand_data_validation, posterior_alpha, posterior_threshold, paths,
+            greedy_sampling, ref_accepted_tokens, ref_num_accepted_tokens,
+            ref_accepted_paths
+        ]]
+
+        ################# CASE 6 ##########################
+        # BS=1, typical sampling, temperature = 1.f, gen request
+        # Small posterior_threshold
+        # 7 draft tokens
+
+        draft_tokens = torch.tensor([[0, 1, 2, 3, 4, 5, 6]],
+                                    dtype=torch.int32,
+                                    device="cuda")
+        draft_lens = torch.tensor([7], dtype=torch.int32, device="cuda")
+        eagle_temperature = torch.tensor([1.0],
+                                         dtype=torch.float,
+                                         device="cuda")
+        rand_data_validation = torch.tensor(
+            [[0.1, 0.8, 0.5, 0.5, 0.1, 0.2, 0.8, 0.1]],
+            dtype=torch.float,
+            device="cuda")
+        posterior_alpha = torch.tensor([0.3], dtype=torch.float, device="cuda")
+        posterior_threshold = torch.tensor([0.09],
+                                           dtype=torch.float,
+                                           device="cuda")
+        paths = torch.tensor(
+            [[
+                [0, 1, 4, 6],  # Draft seq [0, 3, 5],  Target seq [0, 2, 3, 1]
+                [0, 1, 4, 7],  # Draft seq [0, 3, 6],  Target seq [0, 2, 3, 2]
+                [0, 2, -1, -1],  # Draft seq [1],        Target seq [0, 3]
+                [0, 3, 5, -1],  # Draft seq [2, 4],     Target seq [0, 4, 2]
+                [-1, -1, -1, -1],
+                [-1, -1, -1, -1],
+                [-1, -1, -1, -1],
+                [-1, -1, -1, -1]
+            ]],
+            dtype=torch.int32,
+            device="cuda")
+        greedy_sampling = torch.tensor([0], dtype=torch.int32, device="cpu")
+        ref_accepted_tokens = torch.tensor([[0, 2]],
+                                           dtype=torch.int32,
+                                           device="cuda")
+        ref_num_accepted_tokens = torch.tensor([2],
+                                               dtype=torch.int32,
+                                               device="cuda")
+        ref_accepted_paths = torch.tensor([0], dtype=torch.int32, device="cuda")
+
+        test_cases += [[
+            logits, draft_tokens, draft_lens, eagle_temperature,
+            rand_data_validation, posterior_alpha, posterior_threshold, paths,
+            greedy_sampling, ref_accepted_tokens, ref_num_accepted_tokens,
+            ref_accepted_paths
+        ]]
+
+        ################# CASE 7 ##########################
+        # BS=1, typical sampling, temperature = 0.8f, gen request
+        # Small posterior_threshold
+        # 7 draft tokens
+
+        draft_tokens = torch.tensor([[0, 1, 2, 3, 4, 5, 6]],
+                                    dtype=torch.int32,
+                                    device="cuda")
+        draft_lens = torch.tensor([7], dtype=torch.int32, device="cuda")
+        eagle_temperature = torch.tensor([0.8],
+                                         dtype=torch.float,
+                                         device="cuda")
+        rand_data_validation = torch.tensor(
+            [[0.95, 0.8, 0.5, 0.7, 0.1, 0.2, 0.8, 0.1]],
+            dtype=torch.float,
+            device="cuda")
+        posterior_alpha = torch.tensor([0.3], dtype=torch.float, device="cuda")
+        posterior_threshold = torch.tensor([0.09],
+                                           dtype=torch.float,
+                                           device="cuda")
+        paths = torch.tensor(
+            [[
+                [0, 1, 4, 6],  # Draft seq [0, 3, 5],  Target seq [0, 2, 3, 1]
+                [0, 1, 4, 7],  # Draft seq [0, 3, 6],  Target seq [0, 2, 3, 2]
+                [0, 2, -1, -1],  # Draft seq [1],        Target seq [0, 3]
+                [0, 3, 5, -1],  # Draft seq [2, 4],     Target seq [2, 4, 2]
+                [-1, -1, -1, -1],
+                [-1, -1, -1, -1],
+                [-1, -1, -1, -1],
+                [-1, -1, -1, -1]
+            ]],
+            dtype=torch.int32,
+            device="cuda")
+        greedy_sampling = torch.tensor([0], dtype=torch.int32, device="cpu")
+        ref_accepted_tokens = torch.tensor([[2, 4, 2]],
+                                           dtype=torch.int32,
+                                           device="cuda")
+        ref_num_accepted_tokens = torch.tensor([3],
+                                               dtype=torch.int32,
+                                               device="cuda")
+        ref_accepted_paths = torch.tensor([3], dtype=torch.int32, device="cuda")
+
+        test_cases += [[
+            logits, draft_tokens, draft_lens, eagle_temperature,
+            rand_data_validation, posterior_alpha, posterior_threshold, paths,
+            greedy_sampling, ref_accepted_tokens, ref_num_accepted_tokens,
+            ref_accepted_paths
+        ]]
+
+        ################ CASE 8 ##########################
+        # BS=2, typical sampling, gen request
+        draft_tokens = torch.tensor([[0, 1, -1, -1], [2, 3, 4, 5]],
+                                    dtype=torch.int32,
+                                    device="cuda")
+        draft_lens = torch.tensor([2, 4], dtype=torch.int32, device="cuda")
+        eagle_temperature = torch.tensor([0.8, 1.0],
+                                         dtype=torch.float,
+                                         device="cuda")
+        rand_data_validation = torch.tensor(
+            [[0.8, 0.1, 0.95, 0.0, 0.0], [0.5, 0.1, 0.5, 0.2, 0.7]],
+            dtype=torch.float,
+            device="cuda")
+        posterior_alpha = torch.tensor([0.3, 0.999],
+                                       dtype=torch.float,
+                                       device="cuda")
+        posterior_threshold = torch.tensor([0.09, 0.99],
+                                           dtype=torch.float,
+                                           device="cuda")
+        paths = torch.tensor(
+            [
+                [
+                    [0, 1, -1, -1],  # Draft seq [0],  Target seq [1, 1]
+                    [0, 2, -1, -1],  # Draft seq [1],  Target seq [1, 4]
+                    [-1, -1, -1, -1],
+                    [-1, -1, -1, -1],
+                    [-1, -1, -1, -1]
+                ],
+                [
+                    [0, 1, -1, -1],  # Draft seq [2],    Target seq [3, 3]
+                    [0, 2, -1, -1],  # Draft seq [3],    Target seq [3, 2]
+                    [0, 3, 4, -1],  # Draft seq [4, 5], Target seq [3, 1, 0]
+                    [-1, -1, -1, -1],
+                    [-1, -1, -1, -1]
+                ]
+            ],
+            dtype=torch.int32,
+            device="cuda")
+        greedy_sampling = torch.tensor([0], dtype=torch.int32, device="cpu")
+
+        ref_accepted_tokens = torch.tensor([[1, 4, -1, -1], [3, 2, -1, -1]],
+                                           dtype=torch.int32,
+                                           device="cuda")
+        ref_num_accepted_tokens = torch.tensor([2, 2],
+                                               dtype=torch.int32,
+                                               device="cuda")
+        ref_accepted_paths = torch.tensor([1, 1],
+                                          dtype=torch.int32,
+                                          device="cuda")
+
+        test_cases += [[
+            logits, draft_tokens, draft_lens, eagle_temperature,
+            rand_data_validation, posterior_alpha, posterior_threshold, paths,
+            greedy_sampling, ref_accepted_tokens, ref_num_accepted_tokens,
+            ref_accepted_paths
+        ]]
+
         return test_cases
 
     @parameterized.expand(load_test_cases, name_func=unittest_name_func)
     def test_sample_accept_draft_tokens_plugin(
             self, logits, draft_tokens, draft_lens, eagle_temperature,
-            rand_data_validation, paths, greedy_sampling, ref_accepted_tokens,
-            ref_num_accepted_tokens, ref_accepted_paths):
+            rand_data_validation, posterior_alpha, posterior_threshold, paths,
+            greedy_sampling, ref_accepted_tokens, ref_num_accepted_tokens,
+            ref_accepted_paths):
         # construct trt network
         builder = tensorrt_llm.Builder()
         network = builder.create_network()
@@ -307,7 +607,16 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
             rand_data_validation_t = Tensor(name='rand_data_validation',
                                             dtype=trt.float32,
                                             shape=rand_data_validation.shape)
+            posterior_alpha_t = Tensor(name='posterior_alpha',
+                                       dtype=trt.float32,
+                                       shape=posterior_alpha.shape)
+            posterior_threshold_t = Tensor(name='posterior_threshold',
+                                           dtype=trt.float32,
+                                           shape=posterior_threshold.shape)
             paths_t = Tensor(name='paths', dtype=trt.int32, shape=paths.shape)
+            greedy_sampling_t = Tensor(name='greedy_sampling',
+                                       dtype=trt.int32,
+                                       shape=greedy_sampling.shape)
 
             output = tensorrt_llm.models.eagle.model.eagle_sample_and_accept_draft_plugin(
                 logits_t,
@@ -315,8 +624,10 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
                 draft_lens_t,
                 eagle_temperature_t,
                 rand_data_validation_t,
+                posterior_alpha_t,
+                posterior_threshold_t,
                 TreeParams(paths=paths_t),
-                greedy_sampling=greedy_sampling)
+                greedy_sampling=greedy_sampling_t)
             accepted_tokens, num_accepted_tokens, accepted_paths, next_draft_tokens, next_draft_lens, next_draft_paths, hidden_size_batch_level_starts = output
 
             accepted_tokens.mark_output('accepted_tokens')
@@ -336,7 +647,10 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
             "draft_lens": draft_lens,
             "eagle_temperature": eagle_temperature,
             "rand_data_validation": rand_data_validation,
+            "posterior_alpha": posterior_alpha,
+            "posterior_threshold": posterior_threshold,
             "paths": paths,
+            "greedy_sampling": greedy_sampling,
         }
         outputs = run_session(session, inputs)
 

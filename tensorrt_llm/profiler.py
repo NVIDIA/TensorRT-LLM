@@ -14,6 +14,7 @@
 # limitations under the License.
 import time
 from functools import partial
+from importlib.metadata import version
 from typing import Literal, Optional, Tuple, Union
 
 # isort: off
@@ -118,9 +119,10 @@ class PyNVMLContext:
 if pynvml is not None:
     with PyNVMLContext():
         driver_version = pynvml.nvmlSystemGetDriverVersion()
-        if pynvml.__version__ < '11.5.0' or driver_version < '526':
+        pynvml_version = version("pynvml")
+        if pynvml_version < '11.5.0' or driver_version < '526':
             logger.warning(
-                f'Found pynvml=={pynvml.__version__} and cuda driver version '
+                f'Found pynvml=={pynvml_version} and cuda driver version '
                 f'{driver_version}. Please use pynvml>=11.5.0 and cuda '
                 f'driver>=526 to get accurate memory usage.')
             # Support legacy pynvml. Note that an old API could return

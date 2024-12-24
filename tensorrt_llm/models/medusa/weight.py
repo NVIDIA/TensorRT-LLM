@@ -50,7 +50,7 @@ def load_medusa_hf(medusa_path: str,
                    dtype='float32',
                    use_weight_only=False,
                    plugin_weight_only_quant_type=None):
-    logger.info("Loading Medusa heads' weights ...")
+    # logger.info("Loading Medusa heads' weights ...")
     is_ckpt_safetensors = False
 
     ckpt_file = Path(medusa_path) / "medusa_lm_head.pt"
@@ -343,7 +343,6 @@ def convert_hf_llama(hf_model,
                      use_parallel_embedding=False,
                      sharding_dim=0,
                      use_weight_only=False,
-                     share_embedding_table=False,
                      plugin_weight_only_quant_type=torch.int8,
                      use_smooth_quant=False,
                      per_channel=False,

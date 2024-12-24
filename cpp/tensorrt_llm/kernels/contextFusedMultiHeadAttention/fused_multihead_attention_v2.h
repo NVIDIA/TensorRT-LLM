@@ -230,14 +230,15 @@ public:
 
     inline uint64_t hashID(unsigned int s, unsigned int d, unsigned int dv, bool interleaved, bool unroll,
         bool force_fp32_acc, bool flash_attention, bool warp_specialization, bool is_alibi_supported,
-        int attention_mask_type, int input_layout, bool tiled, bool has_qk_tanh_scale) const
+        int attention_mask_type, int input_layout, bool tiled, bool enable_attn_logit_softcapping) const
     {
         s = flash_attention ? 0 : s;
         // D <= 1024
         return (uint64_t(s) << 36) | (uint64_t(d) << 26) | (dv << 16) | (attention_mask_type << 10)
-            | (input_layout << 8) | (has_qk_tanh_scale ? 128ull : 0ull) | (is_alibi_supported ? 64ull : 0ull)
-            | (warp_specialization ? 32ull : 0ull) | (tiled ? 16ull : 0ull) | (force_fp32_acc ? 8ull : 0ull)
-            | (flash_attention ? 4ull : 0ull) | (interleaved ? 2ull : 0ull) | (unroll ? 1ull : 0ull);
+            | (input_layout << 8) | (enable_attn_logit_softcapping ? 128ull : 0ull)
+            | (is_alibi_supported ? 64ull : 0ull) | (warp_specialization ? 32ull : 0ull) | (tiled ? 16ull : 0ull)
+            | (force_fp32_acc ? 8ull : 0ull) | (flash_attention ? 4ull : 0ull) | (interleaved ? 2ull : 0ull)
+            | (unroll ? 1ull : 0ull);
     }
 
     uint64_t hashID(KernelMeta const& kernelMeta) const override
@@ -246,7 +247,7 @@ public:
         return hashID(kernelMeta.mS, kernelMeta.mD, kernelMeta.mDV, kernelMeta.mInterleaved, kernelMeta.mUnrollStep,
             kernelMeta.mFP32Accumulation, kernelMeta.mFlashAttention, kernelMeta.mWarpSpecialization,
             kernelMeta.mAlibiSupported, kernelMeta.mAttentionMaskType, kernelMeta.mAttentionInputLayout,
-            kernelMeta.mTiled, kernelMeta.mEnableQKTanhScale);
+            kernelMeta.mTiled, kernelMeta.mEnableAttnLogitSoftcapping);
     }
 
     // FMHA runner.
@@ -262,7 +263,7 @@ public:
             launch_params.force_fp32_acc, launch_params.flash_attention, launch_params.warp_specialization,
             !launch_params.useKernelWithoutAlibi, static_cast<int>(launch_params.attention_mask_type),
             static_cast<int>(launch_params.attention_input_layout), launch_params.granular_tiling,
-            launch_params.enableQKTanhScale);
+            launch_params.enableAttnLogitSoftcapping);
 
         auto const& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
         const CUfunction func = findIter->second.mDeviceFunction;
@@ -360,7 +361,7 @@ public:
     {
         uint64_t id = hashID(0, params.headSize, params.headSizeV, 0, 0, params.forceFp32Acc, false, false, false,
             static_cast<int>(params.attentionMaskType), static_cast<int>(params.attentionInputLayout), false,
-            params.qkTanhScale != 0.f);
+            params.attnLogitSoftcappingScale != 0.f);
         auto const findIter = std::find_if(mFunctions.begin(), mFunctions.end(), KernelExistPredicate(id));
         return findIter != mFunctions.end();
     }
@@ -374,7 +375,7 @@ public:
             launch_params.kernel_s, params.d, params.dv, launch_params.interleaved, launch_params.force_fp32_acc,
             launch_params.flash_attention, launch_params.warp_specialization, !launch_params.useKernelWithoutAlibi,
             static_cast<int>(launch_params.attention_mask_type), static_cast<int>(launch_params.attention_input_layout),
-            launch_params.granular_tiling, launch_params.enableQKTanhScale);
+            launch_params.granular_tiling, launch_params.enableAttnLogitSoftcapping);
 
         auto const& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
         out_step_q = kernelMeta.mStepQ;
@@ -431,7 +432,7 @@ private:
             launch_params.force_fp32_acc, launch_params.flash_attention, launch_params.warp_specialization,
             !launch_params.useKernelWithoutAlibi, static_cast<int>(launch_params.attention_mask_type),
             static_cast<int>(launch_params.attention_input_layout), launch_params.granular_tiling,
-            launch_params.enableQKTanhScale);
+            launch_params.enableAttnLogitSoftcapping);
     }
 };
 

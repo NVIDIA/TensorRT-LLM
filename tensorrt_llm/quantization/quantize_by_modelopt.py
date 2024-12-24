@@ -24,7 +24,6 @@ import sys
 import time
 
 import numpy as np
-import safetensors
 import torch
 from accelerate.hooks import remove_hook_from_module
 from datasets import load_dataset
@@ -119,6 +118,7 @@ MODEL_NAME_PATTERN_MAP = {
     "Bloom": "bloom",
     "ChatGLM": "chatglm",
     "QWen": "qwen",
+    "RecurrentGemma": "recurrentgemma",
     "Gemma2": "gemma2",
     "Gemma": "gemma",
     "MixtralForCausalLM": "llama",
@@ -508,6 +508,7 @@ def quantize_and_export(*,
                         output_dir,
                         tp_size,
                         pp_size,
+                        cp_size,
                         seed,
                         tokenizer_max_seq_length,
                         num_medusa_heads=None,
@@ -612,7 +613,7 @@ def quantize_and_export(*,
             batch_size=batch_size,
             calib_size=calib_size,
             block_size=calib_max_seq_length,
-            device=device,
+            device=model.device,
             include_labels=auto_quantize_bits is not None,
         )
 
@@ -682,19 +683,6 @@ def quantize_and_export(*,
             with open(f"{export_path}/config.json", "w") as f:
                 json.dump(tensorrt_llm_config, f, indent=4)
 
-        # Workaround for share_embedding_table
-        if pp_size == 1:
-            with safetensors.safe_open(f"{export_path}/rank0.safetensors",
-                                       framework='pt',
-                                       device='cpu') as f:
-                share_embedding_table = 'lm_head.weight' not in f.keys()
-            if share_embedding_table:
-                with open(f"{export_path}/config.json", "r") as f:
-                    tensorrt_llm_config = json.load(f)
-                tensorrt_llm_config["share_embedding_table"] = True
-                with open(f"{export_path}/config.json", "w") as f:
-                    json.dump(tensorrt_llm_config, f, indent=4)
-
         # Workaround for qwen version
         if model_type == 'qwen':
             with open(f"{export_path}/config.json", "r") as f:
@@ -738,6 +726,15 @@ def quantize_and_export(*,
             tensorrt_llm_config['rotary_base'] = rotary_base
             tensorrt_llm_config['rotary_scaling'] = rotary_embedding_scaling
             tensorrt_llm_config['rotary_pct'] = 0.5
+            with open(f"{export_path}/config.json", "w") as f:
+                json.dump(tensorrt_llm_config, f, indent=4)
+
+        # context parallel
+        if cp_size > 1:
+            with open(f"{export_path}/config.json", "r") as f:
+                tensorrt_llm_config = json.load(f)
+            tensorrt_llm_config["mapping"]["cp_size"] = cp_size
+            tensorrt_llm_config["mapping"]["world_size"] *= cp_size
             with open(f"{export_path}/config.json", "w") as f:
                 json.dump(tensorrt_llm_config, f, indent=4)
 
@@ -832,7 +829,7 @@ def quantize_nemo_and_export(*, nemo_ckpt_path, decoder_type, calib_dataset,
                              calib_tp_size, calib_pp_size, dtype, qformat,
                              kv_cache_dtype, calib_size, batch_size,
                              calib_max_seq_length, awq_block_size, output_dir,
-                             tp_size, pp_size, seed):
+                             tp_size, pp_size, cp_size, seed):
     try:
         import modelopt  # noqa
     except ImportError as e:
@@ -1042,6 +1039,15 @@ def quantize_nemo_and_export(*, nemo_ckpt_path, decoder_type, calib_dataset,
         inference_tensor_parallel=tp_size,
         inference_pipeline_parallel=pp_size,
     )
+
+    # context parallel
+    if cp_size > 1:
+        with open(f"{export_path}/config.json", "r") as f:
+            tensorrt_llm_config = json.load(f)
+        tensorrt_llm_config["mapping"]["cp_size"] = cp_size
+        tensorrt_llm_config["mapping"]["world_size"] *= cp_size
+        with open(f"{export_path}/config.json", "w") as f:
+            json.dump(tensorrt_llm_config, f, indent=4)
 
     end_time = time.time()
     print_rank_0(

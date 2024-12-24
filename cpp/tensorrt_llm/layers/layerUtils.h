@@ -25,6 +25,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/layers/decodingParams.h"
+#include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 

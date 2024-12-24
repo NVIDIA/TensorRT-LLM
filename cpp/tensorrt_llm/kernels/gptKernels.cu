@@ -84,6 +84,10 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
     // Whether to calculate cumulative packed mask rows.
     bool const calculate_packed_mask_row_offsets = params.packedMaskRowOffsets != nullptr;
 
+    // Whether to calculate cumulative cp partial sequence lengths.
+    int const cpSize = params.cpSize;
+    bool const calculate_cp_offsets = cpSize > 1 && params.seqCpPartialOffsets != nullptr;
+
     // Compute the padding offsets for Encoder Inputs.
     bool const need_encoder_padding_offsets = (params.encoderPaddingOffsets != nullptr) && calculate_kv_offsets;
     [[maybe_unused]] int* smemEncoderSeqQOffsets;
@@ -100,6 +104,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
     BlockPrefixCallbackOp prefixQOp(0);
     BlockPrefixCallbackOp prefixMaskOp(0);
     BlockPrefixCallbackOp prefixKVOp(0);
+    BlockPrefixCallbackOp prefixCpPartialOp(0);
 
     if (need_encoder_padding_offsets)
     {
@@ -123,6 +128,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
         int seqQLength = 0;
         [[maybe_unused]] int packedMaskRows = 0;
         [[maybe_unused]] int seqKVLength = 0;
+        [[maybe_unused]] int seqCpPartialLength = 0;
         if (batchIdx < batchSizeBound)
         {
             seqQLength = fixed_q_seqlen ? params.maxQSeqLength : params.seqQLengths[batchIdx];
@@ -131,12 +137,14 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
                 ? divUp(seqQLength, int(FLASH_ATTEN_PACKED_MASK_M_ALIGNMENT)) * FLASH_ATTEN_PACKED_MASK_M_ALIGNMENT
                 : 0;
             seqKVLength = calculate_kv_offsets ? params.seqKVLengths[batchIdx] : 0;
+            seqCpPartialLength = calculate_cp_offsets ? (seqQLength + cpSize - 1) / cpSize : 0;
         }
 
         // Do the prefix-scan (it calls syncthreads internally).
         int seqQOffset;
         [[maybe_unused]] int packedMaskRowOffset;
         [[maybe_unused]] int seqKVOffset;
+        [[maybe_unused]] int seqCpPartialOffset;
         BlockScan(tempQStorage).ExclusiveSum(seqQLength, seqQOffset, prefixQOp);
         if (calculate_packed_mask_row_offsets)
         {
@@ -145,6 +153,10 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
         if (calculate_kv_offsets)
         {
             BlockScan(tempKVStorage).ExclusiveSum(seqKVLength, seqKVOffset, prefixKVOp);
+        }
+        if (calculate_cp_offsets)
+        {
+            BlockScan(tempKVStorage).ExclusiveSum(seqCpPartialLength, seqCpPartialOffset, prefixCpPartialOp);
         }
 
         // Store the result to smem.
@@ -168,6 +180,10 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
             if (calculate_kv_offsets)
             {
                 params.seqKVOffsets[batchIdx] = seqKVOffset;
+            }
+            if (calculate_cp_offsets)
+            {
+                params.seqCpPartialOffsets[batchIdx] = seqCpPartialOffset;
             }
         }
 

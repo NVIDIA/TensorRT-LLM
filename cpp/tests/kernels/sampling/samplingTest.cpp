@@ -68,8 +68,18 @@ void SamplingKernelTest<T>::allocateBuffers(SamplingKernelTestParam const& param
         = BufferManager::pinned(ITensor::makeShape({batchSize, maxTokensPerStep}), nvinfer1::DataType::kINT64);
 
     mCumLogProbsDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
-    mOutputLogProbsDevice
-        = mBufferManager->gpu(ITensor::makeShape({mMaxSeqLen, maxBatchSize}), nvinfer1::DataType::kFLOAT);
+
+    if (param.returnAllSelectedTokens)
+    {
+        SizeType32 maxTopK = param.topK == 0 ? vocabSize : param.topK;
+        mOutputLogProbsDevice
+            = mBufferManager->gpu(ITensor::makeShape({maxBatchSize, maxTopK}), nvinfer1::DataType::kFLOAT);
+    }
+    else
+    {
+        mOutputLogProbsDevice
+            = mBufferManager->gpu(ITensor::makeShape({mMaxSeqLen, maxBatchSize}), nvinfer1::DataType::kFLOAT);
+    }
 
     mZeroParentIdsDevice
         = mBufferManager->gpu(ITensor::makeShape({maxBatchSize, maxTokensPerStep}), nvinfer1::DataType::kINT32);
@@ -95,6 +105,18 @@ void SamplingKernelTest<T>::allocateBuffers(SamplingKernelTestParam const& param
     mBatchSlots = BufferManager::pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
 
     mExpectedCumLogProbsHost = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+
+    if (param.returnAllSelectedTokens)
+    {
+        SizeType32 maxTopK = param.topK == 0 ? vocabSize : param.topK;
+        mExpectedLogProbsHost
+            = BufferManager::pinned(ITensor::makeShape({maxBatchSize, maxTopK}), nvinfer1::DataType::kFLOAT);
+    }
+    else
+    {
+        mExpectedLogProbsHost
+            = BufferManager::pinned(ITensor::makeShape({mMaxSeqLen, maxBatchSize}), nvinfer1::DataType::kFLOAT);
+    }
 
     mCurandStatesDevice
         = mBufferManager->gpu(ITensor::makeShape({maxBatchSize, sizeof(curandState_t)}), nvinfer1::DataType::kINT8);
@@ -220,8 +242,8 @@ void SamplingKernelTest<T>::setupBuffers(SamplingKernelTestParam const& param)
 }
 
 template <typename T>
-std::vector<SizeType32> SamplingKernelTest<T>::computeTopKTopPVariants(
-    int32_t bi, int32_t batchSlot, int32_t ti, int32_t maxTokensPerStep, int32_t vocabSize)
+std::vector<SizeType32> SamplingKernelTest<T>::computeTopKTopPVariants(SamplingKernelTestParam const& param, int32_t bi,
+    int32_t batchSlot, int32_t ti, int32_t maxTokensPerStep, int32_t vocabSize)
 {
     std::vector<SizeType32> allowedTokens;
     auto probsPtr = bufferCast<T>(*mProbsHost) + (bi * maxTokensPerStep + ti) * vocabSize;
@@ -253,6 +275,10 @@ std::vector<SizeType32> SamplingKernelTest<T>::computeTopKTopPVariants(
         while (idx < vocabSize
             && static_cast<float>(probsPtr[indices[idx]]) == static_cast<float>(probsPtr[indices[idx - 1]]))
         {
+            if (param.returnAllSelectedTokens && (totalProb + static_cast<float>(probsPtr[indices[idx]]) >= topP))
+            {
+                break;
+            }
             allowedTokens.push_back(indices[idx]);
             totalProb += static_cast<float>(probsPtr[indices[idx++]]);
         }
@@ -264,6 +290,7 @@ template <typename T>
 void SamplingKernelTest<T>::verifyResult(SamplingKernelTestParam const& param)
 {
     auto const batchSize = param.batchSize;
+    auto const maxBatchSize = 2 * batchSize;
     auto const vocabSize = param.vocabSize;
     auto const maxTokensPerStep = param.maxTokensPerStep;
 
@@ -271,6 +298,7 @@ void SamplingKernelTest<T>::verifyResult(SamplingKernelTestParam const& param)
     auto const seqLenHost = mBufferManager->copyFrom(*mSeqLengthsDevice, MemoryType::kCPU);
     auto const finishedHost = mBufferManager->copyFrom(*mFinishedDevice, MemoryType::kCPU);
     auto const cumLogProbsHost = mBufferManager->copyFrom(*mCumLogProbsDevice, MemoryType::kCPU);
+    auto const logProbsHost = mBufferManager->copyFrom(*mOutputLogProbsDevice, MemoryType::kCPU);
 
     // Synchronize to get valid data on Host
     mStream->synchronize();
@@ -295,6 +323,7 @@ void SamplingKernelTest<T>::verifyResult(SamplingKernelTestParam const& param)
     auto const skipDecodeHostPtr = bufferCast<bool>(*mSkipDecodeHost);
     auto const tokensPerStepPtr = bufferCast<int32_t>(*mTokensPerStep);
     auto const expectedCumLogProbsHostPtr = bufferCast<float>(*mExpectedCumLogProbsHost);
+    auto const expectedLogProbsHostPtr = bufferCast<float>(*mExpectedLogProbsHost);
 
     for (SizeType32 bi = 0; bi < batchSize; ++bi)
     {
@@ -304,7 +333,7 @@ void SamplingKernelTest<T>::verifyResult(SamplingKernelTestParam const& param)
         {
             auto topK = bufferCast<int32_t>(*mTopKsHost)[batchSlot];
             auto kResults = param.returnAllSelectedTokens ? (topK == 0 ? vocabSize : topK) : 1;
-            auto topKTopPVariants = computeTopKTopPVariants(bi, batchSlot, ti, maxTokensPerStep, vocabSize);
+            auto topKTopPVariants = computeTopKTopPVariants(param, bi, batchSlot, ti, maxTokensPerStep, vocabSize);
             SizeType32 ki;
             for (ki = 0; ki < kResults && ki < topKTopPVariants.size(); ++ki)
             {
@@ -349,6 +378,23 @@ void SamplingKernelTest<T>::verifyResult(SamplingKernelTestParam const& param)
                     // Compute reference cumLogProb by summing all logProbs up to the stop token
                     expectedCumLogProbsHostPtr[batchSlot]
                         += static_cast<float>(logProbsHostPtr[bi * vocabSize + outputId]);
+
+                    if (param.returnAllSelectedTokens)
+                    {
+                        // expectedLogProbsHostPtr shape: [maxBatchSize, maxTopK]
+                        if (param.topK)
+                        {
+                            expectedLogProbsHostPtr[batchSlot * mMaxTopK + ki]
+                                = static_cast<float>(logProbsHostPtr[bi * vocabSize + outputId]);
+                        }
+                    }
+                    else
+                    {
+                        auto const curSeqLen = seqLengthsOrigHostPtr[batchSlot];
+                        // expectedLogProbsHostPtr shape: [maxSeqLen, maxBatchSize]
+                        expectedLogProbsHostPtr[curSeqLen * maxBatchSize + batchSlot]
+                            = static_cast<float>(logProbsHostPtr[bi * vocabSize + outputId]);
+                    }
                 }
                 else
                 {
@@ -370,6 +416,53 @@ void SamplingKernelTest<T>::verifyResult(SamplingKernelTestParam const& param)
                     auto const idsIdx = ti * mMaxTopK + ki;
                     auto const outputId = outputIdsHostPtr[batchSlot * mMaxSeqLen + idsIdx];
                     EXPECT_EQ(outputId, -1);
+                }
+            }
+        }
+    }
+
+    // Check logProb
+    // if (maxTokensPerStep == 1 && !param.returnAllSelectedTokens)
+    if (maxTokensPerStep == 1)
+    {
+        for (SizeType32 bi = 0; bi < batchSize; ++bi)
+        {
+            auto* batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
+            auto const batchSlot = batchSlotsPtr[bi];
+
+            if (!skipDecodeHostPtr[batchSlot] && !finishedOrigHostPtr[batchSlot].isFinished()
+                && !finishedOrigHostPtr[batchSlot].isSkipDecoding())
+            {
+                auto const curSeqLen = seqLengthsOrigHostPtr[batchSlot];
+                if (param.returnAllSelectedTokens)
+                {
+                    if (param.topK)
+                    {
+                        // Only
+                        // logprob shape: [maxBatchSize, maxTopK]
+                        auto topK = bufferCast<int32_t>(*mTopKsHost)[batchSlot];
+                        auto kResults = param.returnAllSelectedTokens ? (topK == 0 ? vocabSize : topK) : 1;
+                        auto topKTopPVariants
+                            = computeTopKTopPVariants(param, bi, batchSlot, 1, maxTokensPerStep, vocabSize);
+
+                        for (SizeType32 ki = 0; ki < kResults && ki < topKTopPVariants.size(); ++ki)
+                        {
+                            auto const logprobValue = *(bufferCast<float>(*logProbsHost) + (batchSlot * mMaxTopK + ki));
+                            auto const expectedLogprobValue = expectedLogProbsHostPtr[batchSlot * mMaxTopK + ki];
+                            bool passed = checkResult("log probs", &logprobValue, &expectedLogprobValue, 1);
+                            EXPECT_TRUE(passed);
+                        }
+                    }
+                }
+                else
+                {
+                    // logprob shape: [maxSeqLen, maxBatchSize]
+                    auto const logprobValue
+                        = *(bufferCast<float>(*logProbsHost) + (curSeqLen * maxBatchSize + batchSlot));
+                    auto const expectedLogprobValue = expectedLogProbsHostPtr[curSeqLen * maxBatchSize + batchSlot];
+
+                    bool passed = checkResult("log probs", &logprobValue, &expectedLogprobValue, 1);
+                    EXPECT_TRUE(passed);
                 }
             }
         }

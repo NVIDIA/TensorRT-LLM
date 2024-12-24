@@ -102,7 +102,8 @@ def build_engines(model_cache: _tp.Optional[str] = None):
 
     tp_size = 1
     pp_size = 1
-    tp_pp_dir = f"tp{tp_size}-pp{pp_size}-gpu"
+    cp_size = 1
+    tp_pp_cp_dir = f"tp{tp_size}-pp{pp_size}-cp{cp_size}-gpu"
 
     ckpt_dir = models_dir / 'rt_ckpt' / model_name
     engine_dir = models_dir / 'rt_engine' / model_name
@@ -118,8 +119,9 @@ def build_engines(model_cache: _tp.Optional[str] = None):
     model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
 
     print("\nBuilding fp16-plugin-packed-paged engine")
-    build_engine(hf_dir, ckpt_dir / model_spec_obj.get_model_path() / tp_pp_dir,
-                 engine_dir / model_spec_obj.get_model_path() / tp_pp_dir,
+    build_engine(hf_dir,
+                 ckpt_dir / model_spec_obj.get_model_path() / tp_pp_cp_dir,
+                 engine_dir / model_spec_obj.get_model_path() / tp_pp_cp_dir,
                  '--remove_input_padding=enable', '--paged_state=enable')
 
     # Restore transformers version

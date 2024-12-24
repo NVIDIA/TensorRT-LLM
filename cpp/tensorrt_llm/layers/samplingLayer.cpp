@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/layers/topKSamplingLayer.h"
 #include "tensorrt_llm/layers/topPSamplingLayer.h"
@@ -122,6 +123,7 @@ void SamplingLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& 
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(SamplingLayer_forwardAsync);
 
     auto inputs = std::dynamic_pointer_cast<SamplingInputs>(baseInputs);
 
@@ -146,9 +148,24 @@ void SamplingLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& 
         auto logitsPtrsPtr = static_cast<T**>(nullptr);
         auto biasPtr = static_cast<T*>(nullptr);
         auto const* batchSlotsPtr = workspace->getDeviceBatchSlotsPtr();
-        invokeAddBiasSoftMax(runtimeLogitsPtr, logitsPtrsPtr, runtimeLogitsPtr, biasPtr, endIds, finishedInput,
-            batchSlotsPtr, batchSize, mDecoderDomain.getBatchSize(), /* bw */ 1, mDecoderDomain.getVocabSize(),
-            mDecoderDomain.getVocabSizePadded(), skipSoftMax, /* batchSlotLogits */ false, getStream());
+
+        BiasSoftmaxParams<T> biasSoftmaxParams;
+        biasSoftmaxParams.logits = runtimeLogitsPtr;
+        biasSoftmaxParams.logitsPtrs = logitsPtrsPtr;
+        biasSoftmaxParams.probs = runtimeLogitsPtr;
+        biasSoftmaxParams.bias = biasPtr;
+        biasSoftmaxParams.endIds = endIds;
+        biasSoftmaxParams.finished = finishedInput;
+        biasSoftmaxParams.batchSlots = batchSlotsPtr;
+        biasSoftmaxParams.batchSize = batchSize;
+        biasSoftmaxParams.maxBatchSize = mDecoderDomain.getBatchSize();
+        biasSoftmaxParams.maxBeamWidth = 1;
+        biasSoftmaxParams.vocabSize = mDecoderDomain.getVocabSize();
+        biasSoftmaxParams.vocabSizePadded = mDecoderDomain.getVocabSizePadded();
+        biasSoftmaxParams.skipSoftMax = skipSoftMax;
+        biasSoftmaxParams.batchSlotsLogits = false;
+        biasSoftmaxParams.checkParams();
+        invokeAddBiasSoftMax(biasSoftmaxParams, getStream());
         sync_check_cuda_error();
     }
 

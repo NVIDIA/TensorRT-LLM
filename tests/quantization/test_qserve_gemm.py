@@ -68,16 +68,18 @@ class TestQServeGemm(unittest.TestCase):
         s2_scales = torch.randint(1, 16, (n, k // group_size), dtype=torch.int8)
 
         # Initialize s2_zeros (int)
-        s2_zeros = torch.randint(0, 16, (n, k // group_size), dtype=torch.int8)
+        s2_szeros = torch.randint(0, 16, (n, k // group_size), dtype=torch.int8)
+
+        s2_szeros = s2_scales * s2_szeros
 
         # Ground truth matmul
         ref = _utils.gt_qserve_gemm_per_group(qact, act_scales, qweight,
                                               s1_scales, s2_scales,
-                                              s2_zeros).cpu().numpy()
+                                              s2_szeros).cpu().numpy()
 
         # Prepare data for QServe gemm kernel
-        qweight, s1_scales, s2_scales, s2_zeros = qserve_pack_reorder_per_group(
-            qweight, s1_scales, s2_scales, s2_zeros, group_size)
+        qweight, s1_scales, s2_scales, s2_szeros = qserve_pack_reorder_per_group(
+            qweight, s1_scales, s2_scales, s2_szeros, group_size)
         # Create builder
         builder = tensorrt_llm.Builder()
         builder.strongly_typed = False  # Test need to run in weekly typed mode
@@ -107,8 +109,8 @@ class TestQServeGemm(unittest.TestCase):
                 shape=s2_scales.shape,
                 dtype=tensorrt_llm._utils.str_dtype_to_trt("int8"))
             s2_zeros_trt = Tensor(
-                name='s2_zeros',
-                shape=s2_zeros.shape,
+                name='s2_szeros',
+                shape=s2_szeros.shape,
                 dtype=tensorrt_llm._utils.str_dtype_to_trt("int8"))
 
             output = qserve_gemm_per_group(qact_trt, act_scales_trt,
@@ -134,7 +136,7 @@ class TestQServeGemm(unittest.TestCase):
                     'qweight': qweight.numpy(),
                     's1_scales': s1_scales.numpy(),
                     's2_scales': s2_scales.numpy(),
-                    's2_zeros': s2_zeros.numpy()
+                    's2_szeros': s2_szeros.numpy()
                 })
 
         output = outputs['output']
@@ -168,16 +170,17 @@ class TestQServeGemm(unittest.TestCase):
         s1_scales = torch.rand(n, 1, dtype=torch.float16) * 0.1
 
         # Initialize s1_szeros (float16)
-        s1_zeros = torch.randint(1, 16, (n, 1)).half()
+        s1_szeros = torch.randint(1, 16, (n, 1))
+        s1_szeros = s1_szeros.half() * s1_scales
 
         # Ground truth matmul
         ref = _utils.gt_qserve_gemm_per_channel(qact, act_scales, act_sums,
                                                 qweight, s1_scales,
-                                                s1_zeros).cpu().numpy()
+                                                s1_szeros).cpu().numpy()
 
         # Prepare data for QServe gemm kernel
         qweight, s1_scales, s1_szeros = qserve_pack_reorder_per_channel(
-            qweight, s1_scales, s1_zeros)
+            qweight, s1_scales, s1_szeros)
 
         # Create builder
         builder = tensorrt_llm.Builder()

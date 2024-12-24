@@ -98,7 +98,6 @@ class TestGPTNeoX(unittest.TestCase):
             },
             "use_parallel_embedding": False,
             "embedding_sharding_dim": 0,
-            "share_embedding_table": False
         }
         config = tensorrt_llm.models.PretrainedConfig.from_dict(config)
         weights = convert_hf_gptneox(hf_gpt,

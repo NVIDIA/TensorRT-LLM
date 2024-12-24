@@ -99,6 +99,7 @@ setup(
         "Development Status :: 4 - Beta",
         "Intended Audience :: Developers",
         "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.12",
     ],
     distclass=BinaryDistribution,
     license="Apache License 2.0",

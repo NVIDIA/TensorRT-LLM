@@ -35,6 +35,7 @@ struct TreeNode
 SizeType32 initTensorsFromChoices(SpeculativeDecodingModule const& speculativeDecodingModule,
     std::vector<std::vector<SizeType32>> const& choices, std::vector<SizeType32>& topKs,
     ITensor::SharedPtr generationInputLengths, ITensor::SharedPtr positionOffsets, ITensor::SharedPtr treeIds,
-    ITensor::SharedPtr paths, ITensor::SharedPtr packedMask);
+    ITensor::SharedPtr paths, ITensor::SharedPtr packedMask,
+    std::optional<SizeType32> maxNonLeafNodesPerLayer = std::nullopt);
 
 } // namespace tensorrt_llm::runtime::utils

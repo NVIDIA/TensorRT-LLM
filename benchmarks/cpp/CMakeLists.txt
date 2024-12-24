@@ -25,7 +25,7 @@ if(NOT TARGET cxxopts::cxxopts)
 endif()
 
 function(add_benchmark test_name test_src)
-  add_executable(${test_name} ${test_src})
+  add_executable(${test_name} ${test_src} utils/utils.cpp)
 
   target_link_libraries(
     ${test_name} PUBLIC ${SHARED_TARGET} nvinfer_plugin_tensorrt_llm
@@ -40,3 +40,4 @@ endfunction()
 add_benchmark(gptSessionBenchmark gptSessionBenchmark.cpp)
 add_benchmark(bertBenchmark bertBenchmark.cpp)
 add_benchmark(gptManagerBenchmark gptManagerBenchmark.cpp)
+add_benchmark(disaggServerBenchmark disaggServerBenchmark.cpp)

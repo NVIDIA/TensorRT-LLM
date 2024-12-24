@@ -703,6 +703,7 @@ static __global__ void lamport_style_one_shot_all_reduce_norm_kernel(AllReducePa
         }
         __syncthreads();
         acc = cluster_acc_sum;
+        cluster.sync();
     }
 
     float denom = __fsqrt_rn(__fdividef(acc, params.fusion_params.hidden_size) + params.fusion_params.eps);

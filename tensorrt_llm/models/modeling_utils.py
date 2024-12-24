@@ -4,7 +4,6 @@ import dataclasses
 import json
 import os
 import re
-from collections import Counter
 from enum import IntFlag, auto
 from functools import cached_property
 from pathlib import Path
@@ -21,8 +20,9 @@ from .._utils import (QuantModeWrapper, get_init_params, numpy_to_torch,
                       trt_dtype_to_torch)
 from ..bindings import KVCacheType
 from ..bindings.executor import RuntimeDefaults
-from ..functional import (PositionEmbeddingType, Tensor,
-                          gather_last_token_logits, tanh)
+from ..functional import (PositionEmbeddingType, Tensor, allgather, constant,
+                          cp_split_plugin, gather_last_token_logits,
+                          index_select, tanh, view)
 from ..layers import (MLP, AttentionParams, Embedding, FusedGatedMLP,
                       FusedRgLru, GatedMLP, KeyValueCacheParams, LoraParams,
                       PromptTuningEmbedding, RgLru)
@@ -36,7 +36,8 @@ from ..module import Module, ModuleList
 from ..parameter import Parameter
 from ..plugin import init_all_reduce_helper
 from ..quantization import QuantMode
-from ..quantization.layers import (Fp8RowwiseFusedGatedMLP, Fp8RowwiseGatedMLP,
+from ..quantization.layers import (FP8Linear, Fp8RowwiseFusedGatedMLP,
+                                   Fp8RowwiseGatedMLP,
                                    WeightOnlyGroupwiseQuantLinear,
                                    WeightOnlyGroupwiseQuantRowLinear,
                                    WeightOnlyQuantLinear,
@@ -93,7 +94,6 @@ class SpeculativeDecodingMode(IntFlag):
         elif args.speculative_decoding_mode == "explicit_draft_tokens":
             return SpeculativeDecodingMode.EXPLICIT_DRAFT_TOKENS
         elif args.speculative_decoding_mode == "eagle":
-            logger.warning(f"EAGLE is not supported yet. Do not use it.")
             return SpeculativeDecodingMode.EAGLE
         else:
             assert False, "Unknown speculative_decoding_mode " + args.speculative_decoding_mode
@@ -255,9 +255,10 @@ class LayerQuantConfig(QuantConfig):
         return obj
 
     def get_quant_cfg(self, module_name):
-        assert module_name in self.quantized_layers.keys(), \
-            "module {module_name} should be included in `quantized_layers` in AutoQuant mode"
-        return self.quantized_layers[module_name]
+        if module_name in self.quantized_layers.keys():
+            return self.quantized_layers[module_name]
+        else:
+            return QuantConfig()
 
     def get_modelopt_qformat(self):
         algo_to_modelopt_map = {
@@ -300,13 +301,13 @@ class PretrainedConfig:
                      PositionEmbeddingType,
                      str] = PositionEmbeddingType.learned_absolute,
                  max_position_embeddings: Optional[int] = None,
+                 rotary_embedding_dim: Optional[int] = None,
                  num_key_value_heads: Optional[int] = None,
                  intermediate_size: Optional[int] = None,
                  mapping: Optional[Union[Mapping, dict]] = None,
                  quantization: Optional[Union[QuantConfig, dict]] = None,
                  use_parallel_embedding: bool = False,
                  embedding_sharding_dim: int = 0,
-                 share_embedding_table: bool = False,
                  head_size: Optional[int] = None,
                  qk_layernorm: bool = False,
                  runtime_defaults: "RuntimeDefaultsIn" = None,
@@ -330,8 +331,6 @@ class PretrainedConfig:
         assert isinstance(position_embedding_type, PositionEmbeddingType)
         self.position_embedding_type = position_embedding_type
 
-        self.max_position_embeddings = max_position_embeddings
-
         if num_key_value_heads is None:
             num_key_value_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
@@ -339,6 +338,7 @@ class PretrainedConfig:
         if intermediate_size is None:
             intermediate_size = hidden_size * 4
         self.intermediate_size = intermediate_size
+        self.max_position_embeddings = max_position_embeddings
 
         if mapping is None:
             mapping = Mapping()
@@ -356,27 +356,17 @@ class PretrainedConfig:
 
         self.use_parallel_embedding = use_parallel_embedding
         self.embedding_sharding_dim = embedding_sharding_dim
-        self.share_embedding_table = share_embedding_table
-
-        if share_embedding_table and mapping.tp_size > 1:
-            if (not use_parallel_embedding) or (use_parallel_embedding and
-                                                embedding_sharding_dim == 1):
-                raise NotImplementedError(
-                    "For tensor parallelism, sharing the embedding table must set" \
-                        "use_parallel_embedding=True and embedding_sharding_dim=0"
-                )
-        if share_embedding_table and mapping.pp_size > 1:
-            raise NotImplementedError(
-                "Embedding table cannot be shared for pipeline parallelism")
-
-        if share_embedding_table and mapping.cp_size > 1:
-            raise NotImplementedError(
-                "Embedding table cannot be shared for context parallelism")
 
         if head_size is None:
             head_size = hidden_size // num_attention_heads
         self.head_size = head_size
         self.qk_layernorm = qk_layernorm
+
+        if rotary_embedding_dim is None:
+            rotary_embedding_percentage = kwargs.get('rotary_pct', 1.0)
+            rotary_embedding_dim = kwargs.get(
+                'rotary_dim', int(head_size * rotary_embedding_percentage))
+        self.rotary_embedding_dim = rotary_embedding_dim
 
         for key, value in kwargs.items():
             try:
@@ -496,6 +486,7 @@ class DecoderLayerList(ModuleList):
     def __init__(self, cls, config):
         self.num_hidden_layers = config.num_hidden_layers
         self.layer_list = config.mapping.pp_layers(config.num_hidden_layers)
+        self.quant_mode = config.quant_mode
         super().__init__([cls(config, idx) for idx in self.layer_list])
 
     def forward(self,
@@ -504,6 +495,7 @@ class DecoderLayerList(ModuleList):
                 attention_mask=None,
                 kv_cache_params=None,
                 attention_params=None,
+                mrope_params=None,
                 position_ids=None,
                 lora_params=None,
                 spec_decoding_params=None,
@@ -529,11 +521,22 @@ class DecoderLayerList(ModuleList):
                 kwargs['lora_layer_params'] = lora_layer_params
             if spec_decoding_params is not None:
                 kwargs['spec_decoding_params'] = spec_decoding_params
+            if mrope_params is not None:
+                kwargs['mrope_params'] = mrope_params
             if default_net().plugin_config.reduce_fusion:
                 if layer_idx + self.layer_list[0] < self.layer_list[-1]:
+                    if default_net(
+                    ).plugin_config.user_buffer and self.quant_mode.has_fp8_qdq(
+                    ):
+                        qkv_activation_scaling_factor = constant(
+                            self[layer_idx + 1].attention.qkv.
+                            activation_scaling_factor.raw_value.copy())
+                    else:
+                        qkv_activation_scaling_factor = None
                     kwargs['next_layer_input_layernorm_args'] = (
                         self[layer_idx + 1].input_layernorm.weight.value,
-                        self[layer_idx + 1].input_layernorm.eps)
+                        self[layer_idx + 1].input_layernorm.eps,
+                        qkv_activation_scaling_factor)
                 else:
                     kwargs['next_layer_input_layernorm_args'] = None
 
@@ -592,13 +595,10 @@ class PretrainedModel(Module,
         from ..quantization.quantize import quantize
         quantize(self, self.config.quantization)
 
-        # Currently, use_parallel_embedding and share_embedding_table must be enabled before weight loading;
+        # Currently, use_parallel_embedding must be enabled before weight loading;
         # otherwise, the model will be inconsistent with the weights loaded from checkpoint.
         optimize_model(
-            self,
-            use_parallel_embedding=self.config.use_parallel_embedding,
-            share_embedding_table=self.config.share_embedding_table,
-        )
+            self, use_parallel_embedding=self.config.use_parallel_embedding)
 
     def release(self):
         release_gc()
@@ -632,6 +632,11 @@ class PretrainedModel(Module,
             config.set_rank(rank)
 
         rank = config.mapping.rank
+        # tp_cp_pp rank -> tp_pp rank: because different cp ranks share the same ckpt
+        if config.mapping.cp_size > 1:
+            tp_size = config.mapping.tp_size
+            cp_size = config.mapping.cp_size
+            rank = rank % tp_size + rank // (tp_size * cp_size) * tp_size
         weights_path = os.path.join(ckpt_dir, f'rank{rank}.safetensors')
 
         assert os.path.isfile(weights_path)
@@ -649,21 +654,30 @@ class PretrainedModel(Module,
         return model
 
     def load(self, weights, from_pruned=False):
-        expected_names = set()
         required_names = set()
         for name, param in self.named_parameters():
-            expected_names.add(name)
-            if not param.is_inited():
-                required_names.add(name)
+            if param.is_inited():
+                continue
+            if name not in weights:
+                # Exemption for embedding sharing
+                if name.endswith('lm_head.weight') and any(
+                        k.endswith('vocab_embedding.weight')
+                        for k in weights.keys()):
+                    continue
+                if name.endswith('lm_head.per_channel_scale') and any(
+                        k.endswith('vocab_embedding.per_channel_scale')
+                        for k in weights.keys()):
+                    continue
+            required_names.add(name)
 
         provided_names = set(weights.keys())
         if not required_names.issubset(provided_names):
             raise RuntimeError(
                 f"Required but not provided tensors:{required_names.difference(provided_names)}"
             )
-        if not provided_names.issubset(expected_names):
+        if not provided_names.issubset(required_names):
             logger.warning(
-                f"Provided but not expected tensors: {provided_names.difference(expected_names)}"
+                f"Provided but not required tensors: {provided_names.difference(required_names)}"
             )
 
         for name, param in self.named_parameters():
@@ -684,42 +698,39 @@ class PretrainedModel(Module,
             name: numpy_to_torch(param.raw_value)
             for name, param in self.named_parameters()
         }
-
         # If there are some tensors share memory, this will lead to error when we call "save_file". So, for repeated tensors, we
         # clone the tensors to prevent this issue.
-        weights_ptrs = [weights[key].data_ptr() for key in weights]
-        repeated_ptrs = [
-            key for key, value in dict(Counter(weights_ptrs)).items()
-            if value > 1
-        ]
-        for key in weights:
-            if weights[key].data_ptr() in repeated_ptrs:
-                weights[key] = weights[key].clone().detach()
-
+        data_ptrs = set()
+        for name, param in weights.items():
+            if param.data_ptr() in data_ptrs:
+                weights[name] = param.clone()
+            data_ptrs.add(weights[name].data_ptr())
         safetensors.torch.save_file(
             weights, os.path.join(output_dir, f'rank{rank}.safetensors'))
         if save_config:
             self.config.to_json_file(os.path.join(output_dir, 'config.json'))
 
     def prepare_inputs(
-            self,
-            max_batch_size,
-            max_input_len,
-            max_seq_len,
-            max_num_tokens,
-            use_cache,
-            max_beam_width: int = 1,
-            opt_num_tokens: int = None,
-            prompt_embedding_table_size: int = 0,
-            position_encoding_2d: bool = False,
-            max_draft_len: int = 0,
-            speculative_decoding_draft_tokens_external: bool = False,
-            spec_decoding_is_generation_length_variable: bool = False,
-            gather_context_logits: bool = False,
-            gather_generation_logits: bool = False,
-            lora_target_modules: List[str] = None,
-            opt_batch_size: int = 0,
-            num_hidden_layers: int = None):
+        self,
+        max_batch_size,
+        max_input_len,
+        max_seq_len,
+        max_num_tokens,
+        use_cache,
+        max_beam_width: int = 1,
+        opt_num_tokens: int = None,
+        prompt_embedding_table_size: int = 0,
+        position_encoding_2d: bool = False,
+        max_draft_len: int = 0,
+        speculative_decoding_draft_tokens_external: bool = False,
+        spec_decoding_is_generation_length_variable: bool = False,
+        gather_context_logits: bool = False,
+        gather_generation_logits: bool = False,
+        lora_target_modules: List[str] = None,
+        opt_batch_size: int = 0,
+        num_hidden_layers: int = None,
+        mrope_rotary_sin_cos_size: int = None,
+    ):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
 
@@ -782,7 +793,8 @@ class PretrainedModel(Module,
             multiple_profiles=multiple_profiles,
             streamingllm=streamingllm,
             opt_batch_size=opt_batch_size,
-            pp_reduce_scatter=pp_reduce_scatter)
+            pp_reduce_scatter=pp_reduce_scatter,
+            mrope_rotary_sin_cos_size=mrope_rotary_sin_cos_size)
 
         result = {
             'input_ids':
@@ -840,6 +852,8 @@ class PretrainedModel(Module,
         if model_inputs['spec_decoding_params'] is not None:
             result['spec_decoding_params'] = model_inputs[
                 'spec_decoding_params']
+        if model_inputs['mrope_params'] is not None:
+            result['mrope_params'] = model_inputs['mrope_params']
 
         return result
 
@@ -895,6 +909,7 @@ class PretrainedModel(Module,
             output_dir=output_dir,
             tp_size=config.mapping.tp_size,
             pp_size=config.mapping.pp_size,
+            cp_size=config.mapping.cp_size,
             seed=random_seed,
             tokenizer_max_seq_length=tokenizer_max_seq_length,
         )
@@ -920,6 +935,7 @@ class DecoderModelForCausalLM(PretrainedModel):
                 attention_mask=None,
                 kv_cache_params=None,
                 attention_params=None,
+                mrope_params=None,
                 hidden_states=None,
                 prompt_embedding_table: Optional[Tensor] = None,
                 prompt_tasks: Optional[Tensor] = None,
@@ -930,6 +946,20 @@ class DecoderModelForCausalLM(PretrainedModel):
         # fill attention params.
         attention_params = Attention.fill_attention_params(
             self, attention_params)
+
+        # split the sequence for context parallelism
+        if self.config.mapping.cp_size > 1:
+            if len(input_ids.shape) == 1:
+                # input shape is [-1]
+                input_ids, cp_join_index = cp_split_plugin(
+                    input_ids,
+                    attention_params.host_request_types,
+                    attention_params.host_context_lengths,
+                    self.config.mapping.cp_size,
+                    self.config.mapping.cp_rank,
+                )
+            else:
+                assert False, "Context parallelism with non-remove-padding is not supported yet."
 
         kwargs = {
             'input_ids': input_ids,
@@ -952,11 +982,25 @@ class DecoderModelForCausalLM(PretrainedModel):
 
         if spec_decoding_params is not None:
             kwargs['spec_decoding_params'] = spec_decoding_params
+        if mrope_params is not None:
+            kwargs['mrope_params'] = mrope_params
 
         hidden_states = self.transformer.forward(**kwargs)
 
         if use_cache:
             hidden_states, presents = hidden_states
+
+        # All gather and rebuild sequence after transformer layer for context parallelism
+        if self.config.mapping.cp_size > 1:
+            if len(hidden_states.shape) == 2:
+                hidden_states = allgather(hidden_states,
+                                          self.config.mapping.cp_group,
+                                          gather_dim=0)
+                hidden_states = view(hidden_states,
+                                     [-1, hidden_states.shape[-1]])
+                hidden_states = index_select(hidden_states, 0, cp_join_index)
+            else:
+                assert False, "Context parallelism with non-remove-padding is not supported yet."
 
         if self.config.mapping.is_last_pp_rank():
             all_hidden_states = hidden_states
@@ -1345,11 +1389,29 @@ def share_embedding(model: PretrainedModel) -> PretrainedModel:
         if lm_head is not None and vocab_embedding is not None:
             break
 
-    if lm_head is not None and vocab_embedding is not None:
-        lm_head.weight = vocab_embedding.weight
-        if (hasattr(vocab_embedding, "per_token_scale")
-                and vocab_embedding.per_token_scale is not None):
-            lm_head.per_channel_scale = vocab_embedding.per_token_scale
+    # Cannot find either lm_head or vocab_embedding, e.g., pipeline parallel
+    if lm_head is None or vocab_embedding is None:
+        return model
+
+    # lm_head and vocab_embedding have different shapes, e.g., tensor parallel without embedding parallel
+    if lm_head.weight.shape != vocab_embedding.weight.shape:
+        return model
+
+    # Don't assume weight can be shared if vocab_embedding is not initialized, e.g., dummy weights
+    if not vocab_embedding.weight.is_inited():
+        return model
+
+    if lm_head.weight.is_inited():
+        lm_head_weight = numpy_to_torch(lm_head.weight.raw_value)
+        vocab_embed_weight = numpy_to_torch(vocab_embedding.weight.raw_value)
+        # The lm_head and vocab_embedding have different weights
+        if (lm_head_weight - vocab_embed_weight).abs().max().item() > 1e-6:
+            return model
+
+    lm_head.weight = vocab_embedding.weight
+    if getattr(lm_head, 'per_channel_scale', None) and getattr(
+            vocab_embedding, 'per_channel_scale', None):
+        lm_head.per_channel_scale = vocab_embedding.per_token_scale
     return model
 
 
@@ -1377,6 +1439,7 @@ def optimize_model(
     use_lora: bool = False,
     max_lora_rank: Optional[int] = None,
     use_fp8_context_fmha: bool = False,
+    use_optimize_cross_qkv: bool = False,
 ) -> PretrainedModel:
     """
     Run optimization passes on model.
@@ -1386,6 +1449,7 @@ def optimize_model(
     # before weight loading
     if use_parallel_embedding:
         model = parallelize_embedding(model)
+
     if share_embedding_table:
         # if share_embedding_table is enabled, only one copy of the embedding table is store in converted ckpt
         # this pass is required to make lm_head.weight and vocab_embedding.weight point to the same tensor
@@ -1408,6 +1472,87 @@ def optimize_model(
         model = add_lora(model, max_lora_rank)
     if use_fp8_context_fmha:
         model = set_fp8_context_fhma(model)
+    if not use_lora and use_optimize_cross_qkv is True:
+        # This optimization is not supported when we use lora
+        model = optimize_cross_qkv(model)
+
+    return model
+
+
+def optimize_cross_qkv(model):
+    """
+    For cross attention layer, we can skip computing the query of encoder_output.
+    So, add a new attribute 'kv' in the cross_attention layer. This might lead to
+    additional memory cost on model size, but save the memory usage on runtime.
+
+    Currently, this function only detect the ColumnLinear and FP8Linear. It does not supports
+    other quantization now.
+    """
+    for name, attn, layer in model.named_modules_with_parent():
+        if isinstance(attn, Attention) and attn.cross_attention and \
+        (type(attn.qkv) == ColumnLinear or type(attn.qkv) == FP8Linear):
+            old_qkv = attn.qkv
+            linear_class = type(old_qkv)
+            new_kv = linear_class(in_features=attn.hidden_size,
+                                  out_features=2 * attn.tp_size *
+                                  attn.num_attention_kv_heads *
+                                  attn.attention_head_size,
+                                  bias=old_qkv.bias,
+                                  dtype=old_qkv.dtype,
+                                  tp_group=old_qkv.tp_group,
+                                  tp_size=old_qkv.tp_size,
+                                  gather_output=old_qkv.gather_output,
+                                  is_qkv=False)
+
+            old_qkv_weight_value = old_qkv.weight.raw_value
+            if (old_qkv_weight_value.shape == np.asarray([
+                (attn.num_attention_heads + 2 * attn.num_attention_kv_heads) *
+                    attn.attention_head_size, attn.hidden_size
+            ])).all():
+
+                q_weight, kv_weight = np.array_split(
+                    old_qkv_weight_value.reshape(
+                        attn.num_attention_heads +
+                        2 * attn.num_attention_kv_heads,
+                        attn.attention_head_size, attn.hidden_size),
+                    [attn.num_attention_heads],
+                    axis=0)
+                new_kv.weight.value = kv_weight.reshape([
+                    2 * attn.num_attention_kv_heads * attn.attention_head_size,
+                    attn.hidden_size
+                ])
+            elif (old_qkv_weight_value.shape == np.asarray([
+                    attn.hidden_size,
+                (attn.num_attention_heads + 2 * attn.num_attention_kv_heads) *
+                    attn.attention_head_size
+            ])).all():
+                q_weight, kv_weight = np.array_split(
+                    old_qkv_weight_value.reshape(
+                        attn.hidden_size, attn.num_attention_heads +
+                        2 * attn.num_attention_kv_heads,
+                        attn.attention_head_size), [attn.num_attention_heads],
+                    axis=1)
+                new_kv.weight.value = kv_weight.reshape([
+                    attn.hidden_size,
+                    2 * attn.num_attention_kv_heads * attn.attention_head_size
+                ])
+            else:
+                assert False
+
+            if isinstance(attn.qkv, FP8Linear):
+                new_kv.activation_scaling_factor.value = old_qkv.activation_scaling_factor.raw_value
+                new_kv.weights_scaling_factor.value = old_qkv.weights_scaling_factor.raw_value
+
+            if old_qkv.bias:
+                q_bias, kv_bias = np.array_split(old_qkv.bias.raw_value.reshape(
+                    attn.num_attention_heads + 2 * attn.num_attention_kv_heads,
+                    attn.attention_head_size), [attn.num_attention_heads],
+                                                 axis=0)
+                new_kv.bias.value = kv_bias.reshape([
+                    2 * attn.num_attention_kv_heads * attn.attention_head_size
+                ])
+            setattr(attn, "kv", new_kv)
+
     return model
 
 
@@ -1455,6 +1600,8 @@ def preprocess_perlayer_weights(weights,
                         name.replace('weights_scaling_factor',
                                      'weights_scaling_factor_2'))
                     weights[name] /= weights_scaling_factor_2
+                    weights[name] = weights[name].to(torch.float16).view(
+                        str_dtype_to_torch(model_config.dtype))
                     weights[name.replace(
                         'weights_scaling_factor',
                         'prequant_scaling_factor')] /= activation_scaling_factor
@@ -1549,27 +1696,7 @@ def preprocess_weights(weights: Dict[str, torch.Tensor],
                 if 'attention.dense.bias' in name or 'mlp.proj.bias' in name:
                     weights[name] = torch.zeros_like(param)
 
-    # For share_embedding_table
-    check_share_embedding(weights, model_config)
     return weights
-
-
-def check_share_embedding(weights: Dict[str, torch.Tensor],
-                          model_config: PretrainedConfig):
-    if model_config.share_embedding_table:
-        if "lm_head.weight" in weights:
-            if weights["lm_head.weight"] is None:
-                weights.pop("lm_head.weight")
-        if "lm_head.weight" in weights and "transformer.vocab_embedding.weight" in weights:
-            if (weights["lm_head.weight"] -
-                    weights["transformer.vocab_embedding.weight"]).any():
-                logger.warning(
-                    "lm_head.weight and transformer.vocab_embedding.weight are not identical, "
-                    "share_embedding_table cannot be enabled; setting share_embedding_table=False."
-                )
-                model_config.share_embedding_table = False
-            else:
-                weights.pop("lm_head.weight")
 
 
 def get_kv_cache_type_from_legacy(use_cache: bool,

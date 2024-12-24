@@ -50,7 +50,6 @@ class DeciConfig(PretrainedConfig):
                  quantization: Optional[Union[QuantConfig, dict]] = None,
                  use_parallel_embedding: bool = False,
                  embedding_sharding_dim: int = 0,
-                 share_embedding_table: bool = False,
                  head_size: Optional[int] = None,
                  qk_layernorm: bool = False,
                  layer_configs: Optional[List[Union[DeciLayerConfig,
@@ -76,7 +75,6 @@ class DeciConfig(PretrainedConfig):
                          quantization=quantization,
                          use_parallel_embedding=use_parallel_embedding,
                          embedding_sharding_dim=embedding_sharding_dim,
-                         share_embedding_table=share_embedding_table,
                          head_size=head_size,
                          qk_layernorm=qk_layernorm,
                          **kwargs)

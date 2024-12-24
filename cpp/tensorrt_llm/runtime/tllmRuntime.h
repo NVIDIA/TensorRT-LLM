@@ -20,6 +20,7 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/layerProfiler.h"
 #include "tensorrt_llm/runtime/rawEngine.h"
+#include "tensorrt_llm/runtime/worldConfig.h"
 #include <NvInferRuntime.h>
 
 #include <cstdint>
@@ -134,11 +135,20 @@ public:
     void reportToProfiler(SizeType32 contextId);
     void loadManagedWeights(RawEngine const& rawEngine, int localRank);
     void printEngineInfo();
+    void initializeUserBuffer(SizeType32 tpSize, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
+        SizeType32 maxSequenceLength, SizeType32 hiddenSize, std::optional<SizeType32> maxNumTokens);
+
+    bool isUserBufferEnabled() const
+    {
+        return mUserBufferEnabled;
+    }
 
 private:
     void cacheTensorNames();
 
     void setInputTensorsImpl(SizeType32 contextIndex, TensorMap const& tensorMap, bool throwOnMiss);
+
+    void setUserBufferTensors(SizeType32 contextIndex, TensorMap& tensorMap);
 
     // Tool functions for `printEngineInfo()`.
     static std::string shapeToString(nvinfer1::Dims64 const& dim)
@@ -158,6 +168,10 @@ private:
 
     static std::string dataTypeToString(nvinfer1::DataType type)
     {
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wswitch"
+#endif
         switch (type)
         {
         case nvinfer1::DataType::kINT64: return "INT64";
@@ -172,6 +186,9 @@ private:
         case nvinfer1::DataType::kINT4: return "INT4";
         default: return "UNKNOWN";
         }
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
         return "";
     }
 
@@ -201,5 +218,7 @@ private:
     // Names of static tensors are removed from this list when setStaticInputTensors is called.
     std::vector<std::string> mInputTensorNames;
     std::vector<std::string> mOutputTensorNames;
+
+    bool mUserBufferEnabled;
 };
 } // namespace tensorrt_llm::runtime

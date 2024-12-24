@@ -39,16 +39,17 @@ public:
     GPTAttentionPluginCommon() = delete;
 
     GPTAttentionPluginCommon(int layer_idx, int num_heads, int vision_start, int vision_length, int num_kv_heads,
-        int layer_idx_in_cache_pool, int head_size, int unidirectional, float q_scaling, float qk_tanh_scale,
-        tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
+        int layer_idx_in_cache_pool, int head_size, int unidirectional, float q_scaling,
+        float attn_logit_softcapping_scale, tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
         int rotary_embedding_dim, // for RoPE. Use 0 for non-RoPE
         float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
         float rotary_embedding_scale, float rotary_embedding_short_m_scale, float rotary_embedding_long_m_scale,
         int rotary_embedding_max_positions, int rotary_embedding_original_max_positions, int tp_size,
-        int tp_rank,          // for ALiBi
-        bool unfuse_qkv_gemm, // for AutoPP
-        tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool enable_xqa, int kv_cache_quant_mode,
-        bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type,
+        int tp_rank,           // for ALiBi
+        bool unfuse_qkv_gemm,  // for AutoPP
+        bool use_logn_scaling, // for LognScaling
+        tensorrt_llm::kernels::ContextFMHAType context_fmha_type, int kv_cache_quant_mode, bool remove_input_padding,
+        tensorrt_llm::kernels::AttentionMaskType mask_type,
         tensorrt_llm::kernels::BlockSparseParams block_sparse_params, bool paged_kv_cache, int tokens_per_block,
         nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled, bool cross_attention = false,
         int max_distance = 0, bool pos_shift_enabled = false, bool dense_context_fmha = false,
@@ -56,7 +57,8 @@ public:
         bool use_cache = true, bool is_spec_decoding_enabled = false,
         bool spec_decoding_is_generation_length_variable = false, int32_t spec_decoding_max_generation_length = 1,
         bool is_mla_enabled = false, int q_lora_rank = 0, int kv_lora_rank = 0, int qk_nope_head_dim = 0,
-        int qk_rope_head_dim = 0, int v_head_dim = 0, bool skip_attn = false);
+        int qk_rope_head_dim = 0, int v_head_dim = 0, bool skip_attn = false, int cp_size = 1, int cp_rank = 0,
+        std::set<int32_t> cp_group = {});
 
     GPTAttentionPluginCommon(void const* data, size_t length);
 
@@ -117,6 +119,8 @@ protected:
         int32_t max_attention_window;
         // Cyclic kv cache capacity (used to get the cyclic kv cache position for new tokens)
         int32_t cyclic_attention_window_size;
+        int32_t max_cyclic_attention_window_size;
+        bool can_use_one_more_block;
         int32_t sink_token_length;
         int32_t const* q_seq_lengths;
         int32_t const* kv_seq_lengths;
@@ -135,6 +139,11 @@ protected:
         int32_t max_blocks_per_sequence;
         int32_t const* host_context_lengths;
         void* workspace;
+        float2 const* mrope_rotary_sin_cos = nullptr;
+        int32_t const* mrope_position_deltas = nullptr;
+
+        // optional when logn scaling
+        float const* logn_scaling_ptr = nullptr;
         // optional when relative position
         T const* relative_attention_bias = nullptr;
         int relative_attention_bias_stride = 0;
@@ -162,6 +171,8 @@ protected:
             ss << "max_past_kv_len: " << max_past_kv_len << std::endl;
             ss << "max_attention_window: " << max_attention_window << std::endl;
             ss << "cyclic_attention_window_size: " << cyclic_attention_window_size << std::endl;
+            ss << "max_cyclic_attention_window_size: " << max_cyclic_attention_window_size << std::endl;
+            ss << "can_use_one_more_block: " << (can_use_one_more_block ? "true" : "false") << std::endl;
             ss << "sink_token_length: " << sink_token_length << std::endl;
             ss << "q_seq_lengths: "
                << *(runtime::ITensor::wrap(
@@ -185,6 +196,7 @@ protected:
             ss << "num_tokens: " << num_tokens << std::endl;
             ss << "max_blocks_per_sequence: " << max_blocks_per_sequence << std::endl;
             ss << "workspace: " << workspace << std::endl;
+            ss << "logn_scaling_ptr: " << logn_scaling_ptr << std::endl;
             ss << "relative_attention_bias: " << relative_attention_bias << std::endl;
             ss << "relative_attention_bias_stride: " << relative_attention_bias_stride << std::endl;
             ss << "cross_kv: " << cross_kv << std::endl;
@@ -230,6 +242,8 @@ protected:
         int32_t max_attention_window;
         // Cyclic kv cache capacity (used to get the cyclic kv cache position for new tokens)
         int32_t cyclic_attention_window_size;
+        int32_t max_cyclic_attention_window_size;
+        bool can_use_one_more_block;
         int32_t sink_token_length;
         int32_t num_requests;
         int32_t max_blocks_per_sequence;
@@ -237,6 +251,11 @@ protected:
         int32_t* semaphores;
         void* workspace;
         int32_t const* host_past_key_value_lengths;
+        float2 const* mrope_rotary_sin_cos = nullptr;
+        int32_t const* mrope_position_deltas = nullptr;
+
+        // optional when logn scaling
+        float const* logn_scaling_ptr = nullptr;
         // optional when relative position
         T const* relative_attention_bias = nullptr;
         int relative_attention_bias_stride = 0;
@@ -293,7 +312,8 @@ protected:
     {
         return mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kROPE_GPTJ
             || mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kROPE_GPT_NEOX
-            || mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kLONG_ROPE;
+            || mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kLONG_ROPE
+            || mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kROPE_M;
     }
 
     bool isLongRoPE() const
@@ -304,6 +324,16 @@ protected:
     bool isUnfusedCrossAttention() const
     {
         return !mEnableContextFMHA && mCrossAttention;
+    }
+
+    bool isMRoPE() const
+    {
+        return mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kROPE_M;
+    }
+
+    bool isLognScaling() const
+    {
+        return mUseLognScaling;
     }
 
     bool isCrossAttention() const
@@ -349,7 +379,7 @@ protected:
     int mHeadSize;
     int mUnidirectional;
     float mQScaling;
-    float mQKTanhScale;
+    float mAttnLogitSoftcappingScale;
     int mRotaryEmbeddingDim;
     float mRotaryEmbeddingBase;
     tensorrt_llm::kernels::RotaryScalingType mRotaryEmbeddingScaleType;
@@ -359,6 +389,7 @@ protected:
     int mRotaryEmbeddingMaxPositions;
     int mRotaryEmbeddingOriginalMaxPositions;
     tensorrt_llm::kernels::PositionEmbeddingType mPositionEmbeddingType;
+    bool mUseLognScaling = false;
     bool mRemovePadding = false;
     tensorrt_llm::kernels::AttentionMaskType mMaskType;
     tensorrt_llm::kernels::BlockSparseParams mBlockSparseParams;
@@ -385,6 +416,12 @@ protected:
     int32_t mSpecDecodingMaxGenerationLength = 1;
     bool mIsMLAEnabled = false;
     tensorrt_llm::kernels::mlaMetaParams mMLAParams;
+    int mCpSize = 1;
+    int mCpRank = 0;
+    std::set<int32_t> mCpGroup = {};
+#if ENABLE_MULTI_DEVICE
+    std::shared_ptr<ncclComm_t> mCpNcclComm;
+#endif // ENABLE_MULTI_DEVICE
 
     // Speculative decoding packed mask.
     uint4* mSpecDecodingPackedMask;
@@ -443,6 +480,7 @@ protected:
         ss << "mRotaryEmbeddingScale: " << mRotaryEmbeddingScale << std::endl;
         ss << "mRotaryEmbeddingMaxPositions: " << mRotaryEmbeddingMaxPositions << std::endl;
         ss << "mPositionEmbeddingType: " << static_cast<int>(mPositionEmbeddingType) << std::endl;
+        ss << "mUseLognScaling: " << std::boolalpha << mUseLognScaling << std::endl;
         ss << "mRemovePadding: " << std::boolalpha << mRemovePadding << std::endl;
         ss << "mMaskType: " << static_cast<int>(mMaskType) << std::endl;
         ss << "mPagedKVCache: " << std::boolalpha << mPagedKVCache << std::endl;
@@ -471,6 +509,18 @@ protected:
         ss << "mUseKVCache: " << std::boolalpha << mUseKVCache << std::endl;
         ss << "mForceMultiBlockWarned: " << mForceMultiBlockWarned << std::endl;
         ss << "mSkipAttn: " << std::boolalpha << mSkipAttn << std::endl;
+        ss << "mCpSize: " << mCpSize << std::endl;
+        ss << "mCpRank: " << mCpRank << std::endl;
+        ss << "mCpGroup: [";
+        for (auto it = mCpGroup.begin(); it != mCpGroup.end(); it++)
+        {
+            if (it != mCpGroup.begin())
+            {
+                ss << ", ";
+            }
+            ss << *it;
+        }
+        ss << "]" << std::endl;
 
         return ss.str();
     }

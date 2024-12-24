@@ -526,12 +526,21 @@ inline void print_element_(half x)
 {
     print_float_((float) x);
 }
+
 #ifdef ENABLE_BF16
 inline void print_element_(__nv_bfloat16 x)
 {
     print_float_((float) x);
 }
 #endif
+
+#ifdef ENABLE_FP8
+inline void print_element_(__nv_fp8_e4m3 x)
+{
+    print_float_((float) x);
+}
+#endif
+
 inline void print_element_(uint32_t ul)
 {
     printf("%7" PRIu32, ul);
@@ -602,6 +611,9 @@ template void printMatrix(float const* ptr, int m, int k, int stride, bool is_de
 template void printMatrix(half const* ptr, int m, int k, int stride, bool is_device_ptr);
 #ifdef ENABLE_BF16
 template void printMatrix(__nv_bfloat16 const* ptr, int m, int k, int stride, bool is_device_ptr);
+#endif
+#ifdef ENABLE_FP8
+template void printMatrix(__nv_fp8_e4m3 const* ptr, int m, int k, int stride, bool is_device_ptr);
 #endif
 template void printMatrix(uint32_t const* ptr, int m, int k, int stride, bool is_device_ptr);
 template void printMatrix(uint64_t const* ptr, int m, int k, int stride, bool is_device_ptr);

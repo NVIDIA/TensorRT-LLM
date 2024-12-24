@@ -38,8 +38,8 @@ def generate_output(engine: str,
     resources_dir = Path(__file__).parent.resolve().parent
     models_dir = resources_dir / 'models'
     hf_dir = models_dir / hf_model
-    tp_pp_dir = 'tp1-pp1-gpu/'
-    engine_dir = models_dir / 'rt_engine' / model / engine / tp_pp_dir
+    tp_pp_cp_dir = 'tp1-pp1-cp1-gpu/'
+    engine_dir = models_dir / 'rt_engine' / model / engine / tp_pp_cp_dir
 
     data_dir = resources_dir / 'data'
     input_file = data_dir / 'input_vicuna.npy'

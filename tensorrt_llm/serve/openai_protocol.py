@@ -181,6 +181,7 @@ class CompletionRequest(OpenAIBaseModel):
             beam_width=self.best_of if self.best_of else self.n,
             min_tokens=self.min_tokens,
             include_stop_str_in_output=self.include_stop_str_in_output,
+            add_special_tokens=self.add_special_tokens,
         )
         if self.min_p > 0:
             sampling_params.top_p_min = self.min_p
@@ -480,6 +481,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             stop=self.stop,
             include_stop_str_in_output=self.include_stop_str_in_output,
             return_log_probs=self.logprobs,
+            add_special_tokens=self.add_special_tokens,
         )
         if self.min_p > 0:
             sampling_params.top_p_min = self.min_p
@@ -526,8 +528,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
     @model_validator(mode="before")
     @classmethod
     def verify_multi_responses(cls, data):
-        best_of = data.get("best_of")
-        if best_of and best_of < data.get("n"):
+        best_of, n = data.get("best_of"), data.get("n")
+        if best_of and n and best_of < n:
             raise ValueError("best_of should not be smaller than n")
         return data
 

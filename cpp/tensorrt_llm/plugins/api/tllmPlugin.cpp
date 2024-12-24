@@ -32,12 +32,14 @@
 #include "tensorrt_llm/plugins/mambaConv1dPlugin/mambaConv1dPlugin.h"
 #include "tensorrt_llm/plugins/mixtureOfExperts/mixtureOfExpertsPlugin.h"
 #if ENABLE_MULTI_DEVICE
+#include "tensorrt_llm/plugins/cpSplitPlugin/cpSplitPlugin.h"
 #include "tensorrt_llm/plugins/ncclPlugin/allgatherPlugin.h"
 #include "tensorrt_llm/plugins/ncclPlugin/allreducePlugin.h"
 #include "tensorrt_llm/plugins/ncclPlugin/recvPlugin.h"
 #include "tensorrt_llm/plugins/ncclPlugin/reduceScatterPlugin.h"
 #include "tensorrt_llm/plugins/ncclPlugin/sendPlugin.h"
 #endif // ENABLE_MULTI_DEVICE
+#include "tensorrt_llm/plugins/cudaStreamPlugin/cudaStreamPlugin.h"
 #include "tensorrt_llm/plugins/cumsumLastDimPlugin/cumsumLastDimPlugin.h"
 #include "tensorrt_llm/plugins/eaglePlugin/eagleDecodeDraftTokensPlugin.h"
 #include "tensorrt_llm/plugins/eaglePlugin/eaglePrepareDrafterInputsPlugin.h"
@@ -234,6 +236,7 @@ extern "C"
         static tensorrt_llm::plugins::EagleDecodeDraftTokensPluginCreator eagleDecodeDraftTokensPluginCreator;
         static tensorrt_llm::plugins::EagleSampleAndAcceptDraftTokensPluginCreator
             eagleSampleAndAcceptDraftTokensPluginCreator;
+        static tensorrt_llm::plugins::CudaStreamPluginCreator cudaStreamPluginCreator;
 
         static std::array pluginCreators
             = { creatorPtr(identityPluginCreator),
@@ -268,7 +271,9 @@ extern "C"
                   creatorPtr(lowLatencyGemmPluginCreator),
                   creatorPtr(eagleDecodeDraftTokensPluginCreator),
                   creatorPtr(eagleSampleAndAcceptDraftTokensPluginCreator),
-                  creatorPtr(lowLatencyGemmSwigluPluginCreator) };
+                  creatorPtr(lowLatencyGemmSwigluPluginCreator),
+                  creatorPtr(cudaStreamPluginCreator),
+              };
         nbCreators = pluginCreators.size();
         return pluginCreators.data();
     }
@@ -276,10 +281,16 @@ extern "C"
     [[maybe_unused]] nvinfer1::IPluginCreatorInterface* const* getCreators(std::int32_t& nbCreators)
     {
         static tensorrt_llm::plugins::EaglePrepareDrafterInputsPluginCreator eaglePrepareDrafterInputsPluginCreator;
+#if ENABLE_MULTI_DEVICE
+        static tensorrt_llm::plugins::CpSplitPluginCreator cpSplitPluginCreator;
+#endif // ENABLE_MULTI_DEVICE
 
-        static std::array creators = {
-            creatorInterfacePtr(eaglePrepareDrafterInputsPluginCreator),
-        };
+        static std::array creators
+            = { creatorInterfacePtr(eaglePrepareDrafterInputsPluginCreator),
+#if ENABLE_MULTI_DEVICE
+                  creatorInterfacePtr(cpSplitPluginCreator),
+#endif // ENABLE_MULTI_DEVICE
+              };
         nbCreators = creators.size();
         return creators.data();
     }

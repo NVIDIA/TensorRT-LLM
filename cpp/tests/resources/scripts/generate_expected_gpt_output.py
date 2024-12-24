@@ -46,11 +46,13 @@ def generate_output(engine: str,
                     output_log_probs: bool = False):
     tp_size = 1
     pp_size = 1
+    cp_size = 1
     model = 'gpt2'
     resources_dir = Path(__file__).parent.resolve().parent
     models_dir = resources_dir / 'models'
-    tp_pp_dir = 'tp' + str(tp_size) + '-pp' + str(pp_size) + '-gpu/'
-    engine_dir = models_dir / 'rt_engine' / model / engine / tp_pp_dir
+    tp_pp_cp_dir = 'tp' + str(tp_size) + '-pp' + str(pp_size) + '-cp' + str(
+        cp_size) + '-gpu/'
+    engine_dir = models_dir / 'rt_engine' / model / engine / tp_pp_cp_dir
 
     data_dir = resources_dir / 'data'
     input_file = data_dir / input_name
@@ -61,7 +63,7 @@ def generate_output(engine: str,
         output_dir = model_data_dir / ('beam_search_' + str(num_beams))
 
     model_spec_obj.use_tensor_parallelism(tp_size).use_pipeline_parallelism(
-        pp_size)
+        pp_size).use_context_parallelism(cp_size)
 
     base_output_name = os.path.splitext(model_spec_obj.get_results_file())[0]
 

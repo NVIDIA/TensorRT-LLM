@@ -343,7 +343,6 @@ def load_weights_from_hf_model(hf_model: AutoModel,
     mapping = config.mapping
     use_parallel_embedding = config.use_parallel_embedding
     sharding_dim = config.embedding_sharding_dim
-    share_embedding_table = config.share_embedding_table
 
     quant_algo = config.quantization.quant_algo
     use_weight_only = quant_algo in [QuantAlgo.W8A16, QuantAlgo.W4A16]
@@ -640,13 +639,11 @@ def load_weights_from_hf_model(hf_model: AutoModel,
         elif chatglm_version in GLM_ARCH2_VERSIONS:
             lm_head_weight = get_weight(model_params,
                                         'transformer.output_layer', dtype)
-            assert not share_embedding_table
 
-        if not share_embedding_table:
-            weights['lm_head.weight'] = split(lm_head_weight,
-                                              mapping.tp_size,
-                                              mapping.tp_rank,
-                                              dim=0)
+        weights['lm_head.weight'] = split(lm_head_weight,
+                                          mapping.tp_size,
+                                          mapping.tp_rank,
+                                          dim=0)
 
         if chatglm_version in GLM_ARCH1_VERSIONS:
             ln_f_w, ln_f_b = get_weight_and_bias(model_params,

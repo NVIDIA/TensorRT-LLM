@@ -57,34 +57,6 @@ struct MixedGemmArchTraits<float, float, Arch>
     using Operator = cutlass::arch::OpMultiplyAdd;
 };
 
-// ========================= Volta Traits ===========================
-// Volta will always dequantize after the global memory load.
-// This will instantiate any HMMA tensorcore kernels for Volta.
-// Note that volta does not have native bfloat support so weights and activations will be casted to fp16
-// and compute will happen in fp16 then will be converted for bf16 output.
-template <typename TypeA, typename TypeB>
-struct MixedGemmArchTraits<TypeA, TypeB, cutlass::arch::Sm70,
-    typename cutlass::platform::enable_if<cutlass::platform::is_same<TypeA, cutlass::half_t>::value
-        || cutlass::platform::is_same<TypeA, cutlass::bfloat16_t>::value>::type>
-{
-private:
-    using LayoutDetails = LayoutDetailsB<TypeA, TypeB, cutlass::arch::Sm70>;
-
-public:
-    static constexpr int ThreadblockK = LayoutDetails::ThreadblockK;
-
-    using OperatorClass = cutlass::arch::OpClassTensorOp;
-    using AccType = float;
-    using LayoutB = typename LayoutDetails::Layout;
-
-    static constexpr int ElementsPerAccessA = 128 / cutlass::sizeof_bits<TypeA>::value;
-    static constexpr int ElementsPerAccessB = LayoutDetails::ElementsPerAccess;
-    static constexpr int ElementsPerAccessC = 128 / cutlass::sizeof_bits<TypeA>::value;
-    using InstructionShape = cutlass::gemm::GemmShape<8, 8, 4>;
-
-    using Operator = typename LayoutDetails::Operator;
-};
-
 // ======================= Turing Traits ==============================
 // Note that turing does not have native bfloat support so weights and activations will be casted to fp16
 // and compute will happen in fp16 then will be converted for bf16 output.

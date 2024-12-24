@@ -14,8 +14,6 @@
 # limitations under the License.
 from typing import TYPE_CHECKING, Optional, Union
 
-from typing_extensions import Literal
-
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -44,7 +42,6 @@ class GemmaConfig(PretrainedConfig):
         rotary_scaling: Optional[dict] = None,
         attn_bias: bool = False,
         mlp_bias: bool = False,
-        share_embedding_table: Literal[True] = True,
         position_embedding_type: PositionEmbeddingType = PositionEmbeddingType.
         rope_gpt_neox,
         query_pre_attn_scalar: Optional[int] = None,
@@ -53,13 +50,6 @@ class GemmaConfig(PretrainedConfig):
         mapping: Optional[Union[Mapping, dict]] = None,
         **kwargs,
     ):
-        if not share_embedding_table:
-            """
-            We always pass `True` - the passed value is `False` by default, and ignored either way.
-            We can't just raise an exception here, because this will force the user to explicitly pass `LLM(share_embedding_table=False)`.
-            """
-            logger.debug("Using `share_embedding_table=True` for Gemma")
-
         use_parallel_embedding = False
         if mapping:
             use_parallel_embedding = mapping.tp_size > 1 if isinstance(
@@ -75,7 +65,6 @@ class GemmaConfig(PretrainedConfig):
 
         super().__init__(
             architecture=architecture,
-            share_embedding_table=True,
             use_parallel_embedding=use_parallel_embedding,
             rotary_base=rotary_base,
             attn_bias=attn_bias,

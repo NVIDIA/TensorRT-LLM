@@ -58,8 +58,13 @@ async def test_completion_streaming(async_client: openai.AsyncOpenAI,
         echo=echo,
     )
     chunks: List[str] = []
+    finish_reason_count = 0
     async for chunk in stream:
         chunks.append(chunk.choices[0].text)
+        if chunk.choices[0].finish_reason is not None:
+            finish_reason_count += 1
+    assert finish_reason_count == 1
+    assert chunk.choices[0].finish_reason == "length"
     assert chunk.choices[0].text
     assert "".join(chunks) == single_output
 
@@ -74,6 +79,7 @@ def test_single_completion(client: openai.OpenAI, model_name):
 
     choice = completion.choices[0]
     assert len(choice.text) >= 5
+    assert choice.finish_reason == "length"
     assert completion.id is not None
     assert completion.choices is not None and len(completion.choices) == 1
 

@@ -72,8 +72,9 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
 {
     SizeType32 constexpr tensorParallelism{1};
     SizeType32 constexpr pipelineParallelism{1};
+    SizeType32 constexpr contextParallelism{1};
     SizeType32 constexpr localRank{0};
-    WorldConfig const worldConfig{tensorParallelism, pipelineParallelism, localRank};
+    WorldConfig const worldConfig{tensorParallelism, pipelineParallelism, contextParallelism, localRank};
 
     SizeType32 constexpr vocabSize{51200};
     SizeType32 constexpr nbLayers{2};
@@ -103,7 +104,7 @@ void testDecoder(nvinfer1::DataType const dtype, SamplingConfig const& samplingC
         vocabSizePadded, maxSeqLength, streamPtr);
     ASSERT_TRUE(static_cast<bool>(decoder));
 
-    auto batchSlots = getDefaultBatchSlots(batchSize, manager);
+    auto batchSlots = getDefaultBatchSlots(batchSize);
     decoder->setup(samplingConfig, batchSize, batchSlots);
 
     // set up inputs

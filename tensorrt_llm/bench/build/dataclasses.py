@@ -57,10 +57,11 @@ class ModelConfig(BaseModel):
         return param_count
 
     @classmethod
-    def from_hf(cls, model_hf_name):
+    def from_hf(cls, model_hf_name, hf_model_path):
         try:
+            model_path = hf_model_path or model_hf_name
             hf_config = AutoConfig.from_pretrained(
-                model_hf_name, trust_remote_code=True).to_dict()
+                model_path, trust_remote_code=True).to_dict()
         except EnvironmentError as e:
             raise e
 

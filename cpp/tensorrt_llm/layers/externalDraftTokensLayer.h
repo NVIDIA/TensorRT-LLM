@@ -35,7 +35,7 @@ public:
     using Base = BaseLayer;
 
     ExternalDraftTokensLayer(executor::DecodingMode const& mode, DecoderDomain const& decoderDomain,
-        std::shared_ptr<runtime::BufferManager> bufferManager);
+        std::shared_ptr<runtime::BufferManager> bufferManager, bool isDeterministic = true, bool isAirTopP = true);
 
     void setup(runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth, TensorConstPtr batchSlots,
         std::shared_ptr<BaseSetupParams> const& setupParams,
@@ -74,6 +74,12 @@ private:
 
     TensorPtr mTargetLogits;
 
+    // AirTopP
+    cudaDeviceProp mDeviceProp;
+    runtime::SizeType32 mAirTopPBlockNum{0};
+    bool mIsDeterministic{true};
+    bool mIsAirTopP{false};
+
 private:
     void allocateBuffer(runtime::SizeType32 batchSize);
     void acceptDraftTokens(std::shared_ptr<BaseDecodingOutputs> const& outputs,
@@ -82,11 +88,9 @@ private:
     void multinomialSampling(std::shared_ptr<BaseDecodingOutputs> const& outputs,
         std::shared_ptr<BaseDecodingInputs> const& baseInputs,
         std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace);
-    void getAllTopKs(std::shared_ptr<BaseDecodingOutputs> const& outputs,
-        std::shared_ptr<BaseDecodingInputs> const& baseInputs,
+    void getAllTopKs(std::shared_ptr<BaseDecodingInputs> const& baseInputs,
         std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace);
-    void getAllTopPs(std::shared_ptr<BaseDecodingOutputs> const& outputs,
-        std::shared_ptr<BaseDecodingInputs> const& baseInputs,
+    void getAllTopPs(std::shared_ptr<BaseDecodingInputs> const& baseInputs,
         std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace);
     void forwardAcceptedTokens(std::shared_ptr<BaseDecodingOutputs> const& outputs,
         std::shared_ptr<BaseDecodingInputs> const& baseInputs,

@@ -5,7 +5,8 @@ from typing import List, TextIO, Tuple
 
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
-from tensorrt_llm.bench.dataclasses import DatasetMetadata, InferenceRequest
+from tensorrt_llm.bench.dataclasses.general import (DatasetMetadata,
+                                                    InferenceRequest)
 
 
 def initialize_tokenizer(model_name: str) -> PreTrainedTokenizer:
@@ -20,7 +21,9 @@ def initialize_tokenizer(model_name: str) -> PreTrainedTokenizer:
     """
     # Initialize the tokenizer specific to the model that we are planning
     # to benchmark.
-    tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left")
+    tokenizer = AutoTokenizer.from_pretrained(model_name,
+                                              padding_side="left",
+                                              trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 
@@ -82,7 +85,7 @@ def create_dataset_from_stream(
         # Each line should be a complete JSON dictionary with no indentation
         # or newline characters.
         data = json.loads(line)
-        logits = data.get("logits", None)
+        logits = data.get("input_ids", data.get("logits", None))
         prompt = data.get("prompt", None)
         task_id = data["task_id"]
         osl = data["output_tokens"]
@@ -94,7 +97,7 @@ def create_dataset_from_stream(
             task_id=task_id,
             prompt=prompt,
             output_tokens=output_limiter(osl),
-            logits=logits,
+            input_ids=logits,
         )
         all_isl.append(len(logits))
         all_osl.append(osl)

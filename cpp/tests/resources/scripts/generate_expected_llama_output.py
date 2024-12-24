@@ -34,14 +34,16 @@ def generate_output(engine: str,
                     model_spec_obj: model_spec.ModelSpec,
                     tp_size: int = 1,
                     pp_size: int = 1,
+                    cp_size: int = 1,
                     max_output_len: int = 8):
 
     model = 'llama-7b-hf'
     resources_dir = Path(__file__).parent.resolve().parent
     models_dir = resources_dir / 'models'
     hf_dir = models_dir / model
-    tp_pp_dir = 'tp' + str(tp_size) + '-pp' + str(pp_size) + '-gpu/'
-    engine_dir = models_dir / 'rt_engine' / model / engine / tp_pp_dir
+    tp_pp_cp_dir = 'tp' + str(tp_size) + '-pp' + str(pp_size) + '-cp' + str(
+        cp_size) + '-gpu/'
+    engine_dir = models_dir / 'rt_engine' / model / engine / tp_pp_cp_dir
 
     data_dir = resources_dir / 'data'
     input_file = data_dir / 'input_tokens.npy'
@@ -68,11 +70,11 @@ def generate_output(engine: str,
 
 def generate_outputs(num_beams, only_multi_gpu=False):
     if not only_multi_gpu:
-        tp_pp_sizes = [(1, 1)]
+        tp_pp_cp_sizes = [(1, 1, 1)]
     elif COMM_WORLD.size == 4:
-        tp_pp_sizes = [(4, 1), (2, 2), (1, 4)]
+        tp_pp_cp_sizes = [(4, 1, 1), (2, 2, 1), (1, 4, 1)]
     elif COMM_WORLD.size == 2:
-        tp_pp_sizes = [(1, 2), (2, 1)]
+        tp_pp_cp_sizes = [(1, 2, 1), (2, 1, 1)]
     else:
         raise RuntimeError(
             f"The world size of MPI {COMM_WORLD.size} is not equal to 1, 2, or 4."
@@ -82,16 +84,18 @@ def generate_outputs(num_beams, only_multi_gpu=False):
     model_spec_obj.set_kv_cache_type(_tb.KVCacheType.PAGED)
     model_spec_obj.use_packed_input()
 
-    for tp_size, pp_size in tp_pp_sizes:
+    for tp_size, pp_size, cp_size in tp_pp_cp_sizes:
         print(
-            f'Generating outputs for Llama FP16 with TP={tp_size} and PP={pp_size}'
+            f'Generating outputs for Llama FP16 with TP={tp_size}, PP={pp_size} and CP={cp_size}'
         )
         model_spec_obj.use_tensor_parallelism(tp_size)
         model_spec_obj.use_pipeline_parallelism(pp_size)
+        model_spec_obj.use_context_parallelism(cp_size)
         generate_output(engine=model_spec_obj.get_model_path(),
                         num_beams=num_beams,
                         tp_size=tp_size,
                         pp_size=pp_size,
+                        cp_size=cp_size,
                         model_spec_obj=model_spec_obj)
 
 

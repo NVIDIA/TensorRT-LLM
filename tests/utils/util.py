@@ -124,12 +124,16 @@ def skip_bf16_fp32_accum(dtype, context_fmha_type):
         )
 
 
-skip_single_gpu = pytest.mark.skipif(
-    torch.cuda.device_count() < 2,
-    reason="The test needs at least 2 GPUs, skipping")
+def skip_num_gpus_less_than(num_gpus: int):
+    return pytest.mark.skipif(
+        torch.cuda.device_count() < num_gpus,
+        reason=f"The test needs at least {num_gpus} GPUs, skipping")
 
 
-def skip_less_than_memory(required_memory: int):
+skip_single_gpu = skip_num_gpus_less_than(2)
+
+
+def skip_gpu_memory_less_than(required_memory: int):
     memory = get_total_gpu_memory(0)
     return pytest.mark.skipif(
         required_memory > memory,
@@ -138,7 +142,8 @@ def skip_less_than_memory(required_memory: int):
     )
 
 
-skip_less_than_40gb_memory = skip_less_than_memory(40 * 1024 * 1024 * 1024)
+skip_gpu_memory_less_than_40gb = skip_gpu_memory_less_than(40 * 1024 * 1024 *
+                                                           1024)
 
 
 def modelopt_installed():
@@ -236,7 +241,7 @@ def run_session(session: Session,
                 inputs,
                 outputs={},
                 override_shapes={},
-                output_override_shapes={}):
+                override_types={}):
     """
     The current session object needs to pass in both inputs and outputs bindings.
     For test convenience, create a function that infers output shapes automatically,
@@ -247,21 +252,20 @@ def run_session(session: Session,
            This function will prioritize to use the tensor in this dictionary.
         2. `override_shapes` can be used to force some input tensors' shape to be different than the passed tensor.
            Required for zero-volume tensors since torch.Tensor.data_ptr() is nullptr for such tensors.
-        2. `output_override_shapes` can be used to force some output tensors' shape to be different than the passed tensor.
-           Required for dynamic shape tensors since their shape will contain -1.
+        3. `override_types` can be used to force some input tensors' type to be different than the passed tensor.
+           Required for zero-volume tensors since torch.Tensor.data_ptr() is nullptr for such tensors.
     """
 
     # Prepare output tensors.
     output_info = session.infer_shapes([
         TensorInfo(
-            name, torch_dtype_to_trt(tensor.dtype), tensor.shape
+            name,
+            torch_dtype_to_trt(tensor.dtype if name not in
+                               override_types else override_types[name]),
+            tensor.shape
             if name not in override_shapes else override_shapes[name])
         for name, tensor in inputs.items()
     ])
-
-    for tensor in output_info:
-        if tensor.name in output_override_shapes:
-            tensor.shape = output_override_shapes[tensor.name]
 
     outputs = {
         t.name:

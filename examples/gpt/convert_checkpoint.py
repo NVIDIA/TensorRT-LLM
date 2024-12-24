@@ -67,13 +67,6 @@ def parse_arguments():
         'To shard it along hidden dimension, set embedding_sharding_dim=1'
         'Note: embedding sharing is only enabled when embedding_sharding_dim = 0'
     )
-    parser.add_argument(
-        '--use_embedding_sharing',
-        action="store_true",
-        default=False,
-        help=
-        'Try to reduce the engine size by sharing the embedding lookup table between two layers.'
-        'Note: the flag might not take effect when the criteria are not met.')
 
     parser.add_argument(
         '--use_weight_only',
@@ -196,7 +189,6 @@ def convert_and_save_hf(args):
     override_fields = {
         'use_parallel_embedding': args.use_parallel_embedding,
         'embedding_sharding_dim': args.embedding_sharding_dim,
-        'share_embedding_table': args.use_embedding_sharing,
         'gpt_variant': args.gpt_variant,
     }
 
@@ -261,7 +253,6 @@ def convert_and_save_nemo(args):
     override_fields = {
         'use_parallel_embedding': True,
         'embedding_sharding_dim': 0,
-        'share_embedding_table': args.use_embedding_sharing,
     }
 
     nemo_ckpt_dir = os.path.join(args.output_dir, "unpacked")

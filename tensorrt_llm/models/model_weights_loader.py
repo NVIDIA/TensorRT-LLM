@@ -3,7 +3,7 @@ import math
 import os
 import weakref
 from enum import Enum
-from typing import Callable, List
+from typing import Callable, List, Optional
 
 import torch
 from safetensors import safe_open
@@ -49,6 +49,7 @@ class ModelWeightsLoader:
         self.tllm_to_externel_key_dict = {
             "transformer": "model",
             "vocab_embedding": "embed_tokens",
+            "layers": "layers",
             "lm_head": "lm_head",
             "ln_f": "norm",
             "attention": "self_attn",
@@ -59,6 +60,7 @@ class ModelWeightsLoader:
             "fc": "gate_proj",
             "input_layernorm": "input_layernorm",
             "post_layernorm": "post_attention_layernorm",
+            "kv_cache_scaling_factor": ["k_proj.k_scale", "v_proj.v_scale"],
         }
         self.tllm_to_externel_key_dict.update(customized_key_dict)
 
@@ -66,8 +68,10 @@ class ModelWeightsLoader:
         self.preload()
 
     def translate_to_external_key(
-            self, tllm_key: str,
-            tllm_to_externel_key_dict: dict) -> str | List[str]:
+            self,
+            tllm_key: str,
+            tllm_to_externel_key_dict: Optional[dict] = None
+    ) -> str | List[str]:
         """Translate TRT-LLM key into HF key or HF key list (e.g. QKV/MoE/GPTQ)
 
         tllm_key will get translated into HF format section by section.
@@ -87,33 +91,39 @@ class ModelWeightsLoader:
         Returns:
             hf_keys (str | list[str]) : Translated HF key(s).
         """
-        tllm_key_split = tllm_key.split(".")
-        hf_key_split = tllm_key_split.copy()
-
-        for i, tllm_word in enumerate(tllm_key_split):
-            if tllm_word in tllm_to_externel_key_dict:
-                hf_key_split[i] = tllm_to_externel_key_dict[tllm_word]
-            elif tllm_word in self.tllm_to_externel_key_dict:
-                hf_key_split[i] = self.tllm_to_externel_key_dict[tllm_word]
-
-        hf_keys = [""]
-        for hf_word in hf_key_split:
-            if isinstance(hf_word, list):
-                hf_keys = [
-                    item for item in hf_keys for _ in range(len(hf_word))
-                ]
-                hf_keys = [
-                    hf_key + hf_word[i % len(hf_word)]
-                    for i, hf_key in enumerate(hf_keys)
-                ]
-            else:
-                if hf_word == "":
+        tllm_keys = [tllm_key]
+        d = self.tllm_to_externel_key_dict.copy()
+        if tllm_to_externel_key_dict is not None:
+            d.update(tllm_to_externel_key_dict)
+        for k, v in d.items():
+            if k in tllm_key:
+                # Ensure replacement happen when k covers several full sections in tllm_key
+                if not any([
+                    ('.' + k + '.') in tllm_key,
+                        k == tllm_key,
+                        tllm_key.startswith(k) and (k + '.') in tllm_key,
+                        tllm_key.endswith(k) and ('.' + k) in tllm_key,
+                ]):
                     continue
-                hf_keys = [hf_key + hf_word for hf_key in hf_keys]
-            hf_keys = [hf_key + "." for hf_key in hf_keys]
-        hf_keys = [hf_key[:-1] for hf_key in hf_keys]
+                if isinstance(v, list):
+                    tllm_keys = [t for t in tllm_keys for _ in range(len(v))]
+                    tllm_keys = [
+                        s.replace(k, v[idx % len(v)])
+                        for idx, s in enumerate(tllm_keys)
+                    ]
+                else:
+                    tllm_keys = [s.replace(k, v) for s in tllm_keys]
 
-        return hf_keys[0] if len(hf_keys) == 1 else hf_keys
+        for idx, k in enumerate(tllm_keys):
+            while ".." in k:
+                k = k.replace("..", ".")
+            if k.startswith("."):
+                k = k[1:]
+            if k.endswith("."):
+                k = k[:-1]
+            tllm_keys[idx] = k
+
+        return tllm_keys[0] if len(tllm_keys) == 1 else tllm_keys
 
     def detect_format(self):
         if os.path.isfile(self.model_dir):
@@ -242,9 +252,9 @@ class ModelWeightsLoader:
             return {}
         assert sub_module is not None and param is not None, f"{tllm_key} got Nonetype for parameter or parent module."
 
-        tllm_to_externel_key_dict = sub_module.tllm_to_externel_key_dict if hasattr(
-            sub_module, "tllm_to_externel_key_dict") else {}
-        tp_dim = sub_module.tp_dim if hasattr(sub_module, "tp_dim") else -1
+        tllm_to_externel_key_dict = getattr(sub_module,
+                                            "tllm_to_externel_key_dict", None)
+        tp_dim = getattr(sub_module, "tp_dim", -1)
         require_weight_transpose = (
             isinstance(sub_module, WeightOnlyGroupwiseQuantColumnLinear)
             or isinstance(sub_module, WeightOnlyGroupwiseQuantRowLinear))
@@ -256,7 +266,7 @@ class ModelWeightsLoader:
                     tp_dim = -1
             elif tllm_key.endswith("weight"):
                 tp_dim = 1 - tp_dim
-        tp_size = sub_module.tp_size if hasattr(sub_module, "tp_size") else 1
+        tp_size = getattr(sub_module, "tp_size", 1)
         # Disable auto TP when num_kv_heads is invalid for split
         if getattr(sub_module, "is_qkv",
                    False) and self.model.config.num_key_value_heads < tp_size:
@@ -269,7 +279,6 @@ class ModelWeightsLoader:
             tp_rank = self.model.config.mapping.moe_tp_rank
         external_key = self.translate_to_external_key(
             tllm_key, tllm_to_externel_key_dict)
-
         if isinstance(external_key, list):
             v = [
                 self.load_tensor(k, tp_size, tp_dim, tp_rank)
@@ -305,50 +314,6 @@ class ModelWeightsLoader:
 
         return weight_dict
 
-    def check_share_embedding(self, config):
-        # TODO: Remove after --use_share_embedding is removed
-        if not config.share_embedding_table:
-            return
-
-        from ..logger import logger
-        lm_head_weights = self.load_tensor(
-            self.translate_to_external_key("lm_head.weight",
-                                           self.tllm_to_externel_key_dict))
-        vocab_embed_weights = self.load_tensor(
-            self.translate_to_external_key("transformer.vocab_embedding.weight",
-                                           self.tllm_to_externel_key_dict))
-        share_embedding_table = False
-        if lm_head_weights is not None and vocab_embed_weights is not None:
-            if lm_head_weights.shape == vocab_embed_weights.shape:
-                if not (lm_head_weights - vocab_embed_weights).any():
-                    share_embedding_table = True
-        elif lm_head_weights is None and vocab_embed_weights is not None:
-            self.tllm_to_externel_key_dict[
-                'lm_head'] = self.tllm_to_externel_key_dict[
-                    'transformer'] + '.' + self.tllm_to_externel_key_dict[
-                        'vocab_embedding']
-            share_embedding_table = True
-        elif lm_head_weights is not None and vocab_embed_weights is None:
-            self.tllm_to_externel_key_dict[
-                'vocab_embedding'] = self.tllm_to_externel_key_dict['lm_head']
-            share_embedding_table = True
-
-        # Validation
-        mapping = config.mapping
-        if mapping.tp_size > 1:
-            if (not config.use_parallel_embedding) or (
-                    config.use_parallel_embedding
-                    and config.embedding_sharding_dim == 1):
-                share_embedding_table = False
-        if mapping.pp_size > 1:
-            share_embedding_table = False
-        if mapping.cp_size > 1:
-            share_embedding_table = False
-        config.share_embedding_table = share_embedding_table
-
-        if config.share_embedding_table:
-            logger.info("share_embedding_table enabled.")
-
     def update_key_mapping(self, model):
         self.model = weakref.ref(model)()
         # Auto PP
@@ -356,17 +321,35 @@ class ModelWeightsLoader:
         if config.mapping.has_pp():
             pp_layers = config.mapping.pp_layers(config.num_hidden_layers)
             self.tllm_to_externel_key_dict.update({
-                str(tllm_local_layer_idx): str(hf_global_layer_idx)
+                f"layers.{tllm_local_layer_idx}":
+                f"{self.tllm_to_externel_key_dict['layers']}.{hf_global_layer_idx}"
                 for tllm_local_layer_idx, hf_global_layer_idx in enumerate(
                     pp_layers)
             })
+            if self.tllm_to_externel_key_dict['layers'] != 'layers':
+                del self.tllm_to_externel_key_dict['layers']
 
-        # Share embedding
-        if self.tllm_to_externel_key_dict[
-                'vocab_embedding'] == self.tllm_to_externel_key_dict['lm_head']:
-            self.model.transformer.vocab_embedding.tllm_to_externel_key_dict = {
-                self.tllm_to_externel_key_dict['transformer']: '',
-            }
+        # Share embedding; only applies to standard structure with lm_head and transformer.vocab_embedding
+        if hasattr(self.model, 'lm_head') and hasattr(
+                self.model, 'transformer') and hasattr(self.model.transformer,
+                                                       'vocab_embedding'):
+            lm_head_weights = self.load_tensor(
+                self.translate_to_external_key('lm_head.weight'))
+            vocab_embed_weights = self.load_tensor(
+                self.translate_to_external_key(
+                    'transformer.vocab_embedding.weight'))
+            if lm_head_weights is None and vocab_embed_weights is not None:
+                self.tllm_to_externel_key_dict[
+                    'lm_head'] = self.tllm_to_externel_key_dict[
+                        'transformer'] + '.' + self.tllm_to_externel_key_dict[
+                            'vocab_embedding']
+            elif lm_head_weights is not None and vocab_embed_weights is None:
+                self.tllm_to_externel_key_dict[
+                    'vocab_embedding'] = self.tllm_to_externel_key_dict[
+                        'lm_head']
+                self.model.transformer.vocab_embedding.tllm_to_externel_key_dict = {
+                    'transformer': ''
+                }
 
     def fill(self, weights):
         for tllm_key, param in self.model.named_parameters():

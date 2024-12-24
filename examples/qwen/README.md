@@ -36,22 +36,28 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 | Qwen-7B(-Chat)     |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
 | Qwen-14B(-Chat)    |     Y      |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
 | Qwen-72B(-Chat)    |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-0.5B(-Chat)|     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-1.8B(-Chat)|     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen1.5-4B(-Chat)  |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen1.5-0.5B(-Chat)|     Y      |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen1.5-1.8B(-Chat)|     Y      |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen1.5-4B(-Chat)  |     Y      |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
 | Qwen1.5-7B(-Chat)  |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
 | Qwen1.5-14B(-Chat) |     Y      |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
 | Qwen1.5-32B(-Chat) |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
 | Qwen1.5-72B(-Chat) |     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
 | Qwen1.5-110B(-Chat)|     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
 | Qwen1.5-MoE-A2.7B(-Chat)|   Y   |   -   |   Y   |   -   |   -   |   -   |   Y   |   Y   | Ampere+ |
-| Qwen2-0.5B(-Instruct)|     Y    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
-| Qwen2-1.5B(-Instruct)|     Y    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen2-0.5B(-Instruct)|     Y    |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen2-1.5B(-Instruct)|     Y    |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
 | Qwen2-7B(-Instruct)|     Y      |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
 | Qwen2-57B-A14B(-Instruct)|  Y   |   -   |   Y   |   -   |   -   |   -   |   Y   |   Y   | Ampere+ |
-| Qwen2-72B(-Instruct)|     Y     |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen2-72B(-Instruct)|     Y     |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen2.5-0.5B(-Instruct)|     Y  |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen2.5-3B(-Instruct)|     Y    |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen2.5-1.5B(-Instruct)|     Y  |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen2.5-7B(-Instruct)|     Y    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen2.5-32B(-Instruct)|     Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   | Ampere+ |
+| Qwen2.5-72B(-Instruct)|     Y   |   Y   |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   | Ampere+ |
 
-*Please note that these models supports AWQ only with single GPU.
+Please note that Y* sign means that the model does not support all the AWQ + TP combination.
 
 * Model Name: the name of the model, the same as the name on HuggingFace
 * WO: Weight Only Quantization (int8 / int4)
@@ -61,7 +67,7 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 * TP: Tensor Parallel
 * PP: Pipeline Parallel
 
-*Currently Qwen models does not support dynamic NTK and logn attention. Therefore, accuracy on long sequence input for the 7B and 14B model is not promised.
+Currently Qwen1 models does not support dynamic NTK and logn attention. Therefore, accuracy on long sequence input for the Qwen-7B and Qwen-14B model is not promised.
 
 ## Usage
 
@@ -265,10 +271,7 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_fp8 \
 ```
 
 #### INT4-GPTQ
-You may find the official GPTQ quantized INT4 weights of Qwen-7B-Chat here: [Qwen-7B-Chat-Int4](https://huggingface.co/Qwen/Qwen-7B-Chat-Int4). And you need to first install auto-gptq:
-```bash
-pip install auto-gptq
-```
+You may find the official GPTQ quantized INT4 weights of Qwen-7B-Chat here: [Qwen-7B-Chat-Int4](https://huggingface.co/Qwen/Qwen-7B-Chat-Int4).
 
 Example of building engine for INT4 GPTQ quantized Qwen model:
 ```bash
@@ -277,7 +280,7 @@ python3 convert_checkpoint.py --model_dir ./tmp/Qwen-7B-Chat-Int4 \
                               --dtype float16 \
                               --use_weight_only \
                               --weight_only_precision int4_gptq \
-                              --per_group \
+                              --per_group
 
 trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_gptq \
                 --output_dir ./tmp/Qwen/7B/trt_engines/int4_GPTQ/1-gpu/ \
@@ -298,6 +301,13 @@ To run the AWQ Qwen example, the following steps are required:
                                        --awq_block_size 128 \
                                        --output_dir ./quantized_int4-awq \
                                        --calib_size 32
+    ```
+    HF checkpoints generated with [AutoAWQ](https://github.com/casper-hansen/AutoAWQ) are also supported through the following conversion script:
+
+    ```bash
+    # Convert AutoAWQ HF checkpoints into TRT-LLM checkpoint
+    python convert_checkpoint.py --model_dir ./tmp/Qwen2-7B-Instruct-AWQ \
+                                 --output_dir ./quantized_int4-awq
     ```
 
 2. Build TRT-LLM engine:

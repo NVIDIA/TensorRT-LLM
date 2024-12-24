@@ -35,6 +35,16 @@ class SocketState;
 class Serialization
 {
 public:
+    // TimePoint
+    [[nodiscard]] static RequestPerfMetrics::TimePoint deserializeTimePoint(std::istream& is);
+    static void serialize(RequestPerfMetrics::TimePoint const& tp, std::ostream& os);
+    [[nodiscard]] static size_t serializedSize(RequestPerfMetrics::TimePoint const&);
+
+    // RequestPerfMetrics
+    [[nodiscard]] static RequestPerfMetrics deserializeRequestPerfMetrics(std::istream& is);
+    static void serialize(RequestPerfMetrics const& metrics, std::ostream& os);
+    [[nodiscard]] static size_t serializedSize(RequestPerfMetrics const& metrics);
+
     // SamplingConfig
     [[nodiscard]] static SamplingConfig deserializeSamplingConfig(std::istream& is);
     static void serialize(SamplingConfig const& config, std::ostream& os);
@@ -54,6 +64,11 @@ public:
     [[nodiscard]] static PromptTuningConfig deserializePromptTuningConfig(std::istream& is);
     static void serialize(PromptTuningConfig const& config, std::ostream& os);
     [[nodiscard]] static size_t serializedSize(PromptTuningConfig const& config);
+
+    // MropeConfig
+    [[nodiscard]] static MropeConfig deserializeMropeConfig(std::istream& is);
+    static void serialize(MropeConfig const& config, std::ostream& os);
+    [[nodiscard]] static size_t serializedSize(MropeConfig const& config);
 
     // LoraConfig
     [[nodiscard]] static LoraConfig deserializeLoraConfig(std::istream& is);
@@ -164,6 +179,21 @@ public:
     static void serialize(EagleConfig const& eagleConfig, std::ostream& os);
     static size_t serializedSize(EagleConfig const& eagleConfig);
 
+    // SpeculativeDecodingConfig
+    static SpeculativeDecodingConfig deserializeSpeculativeDecodingConfig(std::istream& is);
+    static void serialize(SpeculativeDecodingConfig const& specDecConfig, std::ostream& os);
+    static size_t serializedSize(SpeculativeDecodingConfig const& specDecConfig);
+
+    // GuidedDecodingConfig
+    static GuidedDecodingConfig deserializeGuidedDecodingConfig(std::istream& is);
+    static void serialize(GuidedDecodingConfig const& guidedDecodingConfig, std::ostream& os);
+    static size_t serializedSize(GuidedDecodingConfig const& guidedDecodingConfig);
+
+    // GuidedDecodingParams
+    static GuidedDecodingParams deserializeGuidedDecodingParams(std::istream& is);
+    static void serialize(GuidedDecodingParams const& guidedDecodingParams, std::ostream& os);
+    static size_t serializedSize(GuidedDecodingParams const& guidedDecodingParams);
+
     // KvCacheRetentionConfig
     static KvCacheRetentionConfig deserializeKvCacheRetentionConfig(std::istream& is);
     static void serialize(KvCacheRetentionConfig const& kvCacheRetentionConfig, std::ostream& os);
@@ -211,6 +241,33 @@ public:
     static void serialize(IterationStats const& iterStats, std::ostream& os);
     static std::vector<char> serialize(IterationStats const& iterStats);
     static size_t serializedSize(IterationStats const& iterStats);
+    static std::vector<char> serialize(std::vector<IterationStats> const& iterStatsVec);
+    static std::vector<IterationStats> deserializeIterationStatsVec(std::vector<char>& buffer);
+
+    // DisServingStats
+    [[nodiscard]] static DisServingRequestStats deserializeDisServingRequestStats(std::istream& is);
+    static void serialize(DisServingRequestStats const& stats, std::ostream& os);
+    [[nodiscard]] static size_t serializedSize(DisServingRequestStats const& disServingRequestStats);
+
+    // RequestStage
+    [[nodiscard]] static RequestStage deserializeRequestStage(std::istream& is);
+    static void serialize(RequestStage const& requestStage, std::ostream& os);
+    [[nodiscard]] static size_t serializedSize(RequestStage const& requestStage);
+
+    // RequestStats
+    [[nodiscard]] static RequestStats deserializeRequestStats(std::istream& is);
+    static void serialize(RequestStats const& state, std::ostream& os);
+    [[nodiscard]] static size_t serializedSize(RequestStats const& state);
+
+    // RequestStatsPerIteration
+    [[nodiscard]] static RequestStatsPerIteration deserializeRequestStatsPerIteration(std::istream& is);
+    [[nodiscard]] static RequestStatsPerIteration deserializeRequestStatsPerIteration(std::vector<char>& buffer);
+    static void serialize(RequestStatsPerIteration const& state, std::ostream& os);
+    [[nodiscard]] static std::vector<char> serialize(RequestStatsPerIteration const& state);
+    [[nodiscard]] static size_t serializedSize(RequestStatsPerIteration const& state);
+    [[nodiscard]] static std::vector<char> serialize(std::vector<RequestStatsPerIteration> const& requestStatsVec);
+    [[nodiscard]] static std::vector<RequestStatsPerIteration> deserializeRequestStatsPerIterationVec(
+        std::vector<char>& buffer);
 
     // String
     static std::string deserializeString(std::istream& is);

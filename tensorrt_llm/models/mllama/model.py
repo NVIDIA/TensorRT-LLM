@@ -1493,7 +1493,6 @@ class MLLaMAModel(PretrainedModel):
             hf_model_dir = quant_ckpt_path
 
         loader = ModelWeightsLoader(hf_model_dir, custom_dict)
-        loader.check_share_embedding(config)
         model = cls(config)
         loader.generate_tllm_weights(model)
 

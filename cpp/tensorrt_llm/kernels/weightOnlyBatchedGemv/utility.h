@@ -135,13 +135,13 @@ __device__ __forceinline__ void dequantize(void* w, void* quantized_w, void* sca
         Type2 vec_scale, vec_zero;
         if constexpr (ApplyAlphaInAdvance)
         {
-            vec_scale = MathWrapper<typename Details::TypeDetailsA>::to_vec2(
-                reinterpret_cast<Type*>(scales)[n] * static_cast<Type>(alpha));
+            Type scales_ = static_cast<float>(reinterpret_cast<half*>(scales)[n]) * alpha;
+            vec_scale = MathWrapper<typename Details::TypeDetailsA>::to_vec2(scales_);
             vec_zero = MathWrapper<typename Details::TypeDetailsA>::to_vec2(static_cast<Type>(0.f));
             if constexpr (EnableZero)
             {
                 vec_zero = MathWrapper<typename Details::TypeDetailsA>::to_vec2(
-                    reinterpret_cast<Type*>(zeros)[n] * static_cast<Type>(alpha));
+                    static_cast<float>(reinterpret_cast<half*>(zeros)[n]) * alpha);
             }
         }
         else
@@ -203,7 +203,6 @@ __device__ __forceinline__ void mma(void* acc, void* w_pack2, void* act)
 template <int Interleave, int ThreadsPerInterleavedTile, typename T>
 __device__ __forceinline__ T warp_reduce_sum(T& val)
 {
-    static_assert(Interleave * ThreadsPerInterleavedTile == 8);
     val += __shfl_xor_sync(~0, val, 16);
     val += __shfl_xor_sync(~0, val, 8);
     if (Interleave != 2 && Interleave != 4)

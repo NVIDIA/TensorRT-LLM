@@ -16,7 +16,7 @@ from .activation import Mish
 from .attention import (Attention, AttentionMaskParams, AttentionMaskType,
                         AttentionParams, BertAttention, BlockSparseAttnParams,
                         CogVLMAttention, DeepseekV2Attention,
-                        KeyValueCacheParams, PositionEmbeddingType,
+                        KeyValueCacheParams, MropeParams, PositionEmbeddingType,
                         SpecDecodingParams)
 from .cast import Cast
 from .conv import Conv1d, Conv2d, ConvTranspose2d
@@ -57,6 +57,7 @@ __all__ = [
     'AttentionParams',
     'AttentionMaskParams',
     'SpecDecodingParams',
+    'MropeParams',
     'KeyValueCacheParams',
     'BlockSparseAttnParams',
     'Lora',

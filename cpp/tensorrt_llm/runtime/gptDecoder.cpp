@@ -178,7 +178,7 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
     {
         TLLM_CHECK_WITH_INFO(output.has_value(), "Output tensors must be provided for Eagle");
         auto eagleParams = std::make_shared<tl::EagleSetupParams>();
-        eagleParams->temperature = mSamplingConfig.temperature;
+        eagleParams->temperature = mSamplingConfig.originalTemperature;
         eagleParams->randomDataSample = output->eagleBuffers->randomDataSample;
         eagleParams->temperatures = output->eagleBuffers->temperatures;
 
@@ -285,6 +285,8 @@ void prepareExternalDraftTokensInputs(
     inputParams->useRandomAcceptanceThreshold = externalDraftTokensInputs.useRandomAcceptanceThreshold;
     inputParams->step = externalDraftTokensInputs.step;
     inputParams->useDraftLogits = externalDraftTokensInputs.useDraftLogits;
+    inputParams->useDraftLogitsHost = externalDraftTokensInputs.useDraftLogitsHost;
+
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -348,6 +350,7 @@ void prepareEagleInput(DecodingInput const& inputs, std::shared_ptr<tl::Decoding
     inputParams->acceptedTokens = eagleInputs->acceptedTokens;
     inputParams->acceptedLens = eagleInputs->acceptedLens;
     inputParams->acceptedPathIds = eagleInputs->acceptedPathIds;
+    inputParams->chunkedContextNextTokens = eagleInputs->chunkedContextNextTokens;
     inputParams->seqSlots = eagleInputs->seqSlots;
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -399,7 +402,7 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
             eagleInputs->nextDraftTokens, eagleInputs->nextDraftLens, eagleInputs->nextDraftPaths,
             eagleInputs->lastDraftTokens, eagleInputs->lastDraftLens, eagleInputs->lastDraftPaths,
             eagleInputs->acceptedTokens, eagleInputs->acceptedLens, eagleInputs->acceptedPathIds,
-            eagleInputs->seqSlots);
+            eagleInputs->chunkedContextNextTokens, eagleInputs->seqSlots);
     }
 
     // No logits for explicit draft tokens and eagle

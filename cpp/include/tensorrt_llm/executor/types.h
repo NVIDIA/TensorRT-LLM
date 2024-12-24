@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -55,6 +56,7 @@ using IterationType = std::uint64_t;
 using RandomSeedType = std::uint64_t;
 using VecLogProbs = std::vector<FloatType>;
 using StreamPtr = std::shared_ptr<tensorrt_llm::runtime::CudaStream>;
+using MillisecondsType = std::chrono::milliseconds;
 using LogitsPostProcessor
     = std::function<void(IdType, Tensor&, BeamTokens const&, StreamPtr const&, std::optional<IdType>)>;
 using LogitsPostProcessorMap = std::unordered_map<std::string, LogitsPostProcessor>;
@@ -319,6 +321,12 @@ struct IterationStats
     SizeType32 maxBatchSizeTunerRecommended;
     /// @brife The min of maxBatchSizeStatic and maxBatchSizeRuntimeUpperbound
     SizeType32 maxBatchSizeRuntime;
+    /// @brife Static max num tokens passed to the executor
+    SizeType32 maxNumTokensStatic;
+    /// @brife Max num tokens produced by dynamic tuner based on input stats
+    SizeType32 maxNumTokensTunerRecommended;
+    /// @brife The runtime max num tokens
+    SizeType32 maxNumTokensRuntime;
     /// @brief GPU memory usage in bytes
     size_t gpuMemUsage;
     /// @brief CPU memory usage in bytes
@@ -399,6 +407,52 @@ struct RequestStatsPerIteration
     std::vector<RequestStats> requestStats;
 };
 
+/// @brief Struct that holds the stats of a request
+struct RequestPerfMetrics
+{
+    using TimePoint = std::chrono::time_point<std::chrono::steady_clock>;
+
+    struct TimingMetrics
+    {
+        /// @brief The time when the request arrived
+        TimePoint arrivalTime;
+        /// @brief The time when the request was first scheduled
+        TimePoint firstScheduledTime;
+        /// @brief The time when the first token was generated
+        TimePoint firstTokenTime;
+        /// @brief The time when the request was finished
+        TimePoint lastTokenTime;
+        /// @brief Start time of the KV cache transfer for disaggregated serving
+        TimePoint kvCacheTransferStart;
+        /// @brief End time of the KV cache transfer for disaggregated serving
+        TimePoint kvCacheTransferEnd;
+    };
+
+    struct KvCacheMetrics
+    {
+        /// @brief Number of total allocated blocks
+        SizeType32 numTotalAllocatedBlocks{0};
+        /// @brief Number of newly allocated blocks
+        SizeType32 numNewAllocatedBlocks{0};
+        /// @brief Number of reused blocks
+        SizeType32 numReusedBlocks{0};
+        /// @brief Number of missed blocks
+        SizeType32 numMissedBlocks{0};
+        /// @brief KV Cache Hit Rate, defined as reusedBlocks / (reusedBlocks + missedBlocks)
+        SizeType32 kvCacheHitRate{0};
+    };
+
+    TimingMetrics timingMetrics;
+    KvCacheMetrics kvCacheMetrics;
+
+    /// @brief First iteration where the request was processed
+    std::optional<IterationType> firstIter;
+    /// @brief Last iteration where a token was generated
+    std::optional<IterationType> lastIter;
+    /// @brief Current iteration
+    std::optional<IterationType> iter;
+};
+
 /// @brief Struct that holds the debug tensors in an iteration
 struct DebugTensorsPerIteration
 {
@@ -422,6 +476,12 @@ enum class FinishReason
 
     /// @brief The request finished because the maximum number of tokens was reached.
     kLENGTH = 3,
+
+    /// @brief The request finished because it got timed out (via the mAllotedTime parameter)
+    kTIMED_OUT = 4,
+
+    /// @brief The request was cancelled by calling cancelRequest.
+    kCANCELLED = 5
 };
 
 /// @brief mode of the decoder

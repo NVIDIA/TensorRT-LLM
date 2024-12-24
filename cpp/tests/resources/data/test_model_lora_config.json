@@ -43,7 +43,6 @@
         },
         "use_parallel_embedding": true,
         "embedding_sharding_dim": 0,
-        "share_embedding_table": false,
         "head_size": 128,
         "qk_layernorm": false,
         "inner_layernorm": false,

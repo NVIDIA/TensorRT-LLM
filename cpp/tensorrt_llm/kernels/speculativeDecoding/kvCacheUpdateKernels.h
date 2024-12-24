@@ -79,7 +79,7 @@ void updateKVBlockArrayDraftTokenLocationCommonRewind(runtime::SizeType32 const*
     runtime::SizeType32 seqCount, runtime::SizeType32 numKVHeads, runtime::SizeType32 sizeInBytesPerKVHead,
     runtime::SizeType32 rewindDraftTokenCount, runtime::SizeType32 const* seqSlotRemapping,
     runtime::SizeType32 maxKVCacheLen, runtime::SizeType32 maxBlocksPerSeq, runtime::SizeType32 tokensPerBlock,
-    cudaStream_t stream);
+    bool canUseOneMoreBlock, cudaStream_t stream);
 
 /*!
  * Update Linear KV cache using separate rewind count for each sequence.
@@ -137,7 +137,7 @@ void updateKVBlockArrayDraftTokenLocationSeparateRewind(runtime::SizeType32 cons
     runtime::SizeType32 seqCount, runtime::SizeType32 numKVHeads, runtime::SizeType32 sizeInBytesPerKVHead,
     runtime::SizeType32* rewindDraftTokenCounts, runtime::SizeType32 const* seqSlotRemapping,
     runtime::SizeType32 maxKVCacheLen, runtime::SizeType32 maxBlocksPerSeq, runtime::SizeType32 tokensPerBlock,
-    cudaStream_t stream);
+    bool canUseOneMoreBlock, cudaStream_t stream);
 
 /*!
  * Update Linear KV cache using both common rewind and separate rewind count for each sequence. The common
@@ -203,6 +203,6 @@ void updateKVBlockArrayDraftTokenLocation(runtime::SizeType32 const* seqAccepted
     runtime::SizeType32 rewindDraftTokenCommonCount, runtime::SizeType32 const* rewindDraftTokenSeparateAdjustments,
     runtime::SizeType32 const* seqSlotRemapping, runtime::SizeType32 const* batchSlots,
     runtime::SizeType32 maxKVCacheLen, runtime::SizeType32 maxBlocksPerSeq, runtime::SizeType32 tokensPerBlock,
-    cudaStream_t stream);
+    bool canUseOneMoreBlock, cudaStream_t stream);
 
 } // namespace tensorrt_llm::kernels::speculative_decoding

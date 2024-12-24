@@ -24,7 +24,8 @@ from polygraphy.backend.trt import CreateConfig, EngineFromNetwork
 import tensorrt_llm as tllm
 from tensorrt_llm import Mapping, Tensor
 from tensorrt_llm._utils import OMPI_COMM_TYPE_HOST, mpi_comm
-from tensorrt_llm.functional import AllReduceStrategy, allreduce
+from tensorrt_llm.functional import (AllReduceParams, AllReduceStrategy,
+                                     allreduce)
 from tensorrt_llm.plugin.plugin import current_all_reduce_helper
 
 
@@ -81,7 +82,10 @@ def allreduce_benchmark(dtype: str,
 
                 current = x
                 for _ in range(inner_loop):
-                    current = allreduce(current, mapping.tp_group, strategy)
+                    current = allreduce(
+                        current,
+                        mapping.tp_group,
+                        all_reduce_params=AllReduceParams(strategy=strategy))
                 output = current.trt_tensor
 
                 network.mark_output(output)

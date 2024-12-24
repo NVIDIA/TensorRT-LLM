@@ -116,7 +116,6 @@ trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/${INFERENCE_PRECISION
                 --output_dir tmp/trt_engines/${MODEL_NAME}/${INFERENCE_PRECISION}/encoder \
                 --paged_kv_cache disable \
                 --moe_plugin disable \
-                --enable_xqa disable \
                 --max_beam_width ${MAX_BEAM_WIDTH} \
                 --max_batch_size 8 \
                 --max_input_len 1024 \
@@ -130,7 +129,6 @@ trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/${INFERENCE_PRECISION
 trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/${INFERENCE_PRECISION}/decoder \
                 --output_dir tmp/trt_engines/${MODEL_NAME}/${INFERENCE_PRECISION}/decoder \
                 --moe_plugin disable \
-                --enable_xqa disable \
                 --max_beam_width ${MAX_BEAM_WIDTH} \
                 --max_batch_size 8 \
                 --max_input_len 1 \
@@ -167,7 +165,6 @@ trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/${INFERENCE_PRECISION
                 --output_dir tmp/trt_engines/${MODEL_NAME}/${INFERENCE_PRECISION}/encoder \
                 --paged_kv_cache disable \
                 --moe_plugin disable \
-                --enable_xqa disable \
                 --max_beam_width ${MAX_BEAM_WIDTH} \
                 --max_batch_size 8 \
                 --max_input_len 1024 \
@@ -181,7 +178,6 @@ trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/${INFERENCE_PRECISION
 trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/${INFERENCE_PRECISION}/decoder \
                 --output_dir tmp/trt_engines/${MODEL_NAME}/${INFERENCE_PRECISION}/decoder \
                 --moe_plugin disable \
-                --enable_xqa disable \
                 --max_beam_width ${MAX_BEAM_WIDTH} \
                 --max_batch_size 8 \
                 --max_input_len 1 \
@@ -301,7 +297,6 @@ trtllm-build --checkpoint_dir tmp/trt_models/bart-large-cnn/${INFERENCE_PRECISIO
                 --output_dir tmp/trt_engines/bart-large-cnn/${INFERENCE_PRECISION}/encoder \
                 --paged_kv_cache disable \
                 --moe_plugin disable \
-                --enable_xqa disable \
                 --max_beam_width 1 \
                 --max_batch_size 8 \
                 --max_input_len 1024 \
@@ -316,7 +311,6 @@ trtllm-build --checkpoint_dir tmp/trt_models/bart-large-cnn/${INFERENCE_PRECISIO
 trtllm-build --checkpoint_dir tmp/trt_models/bart-large-cnn/${INFERENCE_PRECISION}/decoder \
                 --output_dir tmp/trt_engines/bart-large-cnn/${INFERENCE_PRECISION}/decoder \
                 --moe_plugin disable \
-                --enable_xqa disable \
                 --max_beam_width 1 \
                 --max_batch_size 8 \
                 --max_input_len 1 \
@@ -406,7 +400,6 @@ trtllm-build --checkpoint_dir tmp/trt_models/wmt14/${INFERENCE_PRECISION}/encode
                 --output_dir tmp/trt_engines/wmt14/${INFERENCE_PRECISION}/encoder \
                 --paged_kv_cache disable \
                 --moe_plugin disable \
-                --enable_xqa disable \
                 --max_beam_width 1 \
                 --max_batch_size 8 \
                 --max_input_len 1024 \
@@ -417,7 +410,6 @@ trtllm-build --checkpoint_dir tmp/trt_models/wmt14/${INFERENCE_PRECISION}/encode
 trtllm-build --checkpoint_dir tmp/trt_models/wmt14/${INFERENCE_PRECISION}/decoder \
                 --output_dir tmp/trt_engines/wmt14/${INFERENCE_PRECISION}/decoder \
                 --moe_plugin disable \
-                --enable_xqa disable \
                 --max_beam_width 1 \
                 --max_batch_size 8 \
                 --max_input_len 1 \

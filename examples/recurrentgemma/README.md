@@ -14,8 +14,12 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 * [`../summarize.py`](../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
 
 ## Support Matrix
-  * FP16/BF16
-  * Checkpoint type: Jax, Huggingface (HF)
+|    Checkpoint type    | FP16  | BF16  | FP8 | INT8 SQ | INT4 AWQ | TP  |
+| :-------------------: | :---: | :---: | :-: | :-----: | :------: | :-: |
+|    Huggingface (HF)   |   Y   |   Y   |  Y  |    Y    |    Y     |  Y  |
+|    Jax                |   Y   |   Y   |  N  |    N    |    N     |  Y  |
+
+* TensorRT-LLM can support different post-training quantization for the Huggingface checkpoints, including FP8, INT8 SmoothQuant, and INT4 AWQ.
 
 ## Usage
 
@@ -45,7 +49,7 @@ git clone https://huggingface.co/google/recurrentgemma-2b-it-flax ./recurrentgem
 ```
 
 ### 2. Convert weights from JAX to TensorRT-LLM format
-The [`convert_checkpoint.py`](./convert_checkpoint.py) script converts JAX weights to TensorRT-LLM checkpoints.
+The [`convert_checkpoint.py`](./convert_checkpoint.py) script converts HF/JAX weights to TensorRT-LLM checkpoints. TensorRT-LLM can support different post-training quantization methods. Here we use recurrentgemma-2b-it model as an example to show how to run quantized model.
 
 ```bash
 # recurrentgemma-2b
@@ -56,13 +60,36 @@ python convert_checkpoint.py --model_dir ${CKPT_2B_PATH} \
                              --dtype float16 \
                              --output_dir ${UNIFIED_CKPT_2B_PATH}
 
-# recurrentgemma-2b-it
+# recurrentgemma-2b-it FP8 with FP8 kv cache
 CKPT_2B_IT_PATH=./recurrentgemma_model/recurrentgemma-2b-it
-UNIFIED_CKPT_2B_IT_PATH=./recurrentgemma_model/recurrentgemma-2b-it/trt_ckpt/fp16/1-gpu/
-python convert_checkpoint.py --model_dir ${CKPT_2B_IT_PATH} \
-                             --ckpt_type hf \
-                             --dtype bfloat16 \
-                             --output_dir ${UNIFIED_CKPT_2B_IT_PATH}
+UNIFIED_CKPT_2B_IT_FP8_PATH=./recurrentgemma_model/recurrentgemma-2b-it/trt_ckpt/fp8/1-gpu/
+python ../quantization/quantize.py --model_dir ${CKPT_2B_IT_PATH} \
+                                   --dtype float16 \
+                                   --qformat fp8 \
+                                   --kv_cache_dtype fp8 \
+                                   --output_dir ${UNIFIED_CKPT_2B_IT_FP8_PATH} \
+                                   --calib_size 512 \
+                                   --tp_size 1
+
+# recurrentgemma-2b-it INT8 SmoothQuant with INT8 kv cache
+UNIFIED_CKPT_2B_IT_INT8_SQ_PATH=./recurrentgemma_model/recurrentgemma-2b-it/trt_ckpt/int8_sq/1-gpu/
+python ../quantization/quantize.py --model_dir ${CKPT_2B_IT_PATH} \
+                                   --dtype float16 \
+                                   --qformat int8_sq \
+                                   --kv_cache_dtype int8 \
+                                   --output_dir ${UNIFIED_CKPT_2B_IT_INT8_SQ_PATH} \
+                                   --calib_size 512 \
+                                   --tp_size 1
+
+# recurrentgemma-2b-it INT4 AWQ with INT8 kv cache
+UNIFIED_CKPT_2B_IT_INT4_AWQ_PATH=./recurrentgemma_model/recurrentgemma-2b-it/trt_ckpt/int4_awq/1-gpu/
+python ../quantization/quantize.py --model_dir ${CKPT_2B_IT_PATH} \
+                                   --dtype float16 \
+                                   --qformat int4_awq \
+                                   --kv_cache_dtype int8 \
+                                   --output_dir ${UNIFIED_CKPT_2B_IT_INT4_AWQ_PATH} \
+                                   --calib_size 512 \
+                                   --tp_size 1
 
 # recurrentgemma-2b-flax
 CKPT_2B_FLAX_PATH=./recurrentgemma_model/recurrentgemma-2b-flax/2b
@@ -94,14 +121,32 @@ trtllm-build --checkpoint_dir ${UNIFIED_CKPT_2B_PATH} \
              --max_seq_len 3100 \
              --output_dir ${ENGINE_2B_PATH}
 
-# recurrentgemma-2b-it
-ENGINE_2B_IT_PATH=./recurrentgemma_model/recurrentgemma-2b-it/trt_engines/bf16/1-gpu/
-trtllm-build --checkpoint_dir ${UNIFIED_CKPT_2B_IT_PATH} \
+# recurrentgemma-2b-it FP8 with FP8 kv cache
+ENGINE_2B_IT_FP8_PATH=./recurrentgemma_model/recurrentgemma-2b-it/trt_engines/fp8/1-gpu/
+trtllm-build --checkpoint_dir ${UNIFIED_CKPT_2B_IT_FP8_PATH} \
              --gemm_plugin auto \
              --max_batch_size 8 \
              --max_input_len 3000 \
              --max_seq_len 3100 \
-             --output_dir ${ENGINE_2B_IT_PATH}
+             --output_dir ${ENGINE_2B_IT_FP8_PATH}
+
+# recurrentgemma-2b-it INT8 SmoothQuant with INT8 kv cache
+ENGINE_2B_IT_INT8_SQ_PATH=./recurrentgemma_model/recurrentgemma-2b-it/trt_engines/int8_sq/1-gpu/
+trtllm-build --checkpoint_dir ${UNIFIED_CKPT_2B_IT_INT8_SQ_PATH} \
+             --gemm_plugin auto \
+             --max_batch_size 8 \
+             --max_input_len 3000 \
+             --max_seq_len 3100 \
+             --output_dir ${ENGINE_2B_IT_INT8_SQ_PATH}
+
+# recurrentgemma-2b-it INT4 AWQ with INT8 kv cache
+ENGINE_2B_IT_INT4_AWQ_PATH=./recurrentgemma_model/recurrentgemma-2b-it/trt_engines/int4_awq/1-gpu/
+trtllm-build --checkpoint_dir ${UNIFIED_CKPT_2B_IT_INT4_AWQ_PATH} \
+             --gemm_plugin auto \
+             --max_batch_size 8 \
+             --max_input_len 3000 \
+             --max_seq_len 3100 \
+             --output_dir ${ENGINE_2B_IT_INT4_AWQ_PATH}
 
 # recurrentgemma-2b-flax
 ENGINE_2B_FLAX_PATH=./recurrentgemma_model/recurrentgemma-2b-flax/trt_engines/fp16/1-gpu/
@@ -143,13 +188,27 @@ python3 ../run.py --max_output_len=100 \
                   --tokenizer_dir ${TOKENIZER_DIR_2B_PATH} \
                   --engine_dir ${ENGINE_2B_PATH}
 
-# recurrentgemma-2b-it
+# recurrentgemma-2b-it FP8 with FP8 kv cache
 TOKENIZER_DIR_2B_IT_PATH=./recurrentgemma_model/recurrentgemma-2b-it
 python3 ../run.py --max_output_len=100 \
                   --use_py_session \
                   --max_attention_window_size 2048 \
                   --tokenizer_dir ${TOKENIZER_DIR_2B_IT_PATH} \
-                  --engine_dir ${ENGINE_2B_IT_PATH}
+                  --engine_dir ${ENGINE_2B_IT_FP8_PATH}
+
+# recurrentgemma-2b-it INT8 SmoothQuant with INT8 kv cache
+python3 ../run.py --max_output_len=100 \
+                  --use_py_session \
+                  --max_attention_window_size 2048 \
+                  --tokenizer_dir ${TOKENIZER_DIR_2B_IT_PATH} \
+                  --engine_dir ${ENGINE_2B_IT_INT8_SQ_PATH}
+
+# recurrentgemma-2b-it INT4 AWQ with INT8 kv cache
+python3 ../run.py --max_output_len=100 \
+                  --use_py_session \
+                  --max_attention_window_size 2048 \
+                  --tokenizer_dir ${TOKENIZER_DIR_2B_IT_PATH} \
+                  --engine_dir ${ENGINE_2B_IT_INT4_AWQ_PATH}
 
 # recurrentgemma-2b-flax
 VOCAB_FILE_2B_FLAX_PATH=./recurrentgemma_model/recurrentgemma-2b-flax/tokenizer.model
@@ -179,10 +238,26 @@ python3 ../summarize.py --test_trt_llm \
                         --max_attention_window_size 2048 \
                         --tokenizer_dir ${TOKENIZER_DIR_2B_PATH}
 
-# recurrentgemma-2b-it
+# recurrentgemma-2b-it FP8 with FP8 kv cache
 python3 ../summarize.py --test_trt_llm \
                         --use_py_session \
-                        --engine_dir ${ENGINE_2B_IT_PATH} \
+                        --engine_dir ${ENGINE_2B_IT_FP8_PATH} \
+                        --batch_size 8 \
+                        --max_attention_window_size 2048 \
+                        --tokenizer_dir ${TOKENIZER_DIR_2B_IT_PATH}
+
+# recurrentgemma-2b-it INT8 SmoothQuant with INT8 kv cache
+python3 ../summarize.py --test_trt_llm \
+                        --use_py_session \
+                        --engine_dir ${ENGINE_2B_IT_INT8_SQ_PATH} \
+                        --batch_size 8 \
+                        --max_attention_window_size 2048 \
+                        --tokenizer_dir ${TOKENIZER_DIR_2B_IT_PATH}
+
+# recurrentgemma-2b-it INT4 AWQ with INT8 kv cache
+python3 ../summarize.py --test_trt_llm \
+                        --use_py_session \
+                        --engine_dir ${ENGINE_2B_IT_INT4_AWQ_PATH} \
                         --batch_size 8 \
                         --max_attention_window_size 2048 \
                         --tokenizer_dir ${TOKENIZER_DIR_2B_IT_PATH}
@@ -224,11 +299,23 @@ python3 ../mmlu.py --test_trt_llm \
                    --tokenizer_dir ${TOKENIZER_DIR_2B_PATH} \
                    --engine_dir ${ENGINE_2B_PATH}
 
-# recurrentgemma-2b-it
+# recurrentgemma-2b-it FP8 with FP8 kv cache
 python3 ../mmlu.py --test_trt_llm \
                    --max_attention_window_size 2048 \
                    --tokenizer_dir ${TOKENIZER_DIR_2B_IT_PATH} \
-                   --engine_dir ${ENGINE_2B_IT_PATH}
+                   --engine_dir ${ENGINE_2B_IT_FP8_PATH}
+
+# recurrentgemma-2b-it INT8 SmoothQuant with INT8 kv cache
+python3 ../mmlu.py --test_trt_llm \
+                   --max_attention_window_size 2048 \
+                   --tokenizer_dir ${TOKENIZER_DIR_2B_IT_PATH} \
+                   --engine_dir ${ENGINE_2B_IT_INT8_SQ_PATH}
+
+# recurrentgemma-2b-it INT4 AWQ with INT8 kv cache
+python3 ../mmlu.py --test_trt_llm \
+                   --max_attention_window_size 2048 \
+                   --tokenizer_dir ${TOKENIZER_DIR_2B_IT_PATH} \
+                   --engine_dir ${ENGINE_2B_IT_INT4_AWQ_PATH}
 
 # recurrentgemma-2b-flax
 python3 ../mmlu.py --test_trt_llm \

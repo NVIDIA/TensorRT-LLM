@@ -27,6 +27,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include <cfloat>
+#include <string>
 
 namespace
 {
@@ -60,6 +61,16 @@ __global__ void checkTensorInvalidKernel(T const* data, std::size_t size, int* f
     {
         atomicCAS(foundInvalid, 0, blockFound);
     }
+}
+
+__global__ void stallStreamKernel(int const microSeconds)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700)
+    for (int i = 0; i < microSeconds; ++i)
+    {
+        __nanosleep(1000);
+    }
+#endif
 }
 } // namespace
 
@@ -198,6 +209,28 @@ bool tensorHasInvalid(
     {
         TLLM_THROW("Not supported type for Nan check");
     }
+}
+
+int stallStream(char const* name, std::optional<cudaStream_t> stream, std::optional<int> delay)
+{
+    int delay_val = 0;
+    if (delay)
+    {
+        delay_val = delay.value();
+    }
+    else
+    {
+        char const* const env = std::getenv(name);
+        if (env != nullptr)
+        {
+            delay_val = std::stoi(env);
+        }
+    }
+    if (stream && delay_val > 0)
+    {
+        stallStreamKernel<<<1, 32, 0, stream.value()>>>(delay_val);
+    }
+    return delay_val;
 }
 
 } // namespace tensorrt_llm::runtime::utils

@@ -17,13 +17,10 @@
 
 #include <cuda_fp16.h>
 
-#include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/kernels/penaltyTypes.h"
+#include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/runtime/common.h"
 
-namespace tensorrt_llm
-{
-namespace kernels
+namespace tensorrt_llm::kernels
 {
 
 template <typename T>
@@ -52,11 +49,11 @@ struct InvokeBatchApplyPenaltyParams
     runtime::SizeType32 const* batchSlots;
     runtime::SizeType32 maxTokensPerStep;
     runtime::SizeType32 const* tokensPerStep;
+    FinishedState const* finished;
     cudaStream_t stream;
 };
 
 template <typename T>
 void invokeBatchApplyPenalty(InvokeBatchApplyPenaltyParams<T> const& params);
 
-} // namespace kernels
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::kernels

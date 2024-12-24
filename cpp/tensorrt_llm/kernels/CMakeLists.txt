@@ -28,6 +28,8 @@ list(FILTER SRC_CPP EXCLUDE REGEX "decoderMaskedMultiheadAttention/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "decoderMaskedMultiheadAttention/.*")
 list(FILTER SRC_CPP EXCLUDE REGEX "selectiveScan/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "selectiveScan/.*")
+list(FILTER SRC_CPP EXCLUDE REGEX "userbuffers/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "userbuffers/.*")
 
 function(filter_cuda_archs ARCH SOURCES_VAR)
   if(NOT "${ARCH}" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
@@ -68,3 +70,4 @@ add_subdirectory(cutlass_kernels)
 add_subdirectory(contextFusedMultiHeadAttention)
 add_subdirectory(decoderMaskedMultiheadAttention)
 add_subdirectory(selectiveScan)
+add_subdirectory(userbuffers)

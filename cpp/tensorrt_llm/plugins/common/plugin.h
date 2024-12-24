@@ -59,10 +59,47 @@ protected:
     std::string mNamespace{api::kDefaultNamespace};
 };
 
+class BasePluginV3 : public nvinfer1::IPluginV3,
+                     public nvinfer1::IPluginV3OneCore,
+                     public nvinfer1::IPluginV3OneBuild,
+                     public nvinfer1::IPluginV3OneRuntime
+{
+public:
+    void setPluginNamespace(char const* libNamespace) noexcept
+    {
+        mNamespace = libNamespace;
+    }
+
+    [[nodiscard]] char const* getPluginNamespace() const noexcept override
+    {
+        return mNamespace.c_str();
+    }
+
+protected:
+    std::string mNamespace{api::kDefaultNamespace};
+};
+
 class BaseCreator : public nvinfer1::IPluginCreator
 {
 public:
     void setPluginNamespace(char const* libNamespace) noexcept override
+    {
+        mNamespace = libNamespace;
+    }
+
+    [[nodiscard]] char const* getPluginNamespace() const noexcept override
+    {
+        return mNamespace.c_str();
+    }
+
+protected:
+    std::string mNamespace{api::kDefaultNamespace};
+};
+
+class BaseCreatorV3 : public nvinfer1::IPluginCreatorV3One
+{
+public:
+    void setPluginNamespace(char const* libNamespace) noexcept
     {
         mNamespace = libNamespace;
     }
@@ -284,6 +321,8 @@ public:
     ~PluginFieldParser();
     template <typename T>
     std::optional<T> getScalar(std::string_view const& name);
+    template <typename T>
+    std::optional<std::set<T>> getSet(std::string_view const& name);
 
 private:
     nvinfer1::PluginField const* mFields;

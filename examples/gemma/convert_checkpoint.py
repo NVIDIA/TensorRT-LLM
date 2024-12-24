@@ -238,7 +238,6 @@ def main() -> None:
             gpus_per_node=8,
             quantization=quant_config,
             use_parallel_embedding=mapping.tp_size > 1,
-            share_embedding_table=True,
         )
         if hasattr(ckpt_config,
                    "model_type") and ckpt_config.model_type == "gemma2":

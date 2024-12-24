@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-#include <algorithm>
 #include <numeric>
 #include <unordered_set>
 
@@ -101,7 +100,7 @@ std::recursive_mutex mpiMutex;
 MpiComm initLocalSession()
 {
 #if ENABLE_MULTI_DEVICE
-    MPI_Comm localComm;
+    MPI_Comm localComm = nullptr;
     MPI_Comm_split_type(COMM_SESSION, OMPI_COMM_TYPE_HOST, COMM_SESSION.getRank(), MPI_INFO_NULL, &localComm);
     MpiComm localSession{localComm, false};
 #else
@@ -115,14 +114,16 @@ MpiComm initLocalSession()
 std::vector<int> getWorldRanks(MpiComm const& comm)
 {
 #if ENABLE_MULTI_DEVICE
-    MPI_Group group, worldGroup;
+    MPI_Group group = nullptr;
+    MPI_Group worldGroup = nullptr;
 
     MPICHECK(MPI_Comm_group(MPI_COMM_WORLD, &worldGroup));
     MPICHECK(MPI_Comm_group(comm, &group));
 
-    int groupSize;
+    int groupSize = 0;
     MPICHECK(MPI_Group_size(group, &groupSize));
-    std::vector<int> ranks(groupSize), worldRanks(groupSize);
+    std::vector<int> ranks(groupSize);
+    std::vector<int> worldRanks(groupSize);
     std::iota(ranks.begin(), ranks.end(), 0);
 
     MPICHECK(MPI_Group_translate_ranks(group, groupSize, ranks.data(), worldGroup, worldRanks.data()));
@@ -152,7 +153,7 @@ void initialize(MpiThreadSupport threadMode, bool forwardAbortToParent)
     if (!initialized)
     {
         TLLM_LOG_INFO("Initializing MPI with thread mode %d", threadMode);
-        int providedMode;
+        int providedMode = 0;
         auto requiredMode = static_cast<int>(threadMode);
         MPICHECK(MPI_Init_thread(nullptr, nullptr, requiredMode, &providedMode));
         TLLM_CHECK_WITH_INFO(providedMode >= requiredMode, "MPI_Init_thread failed");
@@ -323,7 +324,7 @@ MPI_Status MpiComm::recv(runtime::IBuffer& buf, int source, int tag) const
 
 MpiComm MpiComm::split(int color, int key) const
 {
-    MPI_Comm splitComm;
+    MPI_Comm splitComm = nullptr;
 #if ENABLE_MULTI_DEVICE
     MPICHECK(MPI_Comm_split(mComm, color, key, &splitComm));
 #else
@@ -467,11 +468,11 @@ void MpiComm::refreshLocalSession()
         }
     }
 
-    MPI_Group worldGroup;
+    MPI_Group worldGroup = nullptr;
     MPICHECK(MPI_Comm_group(MPI_COMM_WORLD, &worldGroup));
-    MPI_Group localGroup;
+    MPI_Group localGroup = nullptr;
     MPICHECK(MPI_Group_incl(worldGroup, intersectionRanks.size(), intersectionRanks.data(), &localGroup));
-    MPI_Comm localComm;
+    MPI_Comm localComm = nullptr;
     MPICHECK(MPI_Comm_create_group(MPI_COMM_WORLD, localGroup, intersectionRanks.front(), &localComm));
     MpiComm::mutableLocalSession().mFreeComm = true;
     MpiComm::mutableLocalSession() = MpiComm{localComm, false};
@@ -513,6 +514,75 @@ MpiComm& MpiComm::operator=(MpiComm&& comm) noexcept
     mFreeComm = comm.mFreeComm;
     comm.mFreeComm = false;
     return *this;
+}
+
+MpiWaitThread::MpiWaitThread(std::string name, std::function<void()> funcWait, std::function<void()> funcSetup)
+    : mName{name.c_str()}
+    , mFuncWait{funcWait}
+    , mFuncSetup{funcSetup}
+{
+    TLLM_LOG_TRACE("%s: %s start", mName.c_str(), __PRETTY_FUNCTION__);
+    mThread = std::make_unique<std::thread>(&MpiWaitThread::sideThread, this);
+    TLLM_LOG_TRACE("%s: %s stop", mName.c_str(), __PRETTY_FUNCTION__);
+}
+
+MpiWaitThread::~MpiWaitThread()
+{
+    TLLM_LOG_TRACE("%s: %s start", mName.c_str(), __PRETTY_FUNCTION__);
+    waitStop();
+    mShouldExit.store(true);
+    notifyStart();
+    mThread->join();
+    mThread.reset(nullptr);
+    TLLM_LOG_TRACE("%s: %s stop", mName.c_str(), __PRETTY_FUNCTION__);
+}
+
+void MpiWaitThread::sideThread()
+{
+    if (mFuncSetup)
+    {
+        mFuncSetup();
+    }
+    while (!mShouldExit.load())
+    {
+        notifyStop();
+        waitStart();
+        mFuncWait();
+    }
+}
+
+void MpiWaitThread::waitStart()
+{
+    TLLM_LOG_TRACE("%s: %s start", mName.c_str(), __PRETTY_FUNCTION__);
+    std::unique_lock<std::mutex> lock(mMutex);
+    mCondVar.wait(lock, [this] { return mRunning; });
+    TLLM_LOG_TRACE("%s: %s stop", mName.c_str(), __PRETTY_FUNCTION__);
+}
+
+void MpiWaitThread::waitStop()
+{
+    TLLM_LOG_TRACE("%s: %s start", mName.c_str(), __PRETTY_FUNCTION__);
+    std::unique_lock<std::mutex> lock(mMutex);
+    mCondVar.wait(lock, [this] { return !mRunning; });
+    TLLM_LOG_TRACE("%s: %s stop", mName.c_str(), __PRETTY_FUNCTION__);
+}
+
+void MpiWaitThread::notifyStart()
+{
+    TLLM_LOG_TRACE("%s: %s start", mName.c_str(), __PRETTY_FUNCTION__);
+    std::lock_guard<std::mutex> lock(mMutex);
+    mRunning = true;
+    mCondVar.notify_one();
+    TLLM_LOG_TRACE("%s: %s stop", mName.c_str(), __PRETTY_FUNCTION__);
+}
+
+void MpiWaitThread::notifyStop()
+{
+    TLLM_LOG_TRACE("%s: %s start", mName.c_str(), __PRETTY_FUNCTION__);
+    std::lock_guard<std::mutex> lock(mMutex);
+    mRunning = false;
+    mCondVar.notify_one();
+    TLLM_LOG_TRACE("%s: %s stop", mName.c_str(), __PRETTY_FUNCTION__);
 }
 
 } // namespace tensorrt_llm::mpi

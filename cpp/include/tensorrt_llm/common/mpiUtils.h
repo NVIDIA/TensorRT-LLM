@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/runtime/utils/multiDeviceUtils.h"
+#include <functional>
 #include <limits>
 
 #ifdef ENABLE_FP8
@@ -27,19 +28,23 @@
 #include <cuda_bf16.h>
 #endif
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
+#include <thread>
 
 #if ENABLE_MULTI_DEVICE
 #include <mpi.h>
 #else
 // Dummy defines to avoid #if in wider places.
-typedef int MPI_Datatype;
-typedef int MPI_Comm;
-typedef int MPI_Request;
-typedef int MPI_Message;
-typedef int MPI_Op;
+typedef void* MPI_Datatype;
+typedef void* MPI_Comm;
+typedef void* MPI_Request;
+typedef void* MPI_Message;
+typedef void* MPI_Op;
 
 typedef struct MPI_Status
 {
@@ -421,6 +426,31 @@ private:
 std::vector<int> getWorldRanks(MpiComm const& comm);
 
 void initialize(MpiThreadSupport threadMode = MpiThreadSupport::THREAD_MULTIPLE, bool forwardAbortToParent = false);
+
+class MpiWaitThread
+{
+public:
+    explicit MpiWaitThread(std::string name, std::function<void()> funcWait, std::function<void()> funcSetup = nullptr);
+    ~MpiWaitThread();
+
+    void waitStop();
+    void notifyStart();
+
+private:
+    void sideThread();
+
+    void waitStart();
+    void notifyStop();
+
+    std::string mName;
+    std::function<void()> mFuncWait;
+    std::function<void()> mFuncSetup;
+    std::unique_ptr<std::thread> mThread;
+    std::mutex mMutex;
+    std::condition_variable mCondVar;
+    bool mRunning{true};
+    std::atomic<bool> mShouldExit{false};
+};
 
 } // namespace tensorrt_llm::mpi
 

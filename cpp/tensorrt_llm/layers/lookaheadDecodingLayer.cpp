@@ -18,6 +18,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
 #include "tensorrt_llm/layers/decodingParams.h"
@@ -214,6 +215,8 @@ void LookaheadDecodingLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(LookaheadDecodingLayer_forwardAsync);
+
     auto inputs = std::dynamic_pointer_cast<LookaheadDecodingInputs>(inputParams);
     auto outputs = std::dynamic_pointer_cast<LookaheadDecodingOutputs>(outputParams);
     auto batchSize = inputs->localBatchSize;
@@ -300,6 +303,7 @@ void LookaheadDecodingLayer<T>::forwardSyncCPU(
     std::shared_ptr<LookaheadDecodingOutputs> const& outputs, std::shared_ptr<LookaheadDecodingInputs> const& inputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(LookaheadDecodingLayer_forwardSyncCPU);
 
     mCpuAlgo->mBatchSlots->reshape(inputs->batchSlots->getShape());
     mBufferManager->copy(*inputs->batchSlots, *mCpuAlgo->mBatchSlots);

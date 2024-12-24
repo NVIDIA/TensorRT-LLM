@@ -190,7 +190,6 @@ class CohereForCausalLM(DecoderModelForCausalLM):
             'k_layernorm': 'k_norm',
         }
         loader = ModelWeightsLoader(hf_model_or_dir, custom_dict)
-        loader.check_share_embedding(config)
         loader.generate_tllm_weights(model)
 
         return model

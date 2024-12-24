@@ -185,7 +185,7 @@ def parse_arguments():
         default=False,
         action='store_true',
         help=
-        "Enable features for faster engine building. This may cause some performance degradation and is currently incompatible with int8/int4 quantization.",
+        "Enable features for faster engine building. This may cause some performance degradation and is currently incompatible with int8/int4 quantization without plugin.",
     )
 
     parser.add_argument('--workers',
@@ -552,25 +552,42 @@ def main():
 
         build_config = BuildConfig.from_dict(
             {
-                'max_input_len': args.max_input_len,
-                'max_seq_len': args.max_seq_len,
-                'max_batch_size': args.max_batch_size,
-                'max_beam_width': args.max_beam_width,
-                'max_num_tokens': args.max_num_tokens,
-                'opt_num_tokens': args.opt_num_tokens,
+                'max_input_len':
+                args.max_input_len,
+                'max_seq_len':
+                args.max_seq_len,
+                'max_batch_size':
+                args.max_batch_size,
+                'max_beam_width':
+                args.max_beam_width,
+                'max_num_tokens':
+                args.max_num_tokens,
+                'opt_num_tokens':
+                args.opt_num_tokens,
                 'max_prompt_embedding_table_size':
                 args.max_prompt_embedding_table_size,
-                'gather_context_logits': args.gather_context_logits,
-                'gather_generation_logits': args.gather_generation_logits,
-                'strongly_typed': True,
-                'force_num_profiles': force_num_profiles_from_env,
-                'weight_sparsity': args.weight_sparsity,
-                'profiling_verbosity': args.profiling_verbosity,
-                'enable_debug_output': args.enable_debug_output,
-                'max_draft_len': args.max_draft_len,
-                'speculative_decoding_mode': speculative_decoding_mode,
-                'input_timing_cache': args.input_timing_cache,
-                'output_timing_cache': args.output_timing_cache,
+                'gather_context_logits':
+                args.gather_context_logits,
+                'gather_generation_logits':
+                args.gather_generation_logits,
+                'strongly_typed':
+                True,
+                'force_num_profiles':
+                force_num_profiles_from_env,
+                'weight_sparsity':
+                args.weight_sparsity,
+                'profiling_verbosity':
+                args.profiling_verbosity,
+                'enable_debug_output':
+                args.enable_debug_output,
+                'max_draft_len':
+                args.max_draft_len,
+                'speculative_decoding_mode':
+                speculative_decoding_mode,
+                'input_timing_cache':
+                args.input_timing_cache,
+                'output_timing_cache':
+                args.output_timing_cache,
                 'auto_parallel_config': {
                     'world_size':
                     args.auto_parallel,
@@ -585,11 +602,19 @@ def main():
                     },
                     **cluster_config,
                 },
-                'dry_run': args.dry_run,
-                'visualize_network': args.visualize_network,
-                'max_encoder_input_len': args.max_encoder_input_len,
-                'weight_streaming': args.weight_streaming,
-                'monitor_memory': args.monitor_memory,
+                'dry_run':
+                args.dry_run,
+                'visualize_network':
+                args.visualize_network,
+                'max_encoder_input_len':
+                args.max_encoder_input_len,
+                'weight_streaming':
+                args.weight_streaming,
+                'monitor_memory':
+                args.monitor_memory,
+                'use_mrope':
+                (True if model_config.qwen_type == "qwen2_vl" else False)
+                if hasattr(model_config, "qwen_type") else False
             },
             plugin_config=plugin_config)
 

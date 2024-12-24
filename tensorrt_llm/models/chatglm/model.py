@@ -27,7 +27,7 @@ from ...layers import (MLP, Attention, AttentionMaskType, AttentionParams,
 from ...mapping import Mapping
 from ...module import Module
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
-                              QuantConfig, check_share_embedding)
+                              QuantConfig)
 from .config import GLM_ARCH1_VERSIONS, GLM_ARCH2_VERSIONS, ChatGLMConfig
 from .convert import load_weights_from_hf_model
 
@@ -92,6 +92,9 @@ class ChatGLMDecoderLayer(Module):
             relative_attention=False,
             max_distance=0,
             num_buckets=0,
+            cp_rank=config.mapping.cp_rank,
+            cp_size=config.mapping.cp_size,
+            cp_group=config.mapping.cp_group,
         )
 
         mlp_hidden_size = hidden_size * 4 if config.intermediate_size is None else config.intermediate_size
@@ -302,7 +305,6 @@ class ChatGLMForCausalLM(DecoderModelForCausalLM):
             device_map=device_map)
         weights = load_weights_from_hf_model(hf_model, config)
 
-        check_share_embedding(weights, config)
         model = cls(config)
         model.load(weights)
         return model

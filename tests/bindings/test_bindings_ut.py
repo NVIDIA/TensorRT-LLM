@@ -136,16 +136,18 @@ def test_model_config():
 def test_world_config():
     tensor_parallelism = 2
     pipeline_parallelism = 4
+    context_parallelism = 1
     rank = 3
     gpus_per_node = 10
     world_config = _tb.WorldConfig(tensor_parallelism, pipeline_parallelism,
-                                   rank, gpus_per_node)
+                                   context_parallelism, rank, gpus_per_node)
     assert world_config.tensor_parallelism == tensor_parallelism
     assert world_config.pipeline_parallelism == pipeline_parallelism
+    assert world_config.context_parallelism == context_parallelism
     assert world_config.rank == rank
     assert world_config.gpus_per_node == gpus_per_node
     assert world_config.gpus_per_group == gpus_per_node
-    assert world_config.size == tensor_parallelism * pipeline_parallelism
+    assert world_config.size == tensor_parallelism * pipeline_parallelism * context_parallelism
     assert world_config.is_pipeline_parallel
     assert world_config.is_tensor_parallel
     assert world_config.device == rank % gpus_per_node
@@ -155,6 +157,7 @@ def test_world_config():
     world_config = _tb.WorldConfig.mpi(gpus_per_node)
     assert world_config.tensor_parallelism == 1
     assert world_config.pipeline_parallelism == 1
+    assert world_config.context_parallelism == 1
     assert world_config.gpus_per_node == gpus_per_node
     assert world_config.rank == 0
 
@@ -215,6 +218,7 @@ def test_gpt_json_config():
         "precision": "float32",
         "tensor_parallelism": 1,
         "pipeline_parallelism": 1,
+        "context_parallelism": 1,
         "gpus_per_node": 8,
         "model_config": trt_model_config
     }
@@ -247,6 +251,7 @@ def test_gpt_json_config():
             "precision": json_config["precision"],
             "tensor_parallel": json_config["tensor_parallelism"],
             "pipeline_parallel": json_config["pipeline_parallelism"],
+            "context_parallel": json_config["context_parallelism"],
         },
         "plugin_config": {
             "paged_kv_cache": False,
@@ -271,7 +276,8 @@ def test_gpt_json_config():
     rank = 3
     gpus_per_node = 10
     world_config = _tb.WorldConfig(json_config["tensor_parallelism"],
-                                   json_config["pipeline_parallelism"], rank,
+                                   json_config["pipeline_parallelism"],
+                                   json_config["context_parallelism"], rank,
                                    gpus_per_node)
 
     assert gpt_json_config.engine_filename(

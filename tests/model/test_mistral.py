@@ -281,7 +281,9 @@ class TestMistralAndArctic(unittest.TestCase):
 
         if hf_mistral:
             with torch.no_grad():
-                hf_outputs = hf_mistral.forward(ctx_ids)
+                hf_outputs = hf_mistral.forward(ctx_ids,
+                                                use_cache=True,
+                                                past_key_values=[])
             torch.cuda.synchronize()
             ref = hf_outputs.logits[:, -1, :]
 

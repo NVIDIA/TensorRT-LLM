@@ -262,10 +262,9 @@ struct Fused_Moe_Kernel_routine_sm80<ElementInput_, ElementWeight_, ElementOutpu
             cute::copy(smem_tiled_copy_B, tOsfc1g_p(cute::_, cute::_, cute::Int<0>{}),
                 tOrfc1g_copy_view(cute::_, cute::_, cute::Int<0>{}));
         }
-        // k loop for mainloop (k - (stage - 1) -> -(stage - 1), if k_tile_count > 0, it means we still need to
-        // fetch gmem to smem)
+        // k loop for mainloop
         CUTLASS_PRAGMA_NO_UNROLL
-        for (; k_tile_count > -(KT::Stages - 1); --k_tile_count)
+        for (; k_tile_count > 0; --k_tile_count)
         {
             cute::for_each(cute::make_int_sequence<K_BLOCK_MAX>{},
                 [&](auto k_block)
@@ -289,10 +288,6 @@ struct Fused_Moe_Kernel_routine_sm80<ElementInput_, ElementWeight_, ElementOutpu
                     // Copy gmem to smem before computing gemm on each k-pipe
                     if (k_block == 0)
                     {
-                        if (k_tile_count <= 0)
-                        {
-                            cute::clear(tInputpInput);
-                        }
                         // cute::copy(gmem_tiled_copy_A, tInputgInput(cute::_, cute::_, cute::_, *k_tile_iter),
                         //    tInputsInput(cute::_, cute::_, cute::_, smem_pipe_write));
                         cute::copy_if(gmem_tiled_copy_A, tInputpInput,
@@ -320,6 +315,63 @@ struct Fused_Moe_Kernel_routine_sm80<ElementInput_, ElementWeight_, ElementOutpu
                         tOrfc1g(cute::_, cute::_, k_block), accum_gate);
                 });
         }
+
+        // load tail
+        cute::for_each(cute::make_int_sequence<KT::Stages - 2>{},
+            [&](auto WaitIndex)
+            {
+                k_tile_count--;
+                using WaitIndex_t = decltype(WaitIndex);
+                cute::for_each(cute::make_int_sequence<K_BLOCK_MAX>{},
+                    [&](auto k_block)
+                    {
+                        if (k_block == K_BLOCK_MAX - 1)
+                        {
+                            tOsInput_p = tOsInput(cute::_, cute::_, cute::_, smem_pipe_read);
+                            tOsfc1_p = tOsfc1(cute::_, cute::_, cute::_, smem_pipe_read);
+                            tOsfc1g_p = tOsfc1g(cute::_, cute::_, cute::_, smem_pipe_read);
+                            cute::cp_async_wait<KT::Stages - 3 - WaitIndex_t::value>();
+                            __syncthreads();
+                        }
+                        // Load A, B shmem->regs for k_block+1
+                        auto k_block_next = (k_block + cute::_1{}) % K_BLOCK_MAX;
+                        cute::copy(smem_tiled_copy_A, tOsInput_p(cute::_, cute::_, k_block_next),
+                            tOrInput_copy_view(cute::_, cute::_, k_block_next));
+                        cute::copy(smem_tiled_copy_B, tOsfc1_p(cute::_, cute::_, k_block_next),
+                            tOrfc1_copy_view(cute::_, cute::_, k_block_next));
+                        cute::copy(smem_tiled_copy_B, tOsfc1g_p(cute::_, cute::_, k_block_next),
+                            tOrfc1g_copy_view(cute::_, cute::_, k_block_next));
+                        if (k_block == 0)
+                        {
+                            // only update smem_pipe_read
+                            ++smem_pipe_read;
+                            smem_pipe_read = (smem_pipe_read == KT::Stages) ? 0 : smem_pipe_read;
+                        }
+                        // Thread-level register gemm for k_block
+                        cute::gemm(tiled_mma, accum, tOrInput(cute::_, cute::_, k_block),
+                            tOrfc1(cute::_, cute::_, k_block), accum);
+                        cute::gemm(tiled_mma, accum_gate, tOrInput(cute::_, cute::_, k_block),
+                            tOrfc1g(cute::_, cute::_, k_block), accum_gate);
+                    });
+            });
+        // mma tail
+        cute::for_each(cute::make_int_sequence<K_BLOCK_MAX>{},
+            [&](auto k_block)
+            {
+                // Load A, B shmem->regs for k_block+1
+                auto k_block_next = (k_block + cute::_1{}) % K_BLOCK_MAX;
+                cute::copy(smem_tiled_copy_A, tOsInput_p(cute::_, cute::_, k_block_next),
+                    tOrInput_copy_view(cute::_, cute::_, k_block_next));
+                cute::copy(smem_tiled_copy_B, tOsfc1_p(cute::_, cute::_, k_block_next),
+                    tOrfc1_copy_view(cute::_, cute::_, k_block_next));
+                cute::copy(smem_tiled_copy_B, tOsfc1g_p(cute::_, cute::_, k_block_next),
+                    tOrfc1g_copy_view(cute::_, cute::_, k_block_next));
+                // Thread-level register gemm for k_block
+                cute::gemm(
+                    tiled_mma, accum, tOrInput(cute::_, cute::_, k_block), tOrfc1(cute::_, cute::_, k_block), accum);
+                cute::gemm(tiled_mma, accum_gate, tOrInput(cute::_, cute::_, k_block),
+                    tOrfc1g(cute::_, cute::_, k_block), accum_gate);
+            });
         // if (cute::thread0()) {
         //     cute::print(accum_gate(0, 0, 0));
         //     printf("\n");
@@ -585,10 +637,9 @@ struct Fused_Moe_Kernel_routine_sm80<ElementInput_, ElementWeight_, ElementOutpu
             cute::copy(smem_tiled_copy_B, tOsfc1_p(cute::_, cute::_, cute::Int<0>{}),
                 tOrfc1_copy_view(cute::_, cute::_, cute::Int<0>{}));
         }
-        // k loop for mainloop (k - (stage - 1) -> -(stage - 1), if k_tile_count > 0, it means we still need to
-        // fetch gmem to smem)
+        // k loop for mainloop
         CUTLASS_PRAGMA_NO_UNROLL
-        for (; k_tile_count > -(KT::Stages - 1); --k_tile_count)
+        for (; k_tile_count > 0; --k_tile_count)
         {
             cute::for_each(cute::make_int_sequence<K_BLOCK_MAX>{},
                 [&](auto k_block)
@@ -609,10 +660,6 @@ struct Fused_Moe_Kernel_routine_sm80<ElementInput_, ElementWeight_, ElementOutpu
                     // Copy gmem to smem before computing gemm on each k-pipe
                     if (k_block == 0)
                     {
-                        if (k_tile_count <= 0)
-                        {
-                            cute::clear(tInputpInput);
-                        }
                         // cute::copy(gmem_tiled_copy_A, tInputgInput(cute::_, cute::_, cute::_, *k_tile_iter),
                         //    tInputsInput(cute::_, cute::_, cute::_, smem_pipe_write));
                         cute::copy_if(gmem_tiled_copy_A, tInputpInput,
@@ -636,6 +683,53 @@ struct Fused_Moe_Kernel_routine_sm80<ElementInput_, ElementWeight_, ElementOutpu
                         accum);
                 });
         }
+        // load tail
+        cute::for_each(cute::make_int_sequence<KT::Stages - 2>{},
+            [&](auto WaitIndex)
+            {
+                k_tile_count--;
+                using WaitIndex_t = decltype(WaitIndex);
+                cute::for_each(cute::make_int_sequence<K_BLOCK_MAX>{},
+                    [&](auto k_block)
+                    {
+                        if (k_block == K_BLOCK_MAX - 1)
+                        {
+                            tOsInput_p = tOsInput(cute::_, cute::_, cute::_, smem_pipe_read);
+                            tOsfc1_p = tOsfc1(cute::_, cute::_, cute::_, smem_pipe_read);
+                            cute::cp_async_wait<KT::Stages - 3 - WaitIndex_t::value>();
+                            __syncthreads();
+                        }
+                        // Load A, B shmem->regs for k_block+1
+                        auto k_block_next = (k_block + cute::_1{}) % K_BLOCK_MAX;
+                        cute::copy(smem_tiled_copy_A, tOsInput_p(cute::_, cute::_, k_block_next),
+                            tOrInput_copy_view(cute::_, cute::_, k_block_next));
+                        cute::copy(smem_tiled_copy_B, tOsfc1_p(cute::_, cute::_, k_block_next),
+                            tOrfc1_copy_view(cute::_, cute::_, k_block_next));
+                        if (k_block == 0)
+                        {
+                            // only update smem_pipe_read
+                            ++smem_pipe_read;
+                            smem_pipe_read = (smem_pipe_read == KT::Stages) ? 0 : smem_pipe_read;
+                        }
+                        // Thread-level register gemm for k_block
+                        cute::gemm(tiled_mma, accum, tOrInput(cute::_, cute::_, k_block),
+                            tOrfc1(cute::_, cute::_, k_block), accum);
+                    });
+            });
+        // mma tail
+        cute::for_each(cute::make_int_sequence<K_BLOCK_MAX>{},
+            [&](auto k_block)
+            {
+                // Load A, B shmem->regs for k_block+1
+                auto k_block_next = (k_block + cute::_1{}) % K_BLOCK_MAX;
+                cute::copy(smem_tiled_copy_A, tOsInput_p(cute::_, cute::_, k_block_next),
+                    tOrInput_copy_view(cute::_, cute::_, k_block_next));
+                cute::copy(smem_tiled_copy_B, tOsfc1_p(cute::_, cute::_, k_block_next),
+                    tOrfc1_copy_view(cute::_, cute::_, k_block_next));
+                // Thread-level register gemm for k_block
+                cute::gemm(
+                    tiled_mma, accum, tOrInput(cute::_, cute::_, k_block), tOrfc1(cute::_, cute::_, k_block), accum);
+            });
         // if (cute::thread0()) {
         //     cute::print(accum_gate(0, 0, 0));
         //     printf("\n");

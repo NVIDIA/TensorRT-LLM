@@ -78,11 +78,8 @@ void invokeAcceptDraftTokens(runtime::SizeType32 batchSize, T* draftProbs, T* ta
 //! \param vocabSizePadded padded vocab size
 //! \param finishedInput input buffer [batchSize, beamWidth].
 //! \param maxBatchSize maximum batch size
-//! \param batchUseDraftLogits input buffer [batchSize]. Acceptance logic using draft logits or not, per request
 //! \param outputIdsAfterSampling input buffer [batchSize, vocabSize]. Stores all selected IDs from sampling for
 //! masking.
-//! \param targetOutputIds input/output buffer [batchSize]. Stores target sampling output ids for acceptById
-//! logics.
 //! \param numsDraftTokens input buffer [batchSize]. Number of draft tokens per request
 //! \param runtimeTopKDevicePtr input buffer [batchSize] the topks in sampling step, for porting topK ids out.
 //! \param maskBuffer input buffer [batchSize, vocabSize] for masking calculation (index value to position).
@@ -90,9 +87,8 @@ void invokeAcceptDraftTokens(runtime::SizeType32 batchSize, T* draftProbs, T* ta
 template <typename T>
 void invokeMaskTargetLogits(runtime::SizeType32 batchSize, T* targetLogits, runtime::SizeType32 const* batchSlots,
     runtime::SizeType32 beamWidth, runtime::SizeType32 vocabSizePadded, FinishedState const* finishedInput,
-    runtime::SizeType32 maxBatchSize, bool const* batchUseDraftLogits, runtime::SizeType32* outputIdsAfterSampling,
-    runtime::SizeType32* targetOutputIds, runtime::SizeType32* runtimeTopKDevicePtr, bool* maskBuffer,
-    cudaStream_t stream);
+    runtime::SizeType32 maxBatchSize, runtime::SizeType32* outputIdsAfterSampling,
+    runtime::SizeType32* runtimeTopKDevicePtr, bool* maskBuffer, cudaStream_t stream);
 
 void invokeForwardAcceptedTokens(runtime::SizeType32 batchSize, runtime::SizeType32 const* batchSlots,
     bool* batchIsAccepted, runtime::SizeType32* outputSequenceLengths, runtime::TokenIdType const* draftIds,

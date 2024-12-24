@@ -48,6 +48,8 @@ SelectiveScanPlugin::SelectiveScanPlugin(int dim, int dstate, int dtRank, int nH
     TLLM_CHECK_WITH_INFO((getSMVersion() >= 80) || (!mIsMamba2), "Pre SM 80 GPUs do not support Mamba2");
     TLLM_CHECK_WITH_INFO((getSMVersion() >= 80) || (mType != DataType::kBF16),
         "Unsupported data type, pre SM 80 GPUs do not support bfloat16");
+    TLLM_CHECK_WITH_INFO(
+        (mChunkSize == 256 || mChunkSize == 128) || (!mIsMamba2), "Only support CHUNK_SIZE 256 or 128");
     TLLM_CHECK_WITH_INFO((mType == DataType::kBF16) || (mType == DataType::kFLOAT) || (mType == DataType::kHALF),
         "Only support float, half, and bfloat16.");
 }
@@ -70,7 +72,11 @@ SelectiveScanPlugin::SelectiveScanPlugin(void const* data, size_t length)
     read(d, mZEnabled);
     read(d, mIsMamba2);
     TLLM_CHECK(d == a + length);
-    TLLM_CHECK_WITH_INFO((getSMVersion() >= 80) || (mType != DataType::kBF16), "Unsupported data type");
+    TLLM_CHECK_WITH_INFO((getSMVersion() >= 80) || (!mIsMamba2), "Pre SM 80 GPUs do not support Mamba2");
+    TLLM_CHECK_WITH_INFO((getSMVersion() >= 80) || (mType != DataType::kBF16),
+        "Unsupported data type, pre SM 80 GPUs do not support bfloat16");
+    TLLM_CHECK_WITH_INFO(
+        (mChunkSize == 256 || mChunkSize == 128) || (!mIsMamba2), "Only support CHUNK_SIZE 256 or 128");
     TLLM_CHECK_WITH_INFO((mType == DataType::kBF16) || (mType == DataType::kFLOAT) || (mType == DataType::kHALF),
         "Only support float, half, and bfloat16.");
 }
