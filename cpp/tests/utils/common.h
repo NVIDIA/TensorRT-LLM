@@ -32,7 +32,6 @@ using tr::SizeType32;
 using tr::TokenIdType;
 using tr::ITensor;
 using tr::MemoryType;
-using executor::VecTokens;
 
 class ModelIds
 {
@@ -109,7 +108,7 @@ public:
     ITensor::SharedPtr expectedOutputIds;
     std::vector<SizeType32> expectedOutputLengths;
     std::vector<TokenIdType> endIds;
-    std::vector<VecTokens> draftTokens;
+    std::vector<tensorrt_llm::executor::VecTokens> draftTokens;
     std::vector<ITensor::SharedPtr> draftLogits;
     std::vector<SizeType32> acceptedDraftTokensLengths;
     std::vector<ITensor::SharedPtr> expectedGenerationLogits;

@@ -28,7 +28,7 @@ from ...quantization import QuantMode
 from ...quantization.functional import quantize_fp8_per_token
 from ...quantization.layers import Fp8RowwiseMLP
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
-                              QuantConfig, check_share_embedding)
+                              QuantConfig)
 from .config import GPTConfig
 from .convert import (load_hf_gpt, load_weights_from_hf_model,
                       load_weights_from_nemo)
@@ -321,7 +321,6 @@ class GPTForCausalLM(DecoderModelForCausalLM):
             hf_model = load_hf_gpt(hf_model_dir, load_model_on_cpu)
         weights = load_weights_from_hf_model(hf_model, config)
 
-        check_share_embedding(weights, config)
         model = cls(config)
         model.load(weights)
         return model
@@ -392,7 +391,6 @@ class GPTForCausalLM(DecoderModelForCausalLM):
 
         weights = load_weights_from_nemo(nemo_ckpt_dir, config, **kwargs)
 
-        check_share_embedding(weights, config)
         model = cls(config)
         model.load(weights)
         return model

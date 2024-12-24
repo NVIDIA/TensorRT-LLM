@@ -28,8 +28,8 @@ from parameterized import parameterized
 
 import tensorrt_llm
 from tensorrt_llm import Mapping, Tensor
-from tensorrt_llm.functional import (AllReduceConfig, AllReduceStrategy,
-                                     allreduce)
+from tensorrt_llm.functional import (AllReduceConfig, AllReduceParams,
+                                     AllReduceStrategy, allreduce)
 from tensorrt_llm.plugin.plugin import current_all_reduce_helper
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -107,8 +107,10 @@ class TestCommunicationPlugin(unittest.TestCase):
 
             current = x
             for i in range(inner_loop):
-                current = allreduce(current, self.mapping.tp_group, strategy,
-                                    config)
+                current = allreduce(current,
+                                    self.mapping.tp_group,
+                                    all_reduce_params=AllReduceParams(
+                                        strategy=strategy, config=config))
 
             current.mark_output('output', dtype)
 

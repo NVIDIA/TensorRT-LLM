@@ -146,6 +146,7 @@ class Builder():
                               profiling_verbosity: str = "layer_names_only",
                               use_strip_plan: bool = False,
                               weight_streaming: bool = False,
+                              precision_constraints: Optional[str] = "obey",
                               **kwargs) -> BuilderConfig:
         ''' @brief Create a builder config with given precisions and timing cache
             @param precision: one of allowed precisions, defined in Builder._ALLOWED_PRECISIONS
@@ -170,16 +171,18 @@ class Builder():
             fp8 = quant_mode.has_fp8_qdq() or quant_mode.has_fp8_kv_cache()
             if precision == 'float16' or precision == trt.DataType.HALF:
                 config.set_flag(trt.BuilderFlag.FP16)
-                config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
+                if precision_constraints == 'obey':
+                    config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
             elif precision == 'bfloat16' or precision == trt.DataType.BF16:
                 config.set_flag(trt.BuilderFlag.BF16)
-                config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
+                if precision_constraints == 'obey':
+                    config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
             if int8:
                 config.set_flag(trt.BuilderFlag.INT8)
-
             if fp8:
                 config.set_flag(trt.BuilderFlag.FP8)
-                config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
+                if precision_constraints == 'obey':
+                    config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
 
         if use_refit:
             config.set_flag(trt.BuilderFlag.REFIT)
@@ -436,7 +439,7 @@ class Builder():
                 if value is None:
                     logger.error(f'Failed to get weight: {name}')
                     continue
-                if value.dtype == np.float16 and value.ndim == 2 and network.plugin_config.gemm_plugin is None and network.plugin_config.low_latency_gemm_plugin is None:
+                if param.need_transpose:
                     # MOE has ndim=3 and uses plugin, no need to transpose
                     value = value.transpose(1, 0)  # WAR for bug 4641821
                 managed_weights[name] = value
@@ -503,6 +506,7 @@ class BuildConfig:
     dry_run: bool = False
     visualize_network: bool = False
     monitor_memory: bool = False
+    use_mrope: bool = False
 
     # Since we have some overlapping between kv_cache_type, paged_kv_cache, and paged_state (later two will be deprecated in the future),
     # we need to handle it given model architecture.
@@ -598,6 +602,7 @@ class BuildConfig:
         dry_run = config.pop('dry_run', False)
         visualize_network = config.pop('visualize_network', False)
         monitor_memory = config.pop('monitor_memory', False)
+        use_mrope = config.pop('use_mrope', False)
 
         return cls(
             max_input_len=max_input_len,
@@ -630,7 +635,8 @@ class BuildConfig:
             plugin_config=plugin_config,
             dry_run=dry_run,
             visualize_network=visualize_network,
-            monitor_memory=monitor_memory)
+            monitor_memory=monitor_memory,
+            use_mrope=use_mrope)
 
     @classmethod
     def from_json_file(cls, config_file, plugin_config=None):
@@ -835,6 +841,7 @@ def optimize_model_with_config(model: PretrainedModel,
     is_fp8 = model.config.quantization.quant_algo == QuantAlgo.FP8
     model = optimize_model(
         model,
+        share_embedding_table=True,
         use_ootb_moe=build_config.plugin_config.moe_plugin is None,
         use_fused_mlp=(build_config.use_fused_mlp and not is_enc_dec
                        and not (is_recurrent_gemma and is_fp8)
@@ -849,6 +856,7 @@ def optimize_model_with_config(model: PretrainedModel,
         use_fp8_context_fmha=(
             QuantAlgo.FP8 == model.config.quantization.quant_algo
             and build_config.plugin_config.use_fp8_context_fmha),
+        use_optimize_cross_qkv=True,
     )
 
     if is_enc_dec:
@@ -959,6 +967,8 @@ def serialize_managed_weights(managed_weights: dict[str, np.ndarray],
             dtype = "I64"
         elif value.dtype == np.int32:
             dtype = "I32"
+        elif value.dtype == np.int8:
+            dtype = "I8"
         else:
             raise RuntimeError(f"Unsupported dtype: {value.dtype}")
         header[name] = {
@@ -1030,10 +1040,14 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
     _init_max_seq_len(model.config, build_config)
 
     if build_config.plugin_config.reduce_fusion and (
-            model.config.mapping.tp_size == 1
-            or model.config.architecture != "LlamaForCausalLM"):
+            model.config.mapping.tp_size == 1 or
+        (model.config.architecture != "LlamaForCausalLM"
+         and model.config.architecture != "MedusaForCausalLM")):
         logger.warning('Overriding reduce_fusion to False')
         build_config.plugin_config.reduce_fusion = False
+    if build_config.plugin_config.user_buffer and not build_config.plugin_config.reduce_fusion:
+        logger.warning('Overriding user_buffer to False')
+        build_config.plugin_config.user_buffer = False
 
     if model.config.quantization.quant_algo == QuantAlgo.FP8 or \
             model.config.quantization.kv_cache_quant_algo == QuantAlgo.FP8:
@@ -1061,6 +1075,18 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
         )
         build_config.max_seq_len += build_config.max_draft_len
 
+    if build_config.speculative_decoding_mode == SpeculativeDecodingMode.EAGLE:
+        assert hasattr(model.config, 'num_eagle_layers')
+        num_eagle_layers = model.config.num_eagle_layers
+        logger.info(
+            f'Increasing max_seq_len ({build_config.max_seq_len}) '
+            f'by num_eagle_layers ({num_eagle_layers}) '
+            'to account for EAGLE implementation specifics. '
+            'Maximum number of generated tokens remains the same. '
+            f'New max_seq_len is set to {build_config.max_seq_len + num_eagle_layers}'
+        )
+        build_config.max_seq_len += num_eagle_layers
+
     if build_config.speculative_decoding_mode != SpeculativeDecodingMode.NONE:
         num_tokens = build_config.max_batch_size * (build_config.max_draft_len +
                                                     1)
@@ -1087,11 +1113,6 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
         if model.config.quant_mode.has_int8_kv_cache():
             raise RuntimeError(
                 "Paged Context FMHA doesn't work with int8 kv cache currently.")
-
-    if build_config.plugin_config.manage_weights:
-        if model.config.quant_mode.has_weight_quant():
-            raise RuntimeError(
-                "Managed weights is not supported with int4 or int8 weights.")
 
     model = optimize_model_with_config(model, build_config)
 
@@ -1124,6 +1145,13 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
     use_fp8_rowwise = model.config.quant_mode.has_fp8_rowwise()
     disable_weight_only_quant_plugin = model.config.disable_weight_only_quant_plugin if hasattr(
         model.config, 'disable_weight_only_quant_plugin') else False
+    use_fp8_rowwise = model.config.quant_mode.has_fp8_rowwise()
+
+    if build_config.plugin_config.manage_weights:
+        if use_weight_only and disable_weight_only_quant_plugin:
+            raise RuntimeError(
+                "Manage weights of weight only quant works only with plugin currently."
+            )
 
     if use_weight_only and not disable_weight_only_quant_plugin:
         if per_group:
@@ -1197,7 +1225,9 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
         if build_config.speculative_decoding_mode == SpeculativeDecodingMode.LOOKAHEAD_DECODING:
             prepare_input_args[
                 "spec_decoding_is_generation_length_variable"] = True
-
+        if model.config.architecture == "Qwen2VLForConditionalGeneration":
+            prepare_input_args[
+                'mrope_rotary_sin_cos_size'] = model.config.max_position_embeddings * model.config.rotary_embedding_dim
         if build_config.speculative_decoding_mode == SpeculativeDecodingMode.EAGLE and not build_config.plugin_config.use_paged_context_fmha:
             logger.warning(
                 "Paged Context FMHA is required for EAGLE. Turning it on")

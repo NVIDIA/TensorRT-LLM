@@ -6,10 +6,9 @@ import pytest
 from tensorrt_llm.builder import PluginConfig
 from tensorrt_llm.llmapi.llm_utils import *
 
-try:
-    from test_llm import llama_model_path
-except ImportError:
-    from .test_llm import llama_model_path
+# isort: off
+from test_llm import llama_model_path
+# isort: on
 
 
 def test_ConfigArbitrator_basic():
@@ -200,7 +199,7 @@ def test_CachedModelLoader():
     args.setup()
     stats = LlmBuildStats()
     model_loader = CachedModelLoader(args, llm_build_stats=stats)
-    engine_dir = model_loader()
+    engine_dir, _ = model_loader()
     assert engine_dir
     assert engine_dir.exists() and engine_dir.is_dir()
     model_format = ModelLoader.get_model_format(engine_dir)

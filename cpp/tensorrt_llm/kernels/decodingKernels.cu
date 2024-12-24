@@ -329,10 +329,10 @@ __global__ void insertUnfinishedPathKernel(BeamHypotheses bh)
     // update bh.normedScoresCBA
     // update bh.numBeamsCBA
 
-    int const bid = blockIdx.x;       // Index of Batch
-    int const nBM{bh.nBeamWidth};
-    int const nMBS{bh.nMaxBatchSize}; // Only for bh.logProbsTiled
-    int const nMSL{bh.nMaxSeqLen};
+    size_t const bid = blockIdx.x;       // Index of Batch
+    size_t const nBM{bh.nBeamWidth};
+    size_t const nMBS{bh.nMaxBatchSize}; // Only for bh.logProbsTiled
+    size_t const nMSL{bh.nMaxSeqLen};
     bool const bOutputLogProbs{bh.logProbsCBA != nullptr && bh.logProbsTiled != nullptr};
     int const indexDstStart{bh.numBeamsCBA[bid]};
 
@@ -396,11 +396,11 @@ __global__ void finalizeKernel(BeamHypotheses bh)
     // bh.cumLogProbsCBA     -> bh.cumLogProbs
     // bh.logProbsCBA        -> bh.logProbs
 
-    int const bid = blockIdx.x;          // Index of Batch
-    int const tid = threadIdx.x;         // Index of Beam
-    int const nBM{bh.nBeamWidth};
-    int const nCBA{bh.numBeamsCBA[bid]}; // count of candidate beams in CBA, nBM <= nCBA <= 2*nBM
-    int const nMSL{bh.nMaxSeqLen};
+    int const bid = blockIdx.x;  // Index of Batch
+    int const tid = threadIdx.x; // Index of Beam
+    size_t const nBM{bh.nBeamWidth};
+    size_t const nMSL{bh.nMaxSeqLen};
+    int const nCBA{bh.numBeamsCBA[bid]}; // Count of candidates in CBA, nBM <= nCBA <= 2*nBM
 
     extern __shared__ char smem[];
     int* smemRank = (int*) (smem);                // [nBM]
@@ -408,13 +408,13 @@ __global__ void finalizeKernel(BeamHypotheses bh)
     int* smemSL = (int*) (smemScore + nBM * 2);   // [nBM]
 
     // Sort
-    if (tid < nCBA)
+    for (int i = tid; i < nCBA; i += blockDim.x)
     {
-        smemScore[tid] = bh.normedScoresCBA[bid * nBM * 2 + tid];
+        smemScore[i] = bh.normedScoresCBA[bid * nBM * 2 + i];
     }
     __syncthreads();
 
-    if (nCBA < 32)
+    if (nCBA <= 32)
     {
         int const warpid = tid / 32;
         int const laneid = tid % 32;
@@ -422,22 +422,19 @@ __global__ void finalizeKernel(BeamHypotheses bh)
 
         if (warpid == 0 && nCBA > 1)
         {
-            rankNorm = swap(rankNorm, 0x01, bfe(laneid, 1) ^ bfe(laneid, 0)); //  2
+            rankNorm = swap(rankNorm, 0x01, bfe(laneid, 1) ^ bfe(laneid, 0)); // 2
         }
-
         if (warpid == 0 && nCBA > 2)
         {
-            rankNorm = swap(rankNorm, 0x02, bfe(laneid, 2) ^ bfe(laneid, 1)); //  3~4
+            rankNorm = swap(rankNorm, 0x02, bfe(laneid, 2) ^ bfe(laneid, 1)); // 3~4
             rankNorm = swap(rankNorm, 0x01, bfe(laneid, 2) ^ bfe(laneid, 0));
         }
-
         if (warpid == 0 && nCBA > 4)
         {
-            rankNorm = swap(rankNorm, 0x04, bfe(laneid, 3) ^ bfe(laneid, 2)); //  5~8
+            rankNorm = swap(rankNorm, 0x04, bfe(laneid, 3) ^ bfe(laneid, 2)); // 5~8
             rankNorm = swap(rankNorm, 0x02, bfe(laneid, 3) ^ bfe(laneid, 1));
             rankNorm = swap(rankNorm, 0x01, bfe(laneid, 3) ^ bfe(laneid, 0));
         }
-
         if (warpid == 0 && nCBA > 8)
         {
             rankNorm = swap(rankNorm, 0x08, bfe(laneid, 4) ^ bfe(laneid, 3)); // 9~16
@@ -445,7 +442,6 @@ __global__ void finalizeKernel(BeamHypotheses bh)
             rankNorm = swap(rankNorm, 0x02, bfe(laneid, 4) ^ bfe(laneid, 1));
             rankNorm = swap(rankNorm, 0x01, bfe(laneid, 4) ^ bfe(laneid, 0));
         }
-
         if (warpid == 0 && nCBA > 16)
         {
             rankNorm = swap(rankNorm, 0x10, bfe(laneid, 5) ^ bfe(laneid, 4)); // 17~32
@@ -454,7 +450,6 @@ __global__ void finalizeKernel(BeamHypotheses bh)
             rankNorm = swap(rankNorm, 0x02, bfe(laneid, 5) ^ bfe(laneid, 1));
             rankNorm = swap(rankNorm, 0x01, bfe(laneid, 5) ^ bfe(laneid, 0));
         }
-
         if (tid < nBM)
         {
             smemRank[tid] = rankNorm.rank;
@@ -463,13 +458,20 @@ __global__ void finalizeKernel(BeamHypotheses bh)
     }
     else
     {
+        // TODO, wili: use CUB to sort for large nCBA
         for (int i = 0; i < nBM; ++i)
         {
-            float const score = tid < bh.numBeamsCBA[bid] ? smemScore[tid] : -FLT_MAX;
-            float const maxScore = blockReduceMax<float>(score);
+            float maxScore = -FLT_MAX;
+            for (int j = 0; j < (nCBA + 1024 - 1) / 1024; ++j)
+            {
+                int const index = tid + 1024 * j;
+                float const score = (index < bh.numBeamsCBA[bid]) ? smemScore[index] : -FLT_MAX;
+                float const maxScore1 = blockReduceMax<float>(score);
+                maxScore = max(maxScore, maxScore1);
+            }
             if (tid == 0)
             {
-                for (int j = 0; j < nBM * 2; ++j)
+                for (int j = 0; j < nCBA; ++j)
                 {
                     if (smemScore[j] == maxScore)
                     {
@@ -524,8 +526,11 @@ void invokeFinalize(BeamHypotheses& bh, cudaStream_t stream)
     TLLM_LOG_TRACE("%s %s start", __FILE__, __PRETTY_FUNCTION__);
 
     int const nBM = bh.nBeamWidth;
-    size_t const smem_size = sizeof(int) * nBM * 2 + sizeof(float) * nBM * 2;
-    finalizeKernel<<<bh.nBatchSize, roundUp(nBM * 2, 32), smem_size, stream>>>(bh);
+    int const nThread = min(roundUp(nBM * 2, 32), 1024);
+    size_t const nByteSharedMemory = (sizeof(int) + sizeof(float)) * nBM * 2;
+    finalizeKernel<<<bh.nBatchSize, nThread, nByteSharedMemory, stream>>>(bh);
+    sync_check_cuda_error();
+
     TLLM_LOG_TRACE("%s %s stop", __FILE__, __PRETTY_FUNCTION__);
 }
 

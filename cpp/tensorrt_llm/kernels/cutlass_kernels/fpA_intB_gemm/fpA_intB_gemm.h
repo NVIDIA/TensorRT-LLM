@@ -87,6 +87,9 @@ protected:
     static constexpr int SPLIT_K_LIMIT = 7;
     static constexpr int MIN_M_TILE = 16;
     static constexpr int MIN_N_TILE = 64;
+
+    static constexpr int MAX_M_TILE_SM90 = 128;
+    static constexpr int MAX_N_TILE_SM90 = 256;
 };
 
 template <typename ActivationType, typename WeightType, cutlass::WeightOnlyQuantOp QuantOp,

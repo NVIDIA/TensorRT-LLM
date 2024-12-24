@@ -153,13 +153,6 @@ def parse_arguments():
         'To shard it along hidden dimension, set embedding_sharding_dim=1'
         'Note: embedding sharing is only enabled when embedding_sharding_dim = 0'
     )
-    parser.add_argument(
-        '--use_embedding_sharing',
-        action="store_true",
-        default=False,
-        help=
-        'Try to reduce the engine size by sharing the embedding lookup table between two layers.'
-        'Note: the flag might not take effect when the criteria are not met.')
     parser.add_argument('--output_dir',
                         type=Path,
                         default='tllm_checkpoint',
@@ -445,7 +438,6 @@ def convert_hf_bloom(hf_bloom,
                      dtype='float32',
                      use_parallel_embedding=False,
                      sharding_dim=0,
-                     share_embedding_table=False,
                      use_weight_only=False,
                      plugin_weight_only_quant_type=torch.int8,
                      use_smooth_quant=False,
@@ -647,11 +639,10 @@ def convert_hf_bloom(hf_bloom,
         weights[tllm_prex + 'post_layernorm.bias'] = post_ln_bias
 
     embed_w = get_weight(model_params, 'transformer.word_embeddings', dtype)
-    if not share_embedding_table:
-        weights['lm_head.weight'] = split_matrix_tp(embed_w.clone(),
-                                                    tensor_parallel,
-                                                    rank,
-                                                    dim=0)
+    weights['lm_head.weight'] = split_matrix_tp(embed_w.clone(),
+                                                tensor_parallel,
+                                                rank,
+                                                dim=0)
 
     if not use_parallel_embedding:
         weights['transformer.vocab_embedding.weight'] = embed_w
@@ -718,7 +709,6 @@ def convert_from_hf_checkpoint(
     dtype: Union[str, torch.dtype] = torch.float32,
     use_parallel_embedding: bool = False,
     sharding_dim: int = 0,
-    share_embedding_table: bool = False,
     use_weight_only: bool = False,
     plugin_weight_only_quant_type: torch.dtype = torch.int8,
     use_smooth_quant: bool = False,
@@ -791,13 +781,13 @@ def convert_from_hf_checkpoint(
                     param = split_matrix_tp(param, tp_size, tp_rank, dim=1)
                 add_tllm_weight(weights, tllm_name, param, quant_mode)
             elif 'word_embeddings.' in name:
-                if not share_embedding_table:
-                    # TODO: safetensor doesn't allow to save a shared tensor.
-                    # Currently, we clone the weight but to save the disk, it
-                    # would be better to skip saving lm_head weights and
-                    # handle it at the loading phase.
-                    lm_head = split_matrix_tp(param, tp_size, tp_rank, dim=0)
-                    weights['lm_head.weight'] = lm_head.clone()
+                # TODO: safetensor doesn't allow to save a shared tensor.
+                # Currently, we clone the weight but to save the disk, it
+                # would be better to skip saving lm_head weights and
+                # handle it at the loading phase.
+                lm_head = split_matrix_tp(param, tp_size, tp_rank, dim=0)
+                weights['lm_head.weight'] = lm_head.clone()
+
                 if not use_parallel_embedding:
                     weights[tllm_name] = param
                 else:
@@ -897,7 +887,6 @@ def main():
         },
         'use_parallel_embedding': args.use_parallel_embedding,
         'embedding_sharding_dim': args.embedding_sharding_dim,
-        'share_embedding_table': args.use_embedding_sharing,
     }
 
     with (args.output_dir / 'config.json').open('w') as f:
@@ -938,7 +927,6 @@ def main():
         plugin_weight_only_quant_type=plugin_weight_only_quant_type,
         use_parallel_embedding=args.use_parallel_embedding,
         sharding_dim=args.embedding_sharding_dim,
-        share_embedding_table=args.use_embedding_sharing,
         use_smooth_quant=args.smoothquant,
         act_range=act_range,
         bloom_qkv_param=bloom_qkv_param,

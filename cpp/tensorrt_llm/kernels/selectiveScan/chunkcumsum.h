@@ -37,7 +37,7 @@ typedef void (*ChunkCumsumKernelFunc)(int B_, int L_, int H_, int P_, int G_, in
     //  const void *g_mxSt_, // float B*C*H*N*P
     void* g_mxdc_,       // float B*C*H*Q
     void* g_mxdA_,       // float B*C*H*Q
-    void const* g_mxdt_, // Tp_   B*L*((g_mxZ?2:1)*H*P+2*G+H)
+    void const* g_mxdt_, // Tp_   B*L*((g_mxZ?2:1)*H*P+2*G+round_up(H,8))
     void const* g_mxdb_, // Wt_       H
     void const* g_mxA_,  // Wt_       H
                          //  const void *g_mxCB_, // Tp_   B*C*G*Q*Q
@@ -55,7 +55,7 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
     //  const void *g_mxSt_, // float B*C*H*N*P
     void* g_mxdc_,       // float B*C*H*Q
     void* g_mxdA_,       // float B*C*H*Q
-    void const* g_mxdt_, // Tp_   B*L*((g_mxZ?2:1)*H*P+2*G+H)
+    void const* g_mxdt_, // Tp_   B*L*((g_mxZ?2:1)*H*P+2*G+round_up(H,8))
     void const* g_mxdb_, // Wt_       H
     void const* g_mxA_,  // Wt_       H
                          //  const void *g_mxCB_, // Tp_   B*C*G*Q*Q
@@ -83,7 +83,7 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
     auto Q = cn<Q_>;
     auto C = Rn<ID>{div_up(L.var, Q_)};
 
-    auto Z_stride = Rn<ID>{(g_mxZ_ ? 2 : 1) * H_ * P_ + 2 * G_ * N_ + H_};
+    auto Z_stride = Rn<ID>{(g_mxZ_ ? 2 : 1) * H_ * P_ + 2 * G_ * N_ + round_up(H_, 8)};
 
     auto aStart = blockIdx_z * L;
     auto cStart = blockIdx_z * C;
@@ -129,10 +129,16 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 #pragma unroll
     for (Rn<UNROLL, div_up(tileH_, warpH_ * 32)> iStep; iStep.var < iStep.size; iStep.var++)
         if (thread(iStep) < cn<tileH_>)
-        {
-            s_mxdb[get(thread(iStep))] = g_mxdb ? float(g_mxdb[get(blockIdx_x * cn<tileH_> + thread(iStep))]) : 0.f;
-            s_mxA[get(thread(iStep))] = float(g_mxA[get(blockIdx_x * cn<tileH_> + thread(iStep))]);
-        }
+            if (blockIdx_x * cn<tileH_> + thread(iStep) < H)
+            {
+                s_mxdb[get(thread(iStep))] = g_mxdb ? float(g_mxdb[get(blockIdx_x * cn<tileH_> + thread(iStep))]) : 0.f;
+                s_mxA[get(thread(iStep))] = float(g_mxA[get(blockIdx_x * cn<tileH_> + thread(iStep))]);
+            }
+            else
+            {
+                s_mxdb[get(thread(iStep))] = 0.f;
+                s_mxA[get(thread(iStep))] = 0.f;
+            }
 
     __syncthreads();
 
@@ -142,10 +148,17 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
         {
             if (blockIdx_y * Q + thread(iStep) * cn<8> / cn<tileH_> < L)
             {
-                register Tp_ tmp[8];
+                Tp_ tmp[8];
 
-                *(int4*) &tmp = *(int4*) &g_mxdt[get(thread(iStep) * cn<8> / cn<tileH_> * Z_stride + Z_stride - H
-                    + blockIdx_x * cn<tileH_> + thread(iStep) * cn<8> % cn<tileH_>)];
+#pragma unroll
+                for (int i = 0; i < 8; i += 2)
+                    if (blockIdx_x * cn<tileH_> + thread(iStep) * cn<8> % cn<tileH_> + Rn<UNROLL, 8>{i} < H)
+                        *(int*) &tmp[i]
+                            = *(int*) &g_mxdt[get(thread(iStep) * cn<8> / cn<tileH_> * Z_stride + Z_stride
+                                                  + blockIdx_x * cn<tileH_> + thread(iStep) * cn<8> % cn<tileH_>)
+                                - round_up(H_, 8) + i];
+                    else
+                        *(int*) &tmp[i] = 0;
 
 #pragma unroll
                 for (int i = 0; i < 8; i += 2)
@@ -158,8 +171,10 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 
                     if (dtSoftplus_)
                     {
-                        tmp2.x = tmp2.x > 32.f ? tmp2.x : log1p(expf(tmp2.x));
-                        tmp2.y = tmp2.y > 32.f ? tmp2.y : log1p(expf(tmp2.y));
+                        float softplusx = log1p(expf(tmp2.x));
+                        float softplusy = log1p(expf(tmp2.y));
+                        tmp2.x = tmp2.x > 32.f ? tmp2.x : softplusx;
+                        tmp2.y = tmp2.y > 32.f ? tmp2.y : softplusy;
                     }
                     else
                     {
@@ -193,13 +208,14 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 #pragma unroll
     for (Rn<UNROLL, div_up(Q_ * tileH_, warpH_ * 128)> iStep; iStep.var < iStep.size; iStep.var++)
         if (thread(iStep) * cn<4> < cn<Q_ * tileH_>)
-        {
-            float4 tmp4 = *(float4*) &s_mxdc[get(thread(iStep) * cn<4>)];
+            if (blockIdx_x * cn<tileH_> + thread(iStep) * cn<4> / Q < H)
+            {
+                float4 tmp4 = *(float4*) &s_mxdc[get(thread(iStep) * cn<4>)];
 
-            *(float4*) &g_mxdc[get(
-                (thread(iStep) * cn<4> / Q + blockIdx_x * cn<tileH_>) *Q + thread(iStep) * cn<4> % Q)]
-                = tmp4;
-        }
+                *(float4*) &g_mxdc[get(
+                    (thread(iStep) * cn<4> / Q + blockIdx_x * cn<tileH_>) *Q + thread(iStep) * cn<4> % Q)]
+                    = tmp4;
+            }
 
     __syncthreads();
 
@@ -222,20 +238,21 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 #pragma unroll
     for (Rn<UNROLL, div_up(Q_ * tileH_, warpH_ * 128)> iStep; iStep.var < iStep.size; iStep.var++)
         if (thread(iStep) * cn<4> < cn<Q_ * tileH_>)
-        {
-            float r_A = s_mxA[get(thread(iStep) * cn<4> / Q)];
+            if (blockIdx_x * cn<tileH_> + thread(iStep) * cn<4> / Q < H)
+            {
+                float r_A = s_mxA[get(thread(iStep) * cn<4> / Q)];
 
-            float4 tmp4 = *(float4*) &s_mxdc[get(thread(iStep) * cn<4>)];
+                float4 tmp4 = *(float4*) &s_mxdc[get(thread(iStep) * cn<4>)];
 
-            tmp4.x *= r_A;
-            tmp4.y *= r_A;
-            tmp4.z *= r_A;
-            tmp4.w *= r_A;
+                tmp4.x *= r_A;
+                tmp4.y *= r_A;
+                tmp4.z *= r_A;
+                tmp4.w *= r_A;
 
-            *(float4*) &g_mxdA[get(
-                (thread(iStep) * cn<4> / Q + blockIdx_x * cn<tileH_>) *Q + thread(iStep) * cn<4> % Q)]
-                = tmp4;
-        }
+                *(float4*) &g_mxdA[get(
+                    (thread(iStep) * cn<4> / Q + blockIdx_x * cn<tileH_>) *Q + thread(iStep) * cn<4> % Q)]
+                    = tmp4;
+            }
 #endif
 }
 
@@ -248,7 +265,7 @@ ChunkCumsumKernelFunc getChunkCumsumKernel(int B_, int L_, int H_, int P_, int G
 {
     int B = B_;
     int L = L_;
-    int H = H_;
+    int H = round_up(H_, 8);
     // int P = P_;
     // int G = G_;
     // int N = N_;
@@ -257,108 +274,48 @@ ChunkCumsumKernelFunc getChunkCumsumKernel(int B_, int L_, int H_, int P_, int G
 
     int64_t compute = int64_t(numTokens_) * H * Q;
 
-    auto setLaunchParams = [&](int tileH, int warpH)
+    auto set = [&](int tileH, int warpH, ChunkCumsumKernelFunc func)
     {
         auto sharedMem = (Q + 2) * tileH * 4;
 
-        *blockDims_ = dim3(H / tileH, C, B);
+        *blockDims_ = dim3(div_up(H, tileH), C, B);
         *threadDims_ = dim3(32, warpH);
         *sharedMem_ = sharedMem;
+
+        return func;
     };
 
-#ifndef FAST_BUILD
-    if (Q_ == 256 && H_ % 16 == 0)
+    if (Q_ == 256 && H % 16 == 0)
+    {
+        if (compute >= (1LL << 29))
+            return set(16, 8, chunk_cumsum_kernel<256, 16, 8, Tp_, Wt_>);
+        else if (compute >= (1LL << 0))
+            return set(8, 8, chunk_cumsum_kernel<256, 8, 8, Tp_, Wt_>);
+    }
+
+    if (Q_ == 256 && H % 8 == 0)
     {
         if (compute >= (1LL << 0))
-            setLaunchParams(8, 8);
-
-        if (compute >= (1LL << 0))
-            return chunk_cumsum_kernel<256, 8, 8, Tp_, Wt_>;
-    }
-#endif
-
-    if (Q_ == 256 && H_ % 8 == 0)
-    {
-        if (compute >= (1LL << 0))
-            setLaunchParams(8, 8);
-
-        if (compute >= (1LL << 0))
-            return chunk_cumsum_kernel<256, 8, 8, Tp_, Wt_>;
+            return set(8, 8, chunk_cumsum_kernel<256, 8, 8, Tp_, Wt_>);
     }
 
-#ifndef FAST_BUILD
-    if (Q_ == 128 && H_ % 16 == 0)
-    {
-        if (compute >= (1LL << 28))
-            setLaunchParams(16, 8);
-        else if (compute >= (1LL << 27))
-            setLaunchParams(8, 4);
-        else if (compute >= (1LL << 25))
-            setLaunchParams(8, 8);
-        else if (compute >= (1LL << 0))
-            setLaunchParams(8, 4);
-
-        if (compute >= (1LL << 28))
-            return chunk_cumsum_kernel<128, 16, 8, Tp_, Wt_>;
-        else if (compute >= (1LL << 27))
-            return chunk_cumsum_kernel<128, 8, 4, Tp_, Wt_>;
-        else if (compute >= (1LL << 25))
-            return chunk_cumsum_kernel<128, 8, 8, Tp_, Wt_>;
-        else if (compute >= (1LL << 0))
-            return chunk_cumsum_kernel<128, 8, 4, Tp_, Wt_>;
-    }
-
-    if (Q_ == 128 && H_ % 8 == 0)
+    if (Q_ == 128 && H % 16 == 0)
     {
         if (compute >= (1LL << 27))
-            setLaunchParams(8, 4);
-        else if (compute >= (1LL << 25))
-            setLaunchParams(8, 8);
+            return set(16, 8, chunk_cumsum_kernel<128, 16, 8, Tp_, Wt_>);
+        else if (compute >= (1LL << 26))
+            return set(8, 8, chunk_cumsum_kernel<128, 8, 8, Tp_, Wt_>);
         else if (compute >= (1LL << 0))
-            setLaunchParams(8, 4);
-
-        if (compute >= (1LL << 27))
-            return chunk_cumsum_kernel<128, 8, 4, Tp_, Wt_>;
-        else if (compute >= (1LL << 25))
-            return chunk_cumsum_kernel<128, 8, 8, Tp_, Wt_>;
-        else if (compute >= (1LL << 0))
-            return chunk_cumsum_kernel<128, 8, 4, Tp_, Wt_>;
+            return set(8, 4, chunk_cumsum_kernel<128, 8, 4, Tp_, Wt_>);
     }
 
-    if (Q_ == 64 && H_ % 16 == 0)
+    if (Q_ == 128 && H % 8 == 0)
     {
-        if (compute >= (1LL << 27))
-            setLaunchParams(16, 4);
-        else if (compute >= (1LL << 24))
-            setLaunchParams(8, 4);
+        if (compute >= (1LL << 26))
+            return set(8, 8, chunk_cumsum_kernel<128, 8, 8, Tp_, Wt_>);
         else if (compute >= (1LL << 0))
-            setLaunchParams(8, 8);
-
-        if (compute >= (1LL << 27))
-            return chunk_cumsum_kernel<64, 16, 4, Tp_, Wt_>;
-        else if (compute >= (1LL << 24))
-            return chunk_cumsum_kernel<64, 8, 4, Tp_, Wt_>;
-        else if (compute >= (1LL << 0))
-            return chunk_cumsum_kernel<64, 8, 8, Tp_, Wt_>;
+            return set(8, 4, chunk_cumsum_kernel<128, 8, 4, Tp_, Wt_>);
     }
-
-    if (Q_ == 64 && H_ % 8 == 0)
-    {
-        if (compute >= (1LL << 27))
-            setLaunchParams(8, 1);
-        else if (compute >= (1LL << 24))
-            setLaunchParams(8, 4);
-        else if (compute >= (1LL << 0))
-            setLaunchParams(8, 8);
-
-        if (compute >= (1LL << 27))
-            return chunk_cumsum_kernel<64, 8, 1, Tp_, Wt_>;
-        else if (compute >= (1LL << 24))
-            return chunk_cumsum_kernel<64, 8, 4, Tp_, Wt_>;
-        else if (compute >= (1LL << 0))
-            return chunk_cumsum_kernel<64, 8, 8, Tp_, Wt_>;
-    }
-#endif
 
     return nullptr;
 }

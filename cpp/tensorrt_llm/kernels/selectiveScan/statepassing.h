@@ -37,7 +37,7 @@ typedef void (*StatePassingKernelFunc)(int B_, int L_, int H_, int P_, int G_, i
     void const* g_mxSt_, // float B*C*H*N*P
                          //  const void *g_mxdc_, // float B*C*H*Q
     void const* g_mxdA_, // float B*C*H*Q
-                         //  const void *g_mxdt_, // Tp_   B*L*((g_mxZ?2:1)*H*P+2*G+H)
+                         //  const void *g_mxdt_, // Tp_   B*L*((g_mxZ?2:1)*H*P+2*G+round_up(H,8))
                          //  const void *g_mxdb_, // Wt_       H
                          //  const void *g_mxA_,  // Wt_       H
                          //  const void *g_mxCB_, // Tp_   B*C*G*Q*Q
@@ -55,7 +55,7 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
     void const* g_mxSt_, // float B*C*H*N*P
                          //  const void *g_mxdc_, // float B*C*H*Q
     void const* g_mxdA_, // float B*C*H*Q
-                         //  const void *g_mxdt_, // Tp_   B*L*((g_mxZ?2:1)*H*P+2*G+H)
+                         //  const void *g_mxdt_, // Tp_   B*L*((g_mxZ?2:1)*H*P+2*G+round_up(H,8))
                          //  const void *g_mxdb_, // Wt_       H
                          //  const void *g_mxA_,  // Wt_       H
                          //  const void *g_mxCB_, // Tp_   B*C*G*Q*Q
@@ -124,8 +124,8 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
     //  const Tp_   *g_mxX  = (const Tp_   *)g_mxX_;
     //  const Tp_   *g_mxZ  = (const Tp_   *)g_mxZ_;
 
-    register Tp_ r_mxOs[tileH_ / (warpH_ * 32)] = {0};
-    register float r_mxSt[tileH_ / (warpH_ * 32)] = {0};
+    Tp_ r_mxOs[tileH_ / (warpH_ * 32)] = {0};
+    float r_mxSt[tileH_ / (warpH_ * 32)] = {0};
 
     for (int iC = 0; iC < C.var; iC++)
     {
@@ -227,43 +227,28 @@ StatePassingKernelFunc getStatePassingKernel(int B_, int L_, int H_, int P_, int
 
     int64_t compute = int64_t(numTokens_) * H * N * P;
 
-    auto setLaunchParams = [&](int tileH, int warpH)
+    auto set = [&](int tileH, int warpH, StatePassingKernelFunc func)
     {
         auto sharedMem = 0;
 
         *blockDims_ = dim3(H * N * P / tileH, 1, B);
         *threadDims_ = dim3(32, warpH);
         *sharedMem_ = sharedMem;
+
+        return func;
     };
 
     if (Q_ == 256)
     {
         if (compute >= (1LL << 0))
-            setLaunchParams(512, 4);
-
-        if (compute >= (1LL << 0))
-            return state_passing_kernel<256, 512, 4, Tp_>;
+            return set(512, 4, state_passing_kernel<256, 512, 4, Tp_>);
     }
 
-#ifndef FAST_BUILD
     if (Q_ == 128)
     {
         if (compute >= (1LL << 0))
-            setLaunchParams(512, 4);
-
-        if (compute >= (1LL << 0))
-            return state_passing_kernel<128, 512, 4, Tp_>;
+            return set(512, 4, state_passing_kernel<128, 512, 4, Tp_>);
     }
-
-    if (Q_ == 64)
-    {
-        if (compute >= (1LL << 0))
-            setLaunchParams(512, 4);
-
-        if (compute >= (1LL << 0))
-            return state_passing_kernel<64, 512, 4, Tp_>;
-    }
-#endif
 
     return nullptr;
 }

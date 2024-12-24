@@ -33,7 +33,7 @@ class EaglePrepareDrafterInputsPlugin : public nvinfer1::IPluginV3,
 public:
     EaglePrepareDrafterInputsPlugin(EaglePrepareDrafterInputsPlugin const& p) = default;
 
-    EaglePrepareDrafterInputsPlugin(int32_t layerIdx);
+    EaglePrepareDrafterInputsPlugin(int32_t layerIdx, int32_t numLayers, int32_t maxNonLeavesPerLayer);
 
     nvinfer1::IPluginV3* clone() noexcept override;
 
@@ -80,6 +80,8 @@ private:
         CONTEXT_LENGTHS,
         //! [num_tokens]
         INPUT_IDS,
+        //! [batch_size]
+        CHUNKED_CONTEXT_NEXT_TOKENS,
         //! [batch_size, max_path_len]
         ACCEPTED_TOKENS,
         //! [batch_size]
@@ -98,6 +100,10 @@ private:
         PREV_DRAFT_PATHS,
         //! [(max_path_len - 1) * batch_size + 1]
         HIDDEN_SIZE_BATCH_LEVEL_STARTS,
+        //! [num_gen_tokens]
+        INPUT_GEN_TOKENS,
+        //! [num_gen_requests]
+        SPEC_DECODING_GENERATION_LENGTHS,
     };
 
     enum class OutputIdxEntry : int32_t
@@ -112,16 +118,17 @@ private:
         SPEC_DECODING_POSITION_OFFSETS,
         //! [batchSize, maxDecodingTokens, ceil(maxDecodingTokens / 32)]
         SPEC_DECODING_PACKED_MASK,
-        //! [NUM_OUTPUT_TOKENS]
+        //! [batchSize * mMaxNonLeavesPerLayer * layerIdx] for layerIdx > 0
+        //! [num_tokens - numGenTokens + numGenRequests * (mNumLayers + 1)] for layerIdx == 0
         OUTPUT_IDS,
-        //! [NUM_OUTPUT_TOKENS]
+        //! [batchSize] for layerIdx > 0
+        //! [num_tokens - numGenTokens + numGenRequests * (mNumLayers + 1)] for layerIdx == 0
         POSITION_IDS,
-        //! [NUM_OUTPUT_TOKENS]
+        //! [batchSize * mMaxNonLeavesPerLayer * layerIdx] for layerIdx > 0
+        //! [num_tokens - numGenTokens + numGenRequests * (mNumLayers + 1)] for layerIdx == 0
         HIDDEN_STATES_INDICES,
-        //! [NUM_LAST_TOKEN_INDICES]
+        //! [batchSize * mMaxNonLeavesPerLayer]
         LAST_TOKEN_INDICES,
-        //! [1]
-        NUM_OUTPUT_TOKENS,
         //! [1]
         NUM_LAST_TOKEN_INDICES,
         //! [(max_path_len - 1) * batch_size + 1]
@@ -148,7 +155,9 @@ private:
         cudaStream_t stream) noexcept;
 
 private:
-    int32_t mLayerIdx;
+    int32_t mLayerIdx{0};
+    int32_t mNumLayers{0};
+    int32_t mMaxNonLeavesPerLayer{0};
     std::vector<nvinfer1::PluginField> mDataToSerialize;
     nvinfer1::PluginFieldCollection mFCToSerialize;
 };

@@ -22,6 +22,7 @@
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/common.h"
 
+#include <cstdint>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -36,22 +37,24 @@ class TrtGptModelOptionalParams
 public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
-    explicit TrtGptModelOptionalParams(KvCacheConfig const& kvCacheConfig = KvCacheConfig{},
-        bool enableTrtOverlap = false, std::optional<std::vector<SizeType32>> const& deviceIds = std::nullopt,
-        bool normalizeLogProbs = true, bool enableChunkedContext = false,
+    explicit TrtGptModelOptionalParams(KvCacheConfig kvCacheConfig = KvCacheConfig{}, bool enableTrtOverlap = false,
+        std::optional<std::vector<SizeType32>> deviceIds = std::nullopt, bool normalizeLogProbs = true,
+        bool enableChunkedContext = true,
         PeftCacheManagerConfig const& peftCacheManagerConfig = PeftCacheManagerConfig{},
         executor::DecodingConfig decodingConfig = executor::DecodingConfig{}, float gpuWeightsPercent = 1,
         std::optional<SizeType32> maxBeamWidth = std::nullopt, std::optional<SizeType32> maxBatchSize = std::nullopt,
         std::optional<SizeType32> maxNumTokens = std::nullopt,
-        executor::SchedulerConfig const& schedulerConfig = executor::SchedulerConfig{},
+        executor::SchedulerConfig schedulerConfig = executor::SchedulerConfig{},
         executor::ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig
         = executor::ExtendedRuntimePerfKnobConfig{},
-        std::optional<executor::DebugConfig> debugConfig = std::nullopt, uint64_t maxSeqIdleMicroseconds = 180000000,
+        std::optional<executor::DebugConfig> debugConfig = std::nullopt,
+        uint64_t maxSeqIdleMicroseconds = executor::ExecutorConfig::kDefaultMaxSeqIdleMicroseconds,
         std::optional<executor::SpeculativeDecodingConfig> specDecConfig = std::nullopt,
+        std::optional<executor::GuidedDecodingConfig> guidedDecodingConfig = std::nullopt,
         bool isLeaderInOrchMode = false)
-        : kvCacheConfig{kvCacheConfig}
+        : kvCacheConfig{std::move(kvCacheConfig)}
         , enableTrtOverlap{enableTrtOverlap}
-        , deviceIds(deviceIds)
+        , deviceIds(std::move(deviceIds))
         , normalizeLogProbs{normalizeLogProbs}
         , enableChunkedContext{enableChunkedContext}
         , peftCacheManagerConfig(peftCacheManagerConfig)
@@ -60,13 +63,18 @@ public:
         , maxBeamWidth(maxBeamWidth)
         , maxBatchSize(maxBatchSize)
         , maxNumTokens(maxNumTokens)
-        , schedulerConfig{schedulerConfig}
+        , schedulerConfig{std::move(schedulerConfig)}
         , extendedRuntimePerfKnobConfig(extendedRuntimePerfKnobConfig)
         , debugConfig{std::move(debugConfig)}
         , maxSeqIdleMicroseconds{maxSeqIdleMicroseconds}
-        , speculativeDecodingConfig{std::move(specDecConfig)}
+        , speculativeDecodingConfig{specDecConfig}
+        , guidedDecodingConfig{std::move(guidedDecodingConfig)}
         , isLeaderInOrchMode{isLeaderInOrchMode}
     {
+        if (guidedDecodingConfig)
+        {
+            guidedDecodingConfig->validate();
+        }
     }
 
     explicit TrtGptModelOptionalParams(executor::ExecutorConfig const& executorConfig, bool isLeaderInOrchMode)
@@ -78,7 +86,8 @@ public:
             executorConfig.getGpuWeightsPercent(), executorConfig.getMaxBeamWidth(), executorConfig.getMaxBatchSize(),
             executorConfig.getMaxNumTokens(), executorConfig.getSchedulerConfig(),
             executorConfig.getExtendedRuntimePerfKnobConfig(), executorConfig.getDebugConfig(),
-            executorConfig.getMaxSeqIdleMicroseconds(), executorConfig.getSpecDecConfig(), isLeaderInOrchMode)
+            executorConfig.getMaxSeqIdleMicroseconds(), executorConfig.getSpecDecConfig(),
+            executorConfig.getGuidedDecodingConfig(), isLeaderInOrchMode)
     {
     }
 
@@ -99,6 +108,7 @@ public:
             && debugConfig == other.debugConfig                                     //
             && maxSeqIdleMicroseconds == other.maxSeqIdleMicroseconds               //
             && speculativeDecodingConfig == other.speculativeDecodingConfig         //
+            && guidedDecodingConfig == other.guidedDecodingConfig                   //
             && isLeaderInOrchMode == other.isLeaderInOrchMode                       //
             ;
     }
@@ -124,6 +134,7 @@ public:
     // Sequence is considered idle if not updated for this amount of time.
     uint64_t maxSeqIdleMicroseconds;
     std::optional<executor::SpeculativeDecodingConfig> speculativeDecodingConfig;
+    std::optional<executor::GuidedDecodingConfig> guidedDecodingConfig;
     // This rank is the leader worker in orchestrator mode
     bool isLeaderInOrchMode;
 };

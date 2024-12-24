@@ -16,78 +16,9 @@
 import time
 
 import torch
-from transformers import AutoConfig, AutoModelForCausalLM
-
-from tensorrt_llm.layers import MoeConfig
+from transformers import AutoModelForCausalLM
 
 from ..._utils import pad_vocab_size, release_gc
-from ...mapping import Mapping
-from ..convert_utils import infer_dtype
-
-
-## Convert config parameters to dict
-def create_trt_config_from_hf(model_dir,
-                              dtype: str,
-                              mapping: Mapping,
-                              override_fields: dict = {}):
-    assert isinstance(model_dir, str)
-    hf_config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
-    dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
-    n_layer = hf_config.num_hidden_layers
-    n_head = hf_config.num_attention_heads
-    n_embd = hf_config.hidden_size
-    inter_size = hf_config.intermediate_size
-    n_kv_head = hf_config.num_key_value_heads
-    vocab_size = hf_config.vocab_size
-    n_positions = hf_config.max_position_embeddings
-    hidden_act = 'swiglu'  # TRT-LLM request make gated activation explicit for MOE implementation
-    rotary_base = hf_config.rope_theta
-    rms_norm_eps = hf_config.rms_norm_eps
-    moe_num_experts = hf_config.n_routed_experts
-    moe_top_k = hf_config.num_experts_per_tok
-    ## shanshan fix
-    moe_renorm_mode = MoeConfig.ExpertScaleNormalizationMode.NONE
-    moe_num_shared_experts = hf_config.n_shared_experts
-    moe_inter_size = hf_config.moe_intermediate_size
-    rotary_scaling = hf_config.rope_scaling
-
-    config = {
-        'architecture': "DeepseekForCausalLM",
-        'dtype': dtype,
-        'logits_type': 'float32',
-        'num_hidden_layers': n_layer,
-        'num_attention_heads': n_head,
-        'hidden_size': n_embd,
-        'intermediate_size': inter_size,
-        'num_key_value_heads': n_kv_head,
-        'vocab_size': vocab_size,
-        'position_embedding_type': 'rope_gpt_neox',
-        'max_position_embeddings': n_positions,
-        'hidden_act': hidden_act,
-        'rotary_base': rotary_base,
-        'norm_epsilon': rms_norm_eps,
-        'rotary_scaling': rotary_scaling,
-        'moe': {
-            'num_experts': moe_num_experts,
-            'top_k': moe_top_k,
-            'normalization_mode': moe_renorm_mode,
-            'num_shared_experts': moe_num_shared_experts,
-            'moe_intermediate_size': moe_inter_size,
-        },
-        'mapping': {
-            'world_size': mapping.tp_size * mapping.pp_size,
-            'tp_size': mapping.tp_size,
-            'pp_size': mapping.pp_size,
-            'moe_tp_size': mapping.moe_tp_size,
-            'moe_ep_size': mapping.moe_ep_size,
-        },
-    }
-    config.update(override_fields)
-
-    moe_config = MoeConfig.from_dict(config['moe'])
-    moe_config.validate()
-
-    return config
 
 
 ## Get HF model
@@ -141,17 +72,15 @@ def convert_deepseek(hf_model,
                      mapping,
                      dtype='float32',
                      use_parallel_embedding=False,
-                     sharding_dim=0,
-                     share_embedding_table=False):
+                     sharding_dim=0):
 
     weights = {}
     tik = time.time()
     mapping.tp_size
     model_params = dict(hf_model.named_parameters())
     dtype = getattr(torch, dtype)
-    moe_config = MoeConfig.from_dict(config['moe'])
-
-    layers_range = mapping.pp_layers(config['num_hidden_layers'])
+    moe_config = config.moe
+    layers_range = mapping.pp_layers(config.num_hidden_layers)
 
     def convert_layer(l):
         prefix = f'model.layers.{l}.'
@@ -163,8 +92,8 @@ def convert_deepseek(hf_model,
 
         qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
 
-        split_v = split_qkv_tp(qkv_weight, config['num_attention_heads'],
-                               config['hidden_size'], mapping.tp_size,
+        split_v = split_qkv_tp(qkv_weight, config.num_attention_heads,
+                               config.hidden_size, mapping.tp_size,
                                mapping.tp_rank)
 
         weights.update(
@@ -220,54 +149,60 @@ def convert_deepseek(hf_model,
                 model_params, prefix + 'mlp.experts.down_proj', dtype)
             weights.update(
                 get_trtllm_linear_weight(moe_experts_down_proj_weights,
-                                         trtllm_prex + 'mlp.moe.proj.'))
+                                         trtllm_prex + 'mlp.proj.'))
             ##mlp.experts.up_gate.weight
             moe_experts_up_gate_proj_weights = get_weight(
                 model_params, prefix + 'mlp.experts.up_gate_proj', dtype)
             weights.update(
                 get_trtllm_linear_weight(moe_experts_up_gate_proj_weights,
-                                         trtllm_prex + 'mlp.moe.fc.'))
+                                         trtllm_prex + 'mlp.fc.'))
             ## MOE hardcoded routing_input into trt.float32, please refer to moe.py line 397
             moe_experts_gate_weights = get_weight(model_params,
                                                   prefix + 'mlp.gate',
                                                   torch.float32)
             weights.update(
                 get_trtllm_linear_weight(moe_experts_gate_weights,
-                                         trtllm_prex + 'mlp.moe.router.'))
+                                         trtllm_prex + 'mlp.router.'))
 
-            if moe_config.num_shared_experts > 0:
-                ## mlp.shared_experts.gate_proj.weight
-                shared_moe_gate_proj_weights = get_weight(
-                    model_params, prefix + 'mlp.shared_experts.gate_proj',
-                    dtype)
-                split_v = split_matrix_tp(shared_moe_gate_proj_weights,
-                                          mapping.tp_size,
-                                          mapping.tp_rank,
-                                          dim=0)
-                weights.update(
-                    get_trtllm_linear_weight(
-                        split_v, trtllm_prex + 'mlp.shared_experts.fc.'))
-                # mlp.shared_experts.down_proj.weight
+            if moe_config.shared_expert_intermediate_size > 0:
+                shared_moe_up_proj_weights = get_weight(
+                    model_params, prefix + 'mlp.shared_experts.up_proj', dtype)
+                shared_moe_up_proj_weights = split_matrix_tp(
+                    shared_moe_up_proj_weights,
+                    mapping.tp_size,
+                    mapping.tp_rank,
+                    dim=0)
                 shared_moe_down_proj_weights = get_weight(
                     model_params, prefix + 'mlp.shared_experts.down_proj',
                     dtype)
-                split_v = split_matrix_tp(shared_moe_down_proj_weights,
-                                          mapping.tp_size,
-                                          mapping.tp_rank,
-                                          dim=1)
+                shared_moe_down_proj_weights = split_matrix_tp(
+                    shared_moe_down_proj_weights,
+                    mapping.tp_size,
+                    mapping.tp_rank,
+                    dim=1)
+                shared_moe_gate_proj_weights = get_weight(
+                    model_params, prefix + 'mlp.shared_experts.gate_proj',
+                    dtype)
+                shared_moe_gate_proj_weights = split_matrix_tp(
+                    shared_moe_gate_proj_weights,
+                    mapping.tp_size,
+                    mapping.tp_rank,
+                    dim=0)
+                shared_moe_gate_up_proj_weights = torch.concat(
+                    [shared_moe_up_proj_weights, shared_moe_gate_proj_weights],
+                    dim=-2)
+
+                ## mlp.shared_experts.gate_up_proj.weight
                 weights.update(
                     get_trtllm_linear_weight(
-                        split_v, trtllm_prex + 'mlp.shared_experts.proj.'))
-                ## mlp.shared_experts.up_proj.weight
-                shared_moe_up_proj_weights = get_weight(
-                    model_params, prefix + 'mlp.shared_experts.up_proj', dtype)
-                split_v = split_matrix_tp(shared_moe_up_proj_weights,
-                                          mapping.tp_size,
-                                          mapping.tp_rank,
-                                          dim=0)
+                        shared_moe_gate_up_proj_weights,
+                        trtllm_prex + 'mlp.shared_expert.fc.'))
+
+                ## mlp.shared_experts.down_proj.weight
                 weights.update(
                     get_trtllm_linear_weight(
-                        split_v, trtllm_prex + 'mlp.shared_experts.gate.'))
+                        shared_moe_down_proj_weights,
+                        trtllm_prex + 'mlp.shared_expert.proj.'))
 
         else:
             ## Current deepseek model has one MLP layer only, if it goes large consider to do fuse
@@ -314,11 +249,11 @@ def convert_deepseek(hf_model,
     if hf_model.config.tie_word_embeddings:
         # lm_head.weight has the same weights as embedding
         if mapping.is_last_pp_rank():
-            if config['vocab_size'] % mapping.tp_size != 0:
+            if config.vocab_size % mapping.tp_size != 0:
                 # padding
-                vocab_size_padded = pad_vocab_size(config['vocab_size'],
+                vocab_size_padded = pad_vocab_size(config.vocab_size,
                                                    mapping.tp_size)
-                pad_width = vocab_size_padded - config['vocab_size']
+                pad_width = vocab_size_padded - config.vocab_size
                 v = torch.nn.functional.pad(v, (0, 0, 0, pad_width), 'constant',
                                             0)
             weights['lm_head.weight'] = split(v, mapping.tp_size,
@@ -333,11 +268,11 @@ def convert_deepseek(hf_model,
     lm_head_weights = get_weight(model_params, 'lm_head', dtype)
 
     if mapping.is_last_pp_rank():
-        if config['vocab_size'] % mapping.tp_size != 0:
+        if config.vocab_size % mapping.tp_size != 0:
             # padding
-            vocab_size_padded = pad_vocab_size(config['vocab_size'],
+            vocab_size_padded = pad_vocab_size(config.vocab_size,
                                                mapping.tp_size)
-            pad_width = vocab_size_padded - config['vocab_size']
+            pad_width = vocab_size_padded - config.vocab_size
             lm_head_weights = torch.nn.functional.pad(lm_head_weights,
                                                       (0, 0, 0, pad_width),
                                                       'constant',

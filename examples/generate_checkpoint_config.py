@@ -47,13 +47,6 @@ def parse_arguments():
         'To shard it along hidden dimension, set embedding_sharding_dim=1'
         'Note: embedding sharing is only enabled when embedding_sharding_dim = 0'
     )
-    parser.add_argument(
-        '--share_embedding_table',
-        action='store_true',
-        default=False,
-        help=
-        'Try to reduce the engine size by sharing the embedding lookup table between two layers.'
-        'Note: the flag might not take effect when the criteria are not met.')
 
     parser.add_argument('--tp_size',
                         type=int,
@@ -114,7 +107,6 @@ if __name__ == '__main__':
         'position_embedding_type': args.position_embedding_type,
         'use_parallel_embedding': args.use_parallel_embedding,
         'embedding_sharding_dim': args.embedding_sharding_dim,
-        'share_embedding_table': args.share_embedding_table,
         'quantization': {
             'quant_algo': args.quant_algo,
             'kv_cache_quant_algo': args.kv_cache_quant_algo,

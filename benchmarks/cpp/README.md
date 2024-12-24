@@ -352,3 +352,46 @@ If you want to obtain context and generation logits, you could build an enigne w
 If you want to get the logits, you could run gptSessionBenchmark with `--print_all_logits`. This will print a large number of logit values and has a certain impact on performance.
 
 *Please note that the expected outputs in that document are only for reference, specific performance numbers depend on the GPU you're using.*
+
+
+### 4.launch C++ disaggServerBenchmark
+Currently ,TensorRT-LLM has limited support for disaggregated inference, where context and generation phases of a request can run on different executors. `disaggServerBenchmark` is a tool to benchmark disaggregated inference.
+
+#### Usage
+For detailed usage, you can do the following
+```
+cd cpp/build
+
+# You can directly execute the binary for help information
+./benchmarks/disaggServerBenchmark --help
+```
+`disaggServerBenchmark` only supports `decoder-only` models.
+Here is the basic usage:
+```
+mpirun -n ${proc} benchmarks/disaggServerBenchmark --context_engine_dirs ${context_engine_0},${context_engine_1}...,${context_engine_{m-1}} \
+--generation_engine_dirs ${generation_engine_0},${generation_engine_1}...,${generation_engine_{n-1}} --dataset ${dataset_path}
+```
+This command will launch m context engines and n generation engines. You need to ensure `proc` is equal to the sum of the number of processes required for each engine plus 1. Since we use orchestrator mode for `disaggServerBenchmark` we need an additional process as the orchestrator. For example, if there are two context engines (one is TP2_PP1,another is TP1_PP1) and two generation engines(one is TP2_PP1,another is TP1_PP1), then the `proc` value should be set to 7.
+
+for example:
+```
+mpirun -n 7 benchmarks/disaggServerBenchmark --context_engine_dirs ${llama_7b_tp2_pp1_dir},${llama_7b_tp1_pp1_dir} --generation_engine_dirs ${llama_7b_tp1_pp1_dir},${llama_7b_tp2_pp1_dir} --dataset ${dataset_path}
+
+# need 6 gpus and 7 processes to launch the benchmark.
+```
+
+#### Known Issues
+
+##### 1. error `All available sequence slots are used`
+
+If generation_engine's pp_size >1, the error "All available sequence slots are used" may occur, setting and adjusting the parameter `--request_rate` may help alleviate the problem.
+
+##### 2.KVCache transfers are by default via PCIE on single node.
+Currently, because of the dependency libraries,KVCache transfers are by default via PCIE on single node.
+
+If you want to use NVLink, please check the UCX version in the container by running:
+```
+ucx_info -v
+```
+If the UCX version is less than or equal to 1.17, set `UCX_RNDV_FRAG_MEM_TYPE=cuda` to enable KvCache transfers using NVLink.
+If the UCX version is 1.18, please set `UCX_CUDA_COPY_ASYNC_MEM_TYPE=cuda` to enable KvCache transfers using NVLink.

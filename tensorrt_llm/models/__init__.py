@@ -14,7 +14,9 @@
 # limitations under the License.
 from .baichuan.model import BaichuanForCausalLM
 from .bert.model import (BertForQuestionAnswering,
-                         BertForSequenceClassification, BertModel)
+                         BertForSequenceClassification, BertModel,
+                         RobertaForQuestionAnswering,
+                         RobertaForSequenceClassification, RobertaModel)
 from .bloom.model import BloomForCausalLM, BloomModel
 from .chatglm.config import ChatGLMConfig
 from .chatglm.model import ChatGLMForCausalLM, ChatGLMModel
@@ -59,6 +61,9 @@ __all__ = [
     'BertModel',
     'BertForQuestionAnswering',
     'BertForSequenceClassification',
+    'RobertaModel',
+    'RobertaForQuestionAnswering',
+    'RobertaForSequenceClassification',
     'BloomModel',
     'BloomForCausalLM',
     'DiT',
@@ -165,6 +170,7 @@ MODEL_MAP = {
     'Qwen2ForCausalLM': QWenForCausalLM,
     'Qwen2MoeForCausalLM': QWenForCausalLM,
     'Qwen2ForSequenceClassification': QWenForCausalLM,
+    'Qwen2VLForConditionalGeneration': QWenForCausalLM,
     'WhisperEncoder': WhisperEncoder,
     'EncoderModel': EncoderModel,
     'DecoderModel': DecoderModel,
@@ -178,4 +184,10 @@ MODEL_MAP = {
     'EagleForCausalLM': EagleForCausalLM,
     'CohereForCausalLM': CohereForCausalLM,
     'MllamaForConditionalGeneration': MLLaMAModel,
+    'BertForQuestionAnswering': BertForQuestionAnswering,
+    'BertForSequenceClassification': BertForSequenceClassification,
+    'BertModel': BertModel,
+    'RobertaModel': RobertaModel,
+    'RobertaForQuestionAnswering': RobertaForQuestionAnswering,
+    'RobertaForSequenceClassification': RobertaForSequenceClassification,
 }

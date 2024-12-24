@@ -167,7 +167,6 @@ __device__ inline void global_to_share_one_stage_A(int8_t const* src, int8_t* ds
 
             void* dst_ptr = (void*) (dst_hoisted + global_iter * cta_step_m_or_n * kSmemCol);
             uint4* src_ptr = (uint4*) (src_hoisted + global_iter * cta_step_m_or_n * global_ncols);
-            // *dst_ptr = *src_ptr;
             if constexpr (STAGES > 1)
             {
                 uint32_t addr = cast_smem_ptr_to_uint(dst_ptr);

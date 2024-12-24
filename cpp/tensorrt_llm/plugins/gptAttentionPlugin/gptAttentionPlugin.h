@@ -75,18 +75,20 @@ namespace tensorrt_llm::plugins
 //                                    packed_mask_dim = divUp(max_num_spec_decoding_tokens + 1, 32)
 //     22. spec_decoding_position_offsets (optional, required when medusa is enabled) (int32_t) [batch_size,
 //     max_num_spec_decoding_tokens + 1]
-//     23. host_runtime_perf_knobs (int64)
-//     24. host_context_progress (void*)
-//     25. position_id_tensor(MLA) [total_tokens], used for rope embedding in MLA
-//     26. q_a_proj_tensor(MLA) [hidden_dim, c_q_dim + c_k_dim + ropd_dim], used to proj compacted QKV
-//     27. q_a_layernorm_tensor(MLA) [c_q_dim], rmsnorm weight for compacted q
-//     28. q_b_proj_tensor(MLA) [c_q_dim, head_num * head_size], weight for companted q to q in context
-//     29. kv_a_proj_with_mqa_tensor(MLA) [c_q_dim, head_num * (c_k_dim + rope_dim)], weight for companted q to kdim in
+//     23. long_rope_rotary_inv_freq [head / 2] (float) (on device, optional)
+//     24. long_rope_rotary_cos_sin [max_num_embedding_positions, 2] (float) (on device, optional)
+//     25. host_runtime_perf_knobs (int64)
+//     26. host_context_progress (void*)
+//     27. position_id_tensor(MLA) [total_tokens], used for rope embedding in MLA
+//     28. q_a_proj_tensor(MLA) [hidden_dim, c_q_dim + c_k_dim + ropd_dim], used to proj compacted QKV
+//     29. q_a_layernorm_tensor(MLA) [c_q_dim], rmsnorm weight for compacted q
+//     30. q_b_proj_tensor(MLA) [c_q_dim, head_num * head_size], weight for companted q to q in context
+//     31. kv_a_proj_with_mqa_tensor(MLA) [c_q_dim, head_num * (c_k_dim + rope_dim)], weight for companted q to kdim in
 //     generation
-//     30. kv_a_layernorm_tensor(MLA) [c_k_dim], rmsnorm weight for compacted kv
-//     31. kv_b_proj_tensor(MLA) [c_k_dim, head_num * 2 * (head_size - rope_dim)], weight for compacted kv to kv in
+//     32. kv_a_layernorm_tensor(MLA) [c_k_dim], rmsnorm weight for compacted kv
+//     33. kv_b_proj_tensor(MLA) [c_k_dim, head_num * 2 * (head_size - rope_dim)], weight for compacted kv to kv in
 //     context
-//     32. skip_attn (optional, bool) [1]: If it is set as true, skip the atteniton plugin and return
+//     34. skip_attn (optional, bool) [1]: If it is set as true, skip the atteniton plugin and return
 //     directly.
 //
 // outputs
@@ -98,16 +100,17 @@ class GPTAttentionPlugin : public GPTAttentionPluginCommon
 {
 public:
     GPTAttentionPlugin(int layer_idx, int num_heads, int vision_start, int vision_length, int num_kv_heads,
-        int layer_idx_in_cache_pool, int head_size, int unidirectional, float q_scaling, float qk_tanh_scale,
-        tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
+        int layer_idx_in_cache_pool, int head_size, int unidirectional, float q_scaling,
+        float attn_logit_softcapping_scale, tensorrt_llm::kernels::PositionEmbeddingType position_embedding_type,
         int rotary_embedding_dim, // for RoPE. 0 for non-RoPE
         float rotary_embedding_base, tensorrt_llm::kernels::RotaryScalingType rotary_embedding_scale_type,
         float rotary_embedding_scale, float rotary_embedding_short_m_scale, float rotary_embedding_long_m_scale,
         int rotary_embedding_max_positions, int rotary_embedding_original_max_positions, int tp_size,
-        int tp_rank,          // for ALiBi
-        bool unfuse_qkv_gemm, // for AutoPP
-        tensorrt_llm::kernels::ContextFMHAType context_fmha_type, bool enable_xqa, int kv_cache_quant_mode,
-        bool remove_input_padding, tensorrt_llm::kernels::AttentionMaskType mask_type,
+        int tp_rank,           // for ALiBi
+        bool unfuse_qkv_gemm,  // for AutoPP
+        bool use_logn_scaling, // for LognScaling
+        tensorrt_llm::kernels::ContextFMHAType context_fmha_type, int kv_cache_quant_mode, bool remove_input_padding,
+        tensorrt_llm::kernels::AttentionMaskType mask_type,
         tensorrt_llm::kernels::BlockSparseParams block_sparse_params, bool paged_kv_cache, int tokens_per_block,
         nvinfer1::DataType type, int32_t max_context_length, bool qkv_bias_enabled, bool cross_attention = false,
         int max_distance = 0, bool pos_shift_enabled = false, bool dense_context_fmha = false,
@@ -115,7 +118,8 @@ public:
         bool use_cache = true, bool is_spec_decoding_enabled = false,
         bool spec_decoding_is_generation_length_variable = false, int spec_decoding_max_generation_length = 1,
         bool is_mla_enabled = false, int q_lora_rank = 0, int kv_lora_rank = 0, int qk_nope_head_dim = 0,
-        int qk_rope_head_dim = 0, int v_head_dim = 0, bool skip_attn = false);
+        int qk_rope_head_dim = 0, int v_head_dim = 0, bool skip_attn = false, int cp_size = 1, int cp_rank = 0,
+        std::set<int32_t> cp_group = {});
 
     GPTAttentionPlugin(void const* data, size_t length);
 
@@ -166,12 +170,6 @@ public:
     size_t getSerializationSize() const noexcept override;
     void serialize(void* buffer) const noexcept override;
 
-    enum class RequestType : int32_t
-    {
-        kCONTEXT = 0,
-        kGENERATION = 1
-    };
-
 private:
     template <typename T, typename AttentionOutT>
     kernels::mlaParams<T> enqueueMLAPreprocess(int32_t localNbSeq, int32_t localNbTokens,
@@ -220,12 +218,17 @@ private:
         SPEC_DECODING_GENERATION_LENGTHS,
         SPEC_DECODING_PACKED_MASK,
         SPEC_DECODING_POSITION_OFFSETS,
+        LONG_ROPE_ROTARY_INV_FREQ,
+        LONG_ROPE_ROTARY_COS_SIN,
+        MROPE_ROTARY_SIN_COS,
+        MROPE_POSITION_DELTAS,
         HOST_RUNTIME_PERF_KNOBS,
         HOST_CONTEXT_PROGRESS,
         MLA_FUSED_Q_PROJ_TENSOR,
         MLA_Q_B_PROJ_TENSOR,
         MLA_KV_B_PROJ_TENSOR,
         SKIP_ATTN,
+        LOGN_SCALING,
         ENUM_SIZE, // Used to count the number of IdxEntry, must put in last
     };
 

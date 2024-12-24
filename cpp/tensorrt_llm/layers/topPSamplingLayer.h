@@ -54,11 +54,12 @@ protected:
 
     TensorPtr mSkipDecodeDevice;
     TensorPtr mSkipDecodeHost;
-    runtime::SizeType32 mAirTopPBlockNum{0};
     size_t mWorkspaceSize{0};
     size_t mSetupWorkspaceSize{0};
 
+    // AirTopP
     cudaDeviceProp mDeviceProp;
+    runtime::SizeType32 mAirTopPBlockNum{0};
     bool mIsDeterministic{true};
     bool mIsAirTopP{false};
 

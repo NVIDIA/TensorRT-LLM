@@ -82,7 +82,7 @@ protected:
     {
         auto modelConfig = ModelConfig(0, 2, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
         modelConfig.setMlpHiddenSize(32);
-        auto worldConfig = WorldConfig(2, 2, 3);
+        auto worldConfig = WorldConfig(2, 2, 1, 3);
         std::vector<LoraModule> modules{
             LoraModule(LoraModule::ModuleType::kATTN_QKV, 16, 3 * 16, false, true, -1, 0),
             LoraModule(LoraModule::ModuleType::kATTN_Q, 16, 16, false, true, -1, 0),
@@ -294,7 +294,7 @@ TEST_F(LoraManagerTest, fillInputTensors)
     LoraManager loraManager;
     auto modelConfig = ModelConfig(0, 2, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
     modelConfig.setMlpHiddenSize(32);
-    auto worldConfig = WorldConfig(1, 1, 0);
+    auto worldConfig = WorldConfig(1, 1, 1, 0);
     std::vector<LoraModule> modules{
         LoraModule(LoraModule::ModuleType::kATTN_QKV, 16, 3 * 16, false, true, -1, 0),
         LoraModule(LoraModule::ModuleType::kATTN_Q, 16, 16, false, true, -1, 0),

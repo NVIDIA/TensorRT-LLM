@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
-import os
 from pathlib import Path
 from typing import List, Optional, Union
 
@@ -84,9 +83,7 @@ class MLLaMAConfig(PretrainedConfig):
         self.num_buckets = num_buckets
         self.max_distance = max_distance
         self.relative_attention = relative_attention
-        # use to debug, should set as True by default after the bug is fixed.
-        self.skip_cross_attn_blocks = os.environ.get("SKIP_CROSS_ATTN_BLOCKS",
-                                                     "False").lower() == "true"
+        self.skip_cross_attn_blocks = True
 
         kwargs.pop('embed_vocab_size', None)
         kwargs.pop('num_kv_heads_per_layer', None)

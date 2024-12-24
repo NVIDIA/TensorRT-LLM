@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 import torch
 from binding_test_utils import *
+from pydantic import BaseModel
 
 import tensorrt_llm.bindings.executor as trtllm
 import tensorrt_llm.version as trtllm_version
@@ -311,12 +312,14 @@ def test_multi_request(streaming: bool, exclude_input_from_output: bool,
         request = trtllm.Request(input_tokens,
                                  max_tokens=max_tokens,
                                  streaming=streaming,
-                                 sampling_config=trtllm.SamplingConfig(),
+                                 sampling_config=trtllm.SamplingConfig(
+                                     num_return_sequences=num_return_sequences),
                                  output_config=output_config,
-                                 end_id=end_id,
-                                 num_return_sequences=num_return_sequences)
+                                 end_id=end_id)
         request_id = executor.enqueue_request(request)
-        tokens[request_id] = [[] for _ in range(request.num_return_sequences)]
+        tokens[request_id] = [
+            [] for _ in range(request.sampling_config.num_return_sequences)
+        ]
         expected_num_tokens[request_id] = get_expected_num_tokens(
             prompt_len, max_tokens, streaming, exclude_input_from_output)
 
@@ -377,12 +380,14 @@ def test_multi_request_with_ids(streaming: bool,
         request = trtllm.Request(input_tokens,
                                  max_tokens=max_tokens,
                                  streaming=streaming,
-                                 sampling_config=trtllm.SamplingConfig(),
+                                 sampling_config=trtllm.SamplingConfig(
+                                     num_return_sequences=num_return_sequences),
                                  output_config=output_config,
-                                 end_id=end_id,
-                                 num_return_sequences=num_return_sequences)
+                                 end_id=end_id)
         request_id = executor.enqueue_request(request)
-        tokens[request_id] = [[] for _ in range(request.num_return_sequences)]
+        tokens[request_id] = [
+            [] for _ in range(request.sampling_config.num_return_sequences)
+        ]
         expected_num_tokens[request_id] = get_expected_num_tokens(
             prompt_len, max_tokens, streaming, exclude_input_from_output)
 
@@ -448,9 +453,9 @@ def test_get_num_responses_ready(streaming: bool,
         request = trtllm.Request([1] * prompt_len,
                                  max_tokens=max_tokens,
                                  streaming=streaming,
-                                 sampling_config=trtllm.SamplingConfig(),
-                                 output_config=output_config,
-                                 num_return_sequences=num_return_sequences)
+                                 sampling_config=trtllm.SamplingConfig(
+                                     num_return_sequences=num_return_sequences),
+                                 output_config=output_config)
         request_id = executor.enqueue_request(request)
         req_num_expected_responses[request_id] = (
             (max_tokens if streaming else 1) * num_return_sequences)
@@ -615,14 +620,14 @@ def test_token_comparison(batching_type: trtllm.BatchingType, streaming: bool,
         req_max_tokens.append(max_tokens)
         req_tokens = given_input[i][:input_len]
         num_return_sequences = 2 if i % 5 == 1 else 1
-        request = trtllm.Request(
-            req_tokens,
-            max_tokens=max_tokens,
-            streaming=streaming,
-            sampling_config=trtllm.SamplingConfig(beam_width),
-            output_config=output_config,
-            end_id=-1,
-            num_return_sequences=num_return_sequences)
+        request = trtllm.Request(req_tokens,
+                                 max_tokens=max_tokens,
+                                 streaming=streaming,
+                                 sampling_config=trtllm.SamplingConfig(
+                                     beam_width,
+                                     num_return_sequences=num_return_sequences),
+                                 output_config=output_config,
+                                 end_id=-1)
         requests.append(request)
 
     req_ids = executor.enqueue_requests(requests)
@@ -630,7 +635,7 @@ def test_token_comparison(batching_type: trtllm.BatchingType, streaming: bool,
     req_to_batch_id = {req_ids[i]: i for i in range(len(requests))}
     tokens = {
         i: [[[] for _ in range(beam_width)]
-            for _ in range(req.num_return_sequences)]
+            for _ in range(req.sampling_config.num_return_sequences)]
         for i, req in enumerate(requests)
     }
 
@@ -876,6 +881,14 @@ def test_prompt_tuning_config():
     assert (config.embedding_table == embedding_table).all()
 
 
+def test_mrope_config():
+    mrope_rotary_sin_cos = torch.ones(1, 4194304)
+    mrope_position_deltas = torch.tensor([-50])
+    config = trtllm.MropeConfig(mrope_rotary_sin_cos, mrope_position_deltas)
+    assert (config.mrope_rotary_sin_cos == mrope_rotary_sin_cos).all()
+    assert (config.mrope_position_deltas == mrope_position_deltas).all()
+
+
 def test_lora_config():
     task_id = 1
     lora_config = trtllm.LoraConfig(task_id)
@@ -919,6 +932,37 @@ def test_wakeup(model_files, model_path):
     executor.shutdown()
     thread.join()
     assert not thread.is_alive()
+
+
+def test_guided_decoding_params():
+    guided_decoding_params = trtllm.GuidedDecodingParams(
+        trtllm.GuidedDecodingParams.GuideType.JSON)
+    assert guided_decoding_params.guide_type == trtllm.GuidedDecodingParams.GuideType.JSON
+
+    class Answer(BaseModel):
+        answer: int
+
+    json_schema = json.dumps(Answer.model_json_schema())
+    guided_decoding_params = trtllm.GuidedDecodingParams(
+        trtllm.GuidedDecodingParams.GuideType.JSON_SCHEMA, guide=json_schema)
+    assert guided_decoding_params.guide_type == trtllm.GuidedDecodingParams.GuideType.JSON_SCHEMA
+    assert guided_decoding_params.guide == json_schema
+
+    with pytest.raises(Exception):
+        trtllm.GuidedDecodingParams(
+            trtllm.GuidedDecodingParams.GuideType.JSON_SCHEMA)
+
+    regex = "\d+"
+    guided_decoding_params = trtllm.GuidedDecodingParams(
+        trtllm.GuidedDecodingParams.GuideType.REGEX, guide=regex)
+    assert guided_decoding_params.guide_type == trtllm.GuidedDecodingParams.GuideType.REGEX
+    assert guided_decoding_params.guide == regex
+
+    ebnf_grammar = "root ::= [0-9]+"
+    guided_decoding_params = trtllm.GuidedDecodingParams(
+        trtllm.GuidedDecodingParams.GuideType.EBNF_GRAMMAR, guide=ebnf_grammar)
+    assert guided_decoding_params.guide_type == trtllm.GuidedDecodingParams.GuideType.EBNF_GRAMMAR
+    assert guided_decoding_params.guide == ebnf_grammar
 
 
 def test_request():
@@ -1046,13 +1090,14 @@ def test_scheduler_config():
     assert config.capacity_scheduler_policy == capacity_scheduler_policy
     assert config.context_chunking_policy == context_chunking_policy
 
-    dynamic_batch_config = trtllm.DynamicBatchConfig(True, 128)
+    dynamic_batch_config = trtllm.DynamicBatchConfig(True, True, 128)
     config = trtllm.SchedulerConfig(capacity_scheduler_policy,
                                     context_chunking_policy,
                                     dynamic_batch_config)
     assert config.capacity_scheduler_policy == capacity_scheduler_policy
     assert config.context_chunking_policy == context_chunking_policy
     assert config.dynamic_batch_config.enable_batch_size_tuning == True
+    assert config.dynamic_batch_config.enable_max_num_tokens_tuning == True
     assert config.dynamic_batch_config.dynamic_batch_moving_average_window == 128
 
 
@@ -1198,13 +1243,26 @@ def test_lookahead_decoding_config():
 
 
 def test_eagle_config():
-    config = trtllm.EagleConfig([[0, 0], [0, 1]])
+    config = trtllm.EagleConfig([[0, 0], [0, 1]], False, 0.5)
     assert config.eagle_choices == [[0, 0], [0, 1]]
+    assert config.greedy_sampling == False
+    assert config.posterior_threshold == 0.5
 
-    config = trtllm.EagleConfig([[0, 0], [0, 1, 0]])
+    config = trtllm.EagleConfig([[0, 0], [0, 1, 0]], True)
     assert config.eagle_choices == [[0, 0], [0, 1, 0]]
+    assert config.greedy_sampling == True
+    assert config.posterior_threshold == None
 
-    kwargs = {"eagle_choices": [[0, 0], [0, 1], [0, 2]]}
+    config = trtllm.EagleConfig(None, True, 0.5)
+    assert config.eagle_choices == None
+    assert config.greedy_sampling == True
+    assert config.posterior_threshold == 0.5
+
+    kwargs = {
+        "eagle_choices": [[0, 0], [0, 1], [0, 2]],
+        "greedy_sampling": True,
+        "posterior_threshold": 0.5
+    }
 
     config = trtllm.EagleConfig(**kwargs)
     for k, v in kwargs.items():
@@ -1301,6 +1359,21 @@ def test_logits_post_processor_config():
         assert getattr(config, k) == v
 
 
+def test_guided_decoding_config():
+    encoded_vocab = ["eos", "a", "b", "c", "d"]
+    tokenizer_str = None
+    stop_token_ids = [0]
+    guided_decoding_config = trtllm.GuidedDecodingConfig(
+        backend=trtllm.GuidedDecodingConfig.GuidedDecodingBackend.XGRAMMAR,
+        encoded_vocab=encoded_vocab,
+        tokenizer_str=tokenizer_str,
+        stop_token_ids=stop_token_ids)
+    assert guided_decoding_config.backend == trtllm.GuidedDecodingConfig.GuidedDecodingBackend.XGRAMMAR
+    assert guided_decoding_config.encoded_vocab == encoded_vocab
+    assert guided_decoding_config.tokenizer_str == tokenizer_str
+    assert guided_decoding_config.stop_token_ids == stop_token_ids
+
+
 def test_executor_config():
     config = trtllm.ExecutorConfig()
     assert config.max_beam_width == 1
@@ -1320,6 +1393,7 @@ def test_executor_config():
     assert config.recv_poll_period_ms == 0
     assert config.max_seq_idle_microseconds == 180000000
     assert config.spec_dec_config is None
+    assert config.guided_decoding_config is None
 
     kwargs = {
         "max_beam_width":
@@ -1359,7 +1433,11 @@ def test_executor_config():
         "max_seq_idle_microseconds":
         240 * 1000 * 1000,
         "spec_dec_config":
-        trtllm.SpeculativeDecodingConfig(fast_logits=True)
+        trtllm.SpeculativeDecodingConfig(fast_logits=True),
+        "guided_decoding_config":
+        trtllm.GuidedDecodingConfig(
+            trtllm.GuidedDecodingConfig.GuidedDecodingBackend.XGRAMMAR,
+            encoded_vocab=["eos", "a", "b", "c", "d"]),
     }
     config = trtllm.ExecutorConfig(**kwargs)
     for k, v in kwargs.items():
@@ -1375,6 +1453,8 @@ def test_executor_config():
     assert isinstance(config.logits_post_processor_config,
                       trtllm.LogitsPostProcessorConfig)
     assert isinstance(config.spec_dec_config, trtllm.SpeculativeDecodingConfig)
+    assert isinstance(config.guided_decoding_config,
+                      trtllm.GuidedDecodingConfig)
 
 
 def test_parallel_config():
@@ -1637,6 +1717,80 @@ def test_kv_event_stream(model_path):
                         0].block_hash
 
 
+@pytest.mark.parametrize("streaming", [False, True])
+def test_request_perf_metrics(streaming: bool, model_path):
+
+    # Create executor
+    beam_width = 1
+    executor_config = trtllm.ExecutorConfig(beam_width)
+    executor = trtllm.Executor(model_path, trtllm.ModelType.DECODER_ONLY,
+                               executor_config)
+
+    # Create request
+    max_tokens = 5
+    input_tokens = [1, 2, 3, 4]
+    output_config = trtllm.OutputConfig(return_perf_metrics=True)
+    request = trtllm.Request(input_tokens,
+                             max_tokens=max_tokens,
+                             streaming=streaming,
+                             output_config=output_config)
+
+    # Enqueue the request
+    request_id = executor.enqueue_request(request)
+
+    def check_perf_metrics(perf_metrics, done, response_id):
+        assert perf_metrics is not None
+
+        timing_metrics = perf_metrics.timing_metrics
+        assert timing_metrics.arrival_time < timing_metrics.first_scheduled_time
+        assert timing_metrics.first_scheduled_time < timing_metrics.first_token_time
+        if done:
+            assert timing_metrics.first_token_time < timing_metrics.last_token_time
+        else:
+            assert timing_metrics.last_token_time == datetime.timedelta(0)
+
+        kv_cache_metrics = perf_metrics.kv_cache_metrics
+        assert kv_cache_metrics.num_total_allocated_blocks == 1
+        assert kv_cache_metrics.num_new_allocated_blocks == 1
+        assert kv_cache_metrics.num_reused_blocks == 0
+        assert kv_cache_metrics.num_missed_blocks == 0
+        assert kv_cache_metrics.kv_cache_hit_rate == 0
+
+        assert perf_metrics.first_iter == 0
+        if done:
+            assert perf_metrics.iter == (max_tokens - 1)
+            assert perf_metrics.last_iter == max_tokens - 1
+        else:
+            assert perf_metrics.iter == response_id
+            assert perf_metrics.last_iter is None
+
+    # Get the new tokens
+    tokens = []
+    done = False
+    i = 0
+    max_wait_ms = 10000
+    response_id = 0
+    while not done and i < max_wait_ms:
+        wait_time = datetime.timedelta(milliseconds=1)
+        responses = executor.await_responses(request_id, wait_time)
+        for response in responses:
+            assert not response.has_error(
+            ), f"Request id {request_id} failed with err {response.error_msg}"
+            result = response.result
+            done = result.is_final
+            check_perf_metrics(result.request_perf_metrics, done, response_id)
+            new_tokens = result.output_token_ids[beam_width - 1]
+            tokens.extend(new_tokens)
+            response_id += 1
+        i += 1
+    assert i < max_wait_ms
+    assert len(tokens) == get_expected_num_tokens(
+        len(input_tokens),
+        max_tokens,
+        streaming=streaming,
+        exclude_input_from_output=False), f"{request_id}"
+
+
 def test_kv_event_stream_timeout(model_path):
 
     beam_width = 1
@@ -1801,6 +1955,35 @@ def test_logits_post_processor_config_pickle():
         assert getattr(config, k) == getattr(config_copy, k)
 
 
+def test_guided_decoding_params_pickle():
+
+    class Answer(BaseModel):
+        answer: int
+
+    json_schema = json.dumps(Answer.model_json_schema())
+    params = trtllm.GuidedDecodingParams(
+        trtllm.GuidedDecodingParams.GuideType.JSON_SCHEMA, guide=json_schema)
+    params_copy = pickle.loads(pickle.dumps(params))
+    assert params_copy.guide_type == params.guide_type
+    assert params_copy.guide == params.guide
+
+
+def test_guided_decoding_config_pickle():
+    encoded_vocab = ["eos", "a", "b", "c", "d"]
+    tokenizer_str = None
+    stop_token_ids = [0]
+    config = trtllm.GuidedDecodingConfig(
+        backend=trtllm.GuidedDecodingConfig.GuidedDecodingBackend.XGRAMMAR,
+        encoded_vocab=encoded_vocab,
+        tokenizer_str=tokenizer_str,
+        stop_token_ids=stop_token_ids)
+    config_copy = pickle.loads(pickle.dumps(config))
+    assert config_copy.backend == config.backend
+    assert config_copy.encoded_vocab == config.encoded_vocab
+    assert config_copy.tokenizer_str == config.tokenizer_str
+    assert config_copy.stop_token_ids == config.stop_token_ids
+
+
 def test_executor_config_pickle():
     beam_width = 2
     config = trtllm.ExecutorConfig(beam_width)
@@ -1850,6 +2033,7 @@ def test_executor_config_pickle():
         if "config" not in k:
             assert getattr(config, k) == v
 
+
     pickle.dumps(config)
     config_copy = pickle.loads(pickle.dumps(config))
     assert config.max_beam_width == config_copy.max_beam_width
@@ -1882,6 +2066,27 @@ def test_return_full_tokens():
     assert request.return_all_generated_tokens == True
     request.return_all_generated_tokens = False
     assert request.return_all_generated_tokens == False
+
+
+def test_getters_return_references():
+    config = trtllm.ExecutorConfig()
+    # Make sure kv_cache_config is a reference. Returning a value
+    # will lead to the very confusing behavior of this set statement
+    # not working.
+    config.kv_cache_config.max_tokens = 42
+    assert config.kv_cache_config.max_tokens == 42
+
+
+def test_allotted_time_ms():
+    allotted_time = datetime.timedelta(milliseconds=2)
+    input_tokens = [1, 2, 3, 4]
+
+    max_new_tokens = 5
+    request = trtllm.Request(input_tokens, max_tokens=max_new_tokens)
+
+    request.allotted_time_ms = allotted_time
+
+    assert request.allotted_time_ms == datetime.timedelta(milliseconds=2)
 
 
 def test_executor_version():

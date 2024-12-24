@@ -138,6 +138,12 @@ improved end-to-end performance.
 Please note that currently, this feature is
 only supported for the llama model. It is recommended to enable this feature when the batch size is small and the generation phase time is the dominant factor.
 
+### User Buffer
+
+An experimental feature called "User Buffer" is available to enhance communication performance. It can be enabled by using the `--user_buffer enable` argument with `trtllm-build`.
+This feature aims to eliminate extra copies from the local buffer to the shared buffer in the communication kernel, leading to improved end-to-end performance.
+This feature must be enabled with `--reduce_fusion enable` and is only supported for the FP8 LLAMA model.
+
 ### Embedding Parallelism, Embedding Sharing, and Look-Up Plugin
 
 The embedding parallelism feature enables the sharding of the embedding table

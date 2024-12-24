@@ -20,7 +20,10 @@ The LLM API can be used for both offline or online usage. See more examples of t
     llm_inference_async_streaming
     llm_quantization
     llm_auto_parallel
+    llm_multilora
     llm_logits_processor
+    llm_guided_decoding
+    llm_lookahead_decoding
 
 For more details on how to fully utilize this API, check out:
 

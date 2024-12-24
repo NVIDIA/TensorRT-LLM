@@ -104,6 +104,7 @@ class LlmServer:
 @click.option("--max_beam_width", type=int, default=1)
 @click.option("--tp_size", type=int, default=1)
 @click.option("--pp_size", type=int, default=1)
+@click.option("--cp_size", type=int, default=1)
 @click.option("--kv_cache_free_gpu_memory_fraction", type=float, default=0.8)
 def entrypoint(model_dir: str,
                tokenizer: Optional[str] = None,
@@ -112,6 +113,7 @@ def entrypoint(model_dir: str,
                max_beam_width: int = 1,
                tp_size: int = 1,
                pp_size: int = 1,
+               cp_size: int = 1,
                kv_cache_free_gpu_memory_fraction: float = 0.8):
     host = host or "0.0.0.0"
     port = port or 8000

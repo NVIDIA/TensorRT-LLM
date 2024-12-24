@@ -24,7 +24,6 @@ from torch.utils import dlpack as torch_dlpack
 
 from ..._utils import pad_vocab_size, release_gc
 from ...layers import MoeConfig
-from ...logger import logger
 from ...quantization import QuantAlgo
 from ..convert_utils import split
 from ..modeling_utils import PretrainedConfig, QuantConfig, optimize_model
@@ -81,7 +80,6 @@ def convert_grok(hf_model,
                  use_parallel_embedding=False,
                  sharding_dim=0,
                  use_weight_only=False,
-                 share_embedding_table=False,
                  use_gemm_woq_plugin=False,
                  plugin_weight_only_quant_type=torch.int8,
                  moe_config=None):
@@ -451,12 +449,6 @@ def from_hugging_face(cls,
     if isinstance(model_dir, Path):  # some code relies on this as string
         model_dir = str(model_dir)
 
-    if override_fields.get('share_embedding_table', False):
-        logger.warning(
-            "Llama model does not support share_embedding_table; setting share_embedding_table=False"
-        )
-        override_fields['share_embedding_table'] = False
-
     config = create_config_from_xai(dtype,
                                     mapping,
                                     quantization,
@@ -469,7 +461,6 @@ def from_hugging_face(cls,
     grok = optimize_model(
         grok,
         use_parallel_embedding=pretrained_config.use_parallel_embedding,
-        share_embedding_table=pretrained_config.share_embedding_table,
     )
 
     if skip_loading_weights:
@@ -523,6 +514,5 @@ def load_weights_from_xai(*, config, mapping, model):
         plugin_weight_only_quant_type=plugin_weight_only_quant_type,
         use_parallel_embedding=config.get('use_parallel_embedding', False),
         sharding_dim=config.get('embedding_sharding_dim', 0),
-        share_embedding_table=config.get('share_embedding_table', False),
         moe_config=moe_config)
     return weights

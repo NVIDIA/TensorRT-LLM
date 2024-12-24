@@ -266,6 +266,7 @@ std::tuple<std::shared_ptr<BaseDecodingOutputs>, std::shared_ptr<BaseDecodingInp
         decodeInputs->useRandomAcceptanceThreshold = externalDraftTokenParams->useRandomAcceptanceThreshold;
         decodeInputs->step = externalDraftTokenParams->step;
         decodeInputs->useDraftLogits = externalDraftTokenParams->useDraftLogits;
+        decodeInputs->useDraftLogitsHost = externalDraftTokenParams->useDraftLogitsHost;
 
         preparedInputs = decodeInputs;
         preparedOutputs = baseOutputs;

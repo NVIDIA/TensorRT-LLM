@@ -29,10 +29,11 @@
 using namespace tensorrt_llm::runtime;
 namespace tc = tensorrt_llm::common;
 
-WorldConfig::WorldConfig(SizeType32 tensorParallelism, SizeType32 pipelineParallelism, SizeType32 rank,
-    SizeType32 gpusPerNode, std::optional<std::vector<SizeType32>> const& deviceIds)
+WorldConfig::WorldConfig(SizeType32 tensorParallelism, SizeType32 pipelineParallelism, SizeType32 contextParallelism,
+    SizeType32 rank, SizeType32 gpusPerNode, std::optional<std::vector<SizeType32>> const& deviceIds)
     : mTensorParallelism{tensorParallelism}
     , mPipelineParallelism{pipelineParallelism}
+    , mContextParallelism{contextParallelism}
     , mRank{rank}
     , mGpusPerNode{gpusPerNode}
     , mDeviceIds{deviceIds.value_or(std::vector<SizeType32>(mGpusPerNode))}
@@ -87,7 +88,8 @@ bool WorldConfig::validMpiConfig() const
 }
 
 WorldConfig WorldConfig::mpi(SizeType32 gpusPerNode, std::optional<SizeType32> tensorParallelism,
-    std::optional<SizeType32> pipelineParallelism, std::optional<std::vector<SizeType32>> const& deviceIds)
+    std::optional<SizeType32> pipelineParallelism, std::optional<SizeType32> contextParallelism,
+    std::optional<std::vector<SizeType32>> const& deviceIds)
 {
 #if ENABLE_MULTI_DEVICE
     auto& comm = COMM_SESSION;
@@ -96,9 +98,11 @@ WorldConfig WorldConfig::mpi(SizeType32 gpusPerNode, std::optional<SizeType32> t
     auto const mpiLocalSize = LOCAL_COMM_SESSION.getSize();
     TLLM_LOG_INFO("MPI size: %d, MPI local size: %d, rank: %d", mpiSize, mpiLocalSize, mpiRank);
     auto const pp = pipelineParallelism.value_or(1);
-    auto const tp = tensorParallelism.value_or(mpiSize / pp);
-    TLLM_LOG_DEBUG("TP: %d, PP: %d, gpusPerNode: %d", tp, pp, gpusPerNode);
-    TLLM_CHECK_WITH_INFO(mpiSize == tp * pp, "MPI size %d != TP size %d * PP size %d", mpiSize, tp, pp);
+    auto const cp = contextParallelism.value_or(1);
+    auto const tp = tensorParallelism.value_or(mpiSize / pp / cp);
+    TLLM_LOG_DEBUG("TP: %d, PP: %d, CP: %d, gpusPerNode: %d", tp, pp, cp, gpusPerNode);
+    TLLM_CHECK_WITH_INFO(
+        mpiSize == tp * pp * cp, "MPI size %d != TP size %d * PP size %d * CP Size %d", mpiSize, tp, pp, cp);
     SizeType32 deviceCount{0};
     TLLM_CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
     if ((mpiSize < gpusPerNode && deviceCount < mpiSize) || (mpiSize >= gpusPerNode && deviceCount < gpusPerNode))
@@ -128,7 +132,7 @@ WorldConfig WorldConfig::mpi(SizeType32 gpusPerNode, std::optional<SizeType32> t
         gpusPerNode = 1;
     }
 
-    return WorldConfig{tp, pp, mpiRank, gpusPerNode, deviceIds};
+    return WorldConfig{tp, pp, cp, mpiRank, gpusPerNode, deviceIds};
 #else
     return WorldConfig();
 #endif
@@ -138,10 +142,11 @@ std::vector<SizeType32> WorldConfig::getPipelineParallelGroup() const
 {
     auto const pp = getPipelineParallelism();
     auto const tp = getTensorParallelism();
+    auto const cp = getContextParallelism();
     auto const worldSize = getSize();
     std::vector<SizeType32> group;
     group.reserve(pp);
-    for (SizeType32 idx = getTensorParallelRank(); idx < worldSize; idx += tp)
+    for (SizeType32 idx = getTensorParallelRank() * cp + getContextParallelRank(); idx < worldSize; idx += tp * cp)
     {
         group.push_back(idx);
     }
@@ -158,6 +163,21 @@ std::vector<SizeType32> WorldConfig::getTensorParallelGroup() const
     for (SizeType32 idx = 0; idx < tp; idx++)
     {
         group.push_back(rank - tpRank + idx);
+    }
+    return group;
+}
+
+std::vector<SizeType32> WorldConfig::getContextParallelGroup() const
+{
+    auto const cp = getContextParallelism();
+    auto const tp = getTensorParallelism();
+    auto const pp = getPipelineParallelism();
+    auto const rank = getRank();
+    std::vector<SizeType32> group;
+    group.reserve(cp);
+    for (SizeType32 idx = 0; idx < cp; idx++)
+    {
+        group.push_back(rank + cp % (tp * pp));
     }
     return group;
 }

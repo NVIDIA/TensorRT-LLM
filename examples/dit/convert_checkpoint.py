@@ -190,7 +190,8 @@ def convert_timm_dit(args, mapping, dtype='float32'):
 
     weights = dict()
     for name, param in model_params.items():
-        if param.dtype == torch.int8 or 'scaling_factor' in name:
+        if param.dtype in [torch.int8, torch.float8_e4m3fn
+                           ] or 'scaling_factor' in name:
             if 'scaling_factor' in name:
                 assert param.dtype == torch.float32
             weights[get_trtllm_name(name)] = param.contiguous()

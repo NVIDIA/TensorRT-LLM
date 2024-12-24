@@ -15,10 +15,10 @@
  */
 
 #include "medusaDecodingLayer.h"
+#include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/samplingTopKKernels.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/medusaDecodingKernels.h"
-#include "tensorrt_llm/layers/layerUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 
@@ -219,10 +219,12 @@ void MedusaDecodingLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> c
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(MedusaDecodingLayer_forwardAsync);
 
     auto inputs = std::dynamic_pointer_cast<MedusaDecodingInputs>(baseInputs);
     auto outputs = std::dynamic_pointer_cast<SpeculativeDecodingOutputs>(baseOutputs);
 
+    // TODO add typical acceptance similarly to EagleSampleAndAcceptDraftTokensPlugin::doTypicalAcceptance.
     samplePrimeHeadTokens(*outputs, *inputs, workspace);
 
     acceptDraftTokens(*outputs, *inputs, workspace);
@@ -467,7 +469,7 @@ void MedusaDecodingLayer<T>::packAcceptedPaths(SpeculativeDecodingOutputs const&
     TLLM_CHECK_WITH_INFO(numNewTokensCumSum != nullptr, "numNewTokensCumSum must be provided for MedusaDecoding");
     TLLM_CHECK_WITH_INFO(pathsOffsets != nullptr, "pathsOffsets must be provided for MedusaDecoding");
     invokePackAcceptedPaths(numNewTokensCumSum, pathsOffsets, numNewTokens, bestPathIdsDevicePtr, paths, batchSlots,
-        batchSize, mDecoderDomain.getMaxDecodingTokens(),
+        batchSize, batchSize, mDecoderDomain.getMaxDecodingTokens(),
         mDecoderDomain.getSpeculativeDecodingModule()->getMaxPathLen(), false, getStream());
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);

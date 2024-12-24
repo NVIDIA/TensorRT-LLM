@@ -8,6 +8,9 @@ This document shows how to build and run a [whisper model](https://github.com/op
   - [Usage](#usage)
     - [Build TensorRT engine(s)](#build-tensorrt-engines)
     - [Run](#run)
+      - [Run C++ runtime](#run-c-runtime)
+      - [Run Python runtime](#run-python-runtime)
+      - [Advanced Usage](#advanced-usage)
     - [Distil-Whisper](#distil-whisper)
     - [Acknowledgment](#acknowledgment)
 
@@ -64,7 +67,6 @@ python3 convert_checkpoint.py \
 trtllm-build  --checkpoint_dir ${checkpoint_dir}/encoder \
               --output_dir ${output_dir}/encoder \
               --moe_plugin disable \
-              --enable_xqa disable \
               --max_batch_size ${MAX_BATCH_SIZE} \
               --gemm_plugin disable \
               --bert_attention_plugin ${INFERENCE_PRECISION} \
@@ -73,7 +75,6 @@ trtllm-build  --checkpoint_dir ${checkpoint_dir}/encoder \
 trtllm-build  --checkpoint_dir ${checkpoint_dir}/decoder \
               --output_dir ${output_dir}/decoder \
               --moe_plugin disable \
-              --enable_xqa disable \
               --max_beam_width ${MAX_BEAM_WIDTH} \
               --max_batch_size ${MAX_BATCH_SIZE} \
               --max_seq_len 114 \
@@ -169,7 +170,6 @@ python3 convert_checkpoint.py \
 trtllm-build  --checkpoint_dir ${checkpoint_dir}/encoder \
               --output_dir ${output_dir}/encoder \
               --moe_plugin disable \
-              --enable_xqa disable \
               --max_batch_size ${MAX_BATCH_SIZE} \
               --gemm_plugin disable \
               --bert_attention_plugin ${INFERENCE_PRECISION} \
@@ -178,7 +178,6 @@ trtllm-build  --checkpoint_dir ${checkpoint_dir}/encoder \
 trtllm-build  --checkpoint_dir ${checkpoint_dir}/decoder \
               --output_dir ${output_dir}/decoder \
               --moe_plugin disable \
-              --enable_xqa disable \
               --max_beam_width ${MAX_BEAM_WIDTH} \
               --max_batch_size ${MAX_BATCH_SIZE} \
               --max_seq_len 114 \

@@ -6,12 +6,16 @@ import datetime
 import faulthandler
 import io
 import json
+import multiprocessing
 import os
 import pickle  # nosec B403
+import platform
 import signal
 import time
 import traceback
+import weakref
 from abc import ABC, abstractmethod
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
@@ -24,6 +28,8 @@ import numpy as np
 import torch
 import zmq
 
+from tensorrt_llm.logger import set_level
+
 from ._utils import mpi_rank, mpi_world_size
 from .bindings import executor as tllm
 from .builder import ConfigEncoder, Engine, EngineConfig
@@ -32,11 +38,19 @@ from .llmapi.mpi_session import (MpiPoolSession, MpiSession,
                                  need_spawn_mpi_workers)
 from .llmapi.tracer import (VizTracer, enable_llm_tracer, get_tracer,
                             global_tracer, set_global_tracer)
-from .llmapi.utils import (AsyncQueue, ManagedThread, SamplingParams,
-                           _SyncQueue, enable_llm_debug, print_colored)
+from .llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
+                           enable_llm_debug, print_colored)
 from .lora_manager import LoraManager
 from .prompt_adapter_manager import PromptAdapterManager
+from .runtime import ModelConfig
 from .runtime.model_runner import _engine_config_to_model_config
+from .sampling_params import SamplingParams
+
+unblock_corountine = True
+
+if enable_llm_debug():
+    # Mainly enable more detailed logging from cpp runtime.
+    set_level("info")
 
 
 @dataclass(slots=True)
@@ -626,7 +640,8 @@ class GenerationExecutor(ABC):
     @staticmethod
     def create(
         engine: Union[Path, Engine],
-        executor_config: tllm.ExecutorConfig = tllm.ExecutorConfig(1),
+        executor_config: Optional[tllm.ExecutorConfig] = None,
+        logits_post_processor_map: Optional[Dict[str, Callable]] = None,
         model_world_size: int = 1,
         world_size: int = 0,
         mpi_session: Optional[MpiSession] = None,
@@ -645,6 +660,7 @@ class GenerationExecutor(ABC):
         worker_kwargs = {
             "engine": engine,
             "executor_config": executor_config,
+            "logits_post_processor_map": logits_post_processor_map,
         }
 
         # The case where the Python main process is launched by mpirun
@@ -658,7 +674,68 @@ class GenerationExecutor(ABC):
                                          model_world_size=model_world_size,
                                          mpi_session=mpi_session)
 
-        return ExecutorBindingsWorker(**worker_kwargs)
+        # For single-gpu case:
+        # Partition the workload to multiple process for performance. While this requires uses to protect their entrypoint
+        # to `if __name__ == "__main__":`.
+
+        if not platform.system() == 'Windows':
+            return ExecutorBindingsProxy(worker_kwargs,
+                                         model_world_size=model_world_size,
+                                         mpi_session=None)  # use mpi4py
+        else:
+            ctx = multiprocessing.get_context("spawn")
+            # The ProcessPoolExecutorSession is used to support Windows, as mpi4py cannot.
+            mpi_session = ProcessPoolExecutorSession(n_workers=1,
+                                                     mp_context=ctx)
+            return ExecutorBindingsProxy(worker_kwargs,
+                                         model_world_size=model_world_size,
+                                         mpi_session=mpi_session)
+
+    def wait_first_completed(
+        self, futures: List[GenerationResult]
+    ) -> Generator[GenerationResult, None, None]:
+        wait_set = set(futures)
+
+        # clear already-finished requests
+        for f in futures:
+            if f._done:
+                wait_set.pop(f)
+                yield f
+
+        # wait remaining active requests
+        while len(wait_set) > 0:
+            fut = wait_set.pop()
+            if fut.request_id not in self._results:
+                yield fut
+            else:
+                wait_set.add(fut)
+
+
+class ProcessPoolExecutorSession(MpiSession):
+    # This process pool is introduced for better recoverable exceptions handling.
+    # It replaces MpiPoolExecutor for single-gpu case.
+
+    def __init__(self, n_workers: int, **kwargs):
+        self.n_workers = n_workers
+        self.mpi_pool = ProcessPoolExecutor(max_workers=self.n_workers,
+                                            **kwargs)
+
+    def submit(self, task: Callable, *args,
+               **kwargs) -> List[concurrent.futures.Future]:
+        return [
+            self.mpi_pool.submit(task, *args, **kwargs)
+            for i in range(self.n_workers)
+        ]
+
+    def submit_sync(self, task: Callable, *args, **kwargs) -> List[Any]:
+        futures = [
+            self.mpi_pool.submit(task, *args, **kwargs)
+            for i in range(self.n_workers)
+        ]
+        return [future.result() for future in futures]
+
+    def shutdown(self):
+        self.mpi_pool.shutdown(wait=False)
 
 
 class ExecutorBindingsWorker(GenerationExecutor):
@@ -669,7 +746,8 @@ class ExecutorBindingsWorker(GenerationExecutor):
     def __init__(
         self,
         engine: Union[Path, Engine],
-        executor_config: tllm.ExecutorConfig = tllm.ExecutorConfig(1)
+        executor_config: Optional[tllm.ExecutorConfig] = None,
+        logits_post_processor_map: Optional[Dict[str, Callable]] = None,
     ) -> None:
         super().__init__()
 
@@ -682,22 +760,34 @@ class ExecutorBindingsWorker(GenerationExecutor):
         if isinstance(engine, list):
             engine = engine[self.rank]
 
-        if isinstance(engine, Engine):
-            self.engine = tllm.Executor(engine.engine,
-                                        json.dumps(engine.config.to_dict(),
-                                                   cls=ConfigEncoder),
-                                        tllm.ModelType.DECODER_ONLY,
-                                        executor_config=executor_config,
-                                        managed_weights=engine.managed_weights)
-        else:
-            self.engine = tllm.Executor(engine,
-                                        tllm.ModelType.DECODER_ONLY,
-                                        executor_config=executor_config)
+        if executor_config is None:
+            executor_config = tllm.ExecutorConfig(1)
+
+        if logits_post_processor_map is not None:
+            executor_config.logits_post_processor_config = tllm.LogitsPostProcessorConfig(
+                processor_map=logits_post_processor_map, replicate=False)
+
+        def _create_engine():
+            if isinstance(engine, Engine):
+                return tllm.Executor(engine.engine,
+                                     json.dumps(engine.config.to_dict(),
+                                                cls=ConfigEncoder),
+                                     tllm.ModelType.DECODER_ONLY,
+                                     executor_config=executor_config,
+                                     managed_weights=engine.managed_weights)
+
+            use_default_executor = True
+            if use_default_executor:
+                return tllm.Executor(engine, tllm.ModelType.DECODER_ONLY,
+                                     executor_config)
+
+
+        self.engine = _create_engine()
 
         self._lora_manager: Optional[LoraManager] = None
         self._prompt_adapter_manager: Optional[PromptAdapterManager] = None
         self._runtime_model_config: Optional[ModelConfig] = None
-        if self.rank == 0:
+        if self.rank == 0 and isinstance(self.engine, tllm.Executor):
             if isinstance(engine, Engine):
                 engine_config = engine.config
             else:
@@ -767,7 +857,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
     def await_response_task(self) -> bool:
         # Get responses and place in queue.
 
-        async_events = []
+        async_queues = []
         event_loop = None
         for response in self.engine.await_responses(timeout=datetime.timedelta(
                 milliseconds=100)):
@@ -817,9 +907,9 @@ class ExecutorBindingsWorker(GenerationExecutor):
             if isinstance(queue, _SyncQueue):
                 global_tracer().log_instant("worker-rsp.put")
                 queue.put_nowait(rsp)
-                async_events.append(queue.event)
+                async_queues.append(queue)
                 # all the loops are identical
-                event_loop = queue.loop if event_loop is None else event_loop
+                event_loop = event_loop or queue.loop
             else:
                 global_tracer().log_instant("worker-rsp.put")
                 queue.put(rsp)  # This could be IPC
@@ -828,8 +918,8 @@ class ExecutorBindingsWorker(GenerationExecutor):
             if rsp.is_final:
                 self._results.pop(client_id)
 
-        if async_events:
-            _SyncQueue.notify_events(event_loop, async_events)
+        if async_queues:
+            _SyncQueue.notify_queues(event_loop, async_queues)
 
         return True  # success
 
@@ -869,7 +959,8 @@ class ExecutorBindingsWorker(GenerationExecutor):
     def start(self):
         self.create_stats_queue()
         self.start_awaiter_thread()
-        self.start_stats_thread()
+        # TODO: Replace this with a decent get_stats implementation
+        #self.start_stats_thread()
 
     def _load_lora_adapter(self, lora_request: LoRARequest):
         self._lora_manager.load_from_ckpt(
@@ -923,6 +1014,9 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 request.sampling_params.end_id,
                 pad_id=request.sampling_params.pad_id,
                 output_config=request.sampling_params._get_output_config(),
+                lookahead_config=request.sampling_params.lookahead_config,
+                guided_decoding_params=request.sampling_params.
+                _get_guided_decoding_params(),
                 bad_words=request.sampling_params._get_bad_words(),
                 stop_words=request.sampling_params._get_stop_words(),
                 embedding_bias=request.sampling_params.embedding_bias,
@@ -985,8 +1079,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
                     self.dispatch_stats_thread.stop()
                     self.dispatch_stats_thread.join()
 
-                self.engine.shutdown()
-
+            self.engine.shutdown()
             self.engine = None
 
         # Check if there are any errors from the threads before shutdown.
@@ -994,10 +1087,12 @@ class ExecutorBindingsWorker(GenerationExecutor):
 
     def block_subordinates(self):
         if self.rank != 0:
-            self.shutdown()
-            raise self.WorkerExit(
-                "block_subordinates() should be used in a `with ExecutorBindingsWorker() as ...:` block"
-            )
+            if isinstance(self.engine, tllm.Executor):
+                self.shutdown()
+                raise self.WorkerExit(
+                    "block_subordinates() should be used in a `with ExecutorBindingsWorker() as ...:` block"
+                )
+
 
     def __enter__(self):
         return self
@@ -1008,25 +1103,6 @@ class ExecutorBindingsWorker(GenerationExecutor):
 
     def __del__(self):
         self.shutdown()
-
-    def wait_first_completed(
-        self, futures: List[GenerationResult]
-    ) -> Generator[GenerationResult, None, None]:
-        wait_set = set(futures)
-
-        # clear already-finished requests
-        for f in futures:
-            if f._done:
-                wait_set.pop(f)
-                yield f
-
-        # wait remaining active requests
-        while len(wait_set) > 0:
-            fut = wait_set.pop()
-            if fut.request_id not in self._results:
-                yield fut
-            else:
-                wait_set.add(fut)
 
 
 class ZeroMqQueue:
@@ -1104,7 +1180,6 @@ class ZeroMqQueue:
                                               finish_reasons=obj.finish_reasons,
                                               is_final=obj.is_final,
                                               error=obj.error)
-
         return obj
 
     def close(self):
@@ -1285,7 +1360,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
     READY_SIGNAL = b"READY"
 
     def __init__(self,
-                 workers_kwargs,
+                 workers_kwargs: dict,
                  model_world_size: int = 1,
                  mpi_session: Optional[MpiSession] = None,
                  *,
@@ -1296,7 +1371,6 @@ class ExecutorBindingsProxy(GenerationExecutor):
         self.worker_cls = worker_cls
 
         self.request_queue = IpcQueue(is_server=True)
-        # Return request id back to dispatcher
         self.request_error_queue = IpcQueue(is_server=True)
         self.result_queue = FusedIpcQueue(is_server=True, fuse_message=True)
         self.mp_stats_queue = FusedIpcQueue(is_server=True, fuse_message=True)
@@ -1310,17 +1384,13 @@ class ExecutorBindingsProxy(GenerationExecutor):
 
         self.model_world_size = model_world_size
 
-        self.workers_kwargs = workers_kwargs
-        self.workers_kwargs.update({
-            "request_queue_addr":
-            self.request_queue.address,
-            "request_error_queue_addr":
-            self.request_error_queue.address,
-            "result_queue_addr":
-            self.result_queue.address,
-            "stats_queue_addr":
-            self.mp_stats_queue.address,
-        })
+        self.workers_kwargs = dict(
+            **workers_kwargs,
+            request_queue_addr=self.request_queue.address,
+            request_error_queue_addr=self.request_error_queue.address,
+            result_queue_addr=self.result_queue.address,
+            stats_queue_addr=self.mp_stats_queue.address,
+        )
 
         self.dispatch_result_thread: Optional[ManagedThread] = None
         self.dispatch_stats_thread: Optional[ManagedThread] = None
@@ -1333,8 +1403,9 @@ class ExecutorBindingsProxy(GenerationExecutor):
                      request_error_queue_addr: Tuple[str, int, bytes],
                      result_queue_addr: Tuple[str, int, bytes],
                      stats_queue_addr: Tuple[str, int, bytes],
-                     executor_config: tllm.ExecutorConfig = tllm.ExecutorConfig(
-                         1),
+                     executor_config: Optional[tllm.ExecutorConfig] = None,
+                     logits_post_processor_map: Optional[Dict[str,
+                                                              Callable]] = None,
                      worker_cls: type = ExecutorBindingsWorker,
                      tracer_init_kwargs=None) -> None:
         result_queue = None
@@ -1363,15 +1434,20 @@ class ExecutorBindingsProxy(GenerationExecutor):
             mp_stats_queue.put(None)
 
         # Error handling in the Worker/MPI process
-        #   1. During Executor initialization, the errors will be captured by MPIPoolExecutor, and propagate to the
-        #      future.done_callback in the Python main process.
-        #   2. After Executor initialization, the errors will be captured by ManagedThreads, and propagate to the
-        #      error_queue in the Python main process by IPC queue of result_queue in await_response_task.
+        #   1. During Executor initialization, the errors will be captured and send back via request_error_queue.
+        #   2. During execution, the errors will be captured by ManagedThreads
+        #      a) For per-request error, the error will be send back via result_queue, and eventually raised in
+        #         handle_response() in the main thread.
+        #      b) For system error, the error will be raised in the MPI process and handled by future.done_callback,
+        #         that will propagate the error to the error_queue in the main thread.
 
         try:
-            executor = worker_cls(engine, executor_config)
+            executor = worker_cls(engine, executor_config,
+                                  logits_post_processor_map)
         except Exception as e:
-            raise CppExecutorError(f"Failed to initialize executor: {e}") from e
+            if mpi_rank() == 0:
+                request_error_queue.put(e)
+            return
 
         with executor:
             try:
@@ -1405,20 +1481,20 @@ class ExecutorBindingsProxy(GenerationExecutor):
         if (res := self.result_queue.get()) is None:
             return False  # shutdown the thread
 
-        async_events = []
+        async_queues = []
         event_loop = None
 
         def process_res(res):
             client_id = res.client_id
             nonlocal event_loop
-            nonlocal async_events
+            nonlocal async_queues
 
             queue = self._results[client_id].queue
             if isinstance(queue, _SyncQueue):
                 queue.put_nowait(res)
-                async_events.append(queue.event)
+                async_queues.append(queue)
                 # all the loops are identical
-                event_loop = queue.loop if event_loop is None else event_loop
+                event_loop = event_loop or queue.loop
             else:
                 queue.put(res)
 
@@ -1433,8 +1509,8 @@ class ExecutorBindingsProxy(GenerationExecutor):
                 return False
             process_res(i)
 
-        if async_events:
-            _SyncQueue.notify_events(event_loop, async_events)
+        if async_queues:
+            _SyncQueue.notify_queues(event_loop, async_queues)
 
         return True  # success
 
@@ -1473,26 +1549,30 @@ class ExecutorBindingsProxy(GenerationExecutor):
         if self.dispatch_result_thread is None:
 
             self.dispatch_result_thread = ManagedThread(
-                self.dispatch_result_task,
+                weakref.WeakMethod(self.dispatch_result_task),
                 error_queue=self._error_queue,
                 name="proxy_dispatch_result_thread")
             self.dispatch_stats_thread = ManagedThread(
-                self.dispatch_stats_task,
+                weakref.WeakMethod(self.dispatch_stats_task),
                 error_queue=self._error_queue,
                 name="proxy_dispatch_stats_thread")
 
             self.dispatch_result_thread.start()
             self.create_stats_queue()
-            self.dispatch_stats_thread.start()
+            # TODO: clean up the stats thread, and replace with a decent get_stats API
+            #self.dispatch_stats_thread.start()
 
         self._handle_background_error()
 
     def _start_executor_workers(self):
 
+        self_ref = weakref.ref(self)
+
         def mpi_done_callback(future: concurrent.futures.Future):
             # This is called when the MPI worker is done, so future.exception() will not block.
             if future.exception() is not None:
-                self._error_queue.put_nowait(future.exception())
+                if self_ := self_ref():
+                    self_._error_queue.put_nowait(future.exception())
 
         tracer_init_kwargs = get_tracer().init_kwargs if enable_llm_tracer(
         ) else None
@@ -1508,8 +1588,10 @@ class ExecutorBindingsProxy(GenerationExecutor):
 
         while not self.request_error_queue.poll(1):
             self._handle_background_error()
+
         ready_signal = self.request_error_queue.get()
-        assert ready_signal == ExecutorBindingsProxy.READY_SIGNAL
+        if ready_signal != ExecutorBindingsProxy.READY_SIGNAL:
+            raise ready_signal
 
     def shutdown(self):
         if enable_llm_debug():
@@ -1556,6 +1638,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
         self.mp_stats_queue.close()
 
         self.workers_started = False
+        self.mpi_session.shutdown()
 
         # Process the errors in-case error during shutting down the threads
         self._handle_background_error()

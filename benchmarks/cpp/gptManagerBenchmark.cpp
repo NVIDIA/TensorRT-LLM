@@ -31,6 +31,7 @@
 #include "tensorrt_llm/runtime/tllmLogger.h"
 #include "tensorrt_llm/runtime/utils/numpyUtils.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
+#include "utils/utils.h"
 
 #include <chrono>
 #include <cstdint>
@@ -47,7 +48,7 @@
 
 using namespace tensorrt_llm::batch_manager;
 using namespace tensorrt_llm::runtime;
-
+using namespace tensorrt_llm::benchmark;
 namespace tc = tensorrt_llm::common;
 namespace texec = tensorrt_llm::executor;
 namespace mpi = tensorrt_llm::mpi;
@@ -141,47 +142,6 @@ private:
     }
 };
 
-struct BenchmarkParams
-{
-    std::optional<SizeType32> maxTokensInPagedKvCache{std::nullopt};
-    std::optional<float> freeGpuMemoryFraction{std::nullopt};
-    std::optional<float> crossKvCacheFraction{std::nullopt};
-    bool enableTrtOverlap{false};
-    bool enableBatchSizeTuning{false};
-    bool enableBlockReuse{false};
-    bool enableChunkedContext{false};
-    bool streaming{false};
-    bool enableExpDelays{false};
-    std::optional<float> requestRate{std::nullopt};
-    std::optional<int> concurrency{std::nullopt};
-    std::optional<SizeType32> maxBatchSize{std::nullopt};
-    std::optional<SizeType32> maxNumTokens{std::nullopt};
-    int randomSeed = 430;
-    std::optional<std::vector<int>> maxAttentionWindowVec{std::nullopt};
-    std::optional<int> sinkTokenLength{std::nullopt};
-    bool multiBlockMode{true};
-    bool enableContextFMHAFP32Acc{false};
-    bool cudaGraphMode{false};
-    SizeType32 cudaGraphCacheSize{0};
-
-    // lora / peft params
-    std::optional<std::string> loraDir{std::nullopt};
-    SizeType32 loraDeviceNumModLayers{0};
-    size_t loraHostCacheSize{1024 * 2024 * 1024};
-
-    // KV cache block offloading
-    size_t kvHostCacheSize{0};
-    bool kvOnboardBlocks{true};
-
-    // Weights offloading
-    float gpuWeightsPercent{1.0};
-
-    // Decoding params
-    std::optional<std::vector<std::vector<SizeType32>>> medusaChoices;
-
-    std::optional<texec::LookaheadDecodingConfig> executorLookaheadConfig;
-    std::optional<texec::LookaheadDecodingConfig> requestLookaheadConfig;
-};
 } // namespace
 
 struct BenchInfo
@@ -299,6 +259,9 @@ public:
                 const std::lock_guard<std::mutex> lock(mRequestBenchInfosMutex);
                 mRequestBenchInfos[requestId].outputLength = outSeqLen;
                 mRequestBenchInfos[requestId].decodingIter = response.getResult().decodingIter;
+
+                // We record the first beam for the response file
+                mResponseTensors[requestId] = outputTokenIds[0];
             }
             else
             {
@@ -532,14 +495,19 @@ public:
         nlohmann::json jsonResponses = nlohmann::json::array();
         for (auto const& [respId, respTokensTensor] : mResponseTensors)
         {
-            int inputLength = mRequestBenchInfos[respId].inputLength;
-            int outputLength = mRequestBenchInfos[respId].outputLength;
-            std::vector<int32_t> outputTokens(outputLength);
+            auto respTokens = mResponseTensors[respId];
+            int respLength = respTokens.size();
+            int* respBufferPtr = respTokens.data();
 
-            int32_t* outputToksBufferPtr = bufferCast<int32_t>(*respTokensTensor);
             if (mOutputHasInput)
-                outputToksBufferPtr += inputLength;
-            std::copy(outputToksBufferPtr, outputToksBufferPtr + outputLength, outputTokens.begin());
+            {
+                int inputSeqLen = mRequestBenchInfos[respId].inputLength;
+                respBufferPtr += inputSeqLen;
+                respLength -= inputSeqLen;
+            }
+
+            std::vector<int32_t> outputTokens(respLength);
+            std::copy(respBufferPtr, respBufferPtr + respLength, outputTokens.begin());
 
             nlohmann::json currResp;
             currResp["response_id"] = respId;
@@ -592,7 +560,7 @@ private:
     bool mStreaming;
     int mBeamWidth;
     std::string mRespJsonFile;
-    std::unordered_map<uint64_t, TensorPtr> mResponseTensors;
+    std::unordered_map<uint64_t, texec::VecTokens> mResponseTensors;
     bool mOutputHasInput;
     std::mutex mRequestBenchInfosMutex;
 
@@ -614,7 +582,8 @@ public:
         , mShutdown(false)
         , mLogIterationData(logIterationData)
     {
-        texec::DynamicBatchConfig dynamicBatchConfig(benchmarkParams.enableBatchSizeTuning);
+        texec::DynamicBatchConfig dynamicBatchConfig(
+            benchmarkParams.enableBatchSizeTuning, benchmarkParams.enableMaxNumTokensTuning);
         texec::SchedulerConfig schedulerConfig(capacitySchedulerPolicy, std::nullopt, dynamicBatchConfig);
 
         texec::KvCacheConfig kvCacheConfig(benchmarkParams.enableBlockReuse, benchmarkParams.maxTokensInPagedKvCache,
@@ -640,11 +609,22 @@ public:
             executorConfig.setMaxNumTokens(benchmarkParams.maxNumTokens.value());
         }
 
-        executorConfig.setDecodingConfig(
-            texec::DecodingConfig(benchmarkParams.medusaChoices.has_value() ? texec::DecodingMode::Medusa()
-                    : benchmarkParams.executorLookaheadConfig.has_value()   ? texec::DecodingMode::Lookahead()
-                                                                            : texec::DecodingMode::Auto(),
-                benchmarkParams.executorLookaheadConfig, benchmarkParams.medusaChoices));
+        auto decodingMode = texec::DecodingMode::Auto();
+        if (benchmarkParams.medusaChoices.has_value())
+        {
+            decodingMode = texec::DecodingMode::Medusa();
+        }
+        else if (benchmarkParams.executorLookaheadConfig.has_value())
+        {
+            decodingMode = texec::DecodingMode::Lookahead();
+        }
+        else if (benchmarkParams.eagleConfig.has_value())
+        {
+            decodingMode = texec::DecodingMode::Eagle();
+        }
+
+        executorConfig.setDecodingConfig(texec::DecodingConfig(decodingMode, benchmarkParams.executorLookaheadConfig,
+            benchmarkParams.medusaChoices, benchmarkParams.eagleConfig));
         executorConfig.setExtendedRuntimePerfKnobConfig(extendedRuntimePerfKnobConfig);
 
         if (executorModelType == texec::ModelType::kDECODER_ONLY)
@@ -788,91 +768,16 @@ private:
 namespace
 {
 
-struct Sample
-{
-    std::vector<int32_t> inputIds;
-    int32_t outputLen;
-    int32_t taskId;
-};
-
-using Samples = std::vector<Sample>;
-
-Samples parseWorkloadJson(
-    std::filesystem::path const& datasetPath, int maxNumSamples, std::optional<SizeType32> const maxPromptLen)
-{
-    auto constexpr allowExceptions = true;
-    auto constexpr ignoreComments = true;
-    TLLM_CHECK_WITH_INFO(std::filesystem::exists(datasetPath), "File does not exist: %s", datasetPath.c_str());
-    std::ifstream jsonStream(datasetPath);
-    auto json = nlohmann::json::parse(jsonStream, nullptr, allowExceptions, ignoreComments);
-
-    Samples samples;
-
-    for (auto const& sample : json["samples"])
-    {
-        if (samples.size() >= maxNumSamples)
-            break;
-        int32_t taskId = sample.count("task_id") ? sample["task_id"].template get<int32_t>() : -1;
-        auto input_ids(sample["input_ids"].template get<std::vector<int32_t>>());
-        if (maxPromptLen && (input_ids.size() > maxPromptLen.value()))
-        {
-            input_ids.resize(maxPromptLen.value());
-        }
-        samples.emplace_back(Sample{std::move(input_ids), sample["output_len"], taskId});
-    }
-    return samples;
-}
-
-std::vector<double> generateRandomExponentialValues(int count, float lambda, int seed)
-{
-    // Set a constant seed for reproducibility
-    std::mt19937 gen(seed);
-
-    // Create an exponential distribution object
-    std::exponential_distribution<double> distribution(lambda);
-
-    // Generate random numbers from the exponential distribution
-    std::vector<double> randomValues;
-    for (int i = 0; i < count; ++i)
-    {
-        double randomValue = distribution(gen);
-        randomValues.push_back(randomValue);
-    }
-
-    return randomValues;
-}
-
-std::vector<double> computeTimeDelays(BenchmarkParams const& benchmarkParams, int numDelays)
-{
-    std::vector<double> timeDelays;
-    if (benchmarkParams.requestRate.has_value() && benchmarkParams.requestRate.value() > 0.0)
-    {
-        if (benchmarkParams.enableExpDelays)
-        {
-            timeDelays = generateRandomExponentialValues(
-                numDelays, benchmarkParams.requestRate.value(), benchmarkParams.randomSeed);
-        }
-        else
-        {
-            timeDelays.assign(numDelays, 1.0 / benchmarkParams.requestRate.value());
-        }
-    }
-    else
-    {
-        timeDelays.assign(numDelays, 0.0);
-    }
-
-    return timeDelays;
-}
-
 texec::Request makeExecutorRequest(Sample const& sample, SizeType32 const& beamWidth,
     std::optional<SizeType32> const& eosId, std::optional<SizeType32> const& padId, bool streaming = false,
     bool const& returnContextLogits = false, bool const& returnGenerationLogits = false,
     std::optional<texec::LoraConfig> const& loraConfig = std::nullopt,
     std::optional<texec::LookaheadDecodingConfig> const& lookaheadConfig = std::nullopt,
-    std::optional<texec::VecTokens> encoderInputTokenIds = std::nullopt)
+    std::optional<texec::VecTokens> encoderInputTokenIds = std::nullopt,
+    std::optional<float> temperature = std::nullopt)
 {
     auto samplingConfig = texec::SamplingConfig{beamWidth};
+    samplingConfig.setTemperature(temperature);
     auto outputConfig = texec::OutputConfig{false, returnContextLogits, returnGenerationLogits, false};
     return texec::Request(sample.inputIds, sample.outputLen, streaming, samplingConfig, outputConfig, eosId, padId,
         std::nullopt,    // positionIds
@@ -881,6 +786,7 @@ texec::Request makeExecutorRequest(Sample const& sample, SizeType32 const& beamW
         std::nullopt,    // embeddingBias
         std::nullopt,    // speculativeDecoding
         std::nullopt,    // pTuning
+        std::nullopt,    // mRopeConfig
         loraConfig,      // loraConfig
         lookaheadConfig, // lookaheadConfig
         std::nullopt,    // kvCacheRetentionConfig
@@ -894,7 +800,8 @@ void benchmarkExecutor(std::optional<std::filesystem::path> const& decoderEngine
     std::optional<int32_t> const& eosId, std::optional<int32_t> const& padId, BenchmarkParams const& benchmarkParams,
     texec::CapacitySchedulerPolicy capacitySchedulerPolicy, std::chrono::milliseconds waitSleep,
     bool returnContextLogits, bool returnGenerationLogits, std::optional<int> const staticEmulatedBatchSize,
-    bool logIterationData, std::optional<SizeType32> const maxPromptLen, texec::ModelType executorModelType)
+    bool logIterationData, std::optional<SizeType32> const maxPromptLen, texec::ModelType executorModelType,
+    std::string const& responsesJsonFile)
 {
     auto const& world = tensorrt_llm::mpi::MpiComm::world();
     auto worldRank = world.getRank();
@@ -903,7 +810,7 @@ void benchmarkExecutor(std::optional<std::filesystem::path> const& decoderEngine
     auto const samples = parseWorkloadJson(datasetPath, maxNumSamples, maxPromptLen);
     auto const numSamples = samples.size();
 
-    auto recorder = std::make_shared<Recorder>(opCsvFile, benchmarkParams.streaming, beamWidth);
+    auto recorder = std::make_shared<Recorder>(opCsvFile, benchmarkParams.streaming, beamWidth, responsesJsonFile);
     int32_t decoderStartTokenId = 0;
     std::shared_ptr<ExecutorServer> executorServer;
 
@@ -1005,7 +912,7 @@ void benchmarkExecutor(std::optional<std::filesystem::path> const& decoderEngine
                 {
                     requests.emplace_back(makeExecutorRequest(samples[0], beamWidth, eosId, padId,
                         benchmarkParams.streaming, returnContextLogits, returnGenerationLogits, std::nullopt,
-                        benchmarkParams.requestLookaheadConfig));
+                        benchmarkParams.requestLookaheadConfig, std::nullopt, benchmarkParams.temperature));
                 }
             }
             executorServer->enqueue(std::move(requests), true);
@@ -1038,7 +945,7 @@ void benchmarkExecutor(std::optional<std::filesystem::path> const& decoderEngine
                 {
                     requests.emplace_back(makeExecutorRequest(samples[i], beamWidth, eosId, padId,
                         benchmarkParams.streaming, returnContextLogits, returnGenerationLogits, loraConfig,
-                        benchmarkParams.requestLookaheadConfig));
+                        benchmarkParams.requestLookaheadConfig, std::nullopt, benchmarkParams.temperature));
                 }
             }
 
@@ -1091,54 +998,10 @@ void benchmarkExecutor(std::optional<std::filesystem::path> const& decoderEngine
         recorder->calculateMetrics();
         recorder->report();
         recorder->writeOpMetricsToCsv();
+        recorder->dumpResponseSeqs();
         // Send terminateReqId to terminate servers on all ranks
         // Sever on rank 0 will broadcast the terminate signal to other servers on multi-GPU cases
         // gptServer->enqueue(std::make_shared<InferenceRequest>(terminateReqId));
-    }
-}
-
-std::vector<std::vector<SizeType32>> parseVectorOfVectors(std::string const& input)
-{
-    std::vector<std::vector<SizeType32>> result;
-    std::regex outer_regex(R"(\[(.*?)\])");
-    std::regex inner_regex(R"(\d+)");
-    auto outer_begin = std::sregex_iterator(input.begin(), input.end(), outer_regex);
-    auto outer_end = std::sregex_iterator();
-
-    for (std::sregex_iterator i = outer_begin; i != outer_end; ++i)
-    {
-        std::smatch match = *i;
-        std::string inner_str = match.str(1);
-        std::vector<int> inner_vec;
-        auto inner_begin = std::sregex_iterator(inner_str.begin(), inner_str.end(), inner_regex);
-        auto inner_end = std::sregex_iterator();
-
-        for (std::sregex_iterator j = inner_begin; j != inner_end; ++j)
-        {
-            std::smatch inner_match = *j;
-            inner_vec.push_back(std::stoi(inner_match.str()));
-        }
-        result.push_back(inner_vec);
-    }
-    return result;
-}
-
-texec::LookaheadDecodingConfig parseLookaheadConfig(std::string const& input)
-{
-    std::regex regex("\\[ *(\\d+) *, *(\\d+) *, *(\\d+) *\\]");
-    std::smatch match;
-    if (std::regex_match(input, match, regex))
-    {
-        TLLM_CHECK(match.size() == 4);
-        auto w = std::stoi(match[1]);
-        auto n = std::stoi(match[2]);
-        auto g = std::stoi(match[3]);
-        return texec::LookaheadDecodingConfig(w, n, g);
-    }
-    else
-    {
-        TLLM_LOG_WARNING("cannot parse lookahead config from '%s'", input.c_str());
-        return texec::LookaheadDecodingConfig();
     }
 }
 
@@ -1190,13 +1053,17 @@ int main(int argc, char* argv[])
         "max_num_tokens", "The max runtime number of tokens per batch when benchmarking", cxxopts::value<int>());
     options.add_options()(
         "enable_batch_size_tuning", "Dynamic tuning of batch size", cxxopts::value<bool>()->default_value("false"));
+    options.add_options()("enable_max_num_tokens_tuning", "Dynamic tuning of max num tokens",
+        cxxopts::value<bool>()->default_value("false"));
     options.add_options()("enable_exp_delays", "Enables exponential delay distr to mimic real world request arrival",
         cxxopts::value<bool>()->default_value("false"));
-    options.add_options()("streaming", "Operate in streaming mode", cxxopts::value<bool>()->default_value("false"));
+    options.add_options()("streaming",
+        "Operate in streaming mode. Note: it reflects time-to-first-token and inter-token-latency",
+        cxxopts::value<bool>()->default_value("false"));
     options.add_options()(
         "enable_kv_cache_reuse", "Enables the KV cache reuse.", cxxopts::value<bool>()->default_value("false"));
-    options.add_options()("enable_chunked_context", "Whether to enable context chunking.",
-        cxxopts::value<bool>()->default_value("false"));
+    options.add_options()(
+        "enable_chunked_context", "Whether to enable context chunking.", cxxopts::value<bool>()->default_value("true"));
     options.add_options()(
         "return_context_logits", "Whether to return context logits.", cxxopts::value<bool>()->default_value("false"));
     options.add_options()("return_generation_logits", "Whether to return generation logits.",
@@ -1209,7 +1076,7 @@ int main(int argc, char* argv[])
     options.add_options()("static_emulated_batch_size",
         "Emulate static batching performance with the provided batch size.", cxxopts::value<SizeType32>());
     options.add_options()("log_level", "Choose log level between verbose/info/warning/error/internal_error.",
-        cxxopts::value<std::string>()->default_value("error"));
+        cxxopts::value<std::string>()->default_value("warning"));
     options.add_options()("log_iteration_data", "On each decoder iteration, print batch state metadata.",
         cxxopts::value<bool>()->default_value("false"));
     options.add_options()("wait_sleep", "Specify how many milliseconds to sleep each iteration of waitForEmpty loop.",
@@ -1230,6 +1097,12 @@ int main(int argc, char* argv[])
         cxxopts::value<float>()->default_value("1.0"));
     options.add_options()(
         "medusa_choices", "Medusa choices in the format of [[0], [0, 1], [0, 0, 1]]", cxxopts::value<std::string>());
+    options.add_options()(
+        "eagle_choices", "Eagle choices in the format of [[0], [0, 1], [0, 0, 1]]", cxxopts::value<std::string>());
+    options.add_options()("eagle_posterior_threshold",
+        "Minimum token probability threshold for typical acceptance. Enables typical acceptance in Eagle",
+        cxxopts::value<float>());
+    options.add_options()("temperature", "Sampling temperature for each request", cxxopts::value<float>());
 
     options.add_options()("multi_block_mode",
         "Distribute the work across multiple CUDA thread-blocks on the GPU for masked MHA kernel",
@@ -1250,6 +1123,8 @@ int main(int argc, char* argv[])
         "lookahead config in the format of [max_window_size, max_ngram_size, max_verification_set_size], and each <= "
         "executor lookahead config",
         cxxopts::value<std::string>());
+    options.add_options()("responses_json", "Write output response sequences to a json file",
+        cxxopts::value<std::string>()->default_value(""));
 
     auto result = options.parse(argc, argv);
 
@@ -1275,6 +1150,12 @@ int main(int argc, char* argv[])
         if (type == "V1")
         {
             TLLM_LOG_WARNING("type option \"V1\" is going to be renamed to \"static\".");
+        }
+        bool streaming = result["streaming"].as<bool>();
+        if (streaming)
+        {
+            TLLM_LOG_ERROR("Streaming is not supported in static batching.\n");
+            return 1;
         }
         batchingType = texec::BatchingType::kSTATIC;
     }
@@ -1350,6 +1231,9 @@ int main(int argc, char* argv[])
 
     // Argument: Enable dynamic tuning of batch size
     benchmarkParams.enableBatchSizeTuning = result["enable_batch_size_tuning"].as<bool>();
+
+    // Argument: Enable dynamic tuning of max num tokens
+    benchmarkParams.enableMaxNumTokensTuning = result["enable_max_num_tokens_tuning"].as<bool>();
 
     // Argument: Enable KV cache reuse
     benchmarkParams.enableBlockReuse = result["enable_kv_cache_reuse"].as<bool>();
@@ -1427,6 +1311,26 @@ int main(int argc, char* argv[])
     {
         benchmarkParams.medusaChoices = parseVectorOfVectors(result["medusa_choices"].as<std::string>());
     }
+    // Argument: Eagle choices for the Eagle speculative decoding.
+    if (result.count("eagle_choices") || result.count("eagle_posterior_threshold"))
+    {
+        std::optional<float> posteriorThreshold;
+        if (result.count("eagle_posterior_threshold"))
+        {
+            posteriorThreshold = result["eagle_posterior_threshold"].as<float>();
+        }
+        std::optional<texec::EagleChoices> choices;
+        if (result.count("eagle_choices"))
+        {
+            choices = parseVectorOfVectors(result["eagle_choices"].as<std::string>());
+        }
+        benchmarkParams.eagleConfig = texec::EagleConfig(choices, !posteriorThreshold.has_value(), posteriorThreshold);
+    }
+    if (result.count("temperature"))
+    {
+        benchmarkParams.temperature = result["temperature"].as<float>();
+    }
+
     if (result.count("executor_lookahead_config"))
     {
         benchmarkParams.executorLookaheadConfig
@@ -1535,6 +1439,9 @@ int main(int argc, char* argv[])
 
     initTrtLlmPlugins(logger.get());
 
+    // Argument: output sequences JSON
+    auto const responsesJsonFile = result["responses_json"].as<std::string>();
+
     // Argument: API
     auto const api = result["api"].as<std::string>();
     if (api == "executor")
@@ -1565,7 +1472,7 @@ int main(int argc, char* argv[])
             benchmarkExecutor(decoderEngineDir, encoderEngineDir, batchingType, datasetPath, opCsvFile, maxNumSamples,
                 beamWidth, result["warm_up"].as<int>(), eosId, padId, benchmarkParams, capacitySchedulerPolicy,
                 waitSleep, returnContextLogits, returnGenerationLogits, staticEmulatedBatchSize, logIterationData,
-                maxPromptLen, executorModelType);
+                maxPromptLen, executorModelType, responsesJsonFile);
         }
         catch (std::exception const& e)
         {

@@ -201,7 +201,7 @@ class ChatGLMTokenizer(PreTrainedTokenizer):
                  pad_token="<pad>",
                  unk_token="<unk>",
                  num_image_tokens=20000,
-                 **kwargs) -> None:
+                 **kwargs) -> None:  # wili, fix for new tranformers
 
         self.do_lower_case = do_lower_case
         self.remove_space = remove_space
@@ -216,18 +216,19 @@ class ChatGLMTokenizer(PreTrainedTokenizer):
         self.sp_tokenizer = SPTokenizer(vocab_file,
                                         num_image_tokens=num_image_tokens)
 
-        super().__init__(do_lower_case=do_lower_case,
-                         remove_space=remove_space,
-                         padding_side=padding_side,
-                         bos_token=bos_token,
-                         eos_token=eos_token,
-                         end_token=end_token,
-                         mask_token=mask_token,
-                         gmask_token=gmask_token,
-                         pad_token=pad_token,
-                         unk_token=unk_token,
-                         num_image_tokens=num_image_tokens,
-                         **kwargs)
+        super().__init__(
+            do_lower_case=do_lower_case,  # wili, fix for new tranformers
+            remove_space=remove_space,
+            padding_side=padding_side,
+            bos_token=bos_token,
+            eos_token=eos_token,
+            end_token=end_token,
+            mask_token=mask_token,
+            gmask_token=gmask_token,
+            pad_token=pad_token,
+            unk_token=unk_token,
+            num_image_tokens=num_image_tokens,
+            **kwargs)
         """ Initialization """
 
     @property
@@ -356,12 +357,13 @@ class ChatGLMTokenizer(PreTrainedTokenizer):
         return token_ids_0
 
     def _pad(
-        self,
-        encoded_inputs: Union[Dict[str, EncodedInput], BatchEncoding],
-        max_length: Optional[int] = None,
-        padding_strategy: PaddingStrategy = PaddingStrategy.DO_NOT_PAD,
-        pad_to_multiple_of: Optional[int] = None,
-        return_attention_mask: Optional[bool] = None,
+            self,
+            encoded_inputs: Union[Dict[str, EncodedInput], BatchEncoding],
+            max_length: Optional[int] = None,
+            padding_strategy: PaddingStrategy = PaddingStrategy.DO_NOT_PAD,
+            pad_to_multiple_of: Optional[int] = None,
+            return_attention_mask: Optional[bool] = None,
+            padding_side: str = "left",  # wili, fix for new transformers
     ) -> dict:
         """
         Pad encoded inputs (on left/right and up to predefined length or max length in the batch)

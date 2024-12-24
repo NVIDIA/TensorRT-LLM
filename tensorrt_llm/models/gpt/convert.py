@@ -817,18 +817,19 @@ def load_weights_from_hf_model(hf_model,
                                  dtype)
         else:
             embed_w = get_weight(model_params, 'transformer.wte', dtype)
-        if not config.share_embedding_table:
-            if vocab_size % mapping.tp_size != 0:
-                vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
-                pad_width = vocab_size_padded - vocab_size
-                embed_w = torch.nn.functional.pad(embed_w, (0, 0, 0, pad_width),
-                                                  value=0)
-            if hasattr(hf_config, 'logits_scale'):
-                embed_w *= hf_config.logits_scale
-            weights['lm_head.weight'] = split(embed_w.clone(),
-                                              mapping.tp_rank,
-                                              mapping.tp_size,
-                                              is_column=True)
+
+        if vocab_size % mapping.tp_size != 0:
+            vocab_size_padded = pad_vocab_size(vocab_size, mapping.tp_size)
+            pad_width = vocab_size_padded - vocab_size
+            embed_w = torch.nn.functional.pad(embed_w, (0, 0, 0, pad_width),
+                                              value=0)
+        if hasattr(hf_config, 'logits_scale'):
+            embed_w *= hf_config.logits_scale
+        weights['lm_head.weight'] = split(embed_w.clone(),
+                                          mapping.tp_rank,
+                                          mapping.tp_size,
+                                          is_column=True)
+
         if gpt_variant in ['starcoder2', 'nemotron']:
             ln_f_w, ln_f_b = get_weight_and_bias(model_params, 'model.norm',
                                                  dtype)

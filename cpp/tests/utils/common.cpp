@@ -18,6 +18,9 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <vector>
+
 namespace tensorrt_llm::testing
 {
 namespace fs = std::filesystem;
@@ -95,6 +98,8 @@ void TestData::loadGenerationLogits(fs::path const& genLogitsFile, tr::BufferMan
 void TestData::makeDraft(SizeType32 maxDraftTokens, bool acceptDraftByLogits, fs::path const& genLogitsFile,
     std::vector<SizeType32> const& givenInputLengths, tr::BufferManager const& manager)
 {
+    TLLM_CHECK(beamWidth == 1);
+
     ITensor::SharedPtr expectedGenerationLogitsPtr;
     if (acceptDraftByLogits)
     {
@@ -104,59 +109,61 @@ void TestData::makeDraft(SizeType32 maxDraftTokens, bool acceptDraftByLogits, fs
             = std::shared_ptr(tr::utils::loadNpy(manager, genLogitsFile.string(), MemoryType::kCPU));
     }
 
+    std::vector<SizeType32> draftLengths(givenInputLengths.size());
+    // first draft length stays 0
+    std::transform(givenInputLengths.begin() + 1, givenInputLengths.end(), draftLengths.begin() + 1,
+        [this, &maxDraftTokens](auto inputLength)
+        { return std::rand() % std::min((maxSeqLen - (inputLength + 1)), maxDraftTokens) + 1; });
+
     auto* const expectedOutputData = tr::bufferCast<TokenIdType>(*expectedOutputIds);
     for (SizeType32 bi = 0; bi < nbGivenInputs; ++bi)
     {
+        SizeType32 constexpr beamIdx{0};
         auto const endId = endIds.at(bi);
-        for (SizeType32 beam = 0; beam < beamWidth; ++beam)
+        auto const draftLen = draftLengths.at(bi);
+        auto acceptedLen = draftLen > 0 ? std::rand() % draftLen : 0;
+
+        if (acceptDraftByLogits && draftLen > 0)
         {
-            auto const draftLen
-                = std::rand() % std::min((maxSeqLen - (givenInputLengths.at(bi) + 1)), maxDraftTokens) + 1;
-            auto acceptedLen = std::rand() % draftLen;
+            auto expectedLogitBatchSlice = std::shared_ptr(ITensor::slice(expectedGenerationLogitsPtr, bi, 1));
+            expectedLogitBatchSlice->squeeze(0); // bs
+            expectedLogitBatchSlice->squeeze(0); // beam
+            auto expectedLogitBatchStepSlice = std::shared_ptr(ITensor::slice(expectedLogitBatchSlice, 1, draftLen));
+            auto expectedLogitBatchStepView = ITensor::view(expectedLogitBatchStepSlice,
+                ITensor::makeShape({draftLen, 1, 1, expectedLogitBatchStepSlice->getShape().d[1]}));
+            draftLogits.at(bi) = manager.copyFrom(*expectedLogitBatchStepView, MemoryType::kCPU);
+        }
 
-            if (acceptDraftByLogits)
+        for (SizeType32 si = 0; si < draftLen; ++si)
+        {
+            auto const draftIndex
+                = tc::flat_index3(bi, beamIdx, givenInputLengths.at(bi) + si + 1, beamWidth, maxSeqLen);
+            auto draftToken = expectedOutputData[draftIndex];
+            if (draftToken == endId)
             {
-                auto expectedLogitBatchSlice = std::shared_ptr(ITensor::slice(expectedGenerationLogitsPtr, bi, 1));
-                expectedLogitBatchSlice->squeeze(0); // bs
-                expectedLogitBatchSlice->squeeze(0); // beam
-                auto expectedLogitBatchStepSlice
-                    = std::shared_ptr(ITensor::slice(expectedLogitBatchSlice, 1, draftLen));
-                auto expectedLogitBatchStepView = ITensor::view(expectedLogitBatchStepSlice,
-                    ITensor::makeShape({draftLen, 1, 1, expectedLogitBatchStepSlice->getShape().d[1]}));
-                draftLogits.at(bi) = manager.copyFrom(*expectedLogitBatchStepView, MemoryType::kCPU);
+                acceptedLen = std::min(acceptedLen, si);
             }
-
-            for (SizeType32 si = 0; si < draftLen; ++si)
+            if (si >= acceptedLen)
             {
-                auto const draftIndex
-                    = tc::flat_index3(bi, beam, givenInputLengths.at(bi) + si + 1, beamWidth, maxSeqLen);
-                auto draftToken = expectedOutputData[draftIndex];
-                if (draftToken == endId)
+                draftToken = -1;
+                if (acceptDraftByLogits)
                 {
-                    acceptedLen = std::min(acceptedLen, si);
-                }
-                if (si >= acceptedLen)
-                {
-                    draftToken = -1;
-                    if (acceptDraftByLogits)
+                    auto vocabSizePadded = expectedGenerationLogitsPtr->getShape().d[3];
+                    auto* draftLogitsPtr = tr::bufferCast<float>(*draftLogits.at(bi));
+                    for (SizeType32 vi = 0; vi < vocabSizePadded; ++vi)
                     {
-                        auto vocabSizePadded = expectedGenerationLogitsPtr->getShape().d[3];
-                        auto* draftLogitsPtr = tr::bufferCast<float>(*draftLogits.at(bi));
-                        for (SizeType32 vi = 0; vi < vocabSizePadded; ++vi)
-                        {
-                            draftLogitsPtr[si * vocabSizePadded + vi] = 0.f;
-                        }
+                        draftLogitsPtr[si * vocabSizePadded + vi] = 0.f;
                     }
                 }
-                draftTokens.at(bi).push_back(draftToken);
             }
-            acceptedDraftTokensLengths.at(bi) = acceptedLen;
-
-            auto const expectedLen = expectedOutputLengths.at(bi * beamWidth + beam);
-            TLLM_CHECK(expectedLen > 0);
-            expectedOutputLengths[bi * beamWidth + beam]
-                = std::min(expectedLen, (givenInputLengths.at(bi) + 1) + acceptedLen + 1);
+            draftTokens.at(bi).push_back(draftToken);
         }
+        acceptedDraftTokensLengths.at(bi) = acceptedLen;
+
+        auto const expectedLen = expectedOutputLengths.at(bi * beamWidth + beamIdx);
+        TLLM_CHECK(expectedLen > 0);
+        expectedOutputLengths[bi * beamWidth + beamIdx]
+            = std::min(expectedLen, (givenInputLengths.at(bi) + 1) + acceptedLen + 1);
     }
 }
 

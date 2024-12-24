@@ -46,12 +46,13 @@ class Logger(metaclass=Singleton):
     def __init__(self):
         environ_severity = os.environ.get('TLLM_LOG_LEVEL')
         self._set_from_env = environ_severity is not None
+        default_level = "error"
 
         min_severity = environ_severity.lower(
-        ) if self._set_from_env else "warning"
+        ) if self._set_from_env else default_level
         invalid_severity = min_severity not in severity_map
         if invalid_severity:
-            min_severity = "warning"
+            min_severity = default_level
 
         self._min_severity = min_severity
         self._trt_logger = trt.Logger(severity_map[min_severity][0])
@@ -69,7 +70,7 @@ class Logger(metaclass=Singleton):
 
         if invalid_severity:
             self.warning(
-                f"Requested log level {environ_severity} is invalid. Using 'warning' instead"
+                f"Requested log level {environ_severity} is invalid. Using '{default_level}' instead"
             )
 
     def _func_wrapper(self, severity):

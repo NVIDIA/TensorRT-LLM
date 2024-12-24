@@ -48,14 +48,14 @@ public:
         [[maybe_unused]] pybind11::handle traceback);
     void shutdown();
 
-    [[nodiscard]] tle::IdType enqueueRequest(tle::Request request)
+    [[nodiscard]] tle::IdType enqueueRequest(tle::Request const& request)
     {
-        return mExecutor->enqueueRequest(std::move(request));
+        return mExecutor->enqueueRequest(request);
     }
 
-    [[nodiscard]] std::vector<tle::IdType> enqueueRequests(std::vector<tle::Request> requests)
+    [[nodiscard]] std::vector<tle::IdType> enqueueRequests(std::vector<tle::Request> const& requests)
     {
-        return mExecutor->enqueueRequests(std::move(requests));
+        return mExecutor->enqueueRequests(requests);
     }
 
     [[nodiscard]] std::vector<tle::Response> awaitResponses(

@@ -196,7 +196,6 @@ def load_weights_from_hf_model(model, config: FalconConfig):
     new_decoder_architecture = config.new_decoder_architecture
     use_parallel_embedding = config.use_parallel_embedding
     sharding_dim = config.embedding_sharding_dim
-    share_embedding_table = config.share_embedding_table
     quant_algo = config.quantization.quant_algo
     use_weight_only = quant_algo in [QuantAlgo.W8A16, QuantAlgo.W4A16]
     if quant_algo == QuantAlgo.W8A16:
@@ -319,15 +318,14 @@ def load_weights_from_hf_model(model, config: FalconConfig):
                 embed_w, mapping.tp_size, mapping.tp_rank, sharding_dim)
 
     if mapping.is_last_pp_rank():
-        if not share_embedding_table:
-            lm_head = get_weight(model_params, 'lm_head', dtype)
-            if lm_head is None:
-                # No lm_head in the checkpoint, cloning word_embedding.
-                lm_head = embed_w.clone()
-            weights['lm_head.weight'] = split_matrix(lm_head,
-                                                     mapping.tp_size,
-                                                     mapping.tp_rank,
-                                                     dim=0)
+        lm_head = get_weight(model_params, 'lm_head', dtype)
+        if lm_head is None:
+            # No lm_head in the checkpoint, cloning word_embedding.
+            lm_head = embed_w.clone()
+        weights['lm_head.weight'] = split_matrix(lm_head,
+                                                 mapping.tp_size,
+                                                 mapping.tp_rank,
+                                                 dim=0)
         ln_f_w, ln_f_b = get_weight_and_bias(model_params, 'transformer.ln_f',
                                              dtype)
         weights['transformer.ln_f.weight'] = ln_f_w
@@ -482,8 +480,7 @@ def load_weights_from_hf_by_shard(model_dir: str, config: FalconConfig):
                             'transformer.vocab_embedding.weight'] = split_matrix(
                                 param, mapping.tp_size, mapping.tp_rank,
                                 config.embedding_sharding_dim)
-                if mapping.is_last_pp_rank(
-                ) and not config.share_embedding_table:
+                if mapping.is_last_pp_rank():
                     weights['lm_head.weight'] = split_matrix(param,
                                                              mapping.tp_size,
                                                              mapping.tp_rank,

@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/runtime/common.h"
 #include <cuda_fp16.h>
@@ -32,16 +33,24 @@ namespace tensorrt_llm::kernels::speculative_decoding
 //! \param pathsOffsets input buffer [maxBatchSize * maxDraftLen], slices of accepted paths packed in memory
 //! \param acceptedLengths input buffer [maxBatchSize], length of the data accepted tokens
 //! \param bestPathIds input buffer [maxBatchSize], indices of the selected paths
-//! \param paths input buffer [batchSize, numPaths, maxPathLen] if isPathsLinearBatchIdx else [maxBatchSize, numPaths,
-//! maxPathLen], paths to restore sequences from outputIds and targetIds. Should be filled with -1 for everything that
-//! is not path. \param batchSlots input buffer [batchSize], address map from local index to global index [0, batchSize]
-//! -> [0, maxBatchSize] \param batchSize current batch size \param numPaths maximum number of tokens per step
-//! configured in the system \param maxPathLen maximum sequence length of the sequence containing draft tokens \param
-//! isPathsLinearBatchIdx \param stream stream
+//! \param paths input buffer [engineBatchSize, numPaths, maxPathLen] if isPathsLinearBatchIdx else [maxBatchSize,
+//! numPaths, maxPathLen], paths to restore sequences from outputIds and targetIds. Should be filled with -1 for
+//! everything that is not path. \param batchSlots input buffer [engineBatchSize], address map from local index to
+//! global index [0, batchSize]
+//! -> [0, maxBatchSize]
+//! \param batchSize the number of sequences to be decoded
+//! \param engineBatchSize number of sequences processed in the engine.
+//! Includes chunked context reqs that are not in the last chunk.
+//! \param numPaths maximum number of tokens per step
+//! configured in the system
+//! \param maxPathLen maximum sequence length of the sequence containing draft tokens
+//! \param isPathsLinearBatchIdx access paths using batch slot or linear batch idx
+//! \param stream stream
 void invokePackAcceptedPaths(runtime::SizeType32* acceptedLengthsCumSum, runtime::SizeType32* pathsOffsets,
     runtime::SizeType32 const* acceptedLengths, runtime::SizeType32 const* bestPathIds,
     runtime::SizeType32 const* paths, runtime::SizeType32 const* batchSlots, runtime::SizeType32 batchSize,
-    runtime::SizeType32 numPaths, runtime::SizeType32 maxPathLen, bool isPathsLinearBatchIdx, cudaStream_t stream);
+    runtime::SizeType32 engineBatchSize, runtime::SizeType32 numPaths, runtime::SizeType32 maxPathLen,
+    bool isPathsLinearBatchIdx, cudaStream_t stream);
 
 template <typename T>
 struct AcceptDraftTokensByIdsWithPathsParams
@@ -124,5 +133,76 @@ struct AcceptDraftTokensByIdsWithPathsParams
 //! to the next after the last accepted token.
 template <typename T>
 void acceptDraftTokensByIdsWithPaths(AcceptDraftTokensByIdsWithPathsParams<T> const&);
+
+template <typename T>
+struct TypicalAcceptanceSampling
+{
+    //! [maxBatchSize * maxDecodingTokens][vocabSizePadded]
+    //! Array of pointers to the logits
+    T** logitsPtrs{nullptr};
+
+    //! [batchSize], optional.
+    runtime::SizeType32 const* batchSlots{nullptr};
+
+    //! [maxBatchSize], number of draft tokens per request.
+    runtime::SizeType32 const* generationLengths{nullptr};
+    //! [maxBatchSize]
+    //! Sampling temperature per request.
+    float const* temperatures{nullptr};
+    //! [maxBatchSize]
+    float const* posteriorThresholds{nullptr};
+    //! [maxBatchSize]
+    float const* posteriorAlphas{nullptr};
+
+    runtime::TokenIdType* outputIds{nullptr};
+
+    //! Workspace for typical acceptance. Get the workspace size in bytes with getTypicalAcceptanceWorkspaceSize
+    int8_t* workspace{nullptr};
+
+    //! [batchSize * maxDecodingTokens], optional.
+    //! Curand states for sampling.
+    //! Either randomVals or curandStats should be specified.
+    curandState_t* curandStats{nullptr};
+    //! [batchSize * maxDecodingTokens], optional.
+    //! Random values for sampling.
+    //! Either randomVals or curandStats should be specified.
+    float const* randomVals{nullptr};
+
+    runtime::SizeType32 batchSize{0};
+    runtime::SizeType32 maxBatchSize{0};
+    runtime::SizeType32 maxDecodingTokens{0};
+    runtime::SizeType32 vocabSize{0};
+    runtime::SizeType32 smCnt{0};
+
+    void checkParams()
+    {
+        TLLM_CHECK(logitsPtrs);
+
+        TLLM_CHECK(generationLengths);
+        TLLM_CHECK(temperatures);
+        TLLM_CHECK(posteriorThresholds);
+        TLLM_CHECK(posteriorAlphas);
+        TLLM_CHECK(outputIds);
+        TLLM_CHECK(workspace);
+
+        TLLM_CHECK((curandStats != nullptr) || (randomVals != nullptr));
+        TLLM_CHECK(((curandStats != nullptr) & (randomVals != nullptr)) == 0);
+
+        TLLM_CHECK(batchSize > 0);
+        TLLM_CHECK(maxBatchSize > 0);
+        TLLM_CHECK(vocabSize > 0);
+        TLLM_CHECK(maxDecodingTokens > 0);
+        TLLM_CHECK(smCnt > 0);
+    }
+};
+
+//! \brief Performs multinomial sampling for typical acceptance.
+//! For more details check https://arxiv.org/pdf/2401.10774.
+template <typename T>
+void typicalAcceptanceSampling(TypicalAcceptanceSampling<T> const&, cudaStream_t);
+
+template <typename T>
+size_t getTypicalAcceptanceWorkspaceSize(
+    runtime::SizeType32 batchSize, runtime::SizeType32 maxDecodingTokens, runtime::SizeType32 vocabSizePadded);
 
 } // namespace tensorrt_llm::kernels::speculative_decoding

@@ -54,7 +54,7 @@ FtDynamicDecode<T>::FtDynamicDecode(size_t const maxBatchSize, size_t const maxB
         tr::ITensor::makeShape({static_cast<int32_t>(maxBatchSize)}), nvinfer1::DataType::kINT32);
     mDynamicDecodeLayer
         = std::make_shared<tl::DynamicDecodeLayer<T>>(tle::DecodingMode::Auto(), decodingDomain, bufferManager);
-    mBatchSlots = tr::getDefaultBatchSlots(maxBatchSize, *bufferManager);
+    mBatchSlots = tr::getDefaultBatchSlots(maxBatchSize);
     mDecodingWorkspace = std::make_unique<tensorrt_llm::runtime::DecodingLayerWorkspace>(bufferManager, decodingDomain,
         tensorrt_llm::runtime::TRTDataType<T>::value, mDynamicDecodeLayer->getWorkspaceSize());
 }

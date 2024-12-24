@@ -50,6 +50,7 @@ def build_engine(base_model_dir: _pl.Path, drafter_model_dir: _pl.Path,
             '--max_seq_len=1024',
             '--log_level=error',
             '--paged_kv_cache=enable',
+            '--use_paged_context_fmha=enable',
             '--remove_input_padding=enable',
             '--speculative_decoding_mode=explicit_draft_tokens',
         ]
@@ -102,7 +103,7 @@ def build_engines(model_cache: str):
     model_spec_obj.use_explicit_draft_tokens_decoding()
 
     full_engine_path = engine_dir / model_spec_obj.get_model_path(
-    ) / 'tp1-pp1-gpu'
+    ) / 'tp1-pp1-cp1-gpu'
     print(f"\nBuilding fp16 engine at {str(full_engine_path)}")
     build_engine(base_model_dir, drafter_model_dir, full_engine_path)
 

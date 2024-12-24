@@ -26,12 +26,19 @@
 
 #include <cstddef>
 
+namespace tensorrt_llm::batch_manager
+{
+class LlmRequest;
+}
+
 namespace tensorrt_llm::runtime
 {
 
 class EagleBuffers
 {
 public:
+    using LlmRequestPtr = std::shared_ptr<tensorrt_llm::batch_manager::LlmRequest>;
+    using RequestVector = std::vector<LlmRequestPtr>;
     using SizeType32 = runtime::SizeType32;
     using ITensor = runtime::ITensor;
     using BufferPtr = runtime::IBuffer::SharedPtr;
@@ -46,8 +53,12 @@ public:
         //! [maxBatchSize] or [numSequences]
         TensorPtr temperatures;
         //! [maxBatchSize] or [numSequences]
+        TensorPtr posteriorAlpha;
+        //! [maxBatchSize] or [numSequences]
+        TensorPtr posteriorThreshold;
+        //! [maxBatchSize] or [numSequences]
         TensorPtr randomDataSample;
-        //! [maxBatchSize, maxNumPaths, maxPathDraftLen] or [numSequences, maxNumPaths, maxPathDraftLen]
+        //! [maxBatchSize, maxDecodingTokens] or [numSequences, maxDecodingTokens]
         TensorPtr randomDataValidation;
         //! [maxBatchSize, maxDecodingDraftTokens] or [numSequences, maxDecodingDraftTokens]
         TensorPtr draftTokens;
@@ -77,6 +88,14 @@ public:
         TensorPtr eagleNetGenContextLengthsHost;
         //! [maxBatchSize] or [numSequences]
         TensorPtr eagleNetGenPastKeyValueLengthsHost;
+        //! [maxBatchSize * maxDecodingTokens] or [numSequences * maxDecodingTokens]
+        TensorPtr inputGenTokensHost;
+        //! [maxBatchSize] or [numSequences]
+        TensorPtr chunkedContextNextTokens;
+
+        // For Eagle-2
+        //! [1]
+        TensorPtr useDynamicTreeHost;
 
         void create(SizeType32 maxNumSequences, runtime::TllmRuntime const& runtime,
             runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig);
@@ -100,6 +119,8 @@ public:
         TensorPtr acceptedLens;
         //! [batchSize]
         TensorPtr acceptedPaths;
+        //! [batchSize]
+        TensorPtr chunkedContextNextTokens;
 
     } engineOutputs;
 
@@ -110,8 +131,8 @@ public:
 
     void reshape(SizeType32 numCtxSequences, SizeType32 numGenSequences, runtime::ModelConfig const& modelConfig);
 
-    void setFromInputs(SizeType32 numCtxSequences, SizeType32 numGenSequences, runtime::ITensor const& requestTypes,
-        ITensor const& seqSlots, EagleBuffers::Inputs const& decoderBuffers, ITensor const& contextPositionIds,
+    void setFromInputs(RequestVector const& contextRequests, RequestVector const& genRequests,
+        runtime::ITensor const& requestTypes, ITensor const& seqSlots, EagleBuffers::Inputs const& decoderBuffers,
         runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
         runtime::WorldConfig const& worldConfig) const;
 
@@ -120,17 +141,23 @@ public:
 
 private:
     template <typename T>
-    void setFromInputs(SizeType32 numCtxSequences, SizeType32 numGenSequences, SizeType32 vocabSizePadded,
-        ITensor const& seqSlots, EagleBuffers::Inputs const& draftBuffers, ITensor const& contextPositionIds,
-        runtime::EagleModule const& eagleModule, runtime::CudaStream const& stream) const;
+    void setFromInputs(RequestVector const& contextRequests, RequestVector const& genRequests,
+        SizeType32 vocabSizePadded, ITensor const& seqSlots, EagleBuffers::Inputs const& draftBuffers,
+        runtime::EagleModule const& eagleModule, runtime::BufferManager const& manager) const;
 
 private:
     // helper tensors
     std::size_t scanTempStorageBytes{0};
     std::size_t reduceTempStorageBytes{0};
+    float mDefaultPosteriorThreshold{0.09f};
+    bool mDoGreedySampling{true};
     BufferPtr scanReduceTempStorage;
     TensorPtr cumSumGenerationLengths;
     TensorPtr maxGenerationLength;
+    TensorPtr chunkedContextNextTokensHost;
+    TensorPtr greedySamplingHost;
+    TensorPtr posteriorAlphaHost;
+    TensorPtr posteriorThresholdHost;
 };
 
 } // namespace tensorrt_llm::runtime

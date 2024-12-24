@@ -53,6 +53,9 @@ private:
     void fillContextBuffers(runtime::SizeType32 batchSize, BufferConstPtr batchSlots,
         EagleSetupParams const& setupParams, std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace);
 
+    void augmentBatchSlots(EagleOutputs const& outputs, EagleInputs const& inputs,
+        std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace);
+
     void convertToPackedMask(EagleOutputs const& outputs, EagleInputs const& inputs,
         std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace);
 

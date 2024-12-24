@@ -49,14 +49,18 @@ class AutoConfig:
 class AutoModelForCausalLM:
 
     @staticmethod
-    def get_trtllm_model_class(hf_model_or_dir, trust_remote_code=False):
+    def get_trtllm_model_class(hf_model_or_dir,
+                               trust_remote_code=False,
+                               has_speculative_model=False):
         import transformers
 
         hf_config = transformers.AutoConfig.from_pretrained(
             hf_model_or_dir, trust_remote_code=trust_remote_code)
 
-        if hasattr(hf_config,
-                   'architectures') and hf_config.architectures is not None:
+        if has_speculative_model:
+            hf_arch = 'MedusaForCausalLM'
+        elif hasattr(hf_config,
+                     'architectures') and hf_config.architectures is not None:
             hf_arch = hf_config.architectures[0]
         elif hasattr(hf_config,
                      'model_type') and hf_config.model_type.find('mamba') != -1:

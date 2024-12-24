@@ -140,9 +140,9 @@ struct Multihead_attention_params_base
     // The 1.f / sqrt(Dh). Computed on the host.
     float inv_sqrt_dh = 0.0f;
 
-    // The tanh scale factor. (only used by Grok).
-    float qk_tanh_scale = 0.0f;
-    float qk_tanh_inverse_scale = 0.0f;
+    // The attention logit softcapping scale.
+    float attn_logit_softcapping_scale = 0.0f;
+    float attn_logit_softcapping_inverse_scale = 0.0f;
 
     // The attention mask [batch_size, attention_mask_stride (i.e. max_kv_seqlen)]
     bool const* attention_mask = nullptr;
@@ -152,6 +152,9 @@ struct Multihead_attention_params_base
     T const* relative_attention_bias = nullptr;
     int relative_attention_bias_stride = 0;
     int max_distance = 0;
+
+    // If logn scaling is used
+    float const* logn_scaling_ptr = nullptr;
 
     // block sparse config
     bool block_sparse_attention = false;
@@ -197,6 +200,7 @@ struct Multihead_attention_params_base
     int* block_counter = nullptr;
 
     int const* memory_length_per_sample = nullptr;
+    int32_t const* mrope_position_deltas = nullptr;
 };
 
 template <typename T, bool USE_CROSS_ATTENTION = false>

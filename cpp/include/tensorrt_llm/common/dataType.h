@@ -24,6 +24,10 @@ namespace tensorrt_llm::common
 
 constexpr static size_t getDTypeSize(nvinfer1::DataType type)
 {
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wswitch"
+#endif
     switch (type)
     {
     case nvinfer1::DataType::kINT64: return 8;
@@ -39,6 +43,9 @@ constexpr static size_t getDTypeSize(nvinfer1::DataType type)
     default: return 0;
     }
     return 0;
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 }
 
 } // namespace tensorrt_llm::common

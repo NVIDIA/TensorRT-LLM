@@ -81,13 +81,18 @@ void updateKVCacheDraftTokenLocation(torch::Tensor seqAcceptedDraftTokenOffsetsT
 
         auto const& pointerArray = pointerArrayOpt.value();
         auto const& offsetArray = offsetArrayOpt.value();
+        // chunked_context + sliding window attention is not supported in python runtime, so useOneMoreBlock can always
+        // be supported.
+        bool constexpr canUseOneMoreBlock{true};
+
         tksd::updateKVBlockArrayDraftTokenLocation(seqAcceptedDraftTokenOffsetsTensor.data_ptr<int>(),
             packedAcceptedDraftTokensIndicesTensor.data_ptr<int>(), pastKeyValueLengthsTensor.data_ptr<int>(),
             reinterpret_cast<void* const*>(pointerArray.data_ptr<int64_t>()),
             reinterpret_cast<tensorrt_llm::kernels::KVCacheIndex*>(
                 offsetArray.data_ptr<tensorrt_llm::kernels::KVCacheIndex::UnderlyingType>()),
             layerCount, seqCount, numKVHeads, headSizeInBytes, rewindDraftTokenCount, rewindDraftTokenTensorPtr,
-            nullptr, nullptr, maxKVCacheLen, maxBlocksPerSeqOpt.value(), tokensPerBlockOpt.value(), stream);
+            nullptr, nullptr, maxKVCacheLen, maxBlocksPerSeqOpt.value(), tokensPerBlockOpt.value(), canUseOneMoreBlock,
+            stream);
     }
     else
     {

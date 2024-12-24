@@ -103,6 +103,7 @@ __global__ void applyRoPE(KVCacheBuffer kCacheRead, KVLinearBuffer kCacheWrite, 
             k, tidx, rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale, token_pos_idx);
         break;
     }
+    case PositionEmbeddingType::kROPE_M: [[fallthrough]];
     case PositionEmbeddingType::kROPE_GPT_NEOX:
     {
         bool const do_rotary = vec_size * tidx < rotary_embedding_dim;
@@ -159,8 +160,10 @@ void invokeApplyRoPE(KVCacheBuffer const& kCacheRead, KVLinearBuffer const& kCac
     int const vec_size = 16u / sizeof(T);
     dim3 block((sizePerHead / vec_size + 31) / 32 * 32);
     dim3 grid(token_num, kv_head_num, batch_beam);
-    size_t smem_size
-        = (position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX ? 2 * rotary_embedding_dim * sizeof(T) : 0);
+    size_t smem_size = ((position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX
+                            || position_embedding_type == PositionEmbeddingType::kROPE_M)
+            ? 2 * rotary_embedding_dim * sizeof(T)
+            : 0);
 
     applyRoPE<T, KVCacheBuffer><<<grid, block, smem_size, stream>>>(kCacheRead, kCacheWrite, sizePerHead, beam_width,
         token_read_idxs, token_write_idxs, token_pos_idxs, token_seq_idxs, sequence_lengths, input_lengths,
@@ -356,9 +359,10 @@ public:
         mStream->synchronize();
 
         // get kv cache
-        const int32_t batchBeam = batchSize * beamWidth;
+        int32_t const batchBeam = batchSize * beamWidth;
         auto const elemSize = sizeof(T);
         auto const sizePerToken = numHeads * headSize * elemSize;
+        bool const canUseOneMoreBlock = beamWidth > 1;
 
         auto shiftKCacheBuffer = KVLinearBuffer(batchBeam, maxAttentionWindow, sizePerToken, maxAttentionWindow,
             sinkTokenLength, true, reinterpret_cast<int8_t*>(bufferCast<T>(*mOutputDataDevice)));
@@ -375,8 +379,8 @@ public:
             auto inputDataDevicePtr = bufferCast<T>(*mInputDataDevice);
 
             auto const kvCacheBuffer = KVBlockArray(batchBeam, maxBlocksPerSeq, tokensPerBlock, sizePerToken,
-                maxAttentionWindow, sinkTokenLength, inputDataDevicePtr, nullptr,
-                bufferCast<KVBlockArray::DataType>(*mInputBlockOffsetsDevice));
+                maxAttentionWindow, maxAttentionWindow, sinkTokenLength, canUseOneMoreBlock, inputDataDevicePtr,
+                nullptr, bufferCast<KVBlockArray::DataType>(*mInputBlockOffsetsDevice));
             invokeShiftKCache<DataType, KVBlockArray>(kvCacheBuffer, shiftKCacheBuffer, kv_cache_type, headSize,
                 pastKCacheLength, batchBeam, numHeads, beamWidth, maxAttentionWindow, sinkTokenLength,
                 bufferCast<float>(*mKScaleQuantOrigDevice), bufferCast<int32_t>(*mSeqLengthsDevice),

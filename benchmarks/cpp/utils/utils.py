@@ -1,5 +1,6 @@
 import json
 import math
+import os
 import random
 from typing import List
 
@@ -42,6 +43,7 @@ def dataset_dump(input_lens, input_ids, output_lens, task_ids, metadata,
                    output_len=output_lens[i],
                    task_id=task_ids[i]))
     workload = Workload(metadata=metadata, samples=samples)
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
     with open(output_file, 'w') as f:
         json.dump(workload.model_dump(), f)
 
@@ -50,7 +52,7 @@ def print_dataset(input_ids, output_lens):
     for i, input_tokens in enumerate(input_ids):
         d = {
             "task_id": i,
-            "logits": input_tokens,
+            "input_ids": input_tokens,
             "output_tokens": output_lens[i]
         }
         print(json.dumps(d, separators=(',', ':'), ensure_ascii=False))

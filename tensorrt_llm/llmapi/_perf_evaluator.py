@@ -266,6 +266,8 @@ class LLMPerfEvaluator:
             kvcache_extra_params["free_gpu_memory_fraction"] = kwargs.pop(
                 "kv_cache_free_gpu_mem_fraction")
 
+        enable_chunked_prefill = kwargs.pop("chunked_context", True)
+
         print_colored(f"Creating LLM with {model} and {kwargs}\n", "green")
         print_colored(f"sampling_extra_params: {sampling_extra_params}\n",
                       "green")
@@ -277,7 +279,10 @@ class LLMPerfEvaluator:
                 **kvcache_extra_params) if kvcache_extra_params else None
             if kv_cache_config is not None:
                 kwargs['kv_cache_config'] = kv_cache_config
-            llm = LLM(model, skip_tokenizer_init=True, **kwargs)
+            llm = LLM(model,
+                      skip_tokenizer_init=True,
+                      enable_chunked_prefill=enable_chunked_prefill,
+                      **kwargs)
         except Exception as e:
             logger.error(f"Failed to create LLM with {model} and {kwargs}")
             raise e

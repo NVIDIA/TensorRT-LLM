@@ -396,3 +396,31 @@ INSTANTIATE_PluginFieldParser_getScalar(int32_t);
 INSTANTIATE_PluginFieldParser_getScalar(char);
 INSTANTIATE_PluginFieldParser_getScalar(nvinfer1::Dims);
 #undef INSTANTIATE_PluginFieldParser_getScalar
+
+template <typename T>
+std::optional<std::set<T>> PluginFieldParser::getSet(std::string_view const& name)
+{
+    auto const iter = mMap.find(name);
+    if (iter == mMap.end())
+    {
+        return std::nullopt;
+    }
+    auto& record = mMap.at(name);
+    auto const& f = mFields[record.index];
+    TLLM_CHECK(toFieldType<T>() == f.type);
+    std::set<T> group;
+    auto const* r = static_cast<T const*>(f.data);
+    for (int j = 0; j < f.length; ++j)
+    {
+        group.insert(*r);
+        ++r;
+    }
+
+    record.retrieved = true;
+    return std::optional{group};
+}
+
+#define INSTANTIATE_PluginFieldParser_getVector(T)                                                                     \
+    template std::optional<std::set<T>> PluginFieldParser::getSet(std::string_view const&)
+INSTANTIATE_PluginFieldParser_getVector(int32_t);
+#undef INSTANTIATE_PluginFieldParser_getVector

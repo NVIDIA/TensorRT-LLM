@@ -1,5 +1,6 @@
 #!/bin/bash
 set -e
+set -x
 
 TRTLLM_ROOT=$(realpath ${TRTLLM_ROOT:-$(pwd)/../../..})
 DATA_DIR=$TRTLLM_ROOT/benchmarks/cpp
@@ -14,7 +15,7 @@ ISL="128,2048"
 OSL="128,2048"
 RETURN_CONTEXT_LOGITS=0
 RETURN_GENERATION_LOGITS=0
-KVCACHE_MEM_FRACTION=0.95
+KVCACHE_MEM_FRACTION=0.98
 MAX_BATCH_SIZE=2048
 MAX_NUM_TOKENS=8192
 FP8_QUANT=0
@@ -136,13 +137,39 @@ assert_not_empty $TP_SIZE
 assert_not_empty $ISL
 assert_not_empty $OSL
 
+FP8_SUFFIX=""
+if [ $FP8_QUANT -eq 1 ]; then
+  FP8_SUFFIX="-fp8"
+fi
+
 MODEL=$(basename $HF_MODEL_DIR)
-SCRATCH_ROOT=${TRTLLM_SCRATCH_ROOT:-$PWD/_scratch-$MODEL}
+SCRATCH_ROOT=${TRTLLM_SCRATCH_ROOT:-$PWD/_scratch-${MODEL}${FP8_QUANT}-${ISL}-${OSL}}
 JSON_REPORTS_DIR=$SCRATCH_ROOT/reports-$TP_SIZE
 LOGS_DIR=$SCRATCH_ROOT/logs-$TP_SIZE
 NUM_SAMPLES=2000
+MAX_SEQ_LEN=4096
 
-ENGINE_DIR="/tmp/engine-${MODEL}-tp${TP_SIZE}"
+# if isl=128 and osl=128 then NUM_SAMPLES=30000
+# if isl=128 and osl=2048 then NUM_SAMPLES=3000
+if [ "$ISL" = "128" ] && [ "$OSL" = "128" ]; then
+  NUM_SAMPLES=30000
+  NUM_SAMPLES=3000 # DEBUG
+  MAX_SEQ_LEN=256
+fi
+if [ "$ISL" = "128" ] && [ "$OSL" = "2048" ]; then
+  NUM_SAMPLES=3000
+  MAX_SEQ_LEN=2176
+fi
+if [ "$ISL" = "2048" ] && [ "$OSL" = "128" ]; then
+  NUM_SAMPLES=3000
+  MAX_SEQ_LEN=2176
+fi
+if [ "$ISL" = "2048" ] && [ "$OSL" = "2048" ]; then
+  NUM_SAMPLES=1500
+  MAX_SEQ_LEN=4096
+fi
+
+ENGINE_DIR="/tmp/engine-${MODEL}-tp${TP_SIZE}${FP8_SUFFIX}.${ISL}-${OSL}"
 
 if [ -z "$MODEL" ]; then
   echo "MODEL is empty"
@@ -160,68 +187,35 @@ echo "SCRATCH_ROOT: $SCRATCH_ROOT"
 mkdir -p $JSON_REPORTS_DIR
 mkdir -p $LOGS_DIR
 
+function get_data_path {
+  local isl=$1
+  local osl=$2
+  local samples=$3
+  echo $DATA_DIR/data.$samples.$isl.$osl.json
+}
+
 function build_engine_using_cli() {
   cd $TRTLLM_ROOT
+  workspace=$ENGINE_DIR
+  #local data_path=$(get_data_path $ISL $OSL $NUM_SAMPLES)
+  local max_seq_len=$((ISL + OSL))
 
-  local CKPT_DIR=/tmp/ckpt-${MODEL}-tp${TP_SIZE}
+  generate_data_for_bench $ISL $OSL $NUM_SAMPLES
 
-  if [ $FP8_QUANT -eq 1 ]; then
-      CKPT_DIR=/tmp/ckpt-${MODEL}-tp${TP_SIZE}-fp8
-      ENGINE_DIR=/tmp/engine-${MODEL}-tp${TP_SIZE}-fp8
-
-      if [ ! -e $CKPT_DIR ]; then
-
-        echo -e "${GREEN}Quantizing the model to FP8${NC}"
-        set -x
-        python $TRTLLM_ROOT/examples/quantization/quantize.py --model_dir $HF_MODEL_DIR \
-                                    --dtype float16 \
-                                    --qformat fp8 \
-                                    --kv_cache_dtype fp8 \
-                                    --output_dir $CKPT_DIR \
-                                    --calib_size 512 \
-                                    --tp_size $TP_SIZE
-        set +x
-      fi
-
-  else
-
-    if [ ! -e $CKPT_DIR ]; then
-        set -x
-        python examples/$EXAMPLE_DIR/convert_checkpoint.py \
-            --model_dir $HF_MODEL_DIR \
-            --output_dir $CKPT_DIR \
-            --tp_size $TP_SIZE \
-            --workers $TP_SIZE
-        set +x
+  local log_file=$workspace/engine_build.log
+  if [ ! -d $workspace ]; then
+    mkdir -p $workspace
+    local cmd="trtllm-bench -m $HF_MODEL_DIR -w $workspace build -tp $TP_SIZE --dataset $(get_data_path $ISL $OSL $NUM_SAMPLES)"
+    if [ $FP8_QUANT -eq 1 ]; then
+      cmd="$cmd -q FP8"
     fi
-
+    set -x
+    # tee to a file
+    $cmd 2>&1 | tee $log_file
+    set +x
   fi
-
-
-  if [ ! -e $ENGINE_DIR ]; then
-      gather_context_logits=""
-      if [ $RETURN_CONTEXT_LOGITS -eq 1 ]; then
-          gather_context_logits="--gather_context_logits"
-      fi
-
-      gather_generation_logits=""
-      if [ $RETURN_GENERATION_LOGITS -eq 1 ]; then
-          gather_generation_logits="--gather_generation_logits"
-      fi
-
-      set -x
-      python $TRTLLM_ROOT/tensorrt_llm/commands/build.py \
-          --max_seq_len 4096 \
-          --checkpoint_dir $CKPT_DIR \
-          --output_dir $ENGINE_DIR \
-          --workers $TP_SIZE \
-          --max_input_len 2048 \
-          $gather_context_logits \
-          $gather_generation_logits \
-          --max_batch_size $MAX_BATCH_SIZE \
-          --max_num_tokens $MAX_NUM_TOKENS
-      set +x
-  fi
+  ENGINE_DIR=$(grep 'ENGINE SAVED:' $log_file | sed 's/.*SAVED: //')
+  echo "Engine saved to $ENGINE_DIR"
 }
 
 function generate_data() {
@@ -230,7 +224,7 @@ function generate_data() {
   local samples=$3
   cd $DATA_DIR
 
-  local data_path=$DATA_DIR/data.$samples.$isl.$osl.json
+  local data_path=$(get_data_path $isl $osl $samples)
 
   echo "TRTLLM_ROOT: $TRTLLM_ROOT"
   echo "Working on $PWD"
@@ -246,6 +240,27 @@ function generate_data() {
     --output-mean $osl \
     --input-stdev 0 \
     --output-stdev 0
+}
+
+function generate_data_for_bench() {
+  local isl=$1
+   local osl=$2
+   local samples=$3
+   cd $DATA_DIR
+
+   local data_path=$(get_data_path $isl $osl $samples)
+
+   echo "TRTLLM_ROOT: $TRTLLM_ROOT"
+   echo "Working on $PWD"
+
+   local prepare_dataset="prepare_dataset.py"
+
+   python $prepare_dataset \
+    --tokenizer=$HF_MODEL_DIR \
+    --stdout token-norm-dist \
+    --num-requests=$samples \
+    --input-mean=$isl \
+    --output-mean=$osl --input-stdev=0 --output-stdev=0 > $data_path
 }
 
 function run_perf() {
@@ -269,6 +284,9 @@ function run_perf() {
 
   rm -f $log_path
   mkdir -p $report_path
+
+
+  generate_data $ISL $OSL $NUM_SAMPLES
 
   set -x
   python $evaluator_py benchmark \
@@ -317,7 +335,6 @@ function run() {
 
   echo -e "${GREEN}Running with isl: $isl, osl: $osl, samples: $samples, streaming: $streaming${NC}"
 
-  generate_data $isl $osl $samples
   run_perf $isl $osl $samples $streaming
   extractlog $log_path $JSON_REPORTS_DIR/report-$samples.$isl.$osl$streaming_suffix.json
 }
@@ -347,6 +364,8 @@ chmod +x *.py
 
 # get summary of the GPUs
 nvidia-smi --query-gpu=index,name,gpu_uuid,pci.bus_id,power.draw,temperature.gpu,utilization.gpu,memory.total,memory.free,memory.used --format=csv
+export NCCL_DEBUG=INFO
+
 
 build_engine_using_cli
 
@@ -372,6 +391,8 @@ LOCK_FILE=$WORKSPACE/_lockfile
 
   echo "Date: $(date)" >> $OUTPUT_FILE
   echo $MODEL >> $OUTPUT_FILE
+  echo "TP: ${TP_SIZE}" >> $OUTPUT_FILE
+  echo "FP8: $FP8_QUANT" >> $OUTPUT_FILE
   cat $LOGS_DIR/output.csv >> $OUTPUT_FILE
   echo >> $OUTPUT_FILE
 ) 200>"$LOCK_FILE"

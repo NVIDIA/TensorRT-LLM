@@ -18,31 +18,36 @@
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/runtime/common.h"
 
+#include "tensorrt_llm/kernels/topkLastDim.h" // Air TopK
+
 namespace tensorrt_llm
 {
 namespace kernels
 {
-static constexpr int nMaxBeamWidth = 256; // max beam width supported now
-static constexpr int nBlockSizeForSmallBeamWidth = 256;
-static constexpr int nMaxVocabPartForStage1FastKernel = 128;
+static constexpr size_t nMaxBeamWidth = 1024;           // Max beam width supported in TRT-LLM now
+static constexpr size_t nMaxBeamWidthForV1 = 8;         // Max beam width for V1 kernels
+static constexpr size_t nThreadForSmallBeamWidth = 256; // Max count of thread for V1 stage 1
+static constexpr size_t nMaxVPartStage1 = 128;          // Max vocab part count for V1 stage 1
 
 struct BeamHypotheses
 {
     // clang-format off
-
     // MBS: max_batch_size, BS: batch_size, BM: beam_width, MSL: max_seq_length
     // %%: parameter name in file generation.py (python workflow)
-
     // Candidate beams: a beam which generates end_id or its sequence length reaches MSL
     // Candidate-Beam-Array (CBA): The arrays to place the candidate beams and related information
 
     // Scalar values
-    bool bReturnNormedScore{false};     // return `normedScore` or `cumLogProbs`, always be `false` now
-    int nMaxBatchSize{0};               // buildtime max batch size
-    int nBatchSize{0};                  // runtime batch size
-    int nBeamWidth{0};                  //
-    int nMaxSeqLen{0};                  //
-    int nVocabSize{0};                  // vocab_size_padded
+    bool bReturnNormedScore{false};         // return `normedScore` or `cumLogProbs`, always be `false` now
+    size_t nMaxBatchSize{0};                // buildtime max batch size
+    size_t nBatchSize{0};                   // runtime batch size
+    size_t nBeamWidth{0};                   //
+    size_t nMaxSeqLen{0};                   //
+    size_t nVocabSize{0};                   // vocab_size_padded
+    size_t nVPart{0};                       // Count of vocab_size_padded divided
+    size_t nByteMaxSharedMemoryPerBlock{0};  // Device information
+    size_t nByteSharedMemoryStage1{0};       // Dynamic shared memory size of stage 1
+    size_t nByteSharedMemoryStage3{0};       // Static shared memory size of stage 3
 
     // Pointers from SamplingConfig
     float const* diversityRates{nullptr};           // [BS]
@@ -107,8 +112,16 @@ __device__ __forceinline__ T applyLengthPenalty(T const log_prob, int const leng
     return log_prob / static_cast<T>(powf(static_cast<float>(length), length_penalty));
 }
 
+template <typename T, bool IS_V2>
+void invokeTopkBeamSearch(T const* logProbs, T const* bias, void* workspace, BeamHypotheses& bh, cudaStream_t stream);
+
 template <typename T>
-void invokeTopkSoftMax(T const* logits, T const* bias, void* workspace, BeamHypotheses& bh, cudaStream_t stream);
+__global__ void addCumLogProbs(T* __restrict pStage1Probs, float const* __restrict cumLogProbs,
+    FinishedState const* finished, int const* endIds, float const* diversityRates,
+    runtime::SizeType32 const* batchSlots, size_t const nBS, size_t const nBM);
+
+__global__ void gatherId(
+    int const* __restrict pStage1Id, int* __restrict pStage2Id, size_t const nBS, size_t const nBM, size_t const nV);
 
 } // namespace kernels
 } // namespace tensorrt_llm

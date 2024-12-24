@@ -14,10 +14,10 @@
  * limitations under the License.
  */
 
-#ifndef _WIN32
+#ifdef __GNUC__ // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
-#endif // #ifndef _WIN32
+#endif // __GNUC__
 
 #include "cutlass/gemm/kernel/default_gemm.h"
 #include "cutlass_extensions/compute_occupancy.h"
@@ -29,9 +29,9 @@
 #include "cutlass_extensions/gemm/threadblock/default_mma.h"
 #include "cutlass_extensions/gemm_configs.h"
 
-#ifndef _WIN32
+#ifdef __GNUC__ // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic pop
-#endif // #ifndef _WIN32
+#endif          // __GNUC__
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -106,7 +106,7 @@ void generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType const
         MixedGemmArchTraits::ElementsPerAccessB, CutlassOutputType, cutlass::layout::RowMajor, ElementAccumulator,
         cutlass::arch::OpClassTensorOp, arch, ThreadblockShape, WarpShape,
         typename MixedGemmArchTraits::InstructionShape, EpilogueOp,
-        typename cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, Stages, true,
+        typename cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<8>, Stages, true,
         TaggedOperator>::GemmKernel;
 
     using GemmKernel = cutlass::gemm::kernel::GemmFpAIntB<typename GemmKernel_::Mma, typename GemmKernel_::Epilogue,
@@ -433,13 +433,7 @@ void CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType
     char* workspace_ptr, const size_t workspace_bytes, cudaStream_t stream, int* occupancy)
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-    if (sm_ >= 70 && sm_ < 75)
-    {
-        dispatch_gemm_to_cutlass<ActivationType, WeightType, ScaleZeroType, BiasType, OutputType, cutlass::arch::Sm70,
-            QuantOp, EpilogueTag>(A, B, weight_scales, weight_zero_points, biases, alpha, C, m, n, k, group_size,
-            workspace_ptr, workspace_bytes, gemm_config, stream, occupancy);
-    }
-    else if (sm_ >= 75 && sm_ < 80)
+    if (sm_ >= 75 && sm_ < 80)
     {
         dispatch_gemm_to_cutlass<ActivationType, WeightType, ScaleZeroType, BiasType, OutputType, cutlass::arch::Sm75,
             QuantOp, EpilogueTag>(A, B, weight_scales, weight_zero_points, biases, alpha, C, m, n, k, group_size,
@@ -467,6 +461,9 @@ void CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType
     }
     else if (sm_ == 90)
     {
+        static_assert(!cutlass::platform::is_same<ActivationType, __nv_fp8_e4m3>::value
+                || cutlass::platform::is_same<ScaleZeroType, half>::value,
+            "ScaleZeroType must be half for activation=fp8");
         sm90_dispatch_gemm_to_cutlass<ActivationType, WeightType, ScaleZeroType, BiasType, OutputType, QuantOp,
             EpilogueTag>(A, B, weight_scales, weight_zero_points, biases, alpha, C, m, n, k, group_size, workspace_ptr,
             workspace_bytes, gemm_config, stream, occupancy);
@@ -568,6 +565,27 @@ CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType, Bia
     int const m, int const n, int const k)
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+    // For Hopper, we have to allocate large memory size in case for stream-K
+    if (sm_ == 90)
+    {
+        // https://github.com/NVIDIA/cutlass/blob/19b4c5e065e7e5bbc8082dfc7dbd792bdac850fc/include/cutlass/gemm/kernel/tile_scheduler_params.h#L878-L892
+        // The above lines says sk_tiles = output_tiles - (static_cast<uint32_t>(output_tiles / ctas_per_wave) - 1) *
+        // ctas_per_wave This means sk_tiles is at most 2 * ctas_per_wave, which is 2 * multi_processor_count_
+        int const max_sk_tiles = 2 * multi_processor_count_;
+
+        // https://github.com/NVIDIA/cutlass/blob/19b4c5e065e7e5bbc8082dfc7dbd792bdac850fc/include/cutlass/gemm/kernel/tile_scheduler_params.h#L939
+        // The above line says uint64_t sk_units = platform::min(ctas_per_sk_wave, min_sized_sk_units);
+        // That means sk_units is at most ctas_per_sk_wave, which is multi_processor_count_
+        int const max_sk_units = multi_processor_count_;
+
+        // https://github.com/NVIDIA/cutlass/blob/19b4c5e065e7e5bbc8082dfc7dbd792bdac850fc/include/cutlass/gemm/kernel/tile_scheduler_params.h#L505
+        // The above lines scales sk_tiles by the factor of static_cast<uint32_t>(sk_units / sk_tiles + 2)
+        // That means the final sk_tiles is at most 2 * max_sk_tiles + max_sk_units;
+        int const max_sk_tiles_with_seperate_reduction = 2 * max_sk_tiles + max_sk_units;
+
+        return static_cast<size_t>(
+            max_sk_tiles_with_seperate_reduction * MAX_M_TILE_SM90 * MAX_N_TILE_SM90 * sizeof(float));
+    }
     // These are the min tile sizes for each config, which would launch the maximum number of blocks
     int const max_grid_m = cutlass::ceil_div(m, MIN_M_TILE);
     int const max_grid_n = cutlass::ceil_div(n, MIN_N_TILE);

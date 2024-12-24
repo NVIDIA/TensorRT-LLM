@@ -57,7 +57,7 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
   * w4aINT8 quantization (QServe)
   * FP8 KV CACHE
   * INT8 KV CACHE (+ AWQ/per-channel weight-only)
-  * Tensor Parallel
+  * Tensor Parallel + Pipeline Parallel, Tensor Parallel + Context Parallel
   * STRONGLY TYPED
 
 ## Usage
@@ -154,6 +154,16 @@ python convert_checkpoint.py --model_dir ./tmp/llama/7B/ \
                             --tp_size 2 \
                             --pp_size 2
 trtllm-build --checkpoint_dir ./tllm_checkpoint_4gpu_tp2_pp2 \
+            --output_dir ./tmp/llama/7B/trt_engines/fp16/4-gpu/ \
+            --gemm_plugin auto
+
+# Build LLaMA 7B using 2-way tensor parallelism and 2-way context parallelism.
+python convert_checkpoint.py --model_dir ./tmp/llama/7B/ \
+                            --output_dir ./tllm_checkpoint_4gpu_tp2_cp2 \
+                            --dtype float16 \
+                            --tp_size 2 \
+                            --cp_size 2
+trtllm-build --checkpoint_dir ./tllm_checkpoint_4gpu_tp2_cp2 \
             --output_dir ./tmp/llama/7B/trt_engines/fp16/4-gpu/ \
             --gemm_plugin auto
 
@@ -707,6 +717,13 @@ AWQ/GPTQ examples below involves 2 steps:
                                        --output_dir ./quantized_int4-awq \
                                        --calib_size 32
     ```
+    HF checkpoints generated with [AutoAWQ](https://github.com/casper-hansen/AutoAWQ) are also supported through the following conversion script:
+
+    ```bash
+    # Convert AutoAWQ HF checkpoints into TRT-LLM checkpoint
+    python convert_checkpoint.py --model_dir ./tmp/Llama-2-7B-AWQ \
+                                 --output_dir ./quantized_int4-awq
+    ```
 
 2. Build TRT-LLM engine:
 
@@ -735,8 +752,27 @@ To run the GPTQ LLaMa example, the following steps are required:
     # Quantized weight with parameter "--act-order" is not supported in TRT-LLM
     python quant_autogptq.py ./tmp/llama/7B ./llama-7b-4bit-gs128.safetensors wikitext --bits 4 --group_size 128 --desc_act 0 --damp 0.1 --dtype float16 --seqlen 4096 --num_samples 3 --use_fast
     ```
+    Then we can convert the saved `./llama-7b-4bit-gs128.safetensors` into TRT-LLM checkpoints by:
+    ```bash
+    # Build the LLaMA 7B model using 2-way tensor parallelism and apply INT4 GPTQ quantization.
+    # Compressed checkpoint safetensors are generated separately from GPTQ.
+    python convert_checkpoint.py --model_dir /tmp/llama-7b-hf \
+                                 --output_dir ./tllm_checkpoint_2gpu_gptq \
+                                 --dtype float16 \
+                                 --quant_ckpt_path ./llama-7b-4bit-gs128.safetensors  \
+                                 --use_weight_only \
+                                 --weight_only_precision int4_gptq \
+                                 --per_group \
+                                 --tp_size 2
+    ```
+    HF checkpoints generated with AutoGPTQ are also supported through the following conversion script:
 
-    Let us build the TRT-LLM engine with the saved `./llama-7b-4bit-gs128.safetensors`.
+    ```bash
+    # Convert AutoGPTQ HF checkpoints into 2-way tensor parallelism TRT-LLM checkpoint
+    python convert_checkpoint.py --model_dir ./tmp/Llama-2-7B-GPTQ \
+                                 --output_dir ./tllm_checkpoint_2gpu_gptq \
+                                 --tp_size 2
+    ```
 
 2. Build TRT-LLM engine:
 
@@ -765,23 +801,23 @@ Please follow the steps to run the model using QServe w4aINT8:
 
 1. Weight quantization:
 
-   Currently we rely on the 3rd-party repo [lmquant](https://github.com/mit-han-lab/lmquant) to prepare the quantized checkpoint. Follow the [instructions](https://github.com/mit-han-lab/lmquant/blob/main/projects/llm/README.md) to quantize the model. Please use the `configs/qoq/g128.yaml` for per-group quantization, and `configs/qoq/gchn.yaml` for the per-channel quantization. Do not forget to add the flag `--save-model` so that the quantized model is dumped to the disk.
+   Currently we rely on the 3rd-party repo [deepcompressor](https://github.com/mit-han-lab/deepcompressor) to prepare the fake-quantized checkpoint. Follow the [instructions](https://github.com/mit-han-lab/deepcompressor/blob/main/examples/llm/README.md#usage) to quantize the model. Please use the `configs/qoq-g128.yaml` for per-group quantization, and `configs/qoq-gchn.yaml` for the per-channel quantization. Do not forget to add the flag `--save-model path/to/deepcompressor/ckpt` so that the quantized model is dumped to the disk.
 
-   After quantization, the original Hugging Face checkpoint (assume under `path/to/huggingface/ckpt/`) will be quantized and the following files are obtained under your `path/to/lmquant/ckpt`:
+   After quantization, the weights in the original Hugging Face checkpoint (assume under `path/to/huggingface/ckpt/`) will be quantized and the following files are obtained under your `path/to/deepcompressor/ckpt`:
 
    - `model.pt`: fake-quantized fp16 weights.
    - `scale.pt`: quantization scales and zeros.
 
 2. Checkpoint conversion:
 
-   Convert the lmquant checkpoint into TensorRT-LLM checkpoint, potentially with tensor parallelism:
+   Convert the DeepCompressor checkpoint into TensorRT-LLM checkpoint, potentially with tensor parallelism:
 
    ```bash
    export TRTLLM_DISABLE_UNIFIED_CONVERTER=1  # The current checkpoint conversion code requires legacy path
    python convert_checkpoint.py --model_dir path/to/huggingface/ckpt/  \
                                 --output_dir path/to/trtllm/ckpt/  \
                                 --dtype float16  \
-                                --quant_ckpt_path path/to/lmquant/ckpt  \
+                                --quant_ckpt_path path/to/deepcompressor/ckpt  \
                                 --use_qserve  \
                                 --per_group  \  # Add this option if using per-group quantization
                                 --tp_size 2

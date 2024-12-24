@@ -117,6 +117,15 @@ def dup_kv_weight(v, num_head, tp_size):
     return v.reshape(num_head * reps * head_size, -1).clone().detach()
 
 
+def dup_kv_bias(v, num_head, tp_size):
+    assert tp_size % num_head == 0
+    reps = tp_size // num_head
+    head_size = v.shape[0] // num_head
+    v = v.reshape(num_head,
+                  head_size)[:, None, :].expand(num_head, reps, head_size)
+    return v.reshape(num_head * reps * head_size).clone().detach()
+
+
 def weight_only_quantize_dict(weights: Dict[str, torch.Tensor],
                               quant_algo: str,
                               quant_weights=[

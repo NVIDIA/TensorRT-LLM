@@ -26,8 +26,10 @@
 #include <sstream>
 
 // Ignore CUTLASS warnings about type punning
+#ifdef __GNUC__ // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
+#endif
 
 #include "cute/tensor.hpp"
 #include "cutlass/conv/convolution.h"
@@ -41,7 +43,9 @@
 
 #include "cutlass_extensions/epilogue/thread/fused_activations.h"
 
+#ifdef __GNUC__ // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic pop
+#endif
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/dataType.h"

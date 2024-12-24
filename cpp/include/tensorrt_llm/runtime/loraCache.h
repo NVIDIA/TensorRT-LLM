@@ -154,6 +154,8 @@ public:
      */
     struct TaskLayerModuleConfig
     {
+        friend class TaskLayerModuleConfigBindings;
+
         std::size_t pageId;
         SizeType32 slotIdx;
         SizeType32 inSize;  // adapterSize * inDim

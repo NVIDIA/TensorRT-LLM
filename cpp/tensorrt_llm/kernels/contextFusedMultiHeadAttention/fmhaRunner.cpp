@@ -81,8 +81,8 @@ static inline void set_alpha(uint32_t& alpha, float norm, Data_type dtype)
 FusedMHARunnerV2::FusedMHARunnerV2(MHARunnerFixedParams fixedParams)
     : mFixedParams(fixedParams)
 {
-    TLLM_CHECK_WITH_INFO((mSM == kSM_70 || mSM == kSM_80 || mSM == kSM_86 || mSM == kSM_89 || mSM == kSM_90),
-        "Unsupported architecture");
+    TLLM_CHECK_WITH_INFO(
+        (mSM == kSM_80 || mSM == kSM_86 || mSM == kSM_89 || mSM == kSM_90), "Unsupported architecture");
     TLLM_CHECK_WITH_INFO((mFixedParams.dataType == DATA_TYPE_FP16 || mFixedParams.dataType == DATA_TYPE_BF16
                              || mFixedParams.dataType == DATA_TYPE_E4M3),
         "Unsupported data type");
@@ -163,8 +163,9 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
     // (bmm1_output * scale_bmm1 + alibi) * scale_after_alibi
     float const scale_after_alibi = mFixedParams.scaleAlibi ? inv_sqrt_scale : 1.0f;
     float scale_bmm1 = mFixedParams.scaleAlibi ? 1.0f : inv_sqrt_scale;
-    // Fuse 1.0f / qk_tanh_scale into scale_bmm1.
-    scale_bmm1 = mFixedParams.qkTanhScale != 0.f ? scale_bmm1 / mFixedParams.qkTanhScale : scale_bmm1;
+    // Fuse 1.0f / attn_logit_softcapping_scale into scale_bmm1.
+    scale_bmm1 = mFixedParams.attnLogitSoftcappingScale != 0.f ? scale_bmm1 / mFixedParams.attnLogitSoftcappingScale
+                                                               : scale_bmm1;
     // The softmax output scale (not used).
     float const scale_softmax = 1.f;
     // FP8 FMHA kernels load the scale_bmm2 from the device memory.
@@ -185,8 +186,8 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
     set_alpha(mKernelParams.scale_softmax, scale_softmax, scale_type);
     // Host scale_bmm2 will not be used.
     set_alpha(mKernelParams.scale_bmm2, scale_bmm2, scale_type);
-    // The tanh scale after bmm1 (always float32).
-    mKernelParams.tanh_scale_bmm1 = mFixedParams.qkTanhScale;
+    // The attention logit softcapping scale after bmm1 (always float32).
+    mKernelParams.softcapping_scale_bmm1 = mFixedParams.attnLogitSoftcappingScale;
 
     // alibi.
     if (mFixedParams.hasAlibi && mSM > kSM_70)
@@ -247,10 +248,11 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
     mLaunchParams.device_l2_cache_size = mDeviceL2CacheSize;
     mLaunchParams.total_device_memory = mTotalDeviceMemory;
 
-    // Do we use qkTanhScale ?
-    TLLM_CHECK_WITH_INFO((mFixedParams.headSize == 128 || mFixedParams.headSize == 256) || !mFixedParams.qkTanhScale,
-        "FMHA only supports head_size = 128 or 256 with QK Tanh Scale currently.");
-    mLaunchParams.enableQKTanhScale = mFixedParams.qkTanhScale != 0.f;
+    // Do we use attnLogitSoftcappingScale ?
+    TLLM_CHECK_WITH_INFO(
+        (mFixedParams.headSize == 128 || mFixedParams.headSize == 256) || !mFixedParams.attnLogitSoftcappingScale,
+        "FMHA only supports head_size = 128 or 256 with attention logit softcapping scale currently.");
+    mLaunchParams.enableAttnLogitSoftcapping = mFixedParams.attnLogitSoftcappingScale != 0.f;
     // BF16 FMHA only accumulates on FP32.
     // E4M3 FMHA only supports fp32 accumulation currently.
     mLaunchParams.force_fp32_acc = mFixedParams.dataType == DATA_TYPE_BF16 || mFixedParams.dataType == DATA_TYPE_E4M3
@@ -301,8 +303,7 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
     }
     else if (isSm70)
     {
-        mLaunchParams.flash_attention = true;
-        mLaunchParams.force_unroll = true; // need more profile
+        TLLM_CHECK_WITH_INFO(false, "Unsupported architecture");
     }
     // Hopper: fallback to original fmha_v2 when head_size <= 64 and seq_len <= 256
     // Only supports packed_qkv input + padding/causal mask.
@@ -362,8 +363,8 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
         // Enable exp2f optimization (which helps improve performance).
         //    - note that this is not compatible with alibi bias due to the accuracy issues.
         //    - only hopper warp-specialized kernels have this optimization.
-        //    - it doesn't work with scale * tanh(qk / scale) operation (from Grok).
-        mLaunchParams.useBase2ExpTrick = !mLaunchParams.enableQKTanhScale;
+        //    - it doesn't work with attention logit softcapping.
+        mLaunchParams.useBase2ExpTrick = !mLaunchParams.enableAttnLogitSoftcapping;
     }
 
     // For Deepseek-v2(MLA), all of SM80, SM89 and SM90 kernels use tiled flash attention
@@ -653,6 +654,18 @@ void FusedMHARunnerV2::run(MHARunnerParams runnerParams)
         default: TLLM_CHECK_WITH_INFO(false, "Unsupported attention input layout.");
         }
     }
+    // Check if the sliding window size is valid or not.
+    if (mFixedParams.attentionInputLayout == AttentionInputLayout::Q_PAGED_KV
+        && mLaunchParams.attention_mask_type == ContextAttentionMaskType::SLIDING_WINDOW_CAUSAL)
+    {
+        uint32_t q_step = 0, kv_step = 0;
+        xmmaKernel->getStepSize(q_step, kv_step, mKernelParams, mLaunchParams);
+        // The sliding window size needs to be multiple of kv_step, so that the paged context fmha can read the cyclic
+        // kv cache correctly.
+        TLLM_CHECK_WITH_INFO(mKernelParams.sliding_window_size % kv_step == 0,
+            "The sliding window size doesn't work with paged context fmha kv_step_size = %d.", kv_step);
+    }
+
     // Select the kernel and run it.
     xmmaKernel->run(mKernelParams, mLaunchParams, runnerParams.stream);
 }

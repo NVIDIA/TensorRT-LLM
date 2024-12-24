@@ -50,8 +50,11 @@ void BaseSamplingLayerTest<T>::setup(uint64_t seed, TestSamplingParams const& pa
 
     mSeqLengthsDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize()}), nvinfer1::DataType::kINT32);
     mContextLengthDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize()}), nvinfer1::DataType::kINT32);
-    mFinishedDevice = mBufferManager->gpu(
-        ITensor::makeShape({maxBatchSize()}), TRTDataType<tk::FinishedState::UnderlyingType>::value);
+    mFinishedDevice = params.isExternalDraftTokensLayerTest
+        ? mBufferManager->gpu(ITensor::makeShape({mMaxTokensPerEngineStep, maxBatchSize()}),
+            TRTDataType<tk::FinishedState::UnderlyingType>::value)
+        : mBufferManager->gpu(
+            ITensor::makeShape({maxBatchSize()}), TRTDataType<tk::FinishedState::UnderlyingType>::value);
     mOutputIdsDevice
         = mBufferManager->gpu(ITensor::makeShape({maxBatchSize(), mMaxSeqLen}), nvinfer1::DataType::kINT32);
     mEndIdsDevice = mBufferManager->gpu(ITensor::makeShape({maxBatchSize()}), nvinfer1::DataType::kINT32);
@@ -81,7 +84,7 @@ void BaseSamplingLayerTest<T>::setup(uint64_t seed, TestSamplingParams const& pa
     auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
     for (SizeType32 bi = 0; bi < mBatchSize; ++bi)
     {
-        batchSlotsPtr[bi] = 2 * bi;
+        batchSlotsPtr[bi] = kDoubleBatchIdx * bi;
     }
     for (SizeType32 bi = 0; bi < mBatchSizeBadPad; ++bi)
     {
@@ -95,17 +98,35 @@ void BaseSamplingLayerTest<T>::setup(uint64_t seed, TestSamplingParams const& pa
         idsPtrHostPtr[bi] = outputIdsDevicePtr + bi * mMaxSeqLen;
     }
 
-    auto setupParams = std::make_shared<SamplingSetupParams>();
-    setupParams->randomSeed = std::make_optional<std::vector<uint64_t>>({seed});
-    setupParams->runtimeTopK
-        = params.topKs.size() ? std::make_optional<std::vector<SizeType32>>(params.topKs) : std::nullopt;
-    setupParams->runtimeTopP
-        = params.topPs.size() ? std::make_optional<std::vector<float>>(params.topPs) : std::nullopt;
-    setupParams->topPDecay = params.decay.size() ? std::make_optional<std::vector<float>>(params.decay) : std::nullopt;
-    setupParams->topPMin
-        = params.minTopP.size() ? std::make_optional<std::vector<float>>(params.minTopP) : std::nullopt;
-    setupParams->topPResetIds
-        = params.topPResetIds.size() ? std::make_optional<std::vector<int32_t>>(params.topPResetIds) : std::nullopt;
+    std::shared_ptr<DecodingSetupParams> setupParams;
+    if (params.isExternalDraftTokensLayerTest == false)
+    {
+        auto samplingSetupParams = std::make_shared<SamplingSetupParams>();
+        samplingSetupParams->randomSeed = std::make_optional<std::vector<uint64_t>>({seed});
+        samplingSetupParams->runtimeTopK
+            = params.topKs.size() ? std::make_optional<std::vector<SizeType32>>(params.topKs) : std::nullopt;
+        samplingSetupParams->runtimeTopP
+            = params.topPs.size() ? std::make_optional<std::vector<float>>(params.topPs) : std::nullopt;
+        samplingSetupParams->topPDecay
+            = params.decay.size() ? std::make_optional<std::vector<float>>(params.decay) : std::nullopt;
+        samplingSetupParams->topPMin
+            = params.minTopP.size() ? std::make_optional<std::vector<float>>(params.minTopP) : std::nullopt;
+        samplingSetupParams->topPResetIds
+            = params.topPResetIds.size() ? std::make_optional<std::vector<int32_t>>(params.topPResetIds) : std::nullopt;
+
+        setupParams = samplingSetupParams;
+    }
+    else
+    {
+        auto externalDraftTokensSetupParams = std::make_shared<ExternalDraftTokensSetupParams>();
+        externalDraftTokensSetupParams->randomSeed = std::make_optional<std::vector<uint64_t>>({seed});
+        externalDraftTokensSetupParams->runtimeTopK
+            = params.topKs.size() ? std::make_optional<std::vector<SizeType32>>(params.topKs) : std::nullopt;
+        externalDraftTokensSetupParams->runtimeTopP
+            = params.topPs.size() ? std::make_optional<std::vector<float>>(params.topPs) : std::nullopt;
+
+        setupParams = externalDraftTokensSetupParams;
+    }
 
     mDecodingWorkspace->setDeviceBatchSlots(mBatchSlots);
     mDecodingWorkspace->getDeviceRuntimeLogits()->reshape(ITensor::makeShape({mBatchSize, mVocabSize}));
@@ -115,7 +136,7 @@ void BaseSamplingLayerTest<T>::setup(uint64_t seed, TestSamplingParams const& pa
 }
 
 template <typename T>
-std::shared_ptr<SamplingInputs> BaseSamplingLayerTest<T>::createInputTensors(int32_t step)
+std::shared_ptr<DecodingInputs> BaseSamplingLayerTest<T>::createInputTensors(int32_t step)
 {
     constexpr int32_t ite = 0;
     auto decodeInputTensors = std::make_shared<SamplingInputs>(mEndIdsDevice, mBatchSlots, step, ite, mBatchSize);
@@ -222,7 +243,14 @@ void BaseSamplingLayerTest<T>::runTest(
         {
             // Reset by the test value since the sampling layer internally updates the logit buffer.
             batchCopy(step);
-            inputTensors->step = step;
+            if (params.isExternalDraftTokensLayerTest)
+            {
+                inputTensors = createInputTensors(step);
+            }
+            else
+            {
+                inputTensors->step = step;
+            }
             mDecodingWorkspace->setDeviceBatchSlots(mBatchSlots);
             mSamplingLayer->forwardAsync(outputTensors, inputTensors, mDecodingWorkspace);
             mStream->synchronize();

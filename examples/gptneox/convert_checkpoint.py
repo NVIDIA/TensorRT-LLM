@@ -73,13 +73,6 @@ def parse_arguments():
         'To shard it along hidden dimension, set embedding_sharding_dim=1'
         'Note: embedding sharing is only enabled when embedding_sharding_dim = 0'
     )
-    parser.add_argument(
-        '--use_embedding_sharing',
-        action="store_true",
-        default=False,
-        help=
-        'Try to reduce the engine size by sharing the embedding lookup table between two layers.'
-        'Note: the flag might not take effect when the criteria are not met.')
     parser.add_argument('--output_dir',
                         type=str,
                         default='tllm_checkpoint',
@@ -200,7 +193,6 @@ def load_from_gptq_gptneox(quant_ckpt_path,
                            hf_config=None,
                            use_parallel_embedding=False,
                            sharding_dim=0,
-                           share_embedding_table=False,
                            mapping=Mapping(),
                            dtype='float16'):
     tensorrt_llm.logger.info(
@@ -310,14 +302,9 @@ def load_from_gptq_gptneox(quant_ckpt_path,
             weights['transformer.vocab_embedding.weight'] = torch_split(
                 v, sharding_dim).to(torch_dtype)
     # 2. lm_head
-    if not share_embedding_table:
-        v = load('embed_out.weight', no_prefix=1)
     if mapping.is_last_pp_rank():
-        if not share_embedding_table:
-            weights['lm_head.weight'] = torch_split(v, 0).to(torch_dtype)
-        elif not mapping.is_first_pp_rank():
-            weights['transformer.vocab_embedding.weight'] = torch_split(
-                v, 0).to(torch_dtype)
+        v = load('embed_out.weight', no_prefix=1)
+        weights['lm_head.weight'] = torch_split(v, 0).to(torch_dtype)
 
     # 3. ln_f
     v = load('final_layer_norm.weight')
@@ -517,7 +504,6 @@ def convert_hf_gptneox(hf_model,
                        dtype='float32',
                        use_parallel_embedding=False,
                        sharding_dim=0,
-                       share_embedding_table=False,
                        use_weight_only=False,
                        plugin_weight_only_quant_type=torch.int8):
     weights = {}
@@ -600,11 +586,10 @@ def convert_hf_gptneox(hf_model,
     embed_w = get_weight(model_params, 'gpt_neox.embed_in', dtype)
     lm_head_w = get_weight(model_params, 'embed_out', dtype)
 
-    if not share_embedding_table:
-        weights['lm_head.weight'] = split_matrix_tp(lm_head_w,
-                                                    tensor_parallel,
-                                                    rank,
-                                                    dim=0)
+    weights['lm_head.weight'] = split_matrix_tp(lm_head_w,
+                                                tensor_parallel,
+                                                rank,
+                                                dim=0)
 
     if not use_parallel_embedding:
         weights['transformer.vocab_embedding.weight'] = embed_w
@@ -678,7 +663,6 @@ if __name__ == '__main__':
         },
         'use_parallel_embedding': args.use_parallel_embedding,
         'embedding_sharding_dim': args.embedding_sharding_dim,
-        'share_embedding_table': args.use_embedding_sharing,
     }
     if args.use_weight_only and args.weight_only_precision == 'int4_gptq':
         config['quantization'].update({
@@ -703,7 +687,6 @@ if __name__ == '__main__':
                 hf_config,
                 use_parallel_embedding=args.use_parallel_embedding,
                 sharding_dim=args.embedding_sharding_dim,
-                share_embedding_table=args.use_embedding_sharing,
                 mapping=mapping,
                 dtype=args.dtype)
         else:
@@ -714,8 +697,7 @@ if __name__ == '__main__':
                 use_weight_only=args.use_weight_only,
                 plugin_weight_only_quant_type=plugin_weight_only_quant_type,
                 use_parallel_embedding=args.use_parallel_embedding,
-                sharding_dim=args.embedding_sharding_dim,
-                share_embedding_table=args.use_embedding_sharing)
+                sharding_dim=args.embedding_sharding_dim)
         safe_save_path = os.path.join(args.output_dir,
                                       f'rank{rank}.safetensors')
         tensorrt_llm.logger.info(f'Saving safetensors to: {safe_save_path}')

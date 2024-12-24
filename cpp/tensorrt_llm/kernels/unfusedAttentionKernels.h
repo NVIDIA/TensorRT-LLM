@@ -44,8 +44,8 @@ struct MaskedSoftmaxParam
     int num_heads = 0;
     T qk_scale = T(0.0f);
     // always float compute data type.
-    float qk_tanh_scale = 0.f;
-    float qk_tanh_inverse_scale = 0.f;
+    float attn_logit_softcapping_scale = 0.f;
+    float attn_logit_softcapping_inverse_scale = 0.f;
     bool block_sparse_attn = false;
     BlockSparseParams block_sparse_params;
     int const* q_seq_lengths = nullptr; // (batch_size)
@@ -86,6 +86,9 @@ struct QKVPreprocessingParams
     // for more details, refer to kvCacheUtils.h
     KVCacheBuffer kv_cache_buffer{};
     T const* qkv_bias{nullptr};
+
+    // Logn scaling pointer, of shape {max_position_embedding_length}
+    float const* logn_scaling{nullptr};
     // list of sequence lengths, of shape {batch_size + 1}
     int const* seq_lens{nullptr};
     // list sequence lengths for the cache, of shape {batch_size + 1}
@@ -105,6 +108,9 @@ struct QKVPreprocessingParams
     float2 const* rotary_coef_cache_buffer{nullptr};
     float const* kvScaleOrigQuant{nullptr};
     int const* spec_decoding_position_offsets{nullptr};
+
+    float2 const* mrope_rotary_sin_cos{nullptr};
+    int32_t const* mrope_position_deltas{nullptr};
 
     // Scalars.
     int batch_size{0};
@@ -283,6 +289,29 @@ void invokeQKVPreprocessing(QKVPreprocessingParams<T, KVCacheBuffer> params, cud
     }
 }
 
+template <typename T, typename T_cache, typename KVCacheBuffer>
+void invokeUpdateCyclicKvCacheAfterFmha(QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStream_t stream);
+
+template <typename T, typename KVCacheBuffer>
+void invokeKvCachePostprocessing(QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStream_t stream)
+{
+    params.setCommonParameters();
+    if (params.cache_type == KvCacheDataType::INT8)
+    {
+        invokeUpdateCyclicKvCacheAfterFmha<T, int8_t, KVCacheBuffer>(params, stream);
+    }
+#ifdef ENABLE_FP8
+    else if (params.cache_type == KvCacheDataType::FP8)
+    {
+        invokeUpdateCyclicKvCacheAfterFmha<T, __nv_fp8_e4m3, KVCacheBuffer>(params, stream);
+    }
+#endif // ENABLE_FP8
+    else
+    {
+        invokeUpdateCyclicKvCacheAfterFmha<T, T, KVCacheBuffer>(params, stream);
+    }
+}
+
 template <typename T, typename BT>
 void invokeAddRelativeAttentionBiasUnaligned(T* qk_buf, const BT* relative_attention_bias, int const batch_size,
     int const head_num, int const seq_len, int const max_seq_len, cudaStream_t stream, bool implicit = false,
@@ -299,5 +328,25 @@ void invokeShiftKCache(KVCacheBuffer const& kvCacheBuffer, KVLinearBuffer const&
 // compute src[x] * scale[0] and write into dst[x]
 template <typename Dst, typename Src>
 void invokeConversion(Dst* dst, Src const* src, int64_t size, float const* __restrict__ scale, cudaStream_t stream);
+
+template <typename T>
+void invokeCpTranspose(T* dst, T* dst2, T const* src, int64_t partialLength, int64_t cpSize, int64_t partialQHeads,
+    int64_t partialKVHeads, int64_t headSize, int64_t rank, cudaStream_t stream);
+
+template <typename T>
+void invokeCpTransposeToSeqMajor(T* dst, T const* srcMyRank, T const* srcOtherRank, int64_t partialLength,
+    int64_t cpSize, int64_t newPartialHeads, int64_t headSize, int64_t rank, cudaStream_t stream);
+
+template <typename T>
+void invokeCpTranspose2(T* dst, T const* src, int32_t const* q_seq_lengths, int32_t const* cu_q_seqlens,
+    int32_t const* cu_cp_partial_seqlens, int64_t cpSize, int64_t maxPartalLength, int64_t batchSize,
+    int64_t partialHeads, int64_t headSize, cudaStream_t stream);
+
+template <typename T>
+void invokeCpTransposeToSeqMajor2(T* dst, T const* src, int32_t const* q_seq_lengths, int32_t const* cu_q_seqlens,
+    int32_t const* cu_cp_partial_seqlens, int64_t cpSize, int64_t maxPartalLength, int64_t batchSize,
+    int64_t partialHeads, int64_t headSize, cudaStream_t stream);
+
 } // namespace kernels
+
 } // namespace tensorrt_llm

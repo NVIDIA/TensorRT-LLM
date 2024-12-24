@@ -214,9 +214,9 @@ endif()
 # Initialize CMAKE_CUDA_ARCHITECTURES before enabling CUDA
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "11.8")
-    set(CMAKE_CUDA_ARCHITECTURES 70-real 80-real 86-real 89-real 90-real)
+    set(CMAKE_CUDA_ARCHITECTURES 80-real 86-real 89-real 90-real)
   else()
-    set(CMAKE_CUDA_ARCHITECTURES 70-real 80-real 86-real)
+    set(CMAKE_CUDA_ARCHITECTURES 80-real 86-real)
   endif()
 endif()
 
@@ -559,7 +559,7 @@ if(ENABLE_UCX)
         ${3RDPARTY_DIR}/ucxx/build.sh libucxx -n
         --cmake-args=\"-DBUILD_SHARED_LIBS=OFF
         -DCMAKE_CXX_FLAGS=-D_GLIBCXX_USE_CXX11_ABI=${USE_CXX11_ABI}\"
-        COMMAND_ECHO STDOUT)
+        OUTPUT_QUIET)
     find_package(ucxx REQUIRED PATHS ${3RDPARTY_DIR}/ucxx/cpp/build
                  NO_DEFAULT_PATH)
   endif()

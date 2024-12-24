@@ -302,15 +302,15 @@ def fp8_rowwise_quantize(model, quant_config: QuantConfig):
 def qserve_quantize_weight_per_group(linear_weight: torch.HalfTensor,
                                      s1_scales: torch.FloatTensor,
                                      s2_scales: torch.FloatTensor,
-                                     s2_zeros: torch.FloatTensor,
+                                     s2_szeros: torch.FloatTensor,
                                      group_size: int) -> torch.CharTensor:
     out_features = linear_weight.shape[0]
     in_features = linear_weight.shape[1]
 
     # Step 1: Quantize the weights to int8
-    linear_weight = linear_weight.div_(
+    linear_weight = linear_weight.div(
         s1_scales.reshape(out_features, 1).to(linear_weight.device))
-    linear_weight = linear_weight.round_()
+    linear_weight = linear_weight.round()
     # assert linear_weight.min() >= -119 and linear_weight.max() <= 119, "Stage 1: Quantized weight out of range" # 119 is the "magic" number
     assert (linear_weight.min() >= -128 and linear_weight.max() <= 127
             ), "Stage 1: Quantized weight out of range"
@@ -318,37 +318,33 @@ def qserve_quantize_weight_per_group(linear_weight: torch.HalfTensor,
     # Step 2: Quantize the weights to int4
     linear_weight = linear_weight.reshape(out_features,
                                           in_features // group_size, group_size)
-    s2_zero = s2_zeros.reshape(out_features, in_features // group_size, 1)
-    s2_scales = s2_scales.reshape(out_features, in_features // group_size, 1)
-    linear_weight = linear_weight.div_(
-        s2_scales.to(torch.float16).to(linear_weight.device)).add_(
-            s2_zero.to(torch.float16).to(linear_weight.device)).reshape(
-                out_features, in_features)
+    s2_szeros = s2_szeros.reshape(out_features, in_features // group_size,
+                                  1).to(torch.float16).to(linear_weight.device)
+    s2_scales = s2_scales.reshape(out_features, in_features // group_size,
+                                  1).to(torch.float16).to(linear_weight.device)
+    linear_weight = linear_weight.add(s2_szeros).div(s2_scales).round()
     assert (linear_weight.min() >= 0 and
             linear_weight.max() <= 15), "Stage 2: Quantized weight out of range"
 
-    qweight = linear_weight.to(torch.int8)
+    qweight = linear_weight.reshape(out_features, in_features).to(torch.int8)
     return qweight
 
 
 def qserve_quantize_weight_per_channel(
         linear_weight: torch.HalfTensor, s1_scales: torch.FloatTensor,
-        s1_zeros: torch.FloatTensor) -> torch.CharTensor:
+        s1_szeros: torch.FloatTensor) -> torch.CharTensor:
     out_features = linear_weight.shape[0]
-    linear_weight.shape[1]
+    in_features = linear_weight.shape[1]
 
     # Step 1: Quantize the weights to int4
-    linear_weight = linear_weight.div_(
-        s1_scales.reshape(out_features, 1).to(linear_weight.device))
-    qweight = linear_weight.round_().to(torch.int8)
-    qweight = qweight.add_(
-        s1_zeros.reshape(out_features,
-                         1).to(linear_weight.device).to(torch.int8))
+    s1_scales = s1_scales.reshape(out_features, 1).to(linear_weight.device)
+    s1_szeros = s1_szeros.reshape(out_features, 1).to(linear_weight.device)
 
+    qweight = linear_weight.add(s1_szeros).div(s1_scales).round()
     assert (qweight.min() >= 0
             and qweight.max() <= 15), "Quantized weight out of range"
 
-    return qweight
+    return qweight.reshape(out_features, in_features).to(torch.int8)
 
 
 # Pack the quantized weights, scales and zeros and apply the reordering required by QServe kernels.
@@ -356,15 +352,15 @@ def qserve_quantize_weight_per_channel(
 def qserve_pack_reorder_per_group(qweight: torch.CharTensor,
                                   s1_scales: torch.FloatTensor,
                                   s2_scales: torch.FloatTensor,
-                                  s2_zeros: torch.FloatTensor, group_size):
+                                  s2_szeros: torch.FloatTensor, group_size):
     out_features = qweight.shape[0]
     in_features = qweight.shape[1]
 
     outputs = []
 
     s1_scales = s1_scales.reshape(out_features).to(torch.float16)
-    s2_zeros = s2_zeros.reshape(out_features,
-                                in_features // group_size).to(torch.int8)
+    s2_szeros = s2_szeros.reshape(out_features,
+                                  in_features // group_size).to(torch.int8)
     s2_scales = s2_scales.reshape(out_features,
                                   in_features // group_size).to(torch.int8)
 
@@ -411,28 +407,29 @@ def qserve_pack_reorder_per_group(qweight: torch.CharTensor,
     outputs.append(s2_scales)
 
     # ---- Pack the zeros ---- #
-    s2_zeros = (s2_zeros.reshape(out_features, in_features //
-                                 group_size).transpose(0, 1).contiguous())
-    s2_zeros = s2_zeros.reshape(in_features // group_size, out_features // 32,
-                                32)
-    s2_zeros = (s2_zeros.reshape(in_features // group_size, out_features // 32,
-                                 4, 8).transpose(-2, -1).contiguous())
-    s2_zeros = (s2_zeros.reshape(in_features // group_size,
-                                 out_features).contiguous())
+    s2_szeros = (s2_szeros.reshape(out_features, in_features //
+                                   group_size).transpose(0, 1).contiguous())
+    s2_szeros = s2_szeros.reshape(in_features // group_size, out_features // 32,
+                                  32)
+    s2_szeros = (s2_szeros.reshape(in_features // group_size,
+                                   out_features // 32, 4,
+                                   8).transpose(-2, -1).contiguous())
+    s2_szeros = (s2_szeros.reshape(in_features // group_size,
+                                   out_features).contiguous())
 
     # (q - s2_zeros) * s2_scales = q * s2_scales - s2_zeros * s2_scales,
     # We convert the s2_zeros -> -s2_zeros * s2_scales
-    s2_zeros = (-s2_zeros).int() * s2_scales
-    s2_zeros = s2_zeros.to(torch.int8)
+    s2_szeros = (-s2_szeros).int()  # It has been pre-scaled in DeepCompressor
+    s2_szeros = s2_szeros.to(torch.int8)
 
-    outputs.append(s2_zeros)
+    outputs.append(s2_szeros)
 
     return outputs
 
 
 def qserve_pack_reorder_per_channel(qweight: torch.CharTensor,
                                     s1_scales: torch.FloatTensor,
-                                    s1_zeros: torch.FloatTensor):
+                                    s1_szeros: torch.FloatTensor):
     out_features = qweight.shape[0]
     in_features = qweight.shape[1]
 
@@ -468,9 +465,8 @@ def qserve_pack_reorder_per_channel(qweight: torch.CharTensor,
     s1_scales = s1_scales.reshape(out_features).contiguous()
     outputs.append(s1_scales.half())
 
-    s1_szeros = s1_zeros.reshape(
-        out_features).contiguous().float() * s1_scales.float()
-    outputs.append(s1_szeros.half())
+    s1_szeros = s1_szeros.reshape(out_features).contiguous().half()
+    outputs.append(s1_szeros)
 
     return outputs
 

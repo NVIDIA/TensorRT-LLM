@@ -188,9 +188,27 @@ void dumpChoices(Choices const& choices, std::vector<SizeType32> const& indices)
     TLLM_LOG_DEBUG(ss.str().c_str());
 }
 
+void checkNumNonLeafNodesPerLayer(std::vector<TreeNode> const& tree, SizeType32 maxNonLeafNodesPerLayer)
+{
+    std::unordered_map<SizeType32, SizeType32> nonLeavesPerLayer;
+    for (auto const& node : tree)
+    {
+        if (node.childLinearIndices.size() > 0)
+        {
+            nonLeavesPerLayer[node.depth]++;
+        }
+    }
+    for (auto const& [depth, numNodes] : nonLeavesPerLayer)
+    {
+        TLLM_CHECK_WITH_INFO(numNodes <= maxNonLeafNodesPerLayer,
+            "Choices tree at level %d has %d non leaf nodes, while only %d are allowed.", depth, numNodes,
+            maxNonLeafNodesPerLayer);
+    }
+}
+
 SizeType32 initTensorsFromChoices(SpeculativeDecodingModule const& speculativeDecodingModule, Choices const& choices,
     std::vector<SizeType32>& topKs, TensorPtr generationInputLengths, TensorPtr positionOffsets, TensorPtr treeIds,
-    TensorPtr paths, TensorPtr packedMask)
+    TensorPtr paths, TensorPtr packedMask, std::optional<SizeType32> maxNonLeafNodesPerLayer)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto const numChoices = static_cast<SizeType32>(choices.size());
@@ -339,6 +357,11 @@ SizeType32 initTensorsFromChoices(SpeculativeDecodingModule const& speculativeDe
             // Add current linear index to parent's child
             tree[node.parentLinearIdx].childLinearIndices.push_back(ci);
         }
+    }
+
+    if (maxNonLeafNodesPerLayer)
+    {
+        checkNumNonLeafNodesPerLayer(tree, maxNonLeafNodesPerLayer.value());
     }
 
     computePathsAndMask(speculativeDecodingModule, tree, packedMask, paths);

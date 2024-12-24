@@ -22,6 +22,7 @@
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/common/safetensors.h"
 #include "tensorrt_llm/executor/tensor.h"
+#include "tensorrt_llm/kernels/userbuffers/ub_interface.h"
 #include "tllmLogger.h"
 
 #include <NvInferRuntime.h>
@@ -215,6 +216,7 @@ TllmRuntime::TllmRuntime(
     , mBufferManager{mStream, true} // Ensure to trim the memory pool on destruction.
     , mRuntime{nvinfer1::createInferRuntime(static_cast<bool>(logger) ? *logger : defaultLogger)}
     , mUseShapeInference{useShapeInference}
+    , mUserBufferEnabled{false}
 {
     switch (rawEngine.getType())
     {
@@ -238,10 +240,8 @@ TllmRuntime::TllmRuntime(
     mEngineInspector.reset(mEngine->createEngineInspector());
     assessLikelihoodOfRuntimeAllocation(*mEngine, *mEngineInspector);
     setWeightStreaming(getEngine(), gpuWeightsPercent);
-
     auto const devMemorySize = mEngine->getDeviceMemorySizeV2();
     mEngineBuffer = mBufferManager.gpu(devMemorySize);
-
     // Print context memory size for CI/CD to track.
     TLLM_LOG_INFO("[MemUsageChange] Allocated %.2f MiB for execution context memory.",
         static_cast<double>(devMemorySize) / 1048576.0);
@@ -513,13 +513,13 @@ void TllmRuntime::setInputTensorsImpl(SizeType32 contextIndex, TensorMap const& 
                 ITensor::toString(maxShape).c_str());
         }
         auto* const data = tensor->data();
-        if (data)
+        if (static_cast<bool>(data))
         {
             context.setInputTensorAddress(name.c_str(), data);
         }
         else
         {
-            TLLM_CHECK_WITH_INFO(tensor->getSize() == 0, std::string("Invalid data for tensor: ") + name.c_str());
+            TLLM_CHECK_WITH_INFO(tensor->getSize() == 0, std::string("Invalid data for tensor: ") + name);
             // TensorRT runtime does not support nullptr.
             if (!mDummyTensor)
             {
@@ -563,7 +563,7 @@ void TllmRuntime::setInputTensors(SizeType32 contextIndex, TensorMap const& tens
     if (mUseShapeInference)
     {
         NVTX3_SCOPED_RANGE(infer_shapes);
-        char const* missing;
+        char const* missing = nullptr;
         auto const nbMissing = context.inferShapes(1, &missing);
         if (nbMissing > 0)
         {
@@ -587,6 +587,13 @@ void TllmRuntime::setOutputTensors(SizeType32 contextIndex, TensorMap& tensorMap
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_FUNC_RANGE();
+    if (isUserBufferEnabled())
+    {
+        // This function will identify the output tensors in the network that need to be bound as UB buffers
+        // and bind the corresponding buffers to them based on their names.
+        setUserBufferTensors(contextIndex, tensorMap);
+    }
+
     auto& context = getContext(contextIndex);
     for (auto const& name : mOutputTensorNames)
     {
@@ -622,6 +629,72 @@ void TllmRuntime::setOutputTensors(SizeType32 contextIndex, TensorMap& tensorMap
         }
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+void TllmRuntime::setUserBufferTensors(SizeType32 contextIndex, TensorMap& tensorMap)
+{
+    auto startsWith = [](std::string const& str, std::string const& prefix) -> bool
+    { return str.size() > prefix.size() && str.compare(0, prefix.size(), prefix) == 0; };
+    std::string prefix(tensorrt_llm::runtime::ub::tensor_prefix);
+    auto& context = getContext(contextIndex);
+    for (auto const& name : mOutputTensorNames)
+    {
+        auto const pos = tensorMap.find(name);
+        if (pos != tensorMap.end() || !startsWith(name, prefix))
+        {
+            continue;
+        }
+        auto const engineDtype = mEngine->getTensorDataType(name.c_str());
+        auto const dims = context.getTensorShape(name.c_str());
+        void* ubBuffer = nullptr;
+        if (name[prefix.size()] == '0')
+        {
+            ubBuffer = tensorrt_llm::runtime::ub::ub_get(0).addr;
+        }
+        else if (name[prefix.size()] == '1')
+        {
+            ubBuffer = tensorrt_llm::runtime::ub::ub_get(1).addr;
+        }
+        else
+        {
+            TLLM_CHECK(false);
+        }
+        auto tensor = ITensor::SharedPtr(ITensor::wrap(ubBuffer, engineDtype, dims));
+        tensorMap.insert(pos, std::make_pair(name, tensor));
+        context.setTensorAddress(name.c_str(), ubBuffer);
+    }
+}
+
+void TllmRuntime::initializeUserBuffer(SizeType32 tpSize, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
+    SizeType32 maxSequenceLength, SizeType32 hiddenSize, std::optional<SizeType32> maxNumTokens)
+{
+    auto startsWith = [](std::string const& str, std::string const& prefix) -> bool
+    { return str.size() > prefix.size() && str.compare(0, prefix.size(), prefix) == 0; };
+    std::string prefix(tensorrt_llm::runtime::ub::tensor_prefix);
+    for (auto const& name : mOutputTensorNames)
+    {
+        if (startsWith(name, prefix))
+        {
+            mUserBufferEnabled = true;
+            break;
+        }
+    }
+    if (!mUserBufferEnabled)
+    {
+        return;
+    }
+    // The hidden size returned by ModelConfig is the real hidden size divided by the TP size.
+    size_t realHiddenSize = hiddenSize * tpSize;
+    size_t tokensNum = maxNumTokens.value_or(maxBatchSize * maxBeamWidth * maxSequenceLength);
+    TLLM_CHECK(tokensNum > 0);
+    size_t maxMessageSize = tokensNum * realHiddenSize * sizeof(half);
+    TLLM_LOG_INFO("[UserBuffer] MaxBatchSize %d, maxBeamWidth %d, maxSequenceLength %d, maxNumTokens %d, select %lu",
+        maxBatchSize, maxBeamWidth, maxSequenceLength, maxNumTokens.has_value() ? maxNumTokens.value() : 0, tokensNum);
+    TLLM_LOG_INFO("[UserBuffer] Allocated %.2f MiB for execution context memory.",
+        static_cast<double>(maxMessageSize * 2) / 1048576.0);
+    tensorrt_llm::runtime::ub::ub_initialize(tpSize);
+    tensorrt_llm::runtime::ub::ub_allocate(0, maxMessageSize);
+    tensorrt_llm::runtime::ub::ub_allocate(1, maxMessageSize);
 }
 
 CudaStream const& TllmRuntime::getStream() const

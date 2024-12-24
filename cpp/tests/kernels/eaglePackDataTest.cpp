@@ -141,7 +141,8 @@ public:
             ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), nvinfer1::DataType::kFLOAT);
 
         mInputRandomDataValidation = BufferManager::pinnedPool(
-            ITensor::makeShape({mSamplingParams.getMaxBatchSize()}), nvinfer1::DataType::kFLOAT);
+            ITensor::makeShape({mSamplingParams.getMaxBatchSize(), mSamplingParams.getMaxDecodingTokens()}),
+            nvinfer1::DataType::kFLOAT);
 
         mInputNextDraftTokens = BufferManager::pinnedPool(
             ITensor::makeShape({mSamplingParams.getMaxBatchSize(), mSamplingParams.getMaxDecodingDraftTokens()}),
@@ -174,7 +175,8 @@ public:
             ITensor::makeShape({mSamplingParams.getBatchSize()}), nvinfer1::DataType::kFLOAT);
 
         mOutputRandomDataValidation = BufferManager::pinnedPool(
-            ITensor::makeShape({mSamplingParams.getBatchSize()}), nvinfer1::DataType::kFLOAT);
+            ITensor::makeShape({mSamplingParams.getBatchSize(), mSamplingParams.getMaxDecodingTokens()}),
+            nvinfer1::DataType::kFLOAT);
 
         mOutputNextDraftTokens = BufferManager::pinnedPool(
             ITensor::makeShape({mSamplingParams.getBatchSize(), mSamplingParams.getMaxDecodingDraftTokens()}),
@@ -239,7 +241,6 @@ public:
         {
             bufferCast<float>(*mInputTemperatures)[batchSlotsPtr[bi]] = distr(gen);
             bufferCast<float>(*mInputRandomDataSample)[batchSlotsPtr[bi]] = distr(gen);
-            bufferCast<float>(*mInputRandomDataValidation)[batchSlotsPtr[bi]] = distr(gen);
         }
 
         for (SizeType32 bi = 0; bi < mSamplingParams.getBatchSize(); ++bi)
@@ -252,6 +253,9 @@ public:
             }
             for (SizeType32 ti = 0; ti < mSamplingParams.getMaxDecodingTokens(); ++ti)
             {
+                bufferCast<float>(
+                    *mInputRandomDataValidation)[batchSlotsPtr[bi] * mSamplingParams.getMaxDecodingTokens() + ti]
+                    = distr(gen);
                 for (SizeType32 pi = 0; pi < mSamplingParams.getMaxPathLen(); ++pi)
                 {
                     bufferCast<SizeType32>(*mInputNextDraftPaths)[flat_index3(batchSlotsPtr[bi], ti, pi,
@@ -350,8 +354,6 @@ public:
                 BufferRange<float>(*mOutputTemperatures)[bi]);
             EXPECT_EQ(BufferRange<float>(*mInputRandomDataSample)[batchSlotsPtr[bi]],
                 BufferRange<float>(*mOutputRandomDataSample)[bi]);
-            EXPECT_EQ(BufferRange<float>(*mInputRandomDataValidation)[batchSlotsPtr[bi]],
-                BufferRange<float>(*mOutputRandomDataValidation)[bi]);
         }
 
         auto const numCtxRequests = mSamplingParams.getNumCtxRequests();
@@ -359,6 +361,10 @@ public:
         {
             for (SizeType32 ti = 0; ti < mSamplingParams.getMaxDecodingTokens(); ++ti)
             {
+                EXPECT_EQ(
+                    BufferRange<float>(
+                        *mInputRandomDataValidation)[batchSlotsPtr[bi] * mSamplingParams.getMaxDecodingTokens() + ti],
+                    BufferRange<float>(*mOutputRandomDataValidation)[bi * mSamplingParams.getMaxDecodingTokens() + ti]);
                 for (SizeType32 pi = 0; pi < mSamplingParams.getMaxPathLen(); ++pi)
                 {
                     EXPECT_EQ(BufferRange<SizeType32>(*mInputNextDraftPaths)[flat_index3(batchSlotsPtr[bi], ti, pi,

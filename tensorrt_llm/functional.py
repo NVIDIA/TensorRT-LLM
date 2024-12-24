@@ -494,6 +494,12 @@ class Tensor(object):
         '''
         return split(self, split_size_or_sections, dim)
 
+    def select(self, dim, index):
+        '''
+        See functional.select.
+        '''
+        return select(self, dim, index)
+
     def unbind(self, dim=0):
         '''
         See functional.unbind.
@@ -642,6 +648,7 @@ class RotaryScalingType(IntEnum):
     longrope = 3
     llama3 = 4
     yarn = 5
+    mrope = 6
 
     @staticmethod
     def from_string(s):
@@ -660,9 +667,16 @@ class PositionEmbeddingType(IntEnum):
     alibi_with_scale = 5
     relative = 6
     chatglm = 7
+    yarn = 8
+    mrope = 9
 
     def is_rope(self) -> bool:
-        return self in [self.rope_gptj, self.rope_gpt_neox, self.long_rope]
+        return self in [
+            self.rope_gptj, self.rope_gpt_neox, self.long_rope, self.mrope
+        ]
+
+    def is_mrope(self) -> bool:
+        return self in [self.mrope]
 
     def is_alibi(self) -> bool:
         return self in [self.alibi, self.alibi_with_scale]
@@ -1161,7 +1175,8 @@ def slice(input: Tensor,
           starts: Union[Tensor, Sequence[int]],
           sizes: Union[Tensor, Sequence[int]],
           strides: Union[Tensor, Sequence[int]] = None,
-          mode: trt.SampleMode = None) -> Tensor:
+          mode: trt.SampleMode = None,
+          fill_value: Union[float, Tensor] = None) -> Tensor:
     '''
     Add an operation to extract a slice from a tensor.
 
@@ -1236,6 +1251,9 @@ def slice(input: Tensor,
     if isinstance(strides, Tensor) or strides is None:
         trt_strides = [1 for _ in range(input_ndim)]
 
+    if fill_value is not None and isinstance(fill_value, float):
+        fill_value = constant(fp32_array(fill_value))
+
     layer = default_trtnet().add_slice(input.trt_tensor,
                                        start=trt_starts,
                                        shape=trt_sizes,
@@ -1251,6 +1269,9 @@ def slice(input: Tensor,
 
     if isinstance(strides, Tensor):
         layer.set_input(3, strides.trt_tensor)
+
+    if mode is trt.SampleMode.FILL and isinstance(fill_value, Tensor):
+        layer.set_input(4, fill_value.trt_tensor)
 
     return _create_tensor(layer.get_output(0), layer)
 
@@ -3015,7 +3036,7 @@ def log_softmax(input: Tensor, dim: int) -> Tensor:
 
 def reduce(input: Tensor,
            op: trt.ReduceOperation,
-           dim: int,
+           dim: Union[int, Tuple[int]],
            keepdim: bool = False) -> Tensor:
     '''
     Add an reduction operation to do along a dimension.
@@ -3054,7 +3075,9 @@ prod = partial(reduce, op=trt.ReduceOperation.PROD)
 min = partial(reduce, op=trt.ReduceOperation.MIN)
 
 
-def mean(input: Tensor, dim: int, keepdim: bool = False) -> Tensor:
+def mean(input: Tensor,
+         dim: Union[int, Tuple[int]],
+         keepdim: bool = False) -> Tensor:
     '''
     Add an operation to compute the mean along a dimension.
 
@@ -3292,15 +3315,19 @@ def group_norm(input: Tensor,
     ] + [input.size(i) for i in range(2, ndim)])
     x = input.view(new_shape)
 
-    reduce_dim = tuple(range(2, ndim + 1))
-    ux = x.mean(dim=reduce_dim, keepdim=True)
-    numerator = x - ux
-    varx = numerator * numerator
-    varx = varx.mean(dim=reduce_dim, keepdim=True)
-
-    denom = varx + eps
-    denom = denom.sqrt()
-    y = numerator / denom
+    # instance norm
+    w_shape = [1, num_groups] + [1 for i in range(ndim - 1)]
+    instance_weight = constant(np.ones(w_shape, dtype=trt_dtype_to_np(x.dtype)))
+    instance_bias = constant(np.zeros(w_shape, dtype=trt_dtype_to_np(x.dtype)))
+    axes_mask = 0
+    for i in range(2, x.ndim()):
+        axes_mask |= 1 << i
+    layer = default_trtnet().add_normalization(x.trt_tensor,
+                                               instance_weight.trt_tensor,
+                                               instance_bias.trt_tensor,
+                                               axes_mask)
+    layer.epsilon = eps
+    y = _create_tensor(layer.get_output(0), layer)
     y = y.view(old_shape)
 
     new_shape = concat([num_channels] + [1 for _ in range(2, ndim)])
@@ -3441,7 +3468,9 @@ def conv2d(input: Tensor,
            stride: Tuple[int, int] = (1, 1),
            padding: Tuple[int, int] = (0, 0),
            dilation: Tuple[int, int] = (1, 1),
-           groups: int = 1) -> Tensor:
+           groups: int = 1,
+           pre_padding: Optional[Tuple[int, int]] = None,
+           post_padding: Optional[Tuple[int, int]] = None) -> Tensor:
     ##
     ## TODO: Document that function!
     ##
@@ -3469,6 +3498,10 @@ def conv2d(input: Tensor,
     layer.dilation_nd = dilation
     layer.num_groups = groups
     layer.dilation_nd = dilation
+    if pre_padding:
+        layer.pre_padding = pre_padding
+    if post_padding:
+        layer.post_padding = post_padding
 
     if not is_weight_constant:
         layer.set_input(1, weight.trt_tensor)
@@ -3672,7 +3705,8 @@ class AllReduceStrategy(IntEnum):
     NCCL = 0
     ONESHOT = 1
     TWOSHOT = 2
-    AUTO = 3
+    UB = 3
+    AUTO = 4
 
 
 class AllReduceConfig(IntFlag):
@@ -3691,20 +3725,27 @@ class AllReduceFusionOp(IntFlag):
     """
     NONE = 0
     RESIDUAL_RMS_NORM = 1
+    LAST_PROCESS_FOR_UB = 2
 
 
-class AllReduceFusionParams():
+class AllReduceParams():
 
     def __init__(self,
+                 strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
+                 config: AllReduceConfig = AllReduceConfig(0),
                  fusion_op: AllReduceFusionOp = AllReduceFusionOp.NONE,
                  bias: Optional[Tensor] = None,
                  residual: Optional[Tensor] = None,
                  norm_weight: Optional[Tensor] = None,
+                 scale: Optional[Tensor] = None,
                  eps: float = 1e-06):
+        self.strategy = strategy
+        self.config = config
         self.fusion_op = fusion_op
         self.bias = bias
         self.residual = residual
         self.norm_weight = norm_weight
+        self.scale = scale
         self.eps = eps
         assert fusion_op == AllReduceFusionOp.NONE or (residual is not None)
 
@@ -3714,16 +3755,22 @@ class AllReduceFusionParams():
     def has_bias(self):
         return 1 if self.bias is not None else 0
 
+    def has_scale(self):
+        return 1 if self.scale is not None else 0
+
+    def update_strategy(self):
+        if self.strategy == AllReduceStrategy.AUTO and default_net(
+        ).plugin_config.user_buffer:
+            self.strategy = AllReduceStrategy.UB
+
 
 def create_allreduce_plugin(
     network: trt.INetworkDefinition,
     tensor: trt.ITensor,
     workspace: Optional[trt.ITensor],
     group: np.array,
-    strategy: AllReduceStrategy,
     dtype: trt.DataType,
-    config: AllReduceConfig,
-    reduce_fusion_params: AllReduceFusionParams,
+    all_reduce_params: AllReduceParams,
 ):
     allreduce_plg_creator = trt.get_plugin_registry().get_plugin_creator(
         'AllReduce', '1', TRT_LLM_PLUGIN_NAMESPACE)
@@ -3733,51 +3780,61 @@ def create_allreduce_plugin(
     pf_dtype = trt.PluginField("type_id", np.array([int(dtype)], np.int32),
                                trt.PluginFieldType.INT32)
     pfc = [pf_group, pf_dtype]
-    p_strategy = trt.PluginField("strategy", np.array([int(strategy)], np.int8),
-                                 trt.PluginFieldType.INT8)
+    p_strategy = trt.PluginField(
+        "strategy", np.array([int(all_reduce_params.strategy)], np.int8),
+        trt.PluginFieldType.INT8)
     pfc.append(p_strategy)
-    p_config = trt.PluginField("config", np.array([int(config)], np.int8),
-                               trt.PluginFieldType.INT8)
+    p_config = trt.PluginField(
+        "config", np.array([int(all_reduce_params.config)], np.int8),
+        trt.PluginFieldType.INT8)
     pfc.append(p_config)
     p_fusion_op = trt.PluginField(
-        "fusion_op", np.array([int(reduce_fusion_params.fusion_op)], np.int8),
+        "fusion_op", np.array([int(all_reduce_params.fusion_op)], np.int8),
         trt.PluginFieldType.INT8)
     pfc.append(p_fusion_op)
     p_eps = trt.PluginField(
-        "eps", np.array([float(reduce_fusion_params.eps)], np.float32),
+        "eps", np.array([float(all_reduce_params.eps)], np.float32),
         trt.PluginFieldType.FLOAT32)
     pfc.append(p_eps)
     p_affine = trt.PluginField(
-        "affine", np.array([int(reduce_fusion_params.has_affine())], np.int8),
+        "affine", np.array([int(all_reduce_params.has_affine())], np.int8),
         trt.PluginFieldType.INT8)
     pfc.append(p_affine)
     p_bias = trt.PluginField(
-        "bias", np.array([int(reduce_fusion_params.has_bias())], np.int8),
+        "bias", np.array([int(all_reduce_params.has_bias())], np.int8),
         trt.PluginFieldType.INT8)
     pfc.append(p_bias)
+    p_scale = trt.PluginField(
+        "scale", np.array([int(all_reduce_params.has_scale())], np.int8),
+        trt.PluginFieldType.INT8)
+    pfc.append(p_scale)
 
     pfc = trt.PluginFieldCollection(pfc)
     ar_plug = allreduce_plg_creator.create_plugin("allreduce", pfc)
     plug_inputs = [tensor]
-    if strategy != AllReduceStrategy.NCCL:
+    if all_reduce_params.strategy != AllReduceStrategy.NCCL and all_reduce_params.strategy != AllReduceStrategy.UB:
         plug_inputs.append(workspace)
-    if reduce_fusion_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
-        if reduce_fusion_params.has_bias() == 1:
-            plug_inputs.append(reduce_fusion_params.bias.trt_tensor)
-        plug_inputs.append(reduce_fusion_params.residual.trt_tensor)
-        if reduce_fusion_params.has_affine() == 1:
-            plug_inputs.append(reduce_fusion_params.norm_weight.trt_tensor)
+    if all_reduce_params.fusion_op != AllReduceFusionOp.NONE:
+        if all_reduce_params.has_bias() == 1:
+            plug_inputs.append(all_reduce_params.bias.trt_tensor)
+        plug_inputs.append(all_reduce_params.residual.trt_tensor)
+        if all_reduce_params.has_affine() == 1:
+            plug_inputs.append(all_reduce_params.norm_weight.trt_tensor)
+        if all_reduce_params.has_scale() == 1:
+            plug_inputs.append(all_reduce_params.scale.trt_tensor)
 
     layer = network.add_plugin_v2(plug_inputs, ar_plug)
     return layer, allreduce_plg_creator, pfc
 
 
+allreduce_ub_counter = 0
+
+
 def allreduce(
-        tensor: Tensor,
-        group: List[int],
-        strategy: Optional[AllReduceStrategy] = AllReduceStrategy.AUTO,
-        config: AllReduceConfig = AllReduceConfig(0),
-        reduce_fusion_params: Optional[AllReduceFusionParams] = None) -> Tensor:
+    tensor: Tensor,
+    group: List[int],
+    all_reduce_params: Optional[AllReduceParams] = AllReduceParams()
+) -> Tensor:
     '''
     Add an operation that performs a collective all-reduce.
 
@@ -3812,38 +3869,56 @@ def allreduce(
         The tensor produced by that layer.
     '''
 
+    global allreduce_ub_counter
+    allreduce_ub_counter += 1
+
+    if all_reduce_params is None:
+        all_reduce_params = AllReduceParams()
+    all_reduce_params.update_strategy()
+
     # TODO(TRTLLM-996): remove this WAR when custom allreduce is supported
     # for encoder models in C++ runtime.
-    if current_all_reduce_helper().workspace is None:
-        strategy = AllReduceStrategy.NCCL
-
     workspace = None
-    if strategy != AllReduceStrategy.NCCL:
-        workspace = current_all_reduce_helper().workspace.trt_tensor
-
-    if reduce_fusion_params is None:
-        reduce_fusion_params = AllReduceFusionParams()
-
+    if all_reduce_params.strategy != AllReduceStrategy.NCCL and all_reduce_params.strategy != AllReduceStrategy.UB:
+        if current_all_reduce_helper().workspace is None:
+            all_reduce_params.strategy = AllReduceStrategy.NCCL
+        else:
+            workspace = current_all_reduce_helper().workspace.trt_tensor
+    if all_reduce_params.strategy == AllReduceStrategy.UB:
+        tensor.mark_output("allreduce_ub_0_" + str(allreduce_ub_counter))
     dtype = default_net().plugin_config.nccl_plugin
     layer, allreduce_plg_creator, pfc = create_allreduce_plugin(
         network=default_trtnet(),
         tensor=tensor.cast(dtype).trt_tensor,
         workspace=workspace,
         group=np.array(group, dtype=np.int32),
-        strategy=strategy,
         dtype=str_dtype_to_trt(dtype),
-        config=config,
-        reduce_fusion_params=reduce_fusion_params,
+        all_reduce_params=all_reduce_params,
     )
     _add_plugin_info(layer, allreduce_plg_creator, "allreduce", pfc)
-    if reduce_fusion_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
-        final_output = _create_tensor(layer.get_output(0),
-                                      layer).cast(tensor.dtype)
+    if all_reduce_params.fusion_op != AllReduceFusionOp.NONE:
         inter_output = _create_tensor(layer.get_output(1),
                                       layer).cast(tensor.dtype)
+        if all_reduce_params.strategy == AllReduceStrategy.UB and all_reduce_params.has_scale(
+        ) == 1:
+            # data type: trt.DataType.FP8
+            final_output = _create_tensor(layer.get_output(0), layer)
+        else:
+            final_output = _create_tensor(layer.get_output(0),
+                                          layer).cast(tensor.dtype)
+        if all_reduce_params.strategy == AllReduceStrategy.UB:
+            if all_reduce_params.has_scale() == 1:
+                final_output.mark_output("allreduce_ub_1_" +
+                                         str(allreduce_ub_counter))
+            else:
+                assert all_reduce_params.fusion_op == AllReduceFusionOp.LAST_PROCESS_FOR_UB
+                inter_output.mark_output("allreduce_ub_1_" +
+                                         str(allreduce_ub_counter))
         return final_output, inter_output
     else:
-        return _create_tensor(layer.get_output(0), layer).cast(tensor.dtype)
+        final_output = _create_tensor(layer.get_output(0),
+                                      layer).cast(tensor.dtype)
+        return final_output
 
 
 def allgather(tensor: Tensor, group: List[int], gather_dim: int = 0) -> Tensor:
@@ -4233,8 +4308,9 @@ class RopeEmbeddingUtils:
                                                 dtype=dtype),
                                       axis=-1)
         # fuse cos/sin into float2 (cos, sin).
-        concat = np.concatenate((np.cos(sinusoid_inp), np.sin(sinusoid_inp)),
-                                axis=-1)
+        concat = np.concatenate(
+            (np.cos(sinusoid_inp), np.sin(sinusoid_inp)),
+            axis=-1)  #np.cos(sinusoid_inp).shape = (32768, 64, 1)
 
         return inv_freq, concat.reshape(1, -1).astype(dtype)
 
@@ -4308,11 +4384,13 @@ class RopeEmbeddingUtils:
                 concat = np.expand_dims(concat, axis=0)
 
             mscale = short_mscale if is_short else long_mscale
+            concat = concat.astype(dtype) * mscale
+
             # gpt attention plugins also need inv_freq.
             if for_attention_plugin:
-                return inv_freq, concat.astype(dtype) * mscale
+                return inv_freq.reshape(1, -1), concat.reshape(1, -1)
             else:
-                return concat.astype(dtype) * mscale
+                return concat
 
         return _compute_sinusoidal_positions(
             scaling_short_factors, True, False), _compute_sinusoidal_positions(
@@ -4691,7 +4769,7 @@ def gpt_attention(
     num_kv_heads: int,
     hidden_size_per_head: int,
     q_scaling: float,
-    qk_tanh_scale: float = 0.0,
+    attn_logit_softcapping_scale: float = 0.0,
     rotary_embedding_dim: int = 0,
     rotary_embedding_base: float = 10000.0,
     rotary_embedding_scale_type: RotaryScalingType = RotaryScalingType.none,
@@ -4728,6 +4806,7 @@ def gpt_attention(
     cross_kv_length: Optional[Tensor] = None,  # for cross attention
     encoder_input_lengths: Optional[Tensor] = None,  # for cross attention
     relative_attention_bias: Optional[Tensor] = None,  # for relative attention
+    logn_scaling: Optional[Tensor] = None,  # for logn scaling
     max_distance: int = 0,  # for relative attention
     host_context_lengths: Optional[Tensor] = None,  # for pad-free input mode
     qkv_bias: Optional[Tensor] = None,
@@ -4737,6 +4816,10 @@ def gpt_attention(
     spec_decoding_generation_lengths: Tensor = None,
     spec_decoding_position_offsets: Tensor = None,
     spec_decoding_packed_mask: Tensor = None,
+    long_rope_rotary_inv_freq: Optional[Tensor] = None,
+    long_rope_rotary_cos_sin: Optional[Tensor] = None,
+    mrope_rotary_sin_cos: Tensor = None,
+    mrope_position_deltas: Tensor = None,
     host_runtime_perf_knobs: Optional[Tensor] = None,
     host_context_progress: Tensor = None,
     layer_idx_in_cache_pool: Optional[int] = None,
@@ -4750,6 +4833,9 @@ def gpt_attention(
     q_b_proj: Optional[Tensor] = None,
     kv_b_proj: Optional[Tensor] = None,
     skip_attn=None,
+    cp_group: List[int] = [0],
+    cp_size: int = 1,
+    cp_rank: int = 0,
 ) -> Tuple[Tensor, Optional[Tensor]]:
     '''
     Add an operation that performs the multi-head attention in GPT-like models.
@@ -4825,9 +4911,9 @@ def gpt_attention(
             The value used to compute the scaling factor applied to the output
             of the Q*K^T product. See Scaling Factors in docs/source/advanced/gpt-attention.md,
 
-        qk_tanh_scale: float
+        attn_logit_softcapping_scale: float
             The scale * tanh(value / scale) used to compute the scaling factor applied to the output
-            of the Q*K^T product. Note this is only used by grok models.
+            of the Q*K^T product.
 
         rotary_embedding_dim: int
             The dimension to compute RoPE. Use 0 when position_embedding_type is not RoPE.
@@ -4949,6 +5035,9 @@ def gpt_attention(
         encoder_input_lengths: Tensor
             The tensor that stores the length of each encoder input sequence. Its shape is [batch_size],
 
+        logn_scaling: Tensor = None
+            The logn scaling tensor [max_position_embedding_len], which is applied to q in order to help extrapolation
+
         relative_attention_bias: Tensor = None
             The relative attention bias [num_heads, max_seq_len, max_seq_len], or The relative attention embedding table for implicit mode, [num_heads, num_buckets].
 
@@ -4990,9 +5079,14 @@ def gpt_attention(
             remove_input_padding is True:
                 Shape: [sum(spec_decoding_generation_lengths), divUp(num_draft_tokens + 1, 32)].
 
+        long_rope_rotary_inv_freq: float Tensor
+            Additional rotary inv freq used for longer sequence lengths. Shape: [head_size / 2]
+
+        long_rope_rotary_cos_sin: float2(cos/sin) Tensor
+            Additional rotary cos/sin cache used for longer sequence lengths.
+
         is_mla_enable: bool = False
             Do we need to enable deepseekv2 mla?
-
 
         host_runtime_perf_knobs: Tensor = None,
             The runtime perf knobs bit mask, controls whether to use certain perf knob in the runtime.
@@ -5009,6 +5103,8 @@ def gpt_attention(
 
     assert host_request_types is not None
     assert (alibi_slopes is not None) == (position_embedding_type.is_alibi())
+    assert (mrope_rotary_sin_cos
+            is not None) == (position_embedding_type.is_mrope())
     attn_plg_creator = trt.get_plugin_registry().get_plugin_creator(
         'GPTAttention', '1', TRT_LLM_PLUGIN_NAMESPACE)
     assert attn_plg_creator is not None
@@ -5030,6 +5126,11 @@ def gpt_attention(
     default_net().plugin_config.context_fmha_type
     if do_cross_attention and not paged_kv_cache_flag:
         pass
+    if logn_scaling is not None:
+        use_logn_scaling = 1
+    else:
+        use_logn_scaling = 0
+
     unfuse_qkv_gemm = trt.PluginField(
         "unfuse_qkv_gemm", np.array(np.int8(is_unfuse_qkv_gemm), dtype=np.int8),
         trt.PluginFieldType.INT8)
@@ -5061,9 +5162,10 @@ def gpt_attention(
     q_scaling = trt.PluginField("q_scaling",
                                 np.array(q_scaling, dtype=np.float32),
                                 trt.PluginFieldType.FLOAT32)
-    qk_tanh_scale = trt.PluginField("qk_tanh_scale",
-                                    np.array(qk_tanh_scale, dtype=np.float32),
-                                    trt.PluginFieldType.FLOAT32)
+    attn_logit_softcapping_scale = trt.PluginField(
+        "attn_logit_softcapping_scale",
+        np.array(attn_logit_softcapping_scale, dtype=np.float32),
+        trt.PluginFieldType.FLOAT32)
     rotary_embedding_dim = trt.PluginField(
         "rotary_embedding_dim", np.array(rotary_embedding_dim, dtype=np.int32),
         trt.PluginFieldType.INT32)
@@ -5166,10 +5268,6 @@ def gpt_attention(
         "block_sparse_vertical_stride",
         np.array([block_sparse_vertical_stride], np.int32),
         trt.PluginFieldType.INT32)
-    enable_xqa = trt.PluginField(
-        "enable_xqa",
-        np.array(np.int8(default_net().plugin_config.enable_xqa),
-                 dtype=np.int8), trt.PluginFieldType.INT8)
     tp_size = trt.PluginField("tp_size", np.array(tp_size, dtype=np.int32),
                               trt.PluginFieldType.INT32)
     tp_rank = trt.PluginField("tp_rank", np.array(tp_rank, dtype=np.int32),
@@ -5231,15 +5329,25 @@ def gpt_attention(
     skip_attn_pf = trt.PluginField(
         "skip_attn", np.array([skip_attn is not None], dtype=np.int8),
         trt.PluginFieldType.INT8)
+    cp_size = trt.PluginField("cp_size", np.array(cp_size, dtype=np.int32),
+                              trt.PluginFieldType.INT32)
+    cp_rank = trt.PluginField("cp_rank", np.array(cp_rank, dtype=np.int32),
+                              trt.PluginFieldType.INT32)
+    cp_group = np.array(cp_group, dtype=np.int32)
+    cp_group = trt.PluginField("cp_group", cp_group, trt.PluginFieldType.INT32)
+    use_logn_scaling = trt.PluginField(
+        "use_logn_scaling", np.array(np.int8(use_logn_scaling), dtype=np.int8),
+        trt.PluginFieldType.INT8)
+
     pfc = trt.PluginFieldCollection([
         layer_idx, nheads, vision_start, vision_length, num_kv_heads,
         layer_idx_in_cache_pool, head_size, unidirectional, q_scaling,
-        qk_tanh_scale, position_embedding_type, rotary_embedding_dim,
-        rotary_embedding_base, rotary_embedding_scale_type,
-        rotary_embedding_scale, rotary_embedding_short_m_scale,
-        rotary_embedding_long_m_scale, rotary_embedding_max_positions,
-        rotary_embedding_original_max_positions, tp_size, tp_rank,
-        unfuse_qkv_gemm, context_fmha_type, enable_xqa,
+        attn_logit_softcapping_scale, position_embedding_type,
+        rotary_embedding_dim, rotary_embedding_base,
+        rotary_embedding_scale_type, rotary_embedding_scale,
+        rotary_embedding_short_m_scale, rotary_embedding_long_m_scale,
+        rotary_embedding_max_positions, rotary_embedding_original_max_positions,
+        tp_size, tp_rank, unfuse_qkv_gemm, context_fmha_type,
         kv_cache_quant_mode_field, remove_input_padding, mask_type_filed,
         block_sparse_block_size, block_sparse_homo_head_pattern,
         block_sparse_num_local_blocks, block_sparse_vertical_stride,
@@ -5250,7 +5358,7 @@ def gpt_attention(
         is_spec_decoding_enabled, spec_decoding_is_generation_length_variable,
         spec_decoding_max_generation_length, is_mla_enabled, q_lora_rank,
         kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim,
-        skip_attn_pf
+        skip_attn_pf, cp_size, cp_rank, cp_group, use_logn_scaling
     ])
 
     attn_plug = attn_plg_creator.create_plugin("causal_attn", pfc)
@@ -5328,6 +5436,17 @@ def gpt_attention(
             spec_decoding_generation_lengths, spec_decoding_packed_mask,
             spec_decoding_position_offsets
         ]
+
+    if long_rope_rotary_inv_freq is not None:
+        assert long_rope_rotary_cos_sin is not None
+        plug_inputs += [long_rope_rotary_inv_freq, long_rope_rotary_cos_sin]
+
+    if mrope_rotary_sin_cos is not None:
+        assert mrope_position_deltas is not None
+        plug_inputs += [
+            mrope_rotary_sin_cos,
+            mrope_position_deltas,
+        ]
     if host_runtime_perf_knobs is not None:
         plug_inputs += [host_runtime_perf_knobs]
 
@@ -5342,6 +5461,9 @@ def gpt_attention(
 
     if skip_attn is not None:
         plug_inputs += [skip_attn]
+
+    if logn_scaling is not None:
+        plug_inputs += [logn_scaling]
 
     for idx, i in enumerate(plug_inputs):
         assert i is not None, f"Found None input for {idx} th item in plugin inputs {plug_inputs}"
@@ -5542,6 +5664,27 @@ def repeat_interleave(tensor: Tensor, repeats: int, dim: int) -> Tensor:
     tile_reshape_size[dim] = tile_reshape_size[dim] * repeats
     tensor = tile.view(concat(tile_reshape_size))
     return tensor
+
+
+def generate_logn_scaling(seq_length: int = 8192,
+                          max_position_embeddings: int = 32768) -> np.ndarray:
+    '''
+    Compute the Log-N scaling vector for Qwen inference extrapolation
+
+    Parameters:
+        seq_length : int
+            The max seq length in training (default to 8192 in Qwen-1)
+        max_position_embeddings : int
+            The max position embeddings. (default to 32768 in Qwen-1)
+
+    Returns:
+        A constant np.ndarray that contains logn scaling vector
+    '''
+    logn_list = [
+        math.log(i, seq_length) if i > seq_length else 1
+        for i in range(1, max_position_embeddings + 1)
+    ]
+    return np.asarray(logn_list, dtype=np.float32)
 
 
 def generate_alibi_slopes(num_heads: int,
@@ -6570,6 +6713,11 @@ def low_latency_gemm(input: Tensor,
         return _create_tensor(layer.get_output(0), layer)
 
 
+class SideStreamIDType(IntEnum):
+    disable = 0
+    moe = 1
+
+
 def low_latency_gemm_swiglu(input: Tensor,
                             weight: Tensor,
                             scale_d0: float = 1.0,
@@ -6630,3 +6778,95 @@ def low_latency_gemm_swiglu(input: Tensor,
                                            low_latency_gemm_swiglu_plug)
 
     return _create_tensor(layer.get_output(0), layer)
+
+
+def cuda_stream_sync(input_list: List[Tensor],
+                     side_stream_id: SideStreamIDType) -> Tensor:
+    '''
+    Wait for the side stream on the main stream.
+    output = input_list[0]
+
+    Parameters:
+        input_list : List[Tensor] (On GPU)
+            The list of input tensors.
+        side_stream_id : int (On CPU)
+            The side stream ID.
+    '''
+    plg_creator = trt.get_plugin_registry().get_plugin_creator(
+        "CudaStream", "1", TRT_LLM_PLUGIN_NAMESPACE)
+    assert plg_creator is not None
+
+    p_side_stream_id = trt.PluginField("side_stream_id",
+                                       np.array(side_stream_id, dtype=np.int32),
+                                       trt.PluginFieldType.INT32)
+    p_num_inputs = trt.PluginField("num_inputs",
+                                   np.array(len(input_list), dtype=np.int32),
+                                   trt.PluginFieldType.INT32)
+    pf_type = trt.PluginField(
+        "type_id", np.array([int(input_list[0].dtype)], dtype=np.int32),
+        trt.PluginFieldType.INT32)
+    pfc = trt.PluginFieldCollection([p_side_stream_id, p_num_inputs, pf_type])
+    plug = plg_creator.create_plugin("cuda_stream", pfc)
+    plug_inputs = [input.trt_tensor for input in input_list]
+
+    layer = default_trtnet().add_plugin_v2(plug_inputs, plug)
+    _add_plugin_info(layer, plg_creator, "cuda_stream", pfc)
+    output = _create_tensor(layer.get_output(0), layer)
+    return output
+
+
+def cp_split_plugin(
+    input_ids: Tensor,
+    host_request_types: Tensor,
+    host_context_lengths: Tensor,  # for pad-free input mode
+    cp_size: int = 1,
+    cp_rank: int = 0,
+) -> Tensor:
+    '''
+    Add an operation to perform splitting for context parallelism.
+
+    This operation split the input_ids into cp_size chunks, and return the cp_rank-th
+    chunk.
+    When the seqlen % cp_size != 0, the chunk sizes of each rank would be
+    [seqlen // cp_size, seqlen // cp_size, ..., seqlen - (seqlen // cp_size) * cp_size]
+
+    It inserts a IPluginV3Layer.
+
+    Parameters:
+        input : Tensor
+            The input tensor contains the indices to split.
+
+        host_request_types: Tensor = None (On CPU)
+            The tensor on the host that indicates if a request is in context or
+            generation phase. Its shape is [batch_size]. See Inflight Batching
+            in docs/gpt_attention.md,
+
+        host_context_lengths: Tensor = None (On CPU)
+            A host tensor that contains the lengths of the different inputs
+
+    Returns:
+        The output split tensor.
+        The length of the output split tensor.
+        The index for rebuilding the sequence
+    '''
+    plg_creator = trt.get_plugin_registry().get_creator(
+        'CpSplit', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert plg_creator is not None
+
+    cp_size = trt.PluginField("cp_size", np.array([int(cp_size)], np.int32),
+                              trt.PluginFieldType.INT32)
+    cp_rank = trt.PluginField("cp_rank", np.array([int(cp_rank)], np.int32),
+                              trt.PluginFieldType.INT32)
+
+    pfc = trt.PluginFieldCollection([cp_size, cp_rank])
+    cp_split_plug = plg_creator.create_plugin("cp_split", pfc,
+                                              trt.TensorRTPhase.BUILD)
+    plug_inputs = [
+        input_ids.trt_tensor, host_request_types.trt_tensor,
+        host_context_lengths.trt_tensor
+    ]
+
+    layer = default_trtnet().add_plugin_v3(plug_inputs, [], cp_split_plug)
+    _add_plugin_info(layer, plg_creator, "cp_split", pfc)
+    return _create_tensor(layer.get_output(0),
+                          layer), _create_tensor(layer.get_output(2), layer)

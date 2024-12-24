@@ -21,7 +21,7 @@ from ...layers import (MLP, Attention, AttentionMaskType, ColumnLinear,
 from ...mapping import Mapping
 from ...module import Module
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
-                              QuantConfig, check_share_embedding)
+                              QuantConfig)
 from .config import FalconConfig
 from .convert import load_weights_from_hf_by_shard, load_weights_from_hf_model
 
@@ -268,7 +268,6 @@ class FalconForCausalLM(DecoderModelForCausalLM):
                 hf_model_dir, torch_dtype='auto')
             weights = load_weights_from_hf_model(hf_model, config)
 
-        check_share_embedding(weights, config)
         model = cls(config)
         model.load(weights)
         return model

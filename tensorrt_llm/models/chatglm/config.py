@@ -86,7 +86,6 @@ class ChatGLMConfig(PretrainedConfig):
         logits_dtype = kwargs.pop('logits_dtype', 'float32')
         use_parallel_embedding = kwargs.pop('use_parallel_embedding', False)
         embedding_sharding_dim = kwargs.pop('embedding_sharding_dim', 0)
-        share_embedding_table = kwargs.pop('share_embedding_table', False)
         chatglm_version = kwargs.pop('chatglm_version', None)
 
         # get chatglm version
@@ -171,7 +170,6 @@ class ChatGLMConfig(PretrainedConfig):
             hidden_act=hf_config.hidden_act,
             use_parallel_embedding=use_parallel_embedding,
             embedding_sharding_dim=embedding_sharding_dim,
-            share_embedding_table=share_embedding_table,
             quantization=quant_config,
             mapping=mapping,
             chatglm_version=chatglm_version,

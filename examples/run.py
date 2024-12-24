@@ -421,7 +421,7 @@ def main(args):
 
     if args.draft_target_model_config is not None or args.prompt_lookup_config is not None:
         # Speculative-Decoding of Draft-Target-Model (DTM) and Prompt-Lookup-Decoding (PLD)
-        # Argument update of `runner_kwargs` and `runner.generate()` also need to be done to `examples/prompt_lookup/run_dtm_pld.py`
+        # If the parameters of `runner_kwargs` and `runner.generate()` in the "else" branch change, the same change should be done for `examples/prompt_lookup/run_dtm_pld.py`
         assert args.kv_cache_enable_block_reuse, "`--kv_cache_enable_block_reuse` must be specified in speculative decoding."
         assert not args.use_py_session, "`--use_py_session` is not supported in Speculative decoding."
         assert not is_enc_dec, "Encoder-Decoder model is not supported in Speculative decoding."
@@ -449,11 +449,13 @@ def main(args):
             assert args.temperature == 1.0, "Medusa should use temperature == 1.0"
             assert args.num_beams == 1, "Medusa should use num_beams == 1"
             runner_kwargs.update(medusa_choices=args.medusa_choices)
-        if args.eagle_choices is not None:
+        if args.eagle_choices is not None or args.eagle_posterior_threshold is not None:
             args.eagle_choices = ast.literal_eval(args.eagle_choices)
             assert args.num_beams == 1, "Eagle should use num_beams == 1"
             assert not args.use_py_session, "Eagle does not support py session"
             runner_kwargs.update(eagle_choices=args.eagle_choices)
+            runner_kwargs.update(
+                eagle_posterior_threshold=args.eagle_posterior_threshold)
         if args.lookahead_config is not None:
             args.lookahead_config = ast.literal_eval(args.lookahead_config)
             assert len(

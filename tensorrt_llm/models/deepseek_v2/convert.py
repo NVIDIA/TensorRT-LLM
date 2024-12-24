@@ -140,8 +140,8 @@ def create_trt_config_from_hf(model_dir,
 
     moe_config = MoeConfig(
         num_experts=config['moe_num_experts'],
-        moe_intermediate_size=config['moe_inter_size'],
-        num_shared_experts=config['moe_num_shared_experts'],
+        shared_expert_intermediate_size=config['moe_num_shared_experts'] *
+        config['moe_inter_size'],
         top_k=config['moe_top_k'],
         normalization_mode=config['moe_renorm_mode'],
         device_limited_n_group=config['moe_n_group'],
@@ -170,31 +170,30 @@ def load_hf_deepseek(model_dir, load_model_on_cpu=False):
                                                      torch_dtype='auto',
                                                      trust_remote_code=True)
     else:
-        #Deepseek-v2 236B parameters with FP16 dtype need at least 472G GPU memory
-        #(official suggest at least 8x80G GPUs, see https://huggingface.co/deepseek-ai/DeepSeek-V2)
-        #'max_memory' should be set based on memory property of GPUs
-        if torch.cuda.get_device_properties(
-                0
-        ).total_memory > 80000000000 and torch.cuda.get_device_properties(
-                0).total_memory < 90000000000:
+        # Deepseek-v2 236B parameters with FP16 dtype need at least 472G GPU memory
+        # (official suggest at least 8x80G GPUs, see https://huggingface.co/deepseek-ai/DeepSeek-V2)
+
+        max_memory = None
+        device_map = 'auto'
+
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory
+        gpu_count = torch.cuda.device_count()
+
+        if gpu_memory < 90_000_000_000 and gpu_count == 8:
+            # WAR OOM loading on 8*80G GPUs
             max_memory = {i: "76GB" for i in range(8)}
-            model = AutoModelForCausalLM.from_pretrained(
-                model_dir,
-                config=hf_config,
-                device_map='sequential',
-                max_memory=max_memory,
-                torch_dtype='auto',
-                trust_remote_code=True)
-        elif torch.cuda.get_device_properties(0).total_memory >= 90000000000:
-            model = AutoModelForCausalLM.from_pretrained(model_dir,
-                                                         config=hf_config,
-                                                         device_map='auto',
-                                                         torch_dtype='auto',
-                                                         trust_remote_code=True)
-        else:
-            assert torch.cuda.get_device_properties(
-                0
-            ).total_memory >= 80000000000, "deepseek v2 loading requires per GPU memory above 80G"
+            device_map = 'sequential'
+        elif gpu_memory < 180_000_000_000 and gpu_count == 4:
+            # WAR OOM loading on 4*141G GPUs
+            max_memory = {i: "128GB" for i in range(4)}
+            device_map = 'sequential'
+
+        model = AutoModelForCausalLM.from_pretrained(model_dir,
+                                                     config=hf_config,
+                                                     device_map=device_map,
+                                                     max_memory=max_memory,
+                                                     torch_dtype='auto',
+                                                     trust_remote_code=True)
 
     return model
 
@@ -231,18 +230,16 @@ def convert_deepseekv2(hf_model,
                        mapping,
                        dtype='float32',
                        use_parallel_embedding=False,
-                       sharding_dim=0,
-                       share_embedding_table=False):
+                       sharding_dim=0):
 
     weights = {}
     tik = time.time()
-    mapping.tp_size
     model_params = dict(hf_model.named_parameters())
     dtype = getattr(torch, dtype)
     moe_config = MoeConfig(
         num_experts=config['moe_num_experts'],
-        moe_intermediate_size=config['moe_inter_size'],
-        num_shared_experts=config['moe_num_shared_experts'],
+        shared_expert_intermediate_size=config['moe_num_shared_experts'] *
+        config['moe_inter_size'],
         top_k=config['moe_top_k'],
         normalization_mode=config['moe_renorm_mode'],
         device_limited_n_group=config['moe_n_group'],
@@ -254,31 +251,8 @@ def convert_deepseekv2(hf_model,
 
     def convert_layer(l):
         prefix = f'model.layers.{l}.'
-        print(prefix)
         trtllm_prex = f'transformer.layers.{l - layers_range[0]}.'
         # Fuse matrices for compression
-        q_a_proj_weight = get_weight(model_params,
-                                     prefix + 'self_attn.q_a_proj', dtype)
-        kv_a_proj_with_mqa_weight = get_weight(
-            model_params, prefix + 'self_attn.kv_a_proj_with_mqa', dtype)
-
-        fused_a_weight = torch.cat(
-            [q_a_proj_weight, kv_a_proj_with_mqa_weight],
-            dim=0,
-        )
-
-        # Layer normalization
-        q_a_layernorm_weight = get_weight(
-            model_params,
-            prefix + 'self_attn.q_a_layernorm',
-            dtype,
-        )
-        kv_a_layernorm_weight = get_weight(
-            model_params,
-            prefix + 'self_attn.kv_a_layernorm',
-            dtype,
-        )
-
         # Split matrices for decompression
         q_lora_rank = config['q_lora_rank']
         kv_lora_rank = config['kv_lora_rank']
@@ -286,15 +260,52 @@ def convert_deepseekv2(hf_model,
         qk_nope_head_dim = config['qk_nope_head_dim']
         qk_rope_head_dim = config['qk_rope_head_dim']
         v_head_dim = config['v_head_dim']
+        hidden_size = config['hidden_size']
 
-        q_b_proj_weight = get_weight(
-            model_params, prefix + 'self_attn.q_b_proj', dtype).unflatten(
-                0,
-                [
-                    num_heads,
-                    qk_nope_head_dim + qk_rope_head_dim,
-                ],
+        if q_lora_rank is not None:
+            q_a_proj_weight = get_weight(model_params,
+                                         prefix + 'self_attn.q_a_proj', dtype)
+            # Layer normalization
+            q_a_layernorm_weight = get_weight(
+                model_params,
+                prefix + 'self_attn.q_a_layernorm',
+                dtype,
             )
+
+        kv_a_proj_with_mqa_weight = get_weight(
+            model_params, prefix + 'self_attn.kv_a_proj_with_mqa', dtype)
+
+        kv_a_layernorm_weight = get_weight(
+            model_params,
+            prefix + 'self_attn.kv_a_layernorm',
+            dtype,
+        )
+
+        if q_lora_rank is not None:
+            fused_a_weight = torch.cat(
+                [q_a_proj_weight, kv_a_proj_with_mqa_weight],
+                dim=0,
+            )
+
+            q_b_proj_weight = get_weight(
+                model_params, prefix + 'self_attn.q_b_proj', dtype).unflatten(
+                    0,
+                    [
+                        num_heads,
+                        qk_nope_head_dim + qk_rope_head_dim,
+                    ],
+                )
+        else:
+            fused_a_weight = kv_a_proj_with_mqa_weight
+
+            q_b_proj_weight = get_weight(
+                model_params, prefix + 'self_attn.q_proj', dtype).unflatten(
+                    0,
+                    [
+                        num_heads,
+                        qk_nope_head_dim + qk_rope_head_dim,
+                    ],
+                )
 
         kv_b_proj_weight = get_weight(model_params,
                                       prefix + 'self_attn.kv_b_proj',
@@ -337,9 +348,15 @@ def convert_deepseekv2(hf_model,
             dim=1,
         )
 
-        q_b_proj_weight = q_b_proj_weight.reshape(
-            num_heads * (qk_nope_head_dim + qk_rope_head_dim) //
-            mapping.tp_size, q_lora_rank)
+        if q_lora_rank is None:
+            q_b_proj_weight = q_b_proj_weight.reshape(
+                num_heads * (qk_nope_head_dim + qk_rope_head_dim) //
+                mapping.tp_size, hidden_size)
+        else:
+            q_b_proj_weight = q_b_proj_weight.reshape(
+                num_heads * (qk_nope_head_dim + qk_rope_head_dim) //
+                mapping.tp_size, q_lora_rank)
+
         kv_b_proj_weight = torch.concat([
             k_nope_weight.reshape(
                 num_heads * qk_nope_head_dim // mapping.tp_size, kv_lora_rank),
@@ -363,9 +380,6 @@ def convert_deepseekv2(hf_model,
             get_tllm_linear_weight(fused_a_weight,
                                    trtllm_prex + 'attention.fused_a.'))
         weights.update(
-            get_tllm_linear_weight(q_a_layernorm_weight,
-                                   trtllm_prex + 'attention.q_a_layernorm.'))
-        weights.update(
             get_tllm_linear_weight(kv_a_layernorm_weight,
                                    trtllm_prex + 'attention.kv_a_layernorm.'))
         weights.update(
@@ -381,34 +395,10 @@ def convert_deepseekv2(hf_model,
             get_tllm_linear_weight(o_proj_weight,
                                    trtllm_prex + 'attention.dense.'))
 
-        # #OPT MLA
-        # head_num = config["num_attention_heads"]  #128
-        # head_size = config["qk_nope_head_dim"]  #128
-        # c_k = config["kv_lora_rank"]  #512
-        # c_q = config["q_lora_rank"]  #1536
-
-        # #kv_b:[32768,512]=[128,128*2=256,512]
-        # kv_b_proj_weight = kv_b_proj_weight.view(head_num, head_size * 2, c_k)
-        # #kv_b_proj_weight:[32768,512], k_proj: [128,128,512], v_proj: [128,128,512]
-        # k_proj, v_proj = torch.split(kv_b_proj_weight, [head_size, head_size],
-        #                              dim=1)
-        # #k_proj:[128*128=16384,512], v_proj:[128*128=16384,512]
-        # k_proj = k_proj.reshape(head_num * head_size, c_k)
-        # v_proj = v_proj.reshape(head_num * head_size, c_k)
-        # #kv_b:[16384+16384=32768,512]
-        # # kv_b = torch.concat([k_proj, v_proj], dim=0)
-
-        # #q_b_proj_weight:[24576,1536],split_q:[128,128,1536], split_rope:[128,64,1526]
-        # split_q, split_rope = torch.split(q_b_proj_weight.view(
-        #     head_num, head_size + rope_dim, c_q), [head_size, rope_dim],
-        #                                   dim=1)
-        # #k_proj:[128,128,512]=[128,512,128]
-        # k_trans = k_proj.view(head_num, head_size, c_k).transpose(1, 2)
-        # #k_trans:[128,512,128],split_q:[128,128,1536],absorbed_gemm:[128,512,1536]
-        # absorbed_gemm = torch.bmm(k_trans, split_q)
-        # #absorbed_gemm:[128,512,1536],split_rope:[128,64,1536],final_w:[128*(512+64)]
-        # final_w = torch.concat([absorbed_gemm, split_rope],
-        #                        dim=1).reshape(head_num * (c_k + rope_dim), c_q)
+        if q_lora_rank is not None:
+            weights.update(
+                get_tllm_linear_weight(q_a_layernorm_weight, trtllm_prex +
+                                       'attention.q_a_layernorm.'))
 
         if moe_config.has_moe() and l > 0:
             rank_experts = list(range(moe_config.num_experts))
@@ -450,57 +440,60 @@ def convert_deepseekv2(hf_model,
                 model_params, prefix + 'mlp.experts.down_proj', dtype)
             weights.update(
                 get_tllm_linear_weight(moe_experts_down_proj_weights,
-                                       trtllm_prex + 'mlp.moe.proj.'))
+                                       trtllm_prex + 'mlp.proj.'))
             ## mlp.experts.up_gate.weight
             moe_experts_up_gate_proj_weights = get_weight(
                 model_params, prefix + 'mlp.experts.up_gate_proj', dtype)
             weights.update(
                 get_tllm_linear_weight(moe_experts_up_gate_proj_weights,
-                                       trtllm_prex + 'mlp.moe.fc.'))
+                                       trtllm_prex + 'mlp.fc.'))
             ## MOE hardcoded routing_input into trt.float32, please refer to moe.py line 397
             moe_experts_gate_weights = get_weight(model_params,
                                                   prefix + 'mlp.gate',
                                                   torch.float32)
             weights.update(
                 get_tllm_linear_weight(moe_experts_gate_weights,
-                                       trtllm_prex + 'mlp.moe.router.'))
+                                       trtllm_prex + 'mlp.router.'))
 
-            if moe_config.num_shared_experts > 0:
-                ## mlp.shared_experts.gate_proj.weight
-                shared_moe_gate_proj_weights = get_weight(
-                    model_params, prefix + 'mlp.shared_experts.gate_proj',
-                    dtype)
-                split_v = split_matrix_tp(shared_moe_gate_proj_weights,
-                                          mapping.tp_size,
-                                          mapping.tp_rank,
-                                          dim=0)
-                weights.update(
-                    get_tllm_linear_weight(
-                        split_v, trtllm_prex + 'mlp.shared_experts.fc.'))
-
-                # mlp.shared_experts.down_proj.weight
+            if moe_config.shared_expert_intermediate_size > 0:
+                shared_moe_up_proj_weights = get_weight(
+                    model_params, prefix + 'mlp.shared_experts.up_proj', dtype)
+                shared_moe_up_proj_weights = split_matrix_tp(
+                    shared_moe_up_proj_weights,
+                    mapping.tp_size,
+                    mapping.tp_rank,
+                    dim=0)
                 shared_moe_down_proj_weights = get_weight(
                     model_params, prefix + 'mlp.shared_experts.down_proj',
                     dtype)
-                split_down = split_matrix_tp(shared_moe_down_proj_weights,
-                                             mapping.tp_size,
-                                             mapping.tp_rank,
-                                             dim=1)
-                weights.update(
-                    get_tllm_linear_weight(
-                        split_down, trtllm_prex + 'mlp.shared_experts.proj.'))
+                shared_moe_down_proj_weights = split_matrix_tp(
+                    shared_moe_down_proj_weights,
+                    mapping.tp_size,
+                    mapping.tp_rank,
+                    dim=1)
+                shared_moe_gate_proj_weights = get_weight(
+                    model_params, prefix + 'mlp.shared_experts.gate_proj',
+                    dtype)
+                shared_moe_gate_proj_weights = split_matrix_tp(
+                    shared_moe_gate_proj_weights,
+                    mapping.tp_size,
+                    mapping.tp_rank,
+                    dim=0)
+                shared_moe_gate_up_proj_weights = torch.concat(
+                    [shared_moe_up_proj_weights, shared_moe_gate_proj_weights],
+                    dim=-2)
 
-                ## mlp.shared_experts.up_proj.weight
-                shared_moe_up_gate_proj_weights = get_weight(
-                    model_params, prefix + 'mlp.shared_experts.up_proj', dtype)
-                split_up_gate = split_matrix_tp(shared_moe_up_gate_proj_weights,
-                                                mapping.tp_size,
-                                                mapping.tp_rank,
-                                                dim=0)
+                ## mlp.shared_experts.gate_up_proj.weight
                 weights.update(
                     get_tllm_linear_weight(
-                        split_up_gate,
-                        trtllm_prex + 'mlp.shared_experts.gate.'))
+                        shared_moe_gate_up_proj_weights,
+                        trtllm_prex + 'mlp.shared_expert.fc.'))
+
+                ## mlp.shared_experts.down_proj.weight
+                weights.update(
+                    get_tllm_linear_weight(
+                        shared_moe_down_proj_weights,
+                        trtllm_prex + 'mlp.shared_expert.proj.'))
 
         else:
             ## Current MLP layer is only one, if it goes large consider to do fuse
