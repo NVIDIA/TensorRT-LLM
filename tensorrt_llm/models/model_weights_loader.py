@@ -286,7 +286,6 @@ class ModelWeightsLoader:
             ]
         else:
             v = self.load_tensor(external_key, tp_size, tp_dim, tp_rank)
-
         if preprocess is not None:
             v = preprocess(v)
 
@@ -309,7 +308,7 @@ class ModelWeightsLoader:
                 weight_dict = {tllm_key: v}
 
         for k, v in weight_dict.items():
-            if not v.is_contiguous():
+            if v is not None and not v.is_contiguous():
                 weight_dict[k] = v.contiguous()
 
         return weight_dict
@@ -352,6 +351,8 @@ class ModelWeightsLoader:
     def fill(self, weights):
         for tllm_key, param in self.model.named_parameters():
             if param.is_buffer:
+                continue
+            if weights[tllm_key] is None:
                 continue
             w_shape = weights[tllm_key].shape
             if w_shape != param.shape:

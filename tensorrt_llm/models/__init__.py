@@ -70,6 +70,7 @@ __all__ = [
     'DeepseekForCausalLM',
     'FalconConfig',
     'DeepseekV2ForCausalLM',
+    'DeepSeekV2Config'
     'FalconForCausalLM',
     'FalconModel',
     'GPTConfig',

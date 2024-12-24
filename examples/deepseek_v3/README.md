@@ -61,22 +61,35 @@ Below is the step-by-step to run DeepSeek-V3 with TensorRT-LLM.
 First the checkpoint will be converted to the TensorRT-LLM checkpoint format by apply [`convert_checkpoint.py`](./convert_checkpoint.py). After that, the TensorRT engine(s) can be build with TensorRT-LLM checkpoint.
 
 ```bash
-# Convert Deepseek-v HF weights to TensorRT-LLM checkpoint format.
+# Convert Deepseek-v HF weights to TensorRT-LLM checkpoint in BF16.
 python convert_checkpoint.py --model_dir ./DeepSeek-V3 \
                             --output_dir ./trtllm_checkpoint_deepseek_v3_32gpu_bf16 \
                             --dtype bfloat16 \
-                            --tp_size 32
+                            --tp_size 32 \
+                            --workers 8 # using multiple workers can accelerate the conversion process
 
-# With '--load_model_on_cpu' option if total GPU memory is insufficient
+
+# Use Weight-Only Int8 quantization
 python convert_checkpoint.py --model_dir ./DeepSeek-V3 \
-                            --output_dir ./trtllm_checkpoint_deepseek_v3_cpu_bf16 \
+                            --output_dir ./trtllm_checkpoint_deepseek_v3_32gpu_bf16 \
                             --dtype bfloat16 \
                             --tp_size 32 \
-                            --load_model_on_cpu
+                            --use_weight_only \
+                            --weight_only_precision int8 \
+                            --workers 8
+
+# Use Weight-Only Int4 quantization
+python convert_checkpoint.py --model_dir ./DeepSeek-V3 \
+                            --output_dir ./trtllm_checkpoint_deepseek_v3_32gpu_bf16 \
+                            --dtype bfloat16 \
+                            --tp_size 32 \
+                            --use_weight_only \
+                            --weight_only_precision int4 \
+                            --workers 8
 ```
+We observe the checkpoint conversion time took hours, while use significant amount of CPU memory, please adjust the `--workers` parameter to balance your time and memory consumption.
 
-
-We observe the checkpoint conversion time took exceed 10 hours, while use CPU memory required >= 1.3TB.
+And **please note** that although Int8 and Int4 quantization can reduce the amount of total GPU memory needed, they may affect the accuracy to a certain degree. 
 
 After the checkpoint conversion, the TensorRT engine(s) can be built with the TensorRT-LLM checkpoint.
 

@@ -35,6 +35,7 @@ def quantize_layers(
         '*position_embedding',
         '*block_embedding',
         '*shared_expert_gate',
+        '*fused_a',
     ]
 
     for name, module, parent in model.named_modules_with_parent():

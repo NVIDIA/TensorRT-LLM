@@ -426,6 +426,11 @@ class Linear(LinearBase):
                     weights = w.reshape(-1, self.in_features)  # Weight
                 else:
                     weights = w.reshape(-1)  # Bias
+        elif tllm_key.endswith("fused_a.weight") and isinstance(weights, list):
+            weights = torch.cat(
+                [weights[0], weights[1]],
+                dim=0,
+            )
         weights = weights.to(str_dtype_to_torch(self.dtype))
         return {tllm_key: weights}
 
