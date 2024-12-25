@@ -178,15 +178,15 @@
 
 <span class="kn">from</span> <span class="nn">..._utils</span> <span class="kn">import</span> <span class="n">pad_vocab_size</span>
 <span class="kn">from</span> <span class="nn">...functional</span> <span class="kn">import</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">non_gated_version</span><span class="p">,</span> <span class="n">recv</span><span class="p">,</span> <span class="n">send</span>
-<span class="kn">from</span> <span class="nn">...layers</span> <span class="kn">import</span> <span class="p">(</span><span class="n">MOE</span><span class="p">,</span> <span class="n">Attention</span><span class="p">,</span> <span class="n">AttentionMaskType</span><span class="p">,</span> <span class="n">ColumnLinear</span><span class="p">,</span>
-                       <span class="n">Embedding</span><span class="p">,</span> <span class="n">GatedMLP</span><span class="p">,</span> <span class="n">MoeConfig</span><span class="p">,</span> <span class="n">PositionEmbeddingType</span><span class="p">,</span>
-                       <span class="n">RmsNorm</span><span class="p">,</span> <span class="n">SharedMoE</span><span class="p">)</span>
+<span class="kn">from</span> <span class="nn">...layers</span> <span class="kn">import</span> <span class="p">(</span><span class="n">Attention</span><span class="p">,</span> <span class="n">AttentionMaskType</span><span class="p">,</span> <span class="n">ColumnLinear</span><span class="p">,</span> <span class="n">Embedding</span><span class="p">,</span>
+                       <span class="n">GatedMLP</span><span class="p">,</span> <span class="n">PositionEmbeddingType</span><span class="p">,</span> <span class="n">RmsNorm</span><span class="p">,</span> <span class="n">SharedMoE</span><span class="p">)</span>
 <span class="kn">from</span> <span class="nn">...mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
 <span class="kn">from</span> <span class="nn">...module</span> <span class="kn">import</span> <span class="n">Module</span>
 <span class="kn">from</span> <span class="nn">...plugin</span> <span class="kn">import</span> <span class="n">init_all_reduce_helper</span>
 <span class="kn">from</span> <span class="nn">..modeling_utils</span> <span class="kn">import</span> <span class="p">(</span><span class="n">DecoderLayerList</span><span class="p">,</span> <span class="n">DecoderModelForCausalLM</span><span class="p">,</span>
                               <span class="n">PretrainedConfig</span><span class="p">)</span>
-<span class="kn">from</span> <span class="nn">.convert</span> <span class="kn">import</span> <span class="n">convert_deepseek</span><span class="p">,</span> <span class="n">create_trt_config_from_hf</span>
+<span class="kn">from</span> <span class="nn">.config</span> <span class="kn">import</span> <span class="n">DeepSeekV1Config</span>
+<span class="kn">from</span> <span class="nn">.convert</span> <span class="kn">import</span> <span class="n">convert_deepseek</span><span class="p">,</span> <span class="n">load_hf_deepseek</span>
 
 
 <span class="k">class</span> <span class="nc">DeepseekDecoderLayer</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
@@ -222,7 +222,9 @@
             <span class="n">tp_rank</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_rank</span><span class="p">,</span>
             <span class="n">quant_mode</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">quant_mode</span><span class="p">)</span>
 
-        <span class="n">moe_config</span> <span class="o">=</span> <span class="n">MoeConfig</span><span class="o">.</span><span class="n">from_dict</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">moe</span><span class="p">)</span>
+        <span class="n">ClsMLP</span> <span class="o">=</span> <span class="n">GatedMLP</span>
+        <span class="n">moe_config</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">moe</span>
+
         <span class="k">if</span> <span class="n">moe_config</span><span class="o">.</span><span class="n">num_experts</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="ow">and</span> <span class="n">layer_idx</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
             <span class="n">mlp_hidden_size</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">moe_intermediate_size</span>
             <span class="n">hidden_act</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">hidden_act</span>
@@ -352,6 +354,7 @@
 <div class="viewcode-block" id="DeepseekForCausalLM">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.DeepseekForCausalLM">[docs]</a>
 <span class="k">class</span> <span class="nc">DeepseekForCausalLM</span><span class="p">(</span><span class="n">DecoderModelForCausalLM</span><span class="p">):</span>
+    <span class="n">config_class</span> <span class="o">=</span> <span class="n">DeepSeekV1Config</span>
 
     <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">):</span>
         <span class="n">transformer</span> <span class="o">=</span> <span class="n">DeepseekModel</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
@@ -374,33 +377,27 @@
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.DeepseekForCausalLM.from_hugging_face">[docs]</a>
     <span class="nd">@classmethod</span>
     <span class="k">def</span> <span class="nf">from_hugging_face</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span>
-                          <span class="n">hf_model</span><span class="p">,</span>
                           <span class="n">model_dir</span><span class="p">,</span>
                           <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s1">&#39;auto&#39;</span><span class="p">,</span>
                           <span class="n">mapping</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Mapping</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                           <span class="n">override_fields</span><span class="o">=</span><span class="p">{},</span>
                           <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
-        <span class="k">assert</span> <span class="n">hf_model</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
         <span class="k">if</span> <span class="n">mapping</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">mapping</span> <span class="o">=</span> <span class="n">Mapping</span><span class="p">()</span>
-        <span class="n">config</span> <span class="o">=</span> <span class="n">create_trt_config_from_hf</span><span class="p">(</span><span class="n">model_dir</span><span class="p">,</span>
-                                           <span class="n">dtype</span><span class="p">,</span>
-                                           <span class="n">mapping</span><span class="o">=</span><span class="n">mapping</span><span class="p">,</span>
-                                           <span class="n">override_fields</span><span class="o">=</span><span class="n">override_fields</span><span class="p">)</span>
-        <span class="nb">print</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
-        <span class="n">pretrained_config</span> <span class="o">=</span> <span class="n">PretrainedConfig</span><span class="o">.</span><span class="n">from_dict</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
-        <span class="n">pretrained_config</span><span class="o">.</span><span class="n">set_rank</span><span class="p">(</span><span class="n">mapping</span><span class="o">.</span><span class="n">rank</span><span class="p">)</span>  <span class="c1"># TODO:remove this hack</span>
 
+        <span class="n">pretrained_config</span> <span class="o">=</span> <span class="n">DeepSeekV1Config</span><span class="o">.</span><span class="n">from_hugging_face</span><span class="p">(</span><span class="n">model_dir</span><span class="p">,</span>
+                                                               <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+                                                               <span class="n">mapping</span><span class="o">=</span><span class="n">mapping</span><span class="p">,</span>
+                                                               <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
         <span class="n">deepseek</span> <span class="o">=</span> <span class="bp">cls</span><span class="o">.</span><span class="n">from_config</span><span class="p">(</span><span class="n">pretrained_config</span><span class="p">)</span>
+        <span class="n">hf_model</span> <span class="o">=</span> <span class="n">load_hf_deepseek</span><span class="p">(</span><span class="n">model_dir</span><span class="p">)</span>
         <span class="n">weights</span> <span class="o">=</span> <span class="n">convert_deepseek</span><span class="p">(</span>
             <span class="n">hf_model</span><span class="p">,</span>
-            <span class="n">config</span><span class="p">,</span>
+            <span class="n">pretrained_config</span><span class="p">,</span>
             <span class="n">mapping</span><span class="o">=</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">mapping</span><span class="p">,</span>
             <span class="n">dtype</span><span class="o">=</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
-            <span class="n">use_parallel_embedding</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;use_parallel_embedding&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">),</span>
-            <span class="n">sharding_dim</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;embedding_sharding_dim&#39;</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span>
-            <span class="n">share_embedding_table</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;share_embedding_table&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">))</span>
-        <span class="c1">#check_share_embedding(weights, config)</span>
+            <span class="n">use_parallel_embedding</span><span class="o">=</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">use_parallel_embedding</span><span class="p">,</span>
+            <span class="n">sharding_dim</span><span class="o">=</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">embedding_sharding_dim</span><span class="p">)</span>
         <span class="n">deepseek</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">weights</span><span class="p">)</span>
 
         <span class="k">return</span> <span class="n">deepseek</span></div>
@@ -415,7 +412,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f9469090320>
+<jinja2.runtime.BlockReference object at 0x7fed97ab2660>
 
 <div class="footer">
     <p>

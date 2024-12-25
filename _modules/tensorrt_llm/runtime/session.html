@@ -460,9 +460,10 @@
         <span class="p">]</span>
         <span class="n">outputs_info</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">infer_shapes</span><span class="p">(</span><span class="n">inputs_info</span><span class="p">)</span>
         <span class="n">outputs</span> <span class="o">=</span> <span class="p">{</span>
-            <span class="n">t</span><span class="o">.</span><span class="n">name</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span><span class="nb">tuple</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">shape</span><span class="p">),</span>
-                                <span class="n">dtype</span><span class="o">=</span><span class="n">trt_dtype_to_torch</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">dtype</span><span class="p">),</span>
-                                <span class="n">device</span><span class="o">=</span><span class="s1">&#39;cuda&#39;</span><span class="p">)</span>
+            <span class="n">t</span><span class="o">.</span><span class="n">name</span><span class="p">:</span>
+            <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span><span class="nb">tuple</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">shape</span><span class="p">),</span>
+                        <span class="n">dtype</span><span class="o">=</span><span class="n">trt_dtype_to_torch</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">dtype</span><span class="p">),</span>
+                        <span class="n">device</span><span class="o">=</span><span class="s1">&#39;cuda&#39;</span><span class="p">)</span>
             <span class="k">for</span> <span class="n">t</span> <span class="ow">in</span> <span class="n">outputs_info</span>
         <span class="p">}</span>
         <span class="k">with</span> <span class="n">_scoped_stream</span><span class="p">()</span> <span class="k">as</span> <span class="n">stream</span><span class="p">:</span>
@@ -481,7 +482,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f946ada6060>
+<jinja2.runtime.BlockReference object at 0x7fed973d9460>
 
 <div class="footer">
     <p>

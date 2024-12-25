@@ -174,13 +174,14 @@
 <span class="kn">from</span> <span class="nn">..builder</span> <span class="kn">import</span> <span class="n">EngineConfig</span>
 <span class="kn">from</span> <span class="nn">..executor</span> <span class="kn">import</span> <span class="p">(</span><span class="n">GenerationExecutor</span><span class="p">,</span> <span class="n">GenerationResult</span><span class="p">,</span> <span class="n">LoRARequest</span><span class="p">,</span>
                         <span class="n">PromptAdapterRequest</span><span class="p">)</span>
+<span class="kn">from</span> <span class="nn">..inputs</span> <span class="kn">import</span> <span class="n">PromptInputs</span><span class="p">,</span> <span class="n">create_input_processor</span><span class="p">,</span> <span class="n">prompt_inputs</span>
 <span class="kn">from</span> <span class="nn">..logger</span> <span class="kn">import</span> <span class="n">logger</span>
 <span class="kn">from</span> <span class="nn">..sampling_params</span> <span class="kn">import</span> <span class="n">SamplingParams</span>
 <span class="kn">from</span> <span class="nn">.llm_utils</span> <span class="kn">import</span> <span class="p">(</span><span class="n">LLMARGS_DOCSTRING</span><span class="p">,</span> <span class="n">CachedModelLoader</span><span class="p">,</span> <span class="n">LlmArgs</span><span class="p">,</span>
                         <span class="n">LlmBuildStats</span><span class="p">,</span> <span class="n">ModelLoader</span><span class="p">,</span> <span class="n">_ModelRuntimeContext</span><span class="p">)</span>
 <span class="kn">from</span> <span class="nn">.mpi_session</span> <span class="kn">import</span> <span class="p">(</span><span class="n">MpiCommSession</span><span class="p">,</span> <span class="n">MpiPoolSession</span><span class="p">,</span> <span class="n">MpiSession</span><span class="p">,</span>
                           <span class="n">external_mpi_comm_available</span><span class="p">)</span>
-<span class="kn">from</span> <span class="nn">.tokenizer</span> <span class="kn">import</span> <span class="n">TokenizerBase</span>
+<span class="kn">from</span> <span class="nn">.tokenizer</span> <span class="kn">import</span> <span class="n">TokenizerBase</span><span class="p">,</span> <span class="n">_xgrammar_tokenizer_info</span>
 <span class="c1"># TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import</span>
 <span class="kn">from</span> <span class="nn">.utils</span> <span class="kn">import</span> <span class="n">append_docstring</span><span class="p">,</span> <span class="n">exception_handler</span><span class="p">,</span> <span class="n">get_device_count</span>
 
@@ -250,9 +251,6 @@
 
 
 
-<span class="n">PromptInputs</span> <span class="o">=</span> <span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span>
-
-
 <div class="viewcode-block" id="LLM">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.LLM">[docs]</a>
 <span class="nd">@append_docstring</span><span class="p">(</span><span class="n">LLMARGS_DOCSTRING</span><span class="p">)</span>
@@ -275,6 +273,7 @@
                  <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;auto&quot;</span><span class="p">,</span>
                  <span class="n">revision</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">tokenizer_revision</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">speculative_model</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="o">**</span><span class="n">kwargs</span><span class="p">:</span> <span class="n">Any</span><span class="p">):</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_executor_cls</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">&quot;executor_cls&quot;</span><span class="p">,</span> <span class="n">GenerationExecutor</span><span class="p">)</span>
@@ -291,6 +290,7 @@
                 <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
                 <span class="n">revision</span><span class="o">=</span><span class="n">revision</span><span class="p">,</span>
                 <span class="n">tokenizer_revision</span><span class="o">=</span><span class="n">tokenizer_revision</span><span class="p">,</span>
+                <span class="n">speculative_model</span><span class="o">=</span><span class="n">speculative_model</span><span class="p">,</span>
                 <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
         <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
             <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span>
@@ -327,7 +327,7 @@
             <span class="bp">self</span><span class="o">.</span><span class="n">llm_build_stats</span> <span class="o">=</span> <span class="n">LlmBuildStats</span><span class="p">()</span>
 
             <span class="bp">self</span><span class="o">.</span><span class="n">_build_model</span><span class="p">()</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_tokenizer</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_try_load_tokenizer</span><span class="p">()</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span> <span class="o">=</span> <span class="n">create_input_processor</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">)</span>
         <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
@@ -352,6 +352,7 @@
                                      <span class="n">Sequence</span><span class="p">[</span><span class="n">LoRARequest</span><span class="p">]]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">prompt_adapter_request</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span>
             <span class="n">PromptAdapterRequest</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">PromptAdapterRequest</span><span class="p">]]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">queries</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="n">PromptInputs</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">PromptInputs</span><span class="p">]]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Union</span><span class="p">[</span><span class="n">RequestOutput</span><span class="p">,</span> <span class="n">List</span><span class="p">[</span><span class="n">RequestOutput</span><span class="p">]]:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;Generate output for the given prompts in the synchronous mode.</span>
 <span class="sd">        Synchronous generation accepts either single prompt or batched prompts.</span>
@@ -366,17 +367,22 @@
 <span class="sd">                if any. Defaults to None.</span>
 <span class="sd">            prompt_adapter_request (PromptAdapterRequest, Sequence[PromptAdapterRequest], optional):</span>
 <span class="sd">                Prompt Adapter request to use for generation, if any. Defaults to None.</span>
-
+<span class="sd">            queries (PromptInputs or Sequence[PromptInputs]): The query text or token ids.</span>
+<span class="sd">                it can be single prompt or batched prompts. it is used for star attention to run long context tasks.</span>
 <span class="sd">        Returns:</span>
 <span class="sd">            Union[RequestOutput, List[RequestOutput]]: The output data of the completion request to the LLM.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
-        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">inputs</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span> <span class="ow">or</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">inputs</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="nb">str</span><span class="p">):</span>
-            <span class="n">unbatched</span> <span class="o">=</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">inputs</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="n">unbatched</span> <span class="o">=</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">inputs</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="nb">int</span><span class="p">)</span>
+        <span class="n">unbatched</span> <span class="o">=</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">inputs</span><span class="p">,</span> <span class="nb">list</span><span class="p">)</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">unbatched</span><span class="p">:</span>
+            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">inputs</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="nb">int</span><span class="p">):</span>
+                <span class="n">unbatched</span> <span class="o">=</span> <span class="kc">True</span>
 
         <span class="k">if</span> <span class="n">unbatched</span><span class="p">:</span>
             <span class="n">inputs</span> <span class="o">=</span> <span class="p">[</span><span class="n">inputs</span><span class="p">]</span>
+            <span class="k">if</span> <span class="n">queries</span><span class="p">:</span>
+                <span class="n">queries</span> <span class="o">=</span> <span class="p">[</span><span class="n">queries</span><span class="p">]</span>
+
+        <span class="n">inputs</span> <span class="o">=</span> <span class="p">[</span><span class="n">prompt_inputs</span><span class="p">(</span><span class="n">i</span><span class="p">)</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">inputs</span><span class="p">]</span>
 
         <span class="n">futures</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">request_inputs</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">inputs</span><span class="p">):</span>
@@ -392,7 +398,9 @@
                 <span class="n">pa_req</span> <span class="o">=</span> <span class="n">prompt_adapter_request</span><span class="p">[</span><span class="n">i</span><span class="p">]</span>
             <span class="k">else</span><span class="p">:</span>
                 <span class="n">pa_req</span> <span class="o">=</span> <span class="n">prompt_adapter_request</span>
+            <span class="n">request_queries</span> <span class="o">=</span> <span class="kc">None</span> <span class="k">if</span> <span class="n">queries</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">queries</span><span class="p">[</span><span class="n">i</span><span class="p">]</span>
             <span class="n">future</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">generate_async</span><span class="p">(</span><span class="n">request_inputs</span><span class="p">,</span>
+                                         <span class="n">queries</span><span class="o">=</span><span class="n">request_queries</span><span class="p">,</span>
                                          <span class="n">sampling_params</span><span class="o">=</span><span class="n">sp</span><span class="p">,</span>
                                          <span class="n">lora_request</span><span class="o">=</span><span class="n">lora_req</span><span class="p">,</span>
                                          <span class="n">prompt_adapter_request</span><span class="o">=</span><span class="n">pa_req</span><span class="p">,</span>
@@ -420,6 +428,7 @@
         <span class="n">lora_request</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">LoRARequest</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">prompt_adapter_request</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">PromptAdapterRequest</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">streaming</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+        <span class="n">queries</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">PromptInputs</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">RequestOutput</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;Generate output for the given prompt in the asynchronous mode.</span>
 <span class="sd">        Asynchronous generation accepts single prompt only.</span>
@@ -434,31 +443,49 @@
 <span class="sd">                use for generation, if any. Defaults to None.</span>
 <span class="sd">            streaming (bool): Whether to use the streaming mode for the generation. Defaults to</span>
 <span class="sd">                False.</span>
+<span class="sd">            queries (PromptInputs or Sequence[PromptInputs]): The query text or token ids.</span>
+<span class="sd">                it can be single prompt or batched prompts. it is used for star attention to run long context tasks.</span>
 
 <span class="sd">        Returns:</span>
 <span class="sd">            RequestOutput: The output data of the completion request to the LLM.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="n">sampling_params</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepare_sampling_params</span><span class="p">(</span><span class="n">sampling_params</span><span class="p">)</span>
 
-        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">inputs</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
-            <span class="n">prompt_token_ids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepare_prompt_token_ids</span><span class="p">(</span>
-                <span class="n">inputs</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
-            <span class="n">prompt</span> <span class="o">=</span> <span class="n">inputs</span>
-        <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">inputs</span><span class="p">,</span> <span class="nb">list</span><span class="p">)</span> <span class="ow">and</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">inputs</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="nb">int</span><span class="p">):</span>
-            <span class="n">prompt_token_ids</span> <span class="o">=</span> <span class="n">inputs</span>
+        <span class="n">inputs</span> <span class="o">=</span> <span class="n">prompt_inputs</span><span class="p">(</span><span class="n">inputs</span><span class="p">)</span>
+
+        <span class="n">query_token_ids</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">prompt_tuning_config</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="s2">&quot;prompt_token_ids&quot;</span> <span class="ow">in</span> <span class="n">inputs</span><span class="p">:</span>
+            <span class="n">prompt_token_ids</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;prompt_token_ids&#39;</span><span class="p">]</span>
             <span class="n">prompt</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="k">if</span> <span class="n">queries</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">query_token_ids</span> <span class="o">=</span> <span class="n">queries</span>
+        <span class="k">elif</span> <span class="s2">&quot;prompt&quot;</span> <span class="ow">in</span> <span class="n">inputs</span><span class="p">:</span>
+            <span class="n">prompt_token_ids</span><span class="p">,</span> <span class="n">extra_processed_inputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span><span class="p">(</span>
+                <span class="n">inputs</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
+            <span class="n">prompt</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;prompt&#39;</span><span class="p">]</span>
+            <span class="k">if</span> <span class="n">queries</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">query_token_ids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span><span class="p">(</span><span class="n">queries</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">extra_processed_inputs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">prompt_tuning_config</span> <span class="o">=</span> <span class="n">extra_processed_inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
+                    <span class="s1">&#39;prompt_tuning_config&#39;</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">TypeError</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">&quot;The inputs must be type str or list of int, but got </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">inputs</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span>
             <span class="p">)</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">_check_arguments</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_check_arguments</span><span class="p">(</span>
+            <span class="nb">len</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="p">),</span>
+            <span class="nb">len</span><span class="p">(</span><span class="n">query_token_ids</span><span class="p">)</span> <span class="k">if</span> <span class="n">query_token_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="mi">0</span><span class="p">,</span>
+            <span class="n">sampling_params</span><span class="p">)</span>
         <span class="n">result</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">generate_async</span><span class="p">(</span>
             <span class="n">prompt_token_ids</span><span class="p">,</span>
+            <span class="n">query_token_ids</span><span class="o">=</span><span class="n">query_token_ids</span><span class="p">,</span>
             <span class="n">sampling_params</span><span class="o">=</span><span class="n">sampling_params</span><span class="p">,</span>
             <span class="n">lora_request</span><span class="o">=</span><span class="n">lora_request</span><span class="p">,</span>
             <span class="n">prompt_adapter_request</span><span class="o">=</span><span class="n">prompt_adapter_request</span><span class="p">,</span>
             <span class="n">streaming</span><span class="o">=</span><span class="n">streaming</span><span class="p">,</span>
+            <span class="n">prompt_tuning_config</span><span class="o">=</span><span class="n">prompt_tuning_config</span><span class="p">,</span>
         <span class="p">)</span>
         <span class="k">return</span> <span class="n">RequestOutput</span><span class="p">(</span><span class="n">result</span><span class="p">,</span> <span class="n">prompt</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">)</span></div>
 
@@ -491,21 +518,6 @@
 <span class="sd">        &#39;&#39;&#39;</span>
         <span class="k">return</span> <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">aget_stats</span><span class="p">(</span><span class="n">timeout</span><span class="o">=</span><span class="n">timeout</span><span class="p">)</span>
 
-    <span class="k">def</span> <span class="nf">_prepare_prompt_token_ids</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">prompt</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
-                                  <span class="n">sampling_params</span><span class="p">:</span> <span class="n">SamplingParams</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;tokenizer is required to tokenize string prompt&quot;</span><span class="p">)</span>
-
-        <span class="k">if</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">truncate_prompt_tokens</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span>
-                <span class="n">prompt</span><span class="p">,</span> <span class="n">add_special_tokens</span><span class="o">=</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">add_special_tokens</span><span class="p">)</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span>
-                <span class="n">prompt</span><span class="p">,</span>
-                <span class="n">add_special_tokens</span><span class="o">=</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">add_special_tokens</span><span class="p">,</span>
-                <span class="n">truncation</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-                <span class="n">max_length</span><span class="o">=</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">truncate_prompt_tokens</span><span class="p">)</span>
-
     <span class="k">def</span> <span class="nf">_prepare_sampling_params</span><span class="p">(</span>
             <span class="bp">self</span><span class="p">,</span>
             <span class="n">sampling_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">SamplingParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SamplingParams</span><span class="p">:</span>
@@ -528,24 +540,24 @@
                 <span class="sa">f</span><span class="s2">&quot;The sampling_params must be type SamplingParams or None, but got </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">sampling_params</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span>
             <span class="p">)</span>
 
-    <span class="k">def</span> <span class="nf">_check_arguments</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">prompt_token_ids</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
+    <span class="k">def</span> <span class="nf">_check_arguments</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">prompt_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">query_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
                          <span class="n">sampling_params</span><span class="p">:</span> <span class="n">SamplingParams</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 
         <span class="n">build_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span>
 
-        <span class="n">built_enging_cfg_file</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">model</span> <span class="o">/</span> <span class="s1">&#39;config.json&#39;</span>
+        <span class="n">built_enging_cfg_file</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">model</span><span class="p">)</span> <span class="o">/</span> <span class="s1">&#39;config.json&#39;</span>
         <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">built_enging_cfg_file</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
             <span class="n">built_enging_cfg</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
         <span class="n">max_seq_len</span> <span class="o">=</span> <span class="n">built_enging_cfg</span><span class="p">[</span><span class="s1">&#39;build_config&#39;</span><span class="p">][</span>
             <span class="s1">&#39;max_seq_len&#39;</span><span class="p">]</span> <span class="k">if</span> <span class="s1">&#39;build_config&#39;</span> <span class="ow">in</span> <span class="n">built_enging_cfg</span> <span class="k">else</span> <span class="n">build_config</span><span class="o">.</span><span class="n">max_seq_len</span>
-
-        <span class="n">prompt_len</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="p">)</span>
-
         <span class="c1"># TODO: Remove this check and left the request verification to cpp runtime</span>
-        <span class="k">if</span> <span class="p">(</span><span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">enable_chunked_prefill</span>
-            <span class="p">)</span> <span class="ow">and</span> <span class="n">prompt_len</span> <span class="o">+</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">max_tokens</span> <span class="o">&gt;</span> <span class="n">max_seq_len</span><span class="p">:</span>
+
+        <span class="c1"># NOTE: [yuhangh] the meaning of max_seq_len should be for the all sequence. It&#39;s about position embedding.</span>
+        <span class="k">if</span> <span class="p">(</span><span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">enable_chunked_prefill</span><span class="p">)</span> <span class="ow">and</span> <span class="p">(</span>
+                <span class="n">prompt_len</span> <span class="o">/</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">cp_size</span> <span class="o">+</span> <span class="n">query_len</span> <span class="o">+</span>
+                <span class="n">sampling_params</span><span class="o">.</span><span class="n">max_tokens</span> <span class="o">&gt;</span> <span class="n">max_seq_len</span><span class="p">):</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">&quot;The sum of prompt length (</span><span class="si">{</span><span class="n">prompt_len</span><span class="si">}</span><span class="s2">) and max_tokens (</span><span class="si">{</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">max_tokens</span><span class="si">}</span><span class="s2">) should not exceed &quot;</span>
+                <span class="sa">f</span><span class="s2">&quot;The sum of prompt length (</span><span class="si">{</span><span class="n">prompt_len</span><span class="o">/</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">cp_size</span><span class="si">}</span><span class="s2">) and query length (</span><span class="si">{</span><span class="n">query_len</span><span class="si">}</span><span class="s2">) max_tokens (</span><span class="si">{</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">max_tokens</span><span class="si">}</span><span class="s2">) should not exceed &quot;</span>
                 <span class="sa">f</span><span class="s2">&quot;max_seq_len (</span><span class="si">{</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_seq_len</span><span class="si">}</span><span class="s2">)&quot;</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">beam_width</span> <span class="o">&gt;</span> <span class="n">build_config</span><span class="o">.</span><span class="n">max_beam_width</span><span class="p">:</span>
@@ -563,12 +575,18 @@
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">model</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span>
 
+        <span class="c1"># Tokenizer loading should be after calling model_loader(), since model_loader() may download the model from HF hub.</span>
+        <span class="c1"># It should also be before bindings ExecutorConfig, which may depend on tokenizer info.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_tokenizer</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_try_load_tokenizer</span><span class="p">()</span>
+
+        <span class="n">max_batch_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_batch_size</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_batch_size</span>
+        <span class="n">max_num_tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_num_tokens</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_num_tokens</span>
         <span class="n">executor_config</span> <span class="o">=</span> <span class="n">tllm</span><span class="o">.</span><span class="n">ExecutorConfig</span><span class="p">(</span>
             <span class="n">max_beam_width</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_beam_width</span><span class="p">,</span>
             <span class="n">scheduler_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">scheduler_config</span><span class="p">,</span>
             <span class="n">batching_type</span><span class="o">=</span><span class="n">tllm</span><span class="o">.</span><span class="n">BatchingType</span><span class="o">.</span><span class="n">INFLIGHT</span><span class="p">,</span>
-            <span class="n">max_batch_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_batch_size</span><span class="p">,</span>
-            <span class="n">max_num_tokens</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_num_tokens</span><span class="p">)</span>
+            <span class="n">max_batch_size</span><span class="o">=</span><span class="n">max_batch_size</span><span class="p">,</span>
+            <span class="n">max_num_tokens</span><span class="o">=</span><span class="n">max_num_tokens</span><span class="p">)</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">kv_cache_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">executor_config</span><span class="o">.</span><span class="n">kv_cache_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">kv_cache_config</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">peft_cache_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
@@ -588,18 +606,26 @@
             <span class="p">)</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">decoding_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">executor_config</span><span class="o">.</span><span class="n">decoding_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">decoding_config</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">logits_post_processor_map</span><span class="p">:</span>
-            <span class="n">executor_config</span><span class="o">.</span><span class="n">logits_post_processor_config</span> <span class="o">=</span> <span class="n">tllm</span><span class="o">.</span><span class="n">LogitsPostProcessorConfig</span><span class="p">(</span>
-                <span class="n">processor_map</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">logits_post_processor_map</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">guided_decoding_backend</span> <span class="o">==</span> <span class="s1">&#39;xgrammar&#39;</span><span class="p">:</span>
+            <span class="n">executor_config</span><span class="o">.</span><span class="n">guided_decoding_config</span> <span class="o">=</span> <span class="n">tllm</span><span class="o">.</span><span class="n">GuidedDecodingConfig</span><span class="p">(</span>
+                <span class="n">backend</span><span class="o">=</span><span class="n">tllm</span><span class="o">.</span><span class="n">GuidedDecodingConfig</span><span class="o">.</span><span class="n">GuidedDecodingBackend</span><span class="o">.</span>
+                <span class="n">XGRAMMAR</span><span class="p">,</span>
+                <span class="o">**</span><span class="n">_xgrammar_tokenizer_info</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">))</span>
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">guided_decoding_backend</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;Unrecognized guided decoding backend </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">guided_decoding_backend</span><span class="si">}</span><span class="s2">&quot;</span>
+            <span class="p">)</span>
 
         <span class="n">executor_config</span><span class="o">.</span><span class="n">normalize_log_probs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">normalize_log_probs</span>
         <span class="n">executor_config</span><span class="o">.</span><span class="n">enable_chunked_context</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">enable_chunked_prefill</span>
         <span class="n">executor_config</span><span class="o">.</span><span class="n">max_beam_width</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_beam_width</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">extended_runtime_perf_knob_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">executor_config</span><span class="o">.</span><span class="n">extended_runtime_perf_knob_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">extended_runtime_perf_knob_config</span>
 
-        <span class="n">trt_engine_dir</span> <span class="o">=</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span><span class="o">.</span><span class="n">absolute</span><span class="p">()</span><span class="o">.</span><span class="n">as_posix</span><span class="p">()</span>
+        <span class="n">trt_engine_dir</span> <span class="o">=</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span>
                           <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span><span class="p">)</span>
         <span class="c1"># PIVOT_TO_PYTHON_START</span>
-        <span class="n">hf_model_dir</span> <span class="o">=</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span><span class="o">.</span><span class="n">absolute</span><span class="p">()</span><span class="o">.</span><span class="n">as_posix</span><span class="p">()</span>
+        <span class="n">hf_model_dir</span> <span class="o">=</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span>
                         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span><span class="p">)</span>
         <span class="kn">from</span> <span class="nn">tensorrt_llm.pyexecutor.config</span> <span class="kn">import</span> <span class="n">update_executor_config</span>
         <span class="n">update_executor_config</span><span class="p">(</span>
@@ -609,16 +635,17 @@
             <span class="n">max_seq_len</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_seq_len</span><span class="p">,</span>
             <span class="n">hf_model_dir</span><span class="o">=</span><span class="n">hf_model_dir</span><span class="p">,</span>
             <span class="n">trt_engine_dir</span><span class="o">=</span><span class="n">trt_engine_dir</span><span class="p">)</span>
+        <span class="n">executor_config</span><span class="o">.</span><span class="n">llm_parallel_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span>
         <span class="c1"># PIVOT_TO_PYTHON_END</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor_cls</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span><span class="p">,</span>
             <span class="n">executor_config</span><span class="o">=</span><span class="n">executor_config</span><span class="p">,</span>
+            <span class="n">logits_post_processor_map</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">logits_post_processor_map</span><span class="p">,</span>
             <span class="n">model_world_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">world_size</span><span class="p">,</span>
             <span class="n">mpi_session</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span><span class="p">,</span>
             <span class="n">reuse_mpi_comm</span><span class="o">=</span><span class="n">external_mpi_comm_available</span><span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">world_size</span><span class="p">),</span>
-            <span class="n">enable_processes_for_single_gpu</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span>
-            <span class="n">enable_processes_for_single_gpu</span><span class="p">)</span>
+        <span class="p">)</span>
 
     <span class="k">def</span> <span class="nf">_try_load_tokenizer</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="n">TokenizerBase</span><span class="p">]:</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">skip_tokenizer_init</span><span class="p">:</span>
@@ -632,7 +659,7 @@
             <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">runtime_context</span><span class="o">.</span><span class="n">tokenizer</span>
 
         <span class="k">return</span> <span class="n">ModelLoader</span><span class="o">.</span><span class="n">load_hf_tokenizer</span><span class="p">(</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">model_dir</span><span class="p">,</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">model</span><span class="p">,</span>
             <span class="n">trust_remote_code</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">trust_remote_code</span><span class="p">,</span>
             <span class="n">use_fast</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">tokenizer_mode</span> <span class="o">!=</span> <span class="s1">&#39;slow&#39;</span><span class="p">)</span>
 
@@ -689,7 +716,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f9468da5af0>
+<jinja2.runtime.BlockReference object at 0x7fed97af7950>
 
 <div class="footer">
     <p>

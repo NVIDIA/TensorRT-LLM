@@ -261,6 +261,13 @@ Refer to the <a class="reference external" href="https://github.com/NVIDIA/Tenso
 <p>Because the LLM API relies on the <code class="docutils literal notranslate"><span class="pre">mpi4py</span></code> library, put the LLM class in a function and protect the main entrypoint to the program under the <code class="docutils literal notranslate"><span class="pre">__main__</span></code> namespace to avoid a <a class="reference external" href="https://mpi4py.readthedocs.io/en/stable/mpi4py.futures.html#mpipoolexecutor">recursive spawn</a> process in <code class="docutils literal notranslate"><span class="pre">mpi4py</span></code>.</p>
 <p>This limitation is applicable for multi-GPU inference only.</p>
 </li>
+<li><p>Cannot quit after generation</p>
+<p>The LLM instance manages threads and processes, which may prevent its reference count from reaching zero. To address this issue, there are two common solutions:</p>
+<ol class="arabic simple">
+<li><p>Wrap the LLM instance in a function, as demonstrated in the quickstart guide. This will reduce the reference count and trigger the shutdown process.</p></li>
+<li><p>Use LLM as an contextmanager, with the following code: <code class="docutils literal notranslate"><span class="pre">with</span> <span class="pre">LLM(...)</span> <span class="pre">as</span> <span class="pre">llm:</span> <span class="pre">...</span></code>, the shutdown methed will be invoked automatically once it goes out of the <code class="docutils literal notranslate"><span class="pre">with</span></code>-statement block.</p></li>
+</ol>
+</li>
 </ul>
 </section>
 </section>
@@ -276,7 +283,7 @@ Refer to the <a class="reference external" href="https://github.com/NVIDIA/Tenso
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f945968e960>
+<jinja2.runtime.BlockReference object at 0x7fed9b9f93d0>
 
 <div class="footer">
     <p>

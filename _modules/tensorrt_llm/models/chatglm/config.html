@@ -254,7 +254,6 @@
         <span class="n">logits_dtype</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;logits_dtype&#39;</span><span class="p">,</span> <span class="s1">&#39;float32&#39;</span><span class="p">)</span>
         <span class="n">use_parallel_embedding</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;use_parallel_embedding&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
         <span class="n">embedding_sharding_dim</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;embedding_sharding_dim&#39;</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
-        <span class="n">share_embedding_table</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;share_embedding_table&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
         <span class="n">chatglm_version</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;chatglm_version&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
 
         <span class="c1"># get chatglm version</span>
@@ -339,7 +338,6 @@
             <span class="n">hidden_act</span><span class="o">=</span><span class="n">hf_config</span><span class="o">.</span><span class="n">hidden_act</span><span class="p">,</span>
             <span class="n">use_parallel_embedding</span><span class="o">=</span><span class="n">use_parallel_embedding</span><span class="p">,</span>
             <span class="n">embedding_sharding_dim</span><span class="o">=</span><span class="n">embedding_sharding_dim</span><span class="p">,</span>
-            <span class="n">share_embedding_table</span><span class="o">=</span><span class="n">share_embedding_table</span><span class="p">,</span>
             <span class="n">quantization</span><span class="o">=</span><span class="n">quant_config</span><span class="p">,</span>
             <span class="n">mapping</span><span class="o">=</span><span class="n">mapping</span><span class="p">,</span>
             <span class="n">chatglm_version</span><span class="o">=</span><span class="n">chatglm_version</span><span class="p">,</span>
@@ -361,7 +359,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f9468f63680>
+<jinja2.runtime.BlockReference object at 0x7fed979fe930>
 
 <div class="footer">
     <p>

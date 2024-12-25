@@ -444,9 +444,7 @@
             <span class="n">mapping</span><span class="p">,</span>
             <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
             <span class="n">use_parallel_embedding</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;use_parallel_embedding&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">),</span>
-            <span class="n">sharding_dim</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;embedding_sharding_dim&#39;</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span>
-            <span class="n">share_embedding_table</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;share_embedding_table&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">))</span>
-        <span class="c1">#check_share_embedding(weights, config)</span>
+            <span class="n">sharding_dim</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;embedding_sharding_dim&#39;</span><span class="p">,</span> <span class="mi">0</span><span class="p">))</span>
         <span class="n">deepseek</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">weights</span><span class="p">)</span>
 
         <span class="k">return</span> <span class="n">deepseek</span></div>
@@ -461,7 +459,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f946e5914f0>
+<jinja2.runtime.BlockReference object at 0x7fed9790f290>
 
 <div class="footer">
     <p>

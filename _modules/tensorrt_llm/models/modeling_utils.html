@@ -181,8 +181,9 @@
                       <span class="n">trt_dtype_to_torch</span><span class="p">)</span>
 <span class="kn">from</span> <span class="nn">..bindings</span> <span class="kn">import</span> <span class="n">KVCacheType</span>
 <span class="kn">from</span> <span class="nn">..bindings.executor</span> <span class="kn">import</span> <span class="n">RuntimeDefaults</span>
-<span class="kn">from</span> <span class="nn">..functional</span> <span class="kn">import</span> <span class="p">(</span><span class="n">PositionEmbeddingType</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span>
-                          <span class="n">gather_last_token_logits</span><span class="p">,</span> <span class="n">tanh</span><span class="p">)</span>
+<span class="kn">from</span> <span class="nn">..functional</span> <span class="kn">import</span> <span class="p">(</span><span class="n">PositionEmbeddingType</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">allgather</span><span class="p">,</span> <span class="n">constant</span><span class="p">,</span>
+                          <span class="n">cp_split_plugin</span><span class="p">,</span> <span class="n">gather_last_token_logits</span><span class="p">,</span>
+                          <span class="n">index_select</span><span class="p">,</span> <span class="n">tanh</span><span class="p">,</span> <span class="n">view</span><span class="p">)</span>
 <span class="kn">from</span> <span class="nn">..layers</span> <span class="kn">import</span> <span class="p">(</span><span class="n">MLP</span><span class="p">,</span> <span class="n">AttentionParams</span><span class="p">,</span> <span class="n">Embedding</span><span class="p">,</span> <span class="n">FusedGatedMLP</span><span class="p">,</span>
                       <span class="n">FusedRgLru</span><span class="p">,</span> <span class="n">GatedMLP</span><span class="p">,</span> <span class="n">KeyValueCacheParams</span><span class="p">,</span> <span class="n">LoraParams</span><span class="p">,</span>
                       <span class="n">PromptTuningEmbedding</span><span class="p">,</span> <span class="n">RgLru</span><span class="p">)</span>
@@ -258,7 +259,6 @@
         <span class="k">elif</span> <span class="n">args</span><span class="o">.</span><span class="n">speculative_decoding_mode</span> <span class="o">==</span> <span class="s2">&quot;explicit_draft_tokens&quot;</span><span class="p">:</span>
             <span class="k">return</span> <span class="n">SpeculativeDecodingMode</span><span class="o">.</span><span class="n">EXPLICIT_DRAFT_TOKENS</span>
         <span class="k">elif</span> <span class="n">args</span><span class="o">.</span><span class="n">speculative_decoding_mode</span> <span class="o">==</span> <span class="s2">&quot;eagle&quot;</span><span class="p">:</span>
-            <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;EAGLE is not supported yet. Do not use it.&quot;</span><span class="p">)</span>
             <span class="k">return</span> <span class="n">SpeculativeDecodingMode</span><span class="o">.</span><span class="n">EAGLE</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="k">assert</span> <span class="kc">False</span><span class="p">,</span> <span class="s2">&quot;Unknown speculative_decoding_mode &quot;</span> <span class="o">+</span> <span class="n">args</span><span class="o">.</span><span class="n">speculative_decoding_mode</span></div>
@@ -440,9 +440,10 @@
         <span class="k">return</span> <span class="n">obj</span>
 
     <span class="k">def</span> <span class="nf">get_quant_cfg</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">module_name</span><span class="p">):</span>
-        <span class="k">assert</span> <span class="n">module_name</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">quantized_layers</span><span class="o">.</span><span class="n">keys</span><span class="p">(),</span> \
-            <span class="s2">&quot;module </span><span class="si">{module_name}</span><span class="s2"> should be included in `quantized_layers` in AutoQuant mode&quot;</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">quantized_layers</span><span class="p">[</span><span class="n">module_name</span><span class="p">]</span>
+        <span class="k">if</span> <span class="n">module_name</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">quantized_layers</span><span class="o">.</span><span class="n">keys</span><span class="p">():</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">quantized_layers</span><span class="p">[</span><span class="n">module_name</span><span class="p">]</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">QuantConfig</span><span class="p">()</span>
 
     <span class="k">def</span> <span class="nf">get_modelopt_qformat</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="n">algo_to_modelopt_map</span> <span class="o">=</span> <span class="p">{</span>
@@ -494,7 +495,6 @@
                  <span class="n">quantization</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="n">QuantConfig</span><span class="p">,</span> <span class="nb">dict</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">use_parallel_embedding</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
                  <span class="n">embedding_sharding_dim</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
-                 <span class="n">share_embedding_table</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
                  <span class="n">head_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">qk_layernorm</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
                  <span class="n">runtime_defaults</span><span class="p">:</span> <span class="s2">&quot;RuntimeDefaultsIn&quot;</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -543,22 +543,6 @@
 
         <span class="bp">self</span><span class="o">.</span><span class="n">use_parallel_embedding</span> <span class="o">=</span> <span class="n">use_parallel_embedding</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">embedding_sharding_dim</span> <span class="o">=</span> <span class="n">embedding_sharding_dim</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">share_embedding_table</span> <span class="o">=</span> <span class="n">share_embedding_table</span>
-
-        <span class="k">if</span> <span class="n">share_embedding_table</span> <span class="ow">and</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
-            <span class="k">if</span> <span class="p">(</span><span class="ow">not</span> <span class="n">use_parallel_embedding</span><span class="p">)</span> <span class="ow">or</span> <span class="p">(</span><span class="n">use_parallel_embedding</span> <span class="ow">and</span>
-                                                <span class="n">embedding_sharding_dim</span> <span class="o">==</span> <span class="mi">1</span><span class="p">):</span>
-                <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span>
-                    <span class="s2">&quot;For tensor parallelism, sharing the embedding table must set&quot;</span> \
-                        <span class="s2">&quot;use_parallel_embedding=True and embedding_sharding_dim=0&quot;</span>
-                <span class="p">)</span>
-        <span class="k">if</span> <span class="n">share_embedding_table</span> <span class="ow">and</span> <span class="n">mapping</span><span class="o">.</span><span class="n">pp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span>
-                <span class="s2">&quot;Embedding table cannot be shared for pipeline parallelism&quot;</span><span class="p">)</span>
-
-        <span class="k">if</span> <span class="n">share_embedding_table</span> <span class="ow">and</span> <span class="n">mapping</span><span class="o">.</span><span class="n">cp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span>
-                <span class="s2">&quot;Embedding table cannot be shared for context parallelism&quot;</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="n">head_size</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">head_size</span> <span class="o">=</span> <span class="n">hidden_size</span> <span class="o">//</span> <span class="n">num_attention_heads</span>
@@ -729,6 +713,7 @@
     <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="bp">cls</span><span class="p">,</span> <span class="n">config</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">num_hidden_layers</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">num_hidden_layers</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">layer_list</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">pp_layers</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">num_hidden_layers</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">quant_mode</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">([</span><span class="bp">cls</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="n">idx</span><span class="p">)</span> <span class="k">for</span> <span class="n">idx</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">layer_list</span><span class="p">])</span>
 
     <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
@@ -766,12 +751,19 @@
             <span class="k">if</span> <span class="n">mrope_params</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;mrope_params&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">mrope_params</span>
             <span class="k">if</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">reduce_fusion</span><span class="p">:</span>
-                <span class="k">if</span> <span class="n">layer_idx</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">layer_list</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]:</span>
+                <span class="k">if</span> <span class="n">layer_idx</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">layer_list</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">layer_list</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]:</span>
+                    <span class="k">if</span> <span class="n">default_net</span><span class="p">(</span>
+                    <span class="p">)</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">user_buffer</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_fp8_qdq</span><span class="p">(</span>
+                    <span class="p">):</span>
+                        <span class="n">qkv_activation_scaling_factor</span> <span class="o">=</span> <span class="n">constant</span><span class="p">(</span>
+                            <span class="bp">self</span><span class="p">[</span><span class="n">layer_idx</span> <span class="o">+</span> <span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">attention</span><span class="o">.</span><span class="n">qkv</span><span class="o">.</span>
+                            <span class="n">activation_scaling_factor</span><span class="o">.</span><span class="n">raw_value</span><span class="o">.</span><span class="n">copy</span><span class="p">())</span>
+                    <span class="k">else</span><span class="p">:</span>
+                        <span class="n">qkv_activation_scaling_factor</span> <span class="o">=</span> <span class="kc">None</span>
                     <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;next_layer_input_layernorm_args&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span>
-                        <span class="bp">self</span><span class="p">[</span><span class="n">layer_idx</span> <span class="o">+</span> <span class="mi">1</span> <span class="o">-</span>
-                             <span class="bp">self</span><span class="o">.</span><span class="n">layer_list</span><span class="p">[</span><span class="mi">0</span><span class="p">]]</span><span class="o">.</span><span class="n">input_layernorm</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">value</span><span class="p">,</span>
-                        <span class="bp">self</span><span class="p">[</span><span class="n">layer_idx</span> <span class="o">+</span> <span class="mi">1</span> <span class="o">-</span>
-                             <span class="bp">self</span><span class="o">.</span><span class="n">layer_list</span><span class="p">[</span><span class="mi">0</span><span class="p">]]</span><span class="o">.</span><span class="n">input_layernorm</span><span class="o">.</span><span class="n">eps</span><span class="p">)</span>
+                        <span class="bp">self</span><span class="p">[</span><span class="n">layer_idx</span> <span class="o">+</span> <span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">input_layernorm</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">value</span><span class="p">,</span>
+                        <span class="bp">self</span><span class="p">[</span><span class="n">layer_idx</span> <span class="o">+</span> <span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">input_layernorm</span><span class="o">.</span><span class="n">eps</span><span class="p">,</span>
+                        <span class="n">qkv_activation_scaling_factor</span><span class="p">)</span>
                 <span class="k">else</span><span class="p">:</span>
                     <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;next_layer_input_layernorm_args&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
 
@@ -832,13 +824,10 @@
         <span class="kn">from</span> <span class="nn">..quantization.quantize</span> <span class="kn">import</span> <span class="n">quantize</span>
         <span class="n">quantize</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">quantization</span><span class="p">)</span>
 
-        <span class="c1"># Currently, use_parallel_embedding and share_embedding_table must be enabled before weight loading;</span>
+        <span class="c1"># Currently, use_parallel_embedding must be enabled before weight loading;</span>
         <span class="c1"># otherwise, the model will be inconsistent with the weights loaded from checkpoint.</span>
         <span class="n">optimize_model</span><span class="p">(</span>
-            <span class="bp">self</span><span class="p">,</span>
-            <span class="n">use_parallel_embedding</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">use_parallel_embedding</span><span class="p">,</span>
-            <span class="n">share_embedding_table</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">share_embedding_table</span><span class="p">,</span>
-        <span class="p">)</span>
+            <span class="bp">self</span><span class="p">,</span> <span class="n">use_parallel_embedding</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">use_parallel_embedding</span><span class="p">)</span>
 
 <div class="viewcode-block" id="PretrainedModel.release">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedModel.release">[docs]</a>
@@ -883,6 +872,11 @@
             <span class="n">config</span><span class="o">.</span><span class="n">set_rank</span><span class="p">(</span><span class="n">rank</span><span class="p">)</span>
 
         <span class="n">rank</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">rank</span>
+        <span class="c1"># tp_cp_pp rank -&gt; tp_pp rank: because different cp ranks share the same ckpt</span>
+        <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">cp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="n">tp_size</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span>
+            <span class="n">cp_size</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">cp_size</span>
+            <span class="n">rank</span> <span class="o">=</span> <span class="n">rank</span> <span class="o">%</span> <span class="n">tp_size</span> <span class="o">+</span> <span class="n">rank</span> <span class="o">//</span> <span class="p">(</span><span class="n">tp_size</span> <span class="o">*</span> <span class="n">cp_size</span><span class="p">)</span> <span class="o">*</span> <span class="n">tp_size</span>
         <span class="n">weights_path</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">ckpt_dir</span><span class="p">,</span> <span class="sa">f</span><span class="s1">&#39;rank</span><span class="si">{</span><span class="n">rank</span><span class="si">}</span><span class="s1">.safetensors&#39;</span><span class="p">)</span>
 
         <span class="k">assert</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">isfile</span><span class="p">(</span><span class="n">weights_path</span><span class="p">)</span>
@@ -903,21 +897,30 @@
 <div class="viewcode-block" id="PretrainedModel.load">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedModel.load">[docs]</a>
     <span class="k">def</span> <span class="nf">load</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">weights</span><span class="p">,</span> <span class="n">from_pruned</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
-        <span class="n">expected_names</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
         <span class="n">required_names</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
         <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">param</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">named_parameters</span><span class="p">():</span>
-            <span class="n">expected_names</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">name</span><span class="p">)</span>
-            <span class="k">if</span> <span class="ow">not</span> <span class="n">param</span><span class="o">.</span><span class="n">is_inited</span><span class="p">():</span>
-                <span class="n">required_names</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">name</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">param</span><span class="o">.</span><span class="n">is_inited</span><span class="p">():</span>
+                <span class="k">continue</span>
+            <span class="k">if</span> <span class="n">name</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">weights</span><span class="p">:</span>
+                <span class="c1"># Exemption for embedding sharing</span>
+                <span class="k">if</span> <span class="n">name</span><span class="o">.</span><span class="n">endswith</span><span class="p">(</span><span class="s1">&#39;lm_head.weight&#39;</span><span class="p">)</span> <span class="ow">and</span> <span class="nb">any</span><span class="p">(</span>
+                        <span class="n">k</span><span class="o">.</span><span class="n">endswith</span><span class="p">(</span><span class="s1">&#39;vocab_embedding.weight&#39;</span><span class="p">)</span>
+                        <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">weights</span><span class="o">.</span><span class="n">keys</span><span class="p">()):</span>
+                    <span class="k">continue</span>
+                <span class="k">if</span> <span class="n">name</span><span class="o">.</span><span class="n">endswith</span><span class="p">(</span><span class="s1">&#39;lm_head.per_channel_scale&#39;</span><span class="p">)</span> <span class="ow">and</span> <span class="nb">any</span><span class="p">(</span>
+                        <span class="n">k</span><span class="o">.</span><span class="n">endswith</span><span class="p">(</span><span class="s1">&#39;vocab_embedding.per_channel_scale&#39;</span><span class="p">)</span>
+                        <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">weights</span><span class="o">.</span><span class="n">keys</span><span class="p">()):</span>
+                    <span class="k">continue</span>
+            <span class="n">required_names</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">name</span><span class="p">)</span>
 
         <span class="n">provided_names</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="n">weights</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">required_names</span><span class="o">.</span><span class="n">issubset</span><span class="p">(</span><span class="n">provided_names</span><span class="p">):</span>
             <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">&quot;Required but not provided tensors:</span><span class="si">{</span><span class="n">required_names</span><span class="o">.</span><span class="n">difference</span><span class="p">(</span><span class="n">provided_names</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span>
             <span class="p">)</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="n">provided_names</span><span class="o">.</span><span class="n">issubset</span><span class="p">(</span><span class="n">expected_names</span><span class="p">):</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">provided_names</span><span class="o">.</span><span class="n">issubset</span><span class="p">(</span><span class="n">required_names</span><span class="p">):</span>
             <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">&quot;Provided but not expected tensors: </span><span class="si">{</span><span class="n">provided_names</span><span class="o">.</span><span class="n">difference</span><span class="p">(</span><span class="n">expected_names</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span>
+                <span class="sa">f</span><span class="s2">&quot;Provided but not required tensors: </span><span class="si">{</span><span class="n">provided_names</span><span class="o">.</span><span class="n">difference</span><span class="p">(</span><span class="n">required_names</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span>
             <span class="p">)</span>
 
         <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">param</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">named_parameters</span><span class="p">():</span>
@@ -941,6 +944,13 @@
             <span class="n">name</span><span class="p">:</span> <span class="n">numpy_to_torch</span><span class="p">(</span><span class="n">param</span><span class="o">.</span><span class="n">raw_value</span><span class="p">)</span>
             <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">param</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">named_parameters</span><span class="p">()</span>
         <span class="p">}</span>
+        <span class="c1"># If there are some tensors share memory, this will lead to error when we call &quot;save_file&quot;. So, for repeated tensors, we</span>
+        <span class="c1"># clone the tensors to prevent this issue.</span>
+        <span class="n">data_ptrs</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
+        <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">param</span> <span class="ow">in</span> <span class="n">weights</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="k">if</span> <span class="n">param</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">()</span> <span class="ow">in</span> <span class="n">data_ptrs</span><span class="p">:</span>
+                <span class="n">weights</span><span class="p">[</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="n">param</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
+            <span class="n">data_ptrs</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">weights</span><span class="p">[</span><span class="n">name</span><span class="p">]</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">())</span>
         <span class="n">safetensors</span><span class="o">.</span><span class="n">torch</span><span class="o">.</span><span class="n">save_file</span><span class="p">(</span>
             <span class="n">weights</span><span class="p">,</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">output_dir</span><span class="p">,</span> <span class="sa">f</span><span class="s1">&#39;rank</span><span class="si">{</span><span class="n">rank</span><span class="si">}</span><span class="s1">.safetensors&#39;</span><span class="p">))</span>
         <span class="k">if</span> <span class="n">save_config</span><span class="p">:</span>
@@ -968,7 +978,7 @@
         <span class="n">lora_target_modules</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">opt_batch_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
         <span class="n">num_hidden_layers</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="n">mrope_rotary_sin_cos_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">mrope_rotary_cos_sin_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
 <span class="w">        </span><span class="sd">&#39;&#39;&#39;@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the</span>
 <span class="sd">            ranges of the dimensions of when using TRT dynamic shapes.</span>
@@ -1033,7 +1043,7 @@
             <span class="n">streamingllm</span><span class="o">=</span><span class="n">streamingllm</span><span class="p">,</span>
             <span class="n">opt_batch_size</span><span class="o">=</span><span class="n">opt_batch_size</span><span class="p">,</span>
             <span class="n">pp_reduce_scatter</span><span class="o">=</span><span class="n">pp_reduce_scatter</span><span class="p">,</span>
-            <span class="n">mrope_rotary_sin_cos_size</span><span class="o">=</span><span class="n">mrope_rotary_sin_cos_size</span><span class="p">)</span>
+            <span class="n">mrope_rotary_cos_sin_size</span><span class="o">=</span><span class="n">mrope_rotary_cos_sin_size</span><span class="p">)</span>
 
         <span class="n">result</span> <span class="o">=</span> <span class="p">{</span>
             <span class="s1">&#39;input_ids&#39;</span><span class="p">:</span>
@@ -1151,6 +1161,7 @@
             <span class="n">output_dir</span><span class="o">=</span><span class="n">output_dir</span><span class="p">,</span>
             <span class="n">tp_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
             <span class="n">pp_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">pp_size</span><span class="p">,</span>
+            <span class="n">cp_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">cp_size</span><span class="p">,</span>
             <span class="n">seed</span><span class="o">=</span><span class="n">random_seed</span><span class="p">,</span>
             <span class="n">tokenizer_max_seq_length</span><span class="o">=</span><span class="n">tokenizer_max_seq_length</span><span class="p">,</span>
         <span class="p">)</span></div>
@@ -1190,6 +1201,20 @@
         <span class="n">attention_params</span> <span class="o">=</span> <span class="n">Attention</span><span class="o">.</span><span class="n">fill_attention_params</span><span class="p">(</span>
             <span class="bp">self</span><span class="p">,</span> <span class="n">attention_params</span><span class="p">)</span>
 
+        <span class="c1"># split the sequence for context parallelism</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">cp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">input_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
+                <span class="c1"># input shape is [-1]</span>
+                <span class="n">input_ids</span><span class="p">,</span> <span class="n">cp_join_index</span> <span class="o">=</span> <span class="n">cp_split_plugin</span><span class="p">(</span>
+                    <span class="n">input_ids</span><span class="p">,</span>
+                    <span class="n">attention_params</span><span class="o">.</span><span class="n">host_request_types</span><span class="p">,</span>
+                    <span class="n">attention_params</span><span class="o">.</span><span class="n">host_context_lengths</span><span class="p">,</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">cp_size</span><span class="p">,</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">cp_rank</span><span class="p">,</span>
+                <span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="k">assert</span> <span class="kc">False</span><span class="p">,</span> <span class="s2">&quot;Context parallelism with non-remove-padding is not supported yet.&quot;</span>
+
         <span class="n">kwargs</span> <span class="o">=</span> <span class="p">{</span>
             <span class="s1">&#39;input_ids&#39;</span><span class="p">:</span> <span class="n">input_ids</span><span class="p">,</span>
             <span class="s1">&#39;position_ids&#39;</span><span class="p">:</span> <span class="n">position_ids</span><span class="p">,</span>
@@ -1218,6 +1243,18 @@
 
         <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
             <span class="n">hidden_states</span><span class="p">,</span> <span class="n">presents</span> <span class="o">=</span> <span class="n">hidden_states</span>
+
+        <span class="c1"># All gather and rebuild sequence after transformer layer for context parallelism</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">cp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">hidden_states</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span> <span class="o">==</span> <span class="mi">2</span><span class="p">:</span>
+                <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">allgather</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span>
+                                          <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">cp_group</span><span class="p">,</span>
+                                          <span class="n">gather_dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+                <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">view</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span>
+                                     <span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">hidden_states</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]])</span>
+                <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">index_select</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">cp_join_index</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="k">assert</span> <span class="kc">False</span><span class="p">,</span> <span class="s2">&quot;Context parallelism with non-remove-padding is not supported yet.&quot;</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_last_pp_rank</span><span class="p">():</span>
             <span class="n">all_hidden_states</span> <span class="o">=</span> <span class="n">hidden_states</span>
@@ -1606,11 +1643,22 @@
         <span class="k">if</span> <span class="n">lm_head</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">vocab_embedding</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">break</span>
 
-    <span class="k">if</span> <span class="n">lm_head</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">vocab_embedding</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="n">lm_head</span><span class="o">.</span><span class="n">weight</span> <span class="o">=</span> <span class="n">vocab_embedding</span><span class="o">.</span><span class="n">weight</span>
-        <span class="k">if</span> <span class="p">(</span><span class="nb">hasattr</span><span class="p">(</span><span class="n">vocab_embedding</span><span class="p">,</span> <span class="s2">&quot;per_token_scale&quot;</span><span class="p">)</span>
-                <span class="ow">and</span> <span class="n">vocab_embedding</span><span class="o">.</span><span class="n">per_token_scale</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">):</span>
-            <span class="n">lm_head</span><span class="o">.</span><span class="n">per_channel_scale</span> <span class="o">=</span> <span class="n">vocab_embedding</span><span class="o">.</span><span class="n">per_token_scale</span>
+    <span class="c1"># Cannot find either lm_head or vocab_embedding, e.g., pipeline parallel</span>
+    <span class="k">if</span> <span class="n">lm_head</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">vocab_embedding</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">model</span>
+
+    <span class="k">if</span> <span class="n">lm_head</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">is_inited</span><span class="p">():</span>
+        <span class="n">lm_head_weight</span> <span class="o">=</span> <span class="n">numpy_to_torch</span><span class="p">(</span><span class="n">lm_head</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">raw_value</span><span class="p">)</span>
+        <span class="n">vocab_embed_weight</span> <span class="o">=</span> <span class="n">numpy_to_torch</span><span class="p">(</span><span class="n">vocab_embedding</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">raw_value</span><span class="p">)</span>
+        <span class="c1"># The lm_head and vocab_embedding have different weights</span>
+        <span class="k">if</span> <span class="n">lm_head_weight</span><span class="o">.</span><span class="n">size</span><span class="p">()</span> <span class="o">!=</span> <span class="n">vocab_embed_weight</span><span class="o">.</span><span class="n">size</span><span class="p">()</span> <span class="ow">or</span> <span class="p">(</span>
+                <span class="n">lm_head_weight</span> <span class="o">-</span> <span class="n">vocab_embed_weight</span><span class="p">)</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span> <span class="o">&gt;</span> <span class="mf">1e-6</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">model</span>
+
+    <span class="n">lm_head</span><span class="o">.</span><span class="n">weight</span> <span class="o">=</span> <span class="n">vocab_embedding</span><span class="o">.</span><span class="n">weight</span>
+    <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">lm_head</span><span class="p">,</span> <span class="s1">&#39;per_channel_scale&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">and</span> <span class="nb">getattr</span><span class="p">(</span>
+            <span class="n">vocab_embedding</span><span class="p">,</span> <span class="s1">&#39;per_channel_scale&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">):</span>
+        <span class="n">lm_head</span><span class="o">.</span><span class="n">per_channel_scale</span> <span class="o">=</span> <span class="n">vocab_embedding</span><span class="o">.</span><span class="n">per_token_scale</span>
     <span class="k">return</span> <span class="n">model</span>
 
 
@@ -1620,7 +1668,7 @@
                 <span class="n">layer</span><span class="o">.</span><span class="n">dense</span><span class="p">,</span> <span class="s1">&#39;activation_scaling_factor&#39;</span><span class="p">):</span>
             <span class="n">scale</span> <span class="o">=</span> <span class="p">[</span><span class="mf">1.0</span><span class="p">]</span> <span class="o">/</span> <span class="n">layer</span><span class="o">.</span><span class="n">dense</span><span class="o">.</span><span class="n">activation_scaling_factor</span><span class="o">.</span><span class="n">raw_value</span>
             <span class="n">layer</span><span class="o">.</span><span class="n">attention_output_orig_quant_scale</span> <span class="o">=</span> <span class="n">Parameter</span><span class="p">(</span>
-                <span class="n">value</span><span class="o">=</span><span class="n">scale</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">))</span>
+                <span class="n">value</span><span class="o">=</span><span class="n">scale</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="s1">&#39;float32&#39;</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">model</span>
 
 
@@ -1648,6 +1696,7 @@
     <span class="c1"># before weight loading</span>
     <span class="k">if</span> <span class="n">use_parallel_embedding</span><span class="p">:</span>
         <span class="n">model</span> <span class="o">=</span> <span class="n">parallelize_embedding</span><span class="p">(</span><span class="n">model</span><span class="p">)</span>
+
     <span class="k">if</span> <span class="n">share_embedding_table</span><span class="p">:</span>
         <span class="c1"># if share_embedding_table is enabled, only one copy of the embedding table is store in converted ckpt</span>
         <span class="c1"># this pass is required to make lm_head.weight and vocab_embedding.weight point to the same tensor</span>
@@ -1691,16 +1740,18 @@
         <span class="p">(</span><span class="nb">type</span><span class="p">(</span><span class="n">attn</span><span class="o">.</span><span class="n">qkv</span><span class="p">)</span> <span class="o">==</span> <span class="n">ColumnLinear</span> <span class="ow">or</span> <span class="nb">type</span><span class="p">(</span><span class="n">attn</span><span class="o">.</span><span class="n">qkv</span><span class="p">)</span> <span class="o">==</span> <span class="n">FP8Linear</span><span class="p">):</span>
             <span class="n">old_qkv</span> <span class="o">=</span> <span class="n">attn</span><span class="o">.</span><span class="n">qkv</span>
             <span class="n">linear_class</span> <span class="o">=</span> <span class="nb">type</span><span class="p">(</span><span class="n">old_qkv</span><span class="p">)</span>
-            <span class="n">new_kv</span> <span class="o">=</span> <span class="n">linear_class</span><span class="p">(</span><span class="n">in_features</span><span class="o">=</span><span class="n">attn</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
-                                  <span class="n">out_features</span><span class="o">=</span><span class="mi">2</span> <span class="o">*</span> <span class="n">attn</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">*</span>
-                                  <span class="n">attn</span><span class="o">.</span><span class="n">num_attention_kv_heads</span> <span class="o">*</span>
-                                  <span class="n">attn</span><span class="o">.</span><span class="n">attention_head_size</span><span class="p">,</span>
-                                  <span class="n">bias</span><span class="o">=</span><span class="n">old_qkv</span><span class="o">.</span><span class="n">bias</span><span class="p">,</span>
-                                  <span class="n">dtype</span><span class="o">=</span><span class="n">old_qkv</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
-                                  <span class="n">tp_group</span><span class="o">=</span><span class="n">old_qkv</span><span class="o">.</span><span class="n">tp_group</span><span class="p">,</span>
-                                  <span class="n">tp_size</span><span class="o">=</span><span class="n">old_qkv</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
-                                  <span class="n">gather_output</span><span class="o">=</span><span class="n">old_qkv</span><span class="o">.</span><span class="n">gather_output</span><span class="p">,</span>
-                                  <span class="n">is_qkv</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+            <span class="n">new_kv</span> <span class="o">=</span> <span class="n">linear_class</span><span class="p">(</span>
+                <span class="n">in_features</span><span class="o">=</span><span class="n">attn</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+                <span class="n">out_features</span><span class="o">=</span><span class="mi">2</span> <span class="o">*</span> <span class="n">attn</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">*</span> <span class="n">attn</span><span class="o">.</span><span class="n">num_attention_kv_heads</span> <span class="o">*</span>
+                <span class="n">attn</span><span class="o">.</span><span class="n">attention_head_size</span><span class="p">,</span>
+                <span class="n">bias</span><span class="o">=</span><span class="n">old_qkv</span><span class="o">.</span><span class="n">bias</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">old_qkv</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
+                <span class="n">tp_group</span><span class="o">=</span><span class="n">old_qkv</span><span class="o">.</span><span class="n">tp_group</span><span class="p">,</span>
+                <span class="n">tp_size</span><span class="o">=</span><span class="n">old_qkv</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
+                <span class="n">gather_output</span><span class="o">=</span><span class="n">old_qkv</span><span class="o">.</span><span class="n">gather_output</span><span class="p">,</span>
+                <span class="n">prefer_managed_weight</span><span class="o">=</span><span class="n">old_qkv</span><span class="o">.</span><span class="n">prefer_managed_weight</span><span class="p">,</span>
+                <span class="n">is_qkv</span><span class="o">=</span><span class="n">old_qkv</span><span class="o">.</span><span class="n">is_qkv</span><span class="p">,</span>
+            <span class="p">)</span>
 
             <span class="n">old_qkv_weight_value</span> <span class="o">=</span> <span class="n">old_qkv</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">raw_value</span>
             <span class="k">if</span> <span class="p">(</span><span class="n">old_qkv_weight_value</span><span class="o">.</span><span class="n">shape</span> <span class="o">==</span> <span class="n">np</span><span class="o">.</span><span class="n">asarray</span><span class="p">([</span>
@@ -1806,6 +1857,9 @@
                     <span class="n">weights</span><span class="p">[</span><span class="n">name</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span>
                         <span class="s1">&#39;weights_scaling_factor&#39;</span><span class="p">,</span> <span class="s1">&#39;alpha&#39;</span>
                     <span class="p">)]</span> <span class="o">=</span> <span class="n">activation_scaling_factor</span> <span class="o">*</span> <span class="n">weights_scaling_factor_2</span>
+                    <span class="n">weights</span><span class="p">[</span><span class="n">name</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s1">&#39;weights_scaling_factor&#39;</span><span class="p">,</span>
+                                         <span class="s1">&#39;activation_scaling_factor&#39;</span>
+                                         <span class="p">)]</span> <span class="o">=</span> <span class="n">activation_scaling_factor</span>
 
     <span class="c1"># FP8</span>
     <span class="k">elif</span> <span class="n">quant_algo</span> <span class="o">==</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8</span><span class="p">:</span>
@@ -1894,27 +1948,7 @@
                 <span class="k">if</span> <span class="s1">&#39;attention.dense.bias&#39;</span> <span class="ow">in</span> <span class="n">name</span> <span class="ow">or</span> <span class="s1">&#39;mlp.proj.bias&#39;</span> <span class="ow">in</span> <span class="n">name</span><span class="p">:</span>
                     <span class="n">weights</span><span class="p">[</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros_like</span><span class="p">(</span><span class="n">param</span><span class="p">)</span>
 
-    <span class="c1"># For share_embedding_table</span>
-    <span class="n">check_share_embedding</span><span class="p">(</span><span class="n">weights</span><span class="p">,</span> <span class="n">model_config</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">weights</span>
-
-
-<span class="k">def</span> <span class="nf">check_share_embedding</span><span class="p">(</span><span class="n">weights</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">],</span>
-                          <span class="n">model_config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">):</span>
-    <span class="k">if</span> <span class="n">model_config</span><span class="o">.</span><span class="n">share_embedding_table</span><span class="p">:</span>
-        <span class="k">if</span> <span class="s2">&quot;lm_head.weight&quot;</span> <span class="ow">in</span> <span class="n">weights</span><span class="p">:</span>
-            <span class="k">if</span> <span class="n">weights</span><span class="p">[</span><span class="s2">&quot;lm_head.weight&quot;</span><span class="p">]</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="n">weights</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">&quot;lm_head.weight&quot;</span><span class="p">)</span>
-        <span class="k">if</span> <span class="s2">&quot;lm_head.weight&quot;</span> <span class="ow">in</span> <span class="n">weights</span> <span class="ow">and</span> <span class="s2">&quot;transformer.vocab_embedding.weight&quot;</span> <span class="ow">in</span> <span class="n">weights</span><span class="p">:</span>
-            <span class="k">if</span> <span class="p">(</span><span class="n">weights</span><span class="p">[</span><span class="s2">&quot;lm_head.weight&quot;</span><span class="p">]</span> <span class="o">-</span>
-                    <span class="n">weights</span><span class="p">[</span><span class="s2">&quot;transformer.vocab_embedding.weight&quot;</span><span class="p">])</span><span class="o">.</span><span class="n">any</span><span class="p">():</span>
-                <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
-                    <span class="s2">&quot;lm_head.weight and transformer.vocab_embedding.weight are not identical, &quot;</span>
-                    <span class="s2">&quot;share_embedding_table cannot be enabled; setting share_embedding_table=False.&quot;</span>
-                <span class="p">)</span>
-                <span class="n">model_config</span><span class="o">.</span><span class="n">share_embedding_table</span> <span class="o">=</span> <span class="kc">False</span>
-            <span class="k">else</span><span class="p">:</span>
-                <span class="n">weights</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">&quot;lm_head.weight&quot;</span><span class="p">)</span>
 
 
 <span class="k">def</span> <span class="nf">get_kv_cache_type_from_legacy</span><span class="p">(</span><span class="n">use_cache</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
@@ -1950,7 +1984,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f94699e9430>
+<jinja2.runtime.BlockReference object at 0x7fed9778a510>
 
 <div class="footer">
     <p>

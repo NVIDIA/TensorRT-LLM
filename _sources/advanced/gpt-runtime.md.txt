@@ -172,7 +172,7 @@ value for a given parameter, the vector can be limited to a single element
 
 |      Name in TRT-LLM      |           Description           |   Data type   |      Range of value      |       Default value       |     Name in HF      |
 | :-----------------------: | :-----------------------------: | :-----------: | :----------------------: | :-----------------------: | :-----------------: |
-|        `beamWidth`        | width for beam-search algorithm |      Int      |        \[0, 64\]         | `0` (disable beam search) |    `beam_width`     |
+|        `beamWidth`        | width for beam-search algorithm |      Int      |        \[0, 1024\]       | `0` (disable beam search) |    `beam_width`     |
 | `beamSearchDiversityRate` |  diversity of generated tokens  | List\[Float\] |     \[0, $+\infty$\)     |          `0.0f`           | `diversity_penalty` |
 |      `lengthPenalty`      |    penalize longer sequences    | List\[Float\] |     \[0, $+\infty$\)     |          `0.0f`           |  `length_penalty`   |
 |      `earlyStopping`      |      see description below      |  List\[Int\]  | \($-\infty$, $+\infty$\) |            `0`            |  `early_stopping`   |

@@ -174,7 +174,13 @@
 <span class="c1"># See the License for the specific language governing permissions and</span>
 <span class="c1"># limitations under the License.</span>
 
+<span class="kn">import</span> <span class="nn">json</span>
+<span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Union</span>
+
+<span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">AutoModelForCausalLM</span>
+
 <span class="kn">from</span> <span class="nn">tensorrt_llm.models.llama.model</span> <span class="kn">import</span> <span class="n">LLaMAForCausalLM</span>
+<span class="kn">from</span> <span class="nn">tensorrt_llm.models.medusa.weight</span> <span class="kn">import</span> <span class="n">load_medusa_hf</span>
 <span class="kn">from</span> <span class="nn">tensorrt_llm.models.qwen.model</span> <span class="kn">import</span> <span class="n">QWenForCausalLM</span>
 
 <span class="kn">from</span> <span class="nn">..._common</span> <span class="kn">import</span> <span class="n">default_net</span>
@@ -183,8 +189,9 @@
 <span class="kn">from</span> <span class="nn">...layers</span> <span class="kn">import</span> <span class="n">ColumnLinear</span>
 <span class="kn">from</span> <span class="nn">...mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
 <span class="kn">from</span> <span class="nn">...module</span> <span class="kn">import</span> <span class="n">Module</span><span class="p">,</span> <span class="n">ModuleList</span>
-<span class="kn">from</span> <span class="nn">..modeling_utils</span> <span class="kn">import</span> <span class="n">PretrainedModel</span>
+<span class="kn">from</span> <span class="nn">..modeling_utils</span> <span class="kn">import</span> <span class="n">PretrainedModel</span><span class="p">,</span> <span class="n">QuantConfig</span>
 <span class="kn">from</span> <span class="nn">.config</span> <span class="kn">import</span> <span class="n">MedusaConfig</span>
+<span class="kn">from</span> <span class="nn">.weight</span> <span class="kn">import</span> <span class="n">convert_hf_llama</span>
 
 
 <span class="k">class</span> <span class="nc">MedusaLayer</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
@@ -252,7 +259,10 @@
 
     <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">MedusaConfig</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
-        <span class="n">BaseLM</span> <span class="o">=</span> <span class="n">QWenForCausalLM</span> <span class="k">if</span> <span class="s2">&quot;qwen&quot;</span> <span class="ow">in</span> <span class="n">config</span><span class="o">.</span><span class="n">model_type</span> <span class="k">else</span> <span class="n">LLaMAForCausalLM</span>
+
+        <span class="n">BaseLM</span> <span class="o">=</span> <span class="n">QWenForCausalLM</span> <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span>
+            <span class="n">config</span><span class="p">,</span>
+            <span class="s2">&quot;model_type&quot;</span><span class="p">)</span> <span class="ow">and</span> <span class="s2">&quot;qwen&quot;</span> <span class="ow">in</span> <span class="n">config</span><span class="o">.</span><span class="n">model_type</span> <span class="k">else</span> <span class="n">LLaMAForCausalLM</span>
 
         <span class="k">class</span> <span class="nc">GenericMedusaForCausalLM</span><span class="p">(</span><span class="n">BaseLM</span><span class="p">):</span>
 
@@ -330,7 +340,71 @@
 
     <span class="c1"># Override specialized __setattr__ defined in Module</span>
     <span class="k">def</span> <span class="fm">__setattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="nb">object</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span></div>
+        <span class="nb">object</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
+
+<div class="viewcode-block" id="MedusaForCausalLm.from_hugging_face">
+<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.MedusaForCausalLm.from_hugging_face">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span> <span class="nf">from_hugging_face</span><span class="p">(</span>
+            <span class="bp">cls</span><span class="p">,</span>
+            <span class="n">hf_model_or_dir</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="s1">&#39;transformers.PreTrainedModel&#39;</span><span class="p">],</span>
+            <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s1">&#39;auto&#39;</span><span class="p">,</span>
+            <span class="n">mapping</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Mapping</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="n">quant_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">QuantConfig</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+        <span class="kn">import</span> <span class="nn">transformers</span>
+
+        <span class="k">assert</span> <span class="n">hf_model_or_dir</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+        <span class="n">speculative_model_dir</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;speculative_model&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+
+        <span class="n">use_preloading</span> <span class="o">=</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">hf_model_or_dir</span><span class="p">,</span>
+                                    <span class="n">transformers</span><span class="o">.</span><span class="n">PreTrainedModel</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">use_preloading</span><span class="p">:</span>
+            <span class="n">hf_model</span> <span class="o">=</span> <span class="n">hf_model_or_dir</span>
+            <span class="n">hf_config_or_dir</span> <span class="o">=</span> <span class="n">hf_model</span><span class="o">.</span><span class="n">config</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">hf_model_dir</span> <span class="o">=</span> <span class="n">hf_model_or_dir</span>
+            <span class="n">hf_config_or_dir</span> <span class="o">=</span> <span class="n">hf_model_or_dir</span>
+
+        <span class="n">config</span> <span class="o">=</span> <span class="n">MedusaConfig</span><span class="o">.</span><span class="n">from_hugging_face</span><span class="p">(</span>
+            <span class="n">hf_config_or_dir</span><span class="p">,</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+            <span class="n">mapping</span><span class="o">=</span><span class="n">mapping</span><span class="p">,</span>
+            <span class="n">quant_config</span><span class="o">=</span><span class="n">quant_config</span><span class="p">,</span>
+            <span class="n">speculative_model</span><span class="o">=</span><span class="n">speculative_model_dir</span><span class="p">,</span>
+            <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">use_preloading</span><span class="p">:</span>
+            <span class="n">trust_remote_code</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;trust_remote_code&#39;</span><span class="p">,</span> <span class="kc">True</span><span class="p">)</span>
+
+            <span class="n">hf_model</span> <span class="o">=</span> <span class="n">AutoModelForCausalLM</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
+                <span class="n">hf_model_dir</span><span class="p">,</span>
+                <span class="n">torch_dtype</span><span class="o">=</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span>
+                <span class="n">trust_remote_code</span><span class="o">=</span><span class="n">trust_remote_code</span><span class="p">)</span>
+
+        <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">hf_model</span><span class="p">,</span> <span class="n">transformers</span><span class="o">.</span><span class="n">PreTrainedModel</span><span class="p">)</span>
+
+        <span class="n">weights</span> <span class="o">=</span> <span class="n">convert_hf_llama</span><span class="p">(</span><span class="n">hf_model</span><span class="p">,</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="s1">&#39;float16&#39;</span><span class="p">)</span>
+
+        <span class="n">model</span> <span class="o">=</span> <span class="bp">cls</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
+
+        <span class="n">config_file</span> <span class="o">=</span> <span class="n">speculative_model_dir</span> <span class="o">/</span> <span class="s2">&quot;config.json&quot;</span>
+        <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">config_file</span><span class="p">)</span> <span class="k">as</span> <span class="n">fp</span><span class="p">:</span>
+            <span class="n">model_config</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">fp</span><span class="p">)</span>
+
+        <span class="n">num_medusa_heads</span> <span class="o">=</span> <span class="n">kwargs</span><span class="p">[</span>
+            <span class="s1">&#39;medusa_num_heads&#39;</span><span class="p">]</span> <span class="k">if</span> <span class="s1">&#39;medusa_num_heads&#39;</span> <span class="ow">in</span> <span class="n">kwargs</span> <span class="k">else</span> <span class="n">model_config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
+                <span class="s1">&#39;medusa_num_heads&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="n">num_medusa_layers</span> <span class="o">=</span> <span class="n">model_config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;medusa_num_layers&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="n">medusa_weights</span> <span class="o">=</span> <span class="n">load_medusa_hf</span><span class="p">(</span><span class="n">medusa_path</span><span class="o">=</span><span class="n">speculative_model_dir</span><span class="p">,</span>
+                                        <span class="n">num_medusa_heads</span><span class="o">=</span><span class="n">num_medusa_heads</span><span class="p">,</span>
+                                        <span class="n">num_medusa_layers</span><span class="o">=</span><span class="n">num_medusa_layers</span><span class="p">,</span>
+                                        <span class="n">mapping</span><span class="o">=</span><span class="n">mapping</span><span class="p">,</span>
+                                        <span class="n">dtype</span><span class="o">=</span><span class="s2">&quot;float16&quot;</span><span class="p">)</span>
+        <span class="n">weights</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">medusa_weights</span><span class="p">)</span>
+        <span class="n">model</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">weights</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">model</span></div>
+</div>
 
 </pre></div>
 
@@ -341,7 +415,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f946a3d2ff0>
+<jinja2.runtime.BlockReference object at 0x7fed97656600>
 
 <div class="footer">
     <p>

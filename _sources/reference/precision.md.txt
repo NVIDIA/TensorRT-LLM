@@ -144,7 +144,7 @@ This release of TensorRT-LLM contains the following examples:
 | OPT            |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | Phi            |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | Qwen           |   Y   |   Y   |   Y   |   .   |    Y    |   Y   |   Y   |     Y     |     Y      |
-| RecurrentGemma |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
+| RecurrentGemma |   Y   |   Y   |   Y   |   Y   |    Y    |   .   |   .   |     Y     |     .      |
 | Replit Code    |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | SantaCoder     |   Y   |   Y   |   Y   |   .   |    .    |   Y   |   Y   |     .     |     .      |
 | Skywork        |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |

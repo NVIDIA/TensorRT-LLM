@@ -999,8 +999,6 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">top_p_reset_ids</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="c1"># TODO: in tensorrt_llm/cpp/tensorrt_llm/thop/dynamicDecodeOp.cpp it&#39;s T, can be float or half?</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">embedding_bias_opt</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="c1"># use one more block in paged kv cache.</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">use_one_more_block</span> <span class="o">=</span> <span class="kc">False</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">buffer</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">buffer_allocated</span> <span class="o">=</span> <span class="kc">False</span>
@@ -1206,7 +1204,7 @@
             <span class="n">expected_tensor_names</span> <span class="o">+=</span> <span class="p">[</span>
                 <span class="s1">&#39;spec_decoding_generation_lengths&#39;</span><span class="p">,</span>
                 <span class="s1">&#39;spec_decoding_position_offsets&#39;</span><span class="p">,</span> <span class="s1">&#39;spec_decoding_packed_mask&#39;</span><span class="p">,</span>
-                <span class="s1">&#39;medusa_logits&#39;</span>
+                <span class="s1">&#39;spec_decoding_use&#39;</span><span class="p">,</span> <span class="s1">&#39;medusa_logits&#39;</span>
             <span class="p">]</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_redrafter_mode</span><span class="p">:</span>
@@ -1216,6 +1214,9 @@
             <span class="bp">self</span><span class="o">.</span><span class="n">runtime</span><span class="o">.</span><span class="n">engine</span><span class="o">.</span><span class="n">get_tensor_name</span><span class="p">(</span><span class="n">i</span><span class="p">)</span>
             <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">runtime</span><span class="o">.</span><span class="n">engine</span><span class="o">.</span><span class="n">num_io_tensors</span><span class="p">)</span>
         <span class="p">]</span>
+        <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">found_tensor_names</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">name</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">&quot;allreduce_ub_&quot;</span><span class="p">):</span>
+                <span class="n">expected_tensor_names</span> <span class="o">+=</span> <span class="p">[</span><span class="n">name</span><span class="p">]</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">debug_mode</span> <span class="ow">and</span> <span class="nb">set</span><span class="p">(</span><span class="n">expected_tensor_names</span><span class="p">)</span> <span class="o">!=</span> <span class="nb">set</span><span class="p">(</span>
                 <span class="n">found_tensor_names</span><span class="p">):</span>
             <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span>
@@ -1792,6 +1793,7 @@
         <span class="c1"># Note: spec_decoding_packed_mask has no paddings in the first dimension.</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">spec_decoding_packed_mask</span> <span class="o">=</span> <span class="n">medusa_info</span><span class="o">.</span><span class="n">medusa_packed_mask</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span>
             <span class="mi">0</span><span class="p">)</span><span class="o">.</span><span class="n">expand</span><span class="p">(</span><span class="n">target_shape</span><span class="p">)</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">target_shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span><span class="o">.</span><span class="n">cuda</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">spec_decoding_use</span> <span class="o">=</span> <span class="n">medusa_info</span><span class="o">.</span><span class="n">medusa_spec_decoding_use</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">medusa_paths</span> <span class="o">=</span> <span class="n">medusa_info</span><span class="o">.</span><span class="n">medusa_paths</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">medusa_tree_ids</span> <span class="o">=</span> <span class="n">medusa_info</span><span class="o">.</span><span class="n">medusa_tree_ids</span>
@@ -1815,15 +1817,13 @@
         <span class="k">return</span>
 
     <span class="k">def</span> <span class="nf">_get_num_paged_blocks</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">max_attention_window_size</span><span class="p">,</span>
-                              <span class="n">sink_token_length</span><span class="p">,</span> <span class="n">use_one_more_block</span><span class="p">):</span>
+                              <span class="n">sink_token_length</span><span class="p">):</span>
         <span class="n">bubble_len</span> <span class="o">=</span> <span class="mi">0</span>
         <span class="k">if</span> <span class="n">sink_token_length</span> <span class="o">%</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
             <span class="n">bubble_len</span> <span class="o">+=</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span> <span class="o">-</span>
                            <span class="n">sink_token_length</span> <span class="o">%</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span><span class="p">)</span>
         <span class="n">max_blocks_per_seq</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">ceil</span><span class="p">(</span>
             <span class="p">(</span><span class="n">max_attention_window_size</span> <span class="o">+</span> <span class="n">bubble_len</span><span class="p">)</span> <span class="o">/</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">use_one_more_block</span><span class="p">:</span>
-            <span class="n">max_blocks_per_seq</span> <span class="o">+=</span> <span class="mi">1</span>
         <span class="n">num_blocks</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">batch_size</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">beam_width</span> <span class="o">*</span> <span class="n">max_blocks_per_seq</span>
 
         <span class="k">return</span> <span class="n">num_blocks</span><span class="p">,</span> <span class="n">max_blocks_per_seq</span>
@@ -1929,9 +1929,6 @@
         <span class="k">else</span><span class="p">:</span>
             <span class="k">assert</span> <span class="kc">False</span><span class="p">,</span> <span class="s2">&quot;invalid sink_token_length!&quot;</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">use_one_more_block</span> <span class="o">=</span> <span class="p">(</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">paged_kv_cache</span> <span class="ow">and</span> <span class="n">beam_width</span> <span class="o">&gt;</span> <span class="mi">1</span>
-            <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_seq_length</span> <span class="o">&gt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_attention_window_size</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">lora_manager</span> <span class="o">=</span> <span class="n">lora_manager</span>
         <span class="k">if</span> <span class="n">medusa_choices</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_init_medusa</span><span class="p">(</span><span class="n">medusa_choices</span><span class="p">)</span>
@@ -2000,8 +1997,7 @@
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_kv_cache</span><span class="p">:</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">paged_kv_cache</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">has_attn_layers</span><span class="p">:</span>
                 <span class="n">num_blocks</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_get_num_paged_blocks</span><span class="p">(</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">max_attention_window_size</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">sink_token_length</span><span class="p">,</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">use_one_more_block</span><span class="p">)</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">max_attention_window_size</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">sink_token_length</span><span class="p">)</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool_allocator</span> <span class="o">=</span> <span class="n">MemoryPoolsAllocator</span><span class="p">(</span>
                     <span class="n">num_blocks</span><span class="o">=</span><span class="n">num_blocks</span><span class="p">,</span>
                     <span class="n">tokens_per_block</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span><span class="p">,</span>
@@ -2017,9 +2013,7 @@
 
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">cross_attention</span><span class="p">:</span>  <span class="c1"># As for now we enable cross paged kv and self paged kv to share the same tokens_per_block</span>
                     <span class="n">cross_num_blocks</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_get_num_paged_blocks</span><span class="p">(</span>
-                        <span class="bp">self</span><span class="o">.</span><span class="n">encoder_max_input_length</span><span class="p">,</span>
-                        <span class="n">sink_token_length</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
-                        <span class="n">use_one_more_block</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">encoder_max_input_length</span><span class="p">,</span> <span class="n">sink_token_length</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
 
                     <span class="n">num_kv_heads_per_layer</span> <span class="o">=</span> <span class="n">MemoryPoolsAllocator</span><span class="o">.</span><span class="n">prepare_num_kv_heads_per_layer</span><span class="p">(</span>
                         <span class="bp">self</span><span class="o">.</span><span class="n">get_num_heads_kv</span><span class="p">(),</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attn_layers</span><span class="p">)</span>
@@ -2155,6 +2149,7 @@
                 <span class="s1">&#39;spec_decoding_position_offsets&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">spec_decoding_position_offsets</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">buffer</span><span class="p">[</span>
                 <span class="s1">&#39;spec_decoding_generation_lengths&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">spec_decoding_generation_lengths</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">buffer</span><span class="p">[</span><span class="s1">&#39;spec_decoding_use&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">spec_decoding_use</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">buffer_allocated</span> <span class="o">=</span> <span class="kc">True</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_medusa_mode</span><span class="p">:</span>
             <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_draft_tokens</span></div>
@@ -2509,6 +2504,7 @@
                        <span class="s1">&#39;spec_decoding_position_offsets&#39;</span><span class="p">)</span>
             <span class="n">add_tensor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">buffer</span><span class="p">[</span><span class="s1">&#39;spec_decoding_generation_lengths&#39;</span><span class="p">],</span>
                        <span class="s1">&#39;spec_decoding_generation_lengths&#39;</span><span class="p">)</span>
+            <span class="n">add_tensor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">buffer</span><span class="p">[</span><span class="s1">&#39;spec_decoding_use&#39;</span><span class="p">],</span> <span class="s1">&#39;spec_decoding_use&#39;</span><span class="p">)</span>
 
         <span class="k">return</span> <span class="n">tensors</span>
 
@@ -2851,6 +2847,7 @@
                        <span class="s1">&#39;spec_decoding_position_offsets&#39;</span><span class="p">)</span>
             <span class="n">add_tensor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">buffer</span><span class="p">[</span><span class="s1">&#39;spec_decoding_generation_lengths&#39;</span><span class="p">],</span>
                        <span class="s1">&#39;spec_decoding_generation_lengths&#39;</span><span class="p">)</span>
+            <span class="n">add_tensor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">buffer</span><span class="p">[</span><span class="s1">&#39;spec_decoding_use&#39;</span><span class="p">],</span> <span class="s1">&#39;spec_decoding_use&#39;</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_redrafter_mode</span><span class="p">:</span>
             <span class="n">set_redrafter_gen_tensors</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">batch_size</span><span class="p">,</span> <span class="n">add_tensor</span><span class="p">,</span>
@@ -3322,11 +3319,11 @@
                 <span class="n">b</span><span class="p">,</span> <span class="p">:</span><span class="bp">self</span><span class="o">.</span><span class="n">accept_lengths</span><span class="p">[</span><span class="n">b</span><span class="p">]]</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">end_ids</span><span class="p">[</span><span class="n">b</span><span class="p">]</span>
             <span class="n">should_stop_with_end_id</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">any</span><span class="p">(</span><span class="n">end_id_mask</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">medusa_should_stop</span><span class="p">[</span><span class="n">b</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">medusa_should_stop</span><span class="p">[</span><span class="n">b</span><span class="p">]</span> <span class="ow">or</span> <span class="p">(</span>
-                <span class="n">prev_total_output_length</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">accept_lengths</span><span class="p">[</span><span class="n">b</span><span class="p">]</span> <span class="o">&gt;=</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">max_new_tokens</span><span class="p">)</span> <span class="ow">or</span> <span class="n">should_stop_with_end_id</span>
+                <span class="n">prev_total_output_length</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">accept_lengths</span><span class="p">[</span><span class="n">b</span><span class="p">]</span>
+                <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_new_tokens</span><span class="p">)</span> <span class="ow">or</span> <span class="n">should_stop_with_end_id</span>
             <span class="c1"># update accept lengths for the current step.</span>
-            <span class="k">if</span> <span class="p">(</span><span class="n">prev_total_output_length</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">accept_lengths</span><span class="p">[</span><span class="n">b</span><span class="p">]</span> <span class="o">&gt;=</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">max_new_tokens</span><span class="p">):</span>
+            <span class="k">if</span> <span class="p">(</span><span class="n">prev_total_output_length</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">accept_lengths</span><span class="p">[</span><span class="n">b</span><span class="p">]</span>
+                    <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_new_tokens</span><span class="p">):</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">accept_lengths</span><span class="p">[</span><span class="n">b</span><span class="p">]</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">max_new_tokens</span> <span class="o">-</span> <span class="n">prev_total_output_length</span><span class="p">,</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">accept_lengths</span><span class="p">[</span><span class="n">b</span><span class="p">])</span>
@@ -3487,28 +3484,41 @@
 
 <div class="viewcode-block" id="GenerationSession.handle_per_step">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.handle_per_step">[docs]</a>
-    <span class="k">def</span> <span class="nf">handle_per_step</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">cache_indirections</span><span class="p">:</span> <span class="nb">list</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-                        <span class="n">batch_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">max_context_length</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-                        <span class="n">beam_width</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-                        <span class="n">hidden_states</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">scfg</span><span class="p">:</span> <span class="n">SamplingConfig</span><span class="p">,</span>
-                        <span class="n">kv_cache_block_offsets</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-                        <span class="n">host_kv_cache_block_offsets</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-                        <span class="n">cross_kv_cache_block_offsets</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-                        <span class="n">host_cross_kv_cache_block_offsets</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-                        <span class="n">prompt_embedding_table</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-                        <span class="n">tasks</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">context_lengths</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-                        <span class="n">host_context_lengths</span><span class="p">,</span> <span class="n">attention_mask</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-                        <span class="n">cross_attention_mask_for_context</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-                        <span class="n">cross_attention_mask_for_gen</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-                        <span class="n">prompt_vocab_size</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">ite</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-                        <span class="n">sequence_limit_lengths</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-                        <span class="n">sequence_lengths</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-                        <span class="n">next_step_tensors</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span>
-                                                <span class="n">RuntimeTensor</span><span class="p">],</span> <span class="n">stop_words_data</span><span class="p">,</span>
-                        <span class="n">bad_words_data</span><span class="p">,</span> <span class="n">encoder_output</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-                        <span class="n">encoder_input_lengths</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-                        <span class="n">stopping_criteria</span><span class="p">:</span> <span class="n">StoppingCriteria</span><span class="p">,</span>
-                        <span class="n">logits_processor</span><span class="p">:</span> <span class="n">LogitsProcessor</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">handle_per_step</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="o">*</span><span class="p">,</span>
+        <span class="n">cache_indirections</span><span class="p">:</span> <span class="nb">list</span><span class="p">,</span>
+        <span class="n">step</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">batch_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">max_context_length</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">beam_width</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">input_ids</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">hidden_states</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">scfg</span><span class="p">:</span> <span class="n">SamplingConfig</span><span class="p">,</span>
+        <span class="n">kv_cache_block_offsets</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">host_kv_cache_block_offsets</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">cross_kv_cache_block_offsets</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">host_cross_kv_cache_block_offsets</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">prompt_embedding_table</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">tasks</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">context_lengths</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">host_context_lengths</span><span class="p">,</span>
+        <span class="n">attention_mask</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">cross_attention_mask_for_context</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">cross_attention_mask_for_gen</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">prompt_vocab_size</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">ite</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">sequence_limit_lengths</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">sequence_lengths</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">next_step_tensors</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">RuntimeTensor</span><span class="p">],</span>
+        <span class="n">stop_words_data</span><span class="p">,</span>
+        <span class="n">bad_words_data</span><span class="p">,</span>
+        <span class="n">encoder_output</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">encoder_input_lengths</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">stopping_criteria</span><span class="p">:</span> <span class="n">StoppingCriteria</span><span class="p">,</span>
+        <span class="n">logits_processor</span><span class="p">:</span> <span class="n">LogitsProcessor</span><span class="p">,</span>
+        <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
+    <span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">debug_mode</span><span class="p">:</span>
             <span class="nb">print</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">&quot;=================================== STEP </span><span class="si">{</span><span class="n">step</span><span class="si">}</span><span class="s2"> ==================================&quot;</span>
@@ -3933,7 +3943,8 @@
                     <span class="bp">self</span><span class="o">.</span><span class="n">debug_buffer</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">k</span><span class="p">)</span>
 
         <span class="n">debug_dir</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span>
-            <span class="sa">f</span><span class="s2">&quot;tllm_debug/PP_</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">pp_rank</span><span class="si">}</span><span class="s2">/TP_</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_rank</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="sa">f</span><span class="s2">&quot;tllm_debug/PP_</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">pp_rank</span><span class="si">}</span><span class="s2">/TP_</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_rank</span><span class="si">}</span><span class="s2">/CP_</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">cp_rank</span><span class="si">}</span><span class="s2">&quot;</span>
+        <span class="p">)</span>
         <span class="n">debug_dir</span><span class="o">.</span><span class="n">mkdir</span><span class="p">(</span><span class="n">parents</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">exist_ok</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 
         <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">t</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">debug_buffer</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
@@ -3953,6 +3964,7 @@
 <div class="viewcode-block" id="GenerationSession.decode_regular">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.decode_regular">[docs]</a>
     <span class="k">def</span> <span class="nf">decode_regular</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                       <span class="o">*</span><span class="p">,</span>
                        <span class="n">batch_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
                        <span class="n">scfg</span><span class="p">:</span> <span class="n">SamplingConfig</span><span class="p">,</span>
                        <span class="n">sequence_lengths</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
@@ -4042,17 +4054,40 @@
         <span class="k">for</span> <span class="n">step</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_new_tokens</span><span class="p">):</span>
 
             <span class="n">should_stop</span><span class="p">,</span> <span class="n">next_step_tensors</span><span class="p">,</span> <span class="n">tasks</span><span class="p">,</span> <span class="n">context_lengths</span><span class="p">,</span> <span class="n">host_context_lengths</span><span class="p">,</span> <span class="n">attention_mask</span><span class="p">,</span> <span class="n">context_logits</span><span class="p">,</span> <span class="n">generation_logits</span><span class="p">,</span> <span class="n">encoder_input_lengths</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">handle_per_step</span><span class="p">(</span>
-                <span class="n">cache_indirections</span><span class="p">,</span> <span class="n">step</span><span class="p">,</span> <span class="n">batch_size</span><span class="p">,</span> <span class="n">max_context_length</span><span class="p">,</span>
-                <span class="n">beam_width</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">scfg</span><span class="p">,</span>
-                <span class="n">kv_cache_block_offsets</span><span class="p">,</span> <span class="n">host_kv_cache_block_offsets</span><span class="p">,</span>
-                <span class="n">cross_kv_cache_block_offsets</span><span class="p">,</span> <span class="n">host_cross_kv_cache_block_offsets</span><span class="p">,</span>
-                <span class="n">prompt_embedding_table</span><span class="p">,</span> <span class="n">tasks</span><span class="p">,</span> <span class="n">context_lengths</span><span class="p">,</span>
-                <span class="n">host_context_lengths</span><span class="p">,</span> <span class="n">attention_mask</span><span class="p">,</span>
-                <span class="n">cross_attention_mask_for_context</span><span class="p">,</span> <span class="n">cross_attention_mask_for_gen</span><span class="p">,</span>
-                <span class="n">prompt_vocab_size</span><span class="p">,</span> <span class="n">ite</span><span class="p">,</span> <span class="n">sequence_limit_lengths</span><span class="p">,</span>
-                <span class="n">sequence_lengths</span><span class="p">,</span> <span class="n">next_step_tensors</span><span class="p">,</span> <span class="n">stop_words_data</span><span class="p">,</span>
-                <span class="n">bad_words_data</span><span class="p">,</span> <span class="n">encoder_output</span><span class="p">,</span> <span class="n">encoder_input_lengths</span><span class="p">,</span>
-                <span class="n">stopping_criteria</span><span class="p">,</span> <span class="n">logits_processor</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+                <span class="n">cache_indirections</span><span class="o">=</span><span class="n">cache_indirections</span><span class="p">,</span>
+                <span class="n">step</span><span class="o">=</span><span class="n">step</span><span class="p">,</span>
+                <span class="n">batch_size</span><span class="o">=</span><span class="n">batch_size</span><span class="p">,</span>
+                <span class="n">max_context_length</span><span class="o">=</span><span class="n">max_context_length</span><span class="p">,</span>
+                <span class="n">beam_width</span><span class="o">=</span><span class="n">beam_width</span><span class="p">,</span>
+                <span class="n">input_ids</span><span class="o">=</span><span class="n">input_ids</span><span class="p">,</span>
+                <span class="n">hidden_states</span><span class="o">=</span><span class="n">hidden_states</span><span class="p">,</span>
+                <span class="n">scfg</span><span class="o">=</span><span class="n">scfg</span><span class="p">,</span>
+                <span class="n">kv_cache_block_offsets</span><span class="o">=</span><span class="n">kv_cache_block_offsets</span><span class="p">,</span>
+                <span class="n">host_kv_cache_block_offsets</span><span class="o">=</span><span class="n">host_kv_cache_block_offsets</span><span class="p">,</span>
+                <span class="n">cross_kv_cache_block_offsets</span><span class="o">=</span><span class="n">cross_kv_cache_block_offsets</span><span class="p">,</span>
+                <span class="n">host_cross_kv_cache_block_offsets</span><span class="o">=</span>
+                <span class="n">host_cross_kv_cache_block_offsets</span><span class="p">,</span>
+                <span class="n">prompt_embedding_table</span><span class="o">=</span><span class="n">prompt_embedding_table</span><span class="p">,</span>
+                <span class="n">tasks</span><span class="o">=</span><span class="n">tasks</span><span class="p">,</span>
+                <span class="n">context_lengths</span><span class="o">=</span><span class="n">context_lengths</span><span class="p">,</span>
+                <span class="n">host_context_lengths</span><span class="o">=</span><span class="n">host_context_lengths</span><span class="p">,</span>
+                <span class="n">attention_mask</span><span class="o">=</span><span class="n">attention_mask</span><span class="p">,</span>
+                <span class="n">cross_attention_mask_for_context</span><span class="o">=</span>
+                <span class="n">cross_attention_mask_for_context</span><span class="p">,</span>
+                <span class="n">cross_attention_mask_for_gen</span><span class="o">=</span><span class="n">cross_attention_mask_for_gen</span><span class="p">,</span>
+                <span class="n">prompt_vocab_size</span><span class="o">=</span><span class="n">prompt_vocab_size</span><span class="p">,</span>
+                <span class="n">ite</span><span class="o">=</span><span class="n">ite</span><span class="p">,</span>
+                <span class="n">sequence_limit_lengths</span><span class="o">=</span><span class="n">sequence_limit_lengths</span><span class="p">,</span>
+                <span class="n">sequence_lengths</span><span class="o">=</span><span class="n">sequence_lengths</span><span class="p">,</span>
+                <span class="n">next_step_tensors</span><span class="o">=</span><span class="n">next_step_tensors</span><span class="p">,</span>
+                <span class="n">stop_words_data</span><span class="o">=</span><span class="n">stop_words_data</span><span class="p">,</span>
+                <span class="n">bad_words_data</span><span class="o">=</span><span class="n">bad_words_data</span><span class="p">,</span>
+                <span class="n">encoder_output</span><span class="o">=</span><span class="n">encoder_output</span><span class="p">,</span>
+                <span class="n">encoder_input_lengths</span><span class="o">=</span><span class="n">encoder_input_lengths</span><span class="p">,</span>
+                <span class="n">stopping_criteria</span><span class="o">=</span><span class="n">stopping_criteria</span><span class="p">,</span>
+                <span class="n">logits_processor</span><span class="o">=</span><span class="n">logits_processor</span><span class="p">,</span>
+                <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
+            <span class="p">)</span>
             <span class="k">if</span> <span class="n">step</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
                 <span class="k">if</span> <span class="n">benchmark_profiler</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                     <span class="n">benchmark_profiler</span><span class="o">.</span><span class="n">record_cuda_event</span><span class="p">(</span><span class="s1">&#39;first_token&#39;</span><span class="p">)</span>
@@ -4117,6 +4152,7 @@
 <div class="viewcode-block" id="GenerationSession.decode_stream">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.decode_stream">[docs]</a>
     <span class="k">def</span> <span class="nf">decode_stream</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                      <span class="o">*</span><span class="p">,</span>
                       <span class="n">batch_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
                       <span class="n">scfg</span><span class="p">:</span> <span class="n">SamplingConfig</span><span class="p">,</span>
                       <span class="n">sequence_lengths</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
@@ -4171,17 +4207,39 @@
         <span class="k">for</span> <span class="n">step</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_new_tokens</span><span class="p">):</span>
 
             <span class="n">should_stop</span><span class="p">,</span> <span class="n">next_step_tensors</span><span class="p">,</span> <span class="n">tasks</span><span class="p">,</span> <span class="n">context_lengths</span><span class="p">,</span> <span class="n">host_context_lengths</span><span class="p">,</span> <span class="n">attention_mask</span><span class="p">,</span> <span class="n">context_logits</span><span class="p">,</span> <span class="n">generation_logits</span><span class="p">,</span> <span class="n">encoder_input_lengths</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">handle_per_step</span><span class="p">(</span>
-                <span class="n">cache_indirections</span><span class="p">,</span> <span class="n">step</span><span class="p">,</span> <span class="n">batch_size</span><span class="p">,</span> <span class="n">max_context_length</span><span class="p">,</span>
-                <span class="n">beam_width</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">scfg</span><span class="p">,</span>
-                <span class="n">kv_cache_block_offsets</span><span class="p">,</span> <span class="n">host_kv_cache_block_offsets</span><span class="p">,</span>
-                <span class="n">cross_kv_cache_block_offsets</span><span class="p">,</span> <span class="n">host_cross_kv_cache_block_offsets</span><span class="p">,</span>
-                <span class="n">prompt_embedding_table</span><span class="p">,</span> <span class="n">tasks</span><span class="p">,</span> <span class="n">context_lengths</span><span class="p">,</span>
-                <span class="n">host_context_lengths</span><span class="p">,</span> <span class="n">attention_mask</span><span class="p">,</span>
-                <span class="n">cross_attention_mask_for_context</span><span class="p">,</span> <span class="n">cross_attention_mask_for_gen</span><span class="p">,</span>
-                <span class="n">prompt_vocab_size</span><span class="p">,</span> <span class="n">ite</span><span class="p">,</span> <span class="n">sequence_limit_lengths</span><span class="p">,</span>
-                <span class="n">sequence_lengths</span><span class="p">,</span> <span class="n">next_step_tensors</span><span class="p">,</span> <span class="n">stop_words_data</span><span class="p">,</span>
-                <span class="n">bad_words_data</span><span class="p">,</span> <span class="n">encoder_output</span><span class="p">,</span> <span class="n">encoder_input_lengths</span><span class="p">,</span>
-                <span class="n">stopping_criteria</span><span class="p">,</span> <span class="n">logits_processor</span><span class="p">)</span>
+                <span class="n">cache_indirections</span><span class="o">=</span><span class="n">cache_indirections</span><span class="p">,</span>
+                <span class="n">step</span><span class="o">=</span><span class="n">step</span><span class="p">,</span>
+                <span class="n">batch_size</span><span class="o">=</span><span class="n">batch_size</span><span class="p">,</span>
+                <span class="n">max_context_length</span><span class="o">=</span><span class="n">max_context_length</span><span class="p">,</span>
+                <span class="n">beam_width</span><span class="o">=</span><span class="n">beam_width</span><span class="p">,</span>
+                <span class="n">input_ids</span><span class="o">=</span><span class="n">input_ids</span><span class="p">,</span>
+                <span class="n">hidden_states</span><span class="o">=</span><span class="n">hidden_states</span><span class="p">,</span>
+                <span class="n">scfg</span><span class="o">=</span><span class="n">scfg</span><span class="p">,</span>
+                <span class="n">kv_cache_block_offsets</span><span class="o">=</span><span class="n">kv_cache_block_offsets</span><span class="p">,</span>
+                <span class="n">host_kv_cache_block_offsets</span><span class="o">=</span><span class="n">host_kv_cache_block_offsets</span><span class="p">,</span>
+                <span class="n">cross_kv_cache_block_offsets</span><span class="o">=</span><span class="n">cross_kv_cache_block_offsets</span><span class="p">,</span>
+                <span class="n">host_cross_kv_cache_block_offsets</span><span class="o">=</span>
+                <span class="n">host_cross_kv_cache_block_offsets</span><span class="p">,</span>
+                <span class="n">prompt_embedding_table</span><span class="o">=</span><span class="n">prompt_embedding_table</span><span class="p">,</span>
+                <span class="n">tasks</span><span class="o">=</span><span class="n">tasks</span><span class="p">,</span>
+                <span class="n">context_lengths</span><span class="o">=</span><span class="n">context_lengths</span><span class="p">,</span>
+                <span class="n">host_context_lengths</span><span class="o">=</span><span class="n">host_context_lengths</span><span class="p">,</span>
+                <span class="n">attention_mask</span><span class="o">=</span><span class="n">attention_mask</span><span class="p">,</span>
+                <span class="n">cross_attention_mask_for_context</span><span class="o">=</span>
+                <span class="n">cross_attention_mask_for_context</span><span class="p">,</span>
+                <span class="n">cross_attention_mask_for_gen</span><span class="o">=</span><span class="n">cross_attention_mask_for_gen</span><span class="p">,</span>
+                <span class="n">prompt_vocab_size</span><span class="o">=</span><span class="n">prompt_vocab_size</span><span class="p">,</span>
+                <span class="n">ite</span><span class="o">=</span><span class="n">ite</span><span class="p">,</span>
+                <span class="n">sequence_limit_lengths</span><span class="o">=</span><span class="n">sequence_limit_lengths</span><span class="p">,</span>
+                <span class="n">sequence_lengths</span><span class="o">=</span><span class="n">sequence_lengths</span><span class="p">,</span>
+                <span class="n">next_step_tensors</span><span class="o">=</span><span class="n">next_step_tensors</span><span class="p">,</span>
+                <span class="n">stop_words_data</span><span class="o">=</span><span class="n">stop_words_data</span><span class="p">,</span>
+                <span class="n">bad_words_data</span><span class="o">=</span><span class="n">bad_words_data</span><span class="p">,</span>
+                <span class="n">encoder_output</span><span class="o">=</span><span class="n">encoder_output</span><span class="p">,</span>
+                <span class="n">encoder_input_lengths</span><span class="o">=</span><span class="n">encoder_input_lengths</span><span class="p">,</span>
+                <span class="n">stopping_criteria</span><span class="o">=</span><span class="n">stopping_criteria</span><span class="p">,</span>
+                <span class="n">logits_processor</span><span class="o">=</span><span class="n">logits_processor</span><span class="p">,</span>
+            <span class="p">)</span>
             <span class="k">if</span> <span class="n">step</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
                 <span class="n">outputs_context_logits</span> <span class="o">=</span> <span class="n">context_logits</span>
             <span class="k">if</span> <span class="n">should_stop</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
@@ -4320,8 +4378,7 @@
         <span class="c1"># Init KV cache block manager</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">paged_kv_cache</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">has_attn_layers</span><span class="p">:</span>
             <span class="n">num_blocks</span><span class="p">,</span> <span class="n">max_blocks_per_seq</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_get_num_paged_blocks</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">max_attention_window_size</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">sink_token_length</span><span class="p">,</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">use_one_more_block</span><span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">max_attention_window_size</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">sink_token_length</span><span class="p">)</span>
 
             <span class="bp">self</span><span class="o">.</span><span class="n">buffer</span><span class="p">[</span>
                 <span class="sa">f</span><span class="s1">&#39;host_kv_cache_pool_pointers&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool_allocator</span><span class="o">.</span><span class="n">get_kv_cache_pool_pointers</span><span class="p">(</span>
@@ -4337,14 +4394,11 @@
                 <span class="bp">self</span><span class="o">.</span><span class="n">head_size</span><span class="p">,</span>
                 <span class="n">max_attention_window_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_attention_window_size</span><span class="p">,</span>
                 <span class="n">beam_width</span><span class="o">=</span><span class="n">beam_width</span><span class="p">,</span>
-                <span class="n">use_one_more_block</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">use_one_more_block</span><span class="p">,</span>
                 <span class="n">sink_token_len</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">sink_token_length</span><span class="p">)</span>
 
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">cross_attention</span><span class="p">:</span>
                 <span class="n">cross_num_blocks</span><span class="p">,</span> <span class="n">max_cross_blocks_per_seq</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_get_num_paged_blocks</span><span class="p">(</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">encoder_max_input_length</span><span class="p">,</span>
-                    <span class="n">sink_token_length</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
-                    <span class="n">use_one_more_block</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">encoder_max_input_length</span><span class="p">,</span> <span class="n">sink_token_length</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">buffer</span><span class="p">[</span>
                     <span class="sa">f</span><span class="s1">&#39;host_cross_kv_cache_pool_pointers&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cross_memory_pool_allocator</span><span class="o">.</span><span class="n">get_kv_cache_pool_pointers</span><span class="p">(</span>
                     <span class="p">)</span>
@@ -4359,7 +4413,6 @@
                     <span class="bp">self</span><span class="o">.</span><span class="n">head_size</span><span class="p">,</span>
                     <span class="n">max_attention_window_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">encoder_max_input_length</span><span class="p">,</span>
                     <span class="n">beam_width</span><span class="o">=</span><span class="n">beam_width</span><span class="p">,</span>
-                    <span class="n">use_one_more_block</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                     <span class="n">sink_token_len</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">sink_token_length</span><span class="p">)</span>
 
             <span class="c1"># Add sequences to the manager</span>
@@ -4444,24 +4497,60 @@
         <span class="c1"># start context phase</span>
         <span class="k">if</span> <span class="n">streaming</span><span class="p">:</span>
             <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">decode_stream</span><span class="p">(</span>
-                <span class="n">batch_size</span><span class="p">,</span> <span class="n">scfg</span><span class="p">,</span> <span class="n">sequence_lengths</span><span class="p">,</span> <span class="n">context_lengths</span><span class="p">,</span>
-                <span class="n">host_context_lengths</span><span class="p">,</span> <span class="n">max_context_length</span><span class="p">,</span> <span class="n">beam_width</span><span class="p">,</span>
-                <span class="n">cache_indirections</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span>
-                <span class="n">prompt_embedding_table</span><span class="p">,</span> <span class="n">tasks</span><span class="p">,</span> <span class="n">prompt_vocab_size</span><span class="p">,</span> <span class="n">ite</span><span class="p">,</span>
-                <span class="n">sequence_limit_lengths</span><span class="p">,</span> <span class="n">stop_words_data</span><span class="p">,</span> <span class="n">bad_words_data</span><span class="p">,</span>
-                <span class="n">output_sequence_lengths</span><span class="p">,</span> <span class="n">return_dict</span><span class="p">,</span> <span class="n">encoder_output</span><span class="p">,</span>
-                <span class="n">encoder_input_lengths</span><span class="p">,</span> <span class="n">stopping_criteria</span><span class="p">,</span> <span class="n">logits_processor</span><span class="p">,</span>
-                <span class="n">cross_attention_mask</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+                <span class="n">batch_size</span><span class="o">=</span><span class="n">batch_size</span><span class="p">,</span>
+                <span class="n">scfg</span><span class="o">=</span><span class="n">scfg</span><span class="p">,</span>
+                <span class="n">sequence_lengths</span><span class="o">=</span><span class="n">sequence_lengths</span><span class="p">,</span>
+                <span class="n">context_lengths</span><span class="o">=</span><span class="n">context_lengths</span><span class="p">,</span>
+                <span class="n">host_context_lengths</span><span class="o">=</span><span class="n">host_context_lengths</span><span class="p">,</span>
+                <span class="n">max_context_length</span><span class="o">=</span><span class="n">max_context_length</span><span class="p">,</span>
+                <span class="n">beam_width</span><span class="o">=</span><span class="n">beam_width</span><span class="p">,</span>
+                <span class="n">cache_indirections</span><span class="o">=</span><span class="n">cache_indirections</span><span class="p">,</span>
+                <span class="n">input_ids</span><span class="o">=</span><span class="n">input_ids</span><span class="p">,</span>
+                <span class="n">hidden_states</span><span class="o">=</span><span class="n">hidden_states</span><span class="p">,</span>
+                <span class="n">prompt_embedding_table</span><span class="o">=</span><span class="n">prompt_embedding_table</span><span class="p">,</span>
+                <span class="n">tasks</span><span class="o">=</span><span class="n">tasks</span><span class="p">,</span>
+                <span class="n">prompt_vocab_size</span><span class="o">=</span><span class="n">prompt_vocab_size</span><span class="p">,</span>
+                <span class="n">ite</span><span class="o">=</span><span class="n">ite</span><span class="p">,</span>
+                <span class="n">sequence_limit_lengths</span><span class="o">=</span><span class="n">sequence_limit_lengths</span><span class="p">,</span>
+                <span class="n">stop_words_data</span><span class="o">=</span><span class="n">stop_words_data</span><span class="p">,</span>
+                <span class="n">bad_words_data</span><span class="o">=</span><span class="n">bad_words_data</span><span class="p">,</span>
+                <span class="n">output_sequence_lengths</span><span class="o">=</span><span class="n">output_sequence_lengths</span><span class="p">,</span>
+                <span class="n">return_dict</span><span class="o">=</span><span class="n">return_dict</span><span class="p">,</span>
+                <span class="n">encoder_output</span><span class="o">=</span><span class="n">encoder_output</span><span class="p">,</span>
+                <span class="n">encoder_input_lengths</span><span class="o">=</span><span class="n">encoder_input_lengths</span><span class="p">,</span>
+                <span class="n">stopping_criteria</span><span class="o">=</span><span class="n">stopping_criteria</span><span class="p">,</span>
+                <span class="n">logits_processor</span><span class="o">=</span><span class="n">logits_processor</span><span class="p">,</span>
+                <span class="n">cross_attention_mask</span><span class="o">=</span><span class="n">cross_attention_mask</span><span class="p">,</span>
+                <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
+            <span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">decode_regular</span><span class="p">(</span>
-                <span class="n">batch_size</span><span class="p">,</span> <span class="n">scfg</span><span class="p">,</span> <span class="n">sequence_lengths</span><span class="p">,</span> <span class="n">context_lengths</span><span class="p">,</span>
-                <span class="n">host_context_lengths</span><span class="p">,</span> <span class="n">max_context_length</span><span class="p">,</span> <span class="n">beam_width</span><span class="p">,</span>
-                <span class="n">cache_indirections</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span>
-                <span class="n">prompt_embedding_table</span><span class="p">,</span> <span class="n">tasks</span><span class="p">,</span> <span class="n">prompt_vocab_size</span><span class="p">,</span> <span class="n">ite</span><span class="p">,</span>
-                <span class="n">sequence_limit_lengths</span><span class="p">,</span> <span class="n">stop_words_data</span><span class="p">,</span> <span class="n">bad_words_data</span><span class="p">,</span>
-                <span class="n">output_sequence_lengths</span><span class="p">,</span> <span class="n">return_dict</span><span class="p">,</span> <span class="n">encoder_output</span><span class="p">,</span>
-                <span class="n">encoder_input_lengths</span><span class="p">,</span> <span class="n">stopping_criteria</span><span class="p">,</span> <span class="n">logits_processor</span><span class="p">,</span>
-                <span class="n">cross_attention_mask</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span></div>
+                <span class="n">batch_size</span><span class="o">=</span><span class="n">batch_size</span><span class="p">,</span>
+                <span class="n">scfg</span><span class="o">=</span><span class="n">scfg</span><span class="p">,</span>
+                <span class="n">sequence_lengths</span><span class="o">=</span><span class="n">sequence_lengths</span><span class="p">,</span>
+                <span class="n">context_lengths</span><span class="o">=</span><span class="n">context_lengths</span><span class="p">,</span>
+                <span class="n">host_context_lengths</span><span class="o">=</span><span class="n">host_context_lengths</span><span class="p">,</span>
+                <span class="n">max_context_length</span><span class="o">=</span><span class="n">max_context_length</span><span class="p">,</span>
+                <span class="n">beam_width</span><span class="o">=</span><span class="n">beam_width</span><span class="p">,</span>
+                <span class="n">cache_indirections</span><span class="o">=</span><span class="n">cache_indirections</span><span class="p">,</span>
+                <span class="n">input_ids</span><span class="o">=</span><span class="n">input_ids</span><span class="p">,</span>
+                <span class="n">hidden_states</span><span class="o">=</span><span class="n">hidden_states</span><span class="p">,</span>
+                <span class="n">prompt_embedding_table</span><span class="o">=</span><span class="n">prompt_embedding_table</span><span class="p">,</span>
+                <span class="n">tasks</span><span class="o">=</span><span class="n">tasks</span><span class="p">,</span>
+                <span class="n">prompt_vocab_size</span><span class="o">=</span><span class="n">prompt_vocab_size</span><span class="p">,</span>
+                <span class="n">ite</span><span class="o">=</span><span class="n">ite</span><span class="p">,</span>
+                <span class="n">sequence_limit_lengths</span><span class="o">=</span><span class="n">sequence_limit_lengths</span><span class="p">,</span>
+                <span class="n">stop_words_data</span><span class="o">=</span><span class="n">stop_words_data</span><span class="p">,</span>
+                <span class="n">bad_words_data</span><span class="o">=</span><span class="n">bad_words_data</span><span class="p">,</span>
+                <span class="n">output_sequence_lengths</span><span class="o">=</span><span class="n">output_sequence_lengths</span><span class="p">,</span>
+                <span class="n">return_dict</span><span class="o">=</span><span class="n">return_dict</span><span class="p">,</span>
+                <span class="n">encoder_output</span><span class="o">=</span><span class="n">encoder_output</span><span class="p">,</span>
+                <span class="n">encoder_input_lengths</span><span class="o">=</span><span class="n">encoder_input_lengths</span><span class="p">,</span>
+                <span class="n">stopping_criteria</span><span class="o">=</span><span class="n">stopping_criteria</span><span class="p">,</span>
+                <span class="n">logits_processor</span><span class="o">=</span><span class="n">logits_processor</span><span class="p">,</span>
+                <span class="n">cross_attention_mask</span><span class="o">=</span><span class="n">cross_attention_mask</span><span class="p">,</span>
+                <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
+            <span class="p">)</span></div>
 </div>
 
 
@@ -4714,7 +4803,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f946b5c68a0>
+<jinja2.runtime.BlockReference object at 0x7fed97476c60>
 
 <div class="footer">
     <p>

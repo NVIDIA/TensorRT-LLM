@@ -182,7 +182,7 @@
 <span class="kn">from</span> <span class="nn">...mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
 <span class="kn">from</span> <span class="nn">...module</span> <span class="kn">import</span> <span class="n">Module</span>
 <span class="kn">from</span> <span class="nn">..modeling_utils</span> <span class="kn">import</span> <span class="p">(</span><span class="n">DecoderLayerList</span><span class="p">,</span> <span class="n">DecoderModelForCausalLM</span><span class="p">,</span>
-                              <span class="n">QuantConfig</span><span class="p">,</span> <span class="n">check_share_embedding</span><span class="p">)</span>
+                              <span class="n">QuantConfig</span><span class="p">)</span>
 <span class="kn">from</span> <span class="nn">.config</span> <span class="kn">import</span> <span class="n">FalconConfig</span>
 <span class="kn">from</span> <span class="nn">.convert</span> <span class="kn">import</span> <span class="n">load_weights_from_hf_by_shard</span><span class="p">,</span> <span class="n">load_weights_from_hf_model</span>
 
@@ -442,7 +442,6 @@
                 <span class="n">hf_model_dir</span><span class="p">,</span> <span class="n">torch_dtype</span><span class="o">=</span><span class="s1">&#39;auto&#39;</span><span class="p">)</span>
             <span class="n">weights</span> <span class="o">=</span> <span class="n">load_weights_from_hf_model</span><span class="p">(</span><span class="n">hf_model</span><span class="p">,</span> <span class="n">config</span><span class="p">)</span>
 
-        <span class="n">check_share_embedding</span><span class="p">(</span><span class="n">weights</span><span class="p">,</span> <span class="n">config</span><span class="p">)</span>
         <span class="n">model</span> <span class="o">=</span> <span class="bp">cls</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
         <span class="n">model</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">weights</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">model</span></div>
@@ -457,7 +456,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f946e380c20>
+<jinja2.runtime.BlockReference object at 0x7fed977fb4d0>
 
 <div class="footer">
     <p>

@@ -113,6 +113,7 @@
 <li class="toctree-l3"><a class="reference internal" href="#the-result-class">The Result Class</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#sending-requests-with-different-beam-widths">Sending Requests with Different Beam Widths</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#controlling-output-with-logits-post-processor">Controlling output with Logits Post-Processor</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#structured-output-with-guided-decoding">Structured output with guided decoding</a></li>
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="#c-executor-api-example">C++ Executor API Example</a></li>
@@ -238,6 +239,26 @@ For details about the API, refer to the <span class="xref std std-ref">_cpp_gen/
 <p>Note: Neither callback variant is supported with the <code class="docutils literal notranslate"><span class="pre">STATIC</span></code> batching type for the moment.</p>
 <p>In a multi-GPU run, the callback is invoked on all ranks in the first tensor-parallel group, by default. To ensure correct execution, replicate the client-side state that is accessed by the callback on these ranks. If replication is expensive or infeasible, use <code class="docutils literal notranslate"><span class="pre">LogitsPostProcessorConfig::setReplicate(false)</span></code> to invoke the callback only on rank 0. The executor broadcasts the sampled tokens internally to ensure correct execution.</p>
 </section>
+<section id="structured-output-with-guided-decoding">
+<h3>Structured output with guided decoding<a class="headerlink" href="#structured-output-with-guided-decoding" title="Link to this heading"></a></h3>
+<p>Guided decoding controls the generation outputs to be amenable to pre-defined structured formats, e.g., JSON or XML. Currently, guided decoding is supported with the <a class="reference external" href="https://github.com/mlc-ai/xgrammar">XGrammar</a> backend.</p>
+<p>To enable guided decoding, a valid instance of <code class="docutils literal notranslate"><span class="pre">GuidedDecodingConfig</span></code> must be provided when constructing <code class="docutils literal notranslate"><span class="pre">Executor</span></code>. <code class="docutils literal notranslate"><span class="pre">GuidedDecodingConfig</span></code> should be constructed with some tokenizer information, including <code class="docutils literal notranslate"><span class="pre">encodedVocab</span></code>, <code class="docutils literal notranslate"><span class="pre">tokenizerStr</span></code> (optional) and <code class="docutils literal notranslate"><span class="pre">stopTokenIds</span></code> (optional). Given a Hugging Face tokenizer, these can be extracted by:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">encoded_vocab</span> <span class="o">=</span> <span class="n">tokenizer</span><span class="o">.</span><span class="n">get_vocab</span><span class="p">()</span>
+<span class="n">encoded_vocab</span> <span class="o">=</span> <span class="p">[</span><span class="n">token</span> <span class="k">for</span> <span class="n">token</span><span class="p">,</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">encoded_vocab</span><span class="o">.</span><span class="n">items</span><span class="p">(),</span> <span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">x</span><span class="p">:</span> <span class="n">x</span><span class="p">[</span><span class="mi">1</span><span class="p">])]</span>
+<span class="n">tokenizer_str</span> <span class="o">=</span> <span class="n">tokenizer</span><span class="o">.</span><span class="n">backend_tokenizer</span><span class="o">.</span><span class="n">to_str</span><span class="p">()</span>
+<span class="n">stop_token_ids</span> <span class="o">=</span> <span class="p">[</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">eos_token_id</span><span class="p">]</span>
+</pre></div>
+</div>
+<p>Refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/tensorrt_llm/llmapi/tokenizer.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/llmapi/tokenizer.py</span></code></a> for more details. You may dump these materials to disk, and reload them to C++ runtime for use.</p>
+<p>Each request can be optionally specified with a <code class="docutils literal notranslate"><span class="pre">GuidedDecodingParams</span></code>, which defines the desired structured format. Currently, it supports four types:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">GuidedDecodingParams::GuideType::kJSON</span></code>: The generated text is amenable to JSON format;</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">GuidedDecodingParams::GuideType::kJSON_SCHEMA</span></code>: The generated text is amenable to JSON format with additional restrictions;</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">GuidedDecodingParams::GuideType::kREGEX</span></code>: The generated text is amenable to regular expression;</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">GuidedDecodingParams::GuideType::kEBNF_GRAMMAR</span></code>: The generated text is amenable to the extended Backus-Naur form (EBNF) grammar.</p></li>
+</ul>
+<p>The latter three types should be used with the schema/regex/grammar provided to <code class="docutils literal notranslate"><span class="pre">GuidedDecodingParams</span></code>.</p>
+</section>
 </section>
 <section id="c-executor-api-example">
 <h2>C++ Executor API Example<a class="headerlink" href="#c-executor-api-example" title="Link to this heading"></a></h2>
@@ -268,7 +289,7 @@ the TensorRT-LLM C++ Executor API.</p>
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f9459e5fb90>
+<jinja2.runtime.BlockReference object at 0x7fed9c8ccd40>
 
 <div class="footer">
     <p>

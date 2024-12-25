@@ -203,7 +203,7 @@ The script below will convert a Hugging Face LoRA model to the correct NumPy ten
 python3<span class="w"> </span>tensorrt_llm/examples/hf_lora_convert.py<span class="w"> </span>-i<span class="w"> </span>luotuo-lora-7b-0.1<span class="w"> </span>-o<span class="w"> </span>luotuo-lora-7b-0.1-weights<span class="w"> </span>--storage-type<span class="w"> </span>float16
 </pre></div>
 </div>
-<p>Refer to the <a class="reference external" href="https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/inflight_batcher_llm/README.md">tensorrtllm_backend documentation</a> for a Multi-LoRA example using Triton.</p>
+<p>Refer to the <a class="reference external" href="https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/docs/lora.md">tensorrtllm_backend documentation</a> for a Multi-LoRA example using Triton.</p>
 <section id="lora-tensor-format-details">
 <h2>LoRA tensor format details<a class="headerlink" href="#lora-tensor-format-details" title="Link to this heading"></a></h2>
 <p>To run inference with <code class="docutils literal notranslate"><span class="pre">LoraWeights</span></code> using <code class="docutils literal notranslate"><span class="pre">GptManager</span></code>, <code class="docutils literal notranslate"><span class="pre">InferenceRequests</span></code> must have <code class="docutils literal notranslate"><span class="pre">LoraWeights</span></code> (<code class="docutils literal notranslate"><span class="pre">lora_weights</span></code>) and <code class="docutils literal notranslate"><span class="pre">LoraConfig</span></code> (<code class="docutils literal notranslate"><span class="pre">lora_config</span></code>) parameters.</p>
@@ -358,7 +358,7 @@ The following tensors are for a LoRA which has a <code class="docutils literal n
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f9459e87e60>
+<jinja2.runtime.BlockReference object at 0x7fed9c653a10>
 
 <div class="footer">
     <p>

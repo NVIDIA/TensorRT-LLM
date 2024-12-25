@@ -626,10 +626,9 @@
             <span class="n">task_vocab_size</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="n">task_vocab_size</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
             <span class="n">prompt_table_data</span> <span class="o">=</span> <span class="n">prompt_table_data</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">hidden_size</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
-            <span class="n">prompt_table_data</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">([</span><span class="mi">1</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">],</span>
-                                            <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+            <span class="n">prompt_table_data</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span>
+                <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
             <span class="n">task_vocab_size</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">([</span><span class="mi">1</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
-
         <span class="k">if</span> <span class="n">tasks</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">tasks</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="nb">int</span><span class="p">(</span><span class="n">t</span><span class="p">)</span> <span class="k">for</span> <span class="n">t</span> <span class="ow">in</span> <span class="n">tasks</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s1">&#39;,&#39;</span><span class="p">)],</span>
                                  <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
@@ -659,14 +658,16 @@
 <span class="sd">    An interface class that wraps GenerationSession and provides generation methods.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
 
-    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
-                 <span class="n">session</span><span class="p">:</span> <span class="n">GenerationSession</span><span class="p">,</span>
-                 <span class="n">max_batch_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-                 <span class="n">max_input_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-                 <span class="n">max_seq_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-                 <span class="n">max_beam_width</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-                 <span class="n">kv_cache_type</span><span class="p">:</span> <span class="n">KVCacheType</span><span class="p">,</span>
-                 <span class="n">lora_manager</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">LoraManager</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">session</span><span class="p">:</span> <span class="n">GenerationSession</span><span class="p">,</span>
+        <span class="n">max_batch_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">max_input_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">max_seq_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">max_beam_width</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">kv_cache_type</span><span class="p">:</span> <span class="n">KVCacheType</span><span class="p">,</span>
+        <span class="n">lora_manager</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">LoraManager</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">        Create a ModelRunner instance.</span>
 <span class="sd">        You are recommended to use the from_dir method to load the engine and create a ModelRunner instance.</span>
@@ -693,22 +694,25 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">lora_manager</span> <span class="o">=</span> <span class="n">lora_manager</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_type</span> <span class="o">=</span> <span class="n">kv_cache_type</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">enable_context_fmha_fp32_acc</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">multi_block_mode</span> <span class="o">=</span> <span class="kc">True</span>
 
 <div class="viewcode-block" id="ModelRunner.from_engine">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelRunner.from_engine">[docs]</a>
     <span class="nd">@classmethod</span>
     <span class="k">def</span> <span class="nf">from_engine</span><span class="p">(</span>
-            <span class="bp">cls</span><span class="p">,</span>
-            <span class="n">engine</span><span class="p">:</span> <span class="n">Engine</span><span class="p">,</span>
-            <span class="n">max_output_len</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-            <span class="n">lora_dir</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-            <span class="n">rank</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
-            <span class="n">debug_mode</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
-            <span class="n">lora_ckpt_source</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;hf&quot;</span><span class="p">,</span>
-            <span class="n">medusa_choices</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-            <span class="n">stream</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Stream</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-            <span class="n">gpu_weights_percent</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
-            <span class="n">enable_context_fmha_fp32_acc</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">cls</span><span class="p">,</span>
+        <span class="n">engine</span><span class="p">:</span> <span class="n">Engine</span><span class="p">,</span>
+        <span class="o">*</span><span class="p">,</span>
+        <span class="n">max_output_len</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
+        <span class="n">lora_dir</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">str</span><span class="p">]],</span>
+        <span class="n">rank</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">debug_mode</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
+        <span class="n">lora_ckpt_source</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+        <span class="n">medusa_choices</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]],</span>
+        <span class="n">stream</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Stream</span><span class="p">,</span>
+        <span class="n">gpu_weights_percent</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
+        <span class="n">enable_context_fmha_fp32_acc</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bool</span><span class="p">],</span>
+        <span class="n">multi_block_mode</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bool</span><span class="p">],</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;ModelRunner&#39;</span><span class="p">:</span>
         <span class="n">model_config</span> <span class="o">=</span> <span class="n">_engine_config_to_model_config</span><span class="p">(</span>
             <span class="n">engine</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="n">gpu_weights_percent</span><span class="o">=</span><span class="n">gpu_weights_percent</span><span class="p">)</span>
@@ -767,6 +771,7 @@
                      <span class="n">kv_cache_type</span><span class="o">=</span><span class="n">model_config</span><span class="o">.</span><span class="n">kv_cache_type</span><span class="p">,</span>
                      <span class="n">lora_manager</span><span class="o">=</span><span class="n">lora_manager</span><span class="p">)</span>
         <span class="n">runner</span><span class="o">.</span><span class="n">enable_context_fmha_fp32_acc</span> <span class="o">=</span> <span class="n">enable_context_fmha_fp32_acc</span>
+        <span class="n">runner</span><span class="o">.</span><span class="n">multi_block_mode</span> <span class="o">=</span> <span class="n">multi_block_mode</span>
         <span class="k">return</span> <span class="n">runner</span></div>
 
 
@@ -774,17 +779,19 @@
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelRunner.from_dir">[docs]</a>
     <span class="nd">@classmethod</span>
     <span class="k">def</span> <span class="nf">from_dir</span><span class="p">(</span>
-            <span class="bp">cls</span><span class="p">,</span>
-            <span class="n">engine_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
-            <span class="n">max_output_len</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-            <span class="n">lora_dir</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-            <span class="n">rank</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
-            <span class="n">debug_mode</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
-            <span class="n">lora_ckpt_source</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;hf&quot;</span><span class="p">,</span>
-            <span class="n">medusa_choices</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-            <span class="n">stream</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Stream</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-            <span class="n">gpu_weights_percent</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
-            <span class="n">enable_context_fmha_fp32_acc</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">cls</span><span class="p">,</span>
+        <span class="n">engine_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+        <span class="o">*</span><span class="p">,</span>
+        <span class="n">max_output_len</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">lora_dir</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">rank</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
+        <span class="n">debug_mode</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+        <span class="n">lora_ckpt_source</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;hf&quot;</span><span class="p">,</span>
+        <span class="n">medusa_choices</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">stream</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Stream</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">gpu_weights_percent</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
+        <span class="n">enable_context_fmha_fp32_acc</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">multi_block_mode</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;ModelRunner&#39;</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">        Create a ModelRunner instance from an engine directory.</span>
@@ -804,6 +811,8 @@
 <span class="sd">                Medusa choices to use when in Medusa decoding</span>
 <span class="sd">            stream (torch.cuda.Stream):</span>
 <span class="sd">                Stream to use.</span>
+<span class="sd">            multi_block_mode (bool):</span>
+<span class="sd">                Whether to distribute the work across multiple CUDA thread-blocks on the GPU for masked MHA kernel.</span>
 <span class="sd">        Returns:</span>
 <span class="sd">            ModelRunner: An instance of ModelRunner.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
@@ -878,6 +887,7 @@
                          <span class="n">kv_cache_type</span><span class="o">=</span><span class="n">KVCacheType</span><span class="o">.</span><span class="n">CONTINUOUS</span><span class="p">,</span>
                          <span class="n">lora_manager</span><span class="o">=</span><span class="n">lora_manager</span><span class="p">)</span>
             <span class="n">runner</span><span class="o">.</span><span class="n">enable_context_fmha_fp32_acc</span> <span class="o">=</span> <span class="n">enable_context_fmha_fp32_acc</span>
+            <span class="n">runner</span><span class="o">.</span><span class="n">multi_block_mode</span> <span class="o">=</span> <span class="n">multi_block_mode</span>
             <span class="k">return</span> <span class="n">runner</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="c1"># the new engine format</span>
@@ -890,10 +900,19 @@
                     <span class="p">]</span>
                     <span class="n">lora_ckpt_source</span> <span class="o">=</span> <span class="n">engine</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">lora_config</span><span class="o">.</span><span class="n">lora_ckpt_source</span>
 
-            <span class="n">runner</span> <span class="o">=</span> <span class="n">ModelRunner</span><span class="o">.</span><span class="n">from_engine</span><span class="p">(</span><span class="n">engine</span><span class="p">,</span> <span class="n">max_output_len</span><span class="p">,</span> <span class="n">lora_dir</span><span class="p">,</span>
-                                             <span class="n">rank</span><span class="p">,</span> <span class="n">debug_mode</span><span class="p">,</span> <span class="n">lora_ckpt_source</span><span class="p">,</span>
-                                             <span class="n">medusa_choices</span><span class="p">,</span> <span class="n">stream</span><span class="p">,</span>
-                                             <span class="n">gpu_weights_percent</span><span class="p">)</span>
+            <span class="n">runner</span> <span class="o">=</span> <span class="n">ModelRunner</span><span class="o">.</span><span class="n">from_engine</span><span class="p">(</span>
+                <span class="n">engine</span><span class="o">=</span><span class="n">engine</span><span class="p">,</span>
+                <span class="n">max_output_len</span><span class="o">=</span><span class="n">max_output_len</span><span class="p">,</span>
+                <span class="n">lora_dir</span><span class="o">=</span><span class="n">lora_dir</span><span class="p">,</span>
+                <span class="n">rank</span><span class="o">=</span><span class="n">rank</span><span class="p">,</span>
+                <span class="n">debug_mode</span><span class="o">=</span><span class="n">debug_mode</span><span class="p">,</span>
+                <span class="n">lora_ckpt_source</span><span class="o">=</span><span class="n">lora_ckpt_source</span><span class="p">,</span>
+                <span class="n">medusa_choices</span><span class="o">=</span><span class="n">medusa_choices</span><span class="p">,</span>
+                <span class="n">stream</span><span class="o">=</span><span class="n">stream</span><span class="p">,</span>
+                <span class="n">gpu_weights_percent</span><span class="o">=</span><span class="n">gpu_weights_percent</span><span class="p">,</span>
+                <span class="n">enable_context_fmha_fp32_acc</span><span class="o">=</span><span class="n">enable_context_fmha_fp32_acc</span><span class="p">,</span>
+                <span class="n">multi_block_mode</span><span class="o">=</span><span class="n">multi_block_mode</span><span class="p">,</span>
+            <span class="p">)</span>
             <span class="n">profiler</span><span class="o">.</span><span class="n">stop</span><span class="p">(</span><span class="s1">&#39;load tensorrt_llm engine&#39;</span><span class="p">)</span>
             <span class="n">loading_time</span> <span class="o">=</span> <span class="n">profiler</span><span class="o">.</span><span class="n">elapsed_time_in_sec</span><span class="p">(</span>
                 <span class="s2">&quot;load tensorrt_llm engine&quot;</span><span class="p">)</span>
@@ -1075,6 +1094,7 @@
             <span class="n">lora_uids</span><span class="o">=</span><span class="n">lora_uids</span><span class="p">,</span>
             <span class="n">medusa_choices</span><span class="o">=</span><span class="n">medusa_choices</span><span class="p">,</span>
             <span class="n">enable_context_fmha_fp32_acc</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_context_fmha_fp32_acc</span><span class="p">,</span>
+            <span class="n">multi_block_mode</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">multi_block_mode</span><span class="p">,</span>
             <span class="n">encoder_max_input_length</span><span class="o">=</span><span class="n">encoder_max_input_length</span><span class="p">,</span>
         <span class="p">)</span>
 
@@ -1130,7 +1150,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f946b44b6b0>
+<jinja2.runtime.BlockReference object at 0x7fed974a2e70>
 
 <div class="footer">
     <p>

@@ -70,14 +70,17 @@
 <li class="toctree-l1"><a class="reference internal" href="index.html">LLM Examples Introduction</a></li>
 <li class="toctree-l1"><a class="reference internal" href="customization.html">Common Customizations</a></li>
 <li class="toctree-l1 current"><a class="reference internal" href="llm_api_examples.html">Examples</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="llm_guided_decoding.html">Generate text with guided decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm_inference.html">Generate text</a></li>
 <li class="toctree-l2 current"><a class="current reference internal" href="#">Generate Text Asynchronously</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm_inference_customize.html">Generate text</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_quantization.html">Generation with Quantization</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm_inference_distributed.html">Distributed LLM Generation</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm_logits_processor.html">Control generated text using logits post processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_quantization.html">Generation with Quantization</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
 </ul>
 </li>
@@ -181,41 +184,44 @@
 <span class="linenos"> 3</span>
 <span class="linenos"> 4</span><span class="kn">from</span> <span class="nn">tensorrt_llm</span> <span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
 <span class="linenos"> 5</span>
-<span class="linenos"> 6</span><span class="c1"># model could accept HF model name or a path to local HF model.</span>
-<span class="linenos"> 7</span><span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">)</span>
-<span class="linenos"> 8</span>
-<span class="linenos"> 9</span><span class="c1"># Sample prompts.</span>
-<span class="linenos">10</span><span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span>
-<span class="linenos">11</span>    <span class="s2">&quot;Hello, my name is&quot;</span><span class="p">,</span>
-<span class="linenos">12</span>    <span class="s2">&quot;The president of the United States is&quot;</span><span class="p">,</span>
-<span class="linenos">13</span>    <span class="s2">&quot;The capital of France is&quot;</span><span class="p">,</span>
-<span class="linenos">14</span>    <span class="s2">&quot;The future of AI is&quot;</span><span class="p">,</span>
-<span class="linenos">15</span><span class="p">]</span>
-<span class="linenos">16</span>
-<span class="linenos">17</span><span class="c1"># Create a sampling params.</span>
-<span class="linenos">18</span><span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">temperature</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span> <span class="n">top_p</span><span class="o">=</span><span class="mf">0.95</span><span class="p">)</span>
-<span class="linenos">19</span>
-<span class="linenos">20</span>
-<span class="linenos">21</span><span class="c1"># Async based on Python coroutines</span>
-<span class="linenos">22</span><span class="k">async</span> <span class="k">def</span> <span class="nf">task</span><span class="p">(</span><span class="n">prompt</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
-<span class="linenos">23</span>    <span class="n">output</span> <span class="o">=</span> <span class="k">await</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate_async</span><span class="p">(</span><span class="n">prompt</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
-<span class="linenos">24</span>    <span class="nb">print</span><span class="p">(</span>
-<span class="linenos">25</span>        <span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">, Generated text: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="si">!r}</span><span class="s2">&quot;</span>
-<span class="linenos">26</span>    <span class="p">)</span>
-<span class="linenos">27</span>
+<span class="linenos"> 6</span>
+<span class="linenos"> 7</span><span class="k">def</span> <span class="nf">main</span><span class="p">():</span>
+<span class="linenos"> 8</span>    <span class="c1"># model could accept HF model name or a path to local HF model.</span>
+<span class="linenos"> 9</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">)</span>
+<span class="linenos">10</span>
+<span class="linenos">11</span>    <span class="c1"># Sample prompts.</span>
+<span class="linenos">12</span>    <span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span>
+<span class="linenos">13</span>        <span class="s2">&quot;Hello, my name is&quot;</span><span class="p">,</span>
+<span class="linenos">14</span>        <span class="s2">&quot;The president of the United States is&quot;</span><span class="p">,</span>
+<span class="linenos">15</span>        <span class="s2">&quot;The capital of France is&quot;</span><span class="p">,</span>
+<span class="linenos">16</span>        <span class="s2">&quot;The future of AI is&quot;</span><span class="p">,</span>
+<span class="linenos">17</span>    <span class="p">]</span>
+<span class="linenos">18</span>
+<span class="linenos">19</span>    <span class="c1"># Create a sampling params.</span>
+<span class="linenos">20</span>    <span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">temperature</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span> <span class="n">top_p</span><span class="o">=</span><span class="mf">0.95</span><span class="p">)</span>
+<span class="linenos">21</span>
+<span class="linenos">22</span>    <span class="c1"># Async based on Python coroutines</span>
+<span class="linenos">23</span>    <span class="k">async</span> <span class="k">def</span> <span class="nf">task</span><span class="p">(</span><span class="n">prompt</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+<span class="linenos">24</span>        <span class="n">output</span> <span class="o">=</span> <span class="k">await</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate_async</span><span class="p">(</span><span class="n">prompt</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
+<span class="linenos">25</span>        <span class="nb">print</span><span class="p">(</span>
+<span class="linenos">26</span>            <span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">, Generated text: </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="si">!r}</span><span class="s2">&quot;</span>
+<span class="linenos">27</span>        <span class="p">)</span>
 <span class="linenos">28</span>
-<span class="linenos">29</span><span class="k">async</span> <span class="k">def</span> <span class="nf">main</span><span class="p">():</span>
-<span class="linenos">30</span>    <span class="n">tasks</span> <span class="o">=</span> <span class="p">[</span><span class="n">task</span><span class="p">(</span><span class="n">prompt</span><span class="p">)</span> <span class="k">for</span> <span class="n">prompt</span> <span class="ow">in</span> <span class="n">prompts</span><span class="p">]</span>
-<span class="linenos">31</span>    <span class="k">await</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">gather</span><span class="p">(</span><span class="o">*</span><span class="n">tasks</span><span class="p">)</span>
+<span class="linenos">29</span>    <span class="k">async</span> <span class="k">def</span> <span class="nf">main</span><span class="p">():</span>
+<span class="linenos">30</span>        <span class="n">tasks</span> <span class="o">=</span> <span class="p">[</span><span class="n">task</span><span class="p">(</span><span class="n">prompt</span><span class="p">)</span> <span class="k">for</span> <span class="n">prompt</span> <span class="ow">in</span> <span class="n">prompts</span><span class="p">]</span>
+<span class="linenos">31</span>        <span class="k">await</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">gather</span><span class="p">(</span><span class="o">*</span><span class="n">tasks</span><span class="p">)</span>
 <span class="linenos">32</span>
-<span class="linenos">33</span>
-<span class="linenos">34</span><span class="n">asyncio</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">main</span><span class="p">())</span>
-<span class="linenos">35</span>
-<span class="linenos">36</span><span class="c1"># Got output like follows:</span>
-<span class="linenos">37</span><span class="c1"># Prompt: &#39;Hello, my name is&#39;, Generated text: &#39;\n\nJane Smith. I am a student pursuing my degree in Computer Science at [university]. I enjoy learning new things, especially technology and programming&#39;</span>
-<span class="linenos">38</span><span class="c1"># Prompt: &#39;The president of the United States is&#39;, Generated text: &#39;likely to nominate a new Supreme Court justice to fill the seat vacated by the death of Antonin Scalia. The Senate should vote to confirm the&#39;</span>
-<span class="linenos">39</span><span class="c1"># Prompt: &#39;The capital of France is&#39;, Generated text: &#39;Paris.&#39;</span>
-<span class="linenos">40</span><span class="c1"># Prompt: &#39;The future of AI is&#39;, Generated text: &#39;an exciting time for us. We are constantly researching, developing, and improving our platform to create the most advanced and efficient model available. We are&#39;</span>
+<span class="linenos">33</span>    <span class="n">asyncio</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">main</span><span class="p">())</span>
+<span class="linenos">34</span>
+<span class="linenos">35</span>    <span class="c1"># Got output like follows:</span>
+<span class="linenos">36</span>    <span class="c1"># Prompt: &#39;Hello, my name is&#39;, Generated text: &#39;\n\nJane Smith. I am a student pursuing my degree in Computer Science at [university]. I enjoy learning new things, especially technology and programming&#39;</span>
+<span class="linenos">37</span>    <span class="c1"># Prompt: &#39;The president of the United States is&#39;, Generated text: &#39;likely to nominate a new Supreme Court justice to fill the seat vacated by the death of Antonin Scalia. The Senate should vote to confirm the&#39;</span>
+<span class="linenos">38</span>    <span class="c1"># Prompt: &#39;The capital of France is&#39;, Generated text: &#39;Paris.&#39;</span>
+<span class="linenos">39</span>    <span class="c1"># Prompt: &#39;The future of AI is&#39;, Generated text: &#39;an exciting time for us. We are constantly researching, developing, and improving our platform to create the most advanced and efficient model available. We are&#39;</span>
+<span class="linenos">40</span>
+<span class="linenos">41</span>
+<span class="linenos">42</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
+<span class="linenos">43</span>    <span class="n">main</span><span class="p">()</span>
 </pre></div>
 </div>
 </section>
@@ -231,7 +237,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f9459b94e60>
+<jinja2.runtime.BlockReference object at 0x7fed9bc5eb40>
 
 <div class="footer">
     <p>

@@ -37,7 +37,7 @@ python3 tensorrt_llm/examples/hf_lora_convert.py -i Japanese-Alpaca-LoRA-7b-v0 -
 python3 tensorrt_llm/examples/hf_lora_convert.py -i luotuo-lora-7b-0.1 -o luotuo-lora-7b-0.1-weights --storage-type float16
 ```
 
-Refer to the [tensorrtllm_backend documentation](https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/inflight_batcher_llm/README.md) for a Multi-LoRA example using Triton.
+Refer to the [tensorrtllm_backend documentation](https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/docs/lora.md) for a Multi-LoRA example using Triton.
 
 ### LoRA tensor format details
 

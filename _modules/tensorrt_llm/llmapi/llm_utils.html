@@ -167,10 +167,13 @@
     <span class="s1">&#39;_ModelInfo&#39;</span><span class="p">,</span>
     <span class="s1">&#39;_ParallelConfig&#39;</span><span class="p">,</span>
     <span class="s1">&#39;_ModelFormatKind&#39;</span><span class="p">,</span>
+    <span class="s1">&#39;_ModelWrapper&#39;</span><span class="p">,</span>
     <span class="s1">&#39;BatchingType&#39;</span><span class="p">,</span>
     <span class="s1">&#39;ExecutorConfig&#39;</span><span class="p">,</span>
     <span class="s1">&#39;SchedulerConfig&#39;</span><span class="p">,</span>
     <span class="s1">&#39;KvCacheConfig&#39;</span><span class="p">,</span>
+    <span class="s1">&#39;LookaheadDecodingConfig&#39;</span><span class="p">,</span>
+    <span class="s1">&#39;MedusaDecodingConfig&#39;</span><span class="p">,</span>
     <span class="s1">&#39;ContextChunkingPolicy&#39;</span><span class="p">,</span>
     <span class="s1">&#39;CapacitySchedulerPolicy&#39;</span><span class="p">,</span>
     <span class="s1">&#39;BuildConfig&#39;</span><span class="p">,</span>
@@ -202,14 +205,17 @@
 <span class="kn">from</span> <span class="nn">..auto_parallel</span> <span class="kn">import</span> <span class="n">AutoParallelConfig</span><span class="p">,</span> <span class="n">infer_cluster_config</span>
 <span class="kn">from</span> <span class="nn">..bindings.executor</span> <span class="kn">import</span> <span class="p">(</span><span class="n">BatchingType</span><span class="p">,</span> <span class="n">CapacitySchedulerPolicy</span><span class="p">,</span>
                                  <span class="n">ContextChunkingPolicy</span><span class="p">,</span> <span class="n">DecodingConfig</span><span class="p">,</span>
-                                 <span class="n">ExecutorConfig</span><span class="p">,</span> <span class="n">KvCacheConfig</span><span class="p">,</span> <span class="n">PeftCacheConfig</span><span class="p">,</span>
+                                 <span class="n">DecodingMode</span><span class="p">,</span> <span class="n">ExecutorConfig</span><span class="p">,</span>
+                                 <span class="n">ExtendedRuntimePerfKnobConfig</span><span class="p">,</span> <span class="n">KvCacheConfig</span><span class="p">,</span>
+                                 <span class="n">LookaheadDecodingConfig</span><span class="p">,</span> <span class="n">PeftCacheConfig</span><span class="p">,</span>
                                  <span class="n">SchedulerConfig</span><span class="p">)</span>
 <span class="kn">from</span> <span class="nn">..builder</span> <span class="kn">import</span> <span class="p">(</span><span class="n">BuildConfig</span><span class="p">,</span> <span class="n">Engine</span><span class="p">,</span> <span class="n">EngineConfig</span><span class="p">,</span> <span class="n">_init_max_seq_len</span><span class="p">,</span>
                        <span class="n">build</span><span class="p">)</span>
 <span class="kn">from</span> <span class="nn">..logger</span> <span class="kn">import</span> <span class="n">logger</span>
 <span class="kn">from</span> <span class="nn">..mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
 <span class="kn">from</span> <span class="nn">..models.automodel</span> <span class="kn">import</span> <span class="n">MODEL_MAP</span><span class="p">,</span> <span class="n">AutoConfig</span><span class="p">,</span> <span class="n">AutoModelForCausalLM</span>
-<span class="kn">from</span> <span class="nn">..models.modeling_utils</span> <span class="kn">import</span> <span class="n">PretrainedConfig</span><span class="p">,</span> <span class="n">QuantAlgo</span><span class="p">,</span> <span class="n">QuantConfig</span>
+<span class="kn">from</span> <span class="nn">..models.modeling_utils</span> <span class="kn">import</span> <span class="p">(</span><span class="n">PretrainedConfig</span><span class="p">,</span> <span class="n">QuantAlgo</span><span class="p">,</span> <span class="n">QuantConfig</span><span class="p">,</span>
+                                     <span class="n">SpeculativeDecodingMode</span><span class="p">)</span>
 <span class="kn">from</span> <span class="nn">..module</span> <span class="kn">import</span> <span class="n">Module</span>
 <span class="kn">from</span> <span class="nn">.build_cache</span> <span class="kn">import</span> <span class="p">(</span><span class="n">BuildCache</span><span class="p">,</span> <span class="n">BuildCacheConfig</span><span class="p">,</span> <span class="n">CachedStage</span><span class="p">,</span>
                           <span class="n">get_build_cache_config_from_env</span><span class="p">)</span>
@@ -227,8 +233,10 @@
 <span class="w">    </span><span class="sd">&#39;&#39;&#39; The model distribution configs for LLM.  &#39;&#39;&#39;</span>
     <span class="n">tp_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
     <span class="n">pp_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
+    <span class="n">cp_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
     <span class="n">moe_tp_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
     <span class="n">moe_ep_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
+    <span class="n">cp_config</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
     <span class="n">auto_parallel</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
     <span class="n">_world_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
@@ -250,8 +258,9 @@
 
     <span class="nd">@property</span>
     <span class="k">def</span> <span class="nf">world_size</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">auto_parallel</span><span class="p">:</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">pp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">pp_size</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">cp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
                 <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
                     <span class="s2">&quot;manually TP and PP are not supported in auto parallel mode.&quot;</span>
                 <span class="p">)</span>
@@ -260,18 +269,16 @@
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_world_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
                 <span class="s2">&quot;world_size &gt; 1 is only supported in auto parallel mode.&quot;</span><span class="p">)</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">pp_size</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">pp_size</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">cp_size</span>
 
     <span class="nd">@world_size</span><span class="o">.</span><span class="n">setter</span>
     <span class="k">def</span> <span class="nf">world_size</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">world_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">auto_parallel</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_world_size</span> <span class="o">=</span> <span class="n">world_size</span>
         <span class="k">elif</span> <span class="p">(</span><span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">auto_parallel</span>
-              <span class="p">)</span> <span class="ow">and</span> <span class="n">world_size</span> <span class="o">!=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">pp_size</span><span class="p">:</span>
+              <span class="p">)</span> <span class="ow">and</span> <span class="n">world_size</span> <span class="o">!=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">pp_size</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">cp_size</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">&quot;world_size </span><span class="si">{</span><span class="n">world_size</span><span class="si">}</span><span class="s2"> should be equal to tp_size * pp_size </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="bp">self</span><span class="o">.</span><span class="n">pp_size</span><span class="si">}</span><span class="s2"> &quot;</span>
-                <span class="s2">&quot;in non-auto_parallel mode.</span><span class="se">\n</span><span class="s2">&quot;</span>
-                <span class="s2">&quot;For non-auto-parallel mode, the world_size is not needed to set&quot;</span>
+                <span class="sa">f</span><span class="s2">&quot;world_size </span><span class="si">{</span><span class="n">world_size</span><span class="si">}</span><span class="s2"> should be equal to tp_size * pp_size </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="bp">self</span><span class="o">.</span><span class="n">pp_size</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="bp">self</span><span class="o">.</span><span class="n">cp_size</span><span class="si">}</span><span class="s2"> &quot;</span>
             <span class="p">)</span>
 
     <span class="nd">@property</span>
@@ -355,6 +362,55 @@
         <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">()</span>
 
 
+<div class="viewcode-block" id="MedusaDecodingConfig">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span> <span class="nc">MedusaDecodingConfig</span><span class="p">:</span>
+    <span class="n">medusa_choices</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">num_medusa_heads</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span></div>
+
+
+
+<span class="nd">@dataclass</span>
+<span class="k">class</span> <span class="nc">_ModelWrapper</span><span class="p">:</span>
+    <span class="n">model</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Path</span><span class="p">]</span>
+
+    <span class="k">def</span> <span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;model should be provided.&quot;</span><span class="p">)</span>
+        <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">,</span>
+                          <span class="p">(</span><span class="nb">str</span><span class="p">,</span> <span class="n">Path</span><span class="p">)),</span> <span class="sa">f</span><span class="s2">&quot;Invalid model: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="si">}</span><span class="s2">&quot;</span>
+
+        <span class="n">model_dir</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">model_dir</span><span class="o">.</span><span class="n">exists</span><span class="p">()</span> <span class="ow">and</span> <span class="n">model_dir</span><span class="o">.</span><span class="n">is_dir</span><span class="p">():</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">model</span> <span class="o">=</span> <span class="n">model_dir</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span> <span class="nf">is_hub_model</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">return</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_local_model</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span> <span class="nf">is_local_model</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">return</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">,</span> <span class="n">Path</span><span class="p">)</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span> <span class="nf">model_dir</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Path</span><span class="p">:</span>
+        <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_local_model</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;model_dir is only available for local model, </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="si">}</span><span class="s2">.&quot;</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">model</span>
+
+    <span class="nd">@model_dir</span><span class="o">.</span><span class="n">setter</span>
+    <span class="k">def</span> <span class="nf">model_dir</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">model_dir</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Path</span><span class="p">]):</span>
+        <span class="n">model_dir</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">model_dir</span><span class="p">)</span>
+        <span class="k">assert</span> <span class="n">model_dir</span><span class="o">.</span><span class="n">exists</span><span class="p">()</span> <span class="ow">and</span> <span class="n">model_dir</span><span class="o">.</span><span class="n">is_dir</span><span class="p">(</span>
+        <span class="p">),</span> <span class="sa">f</span><span class="s2">&quot;model_dir is not a valid path, </span><span class="si">{</span><span class="n">model_dir</span><span class="si">}</span><span class="s2">&quot;</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">model</span> <span class="o">=</span> <span class="n">model_dir</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span> <span class="nf">model_name</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Path</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">model</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span> <span class="k">else</span> <span class="kc">None</span>
+
+
 <span class="c1"># The docstring for LlmArgs and LLM; will be appended to the two classes&#39; apidocs.</span>
 <span class="n">LLMARGS_DOCSTRING</span> <span class="o">=</span> <span class="sa">r</span><span class="s2">&quot;&quot;&quot;</span>
 <span class="s2">        model (str or Path): The model name or a local model directory.</span>
@@ -390,6 +446,8 @@
 
 <span class="s2">        pipeline_parallel_size (int): The pipeline parallel size. Defaults to 1.</span>
 
+<span class="s2">        context_parallel_size (int): The context parallel size. Defaults to 1.</span>
+
 <span class="s2">        load_format (Literal[&#39;auto&#39;, &#39;dummy&#39;]): The format of the model weights to load.</span>
 <span class="s2">            * &#39;auto&#39; will try to load the weights from the provided checkpoint.</span>
 <span class="s2">            * &#39;dummy&#39; will initialize the weights with random values, which is mainly for profiling.</span>
@@ -421,6 +479,8 @@
 
 <span class="s2">        decoding_config (DecodingConfig, optional): The decoding configuration for the model. Defaults to None.</span>
 
+<span class="s2">        guided_decoding_backend (str, optional): The guided decoding backend, currently supports &#39;xgrammar&#39;. Defaults to None.</span>
+
 <span class="s2">        logits_post_processor_map (Dict[str, Callable], optional): A map of logit post-processing functions. Defaults to None.</span>
 
 <span class="s2">        iter_stats_max_iterations (int, optional): The maximum number of iterations for iteration statistics. Defaults to None.</span>
@@ -430,8 +490,6 @@
 <span class="s2">        workspace(str, optional): The directory to store intermediate files. Defaults to None.</span>
 
 <span class="s2">        embedding_parallel_mode (str): The parallel mode for embeddings. Defaults to &#39;SHARDING_ALONG_VOCAB&#39;.</span>
-
-<span class="s2">        share_embedding_table (bool): Whether to share the embedding table. Defaults to False.</span>
 
 <span class="s2">        auto_parallel (bool): Enable auto parallel mode. Defaults to False.</span>
 
@@ -451,12 +509,20 @@
 
 <span class="s2">        scheduler_config (SchedulerConfig, optional): The scheduler configuration for the model. Defaults to None.</span>
 
+<span class="s2">        speculative_config (LookaheadDecodingConfig or other speculative configurations, optional): The speculative decoding configuration. Defaults to None.</span>
+
 <span class="s2">        batching_type (BatchingType, optional): The batching type for the model. Defaults to None.</span>
 
 <span class="s2">        normalize_log_probs (bool): Whether to normalize log probabilities for the model. Defaults to False.</span>
 
 <span class="s2">        enable_processes_for_single_gpu (bool): Whether to enable processes for single GPU, Defaults to False.</span>
 <span class="s2">            This helps to improve the streaming generation performance.</span>
+
+<span class="s2">        max_batch_size (int, optional): The maximum batch size for runtime. Defaults to None.</span>
+
+<span class="s2">        max_num_tokens (int, optional): The maximum number of tokens for runtime. Defaults to None.</span>
+
+<span class="s2">        extended_runtime_perf_knob_config (ExtendedRuntimePerfKnobConfig, optional): The extended runtime performance knob configuration for the model. Defaults to None.</span>
 
 <span class="s2">&quot;&quot;&quot;</span>
 
@@ -470,6 +536,8 @@
 <span class="sd">    &quot;&quot;&quot;</span>
     <span class="c1"># Explicit arguments</span>
     <span class="n">model</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Path</span><span class="p">]</span>
+
+    <span class="n">speculative_model</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Path</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="n">tokenizer</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Path</span><span class="p">,</span> <span class="n">TokenizerBase</span><span class="p">,</span>
                               <span class="n">PreTrainedTokenizerBase</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
@@ -491,9 +559,13 @@
     <span class="c1"># Below are all remaining arguments</span>
     <span class="n">pipeline_parallel_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
 
+    <span class="n">context_parallel_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
+
     <span class="n">moe_tensor_parallel_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="n">moe_expert_parallel_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="n">cp_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
 
     <span class="n">auto_parallel</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
@@ -533,6 +605,8 @@
     <span class="c1"># TODO[enweiz]: this might affect medusa, and could be removed in the future for API consistency</span>
     <span class="n">decoding_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">DecodingConfig</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
 
+    <span class="n">guided_decoding_backend</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+
     <span class="n">logits_post_processor_map</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Callable</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="n">iter_stats_max_iterations</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
@@ -544,8 +618,6 @@
     <span class="c1"># A handful of options from PretrainedConfig</span>
     <span class="n">embedding_parallel_mode</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s1">&#39;SHARDING_ALONG_VOCAB&#39;</span>
 
-    <span class="n">share_embedding_table</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
-
     <span class="n">fast_build</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
     <span class="c1"># Once set, the model will reuse the build_cache</span>
@@ -555,14 +627,24 @@
 
     <span class="n">scheduler_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">SchedulerConfig</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
 
+    <span class="c1"># Speculative decoding parameters</span>
+    <span class="n">speculative_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="n">LookaheadDecodingConfig</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
+
     <span class="n">batching_type</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">BatchingType</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="n">normalize_log_probs</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
+    <span class="n">extended_runtime_perf_knob_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span>
+        <span class="n">ExtendedRuntimePerfKnobConfig</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="c1"># TODO: remove this option in the future</span>
     <span class="n">use_runtime_defaults</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
 
     <span class="c1"># TODO[chunweiy]: Enable this by default and remove the option in the future</span>
     <span class="n">enable_processes_for_single_gpu</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+
+    <span class="n">max_batch_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">max_num_tokens</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="c1"># PIVOT_TO_PYTHON_START</span>
     <span class="c1"># backend to use</span>
@@ -603,8 +685,10 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">parallel_config</span> <span class="o">=</span> <span class="n">_ParallelConfig</span><span class="p">(</span>
             <span class="n">tp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tensor_parallel_size</span><span class="p">,</span>
             <span class="n">pp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">pipeline_parallel_size</span><span class="p">,</span>
+            <span class="n">cp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">context_parallel_size</span><span class="p">,</span>
             <span class="n">moe_tp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_tensor_parallel_size</span><span class="p">,</span>
             <span class="n">moe_ep_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_expert_parallel_size</span><span class="p">,</span>
+            <span class="n">cp_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">cp_config</span><span class="p">,</span>
             <span class="n">auto_parallel</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">auto_parallel</span><span class="p">)</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">auto_parallel</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">world_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">auto_parallel_world_size</span>
@@ -662,8 +746,6 @@
         <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">,</span>
                           <span class="p">(</span><span class="nb">str</span><span class="p">,</span> <span class="n">Path</span><span class="p">)),</span> <span class="sa">f</span><span class="s2">&quot;Invalid model: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="si">}</span><span class="s2">&quot;</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">_check_model_or_model_dir</span><span class="p">()</span>
-
         <span class="bp">self</span><span class="o">.</span><span class="n">_setup_embedding_parallel_mode</span><span class="p">()</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_build_cache</span><span class="p">:</span>
@@ -672,16 +754,20 @@
             <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_build_cache</span><span class="p">,</span> <span class="n">BuildCacheConfig</span><span class="p">):</span>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                     <span class="sa">f</span><span class="s2">&quot;Invalid build_cache_config: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_build_cache</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
-
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_local_model</span><span class="p">:</span>
+        <span class="n">model_obj</span> <span class="o">=</span> <span class="n">_ModelWrapper</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">)</span>
+        <span class="n">speculative_model_obj</span> <span class="o">=</span> <span class="n">_ModelWrapper</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">speculative_model</span>
+        <span class="p">)</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_model</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">model_obj</span><span class="o">.</span><span class="n">is_local_model</span><span class="p">:</span>
             <span class="c1"># Load parallel_config from the engine.</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">model_format</span> <span class="o">=</span> <span class="n">ModelLoader</span><span class="o">.</span><span class="n">get_model_format</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model_dir</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">model_format</span> <span class="o">=</span> <span class="n">ModelLoader</span><span class="o">.</span><span class="n">get_model_format</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">)</span>
+
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_format</span> <span class="ow">is</span> <span class="n">_ModelFormatKind</span><span class="o">.</span><span class="n">TLLM_ENGINE</span><span class="p">:</span>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">build_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                     <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
                         <span class="s2">&quot;The build_config is ignored for model format of TLLM_ENGINE.&quot;</span>
                     <span class="p">)</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">_load_config_from_engine</span><span class="p">(</span><span class="n">Path</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model_dir</span><span class="p">))</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_load_config_from_engine</span><span class="p">(</span><span class="n">model_obj</span><span class="o">.</span><span class="n">model_dir</span><span class="p">)</span>
                 <span class="n">runtime_defaults</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pretrained_config</span><span class="o">.</span><span class="n">runtime_defaults</span>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_runtime_defaults</span> <span class="ow">and</span> <span class="n">runtime_defaults</span><span class="p">:</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">fill_empty_fields_from_runtime_defaults</span><span class="p">(</span>
@@ -689,9 +775,12 @@
 
             <span class="c1"># Load parallel_config from the checkpoint.</span>
             <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_format</span> <span class="ow">is</span> <span class="n">_ModelFormatKind</span><span class="o">.</span><span class="n">TLLM_CKPT</span><span class="p">:</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">_load_config_from_ckpt</span><span class="p">(</span><span class="n">Path</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model_dir</span><span class="p">))</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_load_config_from_ckpt</span><span class="p">(</span><span class="n">model_obj</span><span class="o">.</span><span class="n">model_dir</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">model_format</span> <span class="o">=</span> <span class="n">_ModelFormatKind</span><span class="o">.</span><span class="n">HF</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_model</span> <span class="ow">and</span> <span class="n">speculative_model_obj</span><span class="o">.</span><span class="n">is_local_model</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">speculative_model_format</span> <span class="o">=</span> <span class="n">_ModelFormatKind</span><span class="o">.</span><span class="n">HF</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">quant_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_config</span> <span class="ow">or</span> <span class="n">QuantConfig</span><span class="p">()</span>
 
@@ -717,6 +806,26 @@
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">perform_config_arbitration</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_perform_config_arbitration</span><span class="p">()</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">:</span>
+            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span> <span class="n">LookaheadDecodingConfig</span><span class="p">):</span>
+                <span class="n">lookahead_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span>
+                <span class="c1"># Update the build config</span>
+                <span class="n">_</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">max_draft_tokens</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">lookahead_config</span><span class="o">.</span><span class="n">calculate_speculative_resource</span><span class="p">(</span>
+                <span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">speculative_decoding_mode</span> <span class="o">=</span> <span class="n">SpeculativeDecodingMode</span><span class="o">.</span><span class="n">LOOKAHEAD_DECODING</span>
+                <span class="k">if</span> <span class="n">max_draft_tokens</span> <span class="o">&gt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_draft_len</span><span class="p">:</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">=</span> <span class="n">max_draft_tokens</span>
+
+                <span class="bp">self</span><span class="o">.</span><span class="n">decoding_config</span> <span class="o">=</span> <span class="n">DecodingConfig</span><span class="p">(</span>
+                    <span class="n">decoding_mode</span><span class="o">=</span><span class="n">DecodingMode</span><span class="o">.</span><span class="n">Lookahead</span><span class="p">(),</span>
+                    <span class="n">lookahead_decoding_config</span><span class="o">=</span><span class="n">lookahead_config</span><span class="p">)</span>
+            <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span> <span class="n">MedusaDecodingConfig</span><span class="p">):</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">decoding_config</span> <span class="o">=</span> <span class="n">DecodingConfig</span><span class="p">(</span>
+                    <span class="n">decoding_mode</span><span class="o">=</span><span class="n">DecodingMode</span><span class="o">.</span><span class="n">Medusa</span><span class="p">(),</span>
+                    <span class="n">medusa_choices</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">medusa_choices</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Speculative config type not recognized&quot;</span><span class="p">)</span>
 
     <span class="k">def</span> <span class="nf">_perform_config_arbitration</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&#39;&#39;&#39;</span>
@@ -754,28 +863,6 @@
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_config_arbitrator</span> <span class="o">=</span> <span class="kc">None</span>
 
-    <span class="k">def</span> <span class="nf">_check_model_or_model_dir</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;model should be provided.&quot;</span><span class="p">)</span>
-        <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">,</span>
-                          <span class="p">(</span><span class="nb">str</span><span class="p">,</span> <span class="n">Path</span><span class="p">)),</span> <span class="sa">f</span><span class="s2">&quot;Invalid model: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="si">}</span><span class="s2">&quot;</span>
-        <span class="n">model_dir</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">model_dir</span><span class="o">.</span><span class="n">exists</span><span class="p">()</span> <span class="ow">and</span> <span class="n">model_dir</span><span class="o">.</span><span class="n">is_dir</span><span class="p">():</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">model</span> <span class="o">=</span> <span class="n">model_dir</span>
-
-    <span class="nd">@property</span>
-    <span class="k">def</span> <span class="nf">is_local_model</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-        <span class="k">return</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">,</span> <span class="n">Path</span><span class="p">)</span>
-
-    <span class="nd">@property</span>
-    <span class="k">def</span> <span class="nf">is_hub_model</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-        <span class="k">return</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_local_model</span>
-
-    <span class="nd">@property</span>
-    <span class="k">def</span> <span class="nf">model_dir</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Path</span><span class="p">:</span>
-        <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_local_model</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;model_dir is only available for local model, </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="si">}</span><span class="s2">.&quot;</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">model</span>
-
     <span class="nd">@property</span>
     <span class="k">def</span> <span class="nf">build_config_mutable</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_format</span> <span class="ow">is</span> <span class="ow">not</span> <span class="n">_ModelFormatKind</span><span class="o">.</span><span class="n">TLLM_ENGINE</span>
@@ -798,8 +885,13 @@
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">&quot;pp_size </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">pp_size</span><span class="si">}</span><span class="s2"> is not consistent with the engine&#39;s pp_size </span><span class="si">{</span><span class="n">mapping</span><span class="o">.</span><span class="n">pp_size</span><span class="si">}</span><span class="s2">&quot;</span>
             <span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">cp_size</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">mapping</span><span class="o">.</span><span class="n">cp_size</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;cp_size </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">cp_size</span><span class="si">}</span><span class="s2"> is not consistent with the engine&#39;s cp_size </span><span class="si">{</span><span class="n">mapping</span><span class="o">.</span><span class="n">cp_size</span><span class="si">}</span><span class="s2">&quot;</span>
+            <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">parallel_config</span> <span class="o">=</span> <span class="n">_ParallelConfig</span><span class="p">(</span><span class="n">tp_size</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
                                                <span class="n">pp_size</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">pp_size</span><span class="p">,</span>
+                                               <span class="n">cp_size</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">cp_size</span><span class="p">,</span>
                                                <span class="n">moe_tp_size</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">moe_tp_size</span><span class="p">,</span>
                                                <span class="n">moe_ep_size</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">moe_ep_size</span><span class="p">)</span>
 
@@ -808,6 +900,7 @@
                                                             <span class="s2">&quot;config.json&quot;</span><span class="p">)</span>
         <span class="n">tp_size</span> <span class="o">=</span> <span class="n">pretrained_config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span>
         <span class="n">pp_size</span> <span class="o">=</span> <span class="n">pretrained_config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">pp_size</span>
+        <span class="n">cp_size</span> <span class="o">=</span> <span class="n">pretrained_config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">cp_size</span>
         <span class="n">moe_tp_size</span> <span class="o">=</span> <span class="n">pretrained_config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">moe_tp_size</span>
         <span class="n">moe_ep_size</span> <span class="o">=</span> <span class="n">pretrained_config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">moe_ep_size</span>
         <span class="n">world_size</span> <span class="o">=</span> <span class="n">pretrained_config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">world_size</span>
@@ -821,6 +914,10 @@
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">&quot;pp_size </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">pp_size</span><span class="si">}</span><span class="s2"> is not consistent with the checkpoint&#39;s pp_size </span><span class="si">{</span><span class="n">pp_size</span><span class="si">}</span><span class="s2">&quot;</span>
             <span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">cp_size</span> <span class="o">!=</span> <span class="mi">1</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">cp_size</span> <span class="o">!=</span> <span class="n">cp_size</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;cp_size </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">cp_size</span><span class="si">}</span><span class="s2"> is not consistent with the checkpoint&#39;s cp_size </span><span class="si">{</span><span class="n">cp_size</span><span class="si">}</span><span class="s2">&quot;</span>
+            <span class="p">)</span>
         <span class="k">if</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">auto_parallel</span>
                 <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">world_size</span> <span class="o">!=</span> <span class="mi">1</span> <span class="ow">and</span> <span class="n">world_size</span> <span class="o">!=</span> <span class="mi">1</span><span class="p">):</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
@@ -829,6 +926,7 @@
         <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">auto_parallel</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">parallel_config</span> <span class="o">=</span> <span class="n">_ParallelConfig</span><span class="p">(</span><span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
                                                    <span class="n">pp_size</span><span class="o">=</span><span class="n">pp_size</span><span class="p">,</span>
+                                                   <span class="n">cp_size</span><span class="o">=</span><span class="n">cp_size</span><span class="p">,</span>
                                                    <span class="n">moe_tp_size</span><span class="o">=</span><span class="n">moe_tp_size</span><span class="p">,</span>
                                                    <span class="n">moe_ep_size</span><span class="o">=</span><span class="n">moe_ep_size</span><span class="p">)</span>
 
@@ -845,9 +943,6 @@
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">&quot;Invalid embedding_parallel_mode: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">embedding_parallel_mode</span><span class="si">}</span><span class="s2">&quot;</span>
             <span class="p">)</span>
-
-        <span class="bp">self</span><span class="o">.</span><span class="n">_convert_checkpoint_options</span><span class="p">[</span>
-            <span class="s1">&#39;share_embedding_table&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">share_embedding_table</span>
 
     <span class="k">def</span> <span class="nf">_setup_build_config_into_config_arbitrator</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="c1"># Setup the ConfigArbitrator with the plugin_config, the runtime configs such as KvCacheConfig should not be</span>
@@ -1092,12 +1187,17 @@
         <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">build_config</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">build_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">build_config</span>
 
+        <span class="bp">self</span><span class="o">.</span><span class="n">model_obj</span> <span class="o">=</span> <span class="n">_ModelWrapper</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">model</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">speculative_model_obj</span> <span class="o">=</span> <span class="n">_ModelWrapper</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">speculative_model</span>
+        <span class="p">)</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">speculative_model</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">convert_checkpoint_options</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">_convert_checkpoint_options</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">rank</span> <span class="o">=</span> <span class="n">mpi_rank</span><span class="p">()</span> <span class="k">if</span> <span class="n">llm_args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">is_multi_gpu</span> <span class="k">else</span> <span class="mi">0</span>
         <span class="k">if</span> <span class="n">llm_args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">is_multi_gpu</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">llm_args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">auto_parallel</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span> <span class="o">=</span> <span class="n">Mapping</span><span class="p">(</span>
                 <span class="n">tp_size</span><span class="o">=</span><span class="n">llm_args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
                 <span class="n">pp_size</span><span class="o">=</span><span class="n">llm_args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">pp_size</span><span class="p">,</span>
+                <span class="n">cp_size</span><span class="o">=</span><span class="n">llm_args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">cp_size</span><span class="p">,</span>
                 <span class="n">moe_tp_size</span><span class="o">=</span><span class="n">llm_args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">moe_tp_size</span><span class="p">,</span>
                 <span class="n">moe_ep_size</span><span class="o">=</span><span class="n">llm_args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">moe_ep_size</span><span class="p">,</span>
                 <span class="n">rank</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">rank</span><span class="p">,</span>
@@ -1110,9 +1210,11 @@
 
         <span class="c1"># For model from hub, the _model_dir is None, and will updated once downloaded</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_model_dir</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span>
-            <span class="n">Path</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">model_dir</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">is_local_model</span> <span class="k">else</span> <span class="kc">None</span>
+            <span class="n">Path</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_obj</span><span class="o">.</span><span class="n">model_dir</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_obj</span><span class="o">.</span><span class="n">is_local_model</span> <span class="k">else</span> <span class="kc">None</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">_speculative_model_dir</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span>
+            <span class="n">PATH</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_model_obj</span><span class="o">.</span><span class="n">model_dir</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_model_obj</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_obj</span><span class="o">.</span><span class="n">is_local_model</span> <span class="k">else</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_model_info</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">_ModelInfo</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_model_name</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">model</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_model_format</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">model_format</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">auto_parallel_config</span> <span class="o">=</span> <span class="n">AutoParallelConfig</span><span class="p">(</span>
@@ -1137,9 +1239,12 @@
                  <span class="bp">self</span><span class="o">.</span><span class="n">_build_engine_from_inmemory_model</span><span class="p">))</span>
             <span class="k">return</span>
 
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">is_hub_model</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_model_format</span> <span class="ow">is</span> <span class="ow">not</span> <span class="n">_ModelFormatKind</span><span class="o">.</span><span class="n">TLLM_ENGINE</span><span class="p">:</span>
+        <span class="k">if</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model_obj</span><span class="o">.</span><span class="n">is_hub_model</span>
+                <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_model_format</span> <span class="ow">is</span> <span class="ow">not</span> <span class="n">_ModelFormatKind</span><span class="o">.</span><span class="n">TLLM_ENGINE</span><span class="p">)</span> <span class="ow">or</span> <span class="p">(</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">speculative_model_obj</span>
+                    <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_model_obj</span><span class="o">.</span><span class="n">is_hub_model</span><span class="p">):</span>
             <span class="c1"># Download HF model if necessary</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">model</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_obj</span><span class="o">.</span><span class="n">model_name</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                     <span class="s2">&quot;Either model_dir or model should be provided to ModelConfig.&quot;</span>
                 <span class="p">)</span>
@@ -1233,7 +1338,7 @@
 <span class="sd">        The engine_dir is the path to save the built engine.</span>
 <span class="sd">        &#39;&#39;&#39;</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">model_format</span> <span class="ow">is</span> <span class="n">_ModelFormatKind</span><span class="o">.</span><span class="n">TLLM_ENGINE</span><span class="p">:</span>
-            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">model_dir</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_obj</span><span class="o">.</span><span class="n">model_dir</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">is_multi_gpu</span><span class="p">:</span>
             <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">set_device</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">rank</span><span class="p">)</span>
@@ -1253,7 +1358,7 @@
             <span class="n">mapping</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="p">,</span>
             <span class="n">model_info</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_model_info</span><span class="p">,</span>
         <span class="p">)</span>
-        <span class="n">ModelLoader</span><span class="o">.</span><span class="n">save</span><span class="p">(</span><span class="n">runtime_context</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">model_dir</span><span class="p">,</span> <span class="n">engine_dir</span><span class="p">)</span>
+        <span class="n">ModelLoader</span><span class="o">.</span><span class="n">save</span><span class="p">(</span><span class="n">runtime_context</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_obj</span><span class="o">.</span><span class="n">model_dir</span><span class="p">,</span> <span class="n">engine_dir</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">engine_dir</span>
 
     <span class="k">def</span> <span class="fm">__enter__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
@@ -1340,21 +1445,34 @@
         <span class="c1"># Only the rank0 are allowed to download model</span>
         <span class="k">if</span> <span class="n">mpi_rank</span><span class="p">()</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
             <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">_workspace</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
-            <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">model</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span>
+            <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model_obj</span><span class="o">.</span><span class="n">model_name</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span>
             <span class="c1"># this will download only once when multiple MPI processes are running</span>
-            <span class="n">model_dir</span> <span class="o">=</span> <span class="n">download_hf_model</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">model</span><span class="p">,</span>
+
+            <span class="n">model_dir</span> <span class="o">=</span> <span class="n">download_hf_model</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model_obj</span><span class="o">.</span><span class="n">model_name</span><span class="p">,</span>
                                           <span class="n">revision</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">revision</span><span class="p">)</span>
             <span class="n">print_colored</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Downloaded model to </span><span class="si">{</span><span class="n">model_dir</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span> <span class="s1">&#39;grey&#39;</span><span class="p">)</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_model_obj</span><span class="p">:</span>
+                <span class="n">speculative_model_dir</span> <span class="o">=</span> <span class="n">download_hf_model</span><span class="p">(</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">speculative_model_obj</span><span class="o">.</span><span class="n">model_name</span><span class="p">)</span>
+                <span class="n">print_colored</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Downloaded model to </span><span class="si">{</span><span class="n">speculative_model_dir</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
+                              <span class="s1">&#39;grey&#39;</span><span class="p">)</span>
         <span class="c1"># Make all the processes got the same model_dir</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_model_dir</span> <span class="o">=</span> <span class="n">mpi_broadcast</span><span class="p">(</span><span class="n">model_dir</span><span class="p">,</span> <span class="n">root</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">model</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_model_dir</span><span class="p">)</span>  <span class="c1"># mark as a local model</span>
-        <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">is_local_model</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">model_obj</span><span class="o">.</span><span class="n">model_dir</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_model_dir</span>  <span class="c1"># mark as a local model</span>
+        <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_obj</span><span class="o">.</span><span class="n">is_local_model</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_model_obj</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_speculative_model_dir</span> <span class="o">=</span> <span class="n">mpi_broadcast</span><span class="p">(</span><span class="n">speculative_model_dir</span><span class="p">,</span>
+                                                        <span class="n">root</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">speculative_model_dir</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_speculative_model_dir</span>
+            <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_model_obj</span><span class="o">.</span><span class="n">is_local_model</span>
 
     <span class="k">def</span> <span class="nf">_load_model_from_hf</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&#39;&#39;&#39; Load a TRT-LLM model from a HF model. &#39;&#39;&#39;</span>
         <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">_model_dir</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
         <span class="n">model_cls</span> <span class="o">=</span> <span class="n">AutoModelForCausalLM</span><span class="o">.</span><span class="n">get_trtllm_model_class</span><span class="p">(</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_model_dir</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">trust_remote_code</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_model_dir</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">trust_remote_code</span><span class="p">,</span>
+            <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="p">,</span> <span class="s2">&quot;speculative_model&quot;</span><span class="p">)</span>
+            <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">speculative_model</span><span class="p">)</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">load_format</span> <span class="o">==</span> <span class="s1">&#39;dummy&#39;</span><span class="p">:</span>
             <span class="n">config</span> <span class="o">=</span> <span class="n">model_cls</span><span class="o">.</span><span class="n">config_class</span><span class="o">.</span><span class="n">from_hugging_face</span><span class="p">(</span>
                 <span class="nb">str</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_model_dir</span><span class="p">),</span>
@@ -1390,6 +1508,10 @@
                 <span class="n">load_model_on_cpu</span><span class="o">=</span>
                 <span class="kc">True</span><span class="p">,</span>  <span class="c1"># TODO:TRTLLM-195 to enhance the weights loading memory usage and chose best location</span>
                 <span class="n">trust_remote_code</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">trust_remote_code</span><span class="p">,</span>
+                <span class="n">speculative_model</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_speculative_model_dir</span><span class="p">,</span>
+                <span class="n">medusa_num_heads</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span>
+                <span class="n">num_medusa_heads</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span>
+                                               <span class="n">MedusaDecodingConfig</span><span class="p">)</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
                 <span class="o">**</span><span class="bp">self</span><span class="o">.</span><span class="n">convert_checkpoint_options</span><span class="p">,</span>
             <span class="p">)</span>
 
@@ -1416,9 +1538,7 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">_model_info</span> <span class="o">=</span> <span class="n">_ModelInfo</span><span class="o">.</span><span class="n">from_pretrained_config</span><span class="p">(</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">pretrained_config</span><span class="p">)</span>
 
-        <span class="c1"># load embedding sharing related options</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">convert_checkpoint_options</span><span class="p">[</span>
-            <span class="s1">&#39;share_embedding_table&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">share_embedding_table</span>
+        <span class="c1"># load parallel embedding related options</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">convert_checkpoint_options</span><span class="p">[</span>
             <span class="s1">&#39;use_parallel_embedding&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">use_parallel_embedding</span>
 
@@ -1526,23 +1646,27 @@
                 <span class="bp">self</span><span class="o">.</span><span class="n">_workspace</span><span class="p">)</span>
 
     <span class="k">def</span> <span class="fm">__call__</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Path</span><span class="p">,</span> <span class="n">Union</span><span class="p">[</span><span class="n">Path</span><span class="p">,</span> <span class="kc">None</span><span class="p">]]:</span>
+
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">model_format</span> <span class="ow">is</span> <span class="n">_ModelFormatKind</span><span class="o">.</span><span class="n">TLLM_ENGINE</span><span class="p">:</span>
-            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">model_dir</span><span class="p">,</span> <span class="kc">None</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">model</span><span class="p">,</span> <span class="kc">None</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">engine_cache_stage</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">CachedStage</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span> <span class="o">=</span> <span class="kc">None</span>
 
+        <span class="bp">self</span><span class="o">.</span><span class="n">model_loader</span> <span class="o">=</span> <span class="n">ModelLoader</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="p">)</span>
+
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">build_cache_enabled</span><span class="p">:</span>
             <span class="n">print_colored</span><span class="p">(</span><span class="s2">&quot;Build cache is enabled.</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span> <span class="s1">&#39;yellow&#39;</span><span class="p">)</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">is_hub_model</span><span class="p">:</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_loader</span><span class="o">.</span><span class="n">model_obj</span><span class="o">.</span><span class="n">is_hub_model</span><span class="p">:</span>
                 <span class="c1"># This will download the config.json from HF model hub, this helps to create a PretrainedConfig for</span>
                 <span class="c1"># cache key.</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span> <span class="o">=</span> <span class="n">download_hf_pretrained_config</span><span class="p">(</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">model</span><span class="p">,</span> <span class="n">revision</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">revision</span><span class="p">)</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">model_loader</span><span class="o">.</span><span class="n">model_obj</span><span class="o">.</span><span class="n">model_name</span><span class="p">,</span>
+                    <span class="n">revision</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">revision</span><span class="p">)</span>
 
-            <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">is_local_model</span><span class="p">:</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">model_dir</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">model_format</span> <span class="ow">is</span> <span class="n">_ModelFormatKind</span><span class="o">.</span><span class="n">HF</span> <span class="k">else</span> <span class="kc">None</span>
+            <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_loader</span><span class="o">.</span><span class="n">model_obj</span><span class="o">.</span><span class="n">is_local_model</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_loader</span><span class="o">.</span><span class="n">model_obj</span><span class="o">.</span><span class="n">model_dir</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">model_format</span> <span class="ow">is</span> <span class="n">_ModelFormatKind</span><span class="o">.</span><span class="n">HF</span> <span class="k">else</span> <span class="kc">None</span>
 
             <span class="bp">self</span><span class="o">.</span><span class="n">engine_cache_stage</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_get_engine_cache_stage</span><span class="p">()</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">engine_cache_stage</span><span class="o">.</span><span class="n">is_cached</span><span class="p">():</span>
@@ -1550,8 +1674,9 @@
                 <span class="n">print_colored</span><span class="p">(</span>
                     <span class="sa">f</span><span class="s2">&quot;Reusing cached engine in </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">engine_cache_stage</span><span class="o">.</span><span class="n">get_engine_path</span><span class="p">()</span><span class="si">}</span><span class="se">\n\n</span><span class="s2">&quot;</span><span class="p">,</span>
                     <span class="s1">&#39;grey&#39;</span><span class="p">)</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">model</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">engine_cache_stage</span><span class="o">.</span><span class="n">get_engine_path</span><span class="p">()</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">llm_build_stats</span><span class="o">.</span><span class="n">engine_dir</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">model_dir</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">model_loader</span><span class="o">.</span><span class="n">model_obj</span><span class="o">.</span><span class="n">model_dir</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">engine_cache_stage</span><span class="o">.</span><span class="n">get_engine_path</span><span class="p">(</span>
+                <span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">llm_build_stats</span><span class="o">.</span><span class="n">engine_dir</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_loader</span><span class="o">.</span><span class="n">model_obj</span><span class="o">.</span><span class="n">model_dir</span>
                 <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_build_stats</span><span class="o">.</span><span class="n">engine_dir</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span>
 
         <span class="c1"># PIVOT_TO_PYTHON_START</span>
@@ -1559,12 +1684,13 @@
             <span class="n">get_backend_info</span>
         <span class="k">if</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">backend</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">and</span> <span class="n">get_backend_info</span><span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">backend</span><span class="p">,</span> <span class="s1">&#39;need_hf_model&#39;</span><span class="p">):</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">is_hub_model</span><span class="p">:</span>
-                <span class="n">hf_folder</span> <span class="o">=</span> <span class="n">download_hf_model</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">model</span><span class="p">,</span>
-                                              <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">revision</span><span class="p">)</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_loader</span><span class="o">.</span><span class="n">model_obj</span><span class="o">.</span><span class="n">is_hub_model</span><span class="p">:</span>
+                <span class="n">hf_folder</span> <span class="o">=</span> <span class="n">download_hf_model</span><span class="p">(</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">model_loader</span><span class="o">.</span><span class="n">model_obj</span><span class="o">.</span><span class="n">model_name</span><span class="p">,</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">revision</span><span class="p">)</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span> <span class="o">=</span> <span class="n">hf_folder</span>
             <span class="k">else</span><span class="p">:</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">model_dir</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_loader</span><span class="o">.</span><span class="n">model_obj</span><span class="o">.</span><span class="n">model_dir</span>
 
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">quant_config</span><span class="o">.</span><span class="n">quant_algo</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
@@ -1579,7 +1705,7 @@
 
     <span class="k">def</span> <span class="nf">get_engine_dir</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Path</span><span class="p">:</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">model_format</span> <span class="ow">is</span> <span class="n">_ModelFormatKind</span><span class="o">.</span><span class="n">TLLM_ENGINE</span><span class="p">:</span>
-            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">model_dir</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_obj</span><span class="o">.</span><span class="n">model_dir</span>
 
         <span class="c1"># generate a new path for writing the engine</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">build_cache_enabled</span><span class="p">:</span>
@@ -1634,7 +1760,9 @@
             <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span><span class="p">,</span>
             <span class="n">mapping</span><span class="o">=</span><span class="n">Mapping</span><span class="p">(</span><span class="n">world_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">world_size</span><span class="p">,</span>
                             <span class="n">tp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
-                            <span class="n">pp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">pp_size</span><span class="p">),</span>
+                            <span class="n">pp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">pp_size</span><span class="p">,</span>
+                            <span class="n">cp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">cp_size</span><span class="p">,</span>
+                            <span class="n">cp_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">cp_config</span><span class="p">),</span>
             <span class="n">quant_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">quant_config</span><span class="p">,</span>
             <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
 
@@ -1668,12 +1796,12 @@
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">build_cache_enabled</span><span class="p">:</span>
             <span class="k">try</span><span class="p">:</span>
                 <span class="c1"># TODO[chunweiy]: Cover the case when the model is from HF model hub.</span>
-                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">is_local_model</span><span class="p">:</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_loader</span><span class="o">.</span><span class="n">model_obj</span><span class="o">.</span><span class="n">is_local_model</span><span class="p">:</span>
                     <span class="c1"># This is not perfect, but will make build-cache much more robust.</span>
                     <span class="n">free_storage</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">engine_cache_stage</span><span class="o">.</span><span class="n">parent</span><span class="o">.</span><span class="n">free_storage_in_gb</span><span class="p">(</span>
                     <span class="p">)</span>
                     <span class="n">model_size</span> <span class="o">=</span> <span class="n">get_directory_size_in_gb</span><span class="p">(</span>
-                        <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">model_dir</span><span class="p">)</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">model_loader</span><span class="o">.</span><span class="n">model_obj</span><span class="o">.</span><span class="n">model_dir</span><span class="p">)</span>
                     <span class="n">require_size</span> <span class="o">=</span> <span class="n">model_size</span> <span class="o">*</span> <span class="mf">1.3</span>
                     <span class="n">has_storage</span> <span class="o">=</span> <span class="n">free_storage</span> <span class="o">&gt;=</span> <span class="n">require_size</span>
 
@@ -1757,7 +1885,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f9469093200>
+<jinja2.runtime.BlockReference object at 0x7fed97c8a4b0>
 
 <div class="footer">
     <p>

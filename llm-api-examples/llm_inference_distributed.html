@@ -70,14 +70,17 @@
 <li class="toctree-l1"><a class="reference internal" href="index.html">LLM Examples Introduction</a></li>
 <li class="toctree-l1"><a class="reference internal" href="customization.html">Common Customizations</a></li>
 <li class="toctree-l1 current"><a class="reference internal" href="llm_api_examples.html">Examples</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="llm_guided_decoding.html">Generate text with guided decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm_inference.html">Generate text</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm_inference_async.html">Generate Text Asynchronously</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm_inference_customize.html">Generate text</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_quantization.html">Generation with Quantization</a></li>
 <li class="toctree-l2 current"><a class="current reference internal" href="#">Distributed LLM Generation</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm_logits_processor.html">Control generated text using logits post processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_quantization.html">Generation with Quantization</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
 </ul>
 </li>
@@ -217,11 +220,9 @@
 <span class="linenos">39</span>    <span class="c1"># Prompt: &#39;The future of AI is&#39;, Generated text: &#39;an exciting time for us. We are constantly researching, developing, and improving our platform to create the most advanced and efficient model available. We are&#39;</span>
 <span class="linenos">40</span>
 <span class="linenos">41</span>
-<span class="linenos">42</span><span class="c1"># Due to the requirement of the underlying mpi4py, for multi-gpu, the main function must be placed inside the</span>
-<span class="linenos">43</span><span class="c1"># `if __name__ == &#39;__main__&#39;:` block.</span>
-<span class="linenos">44</span><span class="c1"># Refer to https://mpi4py.readthedocs.io/en/stable/mpi4py.futures.html#mpipoolexecutor</span>
-<span class="linenos">45</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
-<span class="linenos">46</span>    <span class="n">main</span><span class="p">()</span>
+<span class="linenos">42</span><span class="c1"># The entry point of the program need to be protected for spawning processes.</span>
+<span class="linenos">43</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
+<span class="linenos">44</span>    <span class="n">main</span><span class="p">()</span>
 </pre></div>
 </div>
 </section>
@@ -237,7 +238,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f94595a5b20>
+<jinja2.runtime.BlockReference object at 0x7fed9bcbd5b0>
 
 <div class="footer">
     <p>

@@ -196,8 +196,17 @@
 
 <span class="k">class</span> <span class="nc">TreeParams</span><span class="p">(</span><span class="nb">object</span><span class="p">):</span>
 
-    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">paths</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">paths</span> <span class="o">=</span> <span class="n">paths</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                 <span class="n">paths</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">use_dynamic_tree</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">dynamic_tree_max_topK</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">paths</span> <span class="o">=</span> <span class="n">paths</span>  <span class="c1"># on GPU</span>
+        <span class="c1"># When &#39;use_dynamic_tree&#39; is False, which means use Eagle-1;</span>
+        <span class="c1"># When &#39;use_dynamic_tree&#39; is True, which means use Eagle-2;</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">use_dynamic_tree</span> <span class="o">=</span> <span class="n">use_dynamic_tree</span>  <span class="c1"># bool, on CPU</span>
+        <span class="c1"># Indicates how many new draft tokens are expanded for each draft token of each request.</span>
+        <span class="c1"># For Eagle-2, dynamic_tree_max_topK is equal to max_non_leaf_nodes_per_level in the internal EagleNets.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">dynamic_tree_max_topK</span> <span class="o">=</span> <span class="n">dynamic_tree_max_topK</span>  <span class="c1"># int, on CPU</span>
 
 
 <span class="k">def</span> <span class="nf">eagle_sample_and_accept_draft_plugin</span><span class="p">(</span><span class="n">lm_logits</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -205,16 +214,15 @@
                                          <span class="n">draft_lens</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                                          <span class="n">eagle_temperature</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                                          <span class="n">rand_data_validation</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                                         <span class="n">posterior_alpha</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                                         <span class="n">posterior_threshold</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                                          <span class="n">tree_params</span><span class="p">:</span> <span class="n">TreeParams</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-                                         <span class="n">greedy_sampling</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">):</span>
+                                         <span class="n">greedy_sampling</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&#39;&#39;&#39;</span>
 <span class="sd">    Takes input logits and samples golden token + predictions from draft tokens.</span>
 <span class="sd">    Runs acceptance algorithm to accept draft tokens.</span>
 <span class="sd">    When greedy_sampling is True, all decoding is done using Top1 and token equality is used</span>
-<span class="sd">    for acceptance. Otherwise, speculative decoding multi-round sampling and multinomial</span>
-<span class="sd">    samplings are used.</span>
-
-<span class="sd">    Non-greedy sampling is not supported yet.</span>
+<span class="sd">    for acceptance. Otherwise, typical acceptance and multinomial samplings are used.</span>
 
 <span class="sd">    Visit tests/model/eagle/test_sample_accept_draft_tokens.py for input/output examples.</span>
 
@@ -236,13 +244,22 @@
 <span class="sd">            Temperature of the decoding.</span>
 
 <span class="sd">        rand_data_validation : Tensor</span>
-<span class="sd">            [batch_size]</span>
+<span class="sd">            [batch_size, max_decoding_tokens]</span>
 <span class="sd">            Random data for multinomial sampling.</span>
+
+<span class="sd">        posterior_alpha : Tensor</span>
+<span class="sd">            [batch_size]</span>
+<span class="sd">            Delta in typical acceptance in https://arxiv.org/pdf/2401.10774.</span>
+
+<span class="sd">        posterior_threshold : Tensor</span>
+<span class="sd">            [batch_size]</span>
+<span class="sd">            Minimum probability threshold.</span>
+<span class="sd">            Epsilon in typical acceptance in https://arxiv.org/pdf/2401.10774.</span>
 
 <span class="sd">        tree_params : TreeParams</span>
 <span class="sd">            Tree params of the input draft tokens.</span>
 
-<span class="sd">        greedy_sampling : bool</span>
+<span class="sd">        greedy_sampling : Tensor</span>
 <span class="sd">            Whether to do greedy or non-greedy sampling.</span>
 
 <span class="sd">    Return:</span>
@@ -275,8 +292,6 @@
 <span class="sd">            Empty tensor used to allocate space for eagle_prepare_drafter_inputs_plugin.</span>
 <span class="sd">    &#39;&#39;&#39;</span>
 
-    <span class="k">assert</span> <span class="n">greedy_sampling</span><span class="p">,</span> <span class="s2">&quot;Non-greedy sampling is not supported yet&quot;</span>
-
     <span class="n">plg_creator</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">get_plugin_registry</span><span class="p">()</span><span class="o">.</span><span class="n">get_plugin_creator</span><span class="p">(</span>
         <span class="s1">&#39;EagleSampleAndAcceptDraftTokens&#39;</span><span class="p">,</span> <span class="s1">&#39;1&#39;</span><span class="p">,</span> <span class="n">TRT_LLM_PLUGIN_NAMESPACE</span><span class="p">)</span>
     <span class="k">assert</span> <span class="n">plg_creator</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
@@ -285,18 +300,14 @@
                               <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">([</span><span class="nb">int</span><span class="p">(</span><span class="n">lm_logits</span><span class="o">.</span><span class="n">dtype</span><span class="p">)],</span> <span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
                               <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT32</span><span class="p">)</span>
 
-    <span class="n">greedy_sampling</span> <span class="o">=</span> <span class="mi">1</span> <span class="k">if</span> <span class="n">greedy_sampling</span> <span class="k">else</span> <span class="mi">0</span>
-    <span class="n">greedy_sampling</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span><span class="s2">&quot;greedy_sampling&quot;</span><span class="p">,</span>
-                                      <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">greedy_sampling</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
-                                      <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT32</span><span class="p">)</span>
-
-    <span class="n">pfc</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldCollection</span><span class="p">([</span><span class="n">pf_type</span><span class="p">,</span> <span class="n">greedy_sampling</span><span class="p">])</span>
+    <span class="n">pfc</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldCollection</span><span class="p">([</span><span class="n">pf_type</span><span class="p">])</span>
     <span class="n">plugin</span> <span class="o">=</span> <span class="n">plg_creator</span><span class="o">.</span><span class="n">create_plugin</span><span class="p">(</span><span class="s2">&quot;eagle_sample_and_accept_draft_plugin&quot;</span><span class="p">,</span>
                                        <span class="n">pfc</span><span class="p">)</span>
 
     <span class="n">plug_inputs</span> <span class="o">=</span> <span class="p">[</span>
         <span class="n">lm_logits</span><span class="p">,</span> <span class="n">draft_tokens</span><span class="p">,</span> <span class="n">draft_lens</span><span class="p">,</span> <span class="n">eagle_temperature</span><span class="p">,</span>
-        <span class="n">rand_data_validation</span><span class="p">,</span> <span class="n">tree_params</span><span class="o">.</span><span class="n">paths</span>
+        <span class="n">rand_data_validation</span><span class="p">,</span> <span class="n">posterior_alpha</span><span class="p">,</span> <span class="n">posterior_threshold</span><span class="p">,</span>
+        <span class="n">tree_params</span><span class="o">.</span><span class="n">paths</span><span class="p">,</span> <span class="n">greedy_sampling</span>
     <span class="p">]</span>
 
     <span class="n">plug_inputs</span> <span class="o">=</span> <span class="p">[</span><span class="n">i</span><span class="o">.</span><span class="n">trt_tensor</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">plug_inputs</span><span class="p">]</span>
@@ -315,15 +326,21 @@
     <span class="p">])</span>
 
 
-<span class="k">def</span> <span class="nf">eagle_draft_decoder_plugin</span><span class="p">(</span><span class="n">layer_idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">top_k_sampling</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
-                               <span class="n">logits</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">num_last_token_indices</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
-                               <span class="n">rand_sample</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">tree_params</span><span class="p">:</span> <span class="n">TreeParams</span><span class="p">,</span>
-                               <span class="n">input_draft_token_ids</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
-                               <span class="n">input_draft_lens</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">):</span>
+<span class="k">def</span> <span class="nf">eagle_draft_decoder_plugin</span><span class="p">(</span>
+        <span class="n">layer_idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">num_eagle_layers</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">top_k_sampling</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
+        <span class="n">logits</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">num_last_token_indices</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">rand_sample</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">tree_params</span><span class="p">:</span> <span class="n">TreeParams</span><span class="p">,</span> <span class="n">input_draft_token_ids</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">input_draft_lens</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">input_prev_scores</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">input_current_expand_indices</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">input_all_layers_scores</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">input_all_layers_draft_token_ids</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+        <span class="n">input_all_layers_draft_token_ids_predecessor</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&#39;&#39;&#39;</span>
 <span class="sd">    Parameters:</span>
 <span class="sd">        layer_idx : int</span>
 <span class="sd">            The index of the EagleNet.</span>
+
+<span class="sd">        num_eagle_layers: int</span>
+<span class="sd">            The total number of eagle layers.</span>
 
 <span class="sd">        top_k_sampling: bool</span>
 <span class="sd">            Whether to use top K sampling. Otherwise, use multinomial sampling.</span>
@@ -351,6 +368,27 @@
 <span class="sd">            [batch_size]</span>
 <span class="sd">            Number of draft tokens for each request.</span>
 
+<span class="sd">        input_prev_scores: Tensor</span>
+<span class="sd">            [batch_size, max_decoding_draft_tokens]</span>
+<span class="sd">            Last layer&#39;s scores</span>
+
+<span class="sd">        input_current_expand_indices: Tensor</span>
+<span class="sd">            [batch_size, max_decoding_draft_tokens]</span>
+<span class="sd">            The indices of the nodes that expand in this layer.</span>
+<span class="sd">            The index is related to the final output tree, which has max_decoding_draft_tokens draft tokens.</span>
+
+<span class="sd">        input_all_layers_scores: Tensor</span>
+<span class="sd">            [batch_size, num_eagle_layers, max_decoding_draft_tokens x max_decoding_draft_tokens]</span>
+<span class="sd">            For Eagle-2, record scores from all EagleNets</span>
+
+<span class="sd">        input_all_layers_draft_token_ids: Tensor</span>
+<span class="sd">            [batch_size, num_eagle_layers, max_decoding_draft_tokens x max_decoding_draft_tokens]</span>
+<span class="sd">            For Eagle-2, record all draft tokens from all EagleNets</span>
+
+<span class="sd">        input_all_layers_draft_token_ids_predecessor: Tensor</span>
+<span class="sd">            [batch_size, num_eagle_layers, max_decoding_draft_tokens x max_decoding_draft_tokens]</span>
+<span class="sd">            For Eagle-2, record all draft tokens&#39; predecessor</span>
+
 <span class="sd">    Return:</span>
 <span class="sd">        output_draft_token_ids: Tensor</span>
 <span class="sd">            [batch_size, max_decoding_draft_tokens]</span>
@@ -359,6 +397,31 @@
 <span class="sd">        output_draft_draft_lens: Tensor</span>
 <span class="sd">            [batch_size]</span>
 <span class="sd">            Number of draft tokens for each request.</span>
+
+<span class="sd">        output_paths: Tensor</span>
+<span class="sd">            [batch_size, max_decoding_draft_tokens, max_path_len]</span>
+<span class="sd">            The latest path.</span>
+
+<span class="sd">        output_current_scores: Tensor</span>
+<span class="sd">            [batch_size, max_decoding_draft_tokens]</span>
+<span class="sd">            This layer&#39;s scores, which will be used in next layer.</span>
+
+<span class="sd">        output_next_expand_indices:</span>
+<span class="sd">            [batch_size, max_decoding_draft_tokens]</span>
+<span class="sd">            The indices of the nodes that expand in next layer.</span>
+<span class="sd">            The index is related to the final output tree, which has max_decoding_draft_tokens draft tokens.</span>
+
+<span class="sd">        output_all_layers_scores:</span>
+<span class="sd">            [batch_size, num_eagle_layers, max_decoding_draft_tokens x max_decoding_draft_tokens]</span>
+<span class="sd">            For Eagle-2, record scores from all EagleNets</span>
+
+<span class="sd">        output_all_layers_draft_token_ids: Tensor</span>
+<span class="sd">            [batch_size, num_eagle_layers, max_decoding_draft_tokens x max_decoding_draft_tokens]</span>
+<span class="sd">            For Eagle-2, record all draft tokens from all EagleNets</span>
+
+<span class="sd">        output_all_layers_draft_token_ids_predecessor: Tensor</span>
+<span class="sd">            [batch_size, num_eagle_layers, max_decoding_draft_tokens x max_decoding_draft_tokens]</span>
+<span class="sd">            For Eagle-2, record all draft tokens&#39; predecessor</span>
 
 <span class="sd">    &#39;&#39;&#39;</span>
 
@@ -374,17 +437,26 @@
                                   <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">layer_idx</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
                                   <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT32</span><span class="p">)</span>
 
+    <span class="n">num_eagle_layers_t</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span>
+        <span class="s2">&quot;num_eagle_layers&quot;</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">num_eagle_layers</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
+        <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT32</span><span class="p">)</span>
+
     <span class="n">top_k_sampling_t</span> <span class="o">=</span> <span class="mi">1</span> <span class="k">if</span> <span class="n">top_k_sampling</span> <span class="k">else</span> <span class="mi">0</span>
     <span class="n">top_k_sampling_t</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span>
         <span class="s2">&quot;top_k_sampling&quot;</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">top_k_sampling_t</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
         <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT32</span><span class="p">)</span>
 
-    <span class="n">pfc</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldCollection</span><span class="p">([</span><span class="n">pf_type</span><span class="p">,</span> <span class="n">layer_idx_t</span><span class="p">,</span> <span class="n">top_k_sampling_t</span><span class="p">])</span>
+    <span class="n">pfc</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldCollection</span><span class="p">(</span>
+        <span class="p">[</span><span class="n">pf_type</span><span class="p">,</span> <span class="n">layer_idx_t</span><span class="p">,</span> <span class="n">num_eagle_layers_t</span><span class="p">,</span> <span class="n">top_k_sampling_t</span><span class="p">])</span>
     <span class="n">plugin</span> <span class="o">=</span> <span class="n">plg_creator</span><span class="o">.</span><span class="n">create_plugin</span><span class="p">(</span><span class="s2">&quot;eagle_draft_decoder_plugin&quot;</span><span class="p">,</span> <span class="n">pfc</span><span class="p">)</span>
 
     <span class="n">plug_inputs</span> <span class="o">=</span> <span class="p">[</span>
         <span class="n">logits</span><span class="p">,</span> <span class="n">rand_sample</span><span class="p">,</span> <span class="n">tree_params</span><span class="o">.</span><span class="n">paths</span><span class="p">,</span> <span class="n">num_last_token_indices</span><span class="p">,</span>
-        <span class="n">input_draft_token_ids</span><span class="p">,</span> <span class="n">input_draft_lens</span>
+        <span class="n">tree_params</span><span class="o">.</span><span class="n">use_dynamic_tree</span><span class="p">,</span> <span class="n">tree_params</span><span class="o">.</span><span class="n">dynamic_tree_max_topK</span><span class="p">,</span>
+        <span class="n">input_draft_token_ids</span><span class="p">,</span> <span class="n">input_draft_lens</span><span class="p">,</span> <span class="n">input_prev_scores</span><span class="p">,</span>
+        <span class="n">input_current_expand_indices</span><span class="p">,</span> <span class="n">input_all_layers_scores</span><span class="p">,</span>
+        <span class="n">input_all_layers_draft_token_ids</span><span class="p">,</span>
+        <span class="n">input_all_layers_draft_token_ids_predecessor</span>
     <span class="p">]</span>
 
     <span class="n">plug_inputs</span> <span class="o">=</span> <span class="p">[</span><span class="n">i</span><span class="o">.</span><span class="n">trt_tensor</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">plug_inputs</span><span class="p">]</span>
@@ -392,7 +464,20 @@
 
     <span class="n">output_draft_token_ids</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
     <span class="n">output_draft_lens</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
-    <span class="k">return</span> <span class="nb">tuple</span><span class="p">([</span><span class="n">output_draft_token_ids</span><span class="p">,</span> <span class="n">output_draft_lens</span><span class="p">])</span>
+    <span class="n">output_paths</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">2</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
+    <span class="n">output_current_scores</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">3</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
+    <span class="n">output_next_expand_indices</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">4</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
+    <span class="n">output_all_layers_scores</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">5</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
+    <span class="n">output_all_layers_draft_token_ids</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">6</span><span class="p">),</span>
+                                                       <span class="n">layer</span><span class="p">)</span>
+    <span class="n">output_all_layers_draft_token_ids_predecessor</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span>
+        <span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">7</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
+    <span class="k">return</span> <span class="nb">tuple</span><span class="p">([</span>
+        <span class="n">output_draft_token_ids</span><span class="p">,</span> <span class="n">output_draft_lens</span><span class="p">,</span> <span class="n">output_paths</span><span class="p">,</span>
+        <span class="n">output_current_scores</span><span class="p">,</span> <span class="n">output_next_expand_indices</span><span class="p">,</span>
+        <span class="n">output_all_layers_scores</span><span class="p">,</span> <span class="n">output_all_layers_draft_token_ids</span><span class="p">,</span>
+        <span class="n">output_all_layers_draft_token_ids_predecessor</span>
+    <span class="p">])</span>
 
 
 <span class="k">def</span> <span class="nf">eagle_prepare_drafter_inputs_plugin</span><span class="p">(</span>
@@ -692,7 +777,7 @@
             <span class="n">host_gen_eagle_net_context_lengths</span><span class="p">,</span>
             <span class="n">host_gen_eagle_net_past_key_value_lengths</span><span class="p">,</span>
             <span class="n">hidden_size_batch_level_starts</span><span class="p">,</span> <span class="n">input_gen_tokens</span><span class="p">,</span>
-            <span class="n">input_spec_decoding_generation_lengths</span><span class="p">):</span>
+            <span class="n">input_spec_decoding_generation_lengths</span><span class="p">,</span> <span class="n">spec_decoding_use</span><span class="p">):</span>
 
         <span class="n">drafter_inputs</span> <span class="o">=</span> <span class="n">eagle_prepare_drafter_inputs_plugin</span><span class="p">(</span>
             <span class="n">layer_idx</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_eagle_layers</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_non_leaves_per_layer</span><span class="p">,</span>
@@ -726,7 +811,8 @@
         <span class="k">if</span> <span class="n">layer_idx</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
             <span class="n">spec_decoding_params</span> <span class="o">=</span> <span class="n">SpecDecodingParams</span><span class="p">(</span>
                 <span class="kc">True</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span><span class="p">,</span> <span class="n">spec_decoding_generation_lengths</span><span class="p">,</span>
-                <span class="n">spec_decoding_position_offsets</span><span class="p">,</span> <span class="n">spec_decoding_packed_mask</span><span class="p">)</span>
+                <span class="n">spec_decoding_position_offsets</span><span class="p">,</span> <span class="n">spec_decoding_packed_mask</span><span class="p">,</span>
+                <span class="n">spec_decoding_use</span><span class="p">)</span>
 
         <span class="c1"># Get hidden states for accepted ids</span>
         <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_slice_hidden_states</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span>
@@ -828,6 +914,8 @@
         <span class="n">draft_lens</span> <span class="o">=</span> <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;draft_lens&#39;</span><span class="p">]</span>
         <span class="n">eagle_temperature</span> <span class="o">=</span> <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;eagle_temperature&#39;</span><span class="p">]</span>
         <span class="n">rand_data_validation</span> <span class="o">=</span> <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;rand_data_validation&#39;</span><span class="p">]</span>
+        <span class="n">posterior_alpha</span> <span class="o">=</span> <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;posterior_alpha&#39;</span><span class="p">]</span>
+        <span class="n">posterior_threshold</span> <span class="o">=</span> <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;posterior_threshold&#39;</span><span class="p">]</span>
         <span class="n">rand_data_sample</span> <span class="o">=</span> <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;rand_data_sample&#39;</span><span class="p">]</span>
         <span class="n">input_ids</span> <span class="o">=</span> <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;input_ids&#39;</span><span class="p">]</span>
         <span class="n">chunked_context_next_tokens</span> <span class="o">=</span> <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;chunked_context_next_tokens&#39;</span><span class="p">]</span>
@@ -844,16 +932,16 @@
         <span class="n">host_gen_eagle_net_past_key_value_lengths</span> <span class="o">=</span> <span class="n">kwargs</span><span class="p">[</span>
             <span class="s1">&#39;host_gen_eagle_net_past_key_value_lengths&#39;</span><span class="p">]</span>
         <span class="n">input_gen_tokens</span> <span class="o">=</span> <span class="n">kwargs</span><span class="p">[</span><span class="s2">&quot;input_gen_tokens&quot;</span><span class="p">]</span>
+        <span class="n">greedy_sampling</span> <span class="o">=</span> <span class="n">kwargs</span><span class="p">[</span><span class="s2">&quot;greedy_sampling&quot;</span><span class="p">]</span>
 
         <span class="c1"># Sample target tokens and accept them</span>
         <span class="c1"># next_draft_tokens, next_draft_lens, hidden_size_batch_level_starts are outputted here just to</span>
         <span class="c1"># reserve the tensor with max size, which eagle_draft_decoder_plugin and</span>
         <span class="c1"># eagle_prepare_drafter_inputs_plugin are going to directly write to</span>
-        <span class="n">output</span> <span class="o">=</span> <span class="n">eagle_sample_and_accept_draft_plugin</span><span class="p">(</span><span class="n">lm_logits</span><span class="p">,</span> <span class="n">draft_tokens</span><span class="p">,</span>
-                                                      <span class="n">draft_lens</span><span class="p">,</span>
-                                                      <span class="n">eagle_temperature</span><span class="p">,</span>
-                                                      <span class="n">rand_data_validation</span><span class="p">,</span>
-                                                      <span class="n">input_tree_params</span><span class="p">)</span>
+        <span class="n">output</span> <span class="o">=</span> <span class="n">eagle_sample_and_accept_draft_plugin</span><span class="p">(</span>
+            <span class="n">lm_logits</span><span class="p">,</span> <span class="n">draft_tokens</span><span class="p">,</span> <span class="n">draft_lens</span><span class="p">,</span> <span class="n">eagle_temperature</span><span class="p">,</span>
+            <span class="n">rand_data_validation</span><span class="p">,</span> <span class="n">posterior_alpha</span><span class="p">,</span> <span class="n">posterior_threshold</span><span class="p">,</span>
+            <span class="n">input_tree_params</span><span class="p">,</span> <span class="n">greedy_sampling</span><span class="p">)</span>
         <span class="n">accepted_tokens</span><span class="p">,</span> <span class="n">num_accepted_tokens</span><span class="p">,</span> <span class="n">accepted_paths</span><span class="p">,</span> <span class="n">next_draft_tokens</span><span class="p">,</span> \
             <span class="n">next_draft_lens</span><span class="p">,</span> <span class="n">next_draft_paths</span><span class="p">,</span> <span class="n">hidden_size_batch_level_starts</span> <span class="o">=</span> <span class="n">output</span>
 
@@ -896,7 +984,8 @@
                 <span class="n">hidden_size_batch_level_starts</span><span class="o">=</span><span class="n">hidden_size_batch_level_starts</span><span class="p">,</span>
                 <span class="n">input_gen_tokens</span><span class="o">=</span><span class="n">input_gen_tokens</span><span class="p">,</span>
                 <span class="n">input_spec_decoding_generation_lengths</span><span class="o">=</span><span class="n">spec_decoding_params</span><span class="o">.</span>
-                <span class="n">spec_decoding_generation_lengths</span><span class="p">)</span>
+                <span class="n">spec_decoding_generation_lengths</span><span class="p">,</span>
+                <span class="n">spec_decoding_use</span><span class="o">=</span><span class="n">spec_decoding_params</span><span class="o">.</span><span class="n">spec_decoding_use</span><span class="p">)</span>
 
             <span class="k">def</span> <span class="nf">single_eagle_net_iter</span><span class="p">(</span><span class="n">next_draft_tokens</span><span class="p">,</span> <span class="n">next_draft_lens</span><span class="p">):</span>
                 <span class="c1"># Run EAGLE Net</span>
@@ -908,10 +997,22 @@
                 <span class="c1"># Decode draft tokens</span>
                 <span class="c1"># FIXME We need to take top_k_sampling as an input</span>
                 <span class="n">top_k_sampling</span> <span class="o">=</span> <span class="kc">True</span>
-                <span class="n">next_draft_tokens</span><span class="p">,</span> <span class="n">next_draft_lens</span> <span class="o">=</span> <span class="n">eagle_draft_decoder_plugin</span><span class="p">(</span>
-                    <span class="n">li</span><span class="p">,</span> <span class="n">top_k_sampling</span><span class="p">,</span> <span class="n">logits</span><span class="p">,</span> <span class="n">num_last_token_indices</span><span class="p">,</span>
-                    <span class="n">rand_data_sample</span><span class="p">,</span> <span class="n">input_tree_params</span><span class="p">,</span> <span class="n">next_draft_tokens</span><span class="p">,</span>
-                    <span class="n">next_draft_lens</span><span class="p">)</span>
+                <span class="n">next_draft_tokens</span><span class="p">,</span> <span class="n">next_draft_lens</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">eagle_draft_decoder_plugin</span><span class="p">(</span>
+                    <span class="n">li</span><span class="p">,</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">num_eagle_layers</span><span class="p">,</span>
+                    <span class="n">top_k_sampling</span><span class="p">,</span>
+                    <span class="n">logits</span><span class="p">,</span>
+                    <span class="n">num_last_token_indices</span><span class="p">,</span>
+                    <span class="n">rand_data_sample</span><span class="p">,</span>
+                    <span class="n">input_tree_params</span><span class="p">,</span>
+                    <span class="n">next_draft_tokens</span><span class="p">,</span>
+                    <span class="n">next_draft_lens</span><span class="p">,</span>
+                    <span class="n">rand_data_sample</span><span class="p">,</span>  <span class="c1"># dummy input_prev_scores</span>
+                    <span class="n">next_draft_tokens</span><span class="p">,</span>  <span class="c1"># dummy input_current_expand_indices</span>
+                    <span class="n">rand_data_sample</span><span class="p">,</span>  <span class="c1"># dummy input_all_layers_scores</span>
+                    <span class="n">next_draft_tokens</span><span class="p">,</span>  <span class="c1"># dummy input_all_layers_draft_token_ids</span>
+                    <span class="n">next_draft_tokens</span><span class="p">,</span>  <span class="c1"># dummy input_all_layers_draft_token_ids_predecessor</span>
+                <span class="p">)</span>
 
                 <span class="k">return</span> <span class="n">next_draft_tokens</span><span class="p">,</span> <span class="n">next_draft_lens</span><span class="p">,</span> <span class="n">hidden_states</span>
 
@@ -954,7 +1055,8 @@
             <span class="s2">&quot;host_gen_eagle_net_request_types&quot;</span><span class="p">,</span>
             <span class="s2">&quot;host_gen_eagle_net_context_lengths&quot;</span><span class="p">,</span>
             <span class="s2">&quot;host_gen_eagle_net_past_key_value_lengths&quot;</span><span class="p">,</span> <span class="s2">&quot;input_gen_tokens&quot;</span><span class="p">,</span>
-            <span class="s2">&quot;chunked_context_next_tokens&quot;</span>
+            <span class="s2">&quot;chunked_context_next_tokens&quot;</span><span class="p">,</span> <span class="s2">&quot;posterior_alpha&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;posterior_threshold&quot;</span><span class="p">,</span> <span class="s2">&quot;greedy_sampling&quot;</span>
         <span class="p">]</span>
 
         <span class="n">base_kwargs</span> <span class="o">=</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">v</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">k</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">extra_args</span><span class="p">}</span>
@@ -1008,10 +1110,9 @@
         <span class="p">)</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gpt_attention_plugin</span>
         <span class="n">use_gemm_plugin</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gemm_plugin</span>
         <span class="n">paged_kv_cache</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">paged_kv_cache</span>
+        <span class="n">multiple_profiles</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">multiple_profiles</span>
         <span class="n">max_batch_size</span> <span class="o">=</span> <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;max_batch_size&#39;</span><span class="p">]</span>
         <span class="k">assert</span> <span class="n">max_batch_size</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
-        <span class="n">bb_range</span> <span class="o">=</span> <span class="n">default_range</span><span class="p">(</span><span class="n">max_batch_size</span><span class="p">)</span>
-        <span class="n">bb0_range</span> <span class="o">=</span> <span class="n">default_range</span><span class="p">(</span><span class="n">max_batch_size</span><span class="p">,</span> <span class="n">min_range</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">opt_offset</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
         <span class="n">gt_range</span> <span class="o">=</span> <span class="n">default_range</span><span class="p">(</span><span class="n">max_batch_size</span> <span class="o">*</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">+</span> <span class="mi">1</span><span class="p">),</span>
                                  <span class="n">min_range</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
                                  <span class="n">opt_offset</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
@@ -1027,26 +1128,35 @@
 
         <span class="k">assert</span> <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;spec_decoding_params&#39;</span><span class="p">]</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
 
-        <span class="n">enable_two_optimization_profiles</span> <span class="o">=</span> <span class="n">GenerationMixin</span><span class="o">.</span><span class="n">has_ctx_gen_opt_profiles</span><span class="p">(</span>
+        <span class="n">kv_cache_type</span> <span class="o">=</span> <span class="n">KVCacheType</span><span class="o">.</span><span class="n">PAGED</span> <span class="k">if</span> <span class="n">paged_kv_cache</span> <span class="k">else</span> <span class="n">KVCacheType</span><span class="o">.</span><span class="n">CONTINUOUS</span>
+        <span class="n">enable_ctx_gen_opt_profiles</span> <span class="o">=</span> <span class="n">GenerationMixin</span><span class="o">.</span><span class="n">has_ctx_gen_opt_profiles</span><span class="p">(</span>
             <span class="n">use_gpt_attention_plugin</span><span class="o">=</span><span class="n">use_gpt_attention_plugin</span><span class="p">,</span>
             <span class="n">use_gemm_plugin</span><span class="o">=</span><span class="n">use_gemm_plugin</span><span class="p">,</span>
             <span class="n">remove_input_padding</span><span class="o">=</span><span class="n">remove_input_padding</span><span class="p">,</span>
-            <span class="n">kv_cache_type</span><span class="o">=</span><span class="n">KVCacheType</span><span class="o">.</span><span class="n">PAGED</span>
-            <span class="k">if</span> <span class="n">paged_kv_cache</span> <span class="k">else</span> <span class="n">KVCacheType</span><span class="o">.</span><span class="n">CONTINUOUS</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">enable_two_optimization_profiles</span><span class="p">:</span>
-            <span class="n">bb_range</span> <span class="o">=</span> <span class="p">[</span><span class="n">bb_range</span><span class="p">,</span> <span class="n">bb_range</span><span class="p">]</span>
-            <span class="n">bb0_range</span> <span class="o">=</span> <span class="p">[</span><span class="n">bb0_range</span><span class="p">,</span> <span class="n">bb0_range</span><span class="p">]</span>
-            <span class="n">draft_len_range</span> <span class="o">=</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span><span class="p">]</span>
-            <span class="n">decoding_len_range</span> <span class="o">=</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">+</span> <span class="mi">1</span><span class="p">]</span>
-            <span class="n">path_len_range</span> <span class="o">=</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">num_eagle_layers</span> <span class="o">+</span> <span class="mi">1</span><span class="p">]</span>
-            <span class="n">gen_tokens_range</span> <span class="o">=</span> <span class="p">[</span><span class="n">gt_range</span><span class="p">,</span> <span class="n">gt_range</span><span class="p">]</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="n">bb_range</span> <span class="o">=</span> <span class="p">[</span><span class="n">bb_range</span><span class="p">]</span>
-            <span class="n">bb0_range</span> <span class="o">=</span> <span class="p">[</span><span class="n">bb0_range</span><span class="p">]</span>
-            <span class="n">draft_len_range</span> <span class="o">=</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span><span class="p">]</span>
-            <span class="n">decoding_len_range</span> <span class="o">=</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">+</span> <span class="mi">1</span><span class="p">]</span>
-            <span class="n">path_len_range</span> <span class="o">=</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">num_eagle_layers</span> <span class="o">+</span> <span class="mi">1</span><span class="p">]</span>
-            <span class="n">gen_tokens_range</span> <span class="o">=</span> <span class="p">[</span><span class="n">gt_range</span><span class="p">]</span>
+            <span class="n">kv_cache_type</span><span class="o">=</span><span class="n">kv_cache_type</span><span class="p">)</span>
+
+        <span class="n">num_profiles</span><span class="p">,</span> <span class="n">ranges</span> <span class="o">=</span> <span class="n">GenerationMixin</span><span class="o">.</span><span class="n">get_profiles_ranges</span><span class="p">(</span>
+            <span class="n">max_batch_size</span><span class="o">=</span><span class="n">max_batch_size</span><span class="p">,</span>
+            <span class="n">max_beam_width</span><span class="o">=</span><span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;max_beam_width&#39;</span><span class="p">],</span>
+            <span class="n">max_input_len</span><span class="o">=</span><span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;max_input_len&#39;</span><span class="p">],</span>
+            <span class="n">max_num_tokens</span><span class="o">=</span><span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;max_num_tokens&#39;</span><span class="p">],</span>
+            <span class="n">max_draft_len</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span><span class="p">,</span>
+            <span class="n">opt_batch_size</span><span class="o">=</span><span class="kc">None</span>
+            <span class="k">if</span> <span class="s1">&#39;opt_batch_size&#39;</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">kwargs</span> <span class="k">else</span> <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;opt_batch_size&#39;</span><span class="p">],</span>
+            <span class="n">opt_num_tokens</span><span class="o">=</span><span class="kc">None</span>
+            <span class="k">if</span> <span class="s1">&#39;opt_num_tokens&#39;</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">kwargs</span> <span class="k">else</span> <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;opt_num_tokens&#39;</span><span class="p">],</span>
+            <span class="n">enable_ctx_gen_opt_profiles</span><span class="o">=</span><span class="n">enable_ctx_gen_opt_profiles</span><span class="p">,</span>
+            <span class="n">multiple_profiles</span><span class="o">=</span><span class="n">multiple_profiles</span><span class="p">,</span>
+            <span class="n">kv_cache_type</span><span class="o">=</span><span class="n">kv_cache_type</span><span class="p">)</span>
+
+        <span class="n">bb_range</span> <span class="o">=</span> <span class="n">ranges</span><span class="p">[</span><span class="s1">&#39;bb_range&#39;</span><span class="p">]</span>
+
+        <span class="n">draft_len_range</span> <span class="o">=</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">bb_range</span><span class="p">))]</span>
+        <span class="n">decoding_len_range</span> <span class="o">=</span> <span class="p">[(</span><span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span>
+                              <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">bb_range</span><span class="p">))]</span>
+        <span class="n">path_len_range</span> <span class="o">=</span> <span class="p">[(</span><span class="bp">self</span><span class="o">.</span><span class="n">num_eagle_layers</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span>
+                          <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">bb_range</span><span class="p">))]</span>
+        <span class="n">gen_tokens_range</span> <span class="o">=</span> <span class="p">[</span><span class="n">gt_range</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">bb_range</span><span class="p">))]</span>
 
         <span class="n">draft_tokens</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;draft_tokens&#39;</span><span class="p">,</span>
                               <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
@@ -1069,9 +1179,10 @@
                                    <span class="p">]))</span>
         <span class="n">rand_data_validation</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;rand_data_validation&#39;</span><span class="p">,</span>
                                       <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">float32</span><span class="p">,</span>
-                                      <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                                      <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">+</span> <span class="mi">1</span><span class="p">],</span>
                                       <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
                                           <span class="p">(</span><span class="s1">&#39;batch_size&#39;</span><span class="p">,</span> <span class="n">bb_range</span><span class="p">),</span>
+                                          <span class="p">(</span><span class="s1">&#39;decoding_len&#39;</span><span class="p">,</span> <span class="n">decoding_len_range</span><span class="p">),</span>
                                       <span class="p">]))</span>
         <span class="n">rand_data_sample</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;rand_data_sample&#39;</span><span class="p">,</span>
                                   <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">float32</span><span class="p">,</span>
@@ -1079,6 +1190,18 @@
                                   <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
                                       <span class="p">(</span><span class="s1">&#39;batch_size&#39;</span><span class="p">,</span> <span class="n">bb_range</span><span class="p">),</span>
                                   <span class="p">]))</span>
+        <span class="n">posterior_alpha</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;posterior_alpha&#39;</span><span class="p">,</span>
+                                 <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">float32</span><span class="p">,</span>
+                                 <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                                 <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
+                                     <span class="p">(</span><span class="s2">&quot;batch_size&quot;</span><span class="p">,</span> <span class="n">bb_range</span><span class="p">),</span>
+                                 <span class="p">]))</span>
+        <span class="n">posterior_threshold</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;posterior_threshold&#39;</span><span class="p">,</span>
+                                     <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">float32</span><span class="p">,</span>
+                                     <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span>
+                                     <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
+                                         <span class="p">(</span><span class="s2">&quot;batch_size&quot;</span><span class="p">,</span> <span class="n">bb_range</span><span class="p">),</span>
+                                     <span class="p">]))</span>
         <span class="n">draft_paths</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
             <span class="n">name</span><span class="o">=</span><span class="s1">&#39;draft_paths&#39;</span><span class="p">,</span>
             <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
@@ -1144,12 +1267,28 @@
                                              <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
                                                  <span class="p">(</span><span class="s1">&#39;batch_size&#39;</span><span class="p">,</span> <span class="n">bb_range</span><span class="p">),</span>
                                              <span class="p">]))</span>
+        <span class="n">greedy_sampling</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;greedy_sampling&#39;</span><span class="p">,</span>
+                                 <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span>
+                                 <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span>
+                                 <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([</span>
+                                     <span class="p">(</span><span class="s1">&#39;greedy_sampling_flag&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">1</span><span class="p">]),</span>
+                                 <span class="p">]))</span>
 
-        <span class="n">tree_params</span> <span class="o">=</span> <span class="n">TreeParams</span><span class="p">(</span><span class="n">paths</span><span class="o">=</span><span class="n">draft_paths</span><span class="p">)</span>
+        <span class="n">use_dynamic_tree</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s1">&#39;use_dynamic_tree&#39;</span><span class="p">,</span>
+                                  <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">bool</span><span class="p">,</span>
+                                  <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="mi">1</span><span class="p">])</span>
+
+        <span class="n">tree_params</span> <span class="o">=</span> <span class="n">TreeParams</span><span class="p">(</span>
+            <span class="n">paths</span><span class="o">=</span><span class="n">draft_paths</span><span class="p">,</span>
+            <span class="n">use_dynamic_tree</span><span class="o">=</span><span class="n">use_dynamic_tree</span><span class="p">,</span>
+            <span class="n">dynamic_tree_max_topK</span><span class="o">=</span><span class="n">host_ctx_eagle_net_request_types</span>  <span class="c1"># dummy</span>
+        <span class="p">)</span>
 
         <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;draft_tokens&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">draft_tokens</span>
         <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;draft_lens&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">draft_lens</span>
         <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;eagle_temperature&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">eagle_temperature</span>
+        <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;posterior_alpha&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">posterior_alpha</span>
+        <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;posterior_threshold&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">posterior_threshold</span>
         <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;rand_data_validation&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">rand_data_validation</span>
         <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;rand_data_sample&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">rand_data_sample</span>
         <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;tree_params&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">tree_params</span>
@@ -1167,6 +1306,7 @@
             <span class="s1">&#39;host_gen_eagle_net_past_key_value_lengths&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">host_gen_eagle_net_past_key_value_lengths</span>
         <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;input_gen_tokens&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">input_gen_tokens</span>
         <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;chunked_context_next_tokens&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">chunked_context_next_tokens</span>
+        <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;greedy_sampling&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">greedy_sampling</span>
         <span class="k">return</span> <span class="n">inputs</span></div>
 </div>
 
@@ -1179,7 +1319,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f946e5927e0>
+<jinja2.runtime.BlockReference object at 0x7fed979624b0>
 
 <div class="footer">
     <p>

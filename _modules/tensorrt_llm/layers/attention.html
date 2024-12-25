@@ -183,16 +183,16 @@
 <span class="kn">from</span> <span class="nn">.._common</span> <span class="kn">import</span> <span class="n">default_net</span><span class="p">,</span> <span class="n">precision</span>
 <span class="kn">from</span> <span class="nn">.._utils</span> <span class="kn">import</span> <span class="p">(</span><span class="n">fp32_array</span><span class="p">,</span> <span class="n">int32_array</span><span class="p">,</span> <span class="n">is_same_dtype</span><span class="p">,</span> <span class="n">set_obj_attrs</span><span class="p">,</span>
                       <span class="n">trt_dtype_to_np</span><span class="p">,</span> <span class="n">trt_dtype_to_str</span><span class="p">)</span>
-<span class="kn">from</span> <span class="nn">..functional</span> <span class="kn">import</span> <span class="p">(</span><span class="n">ACT2FN</span><span class="p">,</span> <span class="n">AllReduceFusionParams</span><span class="p">,</span> <span class="n">AttentionMaskType</span><span class="p">,</span>
-                          <span class="n">Conditional</span><span class="p">,</span> <span class="n">LayerNormType</span><span class="p">,</span> <span class="n">PositionEmbeddingType</span><span class="p">,</span>
-                          <span class="n">RopeEmbeddingUtils</span><span class="p">,</span> <span class="n">RotaryScalingType</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span>
-                          <span class="n">allgather</span><span class="p">,</span> <span class="n">arange</span><span class="p">,</span> <span class="n">bert_attention</span><span class="p">,</span> <span class="n">cast</span><span class="p">,</span> <span class="n">clip</span><span class="p">,</span> <span class="n">concat</span><span class="p">,</span>
-                          <span class="n">constant</span><span class="p">,</span> <span class="n">embedding</span><span class="p">,</span> <span class="n">expand</span><span class="p">,</span> <span class="n">expand_dims</span><span class="p">,</span> <span class="n">expand_mask</span><span class="p">,</span>
-                          <span class="n">generate_alibi_biases</span><span class="p">,</span> <span class="n">generate_alibi_slopes</span><span class="p">,</span>
-                          <span class="n">gpt_attention</span><span class="p">,</span> <span class="n">gt</span><span class="p">,</span> <span class="n">matmul</span><span class="p">)</span>
-<span class="kn">from</span> <span class="nn">..functional</span> <span class="kn">import</span> <span class="nb">max</span> <span class="k">as</span> <span class="n">fmax</span>
-<span class="kn">from</span> <span class="nn">..functional</span> <span class="kn">import</span> <span class="p">(</span><span class="n">minimum</span><span class="p">,</span> <span class="n">repeat_interleave</span><span class="p">,</span> <span class="n">shape</span><span class="p">,</span> <span class="nb">slice</span><span class="p">,</span> <span class="n">softmax</span><span class="p">,</span>
-                          <span class="n">split</span><span class="p">,</span> <span class="n">unsqueeze</span><span class="p">,</span> <span class="n">where</span><span class="p">)</span>
+
+<span class="c1"># isort: off</span>
+<span class="kn">from</span> <span class="nn">..functional</span> <span class="kn">import</span> <span class="p">(</span>
+    <span class="n">ACT2FN</span><span class="p">,</span> <span class="n">AllReduceParams</span><span class="p">,</span> <span class="n">AttentionMaskType</span><span class="p">,</span> <span class="n">Conditional</span><span class="p">,</span> <span class="n">LayerNormType</span><span class="p">,</span>
+    <span class="n">PositionEmbeddingType</span><span class="p">,</span> <span class="n">RopeEmbeddingUtils</span><span class="p">,</span> <span class="n">RotaryScalingType</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span>
+    <span class="n">allgather</span><span class="p">,</span> <span class="n">arange</span><span class="p">,</span> <span class="n">bert_attention</span><span class="p">,</span> <span class="n">cast</span><span class="p">,</span> <span class="n">clip</span><span class="p">,</span> <span class="n">concat</span><span class="p">,</span> <span class="n">constant</span><span class="p">,</span> <span class="n">embedding</span><span class="p">,</span>
+    <span class="n">expand</span><span class="p">,</span> <span class="n">expand_dims</span><span class="p">,</span> <span class="n">expand_mask</span><span class="p">,</span> <span class="n">generate_alibi_biases</span><span class="p">,</span>
+    <span class="n">generate_alibi_slopes</span><span class="p">,</span> <span class="n">generate_logn_scaling</span><span class="p">,</span> <span class="n">gpt_attention</span><span class="p">,</span> <span class="n">matmul</span><span class="p">,</span>
+    <span class="n">minimum</span><span class="p">,</span> <span class="n">repeat_interleave</span><span class="p">,</span> <span class="n">shape</span><span class="p">,</span> <span class="nb">slice</span><span class="p">,</span> <span class="n">softmax</span><span class="p">,</span> <span class="n">split</span><span class="p">,</span> <span class="n">unsqueeze</span><span class="p">,</span> <span class="n">where</span><span class="p">)</span>
+<span class="c1"># isort: on</span>
 <span class="kn">from</span> <span class="nn">..mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
 <span class="kn">from</span> <span class="nn">..module</span> <span class="kn">import</span> <span class="n">Module</span>
 <span class="kn">from</span> <span class="nn">..parameter</span> <span class="kn">import</span> <span class="n">Parameter</span>
@@ -201,8 +201,6 @@
 <span class="kn">from</span> <span class="nn">.linear</span> <span class="kn">import</span> <span class="n">ColumnLinear</span><span class="p">,</span> <span class="n">RowLinear</span>
 <span class="kn">from</span> <span class="nn">.lora</span> <span class="kn">import</span> <span class="n">LoraRuntimeParams</span>
 <span class="kn">from</span> <span class="nn">.normalization</span> <span class="kn">import</span> <span class="n">GroupNorm</span><span class="p">,</span> <span class="n">LayerNorm</span><span class="p">,</span> <span class="n">RmsNorm</span>
-
-<span class="kn">from</span> <span class="nn">..functional</span> <span class="kn">import</span> <span class="n">maximum</span>  <span class="c1"># isort:skip</span>
 
 <span class="n">layernorm_map</span> <span class="o">=</span> <span class="p">{</span>
     <span class="n">LayerNormType</span><span class="o">.</span><span class="n">LayerNorm</span><span class="p">:</span> <span class="n">LayerNorm</span><span class="p">,</span>
@@ -349,14 +347,12 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">embed_positions</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">rotary_inv_freq</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">embed_positions_for_gpt_attention</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">embed_positions_short_factors</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">embed_positions_long_factors</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">embed_positions_short_factors_for_attention_plugin</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">embed_positions_long_factors_for_attention_plugin</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="c1"># long rope const parameters</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">long_rope_embed_positions</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">long_rope_rotary_inv_freq</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">long_rope_embed_positions_for_gpt_attention</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">short_mscale</span> <span class="o">=</span> <span class="mf">1.0</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">long_mscale</span> <span class="o">=</span> <span class="mf">1.0</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">short_inv_freq</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">long_inv_freq</span> <span class="o">=</span> <span class="kc">None</span>
 
 <div class="viewcode-block" id="AttentionParams.fill_attention_const_params_for_rope">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.AttentionParams.fill_attention_const_params_for_rope">[docs]</a>
@@ -374,18 +370,18 @@
 <div class="viewcode-block" id="AttentionParams.fill_attention_const_params_for_long_rope">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.AttentionParams.fill_attention_const_params_for_long_rope">[docs]</a>
     <span class="k">def</span> <span class="nf">fill_attention_const_params_for_long_rope</span><span class="p">(</span>
-            <span class="bp">self</span><span class="p">,</span> <span class="n">embed_positions_short_factors</span><span class="p">,</span> <span class="n">embed_positions_long_factors</span><span class="p">,</span>
-            <span class="n">embed_positions_short_factors_for_attention_plugin</span><span class="p">,</span>
-            <span class="n">embed_positions_long_factors_for_attention_plugin</span><span class="p">,</span> <span class="n">short_mscale</span><span class="p">,</span>
-            <span class="n">long_mscale</span><span class="p">,</span> <span class="n">short_inv_freq</span><span class="p">,</span> <span class="n">long_inv_freq</span><span class="p">):</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">embed_positions_short_factors</span> <span class="o">=</span> <span class="n">embed_positions_short_factors</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">embed_positions_long_factors</span> <span class="o">=</span> <span class="n">embed_positions_long_factors</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">embed_positions_short_factors_for_attention_plugin</span> <span class="o">=</span> <span class="n">embed_positions_short_factors_for_attention_plugin</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">embed_positions_long_factors_for_attention_plugin</span> <span class="o">=</span> <span class="n">embed_positions_long_factors_for_attention_plugin</span>
+            <span class="bp">self</span><span class="p">,</span> <span class="n">embed_positions</span><span class="p">,</span> <span class="n">long_rope_embed_positions</span><span class="p">,</span> <span class="n">rotary_inv_freq</span><span class="p">,</span>
+            <span class="n">long_rope_rotary_inv_freq</span><span class="p">,</span> <span class="n">embed_positions_for_gpt_attention</span><span class="p">,</span>
+            <span class="n">long_rope_embed_positions_for_gpt_attention</span><span class="p">,</span> <span class="n">short_mscale</span><span class="p">,</span>
+            <span class="n">long_mscale</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">embed_positions</span> <span class="o">=</span> <span class="n">embed_positions</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">long_rope_embed_positions</span> <span class="o">=</span> <span class="n">long_rope_embed_positions</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">rotary_inv_freq</span> <span class="o">=</span> <span class="n">rotary_inv_freq</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">long_rope_rotary_inv_freq</span> <span class="o">=</span> <span class="n">long_rope_rotary_inv_freq</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">embed_positions_for_gpt_attention</span> <span class="o">=</span> <span class="n">embed_positions_for_gpt_attention</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">long_rope_embed_positions_for_gpt_attention</span> <span class="o">=</span> <span class="n">long_rope_embed_positions_for_gpt_attention</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">short_mscale</span> <span class="o">=</span> <span class="n">short_mscale</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">long_mscale</span> <span class="o">=</span> <span class="n">long_mscale</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">short_inv_freq</span> <span class="o">=</span> <span class="n">short_inv_freq</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">long_inv_freq</span> <span class="o">=</span> <span class="n">long_inv_freq</span>
         <span class="k">return</span> <span class="bp">self</span></div>
 
 
@@ -438,13 +434,15 @@
                  <span class="n">spec_decoding_max_generation_length</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
                  <span class="n">spec_decoding_generation_lengths</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">spec_decoding_position_offsets</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-                 <span class="n">spec_decoding_packed_mask</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+                 <span class="n">spec_decoding_packed_mask</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">spec_decoding_use</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">spec_decoding_is_generation_length_variable</span> <span class="o">=</span> <span class="n">spec_decoding_is_generation_length_variable</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">spec_decoding_max_generation_length</span> <span class="o">=</span> <span class="n">spec_decoding_max_generation_length</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">spec_decoding_generation_lengths</span> <span class="o">=</span> <span class="n">spec_decoding_generation_lengths</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">spec_decoding_position_offsets</span> <span class="o">=</span> <span class="n">spec_decoding_position_offsets</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">spec_decoding_packed_mask</span> <span class="o">=</span> <span class="n">spec_decoding_packed_mask</span></div>
+        <span class="bp">self</span><span class="o">.</span><span class="n">spec_decoding_packed_mask</span> <span class="o">=</span> <span class="n">spec_decoding_packed_mask</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">spec_decoding_use</span> <span class="o">=</span> <span class="n">spec_decoding_use</span></div>
 
 
 
@@ -454,10 +452,10 @@
 
     <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
-        <span class="n">mrope_rotary_sin_cos</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">mrope_rotary_cos_sin</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">mrope_position_deltas</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">mrope_rotary_sin_cos</span> <span class="o">=</span> <span class="n">mrope_rotary_sin_cos</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">mrope_rotary_cos_sin</span> <span class="o">=</span> <span class="n">mrope_rotary_cos_sin</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">mrope_position_deltas</span> <span class="o">=</span> <span class="n">mrope_position_deltas</span></div>
 
 
@@ -594,7 +592,12 @@
                  <span class="n">use_implicit_relative_attention</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                  <span class="n">reorder</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                  <span class="n">layer_idx_in_cache_pool</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                 <span class="n">enable_qkv</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
+                 <span class="n">enable_qkv</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+                 <span class="n">cp_group</span><span class="o">=</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span>
+                 <span class="n">cp_size</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+                 <span class="n">cp_rank</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+                 <span class="n">max_seqlen_for_logn_scaling</span><span class="o">=</span><span class="mi">8192</span><span class="p">,</span>
+                 <span class="n">use_logn_scaling</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">local_layer_idx</span> <span class="o">=</span> <span class="n">local_layer_idx</span>
@@ -621,6 +624,9 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">dense_bias</span> <span class="o">=</span> <span class="n">dense_bias</span>
         <span class="k">if</span> <span class="n">dense_bias</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">dense_bias</span> <span class="o">=</span> <span class="n">bias</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">cp_group</span> <span class="o">=</span> <span class="n">cp_group</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">cp_size</span> <span class="o">=</span> <span class="n">cp_size</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">cp_rank</span> <span class="o">=</span> <span class="n">cp_rank</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">num_layers</span> <span class="o">=</span> <span class="n">num_layers</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">apply_query_key_layer_scaling</span> <span class="o">=</span> <span class="n">apply_query_key_layer_scaling</span>
@@ -648,6 +654,8 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">long_mscale</span> <span class="o">=</span> <span class="mf">1.0</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_percentage</span> <span class="o">=</span> <span class="n">rotary_embedding_percentage</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">use_implicit_relative_attention</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">relative_attention</span> <span class="ow">and</span> <span class="n">use_implicit_relative_attention</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">max_seqlen_for_logn_scaling</span> <span class="o">=</span> <span class="n">max_seqlen_for_logn_scaling</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">use_logn_scaling</span> <span class="o">=</span> <span class="n">use_logn_scaling</span>
         <span class="k">if</span> <span class="n">rotary_embedding_scaling</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">rotary_scaling_type</span> <span class="o">=</span> <span class="n">rotary_embedding_scaling</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
                 <span class="s2">&quot;type&quot;</span><span class="p">,</span> <span class="n">rotary_embedding_scaling</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;rope_type&quot;</span><span class="p">))</span>
@@ -672,6 +680,13 @@
             <span class="bp">self</span><span class="o">.</span><span class="n">register_parameter</span><span class="p">(</span>
                 <span class="s1">&#39;alibi_slopes&#39;</span><span class="p">,</span>
                 <span class="n">Parameter</span><span class="p">(</span><span class="n">alibi_slopes</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="s1">&#39;float32&#39;</span><span class="p">,</span> <span class="n">is_buffer</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_logn_scaling</span><span class="p">:</span>
+            <span class="n">logn_scaling</span> <span class="o">=</span> <span class="n">generate_logn_scaling</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">max_seqlen_for_logn_scaling</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">register_parameter</span><span class="p">(</span>
+                <span class="s1">&#39;logn_scaling&#39;</span><span class="p">,</span>
+                <span class="n">Parameter</span><span class="p">(</span><span class="n">logn_scaling</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="s1">&#39;float32&#39;</span><span class="p">,</span> <span class="n">is_buffer</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span> <span class="o">=</span> <span class="n">quant_mode</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">max_attn_value</span> <span class="o">=</span> <span class="n">max_attn_value</span>
@@ -805,9 +820,10 @@
                 <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">architecture</span> <span class="o">==</span> <span class="s2">&quot;Phi3SmallForCausalLM&quot;</span> <span class="ow">or</span> <span class="n">config</span><span class="o">.</span><span class="n">architecture</span> <span class="o">==</span> <span class="s2">&quot;PhiMoEForCausalLM&quot;</span><span class="p">:</span>
                     <span class="n">rope_scaling_short_mscale</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">longrope_short_mscale</span>
                     <span class="n">rope_scaling_long_mscale</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">longrope_long_mscale</span>
-                <span class="n">embed_positions_short_factors</span><span class="p">,</span> <span class="n">embed_positions_long_factors</span><span class="p">,</span> \
-                <span class="p">(</span><span class="n">short_inv_freq</span><span class="p">,</span> <span class="n">embed_positions_short_factors_for_attention_plugin</span><span class="p">),</span> \
-                <span class="p">(</span><span class="n">long_inv_freq</span><span class="p">,</span> <span class="n">embed_positions_long_factors_for_attention_plugin</span><span class="p">),</span> <span class="n">mscale</span> \
+
+                <span class="n">embed_positions</span><span class="p">,</span> <span class="n">long_rope_embed_positions</span><span class="p">,</span> \
+                <span class="p">(</span><span class="n">rotary_inv_freq</span><span class="p">,</span> <span class="n">embed_positions_for_gpt_attention</span><span class="p">),</span> \
+                <span class="p">(</span><span class="n">long_rope_rotary_inv_freq</span><span class="p">,</span> <span class="n">long_rope_embed_positions_for_gpt_attention</span><span class="p">),</span> <span class="n">mscale</span> \
                     <span class="o">=</span> <span class="n">RopeEmbeddingUtils</span><span class="o">.</span><span class="n">create_sinusoidal_positions_long_rope</span><span class="p">(</span>
                     <span class="n">max_position_embeddings</span><span class="p">,</span>
                     <span class="n">original_max_position_embeddings</span><span class="p">,</span> <span class="n">rotary_embedding_dim</span><span class="p">,</span>
@@ -821,38 +837,34 @@
                 <span class="k">else</span><span class="p">:</span>
                     <span class="n">short_mscale</span> <span class="o">=</span> <span class="n">long_mscale</span> <span class="o">=</span> <span class="n">mscale</span>
 
-                <span class="n">short_inv_freq</span> <span class="o">=</span> <span class="n">short_inv_freq</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
-                <span class="n">long_inv_freq</span> <span class="o">=</span> <span class="n">long_inv_freq</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
-
                 <span class="n">model_cls</span><span class="o">.</span><span class="n">register_parameter</span><span class="p">(</span>
-                    <span class="s1">&#39;embed_positions_short_factors&#39;</span><span class="p">,</span>
-                    <span class="n">Parameter</span><span class="p">(</span><span class="n">embed_positions_short_factors</span><span class="p">,</span>
+                    <span class="s1">&#39;embed_positions&#39;</span><span class="p">,</span>
+                    <span class="n">Parameter</span><span class="p">(</span><span class="n">embed_positions</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="s1">&#39;float32&#39;</span><span class="p">,</span> <span class="n">is_buffer</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
+                <span class="n">model_cls</span><span class="o">.</span><span class="n">register_parameter</span><span class="p">(</span>
+                    <span class="s1">&#39;long_rope_embed_positions&#39;</span><span class="p">,</span>
+                    <span class="n">Parameter</span><span class="p">(</span><span class="n">long_rope_embed_positions</span><span class="p">,</span>
                               <span class="n">dtype</span><span class="o">=</span><span class="s1">&#39;float32&#39;</span><span class="p">,</span>
                               <span class="n">is_buffer</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
                 <span class="n">model_cls</span><span class="o">.</span><span class="n">register_parameter</span><span class="p">(</span>
-                    <span class="s1">&#39;embed_positions_long_factors&#39;</span><span class="p">,</span>
-                    <span class="n">Parameter</span><span class="p">(</span><span class="n">embed_positions_long_factors</span><span class="p">,</span>
+                    <span class="s1">&#39;rotary_inv_freq&#39;</span><span class="p">,</span>
+                    <span class="n">Parameter</span><span class="p">(</span><span class="n">rotary_inv_freq</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="s1">&#39;float32&#39;</span><span class="p">,</span> <span class="n">is_buffer</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
+                <span class="n">model_cls</span><span class="o">.</span><span class="n">register_parameter</span><span class="p">(</span>
+                    <span class="s1">&#39;long_rope_rotary_inv_freq&#39;</span><span class="p">,</span>
+                    <span class="n">Parameter</span><span class="p">(</span><span class="n">long_rope_rotary_inv_freq</span><span class="p">,</span>
                               <span class="n">dtype</span><span class="o">=</span><span class="s1">&#39;float32&#39;</span><span class="p">,</span>
                               <span class="n">is_buffer</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
                 <span class="n">model_cls</span><span class="o">.</span><span class="n">register_parameter</span><span class="p">(</span>
-                    <span class="s1">&#39;embed_positions_short_factors_for_attention_plugin&#39;</span><span class="p">,</span>
-                    <span class="n">Parameter</span><span class="p">(</span>
-                        <span class="n">embed_positions_short_factors_for_attention_plugin</span><span class="p">,</span>
-                        <span class="n">dtype</span><span class="o">=</span><span class="s1">&#39;float32&#39;</span><span class="p">,</span>
-                        <span class="n">is_buffer</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
+                    <span class="s1">&#39;embed_positions_for_gpt_attention&#39;</span><span class="p">,</span>
+                    <span class="n">Parameter</span><span class="p">(</span><span class="n">embed_positions_for_gpt_attention</span><span class="p">,</span>
+                              <span class="n">dtype</span><span class="o">=</span><span class="s1">&#39;float32&#39;</span><span class="p">,</span>
+                              <span class="n">is_buffer</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
                 <span class="n">model_cls</span><span class="o">.</span><span class="n">register_parameter</span><span class="p">(</span>
-                    <span class="s1">&#39;embed_positions_long_factors_for_attention_plugin&#39;</span><span class="p">,</span>
-                    <span class="n">Parameter</span><span class="p">(</span><span class="n">embed_positions_long_factors_for_attention_plugin</span><span class="p">,</span>
+                    <span class="s1">&#39;long_rope_embed_positions_for_gpt_attention&#39;</span><span class="p">,</span>
+                    <span class="n">Parameter</span><span class="p">(</span><span class="n">long_rope_embed_positions_for_gpt_attention</span><span class="p">,</span>
                               <span class="n">dtype</span><span class="o">=</span><span class="s1">&#39;float32&#39;</span><span class="p">,</span>
                               <span class="n">is_buffer</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
                 <span class="n">model_cls</span><span class="o">.</span><span class="n">short_mscale</span> <span class="o">=</span> <span class="n">short_mscale</span>
                 <span class="n">model_cls</span><span class="o">.</span><span class="n">long_mscale</span> <span class="o">=</span> <span class="n">long_mscale</span>
-                <span class="n">model_cls</span><span class="o">.</span><span class="n">register_parameter</span><span class="p">(</span>
-                    <span class="s1">&#39;short_inv_freq&#39;</span><span class="p">,</span>
-                    <span class="n">Parameter</span><span class="p">(</span><span class="n">short_inv_freq</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="s1">&#39;float32&#39;</span><span class="p">,</span> <span class="n">is_buffer</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
-                <span class="n">model_cls</span><span class="o">.</span><span class="n">register_parameter</span><span class="p">(</span>
-                    <span class="s1">&#39;long_inv_freq&#39;</span><span class="p">,</span>
-                    <span class="n">Parameter</span><span class="p">(</span><span class="n">long_inv_freq</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="s1">&#39;float32&#39;</span><span class="p">,</span> <span class="n">is_buffer</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="c1"># Rotary const weights.</span>
             <span class="n">embed_positions</span> <span class="o">=</span> <span class="n">RopeEmbeddingUtils</span><span class="o">.</span><span class="n">create_sinusoidal_positions</span><span class="p">(</span>
@@ -884,16 +896,14 @@
             <span class="k">if</span> <span class="n">attention_params</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="n">attention_params</span> <span class="o">=</span> <span class="n">AttentionParams</span><span class="p">()</span>
             <span class="k">if</span> <span class="n">model_cls</span><span class="o">.</span><span class="n">position_embedding_type</span> <span class="o">==</span> <span class="n">PositionEmbeddingType</span><span class="o">.</span><span class="n">long_rope</span><span class="p">:</span>
-                <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">model_cls</span><span class="p">,</span> <span class="s2">&quot;embed_positions_short_factors&quot;</span><span class="p">):</span>
-                    <span class="k">return</span> <span class="n">attention_params</span><span class="o">.</span><span class="n">fill_attention_const_params_for_long_rope</span><span class="p">(</span>
-                        <span class="n">model_cls</span><span class="o">.</span><span class="n">embed_positions_short_factors</span><span class="o">.</span><span class="n">value</span><span class="p">,</span>
-                        <span class="n">model_cls</span><span class="o">.</span><span class="n">embed_positions_long_factors</span><span class="o">.</span><span class="n">value</span><span class="p">,</span> <span class="n">model_cls</span><span class="o">.</span>
-                        <span class="n">embed_positions_short_factors_for_attention_plugin</span><span class="o">.</span>
-                        <span class="n">value</span><span class="p">,</span> <span class="n">model_cls</span><span class="o">.</span>
-                        <span class="n">embed_positions_long_factors_for_attention_plugin</span><span class="o">.</span><span class="n">value</span><span class="p">,</span>
-                        <span class="n">model_cls</span><span class="o">.</span><span class="n">short_mscale</span><span class="p">,</span> <span class="n">model_cls</span><span class="o">.</span><span class="n">long_mscale</span><span class="p">,</span>
-                        <span class="n">model_cls</span><span class="o">.</span><span class="n">short_inv_freq</span><span class="o">.</span><span class="n">value</span><span class="p">,</span>
-                        <span class="n">model_cls</span><span class="o">.</span><span class="n">long_inv_freq</span><span class="o">.</span><span class="n">value</span><span class="p">)</span>
+                <span class="k">return</span> <span class="n">attention_params</span><span class="o">.</span><span class="n">fill_attention_const_params_for_long_rope</span><span class="p">(</span>
+                    <span class="n">model_cls</span><span class="o">.</span><span class="n">embed_positions</span><span class="o">.</span><span class="n">value</span><span class="p">,</span>
+                    <span class="n">model_cls</span><span class="o">.</span><span class="n">long_rope_embed_positions</span><span class="o">.</span><span class="n">value</span><span class="p">,</span>
+                    <span class="n">model_cls</span><span class="o">.</span><span class="n">rotary_inv_freq</span><span class="o">.</span><span class="n">value</span><span class="p">,</span>
+                    <span class="n">model_cls</span><span class="o">.</span><span class="n">long_rope_rotary_inv_freq</span><span class="o">.</span><span class="n">value</span><span class="p">,</span>
+                    <span class="n">model_cls</span><span class="o">.</span><span class="n">embed_positions_for_gpt_attention</span><span class="o">.</span><span class="n">value</span><span class="p">,</span>
+                    <span class="n">model_cls</span><span class="o">.</span><span class="n">long_rope_embed_positions_for_gpt_attention</span><span class="o">.</span><span class="n">value</span><span class="p">,</span>
+                    <span class="n">model_cls</span><span class="o">.</span><span class="n">short_mscale</span><span class="p">,</span> <span class="n">model_cls</span><span class="o">.</span><span class="n">long_mscale</span><span class="p">)</span>
             <span class="k">else</span><span class="p">:</span>
                 <span class="k">return</span> <span class="n">attention_params</span><span class="o">.</span><span class="n">fill_attention_const_params_for_rope</span><span class="p">(</span>
                     <span class="n">model_cls</span><span class="o">.</span><span class="n">embed_positions</span><span class="o">.</span><span class="n">value</span><span class="p">,</span>
@@ -921,16 +931,19 @@
         <span class="n">lora_layer_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">cross_kv_cache_gen</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">cross_kv_reuse</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="n">reduce_fusion_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">AllReduceFusionParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">all_reduce_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">AllReduceParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">skip_attn</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
-
+        <span class="n">attention_input</span> <span class="o">=</span> <span class="n">hidden_states</span>
         <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">)</span>
 
         <span class="n">spec_decoding_params</span> <span class="o">=</span> <span class="n">SpecDecodingParams</span><span class="p">(</span>
         <span class="p">)</span> <span class="k">if</span> <span class="n">spec_decoding_params</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">spec_decoding_params</span>
 
         <span class="n">mrope_params</span> <span class="o">=</span> <span class="n">MropeParams</span><span class="p">()</span> <span class="k">if</span> <span class="n">mrope_params</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">mrope_params</span>
+        <span class="n">logn_scaling</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_logn_scaling</span><span class="p">:</span>
+            <span class="n">logn_scaling</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">logn_scaling</span><span class="o">.</span><span class="n">value</span>
 
         <span class="n">alibi_slopes</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">position_embedding_type</span><span class="o">.</span><span class="n">is_alibi</span><span class="p">():</span>
@@ -1199,48 +1212,21 @@
                 <span class="n">kv_quant_orig_scale</span> <span class="o">=</span> <span class="kc">None</span>
 
             <span class="c1"># Attention output scales</span>
-            <span class="k">assert</span> <span class="p">(</span>
-                <span class="ow">not</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">use_fp8_context_fmha</span>
-            <span class="p">)</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_fp8_qdq</span><span class="p">(</span>
-            <span class="p">),</span> <span class="s2">&quot;FP8 Context FMHA must be used together with the fp8 quantization workflow.&quot;</span>
-
             <span class="n">attention_output_orig_quant_scale</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_output_orig_quant_scale</span><span class="o">.</span><span class="n">value</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_output_orig_quant_scale</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
 
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">position_embedding_type</span> <span class="o">==</span> <span class="n">PositionEmbeddingType</span><span class="o">.</span><span class="n">long_rope</span><span class="p">:</span>
-                <span class="n">max_seq_length</span> <span class="o">=</span> <span class="n">fmax</span><span class="p">(</span><span class="n">attention_params</span><span class="o">.</span><span class="n">sequence_length</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
-                <span class="n">floor_seq_length</span> <span class="o">=</span> <span class="n">maximum</span><span class="p">(</span>
-                    <span class="n">max_seq_length</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">original_max_position_embeddings</span><span class="p">)</span>
+            <span class="c1"># The rotary inv freq can be pre-computed.</span>
+            <span class="n">rotary_inv_freq</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">attention_params</span><span class="p">,</span> <span class="s2">&quot;rotary_inv_freq&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="c1"># Rotary cos/sin cache.</span>
+            <span class="n">rotary_cos_sin</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">attention_params</span><span class="p">,</span>
+                                     <span class="s2">&quot;embed_positions_for_gpt_attention&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
 
-                <span class="n">short</span> <span class="o">=</span> <span class="n">attention_params</span><span class="o">.</span><span class="n">embed_positions_short_factors_for_attention_plugin</span>
-                <span class="n">long</span> <span class="o">=</span> <span class="n">attention_params</span><span class="o">.</span><span class="n">embed_positions_long_factors_for_attention_plugin</span>
+            <span class="n">long_rope_rotary_inv_freq</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">attention_params</span><span class="p">,</span>
+                                                <span class="s2">&quot;long_rope_rotary_inv_freq&quot;</span><span class="p">,</span>
+                                                <span class="kc">None</span><span class="p">)</span>
+            <span class="n">long_rope_rotary_cos_sin</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span>
+                <span class="n">attention_params</span><span class="p">,</span> <span class="s2">&quot;long_rope_embed_positions_for_gpt_attention&quot;</span><span class="p">,</span>
+                <span class="kc">None</span><span class="p">)</span>
 
-                <span class="n">starts</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">])</span>
-                <span class="n">shapes</span> <span class="o">=</span> <span class="n">concat</span><span class="p">(</span>
-                    <span class="p">[</span><span class="n">floor_seq_length</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_dim</span> <span class="o">//</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">2</span><span class="p">])</span>
-
-                <span class="n">short</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span><span class="n">short</span><span class="p">,</span> <span class="n">starts</span><span class="p">,</span> <span class="n">shapes</span><span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">((</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">))</span>
-                <span class="n">long</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span><span class="n">long</span><span class="p">,</span> <span class="n">starts</span><span class="p">,</span> <span class="n">shapes</span><span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">((</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">))</span>
-
-                <span class="n">use_long_factors</span> <span class="o">=</span> <span class="n">gt</span><span class="p">(</span><span class="n">max_seq_length</span><span class="p">,</span>
-                                      <span class="bp">self</span><span class="o">.</span><span class="n">original_max_position_embeddings</span><span class="p">)</span>
-
-                <span class="n">cond</span> <span class="o">=</span> <span class="n">Conditional</span><span class="p">(</span><span class="n">use_long_factors</span><span class="p">)</span>
-                <span class="n">true_val</span> <span class="o">=</span> <span class="n">cond</span><span class="o">.</span><span class="n">add_input</span><span class="p">(</span><span class="n">long</span><span class="p">)</span>
-                <span class="n">false_val</span> <span class="o">=</span> <span class="n">cond</span><span class="o">.</span><span class="n">add_input</span><span class="p">(</span><span class="n">short</span><span class="p">)</span>
-                <span class="n">rotary_cos_sin</span> <span class="o">=</span> <span class="n">cond</span><span class="o">.</span><span class="n">add_output</span><span class="p">(</span><span class="n">true_val</span><span class="p">,</span> <span class="n">false_val</span><span class="p">)</span>
-
-                <span class="n">cond</span> <span class="o">=</span> <span class="n">Conditional</span><span class="p">(</span><span class="n">use_long_factors</span><span class="p">)</span>
-                <span class="n">true_val</span> <span class="o">=</span> <span class="n">cond</span><span class="o">.</span><span class="n">add_input</span><span class="p">(</span><span class="n">attention_params</span><span class="o">.</span><span class="n">long_inv_freq</span><span class="p">)</span>
-                <span class="n">false_val</span> <span class="o">=</span> <span class="n">cond</span><span class="o">.</span><span class="n">add_input</span><span class="p">(</span><span class="n">attention_params</span><span class="o">.</span><span class="n">short_inv_freq</span><span class="p">)</span>
-                <span class="n">rotary_inv_freq</span> <span class="o">=</span> <span class="n">cond</span><span class="o">.</span><span class="n">add_output</span><span class="p">(</span><span class="n">true_val</span><span class="p">,</span> <span class="n">false_val</span><span class="p">)</span>
-            <span class="k">else</span><span class="p">:</span>
-                <span class="c1"># The rotary inv freq can be pre-computed.</span>
-                <span class="n">rotary_inv_freq</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">attention_params</span><span class="p">,</span> <span class="s2">&quot;rotary_inv_freq&quot;</span><span class="p">,</span>
-                                          <span class="kc">None</span><span class="p">)</span>
-                <span class="c1"># Rotary cos/sin cache.</span>
-                <span class="n">rotary_cos_sin</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">attention_params</span><span class="p">,</span>
-                                         <span class="s2">&quot;embed_positions_for_gpt_attention&quot;</span><span class="p">,</span>
-                                         <span class="kc">None</span><span class="p">)</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">position_embedding_type</span> <span class="o">==</span> <span class="n">PositionEmbeddingType</span><span class="o">.</span><span class="n">learned_absolute</span><span class="p">:</span>
                 <span class="n">rotary_inv_freq</span> <span class="o">=</span> <span class="kc">None</span>
                 <span class="n">rotary_cos_sin</span> <span class="o">=</span> <span class="kc">None</span>
@@ -1250,6 +1236,9 @@
                 <span class="k">assert</span> <span class="p">(</span><span class="n">rotary_inv_freq</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">and</span> <span class="p">(</span>
                     <span class="n">rotary_cos_sin</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
                 <span class="p">),</span> <span class="s2">&quot;rotary_inv_freq and embed_positions_for_gpt_attention must be provided.&quot;</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">position_embedding_type</span> <span class="o">==</span> <span class="n">PositionEmbeddingType</span><span class="o">.</span><span class="n">long_rope</span><span class="p">:</span>
+                <span class="k">assert</span> <span class="n">long_rope_rotary_inv_freq</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+                <span class="k">assert</span> <span class="n">long_rope_rotary_cos_sin</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
 
             <span class="n">context</span><span class="p">,</span> <span class="n">past_key_value</span> <span class="o">=</span> <span class="n">gpt_attention</span><span class="p">(</span>
                 <span class="n">qkv</span><span class="o">=</span><span class="n">qkv</span><span class="p">,</span>
@@ -1316,6 +1305,7 @@
                 <span class="n">cross_kv</span><span class="o">=</span><span class="n">cross_kv</span><span class="p">,</span>
                 <span class="n">cross_kv_length</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span><span class="n">encoder_max_input_length</span><span class="p">,</span>
                 <span class="n">encoder_input_lengths</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span><span class="n">encoder_input_lengths</span><span class="p">,</span>
+                <span class="n">logn_scaling</span><span class="o">=</span><span class="n">logn_scaling</span><span class="p">,</span>
                 <span class="n">relative_attention_bias</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">rel_attn_table</span><span class="o">.</span><span class="n">value</span>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">relative_attention</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
                 <span class="n">max_distance</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_distance</span><span class="p">,</span>
@@ -1331,18 +1321,25 @@
                 <span class="n">spec_decoding_position_offsets</span><span class="p">,</span>
                 <span class="n">spec_decoding_packed_mask</span><span class="o">=</span><span class="n">spec_decoding_params</span><span class="o">.</span>
                 <span class="n">spec_decoding_packed_mask</span><span class="p">,</span>
-                <span class="n">mrope_rotary_sin_cos</span><span class="o">=</span><span class="n">mrope_params</span><span class="o">.</span><span class="n">mrope_rotary_sin_cos</span><span class="p">,</span>
+                <span class="n">spec_decoding_use</span><span class="o">=</span><span class="n">spec_decoding_params</span><span class="o">.</span><span class="n">spec_decoding_use</span><span class="p">,</span>
+                <span class="n">long_rope_rotary_inv_freq</span><span class="o">=</span><span class="n">long_rope_rotary_inv_freq</span><span class="p">,</span>
+                <span class="n">long_rope_rotary_cos_sin</span><span class="o">=</span><span class="n">long_rope_rotary_cos_sin</span><span class="p">,</span>
+                <span class="n">mrope_rotary_cos_sin</span><span class="o">=</span><span class="n">mrope_params</span><span class="o">.</span><span class="n">mrope_rotary_cos_sin</span><span class="p">,</span>
                 <span class="n">mrope_position_deltas</span><span class="o">=</span><span class="n">mrope_params</span><span class="o">.</span><span class="n">mrope_position_deltas</span><span class="p">,</span>
                 <span class="n">attn_logit_softcapping_scale</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_attn_value</span><span class="p">,</span>
                 <span class="n">host_runtime_perf_knobs</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span>
                 <span class="n">host_runtime_perf_knobs</span><span class="p">,</span>
                 <span class="n">host_context_progress</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span><span class="n">host_context_progress</span><span class="p">,</span>
                 <span class="n">skip_attn</span><span class="o">=</span><span class="n">skip_attn</span><span class="p">,</span>
-            <span class="p">)</span>
+                <span class="n">cp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">cp_size</span><span class="p">,</span>
+                <span class="n">cp_rank</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">cp_rank</span><span class="p">,</span>
+                <span class="n">cp_group</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">cp_group</span><span class="p">)</span>
 
         <span class="k">else</span><span class="p">:</span>
             <span class="c1"># plain TensorRT mode</span>
             <span class="k">assert</span> <span class="n">paged_kv_cache</span> <span class="o">==</span> <span class="kc">False</span>
+
+            <span class="k">assert</span> <span class="n">logn_scaling</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;plan TensorRT mode does not support logn scaling now&quot;</span>
 
             <span class="k">def</span> <span class="nf">transpose_for_scores</span><span class="p">(</span><span class="n">x</span><span class="p">,</span>
                                      <span class="n">rotary</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
@@ -1389,16 +1386,15 @@
                     <span class="n">starts</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">])</span>
                     <span class="n">shapes</span> <span class="o">=</span> <span class="n">concat</span><span class="p">(</span>
                         <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="n">floor_seq_length</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">rotary_embedding_dim</span><span class="p">])</span>
-                    <span class="n">short</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span>
-                        <span class="n">attention_params</span><span class="o">.</span><span class="n">embed_positions_short_factors</span><span class="p">,</span> <span class="n">starts</span><span class="p">,</span>
-                        <span class="n">shapes</span><span class="p">)</span>
-                    <span class="n">long</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span><span class="n">attention_params</span><span class="o">.</span><span class="n">embed_positions_long_factors</span><span class="p">,</span>
+                    <span class="n">short</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span><span class="n">attention_params</span><span class="o">.</span><span class="n">embed_positions</span><span class="p">,</span> <span class="n">starts</span><span class="p">,</span>
+                                  <span class="n">shapes</span><span class="p">)</span>
+                    <span class="n">long</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span><span class="n">attention_params</span><span class="o">.</span><span class="n">long_rope_embed_positions</span><span class="p">,</span>
                                  <span class="n">starts</span><span class="p">,</span> <span class="n">shapes</span><span class="p">)</span>
 
                     <span class="n">embed_positions</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span><span class="n">short</span><span class="p">,</span> <span class="n">long</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
                     <span class="n">select</span> <span class="o">=</span> <span class="n">where</span><span class="p">(</span>
-                        <span class="n">sequence_length</span> <span class="o">&lt;=</span>
-                        <span class="bp">self</span><span class="o">.</span><span class="n">original_max_position_embeddings</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+                        <span class="n">sequence_length</span>
+                        <span class="o">&lt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">original_max_position_embeddings</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
                     <span class="n">embed_positions</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span><span class="n">embed_positions</span><span class="p">,</span>
                                             <span class="n">concat</span><span class="p">([</span><span class="n">select</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">]),</span>
                                             <span class="n">sizes</span><span class="o">=</span><span class="n">shape</span><span class="p">(</span><span class="n">short</span><span class="p">))</span>
@@ -1675,22 +1671,27 @@
             <span class="n">dense_lora_params</span> <span class="o">=</span> <span class="n">lora_layer_params</span><span class="o">.</span><span class="n">get_runtime_params</span><span class="p">(</span>
                 <span class="mi">0</span><span class="p">,</span> <span class="s2">&quot;attn_dense&quot;</span><span class="p">)</span>
 
-        <span class="k">if</span> <span class="n">skip_attn</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">skip_attn</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">default_net</span><span class="p">(</span>
+        <span class="p">)</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">use_fp8_context_fmha</span><span class="p">:</span>
             <span class="c1"># This case is used when we can skip this attention layer directly.</span>
             <span class="c1"># The output would be undefined and not used if skip_attn is not None</span>
             <span class="c1"># and set skip_attn as True during runtime</span>
+            <span class="c1"># But when use_fp8_context_fmha is enabled, the output data type of</span>
+            <span class="c1"># attention_plugin is fp8. Since TRT&#39;s conditional layer does not support</span>
+            <span class="c1"># FP8 data type yet, we cannot use it to skip the computation in such case.</span>
 
             <span class="n">dense_conditional</span> <span class="o">=</span> <span class="n">Conditional</span><span class="p">(</span><span class="n">skip_attn</span><span class="p">)</span>
-            <span class="n">skip_case</span> <span class="o">=</span> <span class="n">dense_conditional</span><span class="o">.</span><span class="n">add_input</span><span class="p">(</span><span class="n">context</span><span class="p">)</span>
+            <span class="n">skip_case</span> <span class="o">=</span> <span class="n">dense_conditional</span><span class="o">.</span><span class="n">add_input</span><span class="p">(</span><span class="n">attention_input</span><span class="p">)</span>
             <span class="n">context</span> <span class="o">=</span> <span class="n">dense_conditional</span><span class="o">.</span><span class="n">add_input</span><span class="p">(</span><span class="n">context</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">inner_layernorm</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">context</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">inner_layernorm</span><span class="p">(</span><span class="n">context</span><span class="p">)</span>
         <span class="n">context</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">dense</span><span class="p">(</span><span class="n">context</span><span class="p">,</span>
                              <span class="n">lora_runtime_params</span><span class="o">=</span><span class="n">dense_lora_params</span><span class="p">,</span>
-                             <span class="n">reduce_fusion_params</span><span class="o">=</span><span class="n">reduce_fusion_params</span><span class="p">)</span>
+                             <span class="n">all_reduce_params</span><span class="o">=</span><span class="n">all_reduce_params</span><span class="p">)</span>
 
-        <span class="k">if</span> <span class="n">skip_attn</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">skip_attn</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">default_net</span><span class="p">(</span>
+        <span class="p">)</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">use_fp8_context_fmha</span><span class="p">:</span>
             <span class="n">context</span> <span class="o">=</span> <span class="n">dense_conditional</span><span class="o">.</span><span class="n">add_output</span><span class="p">(</span><span class="n">skip_case</span><span class="p">,</span> <span class="n">context</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
@@ -1712,8 +1713,15 @@
 <div class="viewcode-block" id="Attention.postprocess">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.Attention.postprocess">[docs]</a>
     <span class="k">def</span> <span class="nf">postprocess</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tllm_key</span><span class="p">,</span> <span class="n">weights</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
-        <span class="k">if</span> <span class="n">tllm_key</span><span class="o">.</span><span class="n">endswith</span><span class="p">(</span><span class="s2">&quot;kv_cache_scaling_factor&quot;</span><span class="p">)</span> <span class="ow">and</span> <span class="n">weights</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="k">return</span> <span class="p">{</span><span class="n">tllm_key</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">ones</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="p">)}</span>
+        <span class="k">if</span> <span class="n">tllm_key</span><span class="o">.</span><span class="n">endswith</span><span class="p">(</span><span class="s2">&quot;kv_cache_scaling_factor&quot;</span><span class="p">):</span>
+            <span class="k">if</span> <span class="n">weights</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">return</span> <span class="p">{</span><span class="n">tllm_key</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">ones</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="p">)}</span>
+            <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">weights</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">):</span>
+                <span class="k">return</span> <span class="p">{</span><span class="n">tllm_key</span><span class="p">:</span> <span class="n">weights</span><span class="p">}</span>
+            <span class="k">elif</span> <span class="kc">None</span> <span class="ow">in</span> <span class="n">weights</span><span class="p">:</span>
+                <span class="k">return</span> <span class="p">{</span><span class="n">tllm_key</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">ones</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="p">)}</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="k">return</span> <span class="p">{</span><span class="n">tllm_key</span><span class="p">:</span> <span class="nb">max</span><span class="p">(</span><span class="n">weights</span><span class="p">)}</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="k">return</span> <span class="p">{</span><span class="n">tllm_key</span><span class="p">:</span> <span class="n">weights</span><span class="p">}</span></div>
 </div>
@@ -2045,11 +2053,6 @@
             <span class="p">)</span> <span class="k">else</span> <span class="kc">None</span>
 
             <span class="c1"># Attention output scales</span>
-            <span class="k">assert</span> <span class="p">(</span>
-                <span class="ow">not</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">use_fp8_context_fmha</span>
-            <span class="p">)</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_fp8_qdq</span><span class="p">(</span>
-            <span class="p">),</span> <span class="s2">&quot;FP8 Context FMHA must be used together with the fp8 quantization workflow.&quot;</span>
-
             <span class="n">attention_output_orig_quant_scale</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_output_orig_quant_scale</span><span class="o">.</span><span class="n">value</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_output_orig_quant_scale</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
             <span class="n">context</span><span class="p">,</span> <span class="n">past_key_value</span> <span class="o">=</span> <span class="n">gpt_attention</span><span class="p">(</span>
                 <span class="n">qkv</span><span class="o">=</span><span class="n">qkv</span><span class="p">,</span>
@@ -2097,7 +2100,7 @@
                 <span class="n">use_cache</span><span class="o">=</span><span class="n">use_cache</span><span class="p">,</span>
                 <span class="n">spec_decoding_position_offsets</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">spec_decoding_packed_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">mrope_rotary_sin_cos</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">mrope_rotary_cos_sin</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">mrope_position_deltas</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">host_runtime_perf_knobs</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span>
                 <span class="n">host_runtime_perf_knobs</span><span class="p">,</span>
@@ -2337,11 +2340,6 @@
                 <span class="n">kv_quant_orig_scale</span> <span class="o">=</span> <span class="kc">None</span>
 
             <span class="c1"># Attention output scales</span>
-            <span class="k">assert</span> <span class="p">(</span>
-                <span class="ow">not</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">use_fp8_context_fmha</span>
-            <span class="p">)</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_fp8_qdq</span><span class="p">(</span>
-            <span class="p">),</span> <span class="s2">&quot;FP8 Context FMHA must be used together with the fp8 quantization workflow.&quot;</span>
-
             <span class="n">attention_output_orig_quant_scale</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_output_orig_quant_scale</span><span class="o">.</span><span class="n">value</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_output_orig_quant_scale</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
 
             <span class="n">rotary_cos_sin</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">embed_positions_for_gpt_attention</span><span class="o">.</span><span class="n">value</span>
@@ -2414,6 +2412,7 @@
                 <span class="n">spec_decoding_position_offsets</span><span class="p">,</span>
                 <span class="n">spec_decoding_packed_mask</span><span class="o">=</span><span class="n">spec_decoding_params</span><span class="o">.</span>
                 <span class="n">spec_decoding_packed_mask</span><span class="p">,</span>
+                <span class="n">spec_decoding_use</span><span class="o">=</span><span class="n">spec_decoding_params</span><span class="o">.</span><span class="n">spec_decoding_use</span><span class="p">,</span>
                 <span class="n">attn_logit_softcapping_scale</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_attn_value</span><span class="p">,</span>
                 <span class="n">host_runtime_perf_knobs</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span>
                 <span class="n">host_runtime_perf_knobs</span><span class="p">,</span>
@@ -2445,7 +2444,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f9468e16a20>
+<jinja2.runtime.BlockReference object at 0x7fed9814a210>
 
 <div class="footer">
     <p>
