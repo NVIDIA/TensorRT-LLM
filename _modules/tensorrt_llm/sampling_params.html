@@ -159,14 +159,62 @@
            <div itemprop="articleBody">
              
   <h1>Source code for tensorrt_llm.sampling_params</h1><div class="highlight"><pre>
-<span></span><span class="kn">import</span> <span class="nn">os</span>
-<span class="kn">from</span> <span class="nn">dataclasses</span> <span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
+<span></span><span class="kn">import</span> <span class="nn">json</span>
+<span class="kn">import</span> <span class="nn">os</span>
+<span class="kn">from</span> <span class="nn">dataclasses</span> <span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span><span class="p">,</span> <span class="n">fields</span>
 <span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="n">List</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Tuple</span><span class="p">,</span> <span class="n">Union</span>
 
 <span class="kn">import</span> <span class="nn">torch</span>
+<span class="kn">from</span> <span class="nn">pydantic</span> <span class="kn">import</span> <span class="n">BaseModel</span>
 
 <span class="kn">from</span> <span class="nn">tensorrt_llm.bindings</span> <span class="kn">import</span> <span class="n">executor</span> <span class="k">as</span> <span class="n">tllme</span>
 <span class="kn">from</span> <span class="nn">tensorrt_llm.logger</span> <span class="kn">import</span> <span class="n">logger</span>
+
+
+<div class="viewcode-block" id="GuidedDecodingParams">
+<a class="viewcode-back" href="../../llm-api/reference.html#tensorrt_llm.llmapi.GuidedDecodingParams">[docs]</a>
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">slots</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">kw_only</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span> <span class="nc">GuidedDecodingParams</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    Guided decoding parameters for text generation. Only one of the fields could be effective.</span>
+
+<span class="sd">    Args:</span>
+<span class="sd">        json (str, BaseModel, dict, optional): The generated text is amenable to json format with additional user-specified restrictions, namely schema. Defaults to None.</span>
+<span class="sd">        regex (str, optional): The generated text is amenable to the user-specified regular expression. Defaults to None.</span>
+<span class="sd">        grammar (str, optional): The generated text is amenable to the user-specified extended Backus-Naur form (EBNF) grammar. Defaults to None.</span>
+<span class="sd">        json_object (bool): If True, the generated text is amenable to json format. Defaults to False.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">json</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">BaseModel</span><span class="p">,</span> <span class="nb">dict</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">regex</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">grammar</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">json_object</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span> <span class="nf">num_guides</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="n">num_guides</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="k">for</span> <span class="n">field</span> <span class="ow">in</span> <span class="n">fields</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+            <span class="n">num_guides</span> <span class="o">+=</span> <span class="nb">bool</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">field</span><span class="o">.</span><span class="n">name</span><span class="p">))</span>
+        <span class="k">return</span> <span class="n">num_guides</span>
+
+    <span class="k">def</span> <span class="nf">_validate</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">if</span> <span class="p">(</span><span class="n">num_guides</span> <span class="o">:=</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_guides</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;Only one guide can be used for a request, but got </span><span class="si">{</span><span class="n">num_guides</span><span class="si">}</span><span class="s2">.&quot;</span>
+            <span class="p">)</span></div>
+
+
+
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">slots</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">kw_only</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span> <span class="nc">AdditionalModelOutput</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    An additional output to gather from the model.</span>
+
+<span class="sd">    Args:</span>
+<span class="sd">        name (str): The name of the additional output to gather from the model.</span>
+<span class="sd">        gather_context (bool): A value indicating whether or not to gather the additional output from the context too. Defaults to False.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">name</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">gather_context</span><span class="p">:</span> <span class="nb">bool</span>
 
 
 <div class="viewcode-block" id="SamplingParams">
@@ -220,6 +268,11 @@
 <span class="sd">        return_generation_logits (bool): Controls if Result should contain the generation logits. Default is false.</span>
 <span class="sd">        exclude_input_from_output (bool): Controls if output tokens in Result should include the input tokens. Default is true.</span>
 <span class="sd">        return_encoder_output (bool): Controls if Result should contain encoder output hidden states (for encoder-only and encoder-decoder models). Default is false.</span>
+<span class="sd">        return_perf_metrics (bool): Controls if Result should contain the performance metrics for this request. Default is false.</span>
+<span class="sd">        additional_model_outputs (list[AdditionalModelOutput], optional): The additional outputs to gather from the model.</span>
+
+<span class="sd">        lookahead_config (LookaheadDecodingConfig , optional): Lookahead decoding config. Defaults to None.</span>
+<span class="sd">        guided_decoding (GuidedDecodingParams, optional): Guided decoding params. Defaults to None.</span>
 
 <span class="sd">        ignore_eos (bool): Whether to ignore the EOS token and continue generating tokens after the EOS token is generated. Defaults to False.</span>
 <span class="sd">        detokenize (bool): Whether to detokenize the output. Defaults to True.</span>
@@ -290,6 +343,14 @@
     <span class="n">return_generation_logits</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="n">exclude_input_from_output</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="n">return_encoder_output</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="n">return_perf_metrics</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="n">additional_model_outputs</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="n">AdditionalModelOutput</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="c1"># Lookahead decoding config</span>
+    <span class="n">lookahead_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">tllme</span><span class="o">.</span><span class="n">LookaheadDecodingConfig</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="c1"># Guided decoding params</span>
+    <span class="n">guided_decoding</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">GuidedDecodingParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="c1"># Tokenizer-related configs</span>
     <span class="n">ignore_eos</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
@@ -370,6 +431,9 @@
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">&quot;truncate_prompt_tokens must be &gt;= 1, got </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">truncate_prompt_tokens</span><span class="si">}</span><span class="s2">&quot;</span>
             <span class="p">)</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">guided_decoding</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">guided_decoding</span><span class="o">.</span><span class="n">_validate</span><span class="p">()</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span> <span class="nf">greedy_decoding</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
@@ -504,7 +568,8 @@
         <span class="n">expected_fields</span> <span class="o">=</span> <span class="p">[</span>
             <span class="s2">&quot;return_log_probs&quot;</span><span class="p">,</span> <span class="s2">&quot;return_context_logits&quot;</span><span class="p">,</span>
             <span class="s2">&quot;return_generation_logits&quot;</span><span class="p">,</span> <span class="s2">&quot;exclude_input_from_output&quot;</span><span class="p">,</span>
-            <span class="s2">&quot;return_encoder_output&quot;</span>
+            <span class="s2">&quot;return_encoder_output&quot;</span><span class="p">,</span> <span class="s2">&quot;return_perf_metrics&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;additional_model_outputs&quot;</span>
         <span class="p">]</span>
         <span class="n">found_fields</span> <span class="o">=</span> <span class="p">[</span>
             <span class="n">f</span> <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="nb">dir</span><span class="p">(</span><span class="n">tllme</span><span class="o">.</span><span class="n">OutputConfig</span><span class="p">)</span> <span class="k">if</span> <span class="ow">not</span> <span class="n">f</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s1">&#39;__&#39;</span><span class="p">)</span>
@@ -516,7 +581,31 @@
                 <span class="s2">&quot;See [TO DEVELOPER] comments for detailed instructions.&quot;</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">tllme</span><span class="o">.</span><span class="n">OutputConfig</span><span class="p">(</span>
             <span class="o">**</span><span class="p">{</span><span class="n">f</span><span class="p">:</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">f</span><span class="p">)</span>
-               <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="n">expected_fields</span><span class="p">})</span></div>
+               <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="n">expected_fields</span><span class="p">})</span>
+
+    <span class="k">def</span> <span class="nf">_get_guided_decoding_params</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">tllme</span><span class="o">.</span><span class="n">GuidedDecodingParams</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">guided_decoding</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">guided_decoding</span><span class="o">.</span><span class="n">num_guides</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">None</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">guided_decoding</span><span class="o">.</span><span class="n">json_object</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">tllme</span><span class="o">.</span><span class="n">GuidedDecodingParams</span><span class="p">(</span>
+                <span class="n">tllme</span><span class="o">.</span><span class="n">GuidedDecodingParams</span><span class="o">.</span><span class="n">GuideType</span><span class="o">.</span><span class="n">JSON</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">guided_decoding</span><span class="o">.</span><span class="n">json</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">json_schema</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">guided_decoding</span><span class="o">.</span><span class="n">json</span>
+            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">json</span><span class="p">,</span> <span class="n">BaseModel</span><span class="p">):</span>
+                <span class="n">json_schema</span> <span class="o">=</span> <span class="n">json_schema</span><span class="o">.</span><span class="n">model_json_schema</span><span class="p">()</span>
+            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">json_schema</span><span class="p">,</span> <span class="nb">dict</span><span class="p">):</span>
+                <span class="n">json_schema</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">dumps</span><span class="p">(</span><span class="n">json_schema</span><span class="p">)</span>
+            <span class="k">return</span> <span class="n">tllme</span><span class="o">.</span><span class="n">GuidedDecodingParams</span><span class="p">(</span>
+                <span class="n">tllme</span><span class="o">.</span><span class="n">GuidedDecodingParams</span><span class="o">.</span><span class="n">GuideType</span><span class="o">.</span><span class="n">JSON_SCHEMA</span><span class="p">,</span> <span class="n">json_schema</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">guided_decoding</span><span class="o">.</span><span class="n">regex</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">tllme</span><span class="o">.</span><span class="n">GuidedDecodingParams</span><span class="p">(</span>
+                <span class="n">tllme</span><span class="o">.</span><span class="n">GuidedDecodingParams</span><span class="o">.</span><span class="n">GuideType</span><span class="o">.</span><span class="n">REGEX</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">guided_decoding</span><span class="o">.</span><span class="n">regex</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">tllme</span><span class="o">.</span><span class="n">GuidedDecodingParams</span><span class="p">(</span>
+                <span class="n">tllme</span><span class="o">.</span><span class="n">GuidedDecodingParams</span><span class="o">.</span><span class="n">GuideType</span><span class="o">.</span><span class="n">EBNF_GRAMMAR</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">guided_decoding</span><span class="o">.</span><span class="n">grammar</span><span class="p">)</span></div>
 
 </pre></div>
 
@@ -527,7 +616,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f946b791760>
+<jinja2.runtime.BlockReference object at 0x7fed973da8d0>
 
 <div class="footer">
     <p>

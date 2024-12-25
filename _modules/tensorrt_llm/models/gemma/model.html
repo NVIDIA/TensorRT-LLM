@@ -182,8 +182,10 @@
 <span class="kn">from</span> <span class="nn">tensorrt_llm.quantization.mode</span> <span class="kn">import</span> <span class="p">(</span><span class="n">MODELOPT_FLOW_QUANTIZATIONS</span><span class="p">,</span>
                                             <span class="n">QuantAlgo</span><span class="p">)</span>
 
+<span class="kn">from</span> <span class="nn">..._common</span> <span class="kn">import</span> <span class="n">default_net</span>
 <span class="kn">from</span> <span class="nn">..._utils</span> <span class="kn">import</span> <span class="n">pad_vocab_size</span>
-<span class="kn">from</span> <span class="nn">...functional</span> <span class="kn">import</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">cast</span><span class="p">,</span> <span class="n">recv</span><span class="p">,</span> <span class="n">send</span>
+<span class="kn">from</span> <span class="nn">...functional</span> <span class="kn">import</span> <span class="p">(</span><span class="n">AllReduceFusionOp</span><span class="p">,</span> <span class="n">AllReduceParams</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">cast</span><span class="p">,</span>
+                           <span class="n">recv</span><span class="p">,</span> <span class="n">send</span><span class="p">)</span>
 <span class="kn">from</span> <span class="nn">...layers</span> <span class="kn">import</span> <span class="p">(</span><span class="n">Attention</span><span class="p">,</span> <span class="n">AttentionMaskType</span><span class="p">,</span> <span class="n">AttentionParams</span><span class="p">,</span>
                        <span class="n">ColumnLinear</span><span class="p">,</span> <span class="n">Embedding</span><span class="p">,</span> <span class="n">GatedMLP</span><span class="p">,</span> <span class="n">KeyValueCacheParams</span><span class="p">,</span>
                        <span class="n">LoraParams</span><span class="p">,</span> <span class="n">PositionEmbeddingType</span><span class="p">,</span> <span class="n">RmsNorm</span><span class="p">)</span>
@@ -210,7 +212,7 @@
                                        <span class="n">dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
 
         <span class="n">layers_range</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">pp_layers</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">num_hidden_layers</span><span class="p">)</span>
-        <span class="n">local_layer_idx</span> <span class="o">=</span> <span class="n">layer_idx</span> <span class="o">-</span> <span class="n">layers_range</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">local_layer_idx</span> <span class="o">=</span> <span class="n">layer_idx</span> <span class="o">-</span> <span class="n">layers_range</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
 
         <span class="n">q_scaling</span> <span class="o">=</span> <span class="mf">1.0</span>
         <span class="n">max_attn_value</span> <span class="o">=</span> <span class="mf">0.0</span>
@@ -223,7 +225,7 @@
             <span class="n">max_attn_value</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">attn_logit_softcapping</span> <span class="ow">or</span> <span class="mf">0.0</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">attention</span> <span class="o">=</span> <span class="n">Attention</span><span class="p">(</span>
-            <span class="n">local_layer_idx</span><span class="o">=</span><span class="n">local_layer_idx</span><span class="p">,</span>
+            <span class="n">local_layer_idx</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">local_layer_idx</span><span class="p">,</span>
             <span class="n">hidden_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
             <span class="n">num_attention_heads</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">,</span>
             <span class="n">num_kv_heads</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">num_key_value_heads</span><span class="p">,</span>
@@ -239,7 +241,8 @@
             <span class="n">tp_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
             <span class="n">quant_mode</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">quant_mode</span><span class="p">,</span>
             <span class="n">q_scaling</span><span class="o">=</span><span class="n">q_scaling</span><span class="p">,</span>
-            <span class="n">max_attn_value</span><span class="o">=</span><span class="n">max_attn_value</span><span class="p">)</span>
+            <span class="n">max_attn_value</span><span class="o">=</span><span class="n">max_attn_value</span><span class="p">,</span>
+        <span class="p">)</span>
 
         <span class="n">mlp_hidden_size</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span> <span class="o">*</span> <span class="mi">4</span> <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">intermediate_size</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">config</span><span class="o">.</span><span class="n">intermediate_size</span>
 
@@ -272,36 +275,71 @@
                 <span class="n">use_cache</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
                 <span class="n">kv_cache_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">KeyValueCacheParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                 <span class="n">attention_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">AttentionParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-                <span class="n">lora_layer_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">LoraParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
-        <span class="n">residual</span> <span class="o">=</span> <span class="n">hidden_states</span>
-        <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_layernorm</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+                <span class="n">lora_layer_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">LoraParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                <span class="n">next_layer_input_layernorm_args</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+        <span class="c1"># assert not (</span>
+        <span class="c1">#     default_net().plugin_config.reduce_fusion and self.has_residual_mlp</span>
+        <span class="c1"># ), &quot;Custom all reduce and residual mlp can&#39;t be enabled at the same time.&quot;</span>
+        <span class="k">if</span> <span class="n">default_net</span><span class="p">(</span>
+        <span class="p">)</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">reduce_fusion</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">local_layer_idx</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="n">hidden_states</span><span class="p">,</span> <span class="n">residual</span> <span class="o">=</span> <span class="n">hidden_states</span>  <span class="c1">#FIXME:AN need to check if appropriate residual value is hidden state is pulled out.</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">residual</span> <span class="o">=</span> <span class="n">hidden_states</span>
+            <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_layernorm</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
 
-        <span class="n">attention_output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span>
-                                          <span class="n">attention_mask</span><span class="o">=</span><span class="n">attention_mask</span><span class="p">,</span>
-                                          <span class="n">use_cache</span><span class="o">=</span><span class="n">use_cache</span><span class="p">,</span>
-                                          <span class="n">kv_cache_params</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="p">,</span>
-                                          <span class="n">attention_params</span><span class="o">=</span><span class="n">attention_params</span><span class="p">,</span>
-                                          <span class="n">norm_before_bmm1</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-                                          <span class="n">lora_layer_params</span><span class="o">=</span><span class="n">lora_layer_params</span><span class="p">)</span>
+        <span class="n">attention_output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention</span><span class="p">(</span>
+            <span class="n">hidden_states</span><span class="p">,</span>
+            <span class="n">attention_mask</span><span class="o">=</span><span class="n">attention_mask</span><span class="p">,</span>
+            <span class="n">use_cache</span><span class="o">=</span><span class="n">use_cache</span><span class="p">,</span>
+            <span class="n">kv_cache_params</span><span class="o">=</span><span class="n">kv_cache_params</span><span class="p">,</span>
+            <span class="n">attention_params</span><span class="o">=</span><span class="n">attention_params</span><span class="p">,</span>
+            <span class="n">norm_before_bmm1</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+            <span class="n">lora_layer_params</span><span class="o">=</span><span class="n">lora_layer_params</span><span class="p">,</span>
+            <span class="n">all_reduce_params</span><span class="o">=</span><span class="n">AllReduceParams</span><span class="p">(</span>
+                <span class="n">fusion_op</span><span class="o">=</span><span class="n">AllReduceFusionOp</span><span class="o">.</span><span class="n">RESIDUAL_RMS_PREPOST_NORM</span>
+                <span class="k">if</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">reduce_fusion</span> <span class="k">else</span>
+                <span class="n">AllReduceFusionOp</span><span class="o">.</span><span class="n">NONE</span><span class="p">,</span>
+                <span class="n">residual</span><span class="o">=</span><span class="n">residual</span><span class="p">,</span>
+                <span class="n">norm_weight</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">post_layernorm</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">value</span><span class="p">,</span>
+                <span class="n">norm_pre_residual_weight</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">pre_feedforward_layernorm</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span>
+                <span class="n">value</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">inter_layernorms</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
+                <span class="n">eps</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">post_layernorm</span><span class="o">.</span><span class="n">eps</span><span class="p">))</span>
 
         <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
             <span class="n">attention_output</span><span class="p">,</span> <span class="n">presents</span> <span class="o">=</span> <span class="n">attention_output</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">inter_layernorms</span><span class="p">:</span>
-            <span class="n">attention_output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">post_layernorm</span><span class="p">(</span><span class="n">attention_output</span><span class="p">)</span>
 
-        <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">residual</span> <span class="o">+</span> <span class="n">attention_output</span>
-
-        <span class="n">residual</span> <span class="o">=</span> <span class="n">hidden_states</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">inter_layernorms</span><span class="p">:</span>
-            <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">pre_feedforward_layernorm</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">reduce_fusion</span><span class="p">:</span>
+            <span class="n">hidden_states</span><span class="p">,</span> <span class="n">residual</span> <span class="o">=</span> <span class="n">attention_output</span>
         <span class="k">else</span><span class="p">:</span>
-            <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">post_layernorm</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">inter_layernorms</span><span class="p">:</span>
+                <span class="n">attention_output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">post_layernorm</span><span class="p">(</span><span class="n">attention_output</span><span class="p">)</span>
+            <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">residual</span> <span class="o">+</span> <span class="n">attention_output</span>
+            <span class="n">residual</span> <span class="o">=</span> <span class="n">hidden_states</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">inter_layernorms</span><span class="p">:</span>
+                <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">pre_feedforward_layernorm</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">post_layernorm</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
 
-        <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span>
-                                 <span class="n">lora_layer_params</span><span class="o">=</span><span class="n">lora_layer_params</span><span class="p">)</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">inter_layernorms</span><span class="p">:</span>
-            <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">post_feedforward_layernorm</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
-        <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">residual</span> <span class="o">+</span> <span class="n">hidden_states</span>
+        <span class="k">if</span> <span class="n">next_layer_input_layernorm_args</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span><span class="p">(</span>
+                <span class="n">hidden_states</span><span class="p">,</span>
+                <span class="n">lora_layer_params</span><span class="o">=</span><span class="n">lora_layer_params</span><span class="p">,</span>
+                <span class="n">all_reduce_params</span><span class="o">=</span><span class="n">AllReduceParams</span><span class="p">(</span>
+                    <span class="n">fusion_op</span><span class="o">=</span><span class="n">AllReduceFusionOp</span><span class="o">.</span><span class="n">RESIDUAL_RMS_PREPOST_NORM</span>
+                    <span class="k">if</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">reduce_fusion</span> <span class="k">else</span>
+                    <span class="n">AllReduceFusionOp</span><span class="o">.</span><span class="n">NONE</span><span class="p">,</span>
+                    <span class="n">residual</span><span class="o">=</span><span class="n">residual</span><span class="p">,</span>
+                    <span class="n">norm_weight</span><span class="o">=</span><span class="n">next_layer_input_layernorm_args</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span>
+                    <span class="n">norm_pre_residual_weight</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">post_feedforward_layernorm</span><span class="o">.</span>
+                    <span class="n">weight</span><span class="o">.</span><span class="n">value</span><span class="p">,</span>
+                    <span class="n">eps</span><span class="o">=</span><span class="n">next_layer_input_layernorm_args</span><span class="p">[</span><span class="mi">1</span><span class="p">]))</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span>
+                                     <span class="n">lora_layer_params</span><span class="o">=</span><span class="n">lora_layer_params</span><span class="p">)</span>
+
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">inter_layernorms</span><span class="p">:</span>
+                <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">post_feedforward_layernorm</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+            <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">residual</span> <span class="o">+</span> <span class="n">hidden_states</span>
         <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
             <span class="k">return</span> <span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="n">presents</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">hidden_states</span>
@@ -381,22 +419,6 @@
 
         <span class="n">vocab_size_padded</span> <span class="o">=</span> <span class="n">pad_vocab_size</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span>
                                            <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">)</span>
-
-        <span class="k">try</span><span class="p">:</span>
-            <span class="kn">import</span> <span class="nn">modelopt</span>
-            <span class="n">major</span><span class="p">,</span> <span class="n">minor</span><span class="p">,</span> <span class="n">patch</span> <span class="o">=</span> <span class="n">modelopt</span><span class="o">.</span><span class="n">__version__</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">&quot;.&quot;</span><span class="p">)</span>
-            <span class="n">major</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">major</span><span class="p">)</span>
-            <span class="n">minor</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">minor</span><span class="p">)</span>
-            <span class="n">patch</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">patch</span><span class="p">)</span>
-            <span class="k">if</span> <span class="n">major</span> <span class="o">==</span> <span class="mi">0</span> <span class="ow">and</span> <span class="n">minor</span> <span class="o">==</span> <span class="mi">11</span> <span class="ow">and</span> <span class="n">patch</span> <span class="o">&lt;</span> <span class="mi">1</span><span class="p">:</span>
-                <span class="c1"># modelopt=0.11.0 won&#39;t force this field to True, this is a hot fix</span>
-                <span class="c1"># TODO: can remove after modelop=0.11.1 is out</span>
-                <span class="c1"># TRT LLM forces the embedding table to be shared for gemma.</span>
-                <span class="n">config</span><span class="o">.</span><span class="n">share_embedding_table</span> <span class="o">=</span> <span class="kc">True</span>
-            <span class="k">assert</span> <span class="n">config</span><span class="o">.</span><span class="n">share_embedding_table</span><span class="p">,</span> <span class="s2">&quot;Gemma only supports share_embedding_table&quot;</span>
-        <span class="k">except</span><span class="p">:</span>
-            <span class="c1"># Not find modelopt, assume not use modelopt quantized model</span>
-            <span class="k">assert</span> <span class="n">config</span><span class="o">.</span><span class="n">share_embedding_table</span><span class="p">,</span> <span class="s2">&quot;Gemma only supports share_embedding_table&quot;</span>
 
         <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_last_pp_rank</span><span class="p">():</span>
             <span class="n">lm_head</span> <span class="o">=</span> <span class="n">ColumnLinear</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
@@ -529,7 +551,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f946ae42cc0>
+<jinja2.runtime.BlockReference object at 0x7fed9787d0d0>
 
 <div class="footer">
     <p>

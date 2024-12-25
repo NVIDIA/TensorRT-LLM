@@ -6,7 +6,7 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Plugin &mdash; tensorrt_llm  documentation</title>
+  <title>Generate Text Using Lookahead Decoding &mdash; tensorrt_llm  documentation</title>
       <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
@@ -22,8 +22,8 @@
     <script src="../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="Quantization" href="tensorrt_llm.quantization.html" />
-    <link rel="prev" title="Models" href="tensorrt_llm.models.html" /> 
+    <link rel="next" title="Common Customizations" href="customization.html" />
+    <link rel="prev" title="Generate text with guided decoding" href="llm_guided_decoding.html" /> 
 </head>
 
 <body class="wy-body-for-nav"> 
@@ -66,25 +66,33 @@
 <li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">LLM API Examples</span></p>
-<ul>
-<li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/index.html">LLM Examples Introduction</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/customization.html">Common Customizations</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/llm_api_examples.html">Examples</a></li>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="index.html">LLM Examples Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="customization.html">Common Customizations</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="llm_api_examples.html">Examples</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_inference_customize.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_logits_processor.html">Control generated text using logits post processor</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
+</ul>
+</li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
-<ul class="current">
-<li class="toctree-l1"><a class="reference internal" href="tensorrt_llm.layers.html">Layers</a></li>
-<li class="toctree-l1"><a class="reference internal" href="tensorrt_llm.functional.html">Functionals</a></li>
-<li class="toctree-l1"><a class="reference internal" href="tensorrt_llm.models.html">Models</a></li>
-<li class="toctree-l1 current"><a class="current reference internal" href="#">Plugin</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="#tensorrt_llm.plugin.PluginConfig"><code class="docutils literal notranslate"><span class="pre">PluginConfig</span></code></a><ul>
-<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.plugin.PluginConfig.to_legacy_setting"><code class="docutils literal notranslate"><span class="pre">PluginConfig.to_legacy_setting()</span></code></a></li>
-</ul>
-</li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="tensorrt_llm.quantization.html">Quantization</a></li>
-<li class="toctree-l1"><a class="reference internal" href="tensorrt_llm.runtime.html">Runtime</a></li>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
 <ul>
@@ -157,9 +165,10 @@
           <div role="navigation" aria-label="Page navigation">
   <ul class="wy-breadcrumbs">
       <li><a href="../index.html" class="icon icon-home" aria-label="Home"></a></li>
-      <li class="breadcrumb-item active">Plugin</li>
+          <li class="breadcrumb-item"><a href="index.html">LLM Examples Introduction</a></li>
+      <li class="breadcrumb-item active">Generate Text Using Lookahead Decoding</li>
       <li class="wy-breadcrumbs-aside">
-            <a href="../_sources/python-api/tensorrt_llm.plugin.rst.txt" rel="nofollow"> View page source</a>
+            <a href="../_sources/llm-api-examples/llm_lookahead_decoding.rst.txt" rel="nofollow"> View page source</a>
       </li>
   </ul>
   <hr/>
@@ -167,59 +176,63 @@
           <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
            <div itemprop="articleBody">
              
-  <section id="module-tensorrt_llm">
-<span id="plugin"></span><h1>Plugin<a class="headerlink" href="#module-tensorrt_llm" title="Link to this heading"></a></h1>
-<dl class="py class" id="module-tensorrt_llm.plugin">
-<dt class="sig sig-object py" id="tensorrt_llm.plugin.PluginConfig">
-<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.plugin.</span></span><span class="sig-name descname"><span class="pre">PluginConfig</span></span><a class="reference internal" href="../_modules/tensorrt_llm/plugin/plugin.html#PluginConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.plugin.PluginConfig" title="Link to this definition"></a></dt>
-<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></p>
-<p>The config that manages plugin-related options.</p>
-<p>There are two option categories:
-* Plugin options (typically with xxx_plugin naming). These options can be assigned with:</p>
-<blockquote>
-<div><ul class="simple">
-<li><p>“float16”/”bfloat16”/”float32”/”int32”, which means the plugin is enabled with the specified precision; (Some plugins only support limited dtype, i.e., gemm_swiglu_plugin and low_latency_gemm_swiglu_plugin only supports fp8 now)</p></li>
-<li><p>“auto”, which means the plugin is enabled with the precision of <cite>dtype</cite> field (the <cite>dtype</cite> field must be same to model dtype, i.e., the one in PretrainedConfig);</p></li>
-<li><p>None, which means the plugin is disabled.</p></li>
-</ul>
-</div></blockquote>
-<ul class="simple">
-<li><dl class="simple">
-<dt>Other features. These options can be assigned with boolean:</dt><dd><ul>
-<li><p>True, which means the plugin is enabled;</p></li>
-<li><p>False, which means the plugin is disabled.</p></li>
-</ul>
-</dd>
-</dl>
-</li>
-</ul>
-<p>Note: All the fields should use a prefix “_”; PluginConfigMeta will wrap each field as a property.
-This ensures the fields can only be assigned with allowed values.</p>
-<dl class="py method">
-<dt class="sig sig-object py" id="tensorrt_llm.plugin.PluginConfig.to_legacy_setting">
-<span class="sig-name descname"><span class="pre">to_legacy_setting</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/plugin/plugin.html#PluginConfig.to_legacy_setting"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.plugin.PluginConfig.to_legacy_setting" title="Link to this definition"></a></dt>
-<dd><p>Legacy setting means that all of the plugins and features are
-disabled, this is needed for the legacy <cite>build.py</cite> script, which will be
-migrated to the centralized building script <cite>tensorrt_llm/commands/build.py</cite>.</p>
-<p>After the migration is done, this function may or may not be deleted.</p>
-</dd></dl>
-
-</dd></dl>
-
+  <section id="generate-text-using-lookahead-decoding">
+<h1>Generate Text Using Lookahead Decoding<a class="headerlink" href="#generate-text-using-lookahead-decoding" title="Link to this heading"></a></h1>
+<p>Source <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llm-api/llm_lookahead_decoding.py">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llm-api/llm_lookahead_decoding.py</a>.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="c1">### Generate Text Using Lookahead Decoding</span>
+<span class="linenos"> 2</span><span class="kn">from</span> <span class="nn">tensorrt_llm</span> <span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
+<span class="linenos"> 3</span><span class="kn">from</span> <span class="nn">tensorrt_llm.llmapi</span> <span class="kn">import</span> <span class="p">(</span><span class="n">LLM</span><span class="p">,</span> <span class="n">BuildConfig</span><span class="p">,</span> <span class="n">KvCacheConfig</span><span class="p">,</span>
+<span class="linenos"> 4</span>                                 <span class="n">LookaheadDecodingConfig</span><span class="p">,</span> <span class="n">SamplingParams</span><span class="p">)</span>
+<span class="linenos"> 5</span>
+<span class="linenos"> 6</span>
+<span class="linenos"> 7</span><span class="k">def</span> <span class="nf">main</span><span class="p">():</span>
+<span class="linenos"> 8</span>
+<span class="linenos"> 9</span>    <span class="c1"># The end user can customize the build configuration with the build_config class</span>
+<span class="linenos">10</span>    <span class="n">build_config</span> <span class="o">=</span> <span class="n">BuildConfig</span><span class="p">()</span>
+<span class="linenos">11</span>    <span class="n">build_config</span><span class="o">.</span><span class="n">max_batch_size</span> <span class="o">=</span> <span class="mi">32</span>
+<span class="linenos">12</span>
+<span class="linenos">13</span>    <span class="c1"># The configuration for lookahead decoding</span>
+<span class="linenos">14</span>    <span class="n">lookahead_config</span> <span class="o">=</span> <span class="n">LookaheadDecodingConfig</span><span class="p">(</span><span class="n">max_window_size</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>
+<span class="linenos">15</span>                                               <span class="n">max_ngram_size</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>
+<span class="linenos">16</span>                                               <span class="n">max_verification_set_size</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span>
+<span class="linenos">17</span>
+<span class="linenos">18</span>    <span class="n">kv_cache_config</span> <span class="o">=</span> <span class="n">KvCacheConfig</span><span class="p">(</span><span class="n">free_gpu_memory_fraction</span><span class="o">=</span><span class="mf">0.4</span><span class="p">)</span>
+<span class="linenos">19</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">,</span>
+<span class="linenos">20</span>              <span class="n">kv_cache_config</span><span class="o">=</span><span class="n">kv_cache_config</span><span class="p">,</span>
+<span class="linenos">21</span>              <span class="n">build_config</span><span class="o">=</span><span class="n">build_config</span><span class="p">,</span>
+<span class="linenos">22</span>              <span class="n">speculative_config</span><span class="o">=</span><span class="n">lookahead_config</span><span class="p">)</span>
+<span class="linenos">23</span>
+<span class="linenos">24</span>    <span class="n">prompt</span> <span class="o">=</span> <span class="s2">&quot;NVIDIA is a great company because&quot;</span>
+<span class="linenos">25</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span>
+<span class="linenos">26</span>
+<span class="linenos">27</span>    <span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">lookahead_config</span><span class="o">=</span><span class="n">lookahead_config</span><span class="p">)</span>
+<span class="linenos">28</span>
+<span class="linenos">29</span>    <span class="n">output</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompt</span><span class="p">,</span> <span class="n">sampling_params</span><span class="o">=</span><span class="n">sampling_params</span><span class="p">)</span>
+<span class="linenos">30</span>    <span class="nb">print</span><span class="p">(</span><span class="n">output</span><span class="p">)</span>
+<span class="linenos">31</span>
+<span class="linenos">32</span>    <span class="c1">#Output should be similar to:</span>
+<span class="linenos">33</span>    <span class="c1"># Prompt: &#39;NVIDIA is a great company because&#39;</span>
+<span class="linenos">34</span>    <span class="c1">#RequestOutput(request_id=2, prompt=&#39;NVIDIA is a great company because&#39;, prompt_token_ids=[1, 405, 13044, 10764, 338, 263, 2107, 5001, 1363], outputs=[CompletionOutput(index=0, text=&#39;they are always pushing the envelope. They are always trying to make the best graphics cards and the best processors. They are always trying to make the best&#39;, token_ids=[896, 526, 2337, 27556, 278, 427, 21367, 29889, 2688, 526, 2337, 1811, 304, 1207, 278, 1900, 18533, 15889, 322, 278, 1900, 1889, 943, 29889, 2688, 526, 2337, 1811, 304, 1207, 278, 1900], cumulative_logprob=None, logprobs=[], finish_reason=&#39;length&#39;, stop_reason=None, generation_logits=None)], finished=True)</span>
+<span class="linenos">35</span>
+<span class="linenos">36</span>
+<span class="linenos">37</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
+<span class="linenos">38</span>    <span class="n">main</span><span class="p">()</span>
+</pre></div>
+</div>
 </section>
 
 
            </div>
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
-        <a href="tensorrt_llm.models.html" class="btn btn-neutral float-left" title="Models" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
-        <a href="tensorrt_llm.quantization.html" class="btn btn-neutral float-right" title="Quantization" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+        <a href="llm_guided_decoding.html" class="btn btn-neutral float-left" title="Generate text with guided decoding" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="customization.html" class="btn btn-neutral float-right" title="Common Customizations" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fed9a640c50>
+<jinja2.runtime.BlockReference object at 0x7fed9bb637a0>
 
 <div class="footer">
     <p>

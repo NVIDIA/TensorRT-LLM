@@ -599,7 +599,7 @@ However, similar to any new model, you can follow the same approach to define yo
 <section id="eagle">
 <h2>EAGLE<a class="headerlink" href="#eagle" title="Link to this heading"></a></h2>
 <p>The EAGLE approach enhances the single-model Medusa method by predicting and verifying tokens using the same model. Similarly to ReDrafter, it predicts draft tokens using a recurrent predictor where each draft token depends on the previous one. However, unlike ReDrafter, it uses a single-layer transformer model to predict draft tokens from previous hidden states and decoded tokens. In the EAGLE-1 decoding tree needs to be known during the decoding. In the EAGLE-2 this tree is asssembled during the execution by searching for the most probable hypothesis along the beam.</p>
-<p>Similarly to ReDrafter, TensorRT-LLM implements the EAGLE model such that logits prediction, draft tokens acceptance and draft token generation are performed inside of the TensorRT engine. Only EAGLE-1 with greedy sampling and acceptance is supported. Please, visit the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/eagle/README.md">EAGLE README</a> for information about building and running the model.</p>
+<p>Similarly to ReDrafter, TensorRT-LLM implements the EAGLE model such that logits prediction, draft tokens acceptance and draft token generation are performed inside of the TensorRT engine. Only EAGLE-1 is supported. Please, visit the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/eagle/README.md">EAGLE README</a> for information about building and running the model.</p>
 </section>
 <section id="lookahead-decoding">
 <h2>Lookahead Decoding<a class="headerlink" href="#lookahead-decoding" title="Link to this heading"></a></h2>
@@ -618,7 +618,7 @@ However, similar to any new model, you can follow the same approach to define yo
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f9459eff530>
+<jinja2.runtime.BlockReference object at 0x7fed9c72e510>
 
 <div class="footer">
     <p>

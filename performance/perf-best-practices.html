@@ -135,6 +135,7 @@
 <li class="toctree-l3"><a class="reference internal" href="#remove-input-padding">Remove Input Padding</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#paged-kv-cache">Paged KV Cache</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#reduce-norm-fusion">Reduce Norm Fusion</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#user-buffer">User Buffer</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#embedding-parallelism-embedding-sharing-and-look-up-plugin">Embedding Parallelism, Embedding Sharing, and Look-Up Plugin</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#horizontal-fusion-in-gated-mlp">Horizontal Fusion in Gated-MLP</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#gemm-plugin">GEMM Plugin</a><ul>
@@ -313,6 +314,12 @@ improved end-to-end performance.</p>
 <p>Please note that currently, this feature is
 only supported for the llama model. It is recommended to enable this feature when the batch size is small and the generation phase time is the dominant factor.</p>
 </section>
+<section id="user-buffer">
+<h3>User Buffer<a class="headerlink" href="#user-buffer" title="Link to this heading"></a></h3>
+<p>An experimental feature called “User Buffer” is available to enhance communication performance. It can be enabled by using the <code class="docutils literal notranslate"><span class="pre">--user_buffer</span> <span class="pre">enable</span></code> argument with <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code>.
+This feature aims to eliminate extra copies from the local buffer to the shared buffer in the communication kernel, leading to improved end-to-end performance.
+This feature must be enabled with <code class="docutils literal notranslate"><span class="pre">--reduce_fusion</span> <span class="pre">enable</span></code> and is only supported for the FP8 LLAMA model.</p>
+</section>
 <section id="embedding-parallelism-embedding-sharing-and-look-up-plugin">
 <h3>Embedding Parallelism, Embedding Sharing, and Look-Up Plugin<a class="headerlink" href="#embedding-parallelism-embedding-sharing-and-look-up-plugin" title="Link to this heading"></a></h3>
 <p>The embedding parallelism feature enables the sharding of the embedding table
@@ -468,7 +475,7 @@ increase runtime performance at the expense of reduced accuracy.</p>
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f94590e79b0>
+<jinja2.runtime.BlockReference object at 0x7fed9b5a96d0>
 
 <div class="footer">
     <p>

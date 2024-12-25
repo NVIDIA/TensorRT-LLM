@@ -174,14 +174,19 @@
 <span class="c1"># See the License for the specific language governing permissions and</span>
 <span class="c1"># limitations under the License.</span>
 
+<span class="kn">import</span> <span class="nn">json</span>
+<span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Union</span>
+
+<span class="kn">from</span> <span class="nn">...mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
+<span class="kn">from</span> <span class="nn">..convert_utils</span> <span class="kn">import</span> <span class="n">infer_dtype</span>
 <span class="kn">from</span> <span class="nn">..llama.config</span> <span class="kn">import</span> <span class="n">LLaMAConfig</span>
-<span class="kn">from</span> <span class="nn">..qwen.config</span> <span class="kn">import</span> <span class="n">QWenConfig</span>
+<span class="kn">from</span> <span class="nn">..modeling_utils</span> <span class="kn">import</span> <span class="n">PretrainedConfig</span><span class="p">,</span> <span class="n">QuantConfig</span>
 
 
 <span class="c1"># Medusa-specific config is stored and retrieved from GenericMedusaConfig.</span>
 <div class="viewcode-block" id="MedusaConfig">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.MedusaConfig">[docs]</a>
-<span class="k">class</span> <span class="nc">MedusaConfig</span><span class="p">():</span>
+<span class="k">class</span> <span class="nc">MedusaConfig</span><span class="p">(</span><span class="n">PretrainedConfig</span><span class="p">):</span>
 
     <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="o">*</span><span class="p">,</span>
@@ -189,8 +194,9 @@
                  <span class="n">num_medusa_layers</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
                  <span class="n">max_draft_len</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">63</span><span class="p">,</span>
                  <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
-        <span class="n">GenericMedusaConfig</span> <span class="o">=</span> <span class="n">QWenConfig</span> <span class="k">if</span> <span class="s2">&quot;qwen&quot;</span> <span class="ow">in</span> <span class="n">kwargs</span><span class="p">[</span>
-            <span class="s1">&#39;model_type&#39;</span><span class="p">]</span> <span class="k">else</span> <span class="n">LLaMAConfig</span>
+        <span class="n">GenericMedusaConfig</span> <span class="o">=</span> <span class="n">QWenConfig</span> <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span>
+            <span class="n">kwargs</span><span class="p">,</span>
+            <span class="s1">&#39;model_type&#39;</span><span class="p">)</span> <span class="ow">and</span> <span class="s2">&quot;qwen&quot;</span> <span class="ow">in</span> <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;model_type&#39;</span><span class="p">]</span> <span class="k">else</span> <span class="n">LLaMAConfig</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">config</span> <span class="o">=</span> <span class="n">GenericMedusaConfig</span><span class="p">(</span><span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
 
@@ -217,7 +223,59 @@
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="vm">__dict__</span>
 
     <span class="k">def</span> <span class="nf">__setstate__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">state</span><span class="p">):</span>
-        <span class="bp">self</span><span class="o">.</span><span class="vm">__dict__</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">state</span><span class="p">)</span></div>
+        <span class="bp">self</span><span class="o">.</span><span class="vm">__dict__</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
+
+<div class="viewcode-block" id="MedusaConfig.from_hugging_face">
+<a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.MedusaConfig.from_hugging_face">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span> <span class="nf">from_hugging_face</span><span class="p">(</span>
+            <span class="bp">cls</span><span class="p">,</span>
+            <span class="n">hf_config_or_dir</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="s1">&#39;transformers.PretrainedConfig&#39;</span><span class="p">],</span>
+            <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s1">&#39;auto&#39;</span><span class="p">,</span>
+            <span class="n">mapping</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Mapping</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="n">quant_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">QuantConfig</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+        <span class="kn">import</span> <span class="nn">transformers</span>
+
+        <span class="n">trust_remote_code</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;trust_remote_code&#39;</span><span class="p">,</span> <span class="kc">True</span><span class="p">)</span>
+        <span class="n">speculative_config_or_dir</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;speculative_model&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">hf_config_or_dir</span><span class="p">,</span> <span class="n">transformers</span><span class="o">.</span><span class="n">PretrainedConfig</span><span class="p">):</span>
+            <span class="n">hf_config</span> <span class="o">=</span> <span class="n">hf_config_or_dir</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">hf_config_dir</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">hf_config_or_dir</span><span class="p">)</span>
+
+            <span class="n">hf_config</span> <span class="o">=</span> <span class="n">transformers</span><span class="o">.</span><span class="n">AutoConfig</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
+                <span class="n">hf_config_dir</span><span class="p">,</span> <span class="n">trust_remote_code</span><span class="o">=</span><span class="n">trust_remote_code</span><span class="p">)</span>
+        <span class="n">dtype</span> <span class="o">=</span> <span class="n">infer_dtype</span><span class="p">(</span><span class="n">dtype</span><span class="p">,</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">hf_config</span><span class="p">,</span> <span class="s1">&#39;torch_dtype&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">))</span>
+
+        <span class="n">config_file</span> <span class="o">=</span> <span class="n">speculative_config_or_dir</span> <span class="o">/</span> <span class="s2">&quot;config.json&quot;</span>
+        <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">config_file</span><span class="p">)</span> <span class="k">as</span> <span class="n">fp</span><span class="p">:</span>
+            <span class="n">config</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">fp</span><span class="p">)</span>
+        <span class="n">num_medusa_heads</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span>
+            <span class="s2">&quot;medusa_num_heads&quot;</span><span class="p">,</span>
+            <span class="kc">None</span><span class="p">)</span> <span class="k">if</span> <span class="s2">&quot;medusa_num_heads&quot;</span> <span class="ow">in</span> <span class="n">kwargs</span> <span class="k">else</span> <span class="n">config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
+                <span class="s1">&#39;num_medusa_heads&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="n">num_medusa_layers</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;medusa_num_layers&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="n">architecture</span><span class="o">=</span><span class="s2">&quot;MedusaForCausalLM&quot;</span><span class="p">,</span>
+                   <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+                   <span class="n">num_hidden_layers</span><span class="o">=</span><span class="n">hf_config</span><span class="o">.</span><span class="n">num_hidden_layers</span><span class="p">,</span>
+                   <span class="n">num_attention_heads</span><span class="o">=</span><span class="n">hf_config</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">,</span>
+                   <span class="n">hidden_size</span><span class="o">=</span><span class="n">hf_config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+                   <span class="n">intermediate_size</span><span class="o">=</span><span class="n">hf_config</span><span class="o">.</span><span class="n">intermediate_size</span><span class="p">,</span>
+                   <span class="n">num_key_value_heads</span><span class="o">=</span><span class="n">hf_config</span><span class="o">.</span><span class="n">num_key_value_heads</span><span class="p">,</span>
+                   <span class="n">vocab_size</span><span class="o">=</span><span class="n">hf_config</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span>
+                   <span class="n">position_embedding_type</span><span class="o">=</span><span class="s1">&#39;rope_gpt_neox&#39;</span><span class="p">,</span>
+                   <span class="n">max_position_embeddings</span><span class="o">=</span><span class="n">hf_config</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">,</span>
+                   <span class="n">hidden_act</span><span class="o">=</span><span class="n">hf_config</span><span class="o">.</span><span class="n">hidden_act</span><span class="p">,</span>
+                   <span class="n">norm_epsilon</span><span class="o">=</span><span class="n">hf_config</span><span class="o">.</span><span class="n">rms_norm_eps</span><span class="p">,</span>
+                   <span class="n">mapping</span><span class="o">=</span><span class="n">mapping</span><span class="p">,</span>
+                   <span class="n">quantization</span><span class="o">=</span><span class="n">quant_config</span><span class="p">,</span>
+                   <span class="n">num_medusa_heads</span><span class="o">=</span><span class="n">num_medusa_heads</span><span class="p">,</span>
+                   <span class="n">num_medusa_layers</span><span class="o">=</span><span class="n">num_medusa_layers</span><span class="p">,</span>
+                   <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span></div>
+</div>
 
 </pre></div>
 
@@ -228,7 +286,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f9469e996a0>
+<jinja2.runtime.BlockReference object at 0x7fed9778aff0>
 
 <div class="footer">
     <p>

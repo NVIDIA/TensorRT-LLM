@@ -204,8 +204,8 @@
             <span class="n">attention_head_size</span> <span class="o">=</span> <span class="n">hidden_size</span> <span class="o">/</span> <span class="n">num_attention_heads</span>
             <span class="n">q_scaling</span> <span class="o">=</span> <span class="n">attention_head_size</span><span class="o">**</span><span class="mf">.5</span>
 
-            <span class="n">block_sparse</span> <span class="o">=</span> <span class="p">(</span>
-                <span class="p">(</span><span class="n">layer_idx</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">%</span> <span class="n">config</span><span class="o">.</span><span class="n">dense_attention_every_n_layers</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">0</span>
+            <span class="n">block_sparse</span> <span class="o">=</span> <span class="p">((</span><span class="n">layer_idx</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">%</span>
+                            <span class="n">config</span><span class="o">.</span><span class="n">dense_attention_every_n_layers</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">0</span>
             <span class="n">attention_mask_type</span> <span class="o">=</span> <span class="n">AttentionMaskType</span><span class="o">.</span><span class="n">blocksparse</span> <span class="k">if</span> <span class="n">block_sparse</span> <span class="k">else</span> <span class="n">AttentionMaskType</span><span class="o">.</span><span class="n">causal</span>
 
             <span class="n">block_sparse_attn_params</span> <span class="o">=</span> <span class="n">BlockSparseAttnParams</span><span class="p">(</span>
@@ -486,7 +486,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f946b5f79b0>
+<jinja2.runtime.BlockReference object at 0x7fed97549bb0>
 
 <div class="footer">
     <p>

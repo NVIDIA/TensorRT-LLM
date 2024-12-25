@@ -355,7 +355,6 @@
             <span class="s1">&#39;k_layernorm&#39;</span><span class="p">:</span> <span class="s1">&#39;k_norm&#39;</span><span class="p">,</span>
         <span class="p">}</span>
         <span class="n">loader</span> <span class="o">=</span> <span class="n">ModelWeightsLoader</span><span class="p">(</span><span class="n">hf_model_or_dir</span><span class="p">,</span> <span class="n">custom_dict</span><span class="p">)</span>
-        <span class="n">loader</span><span class="o">.</span><span class="n">check_share_embedding</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
         <span class="n">loader</span><span class="o">.</span><span class="n">generate_tllm_weights</span><span class="p">(</span><span class="n">model</span><span class="p">)</span>
 
         <span class="k">return</span> <span class="n">model</span></div>
@@ -370,7 +369,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f9468dac9b0>
+<jinja2.runtime.BlockReference object at 0x7fed97ba5730>
 
 <div class="footer">
     <p>

@@ -283,7 +283,11 @@ example:</p>
 python3<span class="w"> </span>./scripts/build_wheel.py<span class="w"> </span>--cuda_architectures<span class="w"> </span><span class="s2">&quot;80-real;86-real&quot;</span><span class="w"> </span>--trt_root<span class="w"> </span>/usr/local/tensorrt
 </pre></div>
 </div>
-<p>Refer to the Refer to the <a class="reference internal" href="../reference/support-matrix.html#support-matrix-hardware"><span class="std std-ref">Hardware</span></a> section for a list of architectures.</p>
+<p>To use the C++ benchmark scripts under <a class="reference internal" href="#/benchmarks/cpp/"><span class="xref myst">benchmark/cpp</span></a>, for example <code class="docutils literal notranslate"><span class="pre">gptManagerBenchmark.cpp</span></code>, add the <code class="docutils literal notranslate"><span class="pre">--benchmarks</span></code> option:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>./scripts/build_wheel.py<span class="w"> </span>--benchmarks<span class="w"> </span>--trt_root<span class="w"> </span>/usr/local/tensorrt
+</pre></div>
+</div>
+<p>Refer to the <a class="reference internal" href="../reference/support-matrix.html#support-matrix-hardware"><span class="std std-ref">Hardware</span></a> section for a list of architectures.</p>
 </section>
 </section>
 </section>
@@ -332,7 +336,7 @@ relevant classes. The associated unit tests should also be consulted for underst
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f94598aff80>
+<jinja2.runtime.BlockReference object at 0x7fed9c39bd40>
 
 <div class="footer">
     <p>

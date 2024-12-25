@@ -314,51 +314,267 @@
     <span class="n">_dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="s2">&quot;float16&quot;</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
 
     <span class="c1"># Plugins</span>
-    <span class="n">_bert_attention_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-    <span class="n">_gpt_attention_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-    <span class="n">_gemm_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-    <span class="n">_gemm_swiglu_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-    <span class="n">_fp8_rowwise_gemm_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-    <span class="n">_smooth_quant_gemm_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-    <span class="n">_qserve_gemm_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-    <span class="n">_identity_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-    <span class="n">_layernorm_quantization_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                                                          <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-    <span class="n">_rmsnorm_quantization_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                                                        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-    <span class="n">_nccl_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-    <span class="n">_lora_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+    <span class="n">_bert_attention_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;The plugin that uses efficient kernels and enables an in-place update of the KV cache for attention layer of BERT-like encoder models.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_gpt_attention_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;The plugin that uses efficient kernels and enables an in-place update of the KV cache for attention layer of GPT-like decoder models.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_gemm_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;The GEMM plugin that utilizes NVIDIA cuBLASLt to perform GEMM operations. &quot;</span>
+            <span class="s2">&quot;Note: it&#39;s only affective for non-quantized gemm operations (except FP8).&quot;</span>
+            <span class="s2">&quot;Note: For FP8, it also requires same calibration in checkpoint.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_gemm_swiglu_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;The GEMM + SwiGLU fusion in Gated-MLP combines two Matmul operations and &quot;</span>
+            <span class="s2">&quot;one SwiGLU operation into a single kernel. Currently this is only supported for FP8 precision on Hopper.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_fp8_rowwise_gemm_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;The quantized GEMM for fp8, which uses per token dynamic scales for &quot;</span>
+            <span class="s2">&quot;activation and per channel static scales for weights.&quot;</span>
+            <span class="s2">&quot;Note: It also requires same calibration in checkpoint.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_qserve_gemm_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;The quantized GEMM from [QServe](https://arxiv.org/abs/2405.04532), &quot;</span>
+            <span class="s2">&quot;which employs 4-bit quantization for weights and 8-bit quantization for activations.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_identity_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;The identity plugin simply copies inputs to outputs, it&#39;s used mostly for debugging purpose.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_nccl_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;The NCCL plugin wraps NCCL operators to support multi-GPU and even multi-nodes.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_lora_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                                        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                                        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;help&quot;</span><span class="p">:</span> <span class="s2">&quot;Enable LoRA.&quot;</span><span class="p">})</span>
     <span class="n">_weight_only_groupwise_quant_matmul_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
-        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-    <span class="n">_weight_only_quant_matmul_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                                                            <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Enable weight-only groupwise quantization matmul operators.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_weight_only_quant_matmul_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;help&quot;</span><span class="p">:</span> <span class="s2">&quot;Enable weight-only quantization matmul operators.&quot;</span><span class="p">})</span>
     <span class="n">_smooth_quant_plugins</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>  <span class="c1"># Always enable smooth quant plugins for external users</span>
-    <span class="n">_quantize_per_token_plugin</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-    <span class="n">_quantize_tensor_plugin</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-    <span class="n">_moe_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-    <span class="n">_mamba_conv1d_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-    <span class="n">_low_latency_gemm_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-    <span class="n">_low_latency_gemm_swiglu_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                                                           <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span> <span class="s2">&quot;Enable a group of plugins to support smooth quantization.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_smooth_quant_gemm_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Enable plugin that supports smooth quantization gemm kernels.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_layernorm_quantization_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Enable plugin that supports layernorm quantization kernels.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_rmsnorm_quantization_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span> <span class="s2">&quot;Enable plugin that supports rmsnorm quantization kernels.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_quantize_per_token_plugin</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span> <span class="s2">&quot;Enable plugin that supports per-token quantization.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_quantize_tensor_plugin</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span> <span class="s2">&quot;Enable plugin that supports per-tensor quantization.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_moe_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Enable some customized kernels to speed up the MoE layer of MoE models.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_mamba_conv1d_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Enable customized kernels to speed up conv1d operator for Mamba.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_low_latency_gemm_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;The GEMM plugin that optimized specially for low latency scenarios.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_low_latency_gemm_swiglu_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;The GEMM + SwiGLU fusion plugin that optimized specially for low latency scenarios.&quot;</span>
+        <span class="p">})</span>
+
     <span class="c1"># Features</span>
-    <span class="n">_context_fmha</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+    <span class="n">_context_fmha</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Enable the fused multi-head attention during the context phase, &quot;</span>
+            <span class="s2">&quot;will trigger a kernel that performs the MHA/MQA/GQA block using a single kernel.&quot;</span>
+        <span class="p">})</span>
     <span class="n">_bert_context_fmha_fp32_acc</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
-        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>  <span class="c1"># will use fp16 if disabled</span>
-    <span class="n">_paged_kv_cache</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-    <span class="n">_remove_input_padding</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-    <span class="n">_reduce_fusion</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-    <span class="n">_enable_xqa</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-    <span class="n">_tokens_per_block</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-    <span class="n">_use_paged_context_fmha</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-    <span class="n">_use_fp8_context_fmha</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-    <span class="n">_multiple_profiles</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-    <span class="n">_paged_state</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-    <span class="n">_streamingllm</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-    <span class="n">_manage_weights</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-    <span class="n">_use_fused_mlp</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-    <span class="n">_pp_reduce_scatter</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Enable the FP32 accumulator for context FMHA in the bert_attention_plugin. &quot;</span>
+            <span class="s2">&quot;If disabled, FP16 is used, better performance but potentially worse accuracy is expected.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_paged_kv_cache</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Enable paged KV cache, which helps manage memory for the KV cache more efficiently, &quot;</span>
+            <span class="s2">&quot;and usually leads to an increase in the batch size and an improved efficiency.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_remove_input_padding</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Pack different tokens together, which reduces both the amount of computations and memory consumption.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_reduce_fusion</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Fuse the ResidualAdd and LayerNorm kernels after AllReduce into a single kernel, &quot;</span>
+            <span class="s2">&quot;resulting in improved end-to-end performance.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_user_buffer</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Eliminate extra copies from the local buffer to the shared buffer &quot;</span>
+            <span class="s2">&quot;in the communication kernel, leading to improved end-to-end performance. &quot;</span>
+            <span class="s2">&quot;This feature must be enabled with `--reduce_fusion enable` and &quot;</span>
+            <span class="s2">&quot;is currently only supported for the FP8 LLAMA model.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_tokens_per_block</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Define how many tokens are contained in each paged kv cache block.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_use_paged_context_fmha</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Allow advanced features like KV cache reuse and chunked context.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_use_fp8_context_fmha</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;When FP8 quantization is activated, the attention can be further accelerated by enabling FP8 Context FMHA&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_multiple_profiles</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Enables multiple TensorRT optimization profiles in the built engines, &quot;</span>
+            <span class="s2">&quot;will benefits the performance especially when GEMM plugin is disabled, &quot;</span>
+            <span class="s2">&quot;because more optimization profiles help TensorRT have more chances to select better kernels. &quot;</span>
+            <span class="s2">&quot;Note: This feature increases engine build time but no other adverse effects are expected.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_paged_state</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Enable paged state, which helps manage memory for the RNN state more efficiently.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_streamingllm</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Enable [StreamingLLM](https://arxiv.org/abs/2309.17453), which uses a window attention to perform efficient and stable LLM on long texts.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_manage_weights</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Enable TensorRT-LLM managed weights to speed up engine building process.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_use_fused_mlp</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Enable horizontal fusion in Gated-MLP that combines two Matmul &quot;</span>
+            <span class="s2">&quot;operations into a single one followed by a separate SwiGLU kernel.&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_pp_reduce_scatter</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Enable a pipeline parallelism optimization with &quot;</span>
+            <span class="s2">&quot;ReduceScatter + AllGather targeting large MoE models.&quot;</span>
+        <span class="p">})</span>
 
     <span class="k">def</span> <span class="nf">update_from_dict</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="nb">dict</span><span class="p">):</span>
         <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">config</span><span class="o">.</span><span class="n">keys</span><span class="p">():</span>
@@ -473,6 +689,8 @@
 
 
 
+<span class="c1"># Only plugin configs in this list will be exposed as `trtllm-build` arguments,</span>
+<span class="c1"># others are automatically enabled when needed, no need for users to control.</span>
 <span class="n">cli_plugin_args</span> <span class="o">=</span> <span class="p">[</span>
     <span class="c1"># Plugins</span>
     <span class="s2">&quot;bert_attention_plugin&quot;</span><span class="p">,</span>
@@ -491,7 +709,6 @@
     <span class="s2">&quot;context_fmha&quot;</span><span class="p">,</span>
     <span class="s2">&quot;bert_context_fmha_fp32_acc&quot;</span><span class="p">,</span>
     <span class="s2">&quot;remove_input_padding&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;enable_xqa&quot;</span><span class="p">,</span>
     <span class="s2">&quot;tokens_per_block&quot;</span><span class="p">,</span>
     <span class="s2">&quot;use_paged_context_fmha&quot;</span><span class="p">,</span>
     <span class="s2">&quot;use_fp8_context_fmha&quot;</span><span class="p">,</span>
@@ -499,6 +716,7 @@
     <span class="s2">&quot;paged_state&quot;</span><span class="p">,</span>
     <span class="s2">&quot;streamingllm&quot;</span><span class="p">,</span>
     <span class="s2">&quot;reduce_fusion&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;user_buffer&quot;</span><span class="p">,</span>
     <span class="s2">&quot;use_fused_mlp&quot;</span><span class="p">,</span>
     <span class="s2">&quot;pp_reduce_scatter&quot;</span><span class="p">,</span>
 <span class="p">]</span>
@@ -511,6 +729,10 @@
         <span class="n">field_name</span> <span class="o">=</span> <span class="n">field</span><span class="o">.</span><span class="n">name</span><span class="o">.</span><span class="n">lstrip</span><span class="p">(</span><span class="s1">&#39;_&#39;</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">field_name</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">cli_plugin_args</span><span class="p">:</span>
             <span class="k">continue</span>
+        <span class="k">if</span> <span class="n">field</span><span class="o">.</span><span class="n">metadata</span> <span class="ow">and</span> <span class="s2">&quot;help&quot;</span> <span class="ow">in</span> <span class="n">field</span><span class="o">.</span><span class="n">metadata</span><span class="p">:</span>
+            <span class="n">help_message</span> <span class="o">=</span> <span class="n">field</span><span class="o">.</span><span class="n">metadata</span><span class="p">[</span><span class="s2">&quot;help&quot;</span><span class="p">]</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">AttributeError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Please add help message for </span><span class="si">{</span><span class="n">field_name</span><span class="si">}</span><span class="s2">.&quot;</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">field</span><span class="o">.</span><span class="n">type</span> <span class="ow">in</span> <span class="p">(</span><span class="nb">str</span><span class="p">,</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]):</span>
             <span class="n">plugin_dtype_options</span> <span class="o">=</span> <span class="n">DEFAULT_PLUGIN_DTYPE_OPTIONS</span>
             <span class="k">if</span> <span class="n">field_name</span> <span class="ow">in</span> <span class="n">PLUGIN_DTYPE_OPTIONS_MAP</span><span class="p">:</span>
@@ -520,20 +742,19 @@
                 <span class="nb">type</span><span class="o">=</span><span class="nb">str</span><span class="p">,</span>
                 <span class="n">default</span><span class="o">=</span><span class="n">field</span><span class="o">.</span><span class="n">default</span> <span class="k">if</span> <span class="n">field</span><span class="o">.</span><span class="n">default</span> <span class="k">else</span> <span class="s2">&quot;disable&quot;</span><span class="p">,</span>
                 <span class="n">choices</span><span class="o">=</span><span class="p">[</span><span class="n">x</span> <span class="k">if</span> <span class="n">x</span> <span class="k">else</span> <span class="s2">&quot;disable&quot;</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">plugin_dtype_options</span><span class="p">],</span>
-                <span class="n">help</span><span class="o">=</span><span class="sa">f</span><span class="s2">&quot;Whether to enable/disable ``</span><span class="si">{</span><span class="n">field_name</span><span class="si">}</span><span class="s2">`` and the dtype.&quot;</span>
-            <span class="p">)</span>
+                <span class="n">help</span><span class="o">=</span><span class="n">help_message</span><span class="p">)</span>
         <span class="k">elif</span> <span class="n">field</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="nb">bool</span><span class="p">:</span>
             <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span>
                 <span class="s2">&quot;--&quot;</span> <span class="o">+</span> <span class="n">field_name</span><span class="p">,</span>
                 <span class="nb">type</span><span class="o">=</span><span class="nb">str</span><span class="p">,</span>
                 <span class="n">default</span><span class="o">=</span><span class="s2">&quot;enable&quot;</span> <span class="k">if</span> <span class="n">field</span><span class="o">.</span><span class="n">default</span> <span class="k">else</span> <span class="s2">&quot;disable&quot;</span><span class="p">,</span>
                 <span class="n">choices</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;enable&quot;</span><span class="p">,</span> <span class="s2">&quot;disable&quot;</span><span class="p">],</span>
-                <span class="n">help</span><span class="o">=</span><span class="sa">f</span><span class="s2">&quot;Whether to enable/disable ``</span><span class="si">{</span><span class="n">field_name</span><span class="si">}</span><span class="s2">``.&quot;</span><span class="p">)</span>
+                <span class="n">help</span><span class="o">=</span><span class="n">help_message</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">&quot;--&quot;</span> <span class="o">+</span> <span class="n">field_name</span><span class="p">,</span>
                                 <span class="nb">type</span><span class="o">=</span><span class="n">field</span><span class="o">.</span><span class="n">type</span><span class="p">,</span>
                                 <span class="n">default</span><span class="o">=</span><span class="n">field</span><span class="o">.</span><span class="n">default</span><span class="p">,</span>
-                                <span class="n">help</span><span class="o">=</span><span class="sa">f</span><span class="s2">&quot;``</span><span class="si">{</span><span class="n">field_name</span><span class="si">}</span><span class="s2">``.&quot;</span><span class="p">)</span>
+                                <span class="n">help</span><span class="o">=</span><span class="n">help_message</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">parser</span>
 
 
@@ -648,7 +869,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f9468e14920>
+<jinja2.runtime.BlockReference object at 0x7fed976548c0>
 
 <div class="footer">
     <p>

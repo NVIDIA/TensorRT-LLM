@@ -166,7 +166,11 @@
 <div class="admonition note">
 <p class="admonition-title">Note</p>
 <p>The Windows release of TensorRT-LLM is currently in beta.
-We recommend checking out the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases/tag/v0.15.0">v0.15.0 tag</a> for the most stable experience.</p>
+We recommend checking out the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases/tag/v0.16.0">v0.16.0 tag</a> for the most stable experience.</p>
+</div>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>TensorRT-LLM on Windows only supports single-GPU execution.</p>
 </div>
 <p><strong>Prerequisites</strong></p>
 <ol class="arabic">
@@ -175,7 +179,7 @@ We recommend checking out the <a class="reference external" href="https://github
 <ol class="arabic">
 <li><p>Install all dependencies together.</p>
 <ol class="arabic simple">
-<li><p>Run the provided PowerShell script <code class="docutils literal notranslate"><span class="pre">setup_env.ps1</span></code> located under the <code class="docutils literal notranslate"><span class="pre">/windows/</span></code> folder which installs Python and CUDA 12.6.2 automatically with default settings. Run PowerShell as Administrator to use the script.</p></li>
+<li><p>Run the provided PowerShell script <code class="docutils literal notranslate"><span class="pre">setup_env.ps1</span></code> located under the <code class="docutils literal notranslate"><span class="pre">/windows/</span></code> folder which installs Python and CUDA 12.6.3 automatically with default settings. Run PowerShell as Administrator to use the script.</p></li>
 </ol>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>./setup_env.ps1<span class="w"> </span><span class="o">[</span>-skipCUDA<span class="o">]</span><span class="w"> </span><span class="o">[</span>-skipPython<span class="o">]</span>
 </pre></div>
@@ -192,7 +196,7 @@ We recommend checking out the <a class="reference external" href="https://github
 <li><p>Navigate to the installation path <code class="docutils literal notranslate"><span class="pre">%USERPROFILE%\AppData\Local\Programs\Python\Python310</span></code> (<code class="docutils literal notranslate"><span class="pre">AppData</span></code> is a hidden folder) and copy <code class="docutils literal notranslate"><span class="pre">python.exe</span></code> to <code class="docutils literal notranslate"><span class="pre">python3.exe</span></code>.</p></li>
 </ol>
 </li>
-<li><p>Install <a class="reference external" href="https://developer.nvidia.com/cuda-12-6-2-download-archive?target_os=Windows&amp;amp;target_arch=x86_64">CUDA 12.6.2 Toolkit</a>. Use the Express Installation option. Installation may require a restart.</p></li>
+<li><p>Install <a class="reference external" href="https://developer.nvidia.com/cuda-12-6-3-download-archive?target_os=Windows&amp;amp;target_arch=x86_64">CUDA 12.6.3 Toolkit</a>. Use the Express Installation option. Installation may require a restart.</p></li>
 </ol>
 </li>
 </ol>
@@ -213,7 +217,7 @@ pip<span class="w"> </span>uninstall<span class="w"> </span>-y<span class="w"> <
 </pre></div>
 </div>
 <p>before installing TensorRT-LLM with the following command.</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span><span class="nv">tensorrt_llm</span><span class="o">==</span><span class="m">0</span>.15.0<span class="w"> </span>--extra-index-url<span class="w"> </span>https://download.pytorch.org/whl/
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span><span class="nv">tensorrt_llm</span><span class="o">==</span><span class="m">0</span>.16.0<span class="w"> </span>--extra-index-url<span class="w"> </span>https://download.pytorch.org/whl/
 </pre></div>
 </div>
 <p>Run the following command to verify that your TensorRT-LLM installation is working properly.</p>
@@ -248,7 +252,7 @@ and retry. Check the system path to make sure the latest version installed in <c
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f94598ae0c0>
+<jinja2.runtime.BlockReference object at 0x7fed9be34f80>
 
 <div class="footer">
     <p>

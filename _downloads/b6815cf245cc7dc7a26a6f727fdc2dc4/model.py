@@ -21,18 +21,19 @@ import torch
 from tqdm import tqdm
 
 from ..._utils import pad_vocab_size
-from ...functional import Tensor, allreduce, recv, send, sigmoid
-from ...layers import (MLP, MOE, Attention, AttentionMaskType, ColumnLinear,
-                       Embedding, GatedMLP, RmsNorm, RowLinear)
+from ...functional import Tensor, recv, send
+from ...layers import (MOE, Attention, AttentionMaskType, ColumnLinear,
+                       Embedding, GatedMLP, RmsNorm, SharedMoE)
 from ...layers.moe import MOEWeightWrapper
 from ...logger import logger
 from ...lora_manager import (LoraConfig,
                              get_default_trtllm_modules_to_hf_modules, use_lora)
 from ...mapping import Mapping
 from ...module import Module
+from ...quantization import QuantAlgo
 from ..model_weights_loader import ModelWeightsLoader
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
-                              QuantConfig, check_share_embedding)
+                              QuantConfig)
 from .config import QWenConfig
 from .convert import (load_hf_qwen, load_weights_from_hf_gptq_model,
                       load_weights_from_hf_model)
@@ -61,6 +62,7 @@ class QWenDecoderLayer(Module):
             attention_head_size=config.head_size,
             num_attention_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
+            max_seqlen_for_logn_scaling=config.seq_length,
             max_position_embeddings=config.max_position_embeddings,
             dtype=dtype,
             attention_mask_type=AttentionMaskType.causal,
@@ -71,35 +73,22 @@ class QWenDecoderLayer(Module):
             tp_group=self.tp_group,
             tp_size=self.tp_size,
             quant_mode=config.quant_mode,
+            use_logn_scaling=config.use_logn_attn,
             dense_bias=False)
 
-        ClsMLP = GatedMLP
-        mlp_kwargs = {}
         if config.moe.has_moe():
-            ClsMLP = MOE
-            mlp_kwargs = {
-                "moe_config": config.moe,
-                "mapping": config.mapping,
-            }
-
-        if config.qwen_type == 'qwen2_moe':
-            self.shared_expert = MLP(
-                hidden_size=config.hidden_size,
-                ffn_hidden_size=config.moe_shared_expert_intermediate_size,
-                hidden_act=config.hidden_act,
-                dtype=dtype,
-                bias=False,
-                tp_group=self.tp_group,
-                tp_size=self.tp_size,
-                quant_mode=config.quant_mode,
-                is_expert=True)
-            self.shared_expert_gate = RowLinear(config.hidden_size,
-                                                1,
-                                                bias=False,
-                                                dtype=dtype,
-                                                tp_group=None,
-                                                tp_size=1)
-            mlp_kwargs['use_all_reduce'] = False
+            mlp_kwargs = {'moe_config': config.moe, 'mapping': config.mapping}
+            if config.qwen_type == 'qwen2_moe':
+                ClsMLP = SharedMoE
+                mlp_kwargs['use_shared_gate'] = True
+                mlp_kwargs['use_side_stream'] = True
+                mlp_kwargs['moe_config'].shared_expert_intermediate_size = \
+                    config.moe_shared_expert_intermediate_size
+            else:
+                ClsMLP = MOE
+        else:
+            ClsMLP = GatedMLP
+            mlp_kwargs = {}
 
         # Qwen's real inter_size depends on qwen_type
         if self.config.qwen_type == 'qwen':
@@ -131,6 +120,7 @@ class QWenDecoderLayer(Module):
         kv_cache_params=None,
         attention_params=None,
         lora_layer_params=None,
+        mrope_params=None,
     ):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -142,6 +132,7 @@ class QWenDecoderLayer(Module):
             kv_cache_params=kv_cache_params,
             attention_params=attention_params,
             lora_layer_params=lora_layer_params,
+            mrope_params=mrope_params,
         )
         if use_cache:
             attention_output, presents = attention_output
@@ -152,26 +143,8 @@ class QWenDecoderLayer(Module):
 
         hidden_states = self.post_layernorm(hidden_states)
 
-        shared_output = None
-        if self.config.qwen_type == 'qwen2_moe':
-            shared_output = self.shared_expert(
-                hidden_states, lora_layer_params=lora_layer_params)
-            if self.shared_expert_gate is not None:
-                gate_lora_params = None
-                if lora_layer_params is not None:
-                    gate_lora_params = lora_layer_params.get_runtime_params(
-                        0, "mlp_router")
-                shared_output = sigmoid(
-                    self.shared_expert_gate(hidden_states,
-                                            gate_lora_params)) * shared_output
-
         hidden_states = self.mlp(hidden_states,
                                  lora_layer_params=lora_layer_params)
-
-        if shared_output is not None:
-            hidden_states = hidden_states + shared_output
-            if self.tp_size > 1 and self.tp_group is not None:
-                hidden_states = allreduce(hidden_states, self.tp_group)
 
         hidden_states = residual + hidden_states
         if use_cache:
@@ -204,6 +177,7 @@ class QWenModel(Module):
                 attention_mask=None,
                 kv_cache_params=None,
                 attention_params=None,
+                mrope_params=None,
                 hidden_states=None,
                 prompt_embedding_table: Optional[Tensor] = None,
                 prompt_tasks: Optional[Tensor] = None,
@@ -226,7 +200,8 @@ class QWenModel(Module):
             attention_mask=attention_mask,
             kv_cache_params=kv_cache_params,
             attention_params=attention_params,
-            lora_params=lora_params)
+            lora_params=lora_params,
+            mrope_params=mrope_params)
 
         if use_cache:
             hidden_states, presents = hidden_states
@@ -314,7 +289,7 @@ class QWenForCausalLM(DecoderModelForCausalLM):
         import transformers
 
         load_model_on_cpu = kwargs.pop('load_model_on_cpu', False)
-        use_hf_gptq_checkpoint = kwargs.pop('use_hf_gptq_checkpoint', False)
+        use_autoawq = kwargs.pop('use_autoawq', False)
 
         assert hf_model_or_dir is not None
         use_preloading = isinstance(hf_model_or_dir,
@@ -333,6 +308,7 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                                               **kwargs)
 
         if os.environ.get("TRTLLM_DISABLE_UNIFIED_CONVERTER") is None:
+            arg_dict = {"use_autoawq": True} if use_autoawq else {}
             custom_dict = {}
 
             if config.qwen_type == "qwen":
@@ -352,11 +328,12 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                 }
             elif config.qwen_type == "qwen2_moe":
                 custom_dict = {
-                    "shared_expert": "mlp.shared_expert",
-                    "shared_expert_gate": "mlp.shared_expert_gate",
+                    "mlp.shared_expert": "mlp.shared_expert",
+                    "mlp.shared_expert_gate": "mlp.shared_expert_gate",
                     "fc": ["up_proj", "gate_proj"],
                 }
-            elif config.qwen_type == "qwen2" and config.tie_word_embeddings:
+            elif config.qwen_type in {"qwen2", "qwen2_vl"
+                                      } and config.tie_word_embeddings:
                 custom_dict = {"lm_head": "model.embed_tokens"}
             elif config.architecture == "Qwen2ForSequenceClassification":
                 custom_dict = {
@@ -368,7 +345,6 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                     "lm_head": "language_model.lm_head",
                 }
             loader = ModelWeightsLoader(hf_model_dir, custom_dict)
-            loader.check_share_embedding(config)
             model = cls(config)
 
             if config.qwen_type == "qwen" and model.config.mapping.has_tp():
@@ -383,7 +359,7 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                         weights = [weights]
 
                     for idx, w in enumerate(weights):
-                        if use_hf_gptq_checkpoint:
+                        if quant_config.quant_algo == QuantAlgo.W4A16_GPTQ:
                             w = w.reshape(-1, 3, w.shape[-1] // 3)
                             w = w.chunk(mapping.tp_size, 2)[mapping.tp_rank]
                             if w.shape[0] == 1:
@@ -407,9 +383,14 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                 for tllm_key, _ in tqdm(model.named_parameters()):
                     if "qkv" in tllm_key:
                         tllm_weights.update(
-                            loader.load(tllm_key, reshape_qkv, skip_tp=True))
+                            loader.load(tllm_key,
+                                        reshape_qkv,
+                                        skip_tp=True,
+                                        custom_postprocess_kwargs=arg_dict))
                     else:
-                        tllm_weights.update(loader.load(tllm_key))
+                        tllm_weights.update(
+                            loader.load(tllm_key,
+                                        custom_postprocess_kwargs=arg_dict))
                 loader.fill(tllm_weights)
             elif config.qwen_type == "qwen2_moe":
                 for tllm_key, _ in model.named_parameters():
@@ -444,13 +425,17 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                 for tllm_key, _ in tqdm(model.named_parameters()):
                     if tllm_key.endswith("shared_expert.fc.weight"):
                         tllm_weights.update(
-                            loader.load(tllm_key, concat_gate_up_proj))
+                            loader.load(tllm_key,
+                                        concat_gate_up_proj,
+                                        custom_postprocess_kwargs=arg_dict))
                     else:
-                        tllm_weights.update(loader.load(tllm_key))
+                        tllm_weights.update(
+                            loader.load(tllm_key,
+                                        custom_postprocess_kwargs=arg_dict))
                 loader.fill(tllm_weights)
             else:
                 # For Qwen1 w/o TP, Qwen1.5 and Qwen2 w/o MoE
-                loader.generate_tllm_weights(model)
+                loader.generate_tllm_weights(model, arg_dict)
         else:
             if not use_preloading:
                 hf_model = load_hf_qwen(hf_model_dir, load_model_on_cpu)
@@ -461,11 +446,10 @@ class QWenForCausalLM(DecoderModelForCausalLM):
 
             logger.debug(f"TensorRT-LLM model: {model}")
 
-            if use_hf_gptq_checkpoint:
+            if quant_config.quant_algo == QuantAlgo.W4A16_GPTQ:
                 weights = load_weights_from_hf_gptq_model(hf_model, config)
             else:
                 weights = load_weights_from_hf_model(hf_model, config)
-            check_share_embedding(weights, config)
             model.load(weights)
         return model
 

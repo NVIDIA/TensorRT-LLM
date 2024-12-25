@@ -667,7 +667,7 @@
     <span class="n">max_encoder_input_len</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1024</span>  <span class="c1"># for enc-dec DecoderModel</span>
     <span class="n">use_fused_mlp</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="n">dry_run</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
-    <span class="n">visualize_network</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="n">visualize_network</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">monitor_memory</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="n">use_mrope</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
@@ -768,7 +768,7 @@
             <span class="n">plugin_config</span><span class="o">.</span><span class="n">update_from_dict</span><span class="p">(</span><span class="n">config</span><span class="p">[</span><span class="s2">&quot;plugin_config&quot;</span><span class="p">])</span>
 
         <span class="n">dry_run</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;dry_run&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
-        <span class="n">visualize_network</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;visualize_network&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
+        <span class="n">visualize_network</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;visualize_network&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="n">monitor_memory</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;monitor_memory&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
         <span class="n">use_mrope</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;use_mrope&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
 
@@ -1023,6 +1023,7 @@
     <span class="n">is_fp8</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">quantization</span><span class="o">.</span><span class="n">quant_algo</span> <span class="o">==</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8</span>
     <span class="n">model</span> <span class="o">=</span> <span class="n">optimize_model</span><span class="p">(</span>
         <span class="n">model</span><span class="p">,</span>
+        <span class="n">share_embedding_table</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
         <span class="n">use_ootb_moe</span><span class="o">=</span><span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">moe_plugin</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">use_fused_mlp</span><span class="o">=</span><span class="p">(</span><span class="n">build_config</span><span class="o">.</span><span class="n">use_fused_mlp</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">is_enc_dec</span>
                        <span class="ow">and</span> <span class="ow">not</span> <span class="p">(</span><span class="n">is_recurrent_gemma</span> <span class="ow">and</span> <span class="n">is_fp8</span><span class="p">)</span>
@@ -1034,9 +1035,9 @@
         <span class="n">use_prompt_tuning</span><span class="o">=</span><span class="p">(</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_prompt_embedding_table_size</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">),</span>
         <span class="n">use_lora</span><span class="o">=</span><span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">lora_plugin</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">max_lora_rank</span><span class="o">=</span><span class="n">build_config</span><span class="o">.</span><span class="n">lora_config</span><span class="o">.</span><span class="n">max_lora_rank</span><span class="p">,</span>
-        <span class="n">use_fp8_context_fmha</span><span class="o">=</span><span class="p">(</span>
-            <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8</span> <span class="o">==</span> <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">quantization</span><span class="o">.</span><span class="n">quant_algo</span>
-            <span class="ow">and</span> <span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">use_fp8_context_fmha</span><span class="p">),</span>
+        <span class="n">use_fp8_context_fmha</span><span class="o">=</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">quantization</span><span class="o">.</span><span class="n">quant_algo</span> <span class="ow">in</span> <span class="p">[</span>
+            <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8</span><span class="p">,</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A8_AWQ</span>
+        <span class="p">]</span> <span class="ow">and</span> <span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">use_fp8_context_fmha</span><span class="p">),</span>
         <span class="n">use_optimize_cross_qkv</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
     <span class="p">)</span>
 
@@ -1055,8 +1056,9 @@
     <span class="k">if</span> <span class="n">rotary_scaling</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">rotary_type</span> <span class="o">=</span> <span class="n">rotary_scaling</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;type&#39;</span><span class="p">,</span>
                                          <span class="n">rotary_scaling</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;rope_type&#39;</span><span class="p">))</span>
-        <span class="n">rotary_factor</span> <span class="o">=</span> <span class="n">rotary_scaling</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;factor&#39;</span><span class="p">,</span>
-                                           <span class="mf">1.0</span><span class="p">)</span> <span class="k">if</span> <span class="n">rotary_type</span> <span class="o">!=</span> <span class="s1">&#39;su&#39;</span> <span class="k">else</span> <span class="mi">1</span>
+        <span class="n">rotary_factor</span> <span class="o">=</span> <span class="n">rotary_scaling</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
+            <span class="s1">&#39;factor&#39;</span><span class="p">,</span> <span class="mf">1.0</span><span class="p">)</span> <span class="k">if</span> <span class="n">rotary_type</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">&quot;su&quot;</span><span class="p">,</span> <span class="s2">&quot;longrope&quot;</span><span class="p">,</span>
+                                                  <span class="s2">&quot;llama3&quot;</span><span class="p">)</span> <span class="k">else</span> <span class="mi">1</span>
     <span class="k">else</span><span class="p">:</span>
         <span class="n">rotary_factor</span> <span class="o">=</span> <span class="mi">1</span>
 
@@ -1207,7 +1209,7 @@
 
 <span class="k">def</span> <span class="nf">build</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="n">PretrainedModel</span><span class="p">,</span> <span class="n">build_config</span><span class="p">:</span> <span class="n">BuildConfig</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Engine</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">&#39;&#39;&#39;Build engine from given model and optimization options specified in the build_config</span>
-<span class="sd">       WARNING: this function may change the given \p model object state in some optimization passes</span>
+<span class="sd">       WARNING: this function may change the given model object state in some optimization passes</span>
 <span class="sd">       to avoid cloning a model since normally the LLM models consumes large memory.</span>
 <span class="sd">       Create a new fresh model object if you need to build with different options.</span>
 <span class="sd">    &#39;&#39;&#39;</span>
@@ -1221,10 +1223,15 @@
 
     <span class="k">if</span> <span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">reduce_fusion</span> <span class="ow">and</span> <span class="p">(</span>
             <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">==</span> <span class="mi">1</span>
-            <span class="ow">or</span> <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">pp_size</span> <span class="o">!=</span> <span class="mi">1</span>
-            <span class="ow">or</span> <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">architecture</span> <span class="o">!=</span> <span class="s2">&quot;LlamaForCausalLM&quot;</span><span class="p">):</span>
+            <span class="ow">or</span> <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">pp_size</span> <span class="o">!=</span> <span class="mi">1</span> <span class="ow">or</span>
+        <span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">architecture</span> <span class="o">!=</span> <span class="s2">&quot;LlamaForCausalLM&quot;</span>
+         <span class="ow">and</span> <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">architecture</span> <span class="o">!=</span> <span class="s2">&quot;Gemma2ForCausalLM&quot;</span>
+         <span class="ow">and</span> <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">architecture</span> <span class="o">!=</span> <span class="s2">&quot;MedusaForCausalLM&quot;</span><span class="p">)):</span>
         <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s1">&#39;Overriding reduce_fusion to False&#39;</span><span class="p">)</span>
         <span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">reduce_fusion</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="k">if</span> <span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">user_buffer</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">reduce_fusion</span><span class="p">:</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s1">&#39;Overriding user_buffer to False&#39;</span><span class="p">)</span>
+        <span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">user_buffer</span> <span class="o">=</span> <span class="kc">False</span>
 
     <span class="k">if</span> <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">quantization</span><span class="o">.</span><span class="n">quant_algo</span> <span class="o">==</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8</span> <span class="ow">or</span> \
             <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">quantization</span><span class="o">.</span><span class="n">kv_cache_quant_algo</span> <span class="o">==</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8</span><span class="p">:</span>
@@ -1277,7 +1284,8 @@
 
     <span class="k">if</span> <span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">use_paged_context_fmha</span><span class="p">:</span>
         <span class="k">if</span> <span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_fp8_kv_cache</span><span class="p">()</span>
-                <span class="ow">and</span> <span class="ow">not</span> <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_fp8_qdq</span><span class="p">()):</span>
+                <span class="ow">and</span> <span class="ow">not</span> <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">quantization</span><span class="o">.</span><span class="n">quant_algo</span>
+                <span class="ow">in</span> <span class="p">[</span><span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8</span><span class="p">,</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A8_AWQ</span><span class="p">]):</span>
             <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
                 <span class="s2">&quot;FP8 Paged Context FMHA only works with fp8 quantization workflow currently.&quot;</span>
             <span class="p">)</span>
@@ -1380,7 +1388,8 @@
             <span class="n">build_config</span><span class="o">.</span><span class="n">lora_config</span><span class="o">.</span><span class="n">lora_target_modules</span>
         <span class="p">}</span>
 
-        <span class="k">if</span> <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">architecture</span> <span class="o">==</span> <span class="s2">&quot;DecoderModel&quot;</span> <span class="ow">or</span> <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">architecture</span> <span class="o">==</span> <span class="s2">&quot;MllamaForConditionalGeneration&quot;</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">architecture</span> <span class="o">==</span> <span class="s2">&quot;DecoderModel&quot;</span> <span class="ow">or</span> <span class="s2">&quot;mllama&quot;</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">architecture</span><span class="o">.</span><span class="n">lower</span><span class="p">(</span>
+        <span class="p">):</span>
             <span class="n">prepare_input_args</span><span class="p">[</span><span class="s2">&quot;max_seq_len&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">build_config</span><span class="o">.</span><span class="n">max_seq_len</span>
             <span class="n">prepare_input_args</span><span class="p">[</span>
                 <span class="s2">&quot;max_decoder_input_len&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">build_config</span><span class="o">.</span><span class="n">max_input_len</span>
@@ -1404,7 +1413,7 @@
                 <span class="s2">&quot;spec_decoding_is_generation_length_variable&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="kc">True</span>
         <span class="k">if</span> <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">architecture</span> <span class="o">==</span> <span class="s2">&quot;Qwen2VLForConditionalGeneration&quot;</span><span class="p">:</span>
             <span class="n">prepare_input_args</span><span class="p">[</span>
-                <span class="s1">&#39;mrope_rotary_sin_cos_size&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">max_position_embeddings</span> <span class="o">*</span> <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">rotary_embedding_dim</span>
+                <span class="s1">&#39;mrope_rotary_cos_sin_size&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">max_position_embeddings</span> <span class="o">*</span> <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">rotary_embedding_dim</span>
         <span class="k">if</span> <span class="n">build_config</span><span class="o">.</span><span class="n">speculative_decoding_mode</span> <span class="o">==</span> <span class="n">SpeculativeDecodingMode</span><span class="o">.</span><span class="n">EAGLE</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">use_paged_context_fmha</span><span class="p">:</span>
             <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
                 <span class="s2">&quot;Paged Context FMHA is required for EAGLE. Turning it on&quot;</span><span class="p">)</span>
@@ -1429,9 +1438,9 @@
             <span class="n">mapping</span> <span class="o">=</span> <span class="n">network</span><span class="o">.</span><span class="n">auto_parallel_config</span><span class="p">[</span><span class="s2">&quot;mapping&quot;</span><span class="p">]</span>
             <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span> <span class="o">=</span> <span class="n">mapping</span>
 
-    <span class="k">if</span> <span class="n">build_config</span><span class="o">.</span><span class="n">visualize_network</span><span class="p">:</span>
+    <span class="k">if</span> <span class="n">build_config</span><span class="o">.</span><span class="n">visualize_network</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">with</span> <span class="n">net_guard</span><span class="p">(</span><span class="n">network</span><span class="p">):</span>
-            <span class="n">network</span><span class="o">.</span><span class="n">to_onnx</span><span class="p">(</span><span class="sa">f</span><span class="s1">&#39;rank</span><span class="si">{</span><span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">rank</span><span class="si">}</span><span class="s1">.onnx&#39;</span><span class="p">)</span>
+            <span class="n">network</span><span class="o">.</span><span class="n">to_onnx</span><span class="p">(</span><span class="n">build_config</span><span class="o">.</span><span class="n">visualize_network</span><span class="p">)</span>
 
     <span class="c1"># Network -&gt; Engine</span>
     <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
@@ -1470,7 +1479,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f9468ce8ce0>
+<jinja2.runtime.BlockReference object at 0x7fed980dd8b0>
 
 <div class="footer">
     <p>

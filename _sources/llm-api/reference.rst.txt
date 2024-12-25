@@ -11,12 +11,27 @@ API Reference
     :undoc-members:
     :special-members: __init__
     :show-inheritance:
+.. autoclass:: tensorrt_llm.llmapi.GuidedDecodingParams
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
 .. autoclass:: tensorrt_llm.llmapi.SamplingParams
     :members:
     :undoc-members:
     :special-members: __init__
     :show-inheritance:
 .. autoclass:: tensorrt_llm.llmapi.KvCacheConfig
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.llmapi.LookaheadDecodingConfig
+    :members:
+    :undoc-members:
+    :special-members: __init__
+    :show-inheritance:
+.. autoclass:: tensorrt_llm.llmapi.MedusaDecodingConfig
     :members:
     :undoc-members:
     :special-members: __init__
