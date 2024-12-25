@@ -4,7 +4,11 @@
 
 ```{note}
 The Windows release of TensorRT-LLM is currently in beta.
-We recommend checking out the [v0.15.0 tag](https://github.com/NVIDIA/TensorRT-LLM/releases/tag/v0.15.0) for the most stable experience.
+We recommend checking out the [v0.16.0 tag](https://github.com/NVIDIA/TensorRT-LLM/releases/tag/v0.16.0) for the most stable experience.
+```
+
+```{note}
+TensorRT-LLM on Windows only supports single-GPU execution.
 ```
 
 **Prerequisites**
@@ -52,7 +56,7 @@ We recommend checking out the [v0.15.0 tag](https://github.com/NVIDIA/TensorRT-L
   before installing TensorRT-LLM with the following command.
 
   ```bash
-  pip install tensorrt_llm==0.15.0 --extra-index-url https://download.pytorch.org/whl/
+  pip install tensorrt_llm==0.16.0 --extra-index-url https://download.pytorch.org/whl/
   ```
 
   Run the following command to verify that your TensorRT-LLM installation is working properly.
@@ -75,3 +79,4 @@ and retry. Check the system path to make sure the latest version installed in `S
 2. OSError: [WinError 126] The specified module could not be found. Error loading “...\Lib\site-packages\torch\lib\fbgemm.dll” or one of its dependencies.
 
 Installing the latest [Build Tools for Visual Studio 2022] (https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022) will resolve the issue.
+
