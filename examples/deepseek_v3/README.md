@@ -122,23 +122,29 @@ Test the engine with [run.py](../run.py) script:
 ```bash
 mpirun --allow-run-as-root -np 32 python ../run.py --engine_dir ./trtllm_engines/deepseek_3/bf16/tp32-sel4096-isl2048-bs4 \
                 --tokenizer_dir ./DeepSeek-V3 \
-                --max_output_len 40 \
-                --input_text "The president of the United States is person who"
+                --max_output_len 30 \
+                --input_text "Today is a nice day."
 ```
 
 and the output will be like:
 
 ```
-[10/28/2024-15:03:14] [TRT-LLM] [I] Load engine takes: 78.31490468978882 sec
-[10/28/2024-15:03:14] [TRT-LLM] [I] Load engine takes: 78.31163835525513 sec
-[10/28/2024-15:03:14] [TRT-LLM] [I] Load engine takes: 78.31164216995239 sec
-[10/28/2024-15:03:14] [TRT-LLM] [I] Load engine takes: 78.31491041183472 sec
-[10/28/2024-15:03:14] [TRT-LLM] [I] Load engine takes: 78.3116364479065 sec
-[10/28/2024-15:03:14] [TRT-LLM] [I] Load engine takes: 78.3118085861206 sec
-[10/28/2024-15:03:14] [TRT-LLM] [I] Load engine takes: 78.3118691444397 sec
-[10/28/2024-15:03:14] [TRT-LLM] [I] Load engine takes: 78.31516337394714 sec
-Input [Text 0]: "<｜begin▁of▁sentence｜>The president of the United States is person who"
-Output [Text 0 Beam 0]: " is elected by the people of the United States to lead the country. The president is the head of the executive branch of the government. The president is also the commander in chief of the armed forces."
+[12/25/2024-13:34:46] [TRT-LLM] [I] Load engine takes: 38.4361846446991 sec
+[12/25/2024-13:34:46] [TRT-LLM] [I] Load engine takes: 37.81118130683899 sec
+[12/25/2024-13:34:46] [TRT-LLM] [I] Load engine takes: 38.436166286468506 sec
+[12/25/2024-13:34:46] [TRT-LLM] [I] Load engine takes: 38.436179876327515 sec
+[12/25/2024-13:34:46] [TRT-LLM] [I] Load engine takes: 37.811140298843384 sec
+[12/25/2024-13:34:46] [TRT-LLM] [I] Load engine takes: 38.43616843223572 sec
+[12/25/2024-13:34:46] [TRT-LLM] [I] Load engine takes: 37.81416082382202 sec
+[12/25/2024-13:34:46] [TRT-LLM] [I] Load engine takes: 38.436097621917725 sec
+[12/25/2024-13:34:46] [TRT-LLM] [I] Load engine takes: 37.81114745140076 sec
+[12/25/2024-13:34:46] [TRT-LLM] [I] Load engine takes: 38.43618369102478 sec
+[12/25/2024-13:34:46] [TRT-LLM] [I] Load engine takes: 37.810874462127686 sec
+[12/25/2024-13:34:46] [TRT-LLM] [I] Load engine takes: 38.436410903930664 sec
+[12/25/2024-13:34:46] [TRT-LLM] [I] Load engine takes: 37.814189195632935 sec
+[12/25/2024-13:34:46] [TRT-LLM] [I] Load engine takes: 38.43643116950989 sec
+[12/25/2024-13:34:46] [TRT-LLM] [I] Load engine takes: 37.81437277793884 sec
+[12/25/2024-13:34:46] [TRT-LLM] [I] Load engine takes: 37.81150937080383 sec
 [TensorRT-LLM][INFO] Refreshed the MPI local session
 [TensorRT-LLM][INFO] Refreshed the MPI local session
 [TensorRT-LLM][INFO] Refreshed the MPI local session
@@ -147,6 +153,16 @@ Output [Text 0 Beam 0]: " is elected by the people of the United States to lead 
 [TensorRT-LLM][INFO] Refreshed the MPI local session
 [TensorRT-LLM][INFO] Refreshed the MPI local session
 [TensorRT-LLM][INFO] Refreshed the MPI local session
+[TensorRT-LLM][INFO] Refreshed the MPI local session
+[TensorRT-LLM][INFO] Refreshed the MPI local session
+[TensorRT-LLM][INFO] Refreshed the MPI local session
+[TensorRT-LLM][INFO] Refreshed the MPI local session
+[TensorRT-LLM][INFO] Refreshed the MPI local session
+[TensorRT-LLM][INFO] Refreshed the MPI local session
+[TensorRT-LLM][INFO] Refreshed the MPI local session
+[TensorRT-LLM][INFO] Refreshed the MPI local session
+Input [Text 0]: "Today is a nice day."
+Output [Text 0 Beam 0]: " I am going to the park with my friends. We are going to play soccer. We are going"
 ```
 
 If we want to evaluate the model summarization ability, we can use [summarize.py](../summarize.py) script:
