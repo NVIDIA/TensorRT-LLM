@@ -26,6 +26,7 @@ This document shows how to build and run the `DeepSeek-v3` model in TensorRT-LLM
 - TP: Tensor Parallel
 - EP: Expert Parallel
 - IB: Inflight Batching
+- FP8: Support for FP8 is currently in progress and will be released soon
 
 ***Please Note:*** 
 - Prefer using BF16 over FP16 for DeepSeek-V3 since model original training precision is FP8 and we found direct convert FP8 -> FP16 may cause unknown accuracy issues.
