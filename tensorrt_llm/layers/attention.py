@@ -1913,11 +1913,6 @@ class DeepseekV2Attention(Attention):
             max_position_embeddings=1024,
             rotary_embedding_base=10000.0,
             rotary_embedding_scaling=None,
-            rotary_embedding_beta_fast=32,
-            rotary_embedding_beta_slow=1,
-            rotary_embedding_mscale=1,
-            rotary_embedding_mscale_all_dim=0,
-            rotary_embedding_origin_max_position=4096,
             rotary_scaling=None,
             tp_group=None,
             tp_size=1,
@@ -1944,6 +1939,7 @@ class DeepseekV2Attention(Attention):
                          enable_qkv=False)
 
         self.tp_size = tp_size
+        self.tp_rank = tp_rank
 
         if q_lora_rank is None:
             self.q_lora_rank = hidden_size
@@ -1965,7 +1961,7 @@ class DeepseekV2Attention(Attention):
                 return 1.0
             return 0.1 * mscale * math.log(scale) + 1.0
 
-        assert self.rotary_scaling is not None
+        # assert self.rotary_scaling is not None
         if self.rotary_scaling is not None:
             mscale_all_dim = self.rotary_scaling.get("mscale_all_dim", 0)
             scaling_factor = self.rotary_scaling["factor"]
@@ -1973,12 +1969,27 @@ class DeepseekV2Attention(Attention):
                 mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
                 self.q_scaling = 1.0 / (mscale * mscale)
 
-        embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_for_deepseek_attention_plugin(
-            self.max_position_embeddings, self.qk_rope_head_dim,
-            self.rotary_embedding_base, self.rotary_scaling["factor"],
-            rotary_embedding_origin_max_position, rotary_embedding_beta_fast,
-            rotary_embedding_beta_slow, rotary_embedding_mscale,
-            rotary_embedding_mscale_all_dim)
+            embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_for_deepseek_attention_plugin(
+                self.max_position_embeddings, self.qk_rope_head_dim,
+                self.rotary_embedding_base, self.rotary_scaling["factor"],
+                rotary_scaling['original_max_position_embeddings'],
+                self.rotary_scaling["beta_fast"],
+                self.rotary_scaling["beta_slow"], self.rotary_scaling["mscale"],
+                mscale_all_dim)
+        else:
+            embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions(
+                self.max_position_embeddings, self.qk_rope_head_dim,
+                self.rotary_embedding_base)
+            embed_positions_for_gpt_attention = embed_positions_for_gpt_attention.squeeze(
+                0)
+            sin, cos = np.split(embed_positions_for_gpt_attention, 2, 1)
+            cos_embed = np.expand_dims(np.concatenate((cos, cos), axis=1),
+                                       axis=2)
+            sin_embed = np.expand_dims(np.concatenate((sin, sin), axis=1),
+                                       axis=2)
+            embed_positions_for_gpt_attention = np.concatenate(
+                (cos_embed, sin_embed), axis=-1).reshape(1, -1)
+
         self.register_parameter(
             'embed_positions_for_gpt_attention',
             Parameter(embed_positions_for_gpt_attention, dtype='float32'))
@@ -2205,3 +2216,88 @@ class DeepseekV2Attention(Attention):
             return (context, past_key_value)
         else:
             return context
+
+    def postprocess(self, tllm_key, weights, **kwargs):
+
+        def split(v, tp_size, idx, dim=0):
+            if tp_size == 1:
+                return v
+            if len(v.shape) == 1:
+                return torch.chunk(v, tp_size)[idx].contiguous()
+            else:
+                return torch.chunk(v, tp_size, dim=dim)[idx].contiguous()
+
+        if tllm_key.endswith("kv_b_proj"):
+            kv_b_proj = weights.unflatten(0, [
+                self.num_attention_heads * self.tp_size,
+                self.qk_nope_head_dim + self.v_head_dim
+            ])
+            splited_kv_b_proj = split(kv_b_proj,
+                                      self.tp_size,
+                                      self.tp_rank,
+                                      dim=0)
+            k_nope_weight, v_weight = splited_kv_b_proj.split(
+                [self.qk_nope_head_dim, self.v_head_dim],
+                dim=1,
+            )
+            kv_b_proj_weight = torch.concat([
+                k_nope_weight.reshape(
+                    self.num_attention_heads * self.qk_nope_head_dim,
+                    self.kv_lora_rank),
+                v_weight.reshape(self.num_attention_heads * self.v_head_dim,
+                                 self.kv_lora_rank)
+            ],
+                                            dim=0)
+            return {tllm_key: kv_b_proj_weight}
+        elif tllm_key.endswith("q_b_proj"):
+            q_b_proj = weights.unflatten(0, [
+                self.num_attention_heads * self.tp_size,
+                self.qk_nope_head_dim + self.qk_rope_head_dim
+            ])
+            splited_q_b_proj = split(q_b_proj,
+                                     self.tp_size,
+                                     self.tp_rank,
+                                     dim=0)
+            q_b_proj_weight = splited_q_b_proj.reshape(
+                self.num_attention_heads *
+                (self.qk_nope_head_dim + self.qk_rope_head_dim),
+                self.q_lora_rank)
+            return {tllm_key: q_b_proj_weight}
+        elif tllm_key.endswith("fused_q_proj"):
+            assert isinstance(weights, list) and len(weights) == 2
+            q_b_proj = weights[0].unflatten(0, [
+                self.num_attention_heads * self.tp_size,
+                self.qk_nope_head_dim + self.qk_rope_head_dim
+            ])
+            splited_q_b_proj = split(q_b_proj,
+                                     self.tp_size,
+                                     self.tp_rank,
+                                     dim=0)
+            kv_b_proj = weights[1].unflatten(0, [
+                self.num_attention_heads * self.tp_size,
+                self.qk_nope_head_dim + self.v_head_dim
+            ])
+            splited_kv_b_proj = split(kv_b_proj,
+                                      self.tp_size,
+                                      self.tp_rank,
+                                      dim=0)
+            q_nope_weight, q_pe_weight = splited_q_b_proj.split(
+                [self.qk_nope_head_dim, self.qk_rope_head_dim],
+                dim=1,
+            )
+            k_nope_weight, _ = splited_kv_b_proj.split(
+                [self.qk_nope_head_dim, self.v_head_dim],
+                dim=1,
+            )
+            fused_q_nope_weight = torch.einsum(
+                'hdq,hdk->hkq',
+                q_nope_weight,
+                k_nope_weight,
+            )
+            fused_q_weight = torch.cat(
+                [fused_q_nope_weight, q_pe_weight],
+                dim=1,
+            ).flatten(start_dim=0, end_dim=1)
+            return {tllm_key: fused_q_weight}
+        else:
+            return {tllm_key: weights}

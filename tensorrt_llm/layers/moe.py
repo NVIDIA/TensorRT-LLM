@@ -64,6 +64,11 @@ class MoeConfig:
         DEVICE_LIMITED = 3
         DEVICE_LIMITED_RENORM = 4
 
+    class TopKMethod(IntEnum):
+        GREEDY = 0,
+        GROUP_LIMITED_GREEDY = 1,
+        NOAUX_TC = 2
+
     num_experts: int = 0
     shared_expert_intermediate_size: int = 0
 
@@ -71,6 +76,7 @@ class MoeConfig:
     normalization_mode: ExpertScaleNormalizationMode = ExpertScaleNormalizationMode.RENORMALIZE
     sparse_mixer_epsilon: float = 0.01
     tp_mode: int = 0
+    topk_method: TopKMethod = TopKMethod.GREEDY
 
     device_limited_n_group: int = 0
     device_limited_topk_group: int = 0
@@ -499,6 +505,10 @@ class MixtureOfExperts(Module):
             "router": "gate"
         }
 
+        if moe_config.topk_method == MoeConfig.TopKMethod.NOAUX_TC:
+            self.e_score_correction_bias = Parameter(shape=(self.num_experts, ),
+                                                     dtype=trt.float32)
+
         self.init_experts()
 
         self.max_low_rank = None
@@ -542,6 +552,38 @@ class MixtureOfExperts(Module):
             self.moe_config.device_limited_routed_scaling_factor
         return scores
 
+    def noaux_tc(self, logits):
+        n_group = self.moe_config.device_limited_n_group
+        scores = sigmoid(logits)
+        scores_with_bias = scores + self.e_score_correction_bias.value
+        scores_shape = [
+            shape(scores_with_bias, i) for i in range(scores_with_bias.ndim())
+        ]
+        group_scores = sum(topk(scores_with_bias.view(
+            concat(scores_shape[:-1] + [n_group, scores_shape[-1] // n_group])),
+                                k=2,
+                                dim=-1)[0],
+                           dim=-1)
+        _, group_idx = topk(group_scores,
+                            k=self.moe_config.device_limited_topk_group,
+                            dim=-1)
+        group_mask = scatter(group_scores * 0, -1, group_idx,
+                             group_idx.cast(group_scores.dtype) * 0 + 1)
+        score_mask = expand(
+            unsqueeze(group_mask, -1),
+            concat(scores_shape[:-1] + [n_group, scores_shape[-1] // n_group]),
+        ).view(concat(scores_shape))
+        scores_with_bias = scores_with_bias * score_mask
+
+        _, topk_idx = topk(scores_with_bias, k=self.moe_config.top_k, dim=-1)
+        new_mask = scatter(scores * 0, -1, topk_idx,
+                           topk_idx.cast(scores.dtype) * 0 + 1)
+        scores = scores * new_mask
+        score_sum = sum(scores, dim=-1, keepdim=True) + 1e-20
+        scores = scores / score_sum * \
+            self.moe_config.device_limited_routed_scaling_factor
+        return scores
+
     def forward(self,
                 hidden_states,
                 finished=None,
@@ -556,11 +598,10 @@ class MixtureOfExperts(Module):
                 0, "moe_router")
         routing_input = cast(hidden_states, trt.float32)
         routing = self.router(routing_input, moe_router_lora_params)
-        if self.moe_config.normalization_mode in [
-                MoeConfig.ExpertScaleNormalizationMode.DEVICE_LIMITED,
-                MoeConfig.ExpertScaleNormalizationMode.DEVICE_LIMITED_RENORM
-        ]:
+        if self.moe_config.topk_method == MoeConfig.TopKMethod.GROUP_LIMITED_GREEDY:
             routing = self.group_limited_greedy(routing)
+        elif self.moe_config.topk_method == MoeConfig.TopKMethod.NOAUX_TC:
+            routing = self.noaux_tc(routing)
         output = self.forward_experts(hidden_states, routing, finished,
                                       lora_layer_params, side_stream_id)
         if side_stream_id != SideStreamIDType.disable:

@@ -18,139 +18,14 @@ import time
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM
 
-from tensorrt_llm.layers import MoeConfig
-
 from ..._utils import pad_vocab_size, release_gc
-from ...mapping import Mapping
+from ...layers import MoeConfig
+from ...quantization import QuantAlgo
 from ..convert_utils import get_tllm_linear_weight
+from .config import DeepSeekV2Config
 
 # `Override num_hidden_layers` used for reduce number of hidden layers in DeepseekV2ForCausalLM for debug purpose
 OVERRIDE_HIDDEN_LAYERS = None  # 2
-
-
-## Convert config parameters to dict
-def create_trt_config_from_hf(model_dir,
-                              dtype,
-                              mapping: Mapping,
-                              override_fields: dict = {}):
-    config = {}
-    assert isinstance(model_dir, str)
-    hf_config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
-    # Override num_hidden_layers
-    if OVERRIDE_HIDDEN_LAYERS is not None:
-        hf_config.num_hidden_layers = OVERRIDE_HIDDEN_LAYERS
-        print(
-            f'Override hidden layers to {hf_config.num_hidden_layers} for DeepseekV2ForCausalLM'
-        )
-    dtype = dtype
-    n_layer = hf_config.num_hidden_layers
-    n_head = hf_config.num_attention_heads
-    n_embd = hf_config.hidden_size
-    inter_size = hf_config.intermediate_size
-    n_kv_head = hf_config.num_key_value_heads
-    vocab_size = hf_config.vocab_size
-    n_positions = hf_config.max_position_embeddings
-    hidden_act = 'swiglu'  # TRT-LLM request make gated activation explicit for MOE implementation
-    rotary_base = hf_config.rope_theta
-    rms_norm_eps = hf_config.rms_norm_eps
-    rotary_scaling_beta_fast = hf_config.rope_scaling['beta_fast']
-    rotary_scaling_beta_slow = hf_config.rope_scaling['beta_slow']
-    rotary_scaling_factor = hf_config.rope_scaling['factor']
-    rotary_scaling_mscale = hf_config.rope_scaling['mscale']
-    rotary_scaling_mscale_all_dim = hf_config.rope_scaling['mscale_all_dim']
-    rotary_scaling_original_max_position_embeddings = hf_config.rope_scaling[
-        'original_max_position_embeddings']
-    rotary_scaling_type = 'yarn'
-    kv_lora_rank = hf_config.kv_lora_rank
-    q_lora_rank = hf_config.q_lora_rank
-    qk_nope_head_dim = hf_config.qk_nope_head_dim
-    qk_rope_head_dim = hf_config.qk_rope_head_dim
-    v_head_dim = hf_config.v_head_dim
-    moe_num_experts = hf_config.n_routed_experts
-    moe_inter_size = hf_config.moe_intermediate_size
-    moe_num_shared_experts = hf_config.n_shared_experts
-    moe_top_k = hf_config.num_experts_per_tok
-    moe_n_group = hf_config.n_group
-    moe_topk_group = hf_config.topk_group
-    moe_routed_scaling_factor = hf_config.routed_scaling_factor
-    assert moe_routed_scaling_factor > 0, 'routed_scaling_factor should be greater than 0'
-    if hf_config.topk_method == 'group_limited_greedy':
-        if moe_top_k > 1 and hf_config.norm_topk_prob:
-            moe_renorm_mode = MoeConfig.ExpertScaleNormalizationMode.DEVICE_LIMITED_RENORM
-        else:
-            moe_renorm_mode = MoeConfig.ExpertScaleNormalizationMode.DEVICE_LIMITED
-    elif hf_config.topk_method == 'greedy':
-        assert moe_routed_scaling_factor == 1.0, 'The combination of topk_method == greedy and routed_scaling_factor != 1.0 is not supported'
-        if moe_top_k > 1 and hf_config.norm_topk_prob:
-            moe_renorm_mode = MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE
-        else:
-            moe_renorm_mode = MoeConfig.ExpertScaleNormalizationMode.NONE
-    else:
-        raise AssertionError(
-            'Unsupported topk_method in hf_config: {hf_config.topk_method}')
-
-    config = {
-        'architecture': 'DeepseekV2ForCausalLM',
-        'dtype': dtype,
-        'logits_type': 'float32',
-        'num_hidden_layers': n_layer,
-        'num_attention_heads': n_head,
-        'hidden_size': n_embd,
-        'intermediate_size': inter_size,
-        'num_key_value_heads': n_kv_head,
-        'vocab_size': vocab_size,
-        'position_embedding_type': 'rope_gpt_neox',
-        'max_position_embeddings': n_positions,
-        'hidden_act': hidden_act,
-        'rotary_base': rotary_base,
-        'norm_epsilon': rms_norm_eps,
-        'rotary_scaling': {
-            'beta_fast': rotary_scaling_beta_fast,
-            'beta_slow': rotary_scaling_beta_slow,
-            'factor': rotary_scaling_factor,
-            'mscale': rotary_scaling_mscale,
-            'mscale_all_dim': rotary_scaling_mscale_all_dim,
-            'original_max_position_embeddings':
-            rotary_scaling_original_max_position_embeddings,
-            'type': rotary_scaling_type,
-        },
-        'mapping': {
-            'world_size': mapping.tp_size * mapping.pp_size,
-            'tp_size': mapping.tp_size,
-            'pp_size': mapping.pp_size,
-            'moe_tp_size': mapping.moe_tp_size,
-            'moe_ep_size': mapping.moe_ep_size,
-        },
-        'kv_lora_rank': kv_lora_rank,
-        'q_lora_rank': q_lora_rank,
-        'qk_nope_head_dim': qk_nope_head_dim,
-        'qk_rope_head_dim': qk_rope_head_dim,
-        'v_head_dim': v_head_dim,
-        'moe_num_experts': moe_num_experts,
-        'moe_inter_size': moe_inter_size,
-        'moe_num_shared_experts': moe_num_shared_experts,
-        'moe_top_k': moe_top_k,
-        'moe_renorm_mode': moe_renorm_mode,
-        'moe_n_group': moe_n_group,
-        'moe_topk_group': moe_topk_group,
-        'moe_routed_scaling_factor': moe_routed_scaling_factor,
-    }
-
-    config.update(override_fields)
-
-    moe_config = MoeConfig(
-        num_experts=config['moe_num_experts'],
-        shared_expert_intermediate_size=config['moe_num_shared_experts'] *
-        config['moe_inter_size'],
-        top_k=config['moe_top_k'],
-        normalization_mode=config['moe_renorm_mode'],
-        device_limited_n_group=config['moe_n_group'],
-        device_limited_topk_group=config['moe_topk_group'],
-        device_limited_routed_scaling_factor=config['moe_routed_scaling_factor']
-    )
-    moe_config.validate()
-
-    return config
 
 
 ## Get HF model
@@ -225,42 +100,42 @@ def get_param_weight(weight, prefix):
     return results
 
 
-def convert_deepseekv2(hf_model,
-                       config,
-                       mapping,
-                       dtype='float32',
-                       use_parallel_embedding=False,
-                       sharding_dim=0):
+def load_weights_from_hf_model(hf_model,
+                               config: DeepSeekV2Config,
+                               use_parallel_embedding=False,
+                               sharding_dim=0):
+    quant_algo = config.quantization.quant_algo
+    use_weight_only = quant_algo in [QuantAlgo.W8A16, QuantAlgo.W4A16]
+    if quant_algo == QuantAlgo.W8A16:
+        plugin_weight_only_quant_type = torch.int8
+    elif quant_algo == QuantAlgo.W4A16:
+        plugin_weight_only_quant_type = torch.quint4x2
+    else:
+        plugin_weight_only_quant_type = None
+    use_gemm_woq_plugin = True
 
     weights = {}
     tik = time.time()
     model_params = dict(hf_model.named_parameters())
-    dtype = getattr(torch, dtype)
-    moe_config = MoeConfig(
-        num_experts=config['moe_num_experts'],
-        shared_expert_intermediate_size=config['moe_num_shared_experts'] *
-        config['moe_inter_size'],
-        top_k=config['moe_top_k'],
-        normalization_mode=config['moe_renorm_mode'],
-        device_limited_n_group=config['moe_n_group'],
-        device_limited_topk_group=config['moe_topk_group'],
-        device_limited_routed_scaling_factor=config['moe_routed_scaling_factor']
-    )
+    dtype = getattr(torch, config.dtype)
 
-    layers_range = mapping.pp_layers(config['num_hidden_layers'])
+    mapping = config.mapping
+    moe_config = config.moe
+    first_k_dense_replace = config.first_k_dense_replace
+    layers_range = mapping.pp_layers(config.num_hidden_layers)
 
     def convert_layer(l):
         prefix = f'model.layers.{l}.'
         trtllm_prex = f'transformer.layers.{l - layers_range[0]}.'
         # Fuse matrices for compression
         # Split matrices for decompression
-        q_lora_rank = config['q_lora_rank']
-        kv_lora_rank = config['kv_lora_rank']
-        num_heads = config['num_attention_heads']
-        qk_nope_head_dim = config['qk_nope_head_dim']
-        qk_rope_head_dim = config['qk_rope_head_dim']
-        v_head_dim = config['v_head_dim']
-        hidden_size = config['hidden_size']
+        q_lora_rank = config.q_lora_rank
+        kv_lora_rank = config.kv_lora_rank
+        num_heads = config.num_attention_heads
+        qk_nope_head_dim = config.qk_nope_head_dim
+        qk_rope_head_dim = config.qk_rope_head_dim
+        v_head_dim = config.v_head_dim
+        hidden_size = config.hidden_size
 
         if q_lora_rank is not None:
             q_a_proj_weight = get_weight(model_params,
@@ -392,15 +267,19 @@ def convert_deepseekv2(hf_model,
             get_param_weight(kv_b_proj_weight,
                              trtllm_prex + 'attention.kv_b_proj'))
         weights.update(
-            get_tllm_linear_weight(o_proj_weight,
-                                   trtllm_prex + 'attention.dense.'))
+            get_tllm_linear_weight(
+                o_proj_weight,
+                trtllm_prex + 'attention.dense.',
+                use_weight_only=use_weight_only,
+                plugin_weight_only_quant_type=plugin_weight_only_quant_type,
+                use_gemm_woq_plugin=use_gemm_woq_plugin))
 
         if q_lora_rank is not None:
             weights.update(
                 get_tllm_linear_weight(q_a_layernorm_weight, trtllm_prex +
                                        'attention.q_a_layernorm.'))
 
-        if moe_config.has_moe() and l > 0:
+        if moe_config.has_moe() and l >= first_k_dense_replace:
             rank_experts = list(range(moe_config.num_experts))
             if mapping.has_moe_ep():
                 rank_experts = mapping.ep_experts(moe_config.num_experts)
@@ -439,14 +318,22 @@ def convert_deepseekv2(hf_model,
             moe_experts_down_proj_weights = get_weight(
                 model_params, prefix + 'mlp.experts.down_proj', dtype)
             weights.update(
-                get_tllm_linear_weight(moe_experts_down_proj_weights,
-                                       trtllm_prex + 'mlp.proj.'))
+                get_tllm_linear_weight(
+                    moe_experts_down_proj_weights,
+                    trtllm_prex + 'mlp.proj.',
+                    use_weight_only=use_weight_only,
+                    plugin_weight_only_quant_type=plugin_weight_only_quant_type,
+                    use_gemm_woq_plugin=use_gemm_woq_plugin))
             ## mlp.experts.up_gate.weight
             moe_experts_up_gate_proj_weights = get_weight(
                 model_params, prefix + 'mlp.experts.up_gate_proj', dtype)
             weights.update(
-                get_tllm_linear_weight(moe_experts_up_gate_proj_weights,
-                                       trtllm_prex + 'mlp.fc.'))
+                get_tllm_linear_weight(
+                    moe_experts_up_gate_proj_weights,
+                    trtllm_prex + 'mlp.fc.',
+                    use_weight_only=use_weight_only,
+                    plugin_weight_only_quant_type=plugin_weight_only_quant_type,
+                    use_gemm_woq_plugin=use_gemm_woq_plugin))
             ## MOE hardcoded routing_input into trt.float32, please refer to moe.py line 397
             moe_experts_gate_weights = get_weight(model_params,
                                                   prefix + 'mlp.gate',
@@ -454,6 +341,15 @@ def convert_deepseekv2(hf_model,
             weights.update(
                 get_tllm_linear_weight(moe_experts_gate_weights,
                                        trtllm_prex + 'mlp.router.'))
+
+            if moe_config.topk_method == MoeConfig.TopKMethod.NOAUX_TC:
+                e_score_correction_bias = get_weight(
+                    model_params, prefix + 'mlp.gate.e_score_correction_bias',
+                    torch.float32, '')
+                weights.update(
+                    get_param_weight(
+                        e_score_correction_bias,
+                        trtllm_prex + 'mlp.e_score_correction_bias'))
 
             if moe_config.shared_expert_intermediate_size > 0:
                 shared_moe_up_proj_weights = get_weight(
@@ -487,13 +383,21 @@ def convert_deepseekv2(hf_model,
                 weights.update(
                     get_tllm_linear_weight(
                         shared_moe_gate_up_proj_weights,
-                        trtllm_prex + 'mlp.shared_expert.fc.'))
+                        trtllm_prex + 'mlp.shared_expert.fc.',
+                        use_weight_only=use_weight_only,
+                        plugin_weight_only_quant_type=
+                        plugin_weight_only_quant_type,
+                        use_gemm_woq_plugin=use_gemm_woq_plugin))
 
                 ## mlp.shared_experts.down_proj.weight
                 weights.update(
                     get_tllm_linear_weight(
                         shared_moe_down_proj_weights,
-                        trtllm_prex + 'mlp.shared_expert.proj.'))
+                        trtllm_prex + 'mlp.shared_expert.proj.',
+                        use_weight_only=use_weight_only,
+                        plugin_weight_only_quant_type=
+                        plugin_weight_only_quant_type,
+                        use_gemm_woq_plugin=use_gemm_woq_plugin))
 
         else:
             ## Current MLP layer is only one, if it goes large consider to do fuse
@@ -504,7 +408,12 @@ def convert_deepseekv2(hf_model,
                                          mapping.tp_rank,
                                          dim=0)
             weights.update(
-                get_tllm_linear_weight(split_gate, trtllm_prex + 'mlp.gate.'))
+                get_tllm_linear_weight(
+                    split_gate,
+                    trtllm_prex + 'mlp.gate.',
+                    use_weight_only=use_weight_only,
+                    plugin_weight_only_quant_type=plugin_weight_only_quant_type,
+                    use_gemm_woq_plugin=use_gemm_woq_plugin))
 
             mlp_fc_weight = get_weight(model_params, prefix + 'mlp.gate_proj',
                                        dtype)
@@ -513,7 +422,12 @@ def convert_deepseekv2(hf_model,
                                        mapping.tp_rank,
                                        dim=0)
             weights.update(
-                get_tllm_linear_weight(split_fc, trtllm_prex + 'mlp.fc.'))
+                get_tllm_linear_weight(
+                    split_fc,
+                    trtllm_prex + 'mlp.fc.',
+                    use_weight_only=use_weight_only,
+                    plugin_weight_only_quant_type=plugin_weight_only_quant_type,
+                    use_gemm_woq_plugin=use_gemm_woq_plugin))
 
             mlp_proj_weight = get_weight(model_params, prefix + 'mlp.down_proj',
                                          dtype)
@@ -522,7 +436,12 @@ def convert_deepseekv2(hf_model,
                                          mapping.tp_rank,
                                          dim=1)
             weights.update(
-                get_tllm_linear_weight(split_proj, trtllm_prex + 'mlp.proj.'))
+                get_tllm_linear_weight(
+                    split_proj,
+                    trtllm_prex + 'mlp.proj.',
+                    use_weight_only=use_weight_only,
+                    plugin_weight_only_quant_type=plugin_weight_only_quant_type,
+                    use_gemm_woq_plugin=use_gemm_woq_plugin))
 
         # Layer norms do not use tensor parallelism
         input_ln_weight = get_weight(model_params, prefix + 'input_layernorm',
@@ -540,11 +459,11 @@ def convert_deepseekv2(hf_model,
     if hf_model.config.tie_word_embeddings:
         # lm_head.weight has the same weights as embedding
         if mapping.is_last_pp_rank():
-            if config['vocab_size'] % mapping.tp_size != 0:
+            if config.vocab_size % mapping.tp_size != 0:
                 # padding
-                vocab_size_padded = pad_vocab_size(config['vocab_size'],
+                vocab_size_padded = pad_vocab_size(config.vocab_size,
                                                    mapping.tp_size)
-                pad_width = vocab_size_padded - config['vocab_size']
+                pad_width = vocab_size_padded - config.vocab_size
                 v = torch.nn.functional.pad(v, (0, 0, 0, pad_width), 'constant',
                                             0)
             weights['lm_head.weight'] = split(v, mapping.tp_size,
@@ -559,11 +478,11 @@ def convert_deepseekv2(hf_model,
     lm_head_weights = get_weight(model_params, 'lm_head', dtype)
 
     if mapping.is_last_pp_rank():
-        if config['vocab_size'] % mapping.tp_size != 0:
+        if config.vocab_size % mapping.tp_size != 0:
             # padding
-            vocab_size_padded = pad_vocab_size(config['vocab_size'],
+            vocab_size_padded = pad_vocab_size(config.vocab_size,
                                                mapping.tp_size)
-            pad_width = vocab_size_padded - config['vocab_size']
+            pad_width = vocab_size_padded - config.vocab_size
             lm_head_weights = torch.nn.functional.pad(lm_head_weights,
                                                       (0, 0, 0, pad_width),
                                                       'constant',

@@ -13,26 +13,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Optional
 
 import torch
+from tqdm import tqdm
 
 from ..._utils import pad_vocab_size, torch_dtype_to_str
 from ...functional import Tensor, non_gated_version, recv, send
 from ...layers import (MOE, AttentionMaskType, ColumnLinear,
-                       DeepseekV2Attention, Embedding, GatedMLP, MoeConfig,
+                       DeepseekV2Attention, Embedding, GatedMLP,
                        PositionEmbeddingType, RmsNorm, SharedMoE)
+from ...layers.moe import MOEWeightWrapper
 from ...mapping import Mapping
 from ...module import Module
 from ...plugin import init_all_reduce_helper
+from ..model_weights_loader import ModelWeightsLoader
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
-                              PretrainedConfig)
-from .convert import convert_deepseekv2, create_trt_config_from_hf
+                              QuantConfig)
+from .config import DeepSeekV2Config
+from .convert import load_hf_deepseek, load_weights_from_hf_model
 
 
 class DeepseekV2DecoderLayer(Module):
 
-    def __init__(self, config: PretrainedConfig, layer_idx: int):
+    def __init__(self, config: DeepSeekV2Config, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
         self.config = config
@@ -61,13 +66,6 @@ class DeepseekV2DecoderLayer(Module):
             position_embedding_type=PositionEmbeddingType.learned_absolute,
             rotary_embedding_base=config.rotary_base,
             rotary_embedding_scaling=None,
-            rotary_embedding_beta_fast=config.rotary_scaling['beta_fast'],
-            rotary_embedding_beta_slow=config.rotary_scaling['beta_slow'],
-            rotary_embedding_mscale=config.rotary_scaling['mscale'],
-            rotary_embedding_mscale_all_dim=config.
-            rotary_scaling['mscale_all_dim'],
-            rotary_embedding_origin_max_position=config.
-            rotary_scaling['original_max_position_embeddings'],
             rotary_scaling=config.rotary_scaling,
             tp_group=config.mapping.tp_group,
             tp_size=config.mapping.tp_size,
@@ -80,21 +78,12 @@ class DeepseekV2DecoderLayer(Module):
 
         ### Distinguish dense MLP and MoE MLP
         # dense_config = DenseConfig(intermediate_size=config.intermediate_size)
-        moe_config = MoeConfig(
-            num_experts=config.moe_num_experts,
-            shared_expert_intermediate_size=config.moe_num_shared_experts *
-            config.moe_inter_size,
-            top_k=config.moe_top_k,
-            normalization_mode=config.moe_renorm_mode,
-            device_limited_n_group=config.moe_n_group,
-            device_limited_topk_group=config.moe_topk_group,
-            device_limited_routed_scaling_factor=config.
-            moe_routed_scaling_factor)
+        moe_config = config.moe
 
         # layer_config = LayerMLPConfig(config=[dense_config, moe_config], moe_layer_idx_min=0,
         #                             moe_layer_idx_max=config.num_hidden_layers,
         #                             total_num_layers=config.num_hidden_layers)
-        if moe_config.num_experts > 0 and layer_idx > 0:
+        if moe_config.num_experts > 0 and layer_idx >= config.first_k_dense_replace:
             hidden_act = config.hidden_act
             mlp_hidden_size = config.moe_inter_size
             mlp_kwargs = {'moe_config': moe_config, 'mapping': config.mapping}
@@ -118,6 +107,7 @@ class DeepseekV2DecoderLayer(Module):
                           bias=False,
                           tp_group=config.mapping.tp_group,
                           tp_size=config.mapping.tp_size,
+                          quant_mode=config.quant_mode,
                           **mlp_kwargs)
 
         ### Pose layernorm in Deepseek v2 is same as Llama
@@ -159,7 +149,7 @@ class DeepseekV2DecoderLayer(Module):
 
 class DeepseekV2Model(Module):
 
-    def __init__(self, config: PretrainedConfig) -> None:
+    def __init__(self, config: DeepSeekV2Config) -> None:
         super().__init__()
         init_all_reduce_helper()  # enable use_customer_all_reduce
         self.dtype = config.dtype
@@ -221,8 +211,9 @@ class DeepseekV2Model(Module):
 
 
 class DeepseekV2ForCausalLM(DecoderModelForCausalLM):
+    config_class = DeepSeekV2Config
 
-    def __init__(self, config: PretrainedConfig):
+    def __init__(self, config: DeepSeekV2Config):
         transformer = DeepseekV2Model(config)
         vocab_size_padded = pad_vocab_size(config.vocab_size,
                                            config.mapping.tp_size)
@@ -241,22 +232,89 @@ class DeepseekV2ForCausalLM(DecoderModelForCausalLM):
 
     @classmethod
     def from_hugging_face(cls,
-                          hf_model,
                           model_dir,
                           dtype: str = 'auto',
                           mapping: Optional[Mapping] = None,
-                          override_fields={},
+                          quant_config: Optional[QuantConfig] = None,
                           **kwargs):
-        assert hf_model is not None
+        load_model_on_cpu = kwargs.pop('load_model_on_cpu', False)
         if mapping is None:
             mapping = Mapping()
-        config = create_trt_config_from_hf(model_dir,
-                                           dtype,
-                                           mapping=mapping,
-                                           override_fields=override_fields)
-        print(config)
-        pretrained_config = PretrainedConfig.from_dict(config)
-        pretrained_config.set_rank(mapping.rank)  # TODO:remove this hack
+        config = DeepSeekV2Config.from_hugging_face(model_dir,
+                                                    dtype=dtype,
+                                                    mapping=mapping,
+                                                    quant_config=quant_config,
+                                                    **kwargs)
+        if os.environ.get("TRTLLM_DISABLE_UNIFIED_CONVERTER") is None:
+            if config.q_lora_rank is not None:  # Deepseek-V2&V3
+                custom_dict = {
+                    "fused_a": ["q_a_proj", "kv_a_proj_with_mqa"],
+                    "q_a_layernrom": "q_a_layernorm",
+                    "kv_a_layernorm": "kv_a_layernorm",
+                    "q_b_proj": "q_b_proj.weight",
+                    "kv_b_proj": "kv_b_proj.weight",
+                    "fused_q_proj": ["q_b_proj.weight", "kv_b_proj.weight"],
+                    "shared_expert": "shared_experts",
+                    "e_score_correction_bias": "gate.e_score_correction_bias",
+                }
+            else:  # Deepseek-V2-Lite
+                custom_dict = {
+                    "fused_a": "kv_a_proj_with_mqa",
+                    "kv_a_layernorm": "kv_a_layernorm",
+                    "q_b_proj": "q_proj.weight",
+                    "kv_b_proj": "kv_b_proj.weight",
+                    "fused_q_proj": ["q_proj.weight", "kv_b_proj.weight"],
+                    "shared_expert": "shared_experts",
+                    "e_score_correction_bias": "gate.e_score_correction_bias",
+                }
+
+            loader = ModelWeightsLoader(model_dir, custom_dict)
+            model = cls(config)
+            for tllm_key, _ in model.named_parameters():
+                sub_module = model
+                for attr in tllm_key.split(".")[:-1]:
+                    sub_module = getattr(sub_module, attr)
+                if "router" in tllm_key or isinstance(sub_module,
+                                                      MOEWeightWrapper):
+                    sub_module_dic = sub_module.tllm_to_externel_key_dict
+                    sub_module_dic["mlp"] = "mlp"
+                    if "fc" in sub_module_dic.keys():
+                        sub_module_dic["fc"] = [
+                            hf_keyword.replace("w1", "gate_proj")
+                            for hf_keyword in sub_module_dic["fc"]
+                        ]
+                        sub_module_dic["fc"] = [
+                            hf_keyword.replace("w3", "up_proj")
+                            for hf_keyword in sub_module_dic["fc"]
+                        ]
+                    if "proj" in sub_module_dic.keys():
+                        sub_module_dic["proj"] = [
+                            hf_keyword.replace("w2", "down_proj")
+                            for hf_keyword in sub_module_dic["proj"]
+                        ]
+                    sub_module.tllm_to_externel_key_dict = sub_module_dic
+
+            def concat_gate_up_proj(weights):
+                return torch.cat(weights, dim=-2)
+
+            loader.update_key_mapping(model)
+            tllm_weights = {}
+            for tllm_key, _ in tqdm(model.named_parameters()):
+                if tllm_key.endswith("shared_expert.fc.weight"):
+                    updated_map = loader.tllm_to_externel_key_dict
+                    updated_map["fc"] = ["up_proj", "gate_proj"]
+                    loader.tllm_to_externel_key_dict = updated_map
+                    tllm_weights.update(
+                        loader.load(tllm_key, concat_gate_up_proj))
+                else:
+                    tllm_weights.update(loader.load(tllm_key))
+            loader.fill(tllm_weights)
+        else:
+            hf_model = load_hf_deepseek(model_dir, load_model_on_cpu)
+            weights = load_weights_from_hf_model(hf_model, config)
+            model = cls(config)
+            model.load(weights)
+        return model
 
         if dtype == 'auto':
             dtype = getattr(config, 'torch_dtype', None)
