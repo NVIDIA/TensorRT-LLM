@@ -66,6 +66,7 @@ public:
         std::optional<FloatType> const& topPDecay = std::nullopt,
         std::optional<RandomSeedType> const& seed = std::nullopt,
         std::optional<FloatType> const& temperature = std::nullopt,
+        std::optional<FloatType> const& custom = std::nullopt,
         std::optional<SizeType32> const& minTokens = std::nullopt,
         std::optional<FloatType> const& beamSearchDiversityRate = std::nullopt,
         std::optional<FloatType> const& repetitionPenalty = std::nullopt,
@@ -88,6 +89,7 @@ public:
     [[nodiscard]] std::optional<RandomSeedType> getSeed() const;
     [[nodiscard]] std::optional<RandomSeedType> getRandomSeed() const;
     [[nodiscard]] std::optional<FloatType> getTemperature() const;
+    [[nodiscard]] std::optional<FloatType> getCustom() const;
     [[nodiscard]] std::optional<SizeType32> getMinTokens() const;
     [[nodiscard]] std::optional<SizeType32> getMinLength() const;
     [[nodiscard]] std::optional<FloatType> getBeamSearchDiversityRate() const;
@@ -108,6 +110,7 @@ public:
     void setSeed(std::optional<RandomSeedType> const& seed);
     void setRandomSeed(std::optional<RandomSeedType> const& randomSeed);
     void setTemperature(std::optional<FloatType> const& temperature);
+    void setCustom(std::optional<FloatType> const& custom);
     void setMinTokens(std::optional<SizeType32> const& minTokens);
     void setMinLength(std::optional<SizeType32> const& minLength);
     void setBeamSearchDiversityRate(std::optional<FloatType> const& beamSearchDiversityRate);
@@ -127,6 +130,7 @@ private:
     static std::optional<TokenIdType> const& checkTopPResetIds(std::optional<TokenIdType> const& topPResetIds);
     static std::optional<FloatType> const& checkTopPDecay(std::optional<FloatType> const& topPDecay);
     static std::optional<FloatType> const& checkTemperature(std::optional<FloatType> const& temperature);
+    static std::optional<FloatType> const& checkCustom(std::optional<FloatType> const& custom);
     static std::optional<FloatType> const& checkRepetitionPenalty(std::optional<FloatType> const& penalty);
     static std::optional<SizeType32> const& checkMinTokens(std::optional<SizeType32> const& minTokens);
     static std::optional<SizeType32> const& checkNoRepeatNgramSize(std::optional<SizeType32> const& noRepeatNgramSize);
@@ -156,6 +160,8 @@ private:
     /// @brief Controls the modulation of logits when sampling new tokens. It can have values > 0.f. Default is 1.0f
     std::optional<FloatType> mTemperature;
     /// @brief Lower bound on the number of tokens to generate. Values < 1 have no effect. Default is 1.
+    std::optional<FloatType> mCustom;
+    /// @brief Default 1.0.
     std::optional<SizeType32> mMinTokens;
     /// @brief Controls the diversity in beam search.
     std::optional<FloatType> mBeamSearchDiversityRate;

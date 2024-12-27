@@ -120,6 +120,9 @@ public:
         temperature = fuseValues<FloatType>(
             configs, [&configs](size_t ci) { return configs[ci].temperature; },
             layers::DefaultDecodingParams::getTemperature());
+        custom = fuseValues<FloatType>(
+            configs, [&configs](size_t ci) { return configs[ci].custom; },
+            layers::DefaultDecodingParams::getCustom());
         minLength = fuseValues<SizeType32>(
             configs, [&configs](size_t ci) { return configs[ci].minLength; },
             layers::DefaultDecodingParams::getMinLength());
@@ -198,6 +201,7 @@ public:
         SET_FROM_OPTIONAL(topPDecay, TopPDecay, FloatType)
         SET_FROM_OPTIONAL(randomSeed, Seed, uint64_t)
         SET_FROM_OPTIONAL(temperature, Temperature, FloatType)
+        SET_FROM_OPTIONAL(custom, Temperature, FloatType) // TODO: create custom default
         SET_FROM_OPTIONAL(minLength, MinTokens, SizeType32)
         SET_FROM_OPTIONAL(beamSearchDiversityRate, BeamSearchDiversityRate, FloatType)
         SET_FROM_OPTIONAL(repetitionPenalty, RepetitionPenalty, FloatType)
@@ -248,6 +252,7 @@ public:
         valid &= validateVec("topPResetIds", topPResetIds, -1);
 
         valid &= validateVec("temperature", temperature, -fltEpsilon);
+        valid &= validateVec("custom", custom, -fltEpsilon);
         valid &= validateVec("repetitionPenalty", repetitionPenalty, 0.f);
         valid &= validateVec("minLength", minLength, -1);
         valid &= validateVec("noRepeatNgramSize", noRepeatNgramSize, 0);
@@ -284,6 +289,7 @@ public:
 
     // penalties
     OptVec<FloatType> temperature;        // [1] or [batch_size] on cpu
+    OptVec<FloatType> custom;             // [1] or [batch_size] on cpu
     OptVec<SizeType32> minLength;         // [1] or [batch_size] on cpu
     OptVec<FloatType> repetitionPenalty;  // [1] or [batch_size] on cpu
     OptVec<FloatType> presencePenalty;    // [1] or [batch_size] on cpu

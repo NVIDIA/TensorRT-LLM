@@ -606,7 +606,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                     sampling_params[v] = sampling_params.pop(k)
             if "top_p" in sampling_params and sampling_params["top_p"] == 0.0:
                 sampling_params["top_p"] = None
-
+            sampling_params["custom"] = 1.0
             sampling_config = trtllm.SamplingConfig(**sampling_params)
         else:
             sampling_config = copy.deepcopy(sampling_config)

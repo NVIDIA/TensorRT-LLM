@@ -35,6 +35,11 @@ public:
         return 1.0f;
     }
 
+    [[nodiscard]] __host__ __device__ static constexpr float getCustom()
+    {
+        return 1.0f;
+    }
+
     [[nodiscard]] __host__ __device__ static constexpr float getRepetitionPenalty()
     {
         return 1.0f;

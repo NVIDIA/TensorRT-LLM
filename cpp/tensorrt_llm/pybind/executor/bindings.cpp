@@ -223,7 +223,7 @@ void InitBindings(pybind11::module_& m)
                     std::optional<tle::FloatType> const& topP, std::optional<tle::FloatType> const& topPMin,
                     std::optional<tle::TokenIdType> const& topPResetIds, std::optional<tle::FloatType> const& topPDecay,
                     std::optional<tle::RandomSeedType> seed, std::optional<tle::RandomSeedType> const& randomSeed,
-                    std::optional<tle::FloatType> const& temperature, std::optional<tle::SizeType32> minTokens,
+                    std::optional<tle::FloatType> const& temperature, std::optional<tle::FloatType> const& custom, std::optional<tle::SizeType32> minTokens,
                     std::optional<tle::SizeType32> const& minLength,
                     std::optional<tle::FloatType> const& beamSearchDiversityRate,
                     std::optional<tle::FloatType> const& repetitionPenalty,
@@ -251,14 +251,14 @@ void InitBindings(pybind11::module_& m)
                         }
                     }
                     return std::make_unique<tle::SamplingConfig>(beamWidth, topK, topP, topPMin, topPResetIds,
-                        topPDecay, seed, temperature, minTokens, beamSearchDiversityRate, repetitionPenalty,
+                        topPDecay, seed, temperature, custom, minTokens, beamSearchDiversityRate, repetitionPenalty,
                         presencePenalty, frequencyPenalty, lengthPenalty, earlyStopping, noRepeatNgramSize,
                         numReturnSequences);
                 }),
             py::arg("beam_width") = 1, py::kw_only(), py::arg("top_k") = py::none(), py::arg("top_p") = py::none(),
             py::arg("top_p_min") = py::none(), py::arg("top_p_reset_ids") = py::none(),
             py::arg("top_p_decay") = py::none(), py::arg("seed") = py::none(), py::arg("random_seed") = py::none(),
-            py::arg("temperature") = py::none(), py::arg("min_tokens") = py::none(), py::arg("min_length") = py::none(),
+            py::arg("temperature") = py::none(), py::arg("custom") = py::none(), py::arg("min_tokens") = py::none(), py::arg("min_length") = py::none(),
             py::arg("beam_search_diversity_rate") = py::none(), py::arg("repetition_penalty") = py::none(),
             py::arg("presence_penalty") = py::none(), py::arg("frequency_penalty") = py::none(),
             py::arg("length_penalty") = py::none(), py::arg("early_stopping") = py::none(),
@@ -272,6 +272,7 @@ void InitBindings(pybind11::module_& m)
         .def_property("seed", &tle::SamplingConfig::getSeed, &tle::SamplingConfig::setSeed)
         .def_property("random_seed", &tle::SamplingConfig::getRandomSeed, &tle::SamplingConfig::setRandomSeed)
         .def_property("temperature", &tle::SamplingConfig::getTemperature, &tle::SamplingConfig::setTemperature)
+        .def_property("custom", &tle::SamplingConfig::getCustom, &tle::SamplingConfig::setCustom)
         .def_property("min_tokens", &tle::SamplingConfig::getMinTokens, &tle::SamplingConfig::setMinTokens)
         .def_property("min_length", &tle::SamplingConfig::getMinLength, &tle::SamplingConfig::setMinLength)
         .def_property("beam_search_diversity_rate", &tle::SamplingConfig::getBeamSearchDiversityRate,

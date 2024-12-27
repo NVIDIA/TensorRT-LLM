@@ -75,6 +75,8 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
     penaltyParams->frequencyPenalty = mSamplingConfig.frequencyPenalty;
     penaltyParams->temperature = mSamplingConfig.temperature;
     penaltyParams->minLength = mSamplingConfig.minLength;
+    std::cout << "bp: rep penalty: " << mSamplingConfig.repetitionPenalty.value().front() << std::endl;
+    std::cout << "bp: custom: " << mSamplingConfig.custom.value().front() << std::endl;
 
     setupParams->penaltyParams = std::move(penaltyParams);
 
