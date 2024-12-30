@@ -20,6 +20,7 @@
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/layers/topKSamplingLayer.h"
 #include "tensorrt_llm/layers/topPSamplingLayer.h"
+#include "tensorrt_llm/layers/minPSamplingLayer.h"
 
 #include "samplingLayer.h"
 #include <algorithm>
@@ -40,16 +41,25 @@ SamplingLayer<T>::SamplingLayer(executor::DecodingMode const& mode, DecoderDomai
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     TLLM_CHECK_WITH_INFO(!mDecodingMode.isBeamSearch(), "SamplingLayer does not support Beam search mode");
-    TLLM_CHECK_WITH_INFO(mDecodingMode.isTopKorTopP(), "SamplingLayer requires TopK or TopP mode");
+    TLLM_CHECK_WITH_INFO(mDecodingMode.isTopKorTopPorMinP(), "SamplingLayer requires TopK or TopP or MinP mode");
     if (mDecodingMode.isTopK())
     {
+        TLLM_LOG_INFO("TopK sampling layer active");
         mSamplingLayers.emplace_back(std::make_unique<TopKSamplingLayer<T>>(decoderDomain, mBufferManager));
     }
 
     if (mDecodingMode.isTopP())
     {
+        TLLM_LOG_INFO("TopP sampling layer active");
         mSamplingLayers.emplace_back(
             std::make_unique<TopPSamplingLayer<T>>(decoderDomain, mBufferManager, /* deterministic */ true));
+    }
+
+    if (mDecodingMode.isMinP())
+    {
+        TLLM_LOG_INFO("MinP sampling layer active");
+        TLLM_CHECK_WITH_INFO(!mDecodingMode.isUseTemperature(), "MinP sampling is already fused with late temperature");
+        mSamplingLayers.emplace_back(std::make_unique<MinPSamplingLayer<T>>(decoderDomain, mBufferManager));
     }
 
     allocateBuffer(decoderDomain.getBatchSize());
@@ -136,9 +146,10 @@ void SamplingLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& 
         : nullptr;
 
     auto const skipTopP = !mDecodingMode.isTopP();
+    auto const skipMinP = !mDecodingMode.isMinP();
 
-    // Compute probabilities either for TopP or if cumLogProbs or outputLogProbs are specified
-    bool const skipSoftMax = skipTopP && !mOutputLogProbs && !mCumLogProbs;
+    // Compute probabilities either for TopP or MinP or if cumLogProbs or outputLogProbs are specified
+    bool const skipSoftMax = skipTopP && skipMinP && !mOutputLogProbs && !mCumLogProbs;
 
     inputs->curandStates = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*mCurandStatesDevice));
     inputs->probsComputed = !skipSoftMax;

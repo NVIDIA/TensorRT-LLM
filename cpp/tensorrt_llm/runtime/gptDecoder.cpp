@@ -145,7 +145,7 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
 
     setupParams->banWordsParams = std::move(banWordsParams);
 
-    if (mDecodingMode.isTopKorTopP())
+    if (mDecodingMode.isTopKorTopPorMinP())
     {
         auto samplingParams = std::make_shared<tl::SamplingSetupParams>();
         samplingParams->normalizeLogProbs = mSamplingConfig.normalizeLogProbs;
@@ -162,6 +162,14 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
         samplingParams->topPResetIds = mSamplingConfig.topPResetIds;
         samplingParams->outputLogProbs = mSamplingConfig.outputLogProbs;
         samplingParams->cumLogProbs = mSamplingConfig.cumLogProbs;
+
+        if (mDecodingMode.isMinP())
+        {
+            // TODO: This should have its own parameter!
+            // Also it needs shared access to the temperature settings.
+            samplingParams->runtimeMinP = mSamplingConfig.topP;
+            samplingParams->penaltyParams = setupParams->penaltyParams;
+        }
 
         setupParams->decodingParams = std::move(samplingParams);
     }
@@ -426,7 +434,7 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
 
     TLLM_CHECK_WITH_INFO(input.batchSlots != nullptr, "Batch slots are mandatory to call the decoder.");
     std::shared_ptr<tl::DecodingInputs> forwardParams;
-    if (decodingMode.isTopKorTopP())
+    if (decodingMode.isTopKorTopPorMinP())
     {
         forwardParams
             = std::make_shared<tl::SamplingInputs>(input.endIds, input.batchSlots, input.step, ite, input.batchSize);

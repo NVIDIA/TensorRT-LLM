@@ -80,6 +80,11 @@ public:
         return 1.0e-6f;
     }
 
+    [[nodiscard]] __host__ __device__ static constexpr float getMinP()
+    {
+        return 0.0f;
+    }
+
     [[nodiscard]] __host__ __device__ static constexpr runtime::TokenIdType getTopPResetId()
     {
         return -1;

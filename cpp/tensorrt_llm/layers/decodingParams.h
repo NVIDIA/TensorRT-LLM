@@ -151,12 +151,16 @@ public:
     // baseSamplingLayer
     std::optional<std::vector<runtime::SizeType32>> runtimeTopK; // [1] or [setupBatchSize] on cpu
     std::optional<std::vector<float>> runtimeTopP;               // [1] or [setupBatchSize] on cpu
+    std::optional<std::vector<float>> runtimeMinP;               // [1] or [setupBatchSize] on cpu
 
     // topPSamplingLayer
     std::optional<std::vector<float>> topPDecay;                   // [setupBatchSize], must between [0, 1]
     std::optional<std::vector<float>> topPMin;                     // [setupBatchSize], must between [0, 1]
     std::optional<std::vector<runtime::TokenIdType>> topPResetIds; // [setupBatchSize]
     std::optional<bool> normalizeLogProbs;
+
+    // minPSamplingLayer needs access to temperature
+    std::shared_ptr<PenaltySetupParams> penaltyParams;
 };
 
 class BeamSearchSetupParams : public DecodingSetupParams

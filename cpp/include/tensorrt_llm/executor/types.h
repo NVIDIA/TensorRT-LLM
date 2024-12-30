@@ -510,6 +510,11 @@ public:
         return DecodingMode{kTopKTopP | kUsePenalties | kUseBanTokens | kStandardStopCriteria};
     }
 
+    static auto constexpr MinP()
+    {
+        return DecodingMode{kMinP | (kUsePenalties & ~kUseTemperature) | kUseBanTokens | kStandardStopCriteria};
+    }
+
     static auto constexpr BeamSearch()
     {
         return DecodingMode{kBeamSearch | kUsePenalties | kUseBanTokens | kStandardStopCriteria};
@@ -612,6 +617,12 @@ public:
         return *this;
     }
 
+    auto constexpr useMinP()
+    {
+        mState = kMinP | (mState & ~kTopKTopP & ~kUseTemperature);
+        return *this;
+    }
+
     [[nodiscard]] bool constexpr isAuto() const
     {
         return anyBitSet(kAuto);
@@ -635,6 +646,16 @@ public:
     [[nodiscard]] bool constexpr isTopKandTopP() const
     {
         return allBitSet(kTopKTopP);
+    }
+
+    [[nodiscard]] bool constexpr isMinP() const
+    {
+        return anyBitSet(kMinP);
+    }
+
+    [[nodiscard]] bool constexpr isTopKorTopPorMinP() const
+    {
+        return anyBitSet(kTopKTopPMinP);
     }
 
     [[nodiscard]] bool constexpr isBeamSearch() const
@@ -783,6 +804,8 @@ private:
     static UnderlyingType constexpr kExternalDraftTokens{1u << (kNumFlags + 7)};
     static UnderlyingType constexpr kEagle{1u << (kNumFlags + 8)};
     static UnderlyingType constexpr kTopKTopP{kTopK | kTopP};
+    static UnderlyingType constexpr kMinP{1u << (kNumFlags + 9)};
+    static UnderlyingType constexpr kTopKTopPMinP{kTopK | kTopP | kMinP};
 
     [[nodiscard]] bool constexpr anyBitSet(UnderlyingType bits) const
     {

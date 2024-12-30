@@ -41,7 +41,7 @@ DecodingLayer<T>::DecodingLayer(executor::DecodingMode const& mode, DecoderDomai
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    if (mDecodingMode.isTopKorTopP())
+    if (mDecodingMode.isTopKorTopPorMinP())
     {
         mDecodingLayer = std::make_unique<SamplingLayer<T>>(mDecodingMode, decoderDomain, mBufferManager);
     }
@@ -90,10 +90,10 @@ void DecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, TensorC
 
     TLLM_CHECK_WITH_INFO(setupParams->decodingParams, "decodingParams for setup is not set");
 
-    if (mDecodingMode.isTopKorTopP())
+    if (mDecodingMode.isTopKorTopPorMinP())
     { // sampling layers
         TLLM_CHECK_WITH_INFO(
-            beamWidth == 1, "Decoding mode is TopK and/or TopP, but beamWidth != 1 (%d != 1)", beamWidth);
+            beamWidth == 1, "Decoding mode is TopK and/or TopP or MinP, but beamWidth != 1 (%d != 1)", beamWidth);
         mDecodingLayer->setup(batchSize, beamWidth, batchSlots, setupParams->decodingParams, workspace);
     }
     else if (mDecodingMode.isBeamSearch())
@@ -131,7 +131,7 @@ void DecodingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, TensorC
     else
     {
         TLLM_CHECK_WITH_INFO(false,
-            "Decoding mode is none of the supported {TopK, TopP, TopKTopP, BeamSearch, Medusa, Lookahead, "
+            "Decoding mode is none of the supported {TopK, TopP, TopKTopP, MinP, BeamSearch, Medusa, Lookahead, "
             "ExplicitDraftTokens, ExternalDraftTokens, Eagle}");
     }
 
@@ -186,14 +186,14 @@ std::tuple<std::shared_ptr<BaseDecodingOutputs>, std::shared_ptr<BaseDecodingInp
         preparedInputs = baseInputs;
         preparedOutputs = baseOutputs;
     }
-    else if (mDecodingMode.isTopKorTopP())
+    else if (mDecodingMode.isTopKorTopPorMinP())
     {
         auto const ite = params->ite;
         auto const step = params->step;
         auto const localBatchSize = static_cast<int64_t>(params->localBatchSize);
 
         TLLM_CHECK_WITH_INFO(localDecoderDomain.getBeamWidth() == 1,
-            "Decoding mode is TopK and/or TopP, but beamWidth != 1 (%d != 1)", localDecoderDomain.getBeamWidth());
+            "Decoding mode is TopK and/or TopP or MinP, but beamWidth != 1 (%d != 1)", localDecoderDomain.getBeamWidth());
 
         // In sampling, we have supported batch sampling. So, we always compute all
         // sentences once.
@@ -239,7 +239,7 @@ std::tuple<std::shared_ptr<BaseDecodingOutputs>, std::shared_ptr<BaseDecodingInp
         auto const localBatchSize = static_cast<int64_t>(externalDraftTokenParams->localBatchSize);
 
         TLLM_CHECK_WITH_INFO(localDecoderDomain.getBeamWidth() == 1,
-            "Decoding mode is TopK and/or TopP, but beamWidth != 1 (%d != 1)", localDecoderDomain.getBeamWidth());
+            "Decoding mode is TopK and/or TopP or MinP, but beamWidth != 1 (%d != 1)", localDecoderDomain.getBeamWidth());
 
         // In sampling, we have supported batch sampling. So, we always compute all
         // sentences once.

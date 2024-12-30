@@ -419,7 +419,15 @@ void GptDecoderBatched::setup(executor::DecodingMode const& mode, SizeType32 max
     mDecoderStream = std::make_shared<CudaStream>();
     TLLM_CHECK(mDecoderStream->getDevice() == device);
 
-    mDecoder = IGptDecoder::create(mode, dtype, maxBatchSize, maxBeamWidth, mVocabSize, mVocabSizePadded,
+    // TODO: This should be passed from the executor, but I can't modify it!
+    // So we'll hack this to turn all TopP requests into MinP ones for now.
+    executor::DecodingMode modeCopy = mDecodingMode;
+    if (modeCopy.isTopKorTopP())
+    {
+        modeCopy.useMinP();
+    }
+
+    mDecoder = IGptDecoder::create(modeCopy, dtype, maxBatchSize, maxBeamWidth, mVocabSize, mVocabSizePadded,
         mMaxSequenceLength, mDecoderStream, speculativeDecodingModulePtr);
 
     mNbSteps.clear();
