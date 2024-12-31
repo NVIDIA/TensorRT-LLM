@@ -100,6 +100,28 @@ __global__ void fusedMinPSsampling(T const* probs, T* adjustedProbs, TokenIdType
     }
     __syncthreads();
 
+#if DEBUG_MINP
+    // Print how many probabilities are above the cutoff
+    int threadNumProbsAboveCutoff = 0;
+
+    #pragma unroll
+    for (int idx = probsBeginIdx + tid; idx < probsEndIdx; idx += THREADBLOCK_SIZE)
+    {
+        float prob = static_cast<float>(probs[idx]);
+        if (prob >= sCutoffP)
+        {
+            threadNumProbsAboveCutoff++;
+        }
+    }
+
+    threadNumProbsAboveCutoff = blockReduceSum<int>(threadNumProbsAboveCutoff);
+
+    if (tid == 0)
+    {
+        printf("Batch slot %d numProbsAboveCutoff %d\n", batchSlot, threadNumProbsAboveCutoff);
+    }
+#endif
+
     // Adjust the probabilities and cache them
     float threadAdjustedProbsSum = 0.0f;
     float invTemp = 1.0f / (temperatures != nullptr ? temperatures[batchSlot] : 1.0f);
@@ -195,7 +217,7 @@ __global__ void fusedMinPSsampling(T const* probs, T* adjustedProbs, TokenIdType
             printf("Batch slot %d selected token %d original prob %f adjusted prob %f normalized %f\n",
                 batchSlot, selectedTokenIdx, static_cast<float>(probs[idx]), prob, prob / sAdjustedProbsSum);
 
-            printf("Batch slot %d thread index %d prefix %d sum %u quant prob %u\n",
+            printf("Batch slot %d thread index %d prefix %u sum %u quant prob %u\n",
                 batchSlot, tid, threadQuantProbsPrefix, threadQuantProbsSum, quantProb);
 #endif
 
