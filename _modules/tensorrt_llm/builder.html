@@ -14,7 +14,7 @@
       <script src="../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../_static/doctools.js?v=888ff710"></script>
+      <script src="../../_static/doctools.js?v=9a2dae69"></script>
       <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../_static/copybutton.js?v=65e89d2a"></script>
@@ -1036,7 +1036,7 @@
         <span class="n">use_lora</span><span class="o">=</span><span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">lora_plugin</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">max_lora_rank</span><span class="o">=</span><span class="n">build_config</span><span class="o">.</span><span class="n">lora_config</span><span class="o">.</span><span class="n">max_lora_rank</span><span class="p">,</span>
         <span class="n">use_fp8_context_fmha</span><span class="o">=</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">quantization</span><span class="o">.</span><span class="n">quant_algo</span> <span class="ow">in</span> <span class="p">[</span>
-            <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8</span><span class="p">,</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A8_AWQ</span>
+            <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8</span><span class="p">,</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A8_AWQ</span><span class="p">,</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">NVFP4</span>
         <span class="p">]</span> <span class="ow">and</span> <span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">use_fp8_context_fmha</span><span class="p">),</span>
         <span class="n">use_optimize_cross_qkv</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
     <span class="p">)</span>
@@ -1238,7 +1238,10 @@
         <span class="n">build_config</span><span class="o">.</span><span class="n">strongly_typed</span> <span class="o">=</span> <span class="kc">True</span>
 
     <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="s1">&#39;max_draft_len&#39;</span><span class="p">):</span>
-        <span class="n">build_config</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">max_draft_len</span>
+        <span class="c1"># If model.config has &#39;max_draft_len&#39; but build_config not specified,</span>
+        <span class="c1"># use the value of model.config.max_draft_len to set the value of build_config.max_draft_len</span>
+        <span class="k">if</span> <span class="n">build_config</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="n">build_config</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">max_draft_len</span>
 
     <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="s1">&#39;redrafter_num_beams&#39;</span><span class="p">)</span> <span class="ow">and</span> <span class="nb">hasattr</span><span class="p">(</span>
             <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="s1">&#39;redrafter_draft_len_per_beam&#39;</span><span class="p">):</span>
@@ -1285,7 +1288,7 @@
     <span class="k">if</span> <span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">use_paged_context_fmha</span><span class="p">:</span>
         <span class="k">if</span> <span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_fp8_kv_cache</span><span class="p">()</span>
                 <span class="ow">and</span> <span class="ow">not</span> <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">quantization</span><span class="o">.</span><span class="n">quant_algo</span>
-                <span class="ow">in</span> <span class="p">[</span><span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8</span><span class="p">,</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A8_AWQ</span><span class="p">]):</span>
+                <span class="ow">in</span> <span class="p">[</span><span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8</span><span class="p">,</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A8_AWQ</span><span class="p">,</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">NVFP4</span><span class="p">]):</span>
             <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
                 <span class="s2">&quot;FP8 Paged Context FMHA only works with fp8 quantization workflow currently.&quot;</span>
             <span class="p">)</span>
@@ -1331,6 +1334,7 @@
     <span class="n">disable_weight_only_quant_plugin</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">disable_weight_only_quant_plugin</span> <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span>
         <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="s1">&#39;disable_weight_only_quant_plugin&#39;</span><span class="p">)</span> <span class="k">else</span> <span class="kc">False</span>
     <span class="n">use_fp8_rowwise</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_fp8_rowwise</span><span class="p">()</span>
+    <span class="n">use_fp4_gemm</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_nvfp4</span><span class="p">()</span>
 
     <span class="k">if</span> <span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">manage_weights</span><span class="p">:</span>
         <span class="k">if</span> <span class="n">use_weight_only</span> <span class="ow">and</span> <span class="n">disable_weight_only_quant_plugin</span><span class="p">:</span>
@@ -1347,7 +1351,8 @@
         <span class="n">network</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">set_smooth_quant_plugins</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">use_qserve</span><span class="p">:</span>
         <span class="n">network</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">set_qserve_plugins</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
-
+    <span class="k">if</span> <span class="n">use_fp4_gemm</span><span class="p">:</span>
+        <span class="n">network</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">fp4_gemm_plugin</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span>
     <span class="k">if</span> <span class="n">use_fp8_rowwise</span><span class="p">:</span>
         <span class="n">network</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">set_fp8_rowwise_quant_plugins</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
     <span class="n">nccl_plugin</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span> <span class="k">if</span> <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">world_size</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="k">else</span> <span class="kc">None</span>
@@ -1479,7 +1484,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fed980dd8b0>
+<jinja2.runtime.BlockReference object at 0x7f5e6db881d0>
 
 <div class="footer">
     <p>
