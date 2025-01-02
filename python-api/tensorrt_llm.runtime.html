@@ -15,7 +15,7 @@
       <script src="../_static/jquery.js?v=5d32c60e"></script>
       <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../_static/doctools.js?v=888ff710"></script>
+      <script src="../_static/doctools.js?v=9a2dae69"></script>
       <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../_static/copybutton.js?v=65e89d2a"></script>
@@ -265,7 +265,7 @@
 <li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.MultimodalModelRunner.init_llm"><code class="docutils literal notranslate"><span class="pre">MultimodalModelRunner.init_llm()</span></code></a></li>
 <li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.MultimodalModelRunner.init_processor"><code class="docutils literal notranslate"><span class="pre">MultimodalModelRunner.init_processor()</span></code></a></li>
 <li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.MultimodalModelRunner.init_tokenizer"><code class="docutils literal notranslate"><span class="pre">MultimodalModelRunner.init_tokenizer()</span></code></a></li>
-<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.MultimodalModelRunner.load_test_image"><code class="docutils literal notranslate"><span class="pre">MultimodalModelRunner.load_test_image()</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.MultimodalModelRunner.load_test_data"><code class="docutils literal notranslate"><span class="pre">MultimodalModelRunner.load_test_data()</span></code></a></li>
 <li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.MultimodalModelRunner.prepare_position_ids_for_cogvlm"><code class="docutils literal notranslate"><span class="pre">MultimodalModelRunner.prepare_position_ids_for_cogvlm()</span></code></a></li>
 <li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.MultimodalModelRunner.preprocess"><code class="docutils literal notranslate"><span class="pre">MultimodalModelRunner.preprocess()</span></code></a></li>
 <li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.runtime.MultimodalModelRunner.ptuning_setup"><code class="docutils literal notranslate"><span class="pre">MultimodalModelRunner.ptuning_setup()</span></code></a></li>
@@ -1519,8 +1519,8 @@ mrope_position_deltas (<cite>torch.Tensor</cite> of shape <cite>(batch_size)</ci
 <dd></dd></dl>
 
 <dl class="py method">
-<dt class="sig sig-object py" id="tensorrt_llm.runtime.MultimodalModelRunner.load_test_image">
-<span class="sig-name descname"><span class="pre">load_test_image</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/runtime/multimodal_model_runner.html#MultimodalModelRunner.load_test_image"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.runtime.MultimodalModelRunner.load_test_image" title="Link to this definition"></a></dt>
+<dt class="sig sig-object py" id="tensorrt_llm.runtime.MultimodalModelRunner.load_test_data">
+<span class="sig-name descname"><span class="pre">load_test_data</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">image_path</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">video_path</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/runtime/multimodal_model_runner.html#MultimodalModelRunner.load_test_data"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.runtime.MultimodalModelRunner.load_test_data" title="Link to this definition"></a></dt>
 <dd></dd></dl>
 
 <dl class="py method">
@@ -1585,7 +1585,7 @@ mrope_position_deltas (<cite>torch.Tensor</cite> of shape <cite>(batch_size)</ci
 
 <dl class="py method">
 <dt class="sig sig-object py" id="tensorrt_llm.runtime.MultimodalModelRunner.tokenizer_image_token">
-<em class="property"><span class="pre">static</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">tokenizer_image_token</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">batch_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">prompt</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tokenizer</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">image_token_index</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">-200</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/runtime/multimodal_model_runner.html#MultimodalModelRunner.tokenizer_image_token"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.runtime.MultimodalModelRunner.tokenizer_image_token" title="Link to this definition"></a></dt>
+<em class="property"><span class="pre">static</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">tokenizer_image_token</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">batch_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pre_prompt</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">post_prompt</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tokenizer</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">image_token_index</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">-200</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/runtime/multimodal_model_runner.html#MultimodalModelRunner.tokenizer_image_token"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.runtime.MultimodalModelRunner.tokenizer_image_token" title="Link to this definition"></a></dt>
 <dd></dd></dl>
 
 <dl class="py method">
@@ -1906,7 +1906,7 @@ For example, word_dict[2] = [” I am happy”, “ I am sad”].</p>
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fed9a2cfd70>
+<jinja2.runtime.BlockReference object at 0x7f59f7097170>
 
 <div class="footer">
     <p>

@@ -14,7 +14,7 @@
       <script src="../../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../../_static/doctools.js?v=888ff710"></script>
+      <script src="../../../_static/doctools.js?v=9a2dae69"></script>
       <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
@@ -265,6 +265,8 @@
         <span class="s2">&quot;int4_wo&quot;</span><span class="p">:</span> <span class="n">EMPTY_CFG</span><span class="p">,</span>
         <span class="s2">&quot;full_prec&quot;</span><span class="p">:</span> <span class="n">EMPTY_CFG</span><span class="p">,</span>
     <span class="p">}</span>
+    <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">mtq</span><span class="p">,</span> <span class="s2">&quot;NVFP4_DEFAULT_CFG&quot;</span><span class="p">):</span>
+        <span class="n">QUANT_CFG_CHOICES</span><span class="p">[</span><span class="s2">&quot;nvfp4&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">mtq</span><span class="o">.</span><span class="n">NVFP4_DEFAULT_CFG</span>
     <span class="k">return</span> <span class="n">QUANT_CFG_CHOICES</span>
 
 
@@ -290,6 +292,7 @@
     <span class="s2">&quot;NemotronForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;nemotron&quot;</span><span class="p">,</span>
     <span class="s2">&quot;GPTBigCodeForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;gpt_bigcode&quot;</span><span class="p">,</span>
     <span class="s2">&quot;ArcticForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;llama&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;PhiMoEForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;phi3&quot;</span><span class="p">,</span>
     <span class="s2">&quot;Phi3SmallForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;phi3small&quot;</span><span class="p">,</span>
     <span class="s2">&quot;Phi3ForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;phi3&quot;</span><span class="p">,</span>
     <span class="s2">&quot;Starcoder2ForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;gptnext&quot;</span><span class="p">,</span>
@@ -298,6 +301,8 @@
     <span class="s2">&quot;Exaone&quot;</span><span class="p">:</span> <span class="s2">&quot;exaone&quot;</span><span class="p">,</span>
     <span class="s2">&quot;DeciLMForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;deci&quot;</span><span class="p">,</span>
     <span class="s2">&quot;DeepseekForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;deepseek&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;GraniteForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;granite&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;GraniteMoeForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;granitemoe&quot;</span><span class="p">,</span>
 <span class="p">}</span>
 
 <span class="n">MULTIMODAL_DATASETS</span> <span class="o">=</span> <span class="p">[</span><span class="s1">&#39;scienceqa&#39;</span><span class="p">,</span> <span class="s1">&#39;science_qa&#39;</span><span class="p">]</span>
@@ -907,7 +912,7 @@
             <span class="n">json</span><span class="o">.</span><span class="n">dump</span><span class="p">(</span><span class="n">tensorrt_llm_config</span><span class="p">,</span> <span class="n">f</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span>
 
         <span class="c1"># Workaround for Modelopt 0.9.x fp8_kv_cache knob issue</span>
-        <span class="k">if</span> <span class="n">qformat</span> <span class="o">==</span> <span class="s1">&#39;fp8&#39;</span> <span class="ow">and</span> <span class="n">kv_cache_dtype</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">qformat</span> <span class="ow">in</span> <span class="p">[</span><span class="s1">&#39;fp8&#39;</span><span class="p">,</span> <span class="s1">&#39;nvfp4&#39;</span><span class="p">]</span> <span class="ow">and</span> <span class="n">kv_cache_dtype</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;r&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
                 <span class="n">tensorrt_llm_config</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
             <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s2">&quot;quantization&quot;</span><span class="p">][</span><span class="s2">&quot;kv_cache_quant_algo&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
@@ -1317,7 +1322,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fed97474fb0>
+<jinja2.runtime.BlockReference object at 0x7f5e6e1b5970>
 
 <div class="footer">
     <p>

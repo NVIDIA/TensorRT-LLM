@@ -4,12 +4,6 @@ Executor
 .. Here are files in the cpp/include/executor
 .. We manually add subsection to enable detailed description in the future
 .. It is also doable to automatically generate this file and list all the modules in the conf.py
-disaggServerUtil.h
-__________________
-
-.. doxygenfile:: disaggServerUtil.h
-   :project: TensorRT-LLM
-
 executor.h
 __________
 
@@ -32,5 +26,17 @@ types.h
 _______
 
 .. doxygenfile:: types.h
+   :project: TensorRT-LLM
+
+disaggServerUtil.h
+__________________
+
+.. doxygenfile:: disaggServerUtil.h
+   :project: TensorRT-LLM
+
+version.h
+_________
+
+.. doxygenfile:: version.h
    :project: TensorRT-LLM
 

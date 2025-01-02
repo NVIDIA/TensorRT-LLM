@@ -14,7 +14,7 @@
       <script src="../../../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../../../_static/doctools.js?v=888ff710"></script>
+      <script src="../../../../_static/doctools.js?v=9a2dae69"></script>
       <script src="../../../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../../../_static/copybutton.js?v=65e89d2a"></script>
@@ -186,7 +186,7 @@
 <span class="kn">from</span> <span class="nn">..._common</span> <span class="kn">import</span> <span class="n">default_net</span><span class="p">,</span> <span class="n">default_trtnet</span>
 <span class="kn">from</span> <span class="nn">..._utils</span> <span class="kn">import</span> <span class="n">pad_vocab_size</span>
 <span class="kn">from</span> <span class="nn">...bindings</span> <span class="kn">import</span> <span class="n">KVCacheType</span>
-<span class="kn">from</span> <span class="nn">...functional</span> <span class="kn">import</span> <span class="p">(</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">_create_tensor</span><span class="p">,</span> <span class="n">concat</span><span class="p">,</span>
+<span class="kn">from</span> <span class="nn">...functional</span> <span class="kn">import</span> <span class="p">(</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">_create_tensor</span><span class="p">,</span> <span class="n">cast</span><span class="p">,</span> <span class="n">concat</span><span class="p">,</span>
                            <span class="n">gather_last_token_logits</span><span class="p">,</span> <span class="n">index_select</span><span class="p">,</span> <span class="n">shape</span><span class="p">)</span>
 <span class="kn">from</span> <span class="nn">...layers</span> <span class="kn">import</span> <span class="n">AttentionParams</span><span class="p">,</span> <span class="n">ColumnLinear</span><span class="p">,</span> <span class="n">SpecDecodingParams</span>
 <span class="kn">from</span> <span class="nn">...module</span> <span class="kn">import</span> <span class="n">Module</span><span class="p">,</span> <span class="n">ModuleList</span>
@@ -685,13 +685,11 @@
 
 <span class="k">class</span> <span class="nc">EagleNet</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
-    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span>
-        <span class="bp">self</span><span class="p">,</span>
-        <span class="n">config</span><span class="p">,</span>
-    <span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">,</span> <span class="n">logits_dtype</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">drafter</span> <span class="o">=</span> <span class="n">LLaMAModel</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">config</span> <span class="o">=</span> <span class="n">config</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">logits_dtype</span> <span class="o">=</span> <span class="n">logits_dtype</span>
 
         <span class="n">vocab_size_padded</span> <span class="o">=</span> <span class="n">pad_vocab_size</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span>
                                            <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">)</span>
@@ -727,7 +725,8 @@
             <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">gather_last_token_logits</span><span class="p">(</span>
                 <span class="n">hidden_states</span><span class="p">,</span> <span class="n">last_token_indices</span><span class="p">,</span>
                 <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">remove_input_padding</span><span class="p">)</span>
-            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">lm_head</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">),</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">cache</span>
+            <span class="k">return</span> <span class="n">cast</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">lm_head</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">),</span>
+                        <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">logits_dtype</span><span class="p">),</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">cache</span>
 
         <span class="k">return</span> <span class="kc">None</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">cache</span>
 
@@ -759,7 +758,8 @@
         <span class="n">eagle_net_config</span><span class="o">.</span><span class="n">layer_idx_offset</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">num_hidden_layers</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_last_pp_rank</span><span class="p">():</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">eagle_nets</span> <span class="o">=</span> <span class="n">ModuleList</span><span class="p">([</span>
-                <span class="n">EagleNet</span><span class="p">(</span><span class="n">config</span><span class="o">=</span><span class="n">eagle_net_config</span><span class="p">)</span>
+                <span class="n">EagleNet</span><span class="p">(</span><span class="n">config</span><span class="o">=</span><span class="n">eagle_net_config</span><span class="p">,</span>
+                         <span class="n">logits_dtype</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">logits_dtype</span><span class="p">)</span>
                 <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">num_eagle_layers</span><span class="p">)</span>
             <span class="p">])</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">max_draft_len</span>
@@ -1073,6 +1073,7 @@
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_last_pp_rank</span><span class="p">():</span>
             <span class="n">lm_logits</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">all_hidden_states</span> <span class="o">=</span> <span class="n">hidden_states</span>
+            <span class="n">lm_logits</span> <span class="o">=</span> <span class="n">cast</span><span class="p">(</span><span class="n">lm_logits</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">logits_dtype</span><span class="p">)</span>
             <span class="c1"># Call eagle logic to accept prev draft tokens and predict next draft tokens</span>
             <span class="n">next_draft_tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_eagle_fwd_helper</span><span class="p">(</span><span class="n">lm_logits</span><span class="p">,</span>
                                                        <span class="n">all_hidden_states</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span>
@@ -1319,7 +1320,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fed979624b0>
+<jinja2.runtime.BlockReference object at 0x7f5e6e14c0b0>
 
 <div class="footer">
     <p>

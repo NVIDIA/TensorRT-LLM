@@ -14,7 +14,7 @@
       <script src="../../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../../_static/doctools.js?v=888ff710"></script>
+      <script src="../../../_static/doctools.js?v=9a2dae69"></script>
       <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
@@ -209,6 +209,15 @@
 <span class="n">SamplingConfigType</span> <span class="o">=</span> <span class="n">Union</span><span class="p">[</span><span class="n">SamplingConfig</span><span class="p">,</span> <span class="n">trtllm</span><span class="o">.</span><span class="n">SamplingConfig</span><span class="p">]</span>
 
 
+<span class="k">def</span> <span class="nf">_world_config_to_mapping</span><span class="p">(</span><span class="n">world_config</span><span class="p">:</span> <span class="n">WorldConfig</span><span class="p">):</span>
+    <span class="k">return</span> <span class="n">Mapping</span><span class="p">(</span><span class="n">world_size</span><span class="o">=</span><span class="n">world_config</span><span class="o">.</span><span class="n">size</span><span class="p">,</span>
+                   <span class="n">rank</span><span class="o">=</span><span class="n">world_config</span><span class="o">.</span><span class="n">rank</span><span class="p">,</span>
+                   <span class="n">gpus_per_node</span><span class="o">=</span><span class="n">world_config</span><span class="o">.</span><span class="n">gpus_per_node</span><span class="p">,</span>
+                   <span class="n">tp_size</span><span class="o">=</span><span class="n">world_config</span><span class="o">.</span><span class="n">tensor_parallelism</span><span class="p">,</span>
+                   <span class="n">pp_size</span><span class="o">=</span><span class="n">world_config</span><span class="o">.</span><span class="n">pipeline_parallelism</span><span class="p">,</span>
+                   <span class="n">cp_size</span><span class="o">=</span><span class="n">world_config</span><span class="o">.</span><span class="n">context_parallelism</span><span class="p">)</span>
+
+
 <div class="viewcode-block" id="ModelRunnerCpp">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelRunnerCpp">[docs]</a>
 <span class="k">class</span> <span class="nc">ModelRunnerCpp</span><span class="p">(</span><span class="n">ModelRunnerMixin</span><span class="p">):</span>
@@ -232,12 +241,7 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">max_seq_len</span> <span class="o">=</span> <span class="n">max_seq_len</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">max_beam_width</span> <span class="o">=</span> <span class="n">max_beam_width</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">model_config</span> <span class="o">=</span> <span class="n">model_config</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span> <span class="o">=</span> <span class="n">Mapping</span><span class="p">(</span><span class="n">world_size</span><span class="o">=</span><span class="n">world_config</span><span class="o">.</span><span class="n">size</span><span class="p">,</span>
-                               <span class="n">rank</span><span class="o">=</span><span class="n">world_config</span><span class="o">.</span><span class="n">rank</span><span class="p">,</span>
-                               <span class="n">gpus_per_node</span><span class="o">=</span><span class="n">world_config</span><span class="o">.</span><span class="n">gpus_per_node</span><span class="p">,</span>
-                               <span class="n">tp_size</span><span class="o">=</span><span class="n">world_config</span><span class="o">.</span><span class="n">tensor_parallelism</span><span class="p">,</span>
-                               <span class="n">pp_size</span><span class="o">=</span><span class="n">world_config</span><span class="o">.</span><span class="n">pipeline_parallelism</span><span class="p">,</span>
-                               <span class="n">cp_size</span><span class="o">=</span><span class="n">world_config</span><span class="o">.</span><span class="n">context_parallelism</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span> <span class="o">=</span> <span class="n">_world_config_to_mapping</span><span class="p">(</span><span class="n">world_config</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">world_config</span> <span class="o">=</span> <span class="n">world_config</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">use_kv_cache</span> <span class="o">=</span> <span class="n">use_kv_cache</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">lora_manager</span> <span class="o">=</span> <span class="n">lora_manager</span>
@@ -456,9 +460,8 @@
                                        <span class="n">gpus_per_node</span><span class="o">=</span><span class="n">gpus_per_node</span><span class="p">)</span>
         <span class="k">assert</span> <span class="n">rank</span> <span class="o">==</span> <span class="n">world_config</span><span class="o">.</span><span class="n">rank</span>
 
+        <span class="n">engine_config</span> <span class="o">=</span> <span class="n">EngineConfig</span><span class="o">.</span><span class="n">from_json_file</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">engine_dir</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">model_config</span><span class="o">.</span><span class="n">use_lora_plugin</span> <span class="ow">and</span> <span class="n">rank</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
-            <span class="n">engine_config</span> <span class="o">=</span> <span class="n">EngineConfig</span><span class="o">.</span><span class="n">from_json_file</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">engine_dir</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">)</span>
             <span class="n">lora_manager</span> <span class="o">=</span> <span class="n">LoraManager</span><span class="p">()</span>
             <span class="k">if</span> <span class="n">lora_dir</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="n">config_lora_dir</span> <span class="o">=</span> <span class="n">engine_config</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">lora_config</span><span class="o">.</span><span class="n">lora_dir</span>
@@ -598,16 +601,6 @@
 
         <span class="n">use_default_executor</span> <span class="o">=</span> <span class="kc">True</span>
         <span class="c1"># PIVOT_TO_PYTHON_START</span>
-        <span class="kn">from</span> <span class="nn">..pyexecutor.backend_registries.backend_registry</span> <span class="kn">import</span> \
-            <span class="n">unique_create_executor</span>
-        <span class="kn">from</span> <span class="nn">..pyexecutor.config</span> <span class="kn">import</span> <span class="n">update_executor_config</span>
-        <span class="k">if</span> <span class="n">trtllm_config</span><span class="o">.</span><span class="n">max_num_tokens</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">trtllm_config</span><span class="o">.</span><span class="n">max_num_tokens</span> <span class="o">=</span> <span class="mi">8192</span>
-        <span class="n">update_executor_config</span><span class="p">(</span><span class="n">trtllm_config</span><span class="p">,</span>
-                               <span class="n">backend</span><span class="o">=</span><span class="n">backend</span><span class="p">,</span>
-                               <span class="n">max_seq_len</span><span class="o">=</span><span class="n">max_seq_len</span><span class="p">,</span>
-                               <span class="n">trt_engine_dir</span><span class="o">=</span><span class="n">engine_dir</span><span class="p">,</span>
-                               <span class="o">**</span><span class="n">py_executor_config</span><span class="p">)</span>
         <span class="n">use_default_executor</span> <span class="o">=</span> <span class="ow">not</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">trtllm_config</span><span class="p">,</span> <span class="s2">&quot;backend&quot;</span><span class="p">)</span>
         <span class="c1"># PIVOT_TO_PYTHON_END</span>
         <span class="k">if</span> <span class="n">use_default_executor</span><span class="p">:</span>
@@ -616,6 +609,16 @@
                                        <span class="n">trtllm_config</span><span class="p">)</span>
         <span class="c1"># PIVOT_TO_PYTHON_START</span>
         <span class="k">else</span><span class="p">:</span>
+            <span class="kn">from</span> <span class="nn">..pyexecutor.backend_registries.backend_registry</span> <span class="kn">import</span> \
+                <span class="n">unique_create_executor</span>
+            <span class="kn">from</span> <span class="nn">..pyexecutor.config</span> <span class="kn">import</span> <span class="n">update_executor_config</span>
+            <span class="n">update_executor_config</span><span class="p">(</span>
+                <span class="n">trtllm_config</span><span class="p">,</span>
+                <span class="n">backend</span><span class="o">=</span><span class="n">backend</span><span class="p">,</span>
+                <span class="n">mapping</span><span class="o">=</span><span class="n">_world_config_to_mapping</span><span class="p">(</span><span class="n">world_config</span><span class="p">),</span>
+                <span class="n">build_config</span><span class="o">=</span><span class="n">engine_config</span><span class="o">.</span><span class="n">build_config</span><span class="p">,</span>
+                <span class="n">trt_engine_dir</span><span class="o">=</span><span class="n">engine_dir</span><span class="p">,</span>
+                <span class="o">**</span><span class="n">py_executor_config</span><span class="p">)</span>
             <span class="n">executor</span> <span class="o">=</span> <span class="n">unique_create_executor</span><span class="p">(</span><span class="n">Path</span><span class="p">(</span><span class="n">engine_dir</span><span class="p">),</span>
                                               <span class="n">trtllm</span><span class="o">.</span><span class="n">ModelType</span><span class="o">.</span><span class="n">DECODER_ONLY</span><span class="p">,</span>
                                               <span class="n">trtllm_config</span><span class="p">)</span>
@@ -1346,7 +1349,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fed97373050>
+<jinja2.runtime.BlockReference object at 0x7f5e6e3f6270>
 
 <div class="footer">
     <p>
