@@ -182,6 +182,7 @@ MODEL_MAP = {
     'DeepseekForCausalLM': DeepseekForCausalLM,
     'DeciLMForCausalLM': DeciLMForCausalLM,
     'DeepseekV2ForCausalLM': DeepseekV2ForCausalLM,
+    'DeepseekV3ForCausalLM': DeepseekV2ForCausalLM,
     'EagleForCausalLM': EagleForCausalLM,
     'CohereForCausalLM': CohereForCausalLM,
     'MLLaMAModel': MLLaMAForCausalLM,  # For modelopt
