@@ -110,6 +110,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul>
@@ -2362,8 +2363,10 @@
         <span class="n">out</span> <span class="o">=</span> <span class="n">record</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
         <span class="c1"># Left the result_handler determine the final output dtype.</span>
         <span class="c1"># NOTE: This will change the CompletionOutput._postprocess_result</span>
+        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">nvtx</span><span class="o">.</span><span class="n">range_push</span><span class="p">(</span><span class="s2">&quot;_result_handler&quot;</span><span class="p">)</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_result_handler</span><span class="p">:</span>
             <span class="n">out</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_result_handler</span><span class="p">(</span><span class="n">record</span><span class="p">)</span>
+        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">nvtx</span><span class="o">.</span><span class="n">range_pop</span><span class="p">()</span>
 
         <span class="c1"># TODO: Keep only the diff token_ids and text in streaming mode when</span>
         <span class="c1"># result_handler is not set</span>
@@ -2388,6 +2391,7 @@
         <span class="n">Input</span> <span class="o">=</span> <span class="n">ResponsePostprocessWorker</span><span class="o">.</span><span class="n">Input</span>
         <span class="n">Output</span> <span class="o">=</span> <span class="n">ResponsePostprocessWorker</span><span class="o">.</span><span class="n">Output</span>
 
+        <span class="nd">@nvtx_range</span><span class="p">(</span><span class="s2">&quot;handle_single_input&quot;</span><span class="p">)</span>
         <span class="k">async</span> <span class="k">def</span> <span class="nf">handle_single_input</span><span class="p">(</span>
                 <span class="nb">input</span><span class="p">:</span> <span class="n">ResponsePostprocessWorker</span><span class="o">.</span><span class="n">Input</span><span class="p">,</span>
                 <span class="n">batch</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">ResponsePostprocessWorker</span><span class="o">.</span><span class="n">Output</span><span class="p">]):</span>
@@ -2469,7 +2473,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f5e6dddfe00>
+<jinja2.runtime.BlockReference object at 0x7da7918410d0>
 
 <div class="footer">
     <p>
