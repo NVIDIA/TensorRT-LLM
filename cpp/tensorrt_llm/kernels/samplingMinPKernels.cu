@@ -15,8 +15,10 @@
 #error CUDART_VERSION Undefined!
 #elif (CUDART_VERSION >= 11050)
 #include <cub/cub.cuh>
+#include <cub/block/block_shuffle.cuh> // Why is it not in the monolithic cub.cuh?
 #else
 #include "3rdparty/cub/cub.cuh"
+#include "3rdparty/cub/block/block_shuffle.cuh" // Why is it not in the monolithic cub.cuh?
 #endif
 
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -31,12 +33,22 @@ using namespace tensorrt_llm::runtime;
 
 namespace tensorrt_llm::kernels
 {
+// Shared state for MinP sampling kernels
 template <typename T, int THREADBLOCK_SIZE>
-__global__ void fusedMinPSsampling(T const* probs, T* adjustedProbs, TokenIdType* outputIds,
-    TokenIdType** outputIdsPtrs, SizeType32* sequenceLengths, FinishedState const* finishedInput,
-    FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs, SizeType32 vocabSize,
-    curandState_t* curandState, float const* randomVals, float const* minPs, float const* temperatures,
-    TokenIdType const* endIds, SizeType32 maxBatchSize, SizeType32 const* batchSlots, bool returnAllSelectedTokens,
+struct BlockScanShuffleStorage
+{
+    union {
+        typename cub::BlockScan<T, THREADBLOCK_SIZE>::TempStorage scan;
+        typename cub::BlockShuffle<T, THREADBLOCK_SIZE>::TempStorage shuffle;
+    };
+};
+
+template <typename T, int THREADBLOCK_SIZE>
+__global__ void fusedMinPSsampling(T const* probs, TokenIdType* outputIds, TokenIdType** outputIdsPtrs,
+    SizeType32* sequenceLengths, FinishedState const* finishedInput, FinishedState* finishedOutput,
+    float* cumLogProbs, float* outputLogProbs, SizeType32 vocabSize, curandState_t* curandState,
+    float const* randomVals, float const* minPs, float const* temperatures, TokenIdType const* endIds,
+    SizeType32 maxBatchSize, SizeType32 const* batchSlots, bool returnAllSelectedTokens,
     SizeType32 maxSeqLen, TokenIdType* outputIdCurrentStep, bool const* skipOutputIdCurrentStep)
 {
     auto const tid = static_cast<SizeType32>(threadIdx.x);
@@ -74,28 +86,35 @@ __global__ void fusedMinPSsampling(T const* probs, T* adjustedProbs, TokenIdType
         return;
     }
 
-    // Each thread computes local maximum across its assigned probabilities
-    float threadMax = -FLT_MAX;
+    // Common stride for all arrays
     const int probsBeginIdx = batchId * vocabSize;
     const int probsEndIdx = (batchId + 1) * vocabSize;
+
+    // Each thread computes local maximum across its assigned probabilities
+    float threadMaxProb = -FLT_MAX;
 
     #pragma unroll
     for (int idx = probsBeginIdx + tid; idx < probsEndIdx; idx += THREADBLOCK_SIZE)
     {
-        float prob = static_cast<float>(probs[idx]);
-        threadMax = max(threadMax, prob);
+        auto const prob = static_cast<float>(probs[idx]);
+        threadMaxProb = max(threadMaxProb, prob);
     }
 
     // Find global maximum probability across all threads in block
-    threadMax = blockReduceMax<float>(threadMax);
+    threadMaxProb = blockReduceMax<float>(threadMaxProb);
     __shared__ float sCutoffP;
+    __shared__ float sInvTemp;
 
     if (tid == 0)
     {
-        sCutoffP = threadMax * (minPs != nullptr ? minPs[batchSlot] : 0.0f);
+        // Probs below this value will be ignored
+        sCutoffP = threadMaxProb * (minPs != nullptr ? minPs[batchSlot] : 0.0f);
+
+        // Inverse temperature for scaling probabilities
+        sInvTemp = 1.0f / (temperatures != nullptr ? temperatures[batchSlot] : 1.0f);
 
 #if DEBUG_MINP
-        printf("Batch slot %d maxP %f cutoffP %f\n", batchSlot, threadMax, sCutoffP);
+        printf("Batch slot %d maxP %f cutoffP %f\n", batchSlot, threadMaxProb, sCutoffP);
 #endif
     }
     __syncthreads();
@@ -107,8 +126,7 @@ __global__ void fusedMinPSsampling(T const* probs, T* adjustedProbs, TokenIdType
     #pragma unroll
     for (int idx = probsBeginIdx + tid; idx < probsEndIdx; idx += THREADBLOCK_SIZE)
     {
-        float prob = static_cast<float>(probs[idx]);
-        if (prob >= sCutoffP)
+        if (static_cast<float>(probs[idx]) >= sCutoffP)
         {
             threadNumProbsAboveCutoff++;
         }
@@ -122,103 +140,85 @@ __global__ void fusedMinPSsampling(T const* probs, T* adjustedProbs, TokenIdType
     }
 #endif
 
-    // Adjust the probabilities and cache them
-    float threadAdjustedProbsSum = 0.0f;
-    float invTemp = 1.0f / (temperatures != nullptr ? temperatures[batchSlot] : 1.0f);
+    // Adjust the probabilities and sum the ones passing the cutoff
+    float threadScaledProbsSum = 0.f;
 
     #pragma unroll
     for (int idx = probsBeginIdx + tid; idx < probsEndIdx; idx += THREADBLOCK_SIZE)
     {
-        float prob = static_cast<float>(probs[idx]);
-        prob = (prob < sCutoffP) ? 0.0f : powf(prob, invTemp);
-        adjustedProbs[idx] = static_cast<T>(prob);
-        threadAdjustedProbsSum += prob;
+        auto const prob = static_cast<float>(probs[idx]);
+        auto const scaledProb = (prob < sCutoffP) ? 0.0f : powf(prob, sInvTemp);
+        threadScaledProbsSum += scaledProb;
     }
 
-    // Find global sum of adjusted probabilities and determine quantization scale factor
-    threadAdjustedProbsSum = blockReduceSum<float>(threadAdjustedProbsSum);
-    __shared__ float sAdjustedProbsSum;
-    __shared__ float sQuantizeScaleFactor;
+    // Find global sum and prefix sum of adjusted probabilities
+    using BlockScan = cub::BlockScan<float, THREADBLOCK_SIZE>;
+    using BlockShuffle = cub::BlockShuffle<float, THREADBLOCK_SIZE>;
+    __shared__ BlockScanShuffleStorage<float, THREADBLOCK_SIZE> tempStorage;
 
-    if (tid == 0)
-    {
-        sAdjustedProbsSum = threadAdjustedProbsSum;
+    float threadScaledProbsIncl = 0.f;
+    float threadScaledProbsExcl = 0.f;
+    float scaledProbsSum = 0.f;
 
-        // Do division with doubles and round down to avoid special cases like
-        // 4294967295 / 32768 giving us 131072 rather than the desired 131071
-        sQuantizeScaleFactor = __double2float_rd((double)(UINT32_MAX - vocabSize) / (double)threadAdjustedProbsSum);
-
-#if DEBUG_MINP
-        printf("Batch slot %d adjustedProbsSum %f quantizeScaleFactor %f\n", batchSlot, threadAdjustedProbsSum, sQuantizeScaleFactor);
-#endif
-    }
-    __syncthreads();
-
-    // We will now quantize the probabilities to integers to avoid numerical errors
-    // when trying to find the selected point in the prefix sum of the probabilities.
-    // We map the adjusted distribution between [0, UINT32_MAX] to avoid overflow.
-
-    // Compute the sum of the quantized probabilities for each thread
-    uint32_t threadQuantProbsSum = 0;
-
-    #pragma unroll
-    for (int idx = probsBeginIdx + tid; idx < probsEndIdx; idx += THREADBLOCK_SIZE)
-    {
-        float prob = static_cast<float>(adjustedProbs[idx]);
-        threadQuantProbsSum += __float2uint_rd(prob * sQuantizeScaleFactor);
-    }
-
-    // Compute a global prefix sum of the quantized probabilities
-    uint32_t threadQuantProbsPrefix;
-    uint32_t totalQuantProbsSum;
-
-    using BlockScan = cub::BlockScan<uint32_t, THREADBLOCK_SIZE>;
-    __shared__ typename BlockScan::TempStorage tempStorage;
-
-    BlockScan(tempStorage).ExclusiveSum(threadQuantProbsSum, threadQuantProbsPrefix, totalQuantProbsSum);
+    BlockScan(tempStorage.scan).InclusiveSum(threadScaledProbsSum, threadScaledProbsIncl, scaledProbsSum);
+    __syncthreads(); // We are aliasing the shared memory
+    BlockShuffle(tempStorage.shuffle).Offset(threadScaledProbsIncl, threadScaledProbsExcl, -1);
 
     // Select a random point in the distribution
-    __shared__ uint32_t sRandomPoint;
+    __shared__ float sRandomPoint;
 
     if (tid == 0)
     {
-        // Rescale uniform random val to be within the sum of quantized probabilities
+        // Rescale uniform random val to be within the sum of included adjusted probabilities
         float randomVal = randomVals != nullptr ? randomVals[batchSlot] : curand_uniform(&curandState[batchSlot]);
-        sRandomPoint = min(__float2uint_rd(randomVal * totalQuantProbsSum), totalQuantProbsSum - 1);
+        sRandomPoint = randomVal * scaledProbsSum;
 
 #if DEBUG_MINP
-        printf("Batch slot %d totalQuantProbsSum %u randomPoint %u\n", batchSlot, totalQuantProbsSum, sRandomPoint);
+        printf("Batch slot %d scaledProbsSum %f randomPoint %f\n", batchSlot, scaledProbsSum, sRandomPoint);
 #endif
     }
     __syncthreads();
 
-    // All but one warps will terminate on this condition
-    if (sRandomPoint < threadQuantProbsPrefix || sRandomPoint >= threadQuantProbsPrefix + threadQuantProbsSum)
+    // All but one warps will reliably terminate on this condition
+    if (sRandomPoint < threadScaledProbsExcl || sRandomPoint >= threadScaledProbsIncl)
     {
         return;
     }
 
+    // Convert global random point to local range of current thread
+    float randomLocalOffset = sRandomPoint - threadScaledProbsExcl;
+    float randomLocalScalar = randomLocalOffset / (threadScaledProbsIncl - threadScaledProbsExcl);
+    float randomLocalPoint = randomLocalScalar * threadScaledProbsSum;
+
+#if DEBUG_MINP
+    printf("Batch slot %d threadScaledProbsExcl %f threadScaledProbsIncl %f threadScaledProbsSum %f\n",
+        batchSlot, threadScaledProbsExcl, threadScaledProbsIncl, threadScaledProbsSum);
+
+    printf("Batch slot %d randomLocalOffset %f randomLocalScalar %f randomLocalPoint %f\n",
+        batchSlot, randomLocalOffset, randomLocalScalar, randomLocalPoint);
+#endif
+
     // Find the selected token id and write it to the output buffer
-    threadQuantProbsSum = threadQuantProbsPrefix;
+    threadScaledProbsSum = 0.f;
+
+    auto const curSeqLen = sequenceLengths == nullptr ? 0 : sequenceLengths[batchSlot];
+    auto* outPtr = outputIdsPtrs == nullptr ? outputIds + batchSlot * maxSeqLen : outputIdsPtrs[batchSlot];
 
     for (int idx = probsBeginIdx + tid; idx < probsEndIdx; idx += THREADBLOCK_SIZE)
     {
-        float prob = static_cast<float>(adjustedProbs[idx]);
-        uint32_t quantProb = __float2uint_rd(prob * sQuantizeScaleFactor);
+        auto const prob = static_cast<float>(probs[idx]);
+        auto const scaledProb = (prob < sCutoffP) ? 0.0f : powf(prob, sInvTemp);
+        threadScaledProbsSum += scaledProb;
 
-        if (sRandomPoint < threadQuantProbsSum + quantProb)
+        // We are summing again in the same order, so this is guaranteed to be entered
+        if (randomLocalPoint < threadScaledProbsSum)
         {
             auto const selectedTokenIdx = idx - probsBeginIdx;
-            auto const curSeqLen = sequenceLengths == nullptr ? 0 : sequenceLengths[batchSlot];
-            auto* outPtr = outputIdsPtrs == nullptr ? outputIds + batchSlot * maxSeqLen : outputIdsPtrs[batchSlot];
             outPtr[curSeqLen] = selectedTokenIdx;
 
 #if DEBUG_MINP
-            printf("Batch slot %d selected token %d original prob %f adjusted prob %f normalized %f\n",
-                batchSlot, selectedTokenIdx, static_cast<float>(probs[idx]), prob, prob / sAdjustedProbsSum);
-
-            printf("Batch slot %d thread index %d prefix %u sum %u quant prob %u\n",
-                batchSlot, tid, threadQuantProbsPrefix, threadQuantProbsSum, quantProb);
+            printf("Batch slot %d selected token %d original prob %f scaled prob %f normalized %f\n",
+                batchSlot, selectedTokenIdx, prob, scaledProb, scaledProb / scaledProbsSum);
 #endif
 
             if (!returnAllSelectedTokens && sequenceLengths != nullptr && finishedOutput != nullptr && endIds != nullptr)
@@ -236,17 +236,16 @@ __global__ void fusedMinPSsampling(T const* probs, T* adjustedProbs, TokenIdType
             }
             return;
         }
-
-        threadQuantProbsSum += quantProb;
     }
+
+    // This should never be reached
+    outPtr[curSeqLen] = vocabSize - 1;
 }
 
 template <typename T>
 std::vector<size_t> getMinPWorkspaceSizes(SizeType32 batchSize, SizeType32 vocabSize)
 {
-    auto const adjustedProbBufSize = sizeof(T) * batchSize * vocabSize;
-
-    return {adjustedProbBufSize};
+    return {};
 }
 
 template std::vector<size_t> getMinPWorkspaceSizes<float>(SizeType32 batchSize, SizeType32 vocabSize);
@@ -283,17 +282,11 @@ void invokeBatchMinPSampling(MinPSamplingKernelParams<T> const& params, cudaStre
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     params.checkParams();
-    auto const workspaceSizes = getMinPWorkspaceSizes<T>(params.batchSize, params.vocabSizePadded);
-
-    std::vector<void*> alignedPointers;
-    calcAlignedPointers(alignedPointers, params.workspace, workspaceSizes);
-
-    auto adjustedProbs = static_cast<T*>(alignedPointers[0]);
 
     // Sample with Min P filter and late temperature in single pass
     SizeType32 constexpr SAMPLING_BLOCK_SIZE = 1024;
     dim3 grid(params.batchSize);
-    fusedMinPSsampling<T, SAMPLING_BLOCK_SIZE><<<grid, SAMPLING_BLOCK_SIZE, 0, stream>>>(params.probs, adjustedProbs,
+    fusedMinPSsampling<T, SAMPLING_BLOCK_SIZE><<<grid, SAMPLING_BLOCK_SIZE, 0, stream>>>(params.probs,
         params.outputIds, params.outputIdsPtrs, params.sequenceLength, params.finishedInput, params.finishedOutput,
         params.cumLogProbs, params.outputLogProbs, params.vocabSizePadded, params.curandState, params.randomVals,
         params.minPs, params.temperatures, params.endIds, params.maxBatchSize, params.batchSlots, params.returnAllSelectedTokens,
