@@ -40,6 +40,12 @@ ________________
 .. doxygenfile:: decodingOutput.h
    :project: TensorRT-LLM
 
+eagleBuffers.h
+______________
+
+.. doxygenfile:: eagleBuffers.h
+   :project: TensorRT-LLM
+
 explicitDraftTokensBuffers.h
 ____________________________
 
@@ -112,6 +118,12 @@ __________
 .. doxygenfile:: ipcUtils.h
    :project: TensorRT-LLM
 
+lookaheadBuffers.h
+__________________
+
+.. doxygenfile:: lookaheadBuffers.h
+   :project: TensorRT-LLM
+
 lookaheadModule.h
 _________________
 
@@ -172,6 +184,12 @@ _________
 .. doxygenfile:: request.h
    :project: TensorRT-LLM
 
+runtimeDefaults.h
+_________________
+
+.. doxygenfile:: runtimeDefaults.h
+   :project: TensorRT-LLM
+
 samplingConfig.h
 ________________
 
@@ -200,23 +218,5 @@ worldConfig.h
 _____________
 
 .. doxygenfile:: worldConfig.h
-   :project: TensorRT-LLM
-
-eagleBuffers.h
-______________
-
-.. doxygenfile:: eagleBuffers.h
-   :project: TensorRT-LLM
-
-lookaheadBuffers.h
-__________________
-
-.. doxygenfile:: lookaheadBuffers.h
-   :project: TensorRT-LLM
-
-runtimeDefaults.h
-_________________
-
-.. doxygenfile:: runtimeDefaults.h
    :project: TensorRT-LLM
 
