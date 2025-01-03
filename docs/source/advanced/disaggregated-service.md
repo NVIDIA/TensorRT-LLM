@@ -58,13 +58,14 @@ In the code above, the `requestId` assigned to a request by different executors 
 
 ![disaggregated-service usage](images/disaggregated-service_usage.png)
 
-An `orchestrator` is required in `disaggregated-service` to manage multiple executor instance and route requests to different executors, TRT-LLM provides class [DisaggExecutorOrchestrator](../../../cpp/include/tensorrt_llm/executor/disaggServerUtil.h) to help user to launch multiple executor instances, however, `DisaggExecutorOrchestrator` only routes requests to executors in a simple round-robin policy, users need to implement their own orchestrator for disaggregated-service based on their business.
+An `orchestrator` is required in `disaggregated-service` to manage multiple executor instance and route requests to different executors, TRT-LLM provides class `DisaggExecutorOrchestrator` in `cpp/include/tensorrt_llm/executor/disaggServerUtil.h` to help user to launch multiple executor instances, however, `DisaggExecutorOrchestrator` only routes requests to executors in a simple round-robin policy, users need to implement their own orchestrator for disaggregated-service based on their business.
 
 TRT-LLM currently implements kvCache transfer using `CUDA-aware MPI`, and all executor processes involved need to hold same MPI world communicator. Therefore, TRT-LLM only supports launching multiple executors using `MPI`, and the `CommunicationMode` of the executors must be set to `KLEADER` or `kORCHESTRATOR` with `SpawnProcesses=false` for `disaggregated-service`, TRT-LLM will relax this restriction in future version to manage executors with greater ease.
 
 ## Benchmarks
 
-Please refer to [disaggServerBenchmark](../../../benchmarks/cpp/README.md#4.launch-C++-disaggServerBenchmark)
+
+Please refer to `benchmarks/cpp/disaggServerBenchmark.cpp` and `benchmarks/cpp/README.md`
 
 
 ## Troubleshooting and FAQ
