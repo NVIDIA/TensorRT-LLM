@@ -106,6 +106,7 @@ Welcome to TensorRT-LLM's Documentation!
    advanced/expert-parallelism.md
    advanced/kv-cache-reuse.md
    advanced/speculative-decoding.md
+   advanced/disaggregated-service.md
 
 .. toctree::
    :maxdepth: 2
