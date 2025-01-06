@@ -70,8 +70,9 @@ Below is the step-by-step to run DeepSeek-V3 with TensorRT-LLM.
 Firstly, convert FP8 weights to BF16:
 ```bash
 git clone https://github.com/deepseek-ai/DeepSeek-V3.git
-cd DeepSeek-V3/inferece/
+cd DeepSeek-V3/inference/
 python fp8_cast_bf16.py --input-fp8-hf-path /path/to/DeepSeek-V3 --output-bf16-hf-path /path/to/deepseek-v3-bf16 
+cp /path/to/DeepSeek-V3/config.json /path/to/DeepSeek-V3/configuration_deepseek.py /path/to/deepseek-v3-bf16/
 ```
 
 Secondly, the BF16 checkpoint will be converted to the TensorRT-LLM checkpoint format by apply [`convert_checkpoint.py`](./convert_checkpoint.py). After that, the TensorRT engine(s) can be built with the TensorRT-LLM checkpoint.
