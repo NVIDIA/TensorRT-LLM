@@ -17,13 +17,19 @@ TensorRT-LLM
 <div align="left">
 
 ## Latest News
-* [2024/12/10] ⚡ Llama 3.3 70B from AI at Meta is accelerated by TensorRT-LLM. 🌟 State-of-the-art model on par with Llama 3.1 405B for reasoning, math, instruction following and tool use. Explore the preview
-[➡️ link](https://build.nvidia.com/meta/llama-3_3-70b-instruct)
+* [2025/01/07] 🌟 Getting Started with TensorRT-LLM
+[➡️ link](https://www.youtube.com/watch?v=TwWqPnuNHV8)
+
+* [2025/01/04] ⚡Boost Llama 3.3 70B Inference Throughput 3x with NVIDIA TensorRT-LLM Speculative Decoding
+[➡️ link](https://developer.nvidia.com/blog/boost-llama-3-3-70b-inference-throughput-3x-with-nvidia-tensorrt-llm-speculative-decoding/)
 <div align="center">
-<img src="https://media.licdn.com/dms/image/v2/D4E10AQEMmE0xCJ6QvQ/image-shrink_800/image-shrink_800/0/1733853602424?e=1734912000&v=beta&t=mjW-P7skGnxGSgMx07IWczyYYC_05RYypB2mEmbgqZQ" width="50%">
+<img src="https://developer-blogs.nvidia.com/wp-content/uploads/2024/12/three-llamas-wearing-goggles.png" width="50%">
 <div align="left">
 
-* [2024/12/03] 🌟 Boost your AI hashtag#inference throughput by up to 3.6x.  We now support speculative decoding and tripling token throughput with our NVIDIA TensorRT-LLM. Perfect for your generative AI apps.  ⚡Learn how in this technical deep dive
+* [2024/12/10] ⚡ Llama 3.3 70B from AI at Meta is accelerated by TensorRT-LLM. 🌟 State-of-the-art model on par with Llama 3.1 405B for reasoning, math, instruction following and tool use. Explore the preview
+[➡️ link](https://build.nvidia.com/meta/llama-3_3-70b-instruct)
+
+* [2024/12/03] 🌟 Boost your AI inference throughput by up to 3.6x.  We now support speculative decoding and tripling token throughput with our NVIDIA TensorRT-LLM. Perfect for your generative AI apps.  ⚡Learn how in this technical deep dive
 [➡️ link](https://nvda.ws/3ZCZTzD)
 
 * [2024/12/02] Working on deploying ONNX models for performance-critical applications? Try our NVIDIA Nsight Deep Learning Designer ⚡ A user-friendly GUI and tight integration with NVIDIA TensorRT that offers:
@@ -52,6 +58,9 @@ TensorRT-LLM
 🙌 Enter for a chance to win prizes including an NVIDIA® GeForce RTX™ 4080 SUPER GPU, DLI credits, and more🙌
 [➡️ link](https://developer.nvidia.com/llamaindex-developer-contest)
 
+<details close>
+<summary>Previous News</summary>
+
 * [2024/10/28] 🏎️🏎️🏎️ NVIDIA GH200 Superchip Accelerates Inference by 2x in Multiturn Interactions with Llama Models
 [➡️ link](https://developer.nvidia.com/blog/nvidia-gh200-superchip-accelerates-inference-by-2x-in-multiturn-interactions-with-llama-models/)
 
@@ -64,9 +73,6 @@ TensorRT-LLM
 
 * [2024/10/07] 🚀🚀🚀Optimizing Microsoft Bing Visual Search with NVIDIA Accelerated Libraries
 [➡️ link](https://developer.nvidia.com/blog/optimizing-microsoft-bing-visual-search-with-nvidia-accelerated-libraries/)
-
-<details close>
-<summary>Previous News</summary>
 
 * [2024/09/29] 🌟 AI at Meta PyTorch + TensorRT v2.4 🌟 ⚡TensorRT 10.1 ⚡PyTorch 2.4 ⚡CUDA 12.4 ⚡Python 3.12
 [➡️ link](https://github.com/pytorch/TensorRT/releases/tag/v2.4.0)
