@@ -14,7 +14,7 @@
       <script src="../../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../../_static/doctools.js?v=9a2dae69"></script>
+      <script src="../../../_static/doctools.js?v=9bcbadda"></script>
       <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
@@ -110,6 +110,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul>
@@ -190,13 +191,11 @@
 <span class="kn">from</span> <span class="nn">datasets</span> <span class="kn">import</span> <span class="n">load_dataset</span>
 <span class="kn">from</span> <span class="nn">safetensors.torch</span> <span class="kn">import</span> <span class="n">load_file</span><span class="p">,</span> <span class="n">save_file</span>
 <span class="kn">from</span> <span class="nn">torch.utils.data</span> <span class="kn">import</span> <span class="n">DataLoader</span>
-<span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="p">(</span><span class="n">AutoConfig</span><span class="p">,</span> <span class="n">AutoModelForCausalLM</span><span class="p">,</span> <span class="n">AutoProcessor</span><span class="p">,</span>
-                          <span class="n">AutoTokenizer</span><span class="p">)</span>
+<span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">AutoConfig</span><span class="p">,</span> <span class="n">AutoModelForCausalLM</span><span class="p">,</span> <span class="n">AutoTokenizer</span>
 
 <span class="kn">from</span> <span class="nn">.._utils</span> <span class="kn">import</span> <span class="n">release_gc</span><span class="p">,</span> <span class="n">str_dtype_to_torch</span>
 <span class="kn">from</span> <span class="nn">..logger</span> <span class="kn">import</span> <span class="n">logger</span>
 <span class="kn">from</span> <span class="nn">..mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
-<span class="kn">from</span> <span class="nn">.image_processing</span> <span class="kn">import</span> <span class="n">MllamaImageProcessor</span>
 <span class="kn">from</span> <span class="nn">.mode</span> <span class="kn">import</span> <span class="n">QuantAlgo</span>
 
 <span class="n">EMPTY_CFG</span> <span class="o">=</span> <span class="p">{</span>
@@ -265,17 +264,13 @@
         <span class="s2">&quot;int4_wo&quot;</span><span class="p">:</span> <span class="n">EMPTY_CFG</span><span class="p">,</span>
         <span class="s2">&quot;full_prec&quot;</span><span class="p">:</span> <span class="n">EMPTY_CFG</span><span class="p">,</span>
     <span class="p">}</span>
-    <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">mtq</span><span class="p">,</span> <span class="s2">&quot;NVFP4_DEFAULT_CFG&quot;</span><span class="p">):</span>
-        <span class="n">QUANT_CFG_CHOICES</span><span class="p">[</span><span class="s2">&quot;nvfp4&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">mtq</span><span class="o">.</span><span class="n">NVFP4_DEFAULT_CFG</span>
     <span class="k">return</span> <span class="n">QUANT_CFG_CHOICES</span>
 
 
 <span class="n">MODEL_NAME_PATTERN_MAP</span> <span class="o">=</span> <span class="p">{</span>
     <span class="s2">&quot;GPT2&quot;</span><span class="p">:</span> <span class="s2">&quot;gpt2&quot;</span><span class="p">,</span>
     <span class="s2">&quot;Xverse&quot;</span><span class="p">:</span> <span class="s2">&quot;llama&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;MllamaForConditionalGeneration&quot;</span><span class="p">:</span> <span class="s2">&quot;mllama&quot;</span><span class="p">,</span>
     <span class="s2">&quot;Llama&quot;</span><span class="p">:</span> <span class="s2">&quot;llama&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;MllamaForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;mllama&quot;</span><span class="p">,</span>
     <span class="s2">&quot;Mistral&quot;</span><span class="p">:</span> <span class="s2">&quot;llama&quot;</span><span class="p">,</span>
     <span class="s2">&quot;GPTJ&quot;</span><span class="p">:</span> <span class="s2">&quot;gptj&quot;</span><span class="p">,</span>
     <span class="s2">&quot;FalconForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;falcon&quot;</span><span class="p">,</span>
@@ -292,7 +287,6 @@
     <span class="s2">&quot;NemotronForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;nemotron&quot;</span><span class="p">,</span>
     <span class="s2">&quot;GPTBigCodeForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;gpt_bigcode&quot;</span><span class="p">,</span>
     <span class="s2">&quot;ArcticForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;llama&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;PhiMoEForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;phi3&quot;</span><span class="p">,</span>
     <span class="s2">&quot;Phi3SmallForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;phi3small&quot;</span><span class="p">,</span>
     <span class="s2">&quot;Phi3ForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;phi3&quot;</span><span class="p">,</span>
     <span class="s2">&quot;Starcoder2ForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;gptnext&quot;</span><span class="p">,</span>
@@ -301,11 +295,7 @@
     <span class="s2">&quot;Exaone&quot;</span><span class="p">:</span> <span class="s2">&quot;exaone&quot;</span><span class="p">,</span>
     <span class="s2">&quot;DeciLMForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;deci&quot;</span><span class="p">,</span>
     <span class="s2">&quot;DeepseekForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;deepseek&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;GraniteForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;granite&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;GraniteMoeForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;granitemoe&quot;</span><span class="p">,</span>
 <span class="p">}</span>
-
-<span class="n">MULTIMODAL_DATASETS</span> <span class="o">=</span> <span class="p">[</span><span class="s1">&#39;scienceqa&#39;</span><span class="p">,</span> <span class="s1">&#39;science_qa&#39;</span><span class="p">]</span>
 
 
 <span class="k">class</span> <span class="nc">_CustomDataset</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">utils</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">Dataset</span><span class="p">):</span>
@@ -343,31 +333,6 @@
     <span class="k">assert</span> <span class="n">tokenizer</span><span class="o">.</span><span class="n">pad_token</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;Pad token for </span><span class="si">{</span><span class="n">model_type</span><span class="si">}</span><span class="s2"> cannot be set!&quot;</span>
 
     <span class="k">return</span> <span class="n">tokenizer</span>
-
-
-<span class="k">def</span> <span class="nf">get_processor</span><span class="p">(</span><span class="n">ckpt_path</span><span class="p">,</span> <span class="n">max_seq_length</span><span class="o">=</span><span class="mi">2048</span><span class="p">,</span> <span class="n">model_type</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
-    <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Initializing tokenizer from </span><span class="si">{</span><span class="n">ckpt_path</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
-    <span class="n">processor</span> <span class="o">=</span> <span class="n">AutoProcessor</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
-        <span class="n">ckpt_path</span><span class="p">,</span>
-        <span class="n">model_max_length</span><span class="o">=</span><span class="n">max_seq_length</span><span class="p">,</span>
-        <span class="n">padding_side</span><span class="o">=</span><span class="s2">&quot;left&quot;</span><span class="p">,</span>
-        <span class="n">trust_remote_code</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-    <span class="p">)</span>
-
-    <span class="k">if</span> <span class="n">processor</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">pad_token</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="k">if</span> <span class="n">model_type</span> <span class="ow">and</span> <span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;qwen&quot;</span><span class="p">:</span>
-            <span class="c1"># qwen use token id 151643 as pad and eos tokens</span>
-            <span class="n">processor</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">eos_token</span> <span class="o">=</span> <span class="n">processor</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">convert_ids_to_tokens</span><span class="p">(</span>
-                <span class="mi">151643</span><span class="p">)</span>
-            <span class="n">processor</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">pad_token</span> <span class="o">=</span> <span class="n">processor</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">convert_ids_to_tokens</span><span class="p">(</span>
-                <span class="mi">151643</span><span class="p">)</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="n">processor</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">pad_token</span> <span class="o">=</span> <span class="n">processor</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">eos_token</span>
-    <span class="k">assert</span> <span class="n">processor</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">pad_token</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;Pad token for </span><span class="si">{</span><span class="n">model_type</span><span class="si">}</span><span class="s2"> cannot be set!&quot;</span>
-
-    <span class="k">if</span> <span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;mllama&#39;</span><span class="p">:</span>
-        <span class="n">processor</span> <span class="o">=</span> <span class="n">MllamaImageProcessor</span><span class="p">(</span><span class="n">processor</span><span class="p">,</span> <span class="n">device</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">processor</span>
 
 
 <span class="k">def</span> <span class="nf">_get_vila_model</span><span class="p">(</span><span class="n">model_dir</span><span class="p">):</span>
@@ -420,10 +385,6 @@
     <span class="k">elif</span> <span class="n">hf_config</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;mpt&quot;</span><span class="p">:</span>
         <span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">MptForCausalLM</span>
         <span class="n">model_cls</span> <span class="o">=</span> <span class="n">MptForCausalLM</span>
-    <span class="k">elif</span> <span class="n">hf_config</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;mllama&#39;</span><span class="p">:</span>
-        <span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">MllamaForConditionalGeneration</span>
-        <span class="n">model_cls</span> <span class="o">=</span> <span class="n">MllamaForConditionalGeneration</span>
-
     <span class="k">if</span> <span class="s2">&quot;vila&quot;</span> <span class="ow">in</span> <span class="n">ckpt_path</span><span class="p">:</span>
         <span class="n">model</span> <span class="o">=</span> <span class="n">_get_vila_model</span><span class="p">(</span><span class="n">ckpt_path</span><span class="p">)</span>
     <span class="k">elif</span> <span class="s2">&quot;llava-onevision-qwen2&quot;</span> <span class="ow">in</span> <span class="n">ckpt_path</span><span class="p">:</span>
@@ -442,7 +403,6 @@
             <span class="n">trust_remote_code</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">hf_config</span><span class="o">.</span><span class="n">model_type</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;llava&quot;</span><span class="p">,</span> <span class="s2">&quot;internvl_chat&quot;</span><span class="p">]:</span>
             <span class="n">model</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">language_model</span>
-
     <span class="n">model</span><span class="o">.</span><span class="n">eval</span><span class="p">()</span>
 
     <span class="n">model_dtype</span> <span class="o">=</span> <span class="nb">next</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">parameters</span><span class="p">())</span><span class="o">.</span><span class="n">dtype</span>
@@ -455,8 +415,6 @@
 
 
 <span class="k">def</span> <span class="nf">get_model_type</span><span class="p">(</span><span class="n">model</span><span class="p">):</span>
-    <span class="k">if</span> <span class="nb">type</span><span class="p">(</span><span class="n">model</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span> <span class="ow">in</span> <span class="n">MODEL_NAME_PATTERN_MAP</span><span class="p">:</span>
-        <span class="k">return</span> <span class="n">MODEL_NAME_PATTERN_MAP</span><span class="p">[</span><span class="nb">type</span><span class="p">(</span><span class="n">model</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="p">]</span>
     <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">MODEL_NAME_PATTERN_MAP</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
         <span class="k">if</span> <span class="n">k</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span> <span class="ow">in</span> <span class="nb">type</span><span class="p">(</span><span class="n">model</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="o">.</span><span class="n">lower</span><span class="p">():</span>
             <span class="k">return</span> <span class="n">v</span>
@@ -477,13 +435,6 @@
             <span class="n">data_files</span><span class="o">=</span><span class="s2">&quot;https://the-eye.eu/public/AI/pile/val.jsonl.zst&quot;</span><span class="p">,</span>
             <span class="n">split</span><span class="o">=</span><span class="s2">&quot;train&quot;</span><span class="p">)</span>
         <span class="n">dataset</span> <span class="o">=</span> <span class="n">dataset</span><span class="p">[</span><span class="s2">&quot;text&quot;</span><span class="p">][:</span><span class="n">calib_size</span><span class="p">]</span>
-    <span class="k">elif</span> <span class="s2">&quot;scienceqa&quot;</span> <span class="ow">in</span> <span class="n">dataset_name_or_dir</span><span class="o">.</span><span class="n">lower</span><span class="p">(</span>
-    <span class="p">)</span> <span class="ow">or</span> <span class="s2">&quot;science_qa&quot;</span> <span class="ow">in</span> <span class="n">dataset_name_or_dir</span><span class="o">.</span><span class="n">lower</span><span class="p">():</span>
-        <span class="k">if</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">isdir</span><span class="p">(</span><span class="n">dataset_name_or_dir</span><span class="p">):</span>
-            <span class="n">dataset</span> <span class="o">=</span> <span class="n">load_dataset</span><span class="p">(</span><span class="n">dataset_name_or_dir</span><span class="p">,</span> <span class="n">split</span><span class="o">=</span><span class="s2">&quot;train&quot;</span><span class="p">)</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="n">dataset</span> <span class="o">=</span> <span class="n">load_dataset</span><span class="p">(</span><span class="s2">&quot;derek-thomas/ScienceQA&quot;</span><span class="p">,</span> <span class="n">split</span><span class="o">=</span><span class="s2">&quot;train&quot;</span><span class="p">)</span>
-        <span class="n">dataset</span> <span class="o">=</span> <span class="n">dataset</span><span class="o">.</span><span class="n">select</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="n">calib_size</span><span class="p">))</span>
     <span class="k">elif</span> <span class="s2">&quot;cnn_dailymail&quot;</span> <span class="ow">in</span> <span class="n">dataset_name_or_dir</span><span class="p">:</span>
         <span class="n">dataset</span> <span class="o">=</span> <span class="n">load_dataset</span><span class="p">(</span>
             <span class="n">dataset_name_or_dir</span><span class="p">,</span>
@@ -503,48 +454,33 @@
             <span class="sa">f</span><span class="s2">&quot;Unsupported dataset name or local repo directory: </span><span class="si">{</span><span class="n">dataset_name_or_dir</span><span class="si">}</span><span class="s2">.&quot;</span>
         <span class="p">)</span>
 
-    <span class="n">is_multimodal</span> <span class="o">=</span> <span class="kc">False</span>
-    <span class="k">for</span> <span class="n">dataset_name</span> <span class="ow">in</span> <span class="n">MULTIMODAL_DATASETS</span><span class="p">:</span>
-        <span class="k">if</span> <span class="n">dataset_name</span> <span class="ow">in</span> <span class="n">dataset_name_or_dir</span><span class="p">:</span>
-            <span class="n">is_multimodal</span> <span class="o">=</span> <span class="kc">True</span>
-    <span class="k">if</span> <span class="n">is_multimodal</span><span class="p">:</span>
-        <span class="c1"># Apply the preprocessing function to the dataset</span>
-        <span class="n">processed_dataset</span> <span class="o">=</span> <span class="n">dataset</span><span class="o">.</span><span class="n">map</span><span class="p">(</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">preprocess_function</span><span class="p">,</span>
-                                        <span class="n">batched</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                                        <span class="n">remove_columns</span><span class="o">=</span><span class="n">dataset</span><span class="o">.</span><span class="n">column_names</span><span class="p">)</span>
+    <span class="n">batch_encoded</span> <span class="o">=</span> <span class="n">tokenizer</span><span class="o">.</span><span class="n">batch_encode_plus</span><span class="p">(</span><span class="n">dataset</span><span class="p">,</span>
+                                                <span class="n">return_tensors</span><span class="o">=</span><span class="s2">&quot;pt&quot;</span><span class="p">,</span>
+                                                <span class="n">padding</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+                                                <span class="n">truncation</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+                                                <span class="n">max_length</span><span class="o">=</span><span class="n">block_size</span><span class="p">)</span>
 
-        <span class="c1"># Create DataLoader with the custom collate function</span>
-        <span class="n">calib_dataloader</span> <span class="o">=</span> <span class="n">DataLoader</span><span class="p">(</span><span class="n">processed_dataset</span><span class="p">,</span>
-                                      <span class="n">batch_size</span><span class="o">=</span><span class="n">batch_size</span><span class="p">,</span>
-                                      <span class="n">shuffle</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                                      <span class="n">collate_fn</span><span class="o">=</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">collate_function</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">device</span><span class="p">:</span>
+        <span class="n">batch_encoded</span> <span class="o">=</span> <span class="n">batch_encoded</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+
+    <span class="k">if</span> <span class="n">include_labels</span><span class="p">:</span>
+        <span class="c1"># Labels are needed when backward is called in the model.</span>
+        <span class="c1"># The labels should be a shifted version of the input_ids.</span>
+        <span class="c1"># However, we should not shift the input_ids here since the labels are shifted by</span>
+        <span class="c1"># Huggingface models during loss calculation as shown here -</span>
+        <span class="c1"># https://github.com/huggingface/transformers/blob/7f79a97399bb52aad8460e1da2f36577d5dccfed/src/transformers/models/llama/modeling_llama.py#L1093-L1095</span>
+        <span class="n">batch_encoded</span><span class="p">[</span><span class="s2">&quot;labels&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">where</span><span class="p">(</span>
+            <span class="n">batch_encoded</span><span class="p">[</span><span class="s2">&quot;attention_mask&quot;</span><span class="p">]</span> <span class="o">&gt;</span> <span class="mf">0.5</span><span class="p">,</span> <span class="n">batch_encoded</span><span class="p">[</span><span class="s2">&quot;input_ids&quot;</span><span class="p">],</span>
+            <span class="o">-</span><span class="mi">100</span><span class="p">)</span>
+        <span class="n">batch_encoded</span> <span class="o">=</span> <span class="n">_CustomDataset</span><span class="p">(</span><span class="n">batch_encoded</span><span class="p">)</span>
     <span class="k">else</span><span class="p">:</span>
-        <span class="n">batch_encoded</span> <span class="o">=</span> <span class="n">tokenizer</span><span class="o">.</span><span class="n">batch_encode_plus</span><span class="p">(</span><span class="n">dataset</span><span class="p">,</span>
-                                                    <span class="n">return_tensors</span><span class="o">=</span><span class="s2">&quot;pt&quot;</span><span class="p">,</span>
-                                                    <span class="n">padding</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-                                                    <span class="n">truncation</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-                                                    <span class="n">max_length</span><span class="o">=</span><span class="n">block_size</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">device</span><span class="p">:</span>
-            <span class="n">batch_encoded</span> <span class="o">=</span> <span class="n">batch_encoded</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+        <span class="c1"># For backward compatibility, if labels are not needed, we only return input_ids.</span>
+        <span class="n">batch_encoded</span> <span class="o">=</span> <span class="n">_CustomDataset</span><span class="p">(</span>
+            <span class="p">{</span><span class="s2">&quot;input_ids&quot;</span><span class="p">:</span> <span class="n">batch_encoded</span><span class="p">[</span><span class="s2">&quot;input_ids&quot;</span><span class="p">]})</span>
 
-        <span class="k">if</span> <span class="n">include_labels</span><span class="p">:</span>
-            <span class="c1"># Labels are needed when backward is called in the model.</span>
-            <span class="c1"># The labels should be a shifted version of the input_ids.</span>
-            <span class="c1"># However, we should not shift the input_ids here since the labels are shifted by</span>
-            <span class="c1"># Huggingface models during loss calculation as shown here -</span>
-            <span class="c1"># https://github.com/huggingface/transformers/blob/7f79a97399bb52aad8460e1da2f36577d5dccfed/src/transformers/models/llama/modeling_llama.py#L1093-L1095</span>
-            <span class="n">batch_encoded</span><span class="p">[</span><span class="s2">&quot;labels&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">where</span><span class="p">(</span>
-                <span class="n">batch_encoded</span><span class="p">[</span><span class="s2">&quot;attention_mask&quot;</span><span class="p">]</span> <span class="o">&gt;</span> <span class="mf">0.5</span><span class="p">,</span>
-                <span class="n">batch_encoded</span><span class="p">[</span><span class="s2">&quot;input_ids&quot;</span><span class="p">],</span> <span class="o">-</span><span class="mi">100</span><span class="p">)</span>
-            <span class="n">batch_encoded</span> <span class="o">=</span> <span class="n">_CustomDataset</span><span class="p">(</span><span class="n">batch_encoded</span><span class="p">)</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="c1"># For backward compatibility, if labels are not needed, we only return input_ids.</span>
-            <span class="n">batch_encoded</span> <span class="o">=</span> <span class="n">_CustomDataset</span><span class="p">(</span>
-                <span class="p">{</span><span class="s2">&quot;input_ids&quot;</span><span class="p">:</span> <span class="n">batch_encoded</span><span class="p">[</span><span class="s2">&quot;input_ids&quot;</span><span class="p">]})</span>
-
-        <span class="n">calib_dataloader</span> <span class="o">=</span> <span class="n">DataLoader</span><span class="p">(</span><span class="n">batch_encoded</span><span class="p">,</span>
-                                      <span class="n">batch_size</span><span class="o">=</span><span class="n">batch_size</span><span class="p">,</span>
-                                      <span class="n">shuffle</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+    <span class="n">calib_dataloader</span> <span class="o">=</span> <span class="n">DataLoader</span><span class="p">(</span><span class="n">batch_encoded</span><span class="p">,</span>
+                                  <span class="n">batch_size</span><span class="o">=</span><span class="n">batch_size</span><span class="p">,</span>
+                                  <span class="n">shuffle</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
 
     <span class="k">return</span> <span class="n">calib_dataloader</span>
 
@@ -562,8 +498,7 @@
             <span class="k">return</span>
         <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
             <span class="n">low_mem_mode</span> <span class="o">=</span> <span class="kc">False</span>
-            <span class="k">for</span> <span class="n">idx</span><span class="p">,</span> <span class="n">data</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">calib_dataloader</span><span class="p">):</span>
-                <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Calibrating batch </span><span class="si">{</span><span class="n">idx</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">_</span><span class="p">,</span> <span class="n">data</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">calib_dataloader</span><span class="p">):</span>
                 <span class="n">batch_size</span> <span class="o">=</span> <span class="n">data</span><span class="p">[</span><span class="nb">list</span><span class="p">(</span><span class="n">data</span><span class="o">.</span><span class="n">keys</span><span class="p">())[</span><span class="mi">0</span><span class="p">]]</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
                 <span class="k">if</span> <span class="n">batch_size</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
                     <span class="n">model</span><span class="p">(</span><span class="o">**</span><span class="n">data</span><span class="p">)</span>
@@ -783,11 +718,6 @@
         <span class="n">tokenizer</span> <span class="o">=</span> <span class="n">get_tokenizer</span><span class="p">(</span><span class="n">model_dir</span> <span class="o">+</span> <span class="s2">&quot;/llm&quot;</span><span class="p">,</span>
                                   <span class="n">max_seq_length</span><span class="o">=</span><span class="n">tokenizer_max_seq_length</span><span class="p">,</span>
                                   <span class="n">model_type</span><span class="o">=</span><span class="n">model_type</span><span class="p">)</span>
-    <span class="k">elif</span> <span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;mllama&quot;</span><span class="p">:</span>
-        <span class="n">tokenizer</span> <span class="o">=</span> <span class="n">get_processor</span><span class="p">(</span><span class="n">model_dir</span><span class="p">,</span>
-                                  <span class="n">max_seq_length</span><span class="o">=</span><span class="n">tokenizer_max_seq_length</span><span class="p">,</span>
-                                  <span class="n">model_type</span><span class="o">=</span><span class="n">model_type</span><span class="p">,</span>
-                                  <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
     <span class="k">else</span><span class="p">:</span>
         <span class="n">tokenizer</span> <span class="o">=</span> <span class="n">get_tokenizer</span><span class="p">(</span><span class="n">model_dir</span><span class="p">,</span>
                                   <span class="n">max_seq_length</span><span class="o">=</span><span class="n">tokenizer_max_seq_length</span><span class="p">,</span>
@@ -875,8 +805,6 @@
             <span class="s2">&quot;w4a8_awq&quot;</span><span class="p">:</span> <span class="s2">&quot;W4A8_AWQ&quot;</span><span class="p">,</span>
         <span class="p">}</span>
 
-        <span class="k">if</span> <span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;mllama&#39;</span><span class="p">:</span>
-            <span class="n">model</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">language_model</span>
         <span class="n">export_tensorrt_llm_checkpoint</span><span class="p">(</span>
             <span class="n">model</span><span class="p">,</span>
             <span class="n">model_type</span><span class="p">,</span>
@@ -912,7 +840,7 @@
             <span class="n">json</span><span class="o">.</span><span class="n">dump</span><span class="p">(</span><span class="n">tensorrt_llm_config</span><span class="p">,</span> <span class="n">f</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span>
 
         <span class="c1"># Workaround for Modelopt 0.9.x fp8_kv_cache knob issue</span>
-        <span class="k">if</span> <span class="n">qformat</span> <span class="ow">in</span> <span class="p">[</span><span class="s1">&#39;fp8&#39;</span><span class="p">,</span> <span class="s1">&#39;nvfp4&#39;</span><span class="p">]</span> <span class="ow">and</span> <span class="n">kv_cache_dtype</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">qformat</span> <span class="o">==</span> <span class="s1">&#39;fp8&#39;</span> <span class="ow">and</span> <span class="n">kv_cache_dtype</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;r&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
                 <span class="n">tensorrt_llm_config</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
             <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s2">&quot;quantization&quot;</span><span class="p">][</span><span class="s2">&quot;kv_cache_quant_algo&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
@@ -990,21 +918,6 @@
                                   <span class="n">num_medusa_heads</span><span class="p">,</span> <span class="n">num_medusa_layers</span><span class="p">,</span>
                                   <span class="n">max_draft_len</span><span class="p">,</span> <span class="n">medusa_hidden_act</span><span class="p">,</span>
                                   <span class="n">medusa_model_dir</span><span class="p">,</span> <span class="n">quant_medusa_head</span><span class="p">)</span>
-
-        <span class="c1"># Workaround for mllama</span>
-        <span class="k">if</span> <span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;mllama&#39;</span><span class="p">:</span>
-            <span class="kn">from</span> <span class="nn">tensorrt_llm.models.mllama.config</span> <span class="kn">import</span> <span class="n">MLLaMAConfig</span>
-            <span class="n">config</span> <span class="o">=</span> <span class="n">MLLaMAConfig</span><span class="o">.</span><span class="n">from_hugging_face</span><span class="p">(</span>
-                <span class="n">model_dir</span><span class="p">,</span>
-                <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
-            <span class="p">)</span>
-            <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">config</span><span class="o">.</span><span class="n">to_dict</span><span class="p">()</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
-                <span class="k">if</span> <span class="n">key</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">tensorrt_llm_config</span><span class="p">:</span>
-                    <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">value</span>
-
-            <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;w&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
-                <span class="n">json</span><span class="o">.</span><span class="n">dump</span><span class="p">(</span><span class="n">tensorrt_llm_config</span><span class="p">,</span> <span class="n">f</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span>
-
         <span class="n">end_time</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span>
         <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
             <span class="s2">&quot;Quantized model exported to </span><span class="si">{}</span><span class="s2"> </span><span class="se">\n</span><span class="s2">Total time used </span><span class="si">{:.2f}</span><span class="s2"> s.&quot;</span><span class="o">.</span><span class="n">format</span><span class="p">(</span>
@@ -1322,7 +1235,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f5e6e1b5970>
+<jinja2.runtime.BlockReference object at 0x7f1ac940dcd0>
 
 <div class="footer">
     <p>

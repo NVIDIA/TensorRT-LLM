@@ -14,7 +14,7 @@
       <script src="../../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../../_static/doctools.js?v=9a2dae69"></script>
+      <script src="../../../_static/doctools.js?v=9bcbadda"></script>
       <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
@@ -110,6 +110,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul>
@@ -201,7 +202,6 @@
     <span class="n">FP8_PER_CHANNEL_PER_TOKEN</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
     <span class="n">INT8</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
     <span class="n">MIXED_PRECISION</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
-    <span class="n">NVFP4</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
     <span class="n">NO_QUANT</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span></div>
 
 
@@ -247,8 +247,6 @@
     <span class="n">FP8_ROWWISE</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
     <span class="c1"># W4A8 qserve</span>
     <span class="n">W4A8_QSERVE</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
-    <span class="c1"># FP4</span>
-    <span class="n">NVFP4</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
 
     <span class="c1"># The smallest power-of-two that is not used by a flag. Do not call auto() after that line.</span>
     <span class="n">COUNT</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
@@ -324,9 +322,6 @@
     <span class="k">def</span> <span class="nf">has_fp8_rowwise</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_any</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">FP8_ROWWISE</span><span class="p">)</span>
 
-    <span class="k">def</span> <span class="nf">has_nvfp4</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_any</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">NVFP4</span><span class="p">)</span>
-
     <span class="k">def</span> <span class="nf">has_weight_quant</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_any</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">INT4_WEIGHTS</span> <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">INT8_WEIGHTS</span><span class="p">)</span>
 
@@ -334,8 +329,7 @@
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_any</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">INT4_WEIGHTS</span> <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">INT8_WEIGHTS</span>
                          <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">ACTIVATIONS</span>
                          <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">INT8_KV_CACHE</span> <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">FP8_KV_CACHE</span>
-                         <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">FP8_QDQ</span> <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">FP8_ROWWISE</span> <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">W4A8_QSERVE</span>
-                         <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">NVFP4</span><span class="p">)</span>
+                         <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">FP8_QDQ</span> <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">FP8_ROWWISE</span><span class="p">)</span>
 
     <span class="k">def</span> <span class="nf">set_int8_kv_cache</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span> <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">INT8_KV_CACHE</span>
@@ -360,7 +354,6 @@
                          <span class="n">use_fp8_kv_cache</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                          <span class="n">use_fp8_qdq</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                          <span class="n">use_fp8_rowwise</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                         <span class="n">use_nvfp4</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                          <span class="n">use_w4a8_qserve</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
 
         <span class="k">def</span> <span class="nf">raise_error</span><span class="p">():</span>
@@ -375,7 +368,6 @@
                              <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">use_fp8_kv_cache</span><span class="si">=}</span><span class="s2">&quot;</span>
                              <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">use_fp8_qdq</span><span class="si">=}</span><span class="s2">&quot;</span>
                              <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">use_fp8_rowwise</span><span class="si">=}</span><span class="s2">&quot;</span>
-                             <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">use_nvfp4</span><span class="si">=}</span><span class="s2">&quot;</span>
                              <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">use_w4a8_qserve</span><span class="si">=}</span><span class="s2">&quot;</span><span class="p">)</span>
 
         <span class="c1"># We must quantize weights when we quantize activations.</span>
@@ -420,9 +412,6 @@
 
         <span class="k">if</span> <span class="n">use_fp8_rowwise</span><span class="p">:</span>
             <span class="n">mode</span> <span class="o">=</span> <span class="n">mode</span> <span class="o">|</span> <span class="n">QuantMode</span><span class="o">.</span><span class="n">FP8_ROWWISE</span> <span class="o">|</span> <span class="n">QuantMode</span><span class="o">.</span><span class="n">PER_TOKEN</span> <span class="o">|</span> <span class="n">QuantMode</span><span class="o">.</span><span class="n">PER_CHANNEL</span>
-
-        <span class="k">if</span> <span class="n">use_nvfp4</span><span class="p">:</span>
-            <span class="n">mode</span> <span class="o">=</span> <span class="n">mode</span> <span class="o">|</span> <span class="n">QuantMode</span><span class="o">.</span><span class="n">NVFP4</span>
 
         <span class="c1"># W4A8 QServe</span>
         <span class="k">if</span> <span class="n">use_w4a8_qserve</span><span class="p">:</span>
@@ -497,8 +486,6 @@
             <span class="n">quant_mode</span> <span class="o">=</span> <span class="n">QuantMode</span><span class="o">.</span><span class="n">from_description</span><span class="p">(</span><span class="n">use_fp8_qdq</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
         <span class="k">elif</span> <span class="n">quant_algo</span> <span class="o">==</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8_PER_CHANNEL_PER_TOKEN</span><span class="p">:</span>
             <span class="n">quant_mode</span> <span class="o">=</span> <span class="n">QuantMode</span><span class="o">.</span><span class="n">from_description</span><span class="p">(</span><span class="n">use_fp8_rowwise</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-        <span class="k">elif</span> <span class="n">quant_algo</span> <span class="o">==</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">NVFP4</span><span class="p">:</span>
-            <span class="n">quant_mode</span> <span class="o">=</span> <span class="n">QuantMode</span><span class="o">.</span><span class="n">from_description</span><span class="p">(</span><span class="n">use_nvfp4</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">quant_mode</span> <span class="o">=</span> <span class="n">QuantMode</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
 
@@ -525,8 +512,6 @@
             <span class="bp">self</span><span class="o">.</span><span class="n">has_fp8_qdq</span><span class="p">(),</span>
             <span class="s1">&#39;enable_fp8_rowwise&#39;</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">has_fp8_rowwise</span><span class="p">(),</span>
-            <span class="s1">&#39;enable_nvfp4&#39;</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">has_nvfp4</span><span class="p">(),</span>
             <span class="s1">&#39;fp8_kv_cache&#39;</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">has_fp8_kv_cache</span><span class="p">(),</span>
             <span class="s1">&#39;use_weight_only&#39;</span><span class="p">:</span>
@@ -544,7 +529,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f5e6e3f4860>
+<jinja2.runtime.BlockReference object at 0x7f1ac940e4e0>
 
 <div class="footer">
     <p>
