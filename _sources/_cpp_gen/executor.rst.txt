@@ -34,9 +34,3 @@ _______
 .. doxygenfile:: types.h
    :project: TensorRT-LLM
 
-version.h
-_________
-
-.. doxygenfile:: version.h
-   :project: TensorRT-LLM
-
