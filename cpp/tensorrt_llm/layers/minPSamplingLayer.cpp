@@ -113,7 +113,7 @@ void MinPSamplingLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, Ten
     {
         auto initWorkspaceSizes = getMinPInitWorkspaceSizes<T>(batchSize);
         std::vector<void*> alignedPointers;
-        calcAlignedPointers(workspace->getRawWorkspaceDevicePtr(), initWorkspaceSizes)(MinPsPtr);
+        calcAlignedPointers(workspace->getRawWorkspaceDevicePtr(), initWorkspaceSizes)(MinPsPtr, TemperaturesPtr);
 
         DecodingLayerWorkspace::copyToWorkspace(
             *mBufferManager, runtimeMinP, IBuffer::wrap(MinPsPtr, initWorkspaceSizes[0] / sizeof(*MinPsPtr)));
