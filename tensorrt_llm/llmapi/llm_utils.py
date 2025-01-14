@@ -485,7 +485,7 @@ class LlmArgs:
         else:
             self.tokenizer = tokenizer_factory(
                 self.tokenizer,
-                rust_remote_code=self.trust_remote_code,
+                trust_remote_code=self.trust_remote_code,
                 use_fast=self.tokenizer_mode != 'slow')
 
         if torch.cuda.get_device_properties(0).major < 8:
