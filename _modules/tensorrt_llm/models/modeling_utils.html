@@ -14,7 +14,7 @@
       <script src="../../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../../../_static/doctools.js?v=9a2dae69"></script>
       <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
@@ -110,7 +110,6 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul>
@@ -315,8 +314,8 @@
     <span class="nd">@property</span>
     <span class="k">def</span> <span class="nf">requires_modelopt_quantization</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_algo</span> <span class="ow">in</span> <span class="p">[</span>
-                <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A16_AWQ</span><span class="p">,</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8</span><span class="p">,</span>
-                <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W8A8_SQ_PER_CHANNEL</span><span class="p">,</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A8_AWQ</span><span class="p">,</span>
+                <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">NVFP4</span><span class="p">,</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8</span><span class="p">,</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A16_AWQ</span><span class="p">,</span>
+                <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A8_AWQ</span><span class="p">,</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W8A8_SQ_PER_CHANNEL</span><span class="p">,</span>
                 <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">MIXED_PRECISION</span>
         <span class="p">]:</span>
             <span class="k">return</span> <span class="kc">True</span>
@@ -337,10 +336,11 @@
         <span class="n">algo_to_modelopt_map</span> <span class="o">=</span> <span class="p">{</span>
             <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W8A16</span><span class="p">:</span> <span class="s2">&quot;int8_wo&quot;</span><span class="p">,</span>
             <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A16</span><span class="p">:</span> <span class="s2">&quot;int4_wo&quot;</span><span class="p">,</span>
+            <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">NVFP4</span><span class="p">:</span> <span class="s2">&quot;nvfp4&quot;</span><span class="p">,</span>
+            <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8</span><span class="p">:</span> <span class="s2">&quot;fp8&quot;</span><span class="p">,</span>
             <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A16_AWQ</span><span class="p">:</span> <span class="s2">&quot;int4_awq&quot;</span><span class="p">,</span>
-            <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A8_AWQ</span><span class="p">:</span> <span class="s1">&#39;w4a8_awq&#39;</span><span class="p">,</span>
-            <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8</span><span class="p">:</span> <span class="s1">&#39;fp8&#39;</span><span class="p">,</span>
-            <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W8A8_SQ_PER_CHANNEL</span><span class="p">:</span> <span class="s1">&#39;int8_sq&#39;</span><span class="p">,</span>
+            <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A8_AWQ</span><span class="p">:</span> <span class="s2">&quot;w4a8_awq&quot;</span><span class="p">,</span>
+            <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W8A8_SQ_PER_CHANNEL</span><span class="p">:</span> <span class="s2">&quot;int8_sq&quot;</span><span class="p">,</span>
         <span class="p">}</span>
         <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_algo</span> <span class="o">!=</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">MIXED_PRECISION</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;We don&#39;t support mixed precision in QuantConfig&quot;</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_algo</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
@@ -448,10 +448,11 @@
 
     <span class="k">def</span> <span class="nf">get_modelopt_qformat</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="n">algo_to_modelopt_map</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">NVFP4</span><span class="p">:</span> <span class="s2">&quot;nvfp4&quot;</span><span class="p">,</span>
+            <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8</span><span class="p">:</span> <span class="s2">&quot;fp8&quot;</span><span class="p">,</span>
             <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A16_AWQ</span><span class="p">:</span> <span class="s2">&quot;int4_awq&quot;</span><span class="p">,</span>
-            <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A8_AWQ</span><span class="p">:</span> <span class="s1">&#39;w4a8_awq&#39;</span><span class="p">,</span>
-            <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8</span><span class="p">:</span> <span class="s1">&#39;fp8&#39;</span><span class="p">,</span>
-            <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W8A8_SQ_PER_CHANNEL</span><span class="p">:</span> <span class="s1">&#39;int8_sq&#39;</span><span class="p">,</span>
+            <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A8_AWQ</span><span class="p">:</span> <span class="s2">&quot;w4a8_awq&quot;</span><span class="p">,</span>
+            <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W8A8_SQ_PER_CHANNEL</span><span class="p">:</span> <span class="s2">&quot;int8_sq&quot;</span><span class="p">,</span>
         <span class="p">}</span>
         <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_algo</span> <span class="o">==</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">MIXED_PRECISION</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;We only support mixed precision quantization in LayerQuantConfig&quot;</span>
         <span class="n">autoq_format</span> <span class="o">=</span> <span class="s1">&#39;,&#39;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span>
@@ -674,15 +675,8 @@
 
 <div class="viewcode-block" id="PretrainedConfig.set_rank">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedConfig.set_rank">[docs]</a>
-    <span class="k">def</span> <span class="nf">set_rank</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rank</span><span class="p">):</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span> <span class="o">=</span> <span class="n">Mapping</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">world_size</span><span class="p">,</span>
-                               <span class="n">rank</span><span class="o">=</span><span class="n">rank</span><span class="p">,</span>
-                               <span class="n">cp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">cp_size</span><span class="p">,</span>
-                               <span class="n">tp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
-                               <span class="n">pp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">pp_size</span><span class="p">,</span>
-                               <span class="n">moe_tp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">moe_tp_size</span><span class="p">,</span>
-                               <span class="n">moe_ep_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">moe_ep_size</span><span class="p">,</span>
-                               <span class="n">gpus_per_node</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">gpus_per_node</span><span class="p">)</span></div>
+    <span class="k">def</span> <span class="nf">set_rank</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rank</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">rank</span> <span class="o">=</span> <span class="n">rank</span></div>
 
 
 <div class="viewcode-block" id="PretrainedConfig.get_config_group">
@@ -873,8 +867,10 @@
             <span class="n">config</span><span class="o">.</span><span class="n">set_rank</span><span class="p">(</span><span class="n">rank</span><span class="p">)</span>
 
         <span class="n">rank</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">rank</span>
-        <span class="c1"># tp_cp_pp rank -&gt; tp_pp rank: because different cp ranks share the same ckpt</span>
-        <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">cp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">auto_parallel</span><span class="p">:</span>
+            <span class="n">rank</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="k">elif</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">cp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="c1"># tp_cp_pp rank -&gt; tp_pp rank: because different cp ranks share the same ckpt</span>
             <span class="n">tp_size</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span>
             <span class="n">cp_size</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">cp_size</span>
             <span class="n">rank</span> <span class="o">=</span> <span class="n">rank</span> <span class="o">%</span> <span class="n">tp_size</span> <span class="o">+</span> <span class="n">rank</span> <span class="o">//</span> <span class="p">(</span><span class="n">tp_size</span> <span class="o">*</span> <span class="n">cp_size</span><span class="p">)</span> <span class="o">*</span> <span class="n">tp_size</span>
@@ -979,7 +975,7 @@
         <span class="n">lora_target_modules</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">opt_batch_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
         <span class="n">num_hidden_layers</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="n">mrope_rotary_sin_cos_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">mrope_rotary_cos_sin_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
 <span class="w">        </span><span class="sd">&#39;&#39;&#39;@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the</span>
 <span class="sd">            ranges of the dimensions of when using TRT dynamic shapes.</span>
@@ -1044,7 +1040,7 @@
             <span class="n">streamingllm</span><span class="o">=</span><span class="n">streamingllm</span><span class="p">,</span>
             <span class="n">opt_batch_size</span><span class="o">=</span><span class="n">opt_batch_size</span><span class="p">,</span>
             <span class="n">pp_reduce_scatter</span><span class="o">=</span><span class="n">pp_reduce_scatter</span><span class="p">,</span>
-            <span class="n">mrope_rotary_sin_cos_size</span><span class="o">=</span><span class="n">mrope_rotary_sin_cos_size</span><span class="p">)</span>
+            <span class="n">mrope_rotary_cos_sin_size</span><span class="o">=</span><span class="n">mrope_rotary_cos_sin_size</span><span class="p">)</span>
 
         <span class="n">result</span> <span class="o">=</span> <span class="p">{</span>
             <span class="s1">&#39;input_ids&#39;</span><span class="p">:</span>
@@ -1676,7 +1672,12 @@
                 <span class="n">layer</span><span class="o">.</span><span class="n">dense</span><span class="p">,</span> <span class="s1">&#39;activation_scaling_factor&#39;</span><span class="p">):</span>
             <span class="n">scale</span> <span class="o">=</span> <span class="p">[</span><span class="mf">1.0</span><span class="p">]</span> <span class="o">/</span> <span class="n">layer</span><span class="o">.</span><span class="n">dense</span><span class="o">.</span><span class="n">activation_scaling_factor</span><span class="o">.</span><span class="n">raw_value</span>
             <span class="n">layer</span><span class="o">.</span><span class="n">attention_output_orig_quant_scale</span> <span class="o">=</span> <span class="n">Parameter</span><span class="p">(</span>
-                <span class="n">value</span><span class="o">=</span><span class="n">scale</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">))</span>
+                <span class="n">value</span><span class="o">=</span><span class="n">scale</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="s1">&#39;float32&#39;</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">layer</span><span class="p">,</span> <span class="n">Attention</span><span class="p">)</span> <span class="ow">and</span> <span class="nb">hasattr</span><span class="p">(</span>
+                <span class="n">layer</span><span class="o">.</span><span class="n">dense</span><span class="p">,</span> <span class="s1">&#39;activation_scaling_factor_2&#39;</span><span class="p">):</span>
+            <span class="n">scale</span> <span class="o">=</span> <span class="n">layer</span><span class="o">.</span><span class="n">dense</span><span class="o">.</span><span class="n">activation_scaling_factor_2</span><span class="o">.</span><span class="n">raw_value</span>
+            <span class="n">layer</span><span class="o">.</span><span class="n">attention_output_orig_quant_scale</span> <span class="o">=</span> <span class="n">Parameter</span><span class="p">(</span>
+                <span class="n">value</span><span class="o">=</span><span class="n">scale</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="s1">&#39;float32&#39;</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">model</span>
 
 
@@ -1748,16 +1749,18 @@
         <span class="p">(</span><span class="nb">type</span><span class="p">(</span><span class="n">attn</span><span class="o">.</span><span class="n">qkv</span><span class="p">)</span> <span class="o">==</span> <span class="n">ColumnLinear</span> <span class="ow">or</span> <span class="nb">type</span><span class="p">(</span><span class="n">attn</span><span class="o">.</span><span class="n">qkv</span><span class="p">)</span> <span class="o">==</span> <span class="n">FP8Linear</span><span class="p">):</span>
             <span class="n">old_qkv</span> <span class="o">=</span> <span class="n">attn</span><span class="o">.</span><span class="n">qkv</span>
             <span class="n">linear_class</span> <span class="o">=</span> <span class="nb">type</span><span class="p">(</span><span class="n">old_qkv</span><span class="p">)</span>
-            <span class="n">new_kv</span> <span class="o">=</span> <span class="n">linear_class</span><span class="p">(</span><span class="n">in_features</span><span class="o">=</span><span class="n">attn</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
-                                  <span class="n">out_features</span><span class="o">=</span><span class="mi">2</span> <span class="o">*</span> <span class="n">attn</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">*</span>
-                                  <span class="n">attn</span><span class="o">.</span><span class="n">num_attention_kv_heads</span> <span class="o">*</span>
-                                  <span class="n">attn</span><span class="o">.</span><span class="n">attention_head_size</span><span class="p">,</span>
-                                  <span class="n">bias</span><span class="o">=</span><span class="n">old_qkv</span><span class="o">.</span><span class="n">bias</span><span class="p">,</span>
-                                  <span class="n">dtype</span><span class="o">=</span><span class="n">old_qkv</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
-                                  <span class="n">tp_group</span><span class="o">=</span><span class="n">old_qkv</span><span class="o">.</span><span class="n">tp_group</span><span class="p">,</span>
-                                  <span class="n">tp_size</span><span class="o">=</span><span class="n">old_qkv</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
-                                  <span class="n">gather_output</span><span class="o">=</span><span class="n">old_qkv</span><span class="o">.</span><span class="n">gather_output</span><span class="p">,</span>
-                                  <span class="n">is_qkv</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+            <span class="n">new_kv</span> <span class="o">=</span> <span class="n">linear_class</span><span class="p">(</span>
+                <span class="n">in_features</span><span class="o">=</span><span class="n">attn</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+                <span class="n">out_features</span><span class="o">=</span><span class="mi">2</span> <span class="o">*</span> <span class="n">attn</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">*</span> <span class="n">attn</span><span class="o">.</span><span class="n">num_attention_kv_heads</span> <span class="o">*</span>
+                <span class="n">attn</span><span class="o">.</span><span class="n">attention_head_size</span><span class="p">,</span>
+                <span class="n">bias</span><span class="o">=</span><span class="n">old_qkv</span><span class="o">.</span><span class="n">bias</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">old_qkv</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
+                <span class="n">tp_group</span><span class="o">=</span><span class="n">old_qkv</span><span class="o">.</span><span class="n">tp_group</span><span class="p">,</span>
+                <span class="n">tp_size</span><span class="o">=</span><span class="n">old_qkv</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
+                <span class="n">gather_output</span><span class="o">=</span><span class="n">old_qkv</span><span class="o">.</span><span class="n">gather_output</span><span class="p">,</span>
+                <span class="n">prefer_managed_weight</span><span class="o">=</span><span class="n">old_qkv</span><span class="o">.</span><span class="n">prefer_managed_weight</span><span class="p">,</span>
+                <span class="n">is_qkv</span><span class="o">=</span><span class="n">old_qkv</span><span class="o">.</span><span class="n">is_qkv</span><span class="p">,</span>
+            <span class="p">)</span>
 
             <span class="n">old_qkv_weight_value</span> <span class="o">=</span> <span class="n">old_qkv</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">raw_value</span>
             <span class="k">if</span> <span class="p">(</span><span class="n">old_qkv_weight_value</span><span class="o">.</span><span class="n">shape</span> <span class="o">==</span> <span class="n">np</span><span class="o">.</span><span class="n">asarray</span><span class="p">([</span>
@@ -1863,6 +1866,9 @@
                     <span class="n">weights</span><span class="p">[</span><span class="n">name</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span>
                         <span class="s1">&#39;weights_scaling_factor&#39;</span><span class="p">,</span> <span class="s1">&#39;alpha&#39;</span>
                     <span class="p">)]</span> <span class="o">=</span> <span class="n">activation_scaling_factor</span> <span class="o">*</span> <span class="n">weights_scaling_factor_2</span>
+                    <span class="n">weights</span><span class="p">[</span><span class="n">name</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s1">&#39;weights_scaling_factor&#39;</span><span class="p">,</span>
+                                         <span class="s1">&#39;activation_scaling_factor&#39;</span>
+                                         <span class="p">)]</span> <span class="o">=</span> <span class="n">activation_scaling_factor</span>
 
     <span class="c1"># FP8</span>
     <span class="k">elif</span> <span class="n">quant_algo</span> <span class="o">==</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8</span><span class="p">:</span>
@@ -1885,7 +1891,33 @@
                 <span class="n">model_config</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
             <span class="n">weights</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;lm_head.weights_scaling_factor&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
             <span class="n">weights</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;lm_head.activation_scaling_factor&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
-
+    <span class="c1"># FP4</span>
+    <span class="k">elif</span> <span class="n">quant_algo</span> <span class="o">==</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">NVFP4</span><span class="p">:</span>
+        <span class="c1"># Interleave block scale for NVFP4 plugin.</span>
+        <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="nb">list</span><span class="p">(</span><span class="n">weights</span><span class="p">):</span>
+            <span class="k">if</span> <span class="n">name</span><span class="o">.</span><span class="n">endswith</span><span class="p">(</span><span class="s1">&#39;weights_scaling_factor&#39;</span><span class="p">):</span>
+                <span class="n">ori_shape</span> <span class="o">=</span> <span class="n">weights</span><span class="p">[</span><span class="n">name</span><span class="p">]</span><span class="o">.</span><span class="n">shape</span>
+                <span class="n">weights</span><span class="p">[</span>
+                    <span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">tensorrt_llm</span><span class="o">.</span><span class="n">nvfp4_block_scale_interleave</span><span class="p">(</span>
+                        <span class="n">weights</span><span class="p">[</span><span class="n">name</span><span class="p">]</span><span class="o">.</span><span class="n">view</span><span class="p">(</span>
+                            <span class="n">torch</span><span class="o">.</span><span class="n">int8</span><span class="p">)</span><span class="o">.</span><span class="n">cpu</span><span class="p">()</span><span class="o">.</span><span class="n">contiguous</span><span class="p">())</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span>
+                                <span class="n">ori_shape</span><span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">name</span><span class="o">.</span><span class="n">endswith</span><span class="p">(</span><span class="s1">&#39;activation_scaling_factor&#39;</span><span class="p">):</span>
+                <span class="n">weights</span><span class="p">[</span><span class="n">name</span> <span class="o">+</span> <span class="s1">&#39;_2&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="mf">1.0</span> <span class="o">/</span> <span class="n">weights</span><span class="p">[</span><span class="n">name</span><span class="p">]</span>
+                <span class="n">weights</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">name</span><span class="o">.</span><span class="n">endswith</span><span class="p">(</span><span class="s1">&#39;weights_scaling_factor_2&#39;</span><span class="p">):</span>
+                <span class="n">weights</span><span class="p">[</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="mf">1.0</span> <span class="o">/</span> <span class="n">weights</span><span class="p">[</span><span class="n">name</span><span class="p">]</span>
+            <span class="k">if</span> <span class="n">name</span><span class="o">.</span><span class="n">endswith</span><span class="p">(</span><span class="s1">&#39;weight&#39;</span><span class="p">)</span> <span class="ow">and</span> <span class="n">weights</span><span class="p">[</span><span class="n">name</span><span class="p">]</span><span class="o">.</span><span class="n">dtype</span> <span class="o">==</span> <span class="n">torch</span><span class="o">.</span><span class="n">uint8</span><span class="p">:</span>
+                <span class="n">weights</span><span class="p">[</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="n">weights</span><span class="p">[</span><span class="n">name</span><span class="p">]</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">int64</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="nb">list</span><span class="p">(</span><span class="n">weights</span><span class="p">):</span>
+            <span class="k">if</span> <span class="n">name</span><span class="o">.</span><span class="n">endswith</span><span class="p">(</span><span class="s1">&#39;weights_scaling_factor_2&#39;</span><span class="p">):</span>
+                <span class="n">weight_global_sf</span> <span class="o">=</span> <span class="n">weights</span><span class="p">[</span><span class="n">name</span><span class="p">]</span>
+                <span class="n">act_global_sf</span> <span class="o">=</span> <span class="n">weights</span><span class="p">[</span><span class="n">name</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span>
+                    <span class="s1">&#39;weights_scaling_factor_2&#39;</span><span class="p">,</span> <span class="s1">&#39;activation_scaling_factor_2&#39;</span><span class="p">)]</span>
+                <span class="n">weights</span><span class="p">[</span><span class="n">name</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span>
+                    <span class="s1">&#39;weights_scaling_factor_2&#39;</span><span class="p">,</span>
+                    <span class="s1">&#39;alpha&#39;</span><span class="p">)]</span> <span class="o">=</span> <span class="mf">1.0</span> <span class="o">/</span> <span class="p">(</span><span class="n">act_global_sf</span> <span class="o">*</span> <span class="n">weight_global_sf</span><span class="p">)</span>
+                <span class="n">weights</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
     <span class="k">elif</span> <span class="n">quant_algo</span> <span class="ow">in</span> <span class="p">[</span><span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A16</span><span class="p">,</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W8A16</span><span class="p">]:</span>
         <span class="n">weights</span> <span class="o">=</span> <span class="n">weight_only_quantize_dict</span><span class="p">(</span><span class="n">weights</span><span class="o">=</span><span class="n">weights</span><span class="p">,</span>
                                             <span class="n">quant_algo</span><span class="o">=</span><span class="n">quant_algo</span><span class="p">,</span>
@@ -1907,6 +1939,20 @@
     <span class="n">quant_algo</span> <span class="o">=</span> <span class="n">quant_config</span><span class="o">.</span><span class="n">quant_algo</span>
 
     <span class="n">pattern_info</span> <span class="o">=</span> <span class="p">[</span><span class="s1">&#39;fc&#39;</span><span class="p">,</span> <span class="s1">&#39;gate&#39;</span><span class="p">,</span> <span class="s1">&#39;proj&#39;</span><span class="p">,</span> <span class="s1">&#39;qkv&#39;</span><span class="p">,</span> <span class="s1">&#39;dense&#39;</span><span class="p">]</span>
+
+    <span class="k">def</span> <span class="nf">add_kv_cache_rcp_scaling_factor</span><span class="p">(</span><span class="n">weights</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]):</span>
+        <span class="n">new_entries</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="c1"># The unified converter generate_tllm_weights() already generates these rcp weights, but legacy</span>
+        <span class="c1"># converters do not. Handle it here.</span>
+        <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">param</span> <span class="ow">in</span> <span class="n">weights</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="k">if</span> <span class="n">name</span><span class="o">.</span><span class="n">endswith</span><span class="p">(</span><span class="s1">&#39;.kv_cache_scaling_factor&#39;</span><span class="p">):</span>
+                <span class="n">rcp_name</span> <span class="o">=</span> <span class="n">name</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s1">&#39;kv_cache_scaling_factor&#39;</span><span class="p">,</span>
+                                        <span class="s1">&#39;kv_cache_rcp_scaling_factor&#39;</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">rcp_name</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">weights</span><span class="p">:</span>
+                    <span class="n">new_entries</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">rcp_name</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">reciprocal</span><span class="p">(</span><span class="n">param</span><span class="p">)))</span>
+        <span class="n">weights</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">new_entries</span><span class="p">)</span>
+
+    <span class="n">add_kv_cache_rcp_scaling_factor</span><span class="p">(</span><span class="n">weights</span><span class="p">)</span>
 
     <span class="n">per_layer_weights</span> <span class="o">=</span> <span class="p">{}</span>
 
@@ -1987,7 +2033,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f1ac7958170>
+<jinja2.runtime.BlockReference object at 0x7f5e6e4a5700>
 
 <div class="footer">
     <p>

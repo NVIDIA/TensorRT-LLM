@@ -15,7 +15,7 @@
       <script src="../_static/jquery.js?v=5d32c60e"></script>
       <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../_static/doctools.js?v=9a2dae69"></script>
       <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../_static/copybutton.js?v=65e89d2a"></script>
@@ -88,10 +88,7 @@
 <p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
 <ul class="current">
 <li class="toctree-l1"><a class="reference internal" href="trtllm-build.html">trtllm-build</a></li>
-<li class="toctree-l1 current"><a class="current reference internal" href="#">trtllm-serve</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="#trtllm-serve">trtllm-serve</a></li>
-</ul>
-</li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">trtllm-serve</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul>
@@ -167,88 +164,6 @@
              
   <section id="trtllm-serve">
 <h1>trtllm-serve<a class="headerlink" href="#trtllm-serve" title="Link to this heading"></a></h1>
-<section id="trtllm-serve">
-<h2>trtllm-serve<a class="headerlink" href="#trtllm-serve" title="Link to this heading"></a></h2>
-<p>Running an OpenAI API compatible server</p>
-<p>MODEL: model name | HF checkpoint path | TensorRT engine path</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span><span class="w"> </span>MODEL
-</pre></div>
-</div>
-<p class="rubric">Options</p>
-<dl class="std option">
-<dt class="sig sig-object std" id="cmdoption-trtllm-serve-tokenizer">
-<span class="sig-name descname"><span class="pre">--tokenizer</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;tokenizer&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-tokenizer" title="Link to this definition"></a></dt>
-<dd><p>Path | Name of the tokenizer.Specify this value only if using TensorRT engine as model.</p>
-</dd></dl>
-
-<dl class="std option">
-<dt class="sig sig-object std" id="cmdoption-trtllm-serve-host">
-<span class="sig-name descname"><span class="pre">--host</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;host&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-host" title="Link to this definition"></a></dt>
-<dd><p>Hostname of the server.</p>
-</dd></dl>
-
-<dl class="std option">
-<dt class="sig sig-object std" id="cmdoption-trtllm-serve-port">
-<span class="sig-name descname"><span class="pre">--port</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;port&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-port" title="Link to this definition"></a></dt>
-<dd><p>Port of the server.</p>
-</dd></dl>
-
-<dl class="std option">
-<dt class="sig sig-object std" id="cmdoption-trtllm-serve-max_beam_width">
-<span class="sig-name descname"><span class="pre">--max_beam_width</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_beam_width&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-max_beam_width" title="Link to this definition"></a></dt>
-<dd><p>Maximum number of beams for beam search decoding.</p>
-</dd></dl>
-
-<dl class="std option">
-<dt class="sig sig-object std" id="cmdoption-trtllm-serve-max_batch_size">
-<span class="sig-name descname"><span class="pre">--max_batch_size</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_batch_size&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-max_batch_size" title="Link to this definition"></a></dt>
-<dd><p>Maximum number of requests that the engine can schedule.</p>
-</dd></dl>
-
-<dl class="std option">
-<dt class="sig sig-object std" id="cmdoption-trtllm-serve-max_num_tokens">
-<span class="sig-name descname"><span class="pre">--max_num_tokens</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_num_tokens&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-max_num_tokens" title="Link to this definition"></a></dt>
-<dd><p>Maximum number of batched input tokens after padding is removed in each batch.</p>
-</dd></dl>
-
-<dl class="std option">
-<dt class="sig sig-object std" id="cmdoption-trtllm-serve-max_seq_len">
-<span class="sig-name descname"><span class="pre">--max_seq_len</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;max_seq_len&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-max_seq_len" title="Link to this definition"></a></dt>
-<dd><p>Maximum total length of one request, including prompt and outputs. If unspecified, the value is deduced from the model config.</p>
-</dd></dl>
-
-<dl class="std option">
-<dt class="sig sig-object std" id="cmdoption-trtllm-serve-tp_size">
-<span class="sig-name descname"><span class="pre">--tp_size</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;tp_size&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-tp_size" title="Link to this definition"></a></dt>
-<dd><p>Tensor parallelism size.</p>
-</dd></dl>
-
-<dl class="std option">
-<dt class="sig sig-object std" id="cmdoption-trtllm-serve-pp_size">
-<span class="sig-name descname"><span class="pre">--pp_size</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;pp_size&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-pp_size" title="Link to this definition"></a></dt>
-<dd><p>Pipeline parallelism size.</p>
-</dd></dl>
-
-<dl class="std option">
-<dt class="sig sig-object std" id="cmdoption-trtllm-serve-kv_cache_free_gpu_memory_fraction">
-<span class="sig-name descname"><span class="pre">--kv_cache_free_gpu_memory_fraction</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;kv_cache_free_gpu_memory_fraction&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-kv_cache_free_gpu_memory_fraction" title="Link to this definition"></a></dt>
-<dd><p>Free GPU memory fraction reserved for KV Cache, after allocating model weights and buffers.</p>
-</dd></dl>
-
-<dl class="std option">
-<dt class="sig sig-object std" id="cmdoption-trtllm-serve-trust_remote_code">
-<span class="sig-name descname"><span class="pre">--trust_remote_code</span></span><span class="sig-prename descclassname"></span><a class="headerlink" href="#cmdoption-trtllm-serve-trust_remote_code" title="Link to this definition"></a></dt>
-<dd><p>Flag for HF transformers.</p>
-</dd></dl>
-
-<p class="rubric">Arguments</p>
-<dl class="std option">
-<dt class="sig sig-object std" id="cmdoption-trtllm-serve-arg-MODEL">
-<span class="sig-name descname"><span class="pre">MODEL</span></span><span class="sig-prename descclassname"></span><a class="headerlink" href="#cmdoption-trtllm-serve-arg-MODEL" title="Link to this definition"></a></dt>
-<dd><p>Required argument</p>
-</dd></dl>
-
-</section>
 </section>
 
 
@@ -262,7 +177,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f1ac74c98b0>
+<jinja2.runtime.BlockReference object at 0x74a61b15b830>
 
 <div class="footer">
     <p>

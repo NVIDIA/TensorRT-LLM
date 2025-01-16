@@ -1,5 +1,12 @@
 /*
+ * basic.css
+ * ~~~~~~~~~
+ *
  * Sphinx stylesheet -- basic theme.
+ *
+ * :copyright: Copyright 2007-2024 by the Sphinx team, see AUTHORS.
+ * :license: BSD, see LICENSE for details.
+ *
  */
 
 /* -- main layout ----------------------------------------------------------- */
@@ -108,11 +115,15 @@ img {
 /* -- search page ----------------------------------------------------------- */
 
 ul.search {
-    margin-top: 10px;
+    margin: 10px 0 0 20px;
+    padding: 0;
 }
 
 ul.search li {
-    padding: 5px 0;
+    padding: 5px 0 5px 20px;
+    background-image: url(file.png);
+    background-repeat: no-repeat;
+    background-position: 0 7px;
 }
 
 ul.search li a {
