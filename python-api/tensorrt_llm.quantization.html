@@ -7,7 +7,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Quantization &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=80d5e7a1" />
+      <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
 
@@ -15,7 +15,7 @@
       <script src="../_static/jquery.js?v=5d32c60e"></script>
       <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../_static/doctools.js?v=9a2dae69"></script>
+      <script src="../_static/doctools.js?v=9bcbadda"></script>
       <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../_static/copybutton.js?v=65e89d2a"></script>
@@ -77,7 +77,12 @@
 <li class="toctree-l1"><a class="reference internal" href="tensorrt_llm.functional.html">Functionals</a></li>
 <li class="toctree-l1"><a class="reference internal" href="tensorrt_llm.models.html">Models</a></li>
 <li class="toctree-l1"><a class="reference internal" href="tensorrt_llm.plugin.html">Plugin</a></li>
-<li class="toctree-l1 current"><a class="current reference internal" href="#">Quantization</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">Quantization</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#tensorrt_llm.quantization.QuantAlgo"><code class="docutils literal notranslate"><span class="pre">QuantAlgo</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="#tensorrt_llm.quantization.QuantMode"><code class="docutils literal notranslate"><span class="pre">QuantMode</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="#tensorrt_llm.quantization.quantize_and_export"><code class="docutils literal notranslate"><span class="pre">quantize_and_export()</span></code></a></li>
+</ul>
+</li>
 <li class="toctree-l1"><a class="reference internal" href="tensorrt_llm.runtime.html">Runtime</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
@@ -162,8 +167,29 @@
           <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
            <div itemprop="articleBody">
              
-  <section id="quantization">
-<h1>Quantization<a class="headerlink" href="#quantization" title="Link to this heading"></a></h1>
+  <section id="module-tensorrt_llm">
+<span id="quantization"></span><h1>Quantization<a class="headerlink" href="#module-tensorrt_llm" title="Link to this heading"></a></h1>
+<dl class="py class" id="module-tensorrt_llm.quantization">
+<dt class="sig sig-object py" id="tensorrt_llm.quantization.QuantAlgo">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.quantization.</span></span><span class="sig-name descname"><span class="pre">QuantAlgo</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">value</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/quantization/mode.html#QuantAlgo"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.quantization.QuantAlgo" title="Link to this definition"></a></dt>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">StrEnum</span></code></p>
+<p>An enumeration.</p>
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="tensorrt_llm.quantization.QuantMode">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.quantization.</span></span><span class="sig-name descname"><span class="pre">QuantMode</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">value</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/quantization/mode.html#QuantMode"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.quantization.QuantMode" title="Link to this definition"></a></dt>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">IntFlag</span></code></p>
+<p>An enumeration.</p>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="tensorrt_llm.quantization.quantize_and_export">
+<span class="sig-prename descclassname"><span class="pre">tensorrt_llm.quantization.</span></span><span class="sig-name descname"><span class="pre">quantize_and_export</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">model_dir</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">calib_dataset</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dtype</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">qformat</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kv_cache_dtype</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">calib_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">batch_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">calib_max_seq_length</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">awq_block_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">output_dir</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tp_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pp_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cp_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">seed</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tokenizer_max_seq_length</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_medusa_heads</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_medusa_layers</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_draft_len</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">medusa_hidden_act</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">medusa_model_dir</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">quant_medusa_head</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">auto_quantize_bits</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/quantization/quantize_by_modelopt.html#quantize_and_export"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.quantization.quantize_and_export" title="Link to this definition"></a></dt>
+<dd><p>Load model from the model_dir, call Modelopt to quantize the model, and then export
+the quantized model as TRT-LLM checkpoint</p>
+</dd></dl>
+
 </section>
 
 
@@ -177,7 +203,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x74a6184daab0>
+<jinja2.runtime.BlockReference object at 0x7fed12efea40>
 
 <div class="footer">
     <p>
