@@ -14,7 +14,7 @@
       <script src="../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../../_static/doctools.js?v=9a2dae69"></script>
       <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../_static/copybutton.js?v=65e89d2a"></script>
@@ -110,7 +110,6 @@
 <li class="toctree-l1"><a class="reference internal" href="../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul>
@@ -205,6 +204,19 @@
 
 
 
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">slots</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">kw_only</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span> <span class="nc">AdditionalModelOutput</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    An additional output to gather from the model.</span>
+
+<span class="sd">    Args:</span>
+<span class="sd">        name (str): The name of the additional output to gather from the model.</span>
+<span class="sd">        gather_context (bool): A value indicating whether or not to gather the additional output from the context too. Defaults to False.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">name</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">gather_context</span><span class="p">:</span> <span class="nb">bool</span>
+
+
 <div class="viewcode-block" id="SamplingParams">
 <a class="viewcode-back" href="../../llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams">[docs]</a>
 <span class="nd">@dataclass</span><span class="p">(</span><span class="n">slots</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">kw_only</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
@@ -257,6 +269,7 @@
 <span class="sd">        exclude_input_from_output (bool): Controls if output tokens in Result should include the input tokens. Default is true.</span>
 <span class="sd">        return_encoder_output (bool): Controls if Result should contain encoder output hidden states (for encoder-only and encoder-decoder models). Default is false.</span>
 <span class="sd">        return_perf_metrics (bool): Controls if Result should contain the performance metrics for this request. Default is false.</span>
+<span class="sd">        additional_model_outputs (list[AdditionalModelOutput], optional): The additional outputs to gather from the model.</span>
 
 <span class="sd">        lookahead_config (LookaheadDecodingConfig , optional): Lookahead decoding config. Defaults to None.</span>
 <span class="sd">        guided_decoding (GuidedDecodingParams, optional): Guided decoding params. Defaults to None.</span>
@@ -331,6 +344,7 @@
     <span class="n">exclude_input_from_output</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="n">return_encoder_output</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="n">return_perf_metrics</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="n">additional_model_outputs</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="n">AdditionalModelOutput</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="c1"># Lookahead decoding config</span>
     <span class="n">lookahead_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">tllme</span><span class="o">.</span><span class="n">LookaheadDecodingConfig</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
@@ -554,7 +568,8 @@
         <span class="n">expected_fields</span> <span class="o">=</span> <span class="p">[</span>
             <span class="s2">&quot;return_log_probs&quot;</span><span class="p">,</span> <span class="s2">&quot;return_context_logits&quot;</span><span class="p">,</span>
             <span class="s2">&quot;return_generation_logits&quot;</span><span class="p">,</span> <span class="s2">&quot;exclude_input_from_output&quot;</span><span class="p">,</span>
-            <span class="s2">&quot;return_encoder_output&quot;</span><span class="p">,</span> <span class="s2">&quot;return_perf_metrics&quot;</span>
+            <span class="s2">&quot;return_encoder_output&quot;</span><span class="p">,</span> <span class="s2">&quot;return_perf_metrics&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;additional_model_outputs&quot;</span>
         <span class="p">]</span>
         <span class="n">found_fields</span> <span class="o">=</span> <span class="p">[</span>
             <span class="n">f</span> <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="nb">dir</span><span class="p">(</span><span class="n">tllme</span><span class="o">.</span><span class="n">OutputConfig</span><span class="p">)</span> <span class="k">if</span> <span class="ow">not</span> <span class="n">f</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s1">&#39;__&#39;</span><span class="p">)</span>
@@ -601,7 +616,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f1ac93f56d0>
+<jinja2.runtime.BlockReference object at 0x7f5e6e3542f0>
 
 <div class="footer">
     <p>

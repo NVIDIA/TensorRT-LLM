@@ -14,7 +14,7 @@
       <script src="../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../../_static/doctools.js?v=9a2dae69"></script>
       <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../_static/copybutton.js?v=65e89d2a"></script>
@@ -110,7 +110,6 @@
 <li class="toctree-l1"><a class="reference internal" href="../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul>
@@ -208,7 +207,7 @@
 <span class="sd">            self.min = [dim 0 min, dim 1 min]</span>
 <span class="sd">            self.opt = [dim 0 opt, dim 1 opt]</span>
 <span class="sd">            self.max = [dim 0 max, dim 1 max]</span>
-<span class="sd">        For static dimension, it has min==opt==max, thus the \p shape param in the ctor can be an integer</span>
+<span class="sd">        For static dimension, it has min==opt==max, thus the shape param in the ctor can be an integer</span>
 <span class="sd">    &#39;&#39;&#39;</span>
 
     <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">shape</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">Tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]],</span>
@@ -2760,9 +2759,9 @@
                                                          <span class="n">to_array</span><span class="o">=</span><span class="kc">False</span><span class="p">),</span>
                                      <span class="n">reduction_length</span><span class="p">,</span>
                                      <span class="n">dtype</span><span class="o">=</span><span class="s1">&#39;int64&#39;</span><span class="p">)</span>
-            <span class="n">lower_triangle</span> <span class="o">=</span> <span class="n">cast</span><span class="p">(</span>
-                <span class="n">unsqueeze</span><span class="p">(</span><span class="n">reduction_range</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">&lt;=</span> <span class="n">unsqueeze</span><span class="p">(</span><span class="n">reduction_range</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span>
-                <span class="n">dtype</span><span class="o">=</span><span class="nb">input</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+            <span class="n">lower_triangle</span> <span class="o">=</span> <span class="n">cast</span><span class="p">(</span><span class="n">unsqueeze</span><span class="p">(</span><span class="n">reduction_range</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+                                  <span class="o">&lt;=</span> <span class="n">unsqueeze</span><span class="p">(</span><span class="n">reduction_range</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span>
+                                  <span class="n">dtype</span><span class="o">=</span><span class="nb">input</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
             <span class="n">output</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="n">unsqueeze</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="o">-</span><span class="mi">2</span><span class="p">)</span> <span class="o">*</span> <span class="n">lower_triangle</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
             <span class="k">return</span> <span class="n">output</span>
     <span class="k">else</span><span class="p">:</span>
@@ -4216,7 +4215,8 @@
 <span class="sd">    &quot;&quot;&quot;</span>
     <span class="n">NONE</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="n">RESIDUAL_RMS_NORM</span> <span class="o">=</span> <span class="mi">1</span>
-    <span class="n">LAST_PROCESS_FOR_UB</span> <span class="o">=</span> <span class="mi">2</span></div>
+    <span class="n">LAST_PROCESS_FOR_UB</span> <span class="o">=</span> <span class="mi">2</span>
+    <span class="n">RESIDUAL_RMS_PREPOST_NORM</span> <span class="o">=</span> <span class="mi">3</span></div>
 
 
 
@@ -4232,6 +4232,7 @@
                  <span class="n">residual</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">norm_weight</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">scale</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">norm_pre_residual_weight</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">eps</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1e-06</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">strategy</span> <span class="o">=</span> <span class="n">strategy</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">config</span> <span class="o">=</span> <span class="n">config</span>
@@ -4240,6 +4241,7 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">residual</span> <span class="o">=</span> <span class="n">residual</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">norm_weight</span> <span class="o">=</span> <span class="n">norm_weight</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">scale</span> <span class="o">=</span> <span class="n">scale</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">norm_pre_residual_weight</span> <span class="o">=</span> <span class="n">norm_pre_residual_weight</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">eps</span> <span class="o">=</span> <span class="n">eps</span>
         <span class="k">assert</span> <span class="n">fusion_op</span> <span class="o">==</span> <span class="n">AllReduceFusionOp</span><span class="o">.</span><span class="n">NONE</span> <span class="ow">or</span> <span class="p">(</span><span class="n">residual</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">)</span>
 
@@ -4305,6 +4307,7 @@
         <span class="s2">&quot;eps&quot;</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">([</span><span class="nb">float</span><span class="p">(</span><span class="n">all_reduce_params</span><span class="o">.</span><span class="n">eps</span><span class="p">)],</span> <span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">),</span>
         <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">FLOAT32</span><span class="p">)</span>
     <span class="n">pfc</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">p_eps</span><span class="p">)</span>
+
     <span class="n">p_affine</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span>
         <span class="s2">&quot;affine&quot;</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">([</span><span class="nb">int</span><span class="p">(</span><span class="n">all_reduce_params</span><span class="o">.</span><span class="n">has_affine</span><span class="p">())],</span> <span class="n">np</span><span class="o">.</span><span class="n">int8</span><span class="p">),</span>
         <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT8</span><span class="p">)</span>
@@ -4329,6 +4332,9 @@
         <span class="n">plug_inputs</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">all_reduce_params</span><span class="o">.</span><span class="n">residual</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">all_reduce_params</span><span class="o">.</span><span class="n">has_affine</span><span class="p">()</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
             <span class="n">plug_inputs</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">all_reduce_params</span><span class="o">.</span><span class="n">norm_weight</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">all_reduce_params</span><span class="o">.</span><span class="n">fusion_op</span> <span class="o">==</span> <span class="n">AllReduceFusionOp</span><span class="o">.</span><span class="n">RESIDUAL_RMS_PREPOST_NORM</span><span class="p">:</span>
+                <span class="n">plug_inputs</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
+                    <span class="n">all_reduce_params</span><span class="o">.</span><span class="n">norm_pre_residual_weight</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">all_reduce_params</span><span class="o">.</span><span class="n">has_scale</span><span class="p">()</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
             <span class="n">plug_inputs</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">all_reduce_params</span><span class="o">.</span><span class="n">scale</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">)</span>
 
@@ -5385,9 +5391,10 @@
     <span class="n">spec_decoding_generation_lengths</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="n">spec_decoding_position_offsets</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="n">spec_decoding_packed_mask</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">spec_decoding_use</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="n">long_rope_rotary_inv_freq</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="n">long_rope_rotary_cos_sin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-    <span class="n">mrope_rotary_sin_cos</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">mrope_rotary_cos_sin</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="n">mrope_position_deltas</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="n">host_runtime_perf_knobs</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="n">host_context_progress</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -5672,7 +5679,7 @@
 
     <span class="k">assert</span> <span class="n">host_request_types</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
     <span class="k">assert</span> <span class="p">(</span><span class="n">alibi_slopes</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">)</span> <span class="o">==</span> <span class="p">(</span><span class="n">position_embedding_type</span><span class="o">.</span><span class="n">is_alibi</span><span class="p">())</span>
-    <span class="k">assert</span> <span class="p">(</span><span class="n">mrope_rotary_sin_cos</span>
+    <span class="k">assert</span> <span class="p">(</span><span class="n">mrope_rotary_cos_sin</span>
             <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">)</span> <span class="o">==</span> <span class="p">(</span><span class="n">position_embedding_type</span><span class="o">.</span><span class="n">is_mrope</span><span class="p">())</span>
     <span class="n">attn_plg_creator</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">get_plugin_registry</span><span class="p">()</span><span class="o">.</span><span class="n">get_plugin_creator</span><span class="p">(</span>
         <span class="s1">&#39;GPTAttention&#39;</span><span class="p">,</span> <span class="s1">&#39;1&#39;</span><span class="p">,</span> <span class="n">TRT_LLM_PLUGIN_NAMESPACE</span><span class="p">)</span>
@@ -6001,19 +6008,20 @@
         <span class="c1"># add position_ids as well only if speculative decoding mode</span>
         <span class="k">assert</span> <span class="n">spec_decoding_position_offsets</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
         <span class="k">assert</span> <span class="n">spec_decoding_generation_lengths</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+        <span class="k">assert</span> <span class="n">spec_decoding_use</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
         <span class="n">plug_inputs</span> <span class="o">+=</span> <span class="p">[</span>
             <span class="n">spec_decoding_generation_lengths</span><span class="p">,</span> <span class="n">spec_decoding_packed_mask</span><span class="p">,</span>
-            <span class="n">spec_decoding_position_offsets</span>
+            <span class="n">spec_decoding_position_offsets</span><span class="p">,</span> <span class="n">spec_decoding_use</span>
         <span class="p">]</span>
 
     <span class="k">if</span> <span class="n">long_rope_rotary_inv_freq</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">assert</span> <span class="n">long_rope_rotary_cos_sin</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
         <span class="n">plug_inputs</span> <span class="o">+=</span> <span class="p">[</span><span class="n">long_rope_rotary_inv_freq</span><span class="p">,</span> <span class="n">long_rope_rotary_cos_sin</span><span class="p">]</span>
 
-    <span class="k">if</span> <span class="n">mrope_rotary_sin_cos</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="k">if</span> <span class="n">mrope_rotary_cos_sin</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">assert</span> <span class="n">mrope_position_deltas</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
         <span class="n">plug_inputs</span> <span class="o">+=</span> <span class="p">[</span>
-            <span class="n">mrope_rotary_sin_cos</span><span class="p">,</span>
+            <span class="n">mrope_rotary_cos_sin</span><span class="p">,</span>
             <span class="n">mrope_position_deltas</span><span class="p">,</span>
         <span class="p">]</span>
     <span class="k">if</span> <span class="n">host_runtime_perf_knobs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
@@ -6494,6 +6502,7 @@
     <span class="s1">&#39;identity&#39;</span><span class="p">:</span> <span class="n">identity</span><span class="p">,</span>
     <span class="s1">&#39;silu&#39;</span><span class="p">:</span> <span class="n">silu</span><span class="p">,</span>
     <span class="s1">&#39;softplus&#39;</span><span class="p">:</span> <span class="n">softplus</span><span class="p">,</span>
+    <span class="s1">&#39;relu2&#39;</span><span class="p">:</span> <span class="n">squared_relu</span><span class="p">,</span>
     <span class="s1">&#39;squared-relu&#39;</span><span class="p">:</span> <span class="n">squared_relu</span><span class="p">,</span>
     <span class="s1">&#39;swiglu&#39;</span><span class="p">:</span> <span class="n">swiglu</span><span class="p">,</span>
     <span class="s1">&#39;fast-swiglu&#39;</span><span class="p">:</span> <span class="n">swiglu</span><span class="p">,</span>
@@ -7515,7 +7524,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f1ac686a480>
+<jinja2.runtime.BlockReference object at 0x7f59fcc7af90>
 
 <div class="footer">
     <p>

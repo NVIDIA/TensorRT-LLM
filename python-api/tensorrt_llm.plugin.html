@@ -15,7 +15,7 @@
       <script src="../_static/jquery.js?v=5d32c60e"></script>
       <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../_static/doctools.js?v=9a2dae69"></script>
       <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../_static/copybutton.js?v=65e89d2a"></script>
@@ -76,13 +76,7 @@
 <li class="toctree-l1"><a class="reference internal" href="tensorrt_llm.layers.html">Layers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="tensorrt_llm.functional.html">Functionals</a></li>
 <li class="toctree-l1"><a class="reference internal" href="tensorrt_llm.models.html">Models</a></li>
-<li class="toctree-l1 current"><a class="current reference internal" href="#">Plugin</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="#tensorrt_llm.plugin.PluginConfig"><code class="docutils literal notranslate"><span class="pre">PluginConfig</span></code></a><ul>
-<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.plugin.PluginConfig.to_legacy_setting"><code class="docutils literal notranslate"><span class="pre">PluginConfig.to_legacy_setting()</span></code></a></li>
-</ul>
-</li>
-</ul>
-</li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">Plugin</a></li>
 <li class="toctree-l1"><a class="reference internal" href="tensorrt_llm.quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="tensorrt_llm.runtime.html">Runtime</a></li>
 </ul>
@@ -168,45 +162,8 @@
           <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
            <div itemprop="articleBody">
              
-  <section id="module-tensorrt_llm">
-<span id="plugin"></span><h1>Plugin<a class="headerlink" href="#module-tensorrt_llm" title="Link to this heading"></a></h1>
-<dl class="py class" id="module-tensorrt_llm.plugin">
-<dt class="sig sig-object py" id="tensorrt_llm.plugin.PluginConfig">
-<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.plugin.</span></span><span class="sig-name descname"><span class="pre">PluginConfig</span></span><a class="reference internal" href="../_modules/tensorrt_llm/plugin/plugin.html#PluginConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.plugin.PluginConfig" title="Link to this definition"></a></dt>
-<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></p>
-<p>The config that manages plugin-related options.</p>
-<p>There are two option categories:
-* Plugin options (typically with xxx_plugin naming). These options can be assigned with:</p>
-<blockquote>
-<div><ul class="simple">
-<li><p>“float16”/”bfloat16”/”float32”/”int32”, which means the plugin is enabled with the specified precision; (Some plugins only support limited dtype, i.e., gemm_swiglu_plugin and low_latency_gemm_swiglu_plugin only supports fp8 now)</p></li>
-<li><p>“auto”, which means the plugin is enabled with the precision of <cite>dtype</cite> field (the <cite>dtype</cite> field must be same to model dtype, i.e., the one in PretrainedConfig);</p></li>
-<li><p>None, which means the plugin is disabled.</p></li>
-</ul>
-</div></blockquote>
-<ul class="simple">
-<li><dl class="simple">
-<dt>Other features. These options can be assigned with boolean:</dt><dd><ul>
-<li><p>True, which means the plugin is enabled;</p></li>
-<li><p>False, which means the plugin is disabled.</p></li>
-</ul>
-</dd>
-</dl>
-</li>
-</ul>
-<p>Note: All the fields should use a prefix “_”; PluginConfigMeta will wrap each field as a property.
-This ensures the fields can only be assigned with allowed values.</p>
-<dl class="py method">
-<dt class="sig sig-object py" id="tensorrt_llm.plugin.PluginConfig.to_legacy_setting">
-<span class="sig-name descname"><span class="pre">to_legacy_setting</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/plugin/plugin.html#PluginConfig.to_legacy_setting"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.plugin.PluginConfig.to_legacy_setting" title="Link to this definition"></a></dt>
-<dd><p>Legacy setting means that all of the plugins and features are
-disabled, this is needed for the legacy <cite>build.py</cite> script, which will be
-migrated to the centralized building script <cite>tensorrt_llm/commands/build.py</cite>.</p>
-<p>After the migration is done, this function may or may not be deleted.</p>
-</dd></dl>
-
-</dd></dl>
-
+  <section id="plugin">
+<h1>Plugin<a class="headerlink" href="#plugin" title="Link to this heading"></a></h1>
 </section>
 
 
@@ -220,7 +177,7 @@ migrated to the centralized building script <cite>tensorrt_llm/commands/build.py
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f1ac5bb88c0>
+<jinja2.runtime.BlockReference object at 0x74a61459a4b0>
 
 <div class="footer">
     <p>

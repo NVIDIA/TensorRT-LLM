@@ -14,7 +14,7 @@
       <script src="../../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../../../_static/doctools.js?v=9a2dae69"></script>
       <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
@@ -110,7 +110,6 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul>
@@ -597,7 +596,10 @@
         <span class="k">else</span><span class="p">:</span>
             <span class="n">use_fast</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;phi-3-vision&quot;</span><span class="p">,</span> <span class="s2">&quot;internvl&quot;</span><span class="p">]</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span> <span class="o">=</span> <span class="n">AutoTokenizer</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">hf_model_dir</span><span class="p">,</span> <span class="n">use_fast</span><span class="o">=</span><span class="n">use_fast</span><span class="p">,</span> <span class="n">use_legacy</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">hf_model_dir</span><span class="p">,</span>
+                <span class="n">use_fast</span><span class="o">=</span><span class="n">use_fast</span><span class="p">,</span>
+                <span class="n">use_legacy</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                <span class="n">trust_remote_code</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">padding_side</span> <span class="o">=</span> <span class="s2">&quot;right&quot;</span></div>
 
@@ -674,7 +676,11 @@
                                       <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
                                                        <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">)</span>
 
-            <span class="bp">self</span><span class="o">.</span><span class="n">processor</span> <span class="o">=</span> <span class="n">processor</span></div>
+            <span class="bp">self</span><span class="o">.</span><span class="n">processor</span> <span class="o">=</span> <span class="n">processor</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;mllama&#39;</span><span class="p">:</span>
+            <span class="kn">from</span> <span class="nn">.processor_wrapper</span> <span class="kn">import</span> <span class="n">MllamaProcessorWrapper</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">processor</span> <span class="o">=</span> <span class="n">MllamaProcessorWrapper</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">processor</span><span class="p">,</span> <span class="n">logger</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="MultimodalModelRunner.init_image_encoder">
@@ -815,6 +821,15 @@
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.preprocess">[docs]</a>
     <span class="k">def</span> <span class="nf">preprocess</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">warmup</span><span class="p">,</span> <span class="n">pre_prompt</span><span class="p">,</span> <span class="n">post_prompt</span><span class="p">,</span> <span class="n">image</span><span class="p">,</span>
                    <span class="n">other_vision_inputs</span><span class="p">):</span>
+        <span class="c1"># same prompt for single/multiple image(s)</span>
+        <span class="n">n_prompts_n_images</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span>
+                <span class="n">post_prompt</span><span class="p">,</span>
+                <span class="nb">list</span><span class="p">)</span> <span class="ow">and</span> <span class="nb">len</span><span class="p">(</span><span class="n">post_prompt</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="ow">and</span> <span class="n">image</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="nb">len</span><span class="p">(</span>
+                    <span class="n">post_prompt</span><span class="p">)</span> <span class="o">==</span> <span class="n">image</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]:</span>
+            <span class="c1"># n prompts and n images</span>
+            <span class="n">n_prompts_n_images</span> <span class="o">=</span> <span class="kc">True</span>
+
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;kosmos-2&#39;</span><span class="p">:</span>
             <span class="n">input_ids</span> <span class="o">=</span> <span class="n">image</span><span class="p">[</span><span class="s1">&#39;input_ids&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
             <span class="n">image_mask</span> <span class="o">=</span> <span class="n">image</span><span class="p">[</span><span class="s2">&quot;image_embeds_position_mask&quot;</span><span class="p">]</span>
@@ -900,25 +915,43 @@
         <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;kosmos-2&#39;</span><span class="p">:</span>
             <span class="n">visual_features</span> <span class="o">=</span> <span class="n">visual_features</span><span class="o">.</span><span class="n">squeeze</span><span class="p">()</span>
         <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;vila&#39;</span><span class="p">:</span>
-            <span class="n">input_ids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer_image_token</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">,</span> <span class="n">pre_prompt</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">+</span> <span class="n">post_prompt</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">)</span>
-            <span class="n">batch_split_prompts</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">split_prompt_by_images</span><span class="p">(</span><span class="n">input_ids</span><span class="p">)</span>
-            <span class="n">first_batch_split_prompts</span> <span class="o">=</span> <span class="n">batch_split_prompts</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
-            <span class="c1"># compute prompt length + visual length</span>
-            <span class="n">length</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">([</span><span class="n">ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="k">for</span> <span class="n">ids</span> <span class="ow">in</span> <span class="n">first_batch_split_prompts</span><span class="p">])</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span> <span class="o">==</span> <span class="mi">1</span> <span class="ow">and</span> <span class="nb">len</span><span class="p">(</span><span class="n">image</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
-                <span class="c1"># mode 1: multiple image as a whole, flatten visual dims</span>
-                <span class="n">length</span> <span class="o">+=</span> <span class="n">visual_atts</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">*</span> <span class="n">visual_atts</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+            <span class="k">if</span> <span class="n">n_prompts_n_images</span><span class="p">:</span>
+                <span class="n">input_ids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer_image_token</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">,</span>
+                                                       <span class="n">pre_prompt</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span>
+                                                       <span class="n">post_prompt</span><span class="p">,</span>
+                                                       <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">)</span>
             <span class="k">else</span><span class="p">:</span>
-                <span class="c1"># mode 2: multiple images individually (replicate prompt for each image)</span>
-                <span class="n">length</span> <span class="o">+=</span> <span class="n">visual_atts</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
-
-            <span class="n">input_lengths</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">IntTensor</span><span class="p">([</span><span class="n">length</span><span class="p">]</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span>
-                <span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
-            <span class="n">input_ids</span><span class="p">,</span> <span class="n">ptuning_args</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">setup_fake_prompts_vila</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">,</span> <span class="n">visual_features</span><span class="p">,</span>
-                <span class="n">first_batch_split_prompts</span><span class="p">,</span> <span class="n">input_lengths</span><span class="p">)</span>
+                <span class="n">input_ids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer_image_token</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">,</span>
+                                                       <span class="n">pre_prompt</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span>
+                                                       <span class="n">post_prompt</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span>
+                                                       <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">)</span>
+            <span class="n">batch_split_prompts</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">split_prompt_by_images</span><span class="p">(</span><span class="n">input_ids</span><span class="p">)</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">n_prompts_n_images</span><span class="p">:</span>
+                <span class="n">first_batch_split_prompts</span> <span class="o">=</span> <span class="n">batch_split_prompts</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+                <span class="c1"># compute prompt length + visual length</span>
+                <span class="n">length</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span>
+                    <span class="p">[</span><span class="n">ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="k">for</span> <span class="n">ids</span> <span class="ow">in</span> <span class="n">first_batch_split_prompts</span><span class="p">])</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span> <span class="o">==</span> <span class="mi">1</span> <span class="ow">and</span> <span class="nb">len</span><span class="p">(</span><span class="n">image</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+                    <span class="c1"># mode 1: multiple image as a whole, flatten visual dims</span>
+                    <span class="n">length</span> <span class="o">+=</span> <span class="n">visual_atts</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">*</span> <span class="n">visual_atts</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="n">length</span> <span class="o">+=</span> <span class="n">visual_atts</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+                <span class="n">input_lengths</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">IntTensor</span><span class="p">(</span>
+                    <span class="p">[</span><span class="n">length</span><span class="p">]</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
+                <span class="n">input_ids</span><span class="p">,</span> <span class="n">ptuning_args</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">setup_fake_prompts_vila</span><span class="p">(</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">,</span> <span class="n">visual_features</span><span class="p">,</span>
+                    <span class="n">first_batch_split_prompts</span><span class="p">,</span> <span class="n">input_lengths</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="c1"># mode 2: multiple different prompts corresponding to multiple images (1-1 correspondence)</span>
+                <span class="n">length</span> <span class="o">=</span> <span class="p">[</span>
+                    <span class="nb">sum</span><span class="p">([</span><span class="n">ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="k">for</span> <span class="n">ids</span> <span class="ow">in</span> <span class="n">batch_split_prompt</span><span class="p">])</span>
+                    <span class="k">for</span> <span class="n">batch_split_prompt</span> <span class="ow">in</span> <span class="n">batch_split_prompts</span>
+                <span class="p">]</span>
+                <span class="n">length</span> <span class="o">=</span> <span class="p">[</span><span class="n">l</span> <span class="o">+</span> <span class="n">visual_atts</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="k">for</span> <span class="n">l</span> <span class="ow">in</span> <span class="n">length</span><span class="p">]</span>
+                <span class="n">input_lengths</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">IntTensor</span><span class="p">(</span><span class="n">length</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
+                <span class="n">input_ids</span><span class="p">,</span> <span class="n">ptuning_args</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">setup_fake_prompts_vila</span><span class="p">(</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">,</span> <span class="n">visual_features</span><span class="p">,</span> <span class="n">batch_split_prompts</span><span class="p">,</span>
+                    <span class="n">input_lengths</span><span class="p">)</span>
             <span class="k">return</span> <span class="n">input_ids</span><span class="p">,</span> <span class="n">input_lengths</span><span class="p">,</span> <span class="n">ptuning_args</span><span class="p">,</span> <span class="n">visual_features</span>
         <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;phi-3-vision&#39;</span><span class="p">:</span>
             <span class="n">image_sizes</span> <span class="o">=</span> <span class="nb">input</span><span class="p">[</span><span class="s2">&quot;image_sizes&quot;</span><span class="p">]</span>
@@ -944,7 +977,10 @@
             <span class="n">pre_input_ids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">(</span><span class="n">pre_prompt</span><span class="p">,</span>
                                            <span class="n">return_tensors</span><span class="o">=</span><span class="s2">&quot;pt&quot;</span><span class="p">,</span>
                                            <span class="n">padding</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span><span class="o">.</span><span class="n">input_ids</span>
-            <span class="n">length</span> <span class="o">=</span> <span class="n">pre_input_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+            <span class="k">if</span> <span class="n">n_prompts_n_images</span><span class="p">:</span>
+                <span class="n">length</span> <span class="o">=</span> <span class="p">[</span><span class="n">pre_input_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]]</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">length</span> <span class="o">=</span> <span class="n">pre_input_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
             <span class="n">post_input_ids</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;llava_onevision&#39;</span><span class="p">:</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">video_path</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
@@ -982,9 +1018,17 @@
                                            <span class="n">return_tensors</span><span class="o">=</span><span class="s2">&quot;pt&quot;</span><span class="p">,</span>
                                            <span class="n">padding</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span><span class="o">.</span><span class="n">input_ids</span>
             <span class="k">if</span> <span class="n">post_prompt</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="n">post_input_ids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">(</span><span class="n">post_prompt</span><span class="p">,</span>
-                                                <span class="n">return_tensors</span><span class="o">=</span><span class="s2">&quot;pt&quot;</span><span class="p">,</span>
-                                                <span class="n">padding</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span><span class="o">.</span><span class="n">input_ids</span>
+                <span class="n">post_input_encoded</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">(</span><span class="n">post_prompt</span><span class="p">,</span>
+                                                    <span class="n">return_tensors</span><span class="o">=</span><span class="s2">&quot;pt&quot;</span><span class="p">,</span>
+                                                    <span class="n">padding</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+                <span class="n">post_input_ids</span> <span class="o">=</span> <span class="n">post_input_encoded</span><span class="o">.</span><span class="n">input_ids</span>
+                <span class="k">if</span> <span class="n">n_prompts_n_images</span><span class="p">:</span>
+                    <span class="n">post_input_attention_mask</span> <span class="o">=</span> <span class="n">post_input_encoded</span><span class="o">.</span><span class="n">attention_mask</span>
+                    <span class="n">post_input_ids</span> <span class="o">=</span> <span class="p">[</span>
+                        <span class="n">input_id</span><span class="p">[</span><span class="n">mask</span><span class="o">.</span><span class="n">bool</span><span class="p">()]</span> <span class="k">for</span> <span class="n">input_id</span><span class="p">,</span> <span class="n">mask</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span>
+                            <span class="n">post_input_ids</span><span class="p">,</span> <span class="n">post_input_attention_mask</span><span class="p">)</span>
+                    <span class="p">]</span>
+
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;video-neva&#39;</span><span class="p">:</span>
                     <span class="n">length</span> <span class="o">=</span> <span class="n">pre_input_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="n">post_input_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span>
                         <span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="n">visual_atts</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="o">*</span> <span class="n">visual_atts</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
@@ -992,14 +1036,24 @@
                     <span class="n">length</span> <span class="o">=</span> <span class="n">pre_input_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="n">post_input_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span>
                         <span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="n">visual_atts</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">*</span> <span class="n">visual_atts</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
                 <span class="k">else</span><span class="p">:</span>
-                    <span class="n">length</span> <span class="o">=</span> <span class="n">pre_input_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="n">post_input_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span>
-                        <span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="n">visual_atts</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+                    <span class="k">if</span> <span class="n">n_prompts_n_images</span><span class="p">:</span>
+                        <span class="n">length</span> <span class="o">=</span> <span class="p">[</span>
+                            <span class="n">pre_input_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="n">visual_atts</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">+</span>
+                            <span class="n">post_input_id</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+                            <span class="k">for</span> <span class="n">post_input_id</span> <span class="ow">in</span> <span class="n">post_input_ids</span>
+                        <span class="p">]</span>
+                    <span class="k">else</span><span class="p">:</span>
+                        <span class="n">length</span> <span class="o">=</span> <span class="n">pre_input_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="n">post_input_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span>
+                            <span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="n">visual_atts</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
             <span class="k">else</span><span class="p">:</span>
                 <span class="n">post_input_ids</span> <span class="o">=</span> <span class="kc">None</span>
                 <span class="n">length</span> <span class="o">=</span> <span class="n">pre_input_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="n">visual_atts</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
 
-        <span class="n">input_lengths</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">IntTensor</span><span class="p">([</span><span class="n">length</span><span class="p">]</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span>
-            <span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">n_prompts_n_images</span><span class="p">:</span>
+            <span class="n">input_lengths</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">IntTensor</span><span class="p">(</span><span class="n">length</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">input_lengths</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">IntTensor</span><span class="p">([</span><span class="n">length</span><span class="p">]</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span>
+                <span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="ow">in</span> <span class="p">[</span>
                 <span class="s1">&#39;fuyu&#39;</span><span class="p">,</span> <span class="s1">&#39;kosmos-2&#39;</span><span class="p">,</span> <span class="s1">&#39;phi-3-vision&#39;</span><span class="p">,</span> <span class="s1">&#39;llava_next&#39;</span>
@@ -1016,33 +1070,43 @@
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.tokenizer_image_token">[docs]</a>
     <span class="nd">@staticmethod</span>
     <span class="k">def</span> <span class="nf">tokenizer_image_token</span><span class="p">(</span><span class="n">batch_size</span><span class="p">,</span>
-                              <span class="n">prompt</span><span class="p">,</span>
+                              <span class="n">pre_prompt</span><span class="p">,</span>
+                              <span class="n">post_prompt</span><span class="p">,</span>
                               <span class="n">tokenizer</span><span class="p">,</span>
                               <span class="n">image_token_index</span><span class="o">=-</span><span class="mi">200</span><span class="p">):</span>
-        <span class="n">prompt_chunks</span> <span class="o">=</span> <span class="p">[</span>
-            <span class="n">tokenizer</span><span class="p">(</span><span class="n">chunk</span><span class="p">)</span><span class="o">.</span><span class="n">input_ids</span> <span class="k">for</span> <span class="n">chunk</span> <span class="ow">in</span> <span class="n">prompt</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">&quot;&lt;image&gt;&quot;</span><span class="p">)</span>
-        <span class="p">]</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">post_prompt</span><span class="p">,</span> <span class="nb">list</span><span class="p">):</span>
+            <span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span><span class="n">pre_prompt</span> <span class="o">+</span> <span class="n">item</span> <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">post_prompt</span><span class="p">]</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span><span class="n">pre_prompt</span> <span class="o">+</span> <span class="n">post_prompt</span><span class="p">]</span>
 
         <span class="k">def</span> <span class="nf">insert_separator</span><span class="p">(</span><span class="n">X</span><span class="p">,</span> <span class="n">sep</span><span class="p">):</span>
             <span class="k">return</span> <span class="p">[</span>
                 <span class="n">ele</span> <span class="k">for</span> <span class="n">sublist</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">X</span><span class="p">,</span> <span class="p">[</span><span class="n">sep</span><span class="p">]</span> <span class="o">*</span> <span class="nb">len</span><span class="p">(</span><span class="n">X</span><span class="p">))</span> <span class="k">for</span> <span class="n">ele</span> <span class="ow">in</span> <span class="n">sublist</span>
             <span class="p">][:</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
 
-        <span class="n">input_ids</span> <span class="o">=</span> <span class="p">[]</span>
-        <span class="n">offset</span> <span class="o">=</span> <span class="mi">0</span>
-        <span class="k">if</span> <span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">prompt_chunks</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="ow">and</span> <span class="nb">len</span><span class="p">(</span><span class="n">prompt_chunks</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span> <span class="o">&gt;</span> <span class="mi">0</span>
-                <span class="ow">and</span> <span class="n">prompt_chunks</span><span class="p">[</span><span class="mi">0</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="n">tokenizer</span><span class="o">.</span><span class="n">bos_token_id</span><span class="p">):</span>
-            <span class="n">offset</span> <span class="o">=</span> <span class="mi">1</span>
-            <span class="n">input_ids</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">prompt_chunks</span><span class="p">[</span><span class="mi">0</span><span class="p">][</span><span class="mi">0</span><span class="p">])</span>
+        <span class="n">result</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">for</span> <span class="n">prompt</span> <span class="ow">in</span> <span class="n">prompts</span><span class="p">:</span>
+            <span class="n">prompt_chunks</span> <span class="o">=</span> <span class="p">[</span>
+                <span class="n">tokenizer</span><span class="p">(</span><span class="n">chunk</span><span class="p">)</span><span class="o">.</span><span class="n">input_ids</span> <span class="k">for</span> <span class="n">chunk</span> <span class="ow">in</span> <span class="n">prompt</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">&quot;&lt;image&gt;&quot;</span><span class="p">)</span>
+            <span class="p">]</span>
+            <span class="n">input_ids</span> <span class="o">=</span> <span class="p">[]</span>
+            <span class="n">offset</span> <span class="o">=</span> <span class="mi">0</span>
+            <span class="k">if</span> <span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">prompt_chunks</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="ow">and</span> <span class="nb">len</span><span class="p">(</span><span class="n">prompt_chunks</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span> <span class="o">&gt;</span> <span class="mi">0</span>
+                    <span class="ow">and</span> <span class="n">prompt_chunks</span><span class="p">[</span><span class="mi">0</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="n">tokenizer</span><span class="o">.</span><span class="n">bos_token_id</span><span class="p">):</span>
+                <span class="n">offset</span> <span class="o">=</span> <span class="mi">1</span>
+                <span class="n">input_ids</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">prompt_chunks</span><span class="p">[</span><span class="mi">0</span><span class="p">][</span><span class="mi">0</span><span class="p">])</span>
 
-        <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">insert_separator</span><span class="p">(</span><span class="n">prompt_chunks</span><span class="p">,</span>
-                                  <span class="p">[</span><span class="n">image_token_index</span><span class="p">]</span> <span class="o">*</span> <span class="p">(</span><span class="n">offset</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)):</span>
-            <span class="n">input_ids</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">x</span><span class="p">[</span><span class="n">offset</span><span class="p">:])</span>
+            <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">insert_separator</span><span class="p">(</span><span class="n">prompt_chunks</span><span class="p">,</span>
+                                      <span class="p">[</span><span class="n">image_token_index</span><span class="p">]</span> <span class="o">*</span> <span class="p">(</span><span class="n">offset</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)):</span>
+                <span class="n">input_ids</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">x</span><span class="p">[</span><span class="n">offset</span><span class="p">:])</span>
 
-        <span class="n">input_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">)</span>
-        <span class="n">input_ids</span><span class="p">[</span><span class="n">input_ids</span> <span class="o">==</span> <span class="n">image_token_index</span><span class="p">]</span> <span class="o">=</span> <span class="mi">0</span>
-        <span class="n">input_ids</span> <span class="o">=</span> <span class="n">input_ids</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span><span class="o">.</span><span class="n">expand</span><span class="p">(</span><span class="n">batch_size</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
-        <span class="k">return</span> <span class="n">input_ids</span></div>
+            <span class="n">input_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">)</span>
+            <span class="n">input_ids</span><span class="p">[</span><span class="n">input_ids</span> <span class="o">==</span> <span class="n">image_token_index</span><span class="p">]</span> <span class="o">=</span> <span class="mi">0</span>
+            <span class="n">result</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">input_ids</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">post_prompt</span><span class="p">,</span> <span class="nb">list</span><span class="p">):</span>
+            <span class="n">result</span> <span class="o">=</span> <span class="n">result</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span><span class="o">.</span><span class="n">expand</span><span class="p">(</span><span class="n">batch_size</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">result</span></div>
 
 
 <div class="viewcode-block" id="MultimodalModelRunner.split_prompt_by_images">
@@ -1102,7 +1166,7 @@
             <span class="n">input_ids</span><span class="p">,</span> <span class="n">input_lengths</span><span class="p">,</span> <span class="n">ptuning_args</span><span class="p">,</span> <span class="n">visual_features</span><span class="p">,</span> <span class="n">mrope_args</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">preprocess</span><span class="p">(</span>
                 <span class="n">warmup</span><span class="p">,</span> <span class="n">pre_prompt</span><span class="p">,</span> <span class="n">post_prompt</span><span class="p">,</span> <span class="n">image</span><span class="p">,</span> <span class="n">other_vision_inputs</span><span class="p">)</span>
             <span class="n">mrope_params</span> <span class="o">=</span> <span class="n">MropeParams</span><span class="p">(</span>
-                <span class="n">mrope_rotary_sin_cos</span><span class="o">=</span><span class="n">mrope_args</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span>
+                <span class="n">mrope_rotary_cos_sin</span><span class="o">=</span><span class="n">mrope_args</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span>
                 <span class="n">mrope_position_deltas</span><span class="o">=</span><span class="n">mrope_args</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span>
             <span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
@@ -1292,14 +1356,15 @@
             <span class="n">output_beams_list</span> <span class="o">=</span> <span class="p">[</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">batch_decode</span><span class="p">(</span>
                     <span class="n">output_ids</span><span class="p">[</span><span class="n">batch_idx</span><span class="p">,</span> <span class="p">:,</span> <span class="n">input_lengths</span><span class="p">[</span><span class="n">batch_idx</span><span class="p">]:],</span>
-                    <span class="n">skip_special_tokens</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-                <span class="k">for</span> <span class="n">batch_idx</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">)</span>
+                    <span class="n">skip_special_tokens</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span> <span class="k">for</span> <span class="n">batch_idx</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span>
+                        <span class="nb">min</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">,</span> <span class="n">input_lengths</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]))</span>
             <span class="p">]</span>
 
             <span class="n">stripped_text</span> <span class="o">=</span> <span class="p">[[</span>
                 <span class="n">output_beams_list</span><span class="p">[</span><span class="n">batch_idx</span><span class="p">][</span><span class="n">beam_idx</span><span class="p">]</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span>
                 <span class="k">for</span> <span class="n">beam_idx</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">num_beams</span><span class="p">)</span>
-            <span class="p">]</span> <span class="k">for</span> <span class="n">batch_idx</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">)]</span>
+            <span class="p">]</span> <span class="k">for</span> <span class="n">batch_idx</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span>
+                <span class="nb">min</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">,</span> <span class="n">input_lengths</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]))]</span>
             <span class="n">profiler</span><span class="o">.</span><span class="n">stop</span><span class="p">(</span><span class="s2">&quot;Generate&quot;</span><span class="p">)</span>
             <span class="k">return</span> <span class="n">stripped_text</span>
         <span class="k">else</span><span class="p">:</span>
@@ -1332,9 +1397,10 @@
             <span class="n">tensor_info</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">visual_encoder_session</span><span class="o">.</span><span class="n">set_shapes</span><span class="p">(</span><span class="n">visual_features</span><span class="p">)</span>
         <span class="n">visual_outputs</span> <span class="o">=</span> <span class="p">{</span>
-            <span class="n">t</span><span class="o">.</span><span class="n">name</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span><span class="nb">tuple</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">shape</span><span class="p">),</span>
-                                <span class="n">dtype</span><span class="o">=</span><span class="n">trt_dtype_to_torch</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">dtype</span><span class="p">),</span>
-                                <span class="n">device</span><span class="o">=</span><span class="n">image</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+            <span class="n">t</span><span class="o">.</span><span class="n">name</span><span class="p">:</span>
+            <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span><span class="nb">tuple</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">shape</span><span class="p">),</span>
+                        <span class="n">dtype</span><span class="o">=</span><span class="n">trt_dtype_to_torch</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">dtype</span><span class="p">),</span>
+                        <span class="n">device</span><span class="o">=</span><span class="n">image</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
             <span class="k">for</span> <span class="n">t</span> <span class="ow">in</span> <span class="n">visual_output_info</span>
         <span class="p">}</span>
 
@@ -1377,21 +1443,27 @@
                 <span class="c1"># in case no inter or post prompt</span>
                 <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">split_input_ids</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">idx</span> <span class="o">+</span> <span class="mi">1</span><span class="p">:</span>
                     <span class="n">input_ids</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">split_input_ids</span><span class="p">[</span><span class="n">idx</span> <span class="o">+</span> <span class="mi">1</span><span class="p">])</span>
+            <span class="n">input_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
+            <span class="n">input_ids</span> <span class="o">=</span> <span class="n">input_ids</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">batch_size</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
 
         <span class="k">elif</span> <span class="n">batch_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
-            <span class="c1"># mode 2: each image have individual prompt, &lt;pre&gt;&lt;image&gt;&lt;post&gt;</span>
+            <span class="c1"># mode 2: each image has a specific prompt, input_ids = [&lt;pre1&gt;&lt;image1&gt;&lt;post1&gt;, &lt;pre2&gt;&lt;image2&gt;&lt;post2&gt;, ...]</span>
             <span class="k">for</span> <span class="n">idx</span><span class="p">,</span> <span class="n">visual_feature</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">visual_features</span><span class="p">):</span>
-                <span class="n">input_ids</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">split_input_ids</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
+                <span class="n">input_ids</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">split_input_ids</span><span class="p">[</span><span class="n">idx</span><span class="p">][</span><span class="mi">0</span><span class="p">])</span>
                 <span class="n">fake_prompt_id</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span>
                     <span class="n">fake_prompt_counter</span><span class="p">,</span>
                     <span class="n">fake_prompt_counter</span> <span class="o">+</span> <span class="n">visual_feature</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
                 <span class="n">fake_prompt_id</span> <span class="o">=</span> <span class="n">fake_prompt_id</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
                 <span class="n">input_ids</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">fake_prompt_id</span><span class="p">)</span>
-                <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">split_input_ids</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
-                    <span class="n">input_ids</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">split_input_ids</span><span class="p">[</span><span class="mi">1</span><span class="p">])</span>
-
-        <span class="n">input_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
-        <span class="n">input_ids</span> <span class="o">=</span> <span class="n">input_ids</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">batch_size</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+                <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">split_input_ids</span><span class="p">[</span><span class="n">idx</span><span class="p">])</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+                    <span class="n">input_ids</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">split_input_ids</span><span class="p">[</span><span class="n">idx</span><span class="p">][</span><span class="mi">1</span><span class="p">])</span>
+            <span class="n">result</span> <span class="o">=</span> <span class="p">[]</span>
+            <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">input_ids</span><span class="p">),</span> <span class="mi">3</span><span class="p">):</span>
+                <span class="c1"># Concatenate every 3 items (&lt;pre&gt;, &lt;image&gt;, &lt;post&gt;)</span>
+                <span class="n">concatenated</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span><span class="n">input_ids</span><span class="p">[</span><span class="n">i</span><span class="p">:</span><span class="n">i</span> <span class="o">+</span> <span class="mi">3</span><span class="p">],</span>
+                                         <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span><span class="o">.</span><span class="n">squeeze</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+                <span class="n">result</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">concatenated</span><span class="p">)</span>
+            <span class="n">input_ids</span> <span class="o">=</span> <span class="n">result</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">decoder_llm</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">runtime_mapping</span><span class="o">.</span><span class="n">is_first_pp_rank</span><span class="p">():</span>
             <span class="n">ptuning_args</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">ptuning_setup</span><span class="p">(</span><span class="n">visual_features</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">,</span>
@@ -1442,10 +1514,27 @@
             <span class="n">input_ids</span> <span class="o">=</span> <span class="n">pre_input_ids</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="k">if</span> <span class="n">post_input_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="n">input_ids</span> <span class="o">=</span> <span class="p">[</span><span class="n">pre_input_ids</span><span class="p">,</span> <span class="n">fake_prompt_id</span><span class="p">,</span> <span class="n">post_input_ids</span><span class="p">]</span>
+                <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">post_input_ids</span><span class="p">,</span> <span class="nb">list</span><span class="p">):</span>
+                    <span class="n">pre_input_fake_prompt_ids</span> <span class="o">=</span> <span class="p">[</span>
+                        <span class="n">pre_input_ids</span><span class="p">[:</span><span class="nb">len</span><span class="p">(</span><span class="n">fake_prompt_id</span><span class="p">)],</span> <span class="n">fake_prompt_id</span>
+                    <span class="p">]</span>
+                    <span class="n">pre_input_fake_prompt_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span>
+                        <span class="n">pre_input_fake_prompt_ids</span><span class="p">,</span>
+                        <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
+                    <span class="n">input_ids</span> <span class="o">=</span> <span class="p">[</span>
+                        <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">((</span><span class="n">pre_input_fake_prompt_id</span><span class="p">,</span>
+                                   <span class="n">post_input_id</span><span class="p">))</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
+                        <span class="k">for</span> <span class="n">pre_input_fake_prompt_id</span><span class="p">,</span> <span class="n">post_input_id</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span>
+                            <span class="n">pre_input_fake_prompt_ids</span><span class="p">,</span> <span class="n">post_input_ids</span><span class="p">)</span>
+                    <span class="p">]</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="n">input_ids</span> <span class="o">=</span> <span class="p">[</span><span class="n">pre_input_ids</span><span class="p">,</span> <span class="n">fake_prompt_id</span><span class="p">,</span> <span class="n">post_input_ids</span><span class="p">]</span>
+                    <span class="n">input_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span>
+                                          <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
             <span class="k">else</span><span class="p">:</span>
                 <span class="n">input_ids</span> <span class="o">=</span> <span class="p">[</span><span class="n">fake_prompt_id</span><span class="p">,</span> <span class="n">pre_input_ids</span><span class="p">]</span>
-            <span class="n">input_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
+                <span class="n">input_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span>
+                                      <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">decoder_llm</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">runtime_mapping</span><span class="o">.</span><span class="n">is_first_pp_rank</span><span class="p">()</span>
             <span class="p">)</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">!=</span> <span class="s2">&quot;mllama&quot;</span><span class="p">:</span>
@@ -1644,14 +1733,16 @@
             <span class="n">attention_mask</span><span class="o">=</span><span class="n">attention_mask</span><span class="p">,</span>
         <span class="p">)</span>
 
-        <span class="n">mask</span> <span class="o">=</span> <span class="p">(</span><span class="n">input_ids</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">image_token_id</span><span class="p">)</span> <span class="o">|</span> <span class="p">(</span>
-            <span class="n">input_ids</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">vision_token_id</span><span class="p">)</span> <span class="o">|</span> <span class="p">(</span><span class="n">input_ids</span>
-                                                  <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">video_token_id</span><span class="p">)</span>
-        <span class="n">indices</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">nonzero</span><span class="p">(</span><span class="n">mask</span><span class="p">,</span> <span class="n">as_tuple</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-        <span class="n">value</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_config</span><span class="o">.</span><span class="n">vocab_size</span>
-        <span class="k">for</span> <span class="n">idx</span> <span class="ow">in</span> <span class="n">indices</span><span class="p">:</span>
-            <span class="n">input_ids</span><span class="p">[</span><span class="nb">tuple</span><span class="p">(</span><span class="n">idx</span><span class="p">)]</span> <span class="o">=</span> <span class="n">value</span>
-            <span class="n">value</span> <span class="o">+=</span> <span class="mi">1</span>
+        <span class="k">for</span> <span class="n">idx</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">input_ids</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="mi">0</span><span class="p">)):</span>
+            <span class="n">input_id</span> <span class="o">=</span> <span class="n">input_ids</span><span class="p">[</span><span class="n">idx</span><span class="p">]</span>
+            <span class="n">mask</span> <span class="o">=</span> <span class="p">(</span><span class="n">input_id</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">image_token_id</span><span class="p">)</span> <span class="o">|</span> <span class="p">(</span>
+                <span class="n">input_id</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">vision_token_id</span><span class="p">)</span> <span class="o">|</span> <span class="p">(</span><span class="n">input_id</span>
+                                                     <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">video_token_id</span><span class="p">)</span>
+            <span class="n">indices</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">nonzero</span><span class="p">(</span><span class="n">mask</span><span class="p">,</span> <span class="n">as_tuple</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+            <span class="n">value</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_config</span><span class="o">.</span><span class="n">vocab_size</span>
+            <span class="k">for</span> <span class="n">idx</span> <span class="ow">in</span> <span class="n">indices</span><span class="p">:</span>
+                <span class="n">input_id</span><span class="p">[</span><span class="nb">tuple</span><span class="p">(</span><span class="n">idx</span><span class="p">)]</span> <span class="o">=</span> <span class="n">value</span>
+                <span class="n">value</span> <span class="o">+=</span> <span class="mi">1</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">decoder_llm</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">runtime_mapping</span><span class="o">.</span><span class="n">is_first_pp_rank</span><span class="p">():</span>
             <span class="n">ptuning_args</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">ptuning_setup</span><span class="p">(</span><span class="n">visual_features</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">,</span>
@@ -1793,14 +1884,19 @@
                                 <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span><span class="o">.</span><span class="n">cuda</span><span class="p">()</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">decoder_llm</span><span class="p">:</span> <span class="n">tasks</span> <span class="o">=</span> <span class="n">tasks</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
-            <span class="n">tasks</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="n">input_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span><span class="o">.</span><span class="n">cuda</span><span class="p">()</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="nb">list</span><span class="p">):</span>
+                <span class="n">tasks</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="n">input_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span><span class="o">.</span><span class="n">cuda</span><span class="p">()</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">max_length</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">input_id</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="k">for</span> <span class="n">input_id</span> <span class="ow">in</span> <span class="n">input_ids</span><span class="p">)</span>
+                <span class="n">tasks</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">((</span><span class="nb">len</span><span class="p">(</span><span class="n">input_ids</span><span class="p">),</span> <span class="n">max_length</span><span class="p">),</span>
+                                    <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span><span class="o">.</span><span class="n">cuda</span><span class="p">()</span>
 
         <span class="k">return</span> <span class="p">[</span><span class="n">prompt_table</span><span class="p">,</span> <span class="n">tasks</span><span class="p">,</span> <span class="n">task_vocab_size</span><span class="p">]</span></div>
 
 
-<div class="viewcode-block" id="MultimodalModelRunner.load_test_image">
-<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.load_test_image">[docs]</a>
-    <span class="k">def</span> <span class="nf">load_test_image</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<div class="viewcode-block" id="MultimodalModelRunner.load_test_data">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.load_test_data">[docs]</a>
+    <span class="k">def</span> <span class="nf">load_test_data</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">image_path</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">video_path</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
 
         <span class="k">def</span> <span class="nf">load_images</span><span class="p">(</span><span class="n">image_paths</span><span class="p">):</span>
             <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">image_paths</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
@@ -1818,7 +1914,7 @@
             <span class="k">return</span> <span class="n">images</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">images</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="k">else</span> <span class="n">images</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
 
         <span class="k">if</span> <span class="s2">&quot;vila&quot;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span><span class="p">:</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">image_path</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="n">img_urls</span> <span class="o">=</span> <span class="p">[</span>
                     <span class="s1">&#39;https://github.com/NVlabs/VILA/blob/6b941da19e31ddfdfaa60160908ccf0978d96615/demo_images/av.png?raw=true&#39;</span><span class="p">,</span>
                     <span class="s1">&#39;https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png&#39;</span>
@@ -1828,8 +1924,9 @@
                 <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span> <span class="o">=</span> <span class="s2">&quot;,&quot;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">img_urls</span><span class="p">)</span>
                 <span class="n">images</span> <span class="o">=</span> <span class="n">load_images</span><span class="p">(</span><span class="n">img_urls</span><span class="p">)</span>
             <span class="k">else</span><span class="p">:</span>
-                <span class="n">images</span> <span class="o">=</span> <span class="n">load_images</span><span class="p">(</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">path_sep</span><span class="p">))</span>
+                <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">image_path</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
+                    <span class="n">image_path</span> <span class="o">=</span> <span class="n">image_path</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">path_sep</span><span class="p">)</span>
+                <span class="n">images</span> <span class="o">=</span> <span class="n">load_images</span><span class="p">(</span><span class="n">image_path</span><span class="p">)</span>
 
         <span class="k">elif</span> <span class="s2">&quot;nougat&quot;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span><span class="p">:</span>
             <span class="n">filepath</span> <span class="o">=</span> <span class="n">hf_hub_download</span><span class="p">(</span>
@@ -1843,33 +1940,38 @@
                                        <span class="n">repo_type</span><span class="o">=</span><span class="s1">&#39;model&#39;</span><span class="p">)</span>
             <span class="n">images</span> <span class="o">=</span> <span class="n">Image</span><span class="o">.</span><span class="n">open</span><span class="p">(</span><span class="n">filepath</span><span class="p">)</span>
         <span class="k">elif</span> <span class="s2">&quot;kosmos&quot;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span><span class="p">:</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span> <span class="o">=</span> <span class="s1">&#39;https://huggingface.co/microsoft/kosmos-2-patch14-224/resolve/main/snowman.png&#39;</span>
-            <span class="n">images</span> <span class="o">=</span> <span class="n">load_images</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">image_path</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">image_path</span> <span class="o">=</span> <span class="s1">&#39;https://huggingface.co/microsoft/kosmos-2-patch14-224/resolve/main/snowman.png&#39;</span>
+            <span class="n">images</span> <span class="o">=</span> <span class="n">load_images</span><span class="p">(</span><span class="n">image_path</span><span class="p">)</span>
         <span class="k">elif</span> <span class="s2">&quot;pix2struct&quot;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span><span class="p">:</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span> <span class="o">=</span> <span class="s1">&#39;https://raw.githubusercontent.com/vis-nlp/ChartQA/main/ChartQA%20Dataset/val/png/multi_col_40963.png&#39;</span>
-            <span class="n">images</span> <span class="o">=</span> <span class="n">load_images</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">image_path</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">image_path</span> <span class="o">=</span> <span class="s1">&#39;https://raw.githubusercontent.com/vis-nlp/ChartQA/main/ChartQA%20Dataset/val/png/multi_col_40963.png&#39;</span>
+            <span class="n">images</span> <span class="o">=</span> <span class="n">load_images</span><span class="p">(</span><span class="n">image_path</span><span class="p">)</span>
         <span class="k">elif</span> <span class="s2">&quot;video-neva&quot;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span><span class="p">:</span>
-            <span class="n">images</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">video_path</span>
+            <span class="n">images</span> <span class="o">=</span> <span class="n">video_path</span>
         <span class="k">elif</span> <span class="s2">&quot;internvl&quot;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span><span class="p">:</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">image_path</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="n">img_url</span> <span class="o">=</span> <span class="s1">&#39;https://huggingface.co/OpenGVLab/InternVL2-4B/blob/main/examples/image1.jpg&#39;</span>
                 <span class="n">images</span> <span class="o">=</span> <span class="n">Image</span><span class="o">.</span><span class="n">open</span><span class="p">(</span>
                     <span class="n">requests</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">img_url</span><span class="p">,</span> <span class="n">stream</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
                                  <span class="n">timeout</span><span class="o">=</span><span class="mi">5</span><span class="p">)</span><span class="o">.</span><span class="n">raw</span><span class="p">)</span><span class="o">.</span><span class="n">convert</span><span class="p">(</span><span class="s1">&#39;RGB&#39;</span><span class="p">)</span>
             <span class="k">else</span><span class="p">:</span>
-                <span class="n">images</span> <span class="o">=</span> <span class="n">Image</span><span class="o">.</span><span class="n">open</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span><span class="p">)</span><span class="o">.</span><span class="n">convert</span><span class="p">(</span><span class="s1">&#39;RGB&#39;</span><span class="p">)</span>
+                <span class="n">images</span> <span class="o">=</span> <span class="n">Image</span><span class="o">.</span><span class="n">open</span><span class="p">(</span><span class="n">image_path</span><span class="p">)</span><span class="o">.</span><span class="n">convert</span><span class="p">(</span><span class="s1">&#39;RGB&#39;</span><span class="p">)</span>
         <span class="k">elif</span> <span class="s2">&quot;qwen2_vl&quot;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span><span class="p">:</span>
+            <span class="n">images</span> <span class="o">=</span> <span class="p">[]</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="n">img_url</span> <span class="o">=</span> <span class="s1">&#39;https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg&#39;</span>
-                <span class="n">images</span> <span class="o">=</span> <span class="n">Image</span><span class="o">.</span><span class="n">open</span><span class="p">(</span>
+                <span class="n">image</span> <span class="o">=</span> <span class="n">Image</span><span class="o">.</span><span class="n">open</span><span class="p">(</span>
                     <span class="n">requests</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">img_url</span><span class="p">,</span> <span class="n">stream</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
                                  <span class="n">timeout</span><span class="o">=</span><span class="mi">5</span><span class="p">)</span><span class="o">.</span><span class="n">raw</span><span class="p">)</span><span class="o">.</span><span class="n">convert</span><span class="p">(</span><span class="s1">&#39;RGB&#39;</span><span class="p">)</span>
-                <span class="n">images</span> <span class="o">=</span> <span class="n">images</span><span class="o">.</span><span class="n">resize</span><span class="p">(</span>
-                    <span class="p">(</span><span class="n">images</span><span class="o">.</span><span class="n">size</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">//</span> <span class="mi">2</span><span class="p">,</span> <span class="n">images</span><span class="o">.</span><span class="n">size</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">//</span> <span class="mi">2</span><span class="p">))</span>
+                <span class="n">image</span> <span class="o">=</span> <span class="n">image</span><span class="o">.</span><span class="n">resize</span><span class="p">((</span><span class="mi">504</span><span class="p">,</span> <span class="mi">504</span><span class="p">))</span>
+                <span class="n">images</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">image</span><span class="p">)</span>
             <span class="k">else</span><span class="p">:</span>
-                <span class="n">images</span> <span class="o">=</span> <span class="n">Image</span><span class="o">.</span><span class="n">open</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span><span class="p">)</span><span class="o">.</span><span class="n">convert</span><span class="p">(</span><span class="s1">&#39;RGB&#39;</span><span class="p">)</span>
+                <span class="n">images</span> <span class="o">=</span> <span class="p">[]</span>
+                <span class="k">for</span> <span class="n">image_path</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span><span class="p">:</span>
+                    <span class="n">image</span> <span class="o">=</span> <span class="n">Image</span><span class="o">.</span><span class="n">open</span><span class="p">(</span><span class="n">image_path</span><span class="p">)</span><span class="o">.</span><span class="n">convert</span><span class="p">(</span><span class="s1">&#39;RGB&#39;</span><span class="p">)</span>
+                    <span class="n">image</span> <span class="o">=</span> <span class="n">image</span><span class="o">.</span><span class="n">resize</span><span class="p">((</span><span class="mi">504</span><span class="p">,</span> <span class="mi">504</span><span class="p">))</span>
+                    <span class="n">images</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">image</span><span class="p">)</span>
         <span class="k">elif</span> <span class="s2">&quot;llava_onevision&quot;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">video_path</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">video_path</span> <span class="o">==</span> <span class="s1">&#39;llava-onevision-accuracy&#39;</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">video_path</span> <span class="o">=</span> <span class="n">hf_hub_download</span><span class="p">(</span>
@@ -1877,7 +1979,7 @@
                     <span class="n">filename</span><span class="o">=</span><span class="s2">&quot;sample_demo_1.mp4&quot;</span><span class="p">,</span>
                     <span class="n">repo_type</span><span class="o">=</span><span class="s2">&quot;dataset&quot;</span><span class="p">)</span>
             <span class="kn">import</span> <span class="nn">av</span>
-            <span class="k">with</span> <span class="n">av</span><span class="o">.</span><span class="n">open</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">video_path</span><span class="p">)</span> <span class="k">as</span> <span class="n">container</span><span class="p">:</span>
+            <span class="k">with</span> <span class="n">av</span><span class="o">.</span><span class="n">open</span><span class="p">(</span><span class="n">video_path</span><span class="p">)</span> <span class="k">as</span> <span class="n">container</span><span class="p">:</span>
                 <span class="n">total_frames</span> <span class="o">=</span> <span class="n">container</span><span class="o">.</span><span class="n">streams</span><span class="o">.</span><span class="n">video</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">frames</span>
                 <span class="k">assert</span> <span class="n">total_frames</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_frames</span>
                 <span class="n">indices</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">total_frames</span><span class="p">,</span>
@@ -1895,10 +1997,21 @@
                     <span class="p">[</span><span class="n">x</span><span class="o">.</span><span class="n">to_ndarray</span><span class="p">(</span><span class="nb">format</span><span class="o">=</span><span class="s2">&quot;rgb24&quot;</span><span class="p">)</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">frames</span><span class="p">])</span>
             <span class="n">images</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">images</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">!=</span> <span class="s1">&#39;mllama&#39;</span><span class="p">:</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span> <span class="o">=</span> <span class="s1">&#39;https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png&#39;</span>
-            <span class="n">images</span> <span class="o">=</span> <span class="n">load_images</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span>
-                                 <span class="p">)</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">!=</span> <span class="s1">&#39;mllama&#39;</span><span class="p">:</span>
+                <span class="k">if</span> <span class="n">image_path</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;llava&quot;</span><span class="p">:</span>
+                        <span class="n">image_path</span> <span class="o">=</span> <span class="p">[</span>
+                            <span class="s1">&#39;https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png&#39;</span>
+                        <span class="p">]</span> <span class="o">*</span> <span class="mi">8</span>
+                        <span class="n">image_path</span> <span class="o">=</span> <span class="n">image_path</span><span class="p">[:</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">]</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">image_path</span> <span class="o">=</span> <span class="s2">&quot;,&quot;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">image_path</span><span class="p">)</span>
+                    <span class="k">else</span><span class="p">:</span>
+                        <span class="n">image_path</span> <span class="o">=</span> <span class="s1">&#39;https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png&#39;</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">image_path</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
+                        <span class="n">image_path</span> <span class="o">=</span> <span class="n">image_path</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">path_sep</span><span class="p">)</span>
+
+            <span class="n">images</span> <span class="o">=</span> <span class="n">load_images</span><span class="p">(</span><span class="n">image_path</span><span class="p">)</span> <span class="k">if</span> <span class="n">image_path</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
         <span class="k">return</span> <span class="n">images</span></div>
 
 
@@ -1908,6 +2021,9 @@
         <span class="kn">from</span> <span class="nn">..tools.multimodal_builder</span> <span class="kn">import</span> <span class="n">compute_rotary_pos_emb</span>
         <span class="n">other_vision_inputs</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="n">other_decoder_inputs</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">[</span><span class="s1">&#39;qwen2_vl&#39;</span><span class="p">,</span> <span class="s1">&#39;vila&#39;</span><span class="p">,</span> <span class="s1">&#39;llava&#39;</span><span class="p">]:</span>
+            <span class="n">input_text</span> <span class="o">=</span> <span class="n">input_text</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">input_text</span><span class="p">,</span>
+                                                     <span class="nb">list</span><span class="p">)</span> <span class="k">else</span> <span class="n">input_text</span>
 
         <span class="k">if</span> <span class="s1">&#39;blip2&#39;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span><span class="p">:</span>
             <span class="n">image</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">processor</span><span class="p">(</span><span class="n">raw_image</span><span class="p">,</span> <span class="n">input_text</span><span class="p">,</span>
@@ -1921,28 +2037,34 @@
             <span class="kn">from</span> <span class="nn">transformers.models.qwen2_vl.modeling_qwen2_vl</span> <span class="kn">import</span> \
                 <span class="n">VisionRotaryEmbedding</span>
             <span class="n">hf_config</span> <span class="o">=</span> <span class="n">AutoConfig</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">hf_model_dir</span><span class="p">)</span>
+            <span class="n">processor</span> <span class="o">=</span> <span class="n">AutoProcessor</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">hf_model_dir</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">input_text</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="n">input_text</span> <span class="o">=</span> <span class="s2">&quot;Question: Describe this image. Answer:&quot;</span>
-            <span class="n">messages</span> <span class="o">=</span> <span class="p">[{</span>
+                <span class="n">input_text</span> <span class="o">=</span> <span class="p">[</span><span class="s2">&quot;Question: Describe this image. Answer:&quot;</span>
+                              <span class="p">]</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span>
+            <span class="n">messages</span> <span class="o">=</span> <span class="p">[[{</span>
                 <span class="s2">&quot;role&quot;</span><span class="p">:</span>
                 <span class="s2">&quot;user&quot;</span><span class="p">,</span>
                 <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="p">[</span>
                     <span class="p">{</span>
                         <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;image&quot;</span><span class="p">,</span>
-                        <span class="s2">&quot;image&quot;</span><span class="p">:</span> <span class="n">raw_image</span><span class="p">,</span>
+                        <span class="s2">&quot;image&quot;</span><span class="p">:</span> <span class="n">raw_image</span><span class="p">[</span><span class="n">idx</span><span class="p">],</span>
                     <span class="p">},</span>
                     <span class="p">{</span>
                         <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;text&quot;</span><span class="p">,</span>
-                        <span class="s2">&quot;text&quot;</span><span class="p">:</span> <span class="n">input_text</span>
+                        <span class="s2">&quot;text&quot;</span><span class="p">:</span> <span class="n">input_text</span><span class="p">[</span><span class="n">idx</span><span class="p">],</span>
                     <span class="p">},</span>
                 <span class="p">],</span>
-            <span class="p">}]</span>
+            <span class="p">}]</span> <span class="k">for</span> <span class="n">idx</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">)]</span>
 
-            <span class="n">text</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">processor</span><span class="o">.</span><span class="n">apply_chat_template</span><span class="p">(</span>
-                <span class="n">messages</span><span class="p">,</span> <span class="n">tokenize</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">add_generation_prompt</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+            <span class="n">texts</span> <span class="o">=</span> <span class="p">[</span>
+                <span class="n">processor</span><span class="o">.</span><span class="n">apply_chat_template</span><span class="p">(</span><span class="n">msg</span><span class="p">,</span>
+                                              <span class="n">tokenize</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                                              <span class="n">add_generation_prompt</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+                <span class="k">for</span> <span class="n">msg</span> <span class="ow">in</span> <span class="n">messages</span>
+            <span class="p">]</span>
             <span class="n">image_inputs</span><span class="p">,</span> <span class="n">video_inputs</span> <span class="o">=</span> <span class="n">process_vision_info</span><span class="p">(</span><span class="n">messages</span><span class="p">)</span>
-            <span class="n">inputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">processor</span><span class="p">(</span>
-                <span class="n">text</span><span class="o">=</span><span class="p">[</span><span class="n">text</span><span class="p">],</span>
+            <span class="n">inputs</span> <span class="o">=</span> <span class="n">processor</span><span class="p">(</span>
+                <span class="n">text</span><span class="o">=</span><span class="n">texts</span><span class="p">,</span>
                 <span class="n">images</span><span class="o">=</span><span class="n">image_inputs</span><span class="p">,</span>
                 <span class="n">videos</span><span class="o">=</span><span class="n">video_inputs</span><span class="p">,</span>
                 <span class="n">padding</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
@@ -1958,17 +2080,17 @@
                 <span class="n">image_grid_thw</span><span class="p">[:,</span> <span class="mi">0</span><span class="p">])</span><span class="o">.</span><span class="n">cumsum</span><span class="p">(</span><span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
             <span class="n">cu_seqlens</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">pad</span><span class="p">(</span><span class="n">cu_seqlens</span><span class="p">,</span> <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span> <span class="n">value</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
             <span class="n">seq_length</span> <span class="o">=</span> <span class="n">image</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
-            <span class="n">attention_mask_vit</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">([</span><span class="mi">1</span><span class="p">,</span> <span class="n">seq_length</span><span class="p">,</span> <span class="n">seq_length</span><span class="p">],</span>
-                                             <span class="n">device</span><span class="o">=</span><span class="n">image</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
-                                             <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bool</span><span class="p">)</span>
+            <span class="n">attention_mask_vit</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">full</span><span class="p">([</span><span class="mi">1</span><span class="p">,</span> <span class="n">seq_length</span><span class="p">,</span> <span class="n">seq_length</span><span class="p">],</span>
+                                            <span class="n">torch</span><span class="o">.</span><span class="n">finfo</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">)</span><span class="o">.</span><span class="n">min</span><span class="p">,</span>
+                                            <span class="n">device</span><span class="o">=</span><span class="n">image</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
+                                            <span class="n">dtype</span><span class="o">=</span><span class="n">image</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
             <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">cu_seqlens</span><span class="p">)):</span>
                 <span class="n">attention_mask_vit</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="n">cu_seqlens</span><span class="p">[</span><span class="n">i</span> <span class="o">-</span> <span class="mi">1</span><span class="p">]:</span><span class="n">cu_seqlens</span><span class="p">[</span><span class="n">i</span><span class="p">],</span>
-                                   <span class="n">cu_seqlens</span><span class="p">[</span><span class="n">i</span> <span class="o">-</span> <span class="mi">1</span><span class="p">]:</span><span class="n">cu_seqlens</span><span class="p">[</span><span class="n">i</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">True</span>
+                                   <span class="n">cu_seqlens</span><span class="p">[</span><span class="n">i</span> <span class="o">-</span> <span class="mi">1</span><span class="p">]:</span><span class="n">cu_seqlens</span><span class="p">[</span><span class="n">i</span><span class="p">]]</span> <span class="o">=</span> <span class="mi">0</span>
 
             <span class="n">decoder_input_ids</span> <span class="o">=</span> <span class="kc">None</span>
             <span class="n">post_prompt</span> <span class="o">=</span> <span class="kc">None</span>
             <span class="n">pre_prompt</span> <span class="o">=</span> <span class="kc">None</span>
-            <span class="n">input_text</span> <span class="o">=</span> <span class="kc">None</span>
             <span class="n">images_qwenvl</span> <span class="o">=</span> <span class="p">{</span>
                 <span class="s2">&quot;image&quot;</span><span class="p">:</span> <span class="n">image</span><span class="p">,</span>
                 <span class="s2">&quot;input_ids&quot;</span><span class="p">:</span> <span class="n">input_ids</span><span class="p">,</span>
@@ -2073,39 +2195,65 @@
                                    <span class="n">images</span><span class="o">=</span><span class="n">raw_image</span><span class="p">,</span>
                                    <span class="n">return_tensors</span><span class="o">=</span><span class="s2">&quot;pt&quot;</span><span class="p">)</span>
 
-        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="ow">in</span> <span class="p">[</span><span class="s1">&#39;llava&#39;</span><span class="p">,</span> <span class="s1">&#39;vila&#39;</span><span class="p">,</span> <span class="s1">&#39;fuyu&#39;</span><span class="p">,</span> <span class="s1">&#39;kosmos-2&#39;</span><span class="p">]:</span>
-            <span class="c1"># LLaVA and VILA</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;llava&quot;</span><span class="p">:</span>
-                <span class="n">pre_prompt</span> <span class="o">=</span> <span class="s2">&quot;USER:</span><span class="se">\n</span><span class="s2">&quot;</span>
-                <span class="k">if</span> <span class="n">input_text</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-                    <span class="n">input_text</span> <span class="o">=</span> <span class="s2">&quot;Question: which city is this? Answer:&quot;</span>
-            <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;vila&quot;</span><span class="p">:</span>
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;vila&#39;</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">input_text</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">input_text</span> <span class="o">=</span> <span class="s2">&quot;&lt;image&gt;</span><span class="se">\n</span><span class="s2"> Please elaborate what you see in the images?&quot;</span>
+            <span class="k">if</span> <span class="s1">&#39;8b&#39;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">hf_model_dir</span><span class="o">.</span><span class="n">lower</span><span class="p">():</span>
+                <span class="n">pre_prompt</span> <span class="o">=</span> <span class="s2">&quot;&lt;|begin_of_text|&gt;&lt;|start_header_id|&gt;system&lt;|end_header_id|&gt;</span><span class="se">\n\n</span><span class="s2">You are a helpful language and vision assistant. You are able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language.&lt;|eot_id|&gt;&lt;|start_header_id|&gt;user&lt;|end_header_id|&gt;</span><span class="se">\n\n</span><span class="s2">&quot;</span>
+                <span class="n">post_prompt</span> <span class="o">=</span> <span class="s2">&quot;&lt;|eot_id|&gt;&lt;|start_header_id|&gt;assistant&lt;|end_header_id|&gt;</span><span class="se">\n\n</span><span class="s2">&quot;</span>
+            <span class="k">elif</span> <span class="s1">&#39;40b&#39;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">hf_model_dir</span><span class="o">.</span><span class="n">lower</span><span class="p">():</span>
+                <span class="n">pre_prompt</span> <span class="o">=</span> <span class="s2">&quot;&lt;|im_start|&gt;system</span><span class="se">\n</span><span class="s2">Answer the questions.&lt;|im_end|&gt;&lt;|im_start|&gt;user</span><span class="se">\n</span><span class="s2">&quot;</span>
+                <span class="n">post_prompt</span> <span class="o">=</span> <span class="s2">&quot;&lt;|im_end|&gt;&lt;|im_start|&gt;assistant</span><span class="se">\n</span><span class="s2">&quot;</span>
+            <span class="k">else</span><span class="p">:</span>
                 <span class="n">pre_prompt</span> <span class="o">=</span> <span class="s2">&quot;A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user&#39;s questions. USER: &quot;</span>
+                <span class="n">post_prompt</span> <span class="o">=</span> <span class="s2">&quot; ASSISTANT:&quot;</span>
+            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">input_text</span><span class="p">,</span> <span class="nb">list</span><span class="p">):</span>
+                <span class="n">post_prompt</span> <span class="o">=</span> <span class="p">[</span><span class="nb">input</span> <span class="o">+</span> <span class="n">post_prompt</span> <span class="k">for</span> <span class="nb">input</span> <span class="ow">in</span> <span class="n">input_text</span><span class="p">]</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">post_prompt</span> <span class="o">=</span> <span class="n">input_text</span> <span class="o">+</span> <span class="n">post_prompt</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">raw_image</span><span class="p">,</span> <span class="nb">list</span><span class="p">):</span>
+                <span class="n">raw_image</span> <span class="o">=</span> <span class="p">[</span><span class="n">raw_image</span><span class="p">]</span>
+            <span class="n">image</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">processor</span><span class="p">(</span><span class="n">raw_image</span><span class="p">)</span>
+
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="ow">in</span> <span class="p">[</span><span class="s1">&#39;llava&#39;</span><span class="p">,</span> <span class="s1">&#39;fuyu&#39;</span><span class="p">,</span> <span class="s1">&#39;kosmos-2&#39;</span><span class="p">]:</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;llava&quot;</span><span class="p">:</span>
+                <span class="n">pre_prompt</span> <span class="o">=</span> <span class="s2">&quot;A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user&#39;s questions. USER: &quot;</span>
+                <span class="n">post_prompt</span> <span class="o">=</span> <span class="s2">&quot; ASSISTANT:&quot;</span>
                 <span class="k">if</span> <span class="n">input_text</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-                    <span class="n">input_text</span> <span class="o">=</span> <span class="s2">&quot;&lt;image&gt;</span><span class="se">\n</span><span class="s2"> Please elaborate what you see in the images?&quot;</span>
+                    <span class="n">input_text</span> <span class="o">=</span> <span class="s2">&quot;</span><span class="se">\n</span><span class="s2"> Which city is this? Answer:&quot;</span>
+                <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">input_text</span><span class="p">,</span> <span class="nb">list</span><span class="p">):</span>
+                    <span class="n">post_prompt</span> <span class="o">=</span> <span class="p">[</span><span class="nb">input</span> <span class="o">+</span> <span class="n">post_prompt</span> <span class="k">for</span> <span class="nb">input</span> <span class="ow">in</span> <span class="n">input_text</span><span class="p">]</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="n">post_prompt</span> <span class="o">=</span> <span class="n">input_text</span> <span class="o">+</span> <span class="n">post_prompt</span>
             <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;fuyu&#39;</span><span class="p">:</span>
                 <span class="n">pre_prompt</span> <span class="o">=</span> <span class="s2">&quot;Describe this image:&quot;</span>
+                <span class="n">post_prompt</span> <span class="o">=</span> <span class="kc">None</span>
                 <span class="k">if</span> <span class="n">input_text</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                     <span class="n">input_text</span> <span class="o">=</span> <span class="s2">&quot;Answer the following VQAv2 question based on the image: How many people are in the image?</span><span class="se">\n</span><span class="s2">&quot;</span>
             <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;kosmos-2&quot;</span><span class="p">:</span>
                 <span class="n">pre_prompt</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span>
+                <span class="n">post_prompt</span> <span class="o">=</span> <span class="kc">None</span>
                 <span class="k">if</span> <span class="n">input_text</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                     <span class="n">input_text</span> <span class="o">=</span> <span class="s2">&quot;&lt;grounding&gt;An image of&quot;</span>
 
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">[</span><span class="s1">&#39;fuyu&#39;</span><span class="p">,</span> <span class="s1">&#39;kosmos-2&#39;</span><span class="p">]:</span>
-                <span class="n">post_prompt</span> <span class="o">=</span> <span class="n">input_text</span> <span class="o">+</span> <span class="s2">&quot; ASSISTANT:&quot;</span>
+                <span class="n">post_prompt</span> <span class="o">=</span> <span class="s2">&quot; ASSISTANT:&quot;</span>
+                <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">input_text</span><span class="p">,</span> <span class="nb">list</span><span class="p">):</span>
+                    <span class="n">post_prompt</span> <span class="o">=</span> <span class="p">[</span><span class="nb">input</span> <span class="o">+</span> <span class="n">post_prompt</span> <span class="k">for</span> <span class="nb">input</span> <span class="ow">in</span> <span class="n">input_text</span><span class="p">]</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="n">post_prompt</span> <span class="o">=</span> <span class="n">input_text</span> <span class="o">+</span> <span class="n">post_prompt</span>
             <span class="k">else</span><span class="p">:</span>
                 <span class="n">post_prompt</span> <span class="o">=</span> <span class="kc">None</span>
-
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;vila&quot;</span><span class="p">:</span>
-                <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">raw_image</span><span class="p">,</span> <span class="nb">list</span><span class="p">):</span>
-                    <span class="n">raw_image</span> <span class="o">=</span> <span class="p">[</span><span class="n">raw_image</span><span class="p">]</span>
-                <span class="n">image</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">processor</span><span class="p">(</span><span class="n">raw_image</span><span class="p">)</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="ow">in</span> <span class="p">[</span><span class="s1">&#39;fuyu&#39;</span><span class="p">,</span> <span class="s1">&#39;kosmos-2&#39;</span><span class="p">]:</span>
+                <span class="n">image</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">processor</span><span class="p">(</span><span class="n">text</span><span class="o">=</span><span class="n">input_text</span><span class="p">,</span>
+                                       <span class="n">images</span><span class="o">=</span><span class="n">raw_image</span><span class="p">,</span>
+                                       <span class="n">return_tensors</span><span class="o">=</span><span class="s1">&#39;pt&#39;</span><span class="p">)</span>
             <span class="k">else</span><span class="p">:</span>
-                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="ow">in</span> <span class="p">[</span><span class="s1">&#39;fuyu&#39;</span><span class="p">,</span> <span class="s1">&#39;kosmos-2&#39;</span><span class="p">]:</span>
-                    <span class="n">image</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">processor</span><span class="p">(</span><span class="n">text</span><span class="o">=</span><span class="n">input_text</span><span class="p">,</span>
+                <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">input_text</span><span class="p">,</span> <span class="nb">list</span><span class="p">):</span>
+                    <span class="n">image</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">processor</span><span class="p">(</span><span class="n">text</span><span class="o">=</span><span class="n">input_text</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span>
                                            <span class="n">images</span><span class="o">=</span><span class="n">raw_image</span><span class="p">,</span>
-                                           <span class="n">return_tensors</span><span class="o">=</span><span class="s1">&#39;pt&#39;</span><span class="p">)</span>
+                                           <span class="n">padding</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+                                           <span class="n">return_tensors</span><span class="o">=</span><span class="s2">&quot;pt&quot;</span><span class="p">)[</span><span class="s1">&#39;pixel_values&#39;</span><span class="p">]</span>
                 <span class="k">else</span><span class="p">:</span>
                     <span class="n">image</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">processor</span><span class="p">(</span><span class="n">text</span><span class="o">=</span><span class="n">input_text</span><span class="p">,</span>
                                            <span class="n">images</span><span class="o">=</span><span class="n">raw_image</span><span class="p">,</span>
@@ -2113,6 +2261,8 @@
 
         <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="ow">in</span> <span class="p">[</span><span class="s1">&#39;mllama&#39;</span><span class="p">]:</span>
             <span class="k">if</span> <span class="n">raw_image</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">input_text</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">processor</span><span class="o">.</span><span class="n">apply_chat_template</span><span class="p">(</span>
+                    <span class="n">images</span><span class="o">=</span><span class="n">raw_image</span><span class="p">,</span> <span class="n">text</span><span class="o">=</span><span class="n">input_text</span><span class="p">)</span>
                 <span class="n">inputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">processor</span><span class="p">(</span><span class="n">images</span><span class="o">=</span><span class="n">raw_image</span><span class="p">,</span>
                                         <span class="n">text</span><span class="o">=</span><span class="n">input_text</span><span class="p">,</span>
                                         <span class="n">return_tensors</span><span class="o">=</span><span class="s2">&quot;pt&quot;</span><span class="p">)</span>
@@ -2158,7 +2308,8 @@
 
         <span class="c1"># Repeat inputs to match batch size</span>
         <span class="n">pre_prompt</span> <span class="o">=</span> <span class="p">[</span><span class="n">pre_prompt</span><span class="p">]</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span>
-        <span class="n">post_prompt</span> <span class="o">=</span> <span class="p">[</span><span class="n">post_prompt</span><span class="p">]</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">input_text</span><span class="p">,</span> <span class="nb">list</span><span class="p">):</span>
+            <span class="n">post_prompt</span> <span class="o">=</span> <span class="p">[</span><span class="n">post_prompt</span><span class="p">]</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">[</span>
                 <span class="s1">&#39;fuyu&#39;</span><span class="p">,</span> <span class="s1">&#39;pix2struct&#39;</span><span class="p">,</span> <span class="s1">&#39;kosmos-2&#39;</span><span class="p">,</span> <span class="s1">&#39;vila&#39;</span><span class="p">,</span> <span class="s1">&#39;phi-3-vision&#39;</span><span class="p">,</span>
                 <span class="s1">&#39;llava_next&#39;</span><span class="p">,</span> <span class="s1">&#39;internvl&#39;</span><span class="p">,</span> <span class="s1">&#39;llava_onevision&#39;</span>
@@ -2171,8 +2322,13 @@
                     <span class="n">image</span> <span class="o">=</span> <span class="n">image</span><span class="o">.</span><span class="n">expand</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span>
                                          <span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
                 <span class="k">else</span><span class="p">:</span>
-                    <span class="n">image</span> <span class="o">=</span> <span class="n">image</span><span class="o">.</span><span class="n">expand</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span>
-                                         <span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+                    <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">input_text</span><span class="p">,</span> <span class="nb">list</span><span class="p">):</span>
+                        <span class="n">image</span> <span class="o">=</span> <span class="n">image</span><span class="o">.</span><span class="n">expand</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span>
+                                             <span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+                    <span class="k">else</span><span class="p">:</span>
+                        <span class="n">image</span> <span class="o">=</span> <span class="n">image</span><span class="o">.</span><span class="n">expand</span><span class="p">(</span>
+                            <span class="nb">min</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batch_size</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">input_text</span><span class="p">)),</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span>
+                            <span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
         <span class="k">if</span> <span class="n">image</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">image</span> <span class="o">=</span> <span class="n">image</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
         <span class="c1"># Generate decoder_input_ids for enc-dec models</span>
@@ -2222,7 +2378,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f1ac93f6f00>
+<jinja2.runtime.BlockReference object at 0x7f5e6e502480>
 
 <div class="footer">
     <p>

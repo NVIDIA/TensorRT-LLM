@@ -14,7 +14,7 @@
       <script src="../../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../../../_static/doctools.js?v=9a2dae69"></script>
       <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
@@ -110,7 +110,6 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul>
@@ -202,8 +201,6 @@
 <span class="kn">from</span> <span class="nn">.linear</span> <span class="kn">import</span> <span class="n">ColumnLinear</span><span class="p">,</span> <span class="n">RowLinear</span>
 <span class="kn">from</span> <span class="nn">.lora</span> <span class="kn">import</span> <span class="n">LoraRuntimeParams</span>
 <span class="kn">from</span> <span class="nn">.normalization</span> <span class="kn">import</span> <span class="n">GroupNorm</span><span class="p">,</span> <span class="n">LayerNorm</span><span class="p">,</span> <span class="n">RmsNorm</span>
-
-<span class="kn">from</span> <span class="nn">..functional</span> <span class="kn">import</span> <span class="n">maximum</span>  <span class="c1"># isort:skip</span>
 
 <span class="n">layernorm_map</span> <span class="o">=</span> <span class="p">{</span>
     <span class="n">LayerNormType</span><span class="o">.</span><span class="n">LayerNorm</span><span class="p">:</span> <span class="n">LayerNorm</span><span class="p">,</span>
@@ -437,13 +434,15 @@
                  <span class="n">spec_decoding_max_generation_length</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
                  <span class="n">spec_decoding_generation_lengths</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">spec_decoding_position_offsets</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-                 <span class="n">spec_decoding_packed_mask</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+                 <span class="n">spec_decoding_packed_mask</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">spec_decoding_use</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">spec_decoding_is_generation_length_variable</span> <span class="o">=</span> <span class="n">spec_decoding_is_generation_length_variable</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">spec_decoding_max_generation_length</span> <span class="o">=</span> <span class="n">spec_decoding_max_generation_length</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">spec_decoding_generation_lengths</span> <span class="o">=</span> <span class="n">spec_decoding_generation_lengths</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">spec_decoding_position_offsets</span> <span class="o">=</span> <span class="n">spec_decoding_position_offsets</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">spec_decoding_packed_mask</span> <span class="o">=</span> <span class="n">spec_decoding_packed_mask</span></div>
+        <span class="bp">self</span><span class="o">.</span><span class="n">spec_decoding_packed_mask</span> <span class="o">=</span> <span class="n">spec_decoding_packed_mask</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">spec_decoding_use</span> <span class="o">=</span> <span class="n">spec_decoding_use</span></div>
 
 
 
@@ -453,10 +452,10 @@
 
     <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
-        <span class="n">mrope_rotary_sin_cos</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">mrope_rotary_cos_sin</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">mrope_position_deltas</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">mrope_rotary_sin_cos</span> <span class="o">=</span> <span class="n">mrope_rotary_sin_cos</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">mrope_rotary_cos_sin</span> <span class="o">=</span> <span class="n">mrope_rotary_cos_sin</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">mrope_position_deltas</span> <span class="o">=</span> <span class="n">mrope_position_deltas</span></div>
 
 
@@ -1205,20 +1204,17 @@
 
             <span class="c1"># KV cache scales.</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_scaling_factor</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="n">kv_orig_quant_scale</span> <span class="o">=</span> <span class="n">constant</span><span class="p">(</span><span class="n">fp32_array</span><span class="p">(</span>
-                    <span class="p">[</span><span class="mf">1.0</span><span class="p">]))</span> <span class="o">/</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_scaling_factor</span><span class="o">.</span><span class="n">value</span>
+                <span class="n">kv_orig_quant_scale</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_rcp_scaling_factor</span><span class="o">.</span><span class="n">value</span>
                 <span class="n">kv_quant_orig_scale</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_scaling_factor</span><span class="o">.</span><span class="n">value</span>
             <span class="k">else</span><span class="p">:</span>
                 <span class="n">kv_orig_quant_scale</span> <span class="o">=</span> <span class="kc">None</span>
                 <span class="n">kv_quant_orig_scale</span> <span class="o">=</span> <span class="kc">None</span>
 
             <span class="c1"># Attention output scales</span>
-            <span class="k">assert</span> <span class="p">(</span>
-                <span class="ow">not</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">use_fp8_context_fmha</span>
-            <span class="p">)</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_fp8_qdq</span><span class="p">(</span>
-            <span class="p">),</span> <span class="s2">&quot;FP8 Context FMHA must be used together with the fp8 quantization workflow.&quot;</span>
-
             <span class="n">attention_output_orig_quant_scale</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_output_orig_quant_scale</span><span class="o">.</span><span class="n">value</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_output_orig_quant_scale</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
+            <span class="k">if</span> <span class="n">attention_output_orig_quant_scale</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">default_net</span><span class="p">(</span>
+            <span class="p">)</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">fp4_gemm_plugin</span><span class="p">:</span>
+                <span class="n">attention_output_orig_quant_scale</span> <span class="o">=</span> <span class="n">attention_output_orig_quant_scale</span> <span class="o">/</span> <span class="mf">6.0</span>
 
             <span class="c1"># The rotary inv freq can be pre-computed.</span>
             <span class="n">rotary_inv_freq</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">attention_params</span><span class="p">,</span> <span class="s2">&quot;rotary_inv_freq&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
@@ -1327,9 +1323,10 @@
                 <span class="n">spec_decoding_position_offsets</span><span class="p">,</span>
                 <span class="n">spec_decoding_packed_mask</span><span class="o">=</span><span class="n">spec_decoding_params</span><span class="o">.</span>
                 <span class="n">spec_decoding_packed_mask</span><span class="p">,</span>
+                <span class="n">spec_decoding_use</span><span class="o">=</span><span class="n">spec_decoding_params</span><span class="o">.</span><span class="n">spec_decoding_use</span><span class="p">,</span>
                 <span class="n">long_rope_rotary_inv_freq</span><span class="o">=</span><span class="n">long_rope_rotary_inv_freq</span><span class="p">,</span>
                 <span class="n">long_rope_rotary_cos_sin</span><span class="o">=</span><span class="n">long_rope_rotary_cos_sin</span><span class="p">,</span>
-                <span class="n">mrope_rotary_sin_cos</span><span class="o">=</span><span class="n">mrope_params</span><span class="o">.</span><span class="n">mrope_rotary_sin_cos</span><span class="p">,</span>
+                <span class="n">mrope_rotary_cos_sin</span><span class="o">=</span><span class="n">mrope_params</span><span class="o">.</span><span class="n">mrope_rotary_cos_sin</span><span class="p">,</span>
                 <span class="n">mrope_position_deltas</span><span class="o">=</span><span class="n">mrope_params</span><span class="o">.</span><span class="n">mrope_position_deltas</span><span class="p">,</span>
                 <span class="n">attn_logit_softcapping_scale</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_attn_value</span><span class="p">,</span>
                 <span class="n">host_runtime_perf_knobs</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span>
@@ -1398,8 +1395,8 @@
 
                     <span class="n">embed_positions</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span><span class="n">short</span><span class="p">,</span> <span class="n">long</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
                     <span class="n">select</span> <span class="o">=</span> <span class="n">where</span><span class="p">(</span>
-                        <span class="n">sequence_length</span> <span class="o">&lt;=</span>
-                        <span class="bp">self</span><span class="o">.</span><span class="n">original_max_position_embeddings</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+                        <span class="n">sequence_length</span>
+                        <span class="o">&lt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">original_max_position_embeddings</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
                     <span class="n">embed_positions</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span><span class="n">embed_positions</span><span class="p">,</span>
                                             <span class="n">concat</span><span class="p">([</span><span class="n">select</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">]),</span>
                                             <span class="n">sizes</span><span class="o">=</span><span class="n">shape</span><span class="p">(</span><span class="n">short</span><span class="p">))</span>
@@ -1676,10 +1673,14 @@
             <span class="n">dense_lora_params</span> <span class="o">=</span> <span class="n">lora_layer_params</span><span class="o">.</span><span class="n">get_runtime_params</span><span class="p">(</span>
                 <span class="mi">0</span><span class="p">,</span> <span class="s2">&quot;attn_dense&quot;</span><span class="p">)</span>
 
-        <span class="k">if</span> <span class="n">skip_attn</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">skip_attn</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">default_net</span><span class="p">(</span>
+        <span class="p">)</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">use_fp8_context_fmha</span><span class="p">:</span>
             <span class="c1"># This case is used when we can skip this attention layer directly.</span>
             <span class="c1"># The output would be undefined and not used if skip_attn is not None</span>
             <span class="c1"># and set skip_attn as True during runtime</span>
+            <span class="c1"># But when use_fp8_context_fmha is enabled, the output data type of</span>
+            <span class="c1"># attention_plugin is fp8. Since TRT&#39;s conditional layer does not support</span>
+            <span class="c1"># FP8 data type yet, we cannot use it to skip the computation in such case.</span>
 
             <span class="n">dense_conditional</span> <span class="o">=</span> <span class="n">Conditional</span><span class="p">(</span><span class="n">skip_attn</span><span class="p">)</span>
             <span class="n">skip_case</span> <span class="o">=</span> <span class="n">dense_conditional</span><span class="o">.</span><span class="n">add_input</span><span class="p">(</span><span class="n">attention_input</span><span class="p">)</span>
@@ -1691,7 +1692,8 @@
                              <span class="n">lora_runtime_params</span><span class="o">=</span><span class="n">dense_lora_params</span><span class="p">,</span>
                              <span class="n">all_reduce_params</span><span class="o">=</span><span class="n">all_reduce_params</span><span class="p">)</span>
 
-        <span class="k">if</span> <span class="n">skip_attn</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">skip_attn</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">default_net</span><span class="p">(</span>
+        <span class="p">)</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">use_fp8_context_fmha</span><span class="p">:</span>
             <span class="n">context</span> <span class="o">=</span> <span class="n">dense_conditional</span><span class="o">.</span><span class="n">add_output</span><span class="p">(</span><span class="n">skip_case</span><span class="p">,</span> <span class="n">context</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
@@ -2045,19 +2047,12 @@
             <span class="p">],</span> <span class="s1">&#39;Plugin only support masked MHA.&#39;</span>
 
             <span class="c1"># KV cache scales.</span>
-            <span class="n">kv_orig_quant_scale</span> <span class="o">=</span> <span class="n">constant</span><span class="p">(</span>
-                <span class="n">fp32_array</span><span class="p">([</span><span class="mf">1.0</span><span class="p">])</span>
-            <span class="p">)</span> <span class="o">/</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_scaling_factor</span><span class="o">.</span><span class="n">value</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_kv_cache_quant</span><span class="p">(</span>
+            <span class="n">kv_orig_quant_scale</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_rcp_scaling_factor</span><span class="o">.</span><span class="n">value</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_kv_cache_quant</span><span class="p">(</span>
             <span class="p">)</span> <span class="k">else</span> <span class="kc">None</span>
             <span class="n">kv_quant_orig_scale</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_scaling_factor</span><span class="o">.</span><span class="n">value</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_kv_cache_quant</span><span class="p">(</span>
             <span class="p">)</span> <span class="k">else</span> <span class="kc">None</span>
 
             <span class="c1"># Attention output scales</span>
-            <span class="k">assert</span> <span class="p">(</span>
-                <span class="ow">not</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">use_fp8_context_fmha</span>
-            <span class="p">)</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_fp8_qdq</span><span class="p">(</span>
-            <span class="p">),</span> <span class="s2">&quot;FP8 Context FMHA must be used together with the fp8 quantization workflow.&quot;</span>
-
             <span class="n">attention_output_orig_quant_scale</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_output_orig_quant_scale</span><span class="o">.</span><span class="n">value</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_output_orig_quant_scale</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
             <span class="n">context</span><span class="p">,</span> <span class="n">past_key_value</span> <span class="o">=</span> <span class="n">gpt_attention</span><span class="p">(</span>
                 <span class="n">qkv</span><span class="o">=</span><span class="n">qkv</span><span class="p">,</span>
@@ -2105,7 +2100,7 @@
                 <span class="n">use_cache</span><span class="o">=</span><span class="n">use_cache</span><span class="p">,</span>
                 <span class="n">spec_decoding_position_offsets</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">spec_decoding_packed_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">mrope_rotary_sin_cos</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">mrope_rotary_cos_sin</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">mrope_position_deltas</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">host_runtime_perf_knobs</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span>
                 <span class="n">host_runtime_perf_knobs</span><span class="p">,</span>
@@ -2337,19 +2332,13 @@
 
             <span class="c1"># KV cache scales.</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_scaling_factor</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="n">kv_orig_quant_scale</span> <span class="o">=</span> <span class="n">constant</span><span class="p">(</span><span class="n">fp32_array</span><span class="p">(</span>
-                    <span class="p">[</span><span class="mf">1.0</span><span class="p">]))</span> <span class="o">/</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_scaling_factor</span><span class="o">.</span><span class="n">value</span>
+                <span class="n">kv_orig_quant_scale</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_rcp_scaling_factor</span><span class="o">.</span><span class="n">value</span>
                 <span class="n">kv_quant_orig_scale</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_scaling_factor</span><span class="o">.</span><span class="n">value</span>
             <span class="k">else</span><span class="p">:</span>
                 <span class="n">kv_orig_quant_scale</span> <span class="o">=</span> <span class="kc">None</span>
                 <span class="n">kv_quant_orig_scale</span> <span class="o">=</span> <span class="kc">None</span>
 
             <span class="c1"># Attention output scales</span>
-            <span class="k">assert</span> <span class="p">(</span>
-                <span class="ow">not</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">use_fp8_context_fmha</span>
-            <span class="p">)</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_fp8_qdq</span><span class="p">(</span>
-            <span class="p">),</span> <span class="s2">&quot;FP8 Context FMHA must be used together with the fp8 quantization workflow.&quot;</span>
-
             <span class="n">attention_output_orig_quant_scale</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_output_orig_quant_scale</span><span class="o">.</span><span class="n">value</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_output_orig_quant_scale</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
 
             <span class="n">rotary_cos_sin</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">embed_positions_for_gpt_attention</span><span class="o">.</span><span class="n">value</span>
@@ -2422,6 +2411,7 @@
                 <span class="n">spec_decoding_position_offsets</span><span class="p">,</span>
                 <span class="n">spec_decoding_packed_mask</span><span class="o">=</span><span class="n">spec_decoding_params</span><span class="o">.</span>
                 <span class="n">spec_decoding_packed_mask</span><span class="p">,</span>
+                <span class="n">spec_decoding_use</span><span class="o">=</span><span class="n">spec_decoding_params</span><span class="o">.</span><span class="n">spec_decoding_use</span><span class="p">,</span>
                 <span class="n">attn_logit_softcapping_scale</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_attn_value</span><span class="p">,</span>
                 <span class="n">host_runtime_perf_knobs</span><span class="o">=</span><span class="n">attention_params</span><span class="o">.</span>
                 <span class="n">host_runtime_perf_knobs</span><span class="p">,</span>
@@ -2453,7 +2443,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f1ac6834e00>
+<jinja2.runtime.BlockReference object at 0x7f59f708c0e0>
 
 <div class="footer">
     <p>
