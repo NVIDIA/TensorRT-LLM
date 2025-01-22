@@ -1289,7 +1289,6 @@ GPTAttentionPluginCreator::GPTAttentionPluginCreator()
     : GPTAttentionPluginCreatorCommon()
 {
 
-    mPluginAttributes.emplace_back(PluginField("in_flight_batching", nullptr, PluginFieldType::kINT8, 0));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }
