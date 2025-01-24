@@ -214,14 +214,13 @@ def load_weights_from_hf_model(hf_model,
             dim=1,
         )
 
-        q_nope_weight, q_pe_weight = q_b_proj_weight.split(
-            [qk_nope_head_dim, qk_rope_head_dim],
-            dim=1,
-        )
         k_nope_weight, v_weight = kv_b_proj_weight.split(
             [qk_nope_head_dim, v_head_dim],
             dim=1,
         )
+
+        k_nope_weight_trans = k_nope_weight.transpose(2, 1).reshape(
+            num_heads // mapping.tp_size * kv_lora_rank, qk_nope_head_dim)
 
         if q_lora_rank is None:
             q_b_proj_weight = q_b_proj_weight.reshape(
@@ -240,17 +239,6 @@ def load_weights_from_hf_model(hf_model,
         ],
                                         dim=0)
 
-        # Fuse matrices for decompression
-        fused_q_nope_weight = torch.einsum(
-            'hdq,hdk->hkq',
-            q_nope_weight,
-            k_nope_weight,
-        )
-        fused_q_weight = torch.cat(
-            [fused_q_nope_weight, q_pe_weight],
-            dim=1,
-        ).flatten(start_dim=0, end_dim=1)
-
         weights.update(
             get_tllm_linear_weight(fused_a_weight,
                                    trtllm_prex + 'attention.fused_a.'))
@@ -258,14 +246,14 @@ def load_weights_from_hf_model(hf_model,
             get_tllm_linear_weight(kv_a_layernorm_weight,
                                    trtllm_prex + 'attention.kv_a_layernorm.'))
         weights.update(
-            get_param_weight(fused_q_weight,
-                             trtllm_prex + 'attention.fused_q_proj'))
-        weights.update(
             get_param_weight(q_b_proj_weight,
                              trtllm_prex + 'attention.q_b_proj'))
         weights.update(
             get_param_weight(kv_b_proj_weight,
                              trtllm_prex + 'attention.kv_b_proj'))
+        weights.update(
+            get_param_weight(k_nope_weight_trans,
+                             trtllm_prex + 'attention.k_b_proj_trans'))
         weights.update(
             get_tllm_linear_weight(
                 o_proj_weight,

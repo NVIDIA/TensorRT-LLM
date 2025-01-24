@@ -45,7 +45,8 @@ MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(bool remove_input_padding, int nu
     bool use_finished, bool use_bias, int tp_size, int tp_rank, int ep_size, int ep_rank,
     MOEExpertScaleNormalizationMode normalization_mode, float sparse_mixer_epsilon, bool force_determinism,
     int side_stream_id, MixtureOfExpertsPluginProfilerPtr gemm_profiler_ptr, bool use_lora,
-    nvinfer1::DataType lora_type, LoraPluginProfilerPtr lora_profiler, int max_low_rank)
+    nvinfer1::DataType lora_type, LoraPluginProfilerPtr lora_profiler, int max_low_rank, bool use_deepseek = false,
+    bool use_deepseek_with_native_fp8_weights = false)
     : mRemoveInputPadding(remove_input_padding)
     , mNumExperts(number_of_experts)
     , mK(top_k)
@@ -68,6 +69,8 @@ MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(bool remove_input_padding, int nu
     , mLoraType(lora_type)
     , mLoraProfiler(std::move(lora_profiler))
     , mMaxLowRank(max_low_rank)
+    , mUseDeepSeek(use_deepseek)
+    , mUseDeepSeekWithNativeFp8Weights(use_deepseek_with_native_fp8_weights)
 {
     init();
 }
@@ -105,6 +108,8 @@ tensorrt_llm::plugins::MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(MixtureOfE
     , mLoraImpl2(other.mLoraImpl2)
     , mLayerName(other.mLayerName)
     , mNamespace(other.mNamespace)
+    , mUseDeepSeek(other.mUseDeepSeek)
+    , mUseDeepSeekWithNativeFp8Weights(other.mUseDeepSeekWithNativeFp8Weights)
 {
     init();
 }
@@ -116,7 +121,8 @@ size_t MixtureOfExpertsPlugin::getSerializationSize() const noexcept
         + sizeof(QuantMode::BaseType) + sizeof(mUseFinished) + sizeof(mUseBias) + sizeof(mParallelismConfig)
         + sizeof(mNormalizationMode) + sizeof(mSparseMixerEpsilon) + sizeof(mDims) + sizeof(mUseDeterministicKernels)
         + sizeof(mSideStreamId) + mGemmProfiler->getSerializationSize(mGemmId1)
-        + mGemmProfiler->getSerializationSize(mGemmId2) + sizeof(mUseLora) + sizeof(mLoraType) + sizeof(mMaxLowRank);
+        + mGemmProfiler->getSerializationSize(mGemmId2) + sizeof(mUseLora) + sizeof(mLoraType) + sizeof(mMaxLowRank)
+        + sizeof(mUseDeepSeek) + sizeof(mUseDeepSeekWithNativeFp8Weights);
 
     if (hasLora())
     {
@@ -157,6 +163,8 @@ MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(void const* data, size_t length,
     read(d, mUseLora);
     read(d, mLoraType);
     read(d, mMaxLowRank);
+    read(d, mUseDeepSeek);
+    read(d, mUseDeepSeekWithNativeFp8Weights);
 
     // Call init before deserialising the profiler to initialize mGemmId
     init();
@@ -202,6 +210,8 @@ void MixtureOfExpertsPlugin::serialize(void* buffer) const noexcept
     write(d, mUseLora);
     write(d, mLoraType);
     write(d, mMaxLowRank);
+    write(d, mUseDeepSeek);
+    write(d, mUseDeepSeekWithNativeFp8Weights);
 
     mGemmProfiler->serialize(d, mGemmId1);
     mGemmProfiler->serialize(d, mGemmId2);
@@ -249,6 +259,10 @@ void MixtureOfExpertsPlugin::init()
     else if (mType == DataType::kBF16 && mWeightType == DataType::kBF16)
     {
         mMOERunner = std::make_unique<CutlassMoeFCRunner<__nv_bfloat16, __nv_bfloat16>>();
+    }
+    else if (mType == DataType::kBF16 && mWeightType == DataType::kFP8)
+    {
+        mMOERunner = std::make_unique<CutlassMoeFCRunner<__nv_bfloat16, __nv_fp8_e4m3>>();
     }
     else if (mType == DataType::kBF16 && mWeightType == DataType::kINT8)
     {
@@ -314,6 +328,35 @@ void MixtureOfExpertsPlugin::init()
 
         TLLM_CUDA_CHECK(cudaEventCreate(&mMemcpyEvent));
     }
+
+    if (useDeepSeekWithNativeFp8Weights())
+    {
+        TLLM_CHECK_WITH_INFO(
+            useDeepSeek(), "the mUseDeepSeek should be true when the mUseDeepSeekWithNativeFp8Weights is true");
+    }
+    if (useDeepSeek())
+    {
+
+#ifdef ENABLE_BF16
+        if (mType == DataType::kBF16)
+        {
+            if (mWeightType == DataType::kBF16)
+            {
+                mBlockScaleGemmImplPtr
+                    = std::make_shared<kernels::small_m_gemm::CutlassFp8BlockScaleGemmRunner<__nv_bfloat16,
+                        __nv_bfloat16, __nv_bfloat16>>();
+            }
+#ifdef ENABLE_FP8
+            else if (mWeightType == DataType::kFP8)
+            {
+                mBlockScaleGemmImplPtr
+                    = std::make_shared<kernels::small_m_gemm::CutlassFp8BlockScaleGemmRunner<__nv_bfloat16,
+                        __nv_fp8_e4m3, __nv_bfloat16>>();
+            }
+        }
+#endif
+#endif
+    }
     mSideStreamPtr = nullptr;
     mDebugStallMain = tensorrt_llm::runtime::utils::stallStream("TLLM_DEBUG_MOE_STALL_MAIN");
     mDebugStallSide = tensorrt_llm::runtime::utils::stallStream("TLLM_DEBUG_MOE_STALL_SIDE");
@@ -377,6 +420,11 @@ bool MixtureOfExpertsPlugin::supportsFormatCombination(
         return true;
     }
     else if (hasExpertFp8QuantScales() && getExpertFP8Dequant1Index() <= pos && pos <= getExpertFP8QuantFinalIndex())
+    {
+        return inOut[pos].type == DataType::kFLOAT;
+    }
+    else if (useDeepSeekWithNativeFp8Weights() && getExpertDeepseekScale1Index() <= pos
+        && pos <= getExpertDeepseekScale2Index())
     {
         return inOut[pos].type == DataType::kFLOAT;
     }
@@ -470,7 +518,7 @@ auto MixtureOfExpertsPlugin::setupWorkspace(void* base_ptr, int64_t num_tokens, 
     size_t dtype_size = tensorrt_llm::common::getDTypeSize(mType);
 
     size_t moe_workspace_size = mMOERunner->getWorkspaceSize(num_tokens, mExpertHiddenSize, mExpertInterSize,
-        mNumExperts, mK, mActivationType, mNormalizationMode, mParallelismConfig, hasLora());
+        mNumExperts, mK, mActivationType, mNormalizationMode, mParallelismConfig, hasLora(), useDeepSeek());
 
     // Output of post-softmax routing probabilities
     size_t scale_probabilities_size = num_tokens * mNumExperts * sizeof(float);
@@ -489,12 +537,24 @@ auto MixtureOfExpertsPlugin::setupWorkspace(void* base_ptr, int64_t num_tokens, 
             mLoraImpl2->getWorkspaceSize(num_tokens * mK, num_reqs_lora, mLoraType));
     }
 
+    size_t deepseek_workspace_size = 0;
+    if (useDeepSeek())
+    {
+        bool is_gated_actiation = isGatedActivation(mActivationType);
+        int factor = is_gated_actiation ? 2 : 1;
+        size_t deepseek_fc1_size = mBlockScaleGemmImplPtr->getWorkspaceSize(
+            num_tokens * mK, factor * mExpertInterSize, mExpertHiddenSize, mNumExperts);
+        size_t deepseek_fc2_size = mBlockScaleGemmImplPtr->getWorkspaceSize(
+            num_tokens * mK, mExpertHiddenSize, mExpertInterSize, mNumExperts);
+        deepseek_workspace_size = std::max(deepseek_fc1_size, deepseek_fc2_size);
+    }
     std::vector<size_t> workspaces{
         moe_workspace_size,
         scale_probabilities_size,
         src_to_dest_map_size,
         selected_expert_size,
         lora_workspace_size,
+        deepseek_workspace_size,
     };
 
     WorkspaceInfo info{};
@@ -507,6 +567,7 @@ auto MixtureOfExpertsPlugin::setupWorkspace(void* base_ptr, int64_t num_tokens, 
         info.src_to_dest_map = nextWorkspacePtr((int8_t*) info.scale_probs, scale_probabilities_size);
         info.selected_experts = nextWorkspacePtr((int8_t*) info.src_to_dest_map, src_to_dest_map_size);
         info.lora_workspace = nextWorkspacePtr((int8_t*) info.selected_experts, selected_expert_size);
+        info.deepseek_workspace = nextWorkspacePtr((int8_t*) info.lora_workspace, lora_workspace_size);
     }
 
     return info;
@@ -669,6 +730,17 @@ LoraParams MixtureOfExpertsPlugin::getLoraParams(
         mLoraExpandGatedWeightPtrs.data());
 }
 
+BlockScaleParams MixtureOfExpertsPlugin::getBlockScaleParams(
+    nvinfer1::PluginTensorDesc const* inputDesc, void const* const* inputs, void* workspace)
+{
+    TLLM_CHECK(useDeepSeek());
+    auto fc1_scales_ptr = static_cast<float const*>(inputs[getExpertDeepseekScale1Index()]);
+    auto fc2_scales_ptr = static_cast<float const*>(inputs[getExpertDeepseekScale2Index()]);
+
+    return BlockScaleParams(
+        fc1_scales_ptr, fc2_scales_ptr, mBlockScaleGemmImplPtr, static_cast<char*>(workspace), &mMemcpyEvent);
+}
+
 int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace_ptr,
     cudaStream_t stream) noexcept
@@ -767,6 +839,20 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
 
     auto gemm1 = mGemmProfiler->getBestConfig(num_tokens, mGemmId1);
     auto gemm2 = mGemmProfiler->getBestConfig(num_tokens, mGemmId2);
+
+    BlockScaleParams deepseek_params{};
+    if (useDeepSeek())
+    {
+        deepseek_params = getBlockScaleParams(inputDesc, inputs, workspace.deepseek_workspace);
+        auto config
+            = cutlass_extensions::CutlassGemmConfig(cutlass_extensions::CutlassTileConfigSM90::CtaShape128x16x128B,
+                cutlass_extensions::MainloopScheduleType::AUTO, cutlass_extensions::EpilogueScheduleType::AUTO,
+                cutlass_extensions::ClusterShape::ClusterShape_1x1x1);
+
+        gemm1 = std::make_optional(config);
+        gemm2 = std::make_optional(config);
+    }
+
     mMOERunner->setTactic(gemm1, gemm2);
     mMOERunner->runMoe(inputs[getInputTensorIndex()], static_cast<float const*>(inputs[getRoutingTensorIndex()]),
         inputs[getExpertWeights1Index()], hasBias() ? inputs[getExpertBias1Index()] : nullptr, mActivationType,
@@ -777,7 +863,7 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         hasFinishedTensor() ? static_cast<bool const*>(inputs[getFinishedTensorIndex()]) : nullptr, num_not_finished,
         workspace.scale_probs, static_cast<int*>(workspace.src_to_dest_map),
         static_cast<int*>(workspace.selected_experts), mSparseMixerEpsilon, mParallelismConfig, mNormalizationMode,
-        hasLora(), lora_params, stream);
+        hasLora(), lora_params, useDeepSeek(), deepseek_params, stream);
 
     if (useSideStream())
     {
@@ -815,6 +901,11 @@ char const* MixtureOfExpertsPlugin::getPluginVersion() const noexcept
 
 int MixtureOfExpertsPlugin::initialize() noexcept
 {
+    if (useDeepSeek())
+    {
+        mLoraProfiler->setSkip(true);
+        mGemmProfiler->setSkip(true);
+    }
     mGemmProfiler->setGemmToProfile(kernels::GemmProfilerBackend::GemmToProfile::GEMM_1);
     mGemmProfiler->profileTactics(this, mType, mDims, mGemmId1);
     mGemmProfiler->setGemmToProfile(kernels::GemmProfilerBackend::GemmToProfile::GEMM_2);
@@ -910,6 +1001,9 @@ MixtureOfExpertsPluginCreator::MixtureOfExpertsPluginCreator()
     mPluginAttributes.emplace_back(nvinfer1::PluginField("use_lora", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(nvinfer1::PluginField("lora_type_id", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(nvinfer1::PluginField("max_low_rank", nullptr, PluginFieldType::kINT32, 0));
+    mPluginAttributes.emplace_back(nvinfer1::PluginField("use_deepseek", nullptr, PluginFieldType::kINT32, 0));
+    mPluginAttributes.emplace_back(
+        nvinfer1::PluginField("use_deepseek_with_native_fp8_weights", nullptr, PluginFieldType::kINT32, 0));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }
@@ -940,6 +1034,8 @@ IPluginV2* MixtureOfExpertsPluginCreator::createPlugin(
     int mUseLora{};
     int mLoraType{INT_MAX};
     int mMaxLowRank{0};
+    int mUseDeepSeek{0};
+    int mUseDeepSeekWithNativeFp8Weights{0};
 
     float mSparseMixerEpsilon = -INFINITY;
 
@@ -977,6 +1073,8 @@ IPluginV2* MixtureOfExpertsPluginCreator::createPlugin(
         MapPair{"side_stream_id", std::ref(mSideStreamId), true},
         MapPair{"lora_type_id", std::ref(mLoraType), true},
         MapPair{"max_low_rank", std::ref(mMaxLowRank), true},
+        MapPair{"use_deepseek", std::ref(mUseDeepSeek), true},
+        MapPair{"use_deepseek_with_native_fp8_weights", std::ref(mUseDeepSeekWithNativeFp8Weights), true},
     };
     for (int i = 0; i < fc->nbFields; ++i)
     {
@@ -1036,7 +1134,8 @@ IPluginV2* MixtureOfExpertsPluginCreator::createPlugin(
             QuantMode(mQuantMode), mUseFinished != 0, mUseBias != 0, mTPSize, mTPRank, mEPSize, mEPRank,
             static_cast<MOEExpertScaleNormalizationMode>(mNormalizationMode), mSparseMixerEpsilon,
             mRequiresDeterminism != 0, mSideStreamId, gemmProfiler, mUseLora != 0,
-            static_cast<nvinfer1::DataType>(mLoraType), loraProfiler, mMaxLowRank);
+            static_cast<nvinfer1::DataType>(mLoraType), loraProfiler, mMaxLowRank, mUseDeepSeek,
+            mUseDeepSeekWithNativeFp8Weights);
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
     }

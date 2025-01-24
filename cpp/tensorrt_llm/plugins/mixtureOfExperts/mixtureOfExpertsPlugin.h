@@ -20,6 +20,7 @@
 #include "NvInferPlugin.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
 #include "tensorrt_llm/kernels/lora/lora.h"
 #include "tensorrt_llm/kernels/mixtureOfExperts/moe_kernels.h"
 #include "tensorrt_llm/plugins/common/gemmPluginProfiler.h"
@@ -100,6 +101,7 @@ public:
     using MOEExpertScaleNormalizationMode = tensorrt_llm::kernels::MOEExpertScaleNormalizationMode;
     using LoraPluginProfilerPtr = std::shared_ptr<CublasLtGemmPluginProfiler>;
     using LoraImplPtr = std::shared_ptr<kernels::LoraImpl>;
+    using BlockScaleGemmImplPtr = std::shared_ptr<kernels::small_m_gemm::CutlassFp8BlockScaleGemmRunnerInterface>;
 
     MixtureOfExpertsPlugin() = delete;
     MixtureOfExpertsPlugin(bool remove_input_padding, int number_of_experts, int top_k, int expert_hidden_size,
@@ -108,7 +110,8 @@ public:
         bool use_finished, bool use_bias, int tp_size, int tp_rank, int ep_size, int ep_rank,
         MOEExpertScaleNormalizationMode normalization_mode, float sparse_mixer_epsilon, bool force_determinism,
         int side_stream_id, MixtureOfExpertsPluginProfilerPtr gemm_profiler_ptr, bool use_lora,
-        nvinfer1::DataType lora_type, LoraPluginProfilerPtr lora_profiler, int max_low_rank);
+        nvinfer1::DataType lora_type, LoraPluginProfilerPtr lora_profiler, int max_low_rank, bool use_deepseek,
+        bool use_deepseek_with_native_fp8_weights);
     MixtureOfExpertsPlugin(void const* data, size_t length, MixtureOfExpertsPluginProfilerPtr gemm_profiler_ptr,
         LoraPluginProfilerPtr lora_profiler);
     MixtureOfExpertsPlugin(MixtureOfExpertsPlugin const&);
@@ -181,6 +184,11 @@ private:
 
     MixtureOfExpertsPluginProfilerPtr mGemmProfiler;
 
+    // deepseek related
+    bool mUseDeepSeek{};
+    bool mUseDeepSeekWithNativeFp8Weights{};
+    BlockScaleGemmImplPtr mBlockScaleGemmImplPtr;
+
     // lora related
     bool mUseLora{};
     nvinfer1::DataType mLoraType{};
@@ -216,6 +224,7 @@ private:
         void* src_to_dest_map{};
         void* selected_experts{};
         void* lora_workspace{};
+        void* deepseek_workspace{};
         size_t size{};
     };
 
@@ -228,6 +237,9 @@ private:
 
     int getNumLoraRequests(nvinfer1::PluginTensorDesc const* input_tensor) const;
     kernels::LoraParams getLoraParams(
+        nvinfer1::PluginTensorDesc const* inputDesc, void const* const* inputs, void* workspace);
+
+    kernels::BlockScaleParams getBlockScaleParams(
         nvinfer1::PluginTensorDesc const* inputDesc, void const* const* inputs, void* workspace);
 
     enum class RequestType : int32_t
@@ -295,6 +307,16 @@ private:
         return mUseLora;
     }
 
+    bool useDeepSeek() const
+    {
+        return mUseDeepSeek;
+    }
+
+    bool useDeepSeekWithNativeFp8Weights() const
+    {
+        return mUseDeepSeekWithNativeFp8Weights;
+    }
+
     bool hasGatedLoraWeightsAndRanks() const
     {
         return mUseLora && isGatedActivation(mActivationType);
@@ -315,6 +337,16 @@ private:
         return getExpertBias2Index() + hasFinishedTensor();
     }
 
+    IndexType getExpertDeepseekScale1Index() const
+    {
+        return getFinishedTensorIndex() + useDeepSeekWithNativeFp8Weights();
+    }
+
+    IndexType getExpertDeepseekScale2Index() const
+    {
+        return getExpertDeepseekScale1Index() + useDeepSeekWithNativeFp8Weights();
+    }
+
     IndexType getExpertIntQuantScale1Index() const
     {
         return getFinishedTensorIndex() + hasExpertIntQuantScales();
@@ -327,7 +359,7 @@ private:
 
     IndexType getExpertFP8Dequant1Index() const
     {
-        return getExpertIntQuantScale2Index() + hasExpertFp8QuantScales();
+        return std::max(getExpertIntQuantScale2Index(), getExpertDeepseekScale2Index()) + hasExpertFp8QuantScales();
     }
 
     IndexType getExpertFP8Quant2Index() const

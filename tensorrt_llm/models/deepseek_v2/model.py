@@ -69,7 +69,8 @@ class DeepseekV2DecoderLayer(Module):
             rotary_scaling=config.rotary_scaling,
             tp_group=config.mapping.tp_group,
             tp_size=config.mapping.tp_size,
-            tp_rank=config.mapping.tp_rank)
+            tp_rank=config.mapping.tp_rank,
+            quant_mode=config.quant_mode)  
 
         ### Added deepseek MoE and shared_experts
         ### First decoder layer: MLA + dense MLP + input_layernorm(RMSNorm) + post_attention_layernorm(RMSNorm)
@@ -252,8 +253,11 @@ class DeepseekV2ForCausalLM(DecoderModelForCausalLM):
                     "q_a_layernrom": "q_a_layernorm",
                     "kv_a_layernorm": "kv_a_layernorm",
                     "q_b_proj": "q_b_proj.weight",
+                    "q_b_proj_scale": "q_b_proj.weight_scale_inv",
                     "kv_b_proj": "kv_b_proj.weight",
-                    "fused_q_proj": ["q_b_proj.weight", "kv_b_proj.weight"],
+                    "kv_b_proj_scale": "kv_b_proj.weight_scale_inv",
+                    "k_b_proj_trans": "kv_b_proj.weight",
+                    "k_b_proj_trans_scale": "kv_b_proj.weight_scale_inv",
                     "shared_expert": "shared_experts",
                     "e_score_correction_bias": "gate.e_score_correction_bias",
                 }
@@ -262,8 +266,11 @@ class DeepseekV2ForCausalLM(DecoderModelForCausalLM):
                     "fused_a": "kv_a_proj_with_mqa",
                     "kv_a_layernorm": "kv_a_layernorm",
                     "q_b_proj": "q_proj.weight",
+                    "q_b_proj_scale": "q_proj.weight_scale_inv",
                     "kv_b_proj": "kv_b_proj.weight",
-                    "fused_q_proj": ["q_proj.weight", "kv_b_proj.weight"],
+                    "kv_b_proj_scale": "kv_b_proj.weight_scale_inv",
+                    "k_b_proj_trans": "kv_b_proj.weight",
+                    "k_b_proj_trans_scale": "kv_b_proj.weight_scale_inv",
                     "shared_expert": "shared_experts",
                     "e_score_correction_bias": "gate.e_score_correction_bias",
                 }

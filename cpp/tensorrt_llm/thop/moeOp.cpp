@@ -294,6 +294,7 @@ public:
 
         kernels::QuantParams quant_params{};
         kernels::LoraParams lora_params{};
+        kernels::BlockScaleParams deepseek_params{};
 
         mKernelRunner->runMoe(input.const_data_ptr(), gating_output.const_data_ptr<float>(),
             fc1_expert_weights.const_data_ptr(), nullptr, activation_type, fc2_expert_weights.const_data_ptr(), nullptr,
@@ -301,7 +302,7 @@ public:
             static_cast<char*>(workspace_info.workspace), output.data_ptr(), nullptr, output.sizes()[0],
             workspace_info.scale_probs, static_cast<int*>(workspace_info.src_to_dest_map),
             static_cast<int*>(workspace_info.selected_experts), 0, parallelism_config, norm_mode, false, lora_params,
-            stream);
+            false, deepseek_params, stream);
 
         return output;
     }
@@ -451,7 +452,7 @@ private:
         kernels::MOEExpertScaleNormalizationMode norm_mode, kernels::MOEParallelismConfig const& parallelismConfig)
     {
         size_t moe_workspace_size = mKernelRunner->getWorkspaceSize(num_rows, hidden_size, inter_size, num_experts,
-            top_k, activation_type, norm_mode, parallelismConfig, /* use_lora */ false);
+            top_k, activation_type, norm_mode, parallelismConfig, /* use_lora */ false, /* use_deepseek */ false);
         size_t scale_prob_size = num_rows * num_experts * sizeof(float);
         size_t src_to_dest_map_size = top_k * num_rows * sizeof(int);
         size_t selected_expert_size = top_k * num_rows * sizeof(int);

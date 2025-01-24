@@ -20,6 +20,7 @@
 #include "tensorrt_llm/runtime/tllmLogger.h"
 
 #include "tensorrt_llm/plugins/bertAttentionPlugin/bertAttentionPlugin.h"
+#include "tensorrt_llm/plugins/fp8CurrentScalingGemmPlugin/fp8CurrentScalingGemmPlugin.h"
 #include "tensorrt_llm/plugins/fp8RowwiseGemmPlugin/fp8RowwiseGemmPlugin.h"
 #include "tensorrt_llm/plugins/gemmPlugin/gemmPlugin.h"
 #include "tensorrt_llm/plugins/gemmSwigluPlugin/gemmSwigluPlugin.h"
@@ -207,6 +208,7 @@ extern "C"
         static tensorrt_llm::plugins::GemmPluginCreator gemmPluginCreator;
         static tensorrt_llm::plugins::GemmSwigluPluginCreator gemmSwigluPluginCreator;
         static tensorrt_llm::plugins::Fp8RowwiseGemmPluginCreator fp8RowwiseGemmPluginCreator;
+        static tensorrt_llm::plugins::Fp8CurrentScalingGemmPluginCreator fp8CurrentScalingGemmPluginCreator;
         static tensorrt_llm::plugins::MixtureOfExpertsPluginCreator moePluginCreator;
 #if ENABLE_MULTI_DEVICE
         static tensorrt_llm::plugins::SendPluginCreator sendPluginCreator;
@@ -245,6 +247,7 @@ extern "C"
                   creatorPtr(gemmPluginCreator),
                   creatorPtr(gemmSwigluPluginCreator),
                   creatorPtr(fp8RowwiseGemmPluginCreator),
+                  creatorPtr(fp8CurrentScalingGemmPluginCreator),
                   creatorPtr(moePluginCreator),
 #if ENABLE_MULTI_DEVICE
                   creatorPtr(sendPluginCreator),

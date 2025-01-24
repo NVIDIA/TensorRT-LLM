@@ -212,6 +212,56 @@ def fp8_rowwise_gemm(input: Tensor, weights: Tensor, scales_a: Tensor,
         return _create_tensor(layer.get_output(0), layer)
 
 
+def fp8_current_scaling_gemm(
+        input: Tensor,
+        weights: Tensor,
+        in_scales: Optional[Tensor] = None,
+        weight_scales: Optional[Tensor] = None,
+        need_quantize_acts_on_demand: bool = True,
+        need_quantize_weights_on_demand: bool = False) -> Tensor:
+    if not default_net().plugin_config.fp8_current_scaling_gemm_plugin:
+        raise TypeError(
+            "Fp8 current scaling GEMM is only supported with plugin")
+    else:
+        plg_creator = trt.get_plugin_registry().get_plugin_creator(
+            'Fp8CurrentScalingGemm', '1', TRT_LLM_PLUGIN_NAMESPACE)
+        assert plg_creator is not None
+
+        need_quantize_acts_on_demand = 1 if need_quantize_acts_on_demand else 0
+        need_quantize_acts_on_demand = trt.PluginField(
+            "need_quantize_acts_on_demand",
+            np.array(need_quantize_acts_on_demand, dtype=np.int32),
+            trt.PluginFieldType.INT32)
+
+        need_quantize_weights_on_demand = 1 if need_quantize_weights_on_demand else 0
+        need_quantize_weights_on_demand = trt.PluginField(
+            "need_quantize_weights_on_demand",
+            np.array(need_quantize_weights_on_demand, dtype=np.int32),
+            trt.PluginFieldType.INT32)
+
+        p_dtype = default_net().plugin_config.fp8_current_scaling_gemm_plugin
+        pf_type = trt.PluginField(
+            "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
+            trt.PluginFieldType.INT32)
+
+        pfc = trt.PluginFieldCollection([
+            need_quantize_acts_on_demand, need_quantize_weights_on_demand,
+            pf_type
+        ])
+        fp8_cs_gemm_plug = plg_creator.create_plugin("fp8_current_scaling_gemm",
+                                                     pfc)
+        plug_inputs = [input.trt_tensor, weights.trt_tensor]
+        if weight_scales is not None:
+            plug_inputs += [weight_scales.trt_tensor]
+        if in_scales is not None:
+            plug_inputs += [in_scales.trt_tensor]
+        layer = default_trtnet().add_plugin_v2(plug_inputs, fp8_cs_gemm_plug)
+        _add_plugin_info(layer, plg_creator, "fp8_current_scaling_gemm", pfc)
+        if not default_net().strongly_typed:
+            layer.get_input(1).set_dynamic_range(-448, 448)
+        return _create_tensor(layer.get_output(0), layer)
+
+
 def weight_only_quant_matmul(input: Tensor,
                              weights: Tensor,
                              scales: Tensor,

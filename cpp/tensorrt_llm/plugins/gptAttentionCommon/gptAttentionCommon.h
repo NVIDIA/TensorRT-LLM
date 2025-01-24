@@ -21,6 +21,7 @@
 #include "tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmhaRunner.h"
 #include "tensorrt_llm/kernels/contextFusedMultiHeadAttention/fused_multihead_attention_common.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunner.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
@@ -33,6 +34,8 @@
 namespace tensorrt_llm::plugins
 {
 
+using Fp8BlockScaleGemmRunnerPtr
+    = std::shared_ptr<tensorrt_llm::kernels::small_m_gemm::CutlassFp8BlockScaleGemmRunnerInterface>;
 class GPTAttentionPluginCommon : public BasePlugin
 {
 public:
@@ -57,8 +60,8 @@ public:
         bool use_cache = true, bool is_spec_decoding_enabled = false,
         bool spec_decoding_is_generation_length_variable = false, int32_t spec_decoding_max_generation_length = 1,
         bool is_mla_enabled = false, int q_lora_rank = 0, int kv_lora_rank = 0, int qk_nope_head_dim = 0,
-        int qk_rope_head_dim = 0, int v_head_dim = 0, bool skip_attn = false, int cp_size = 1, int cp_rank = 0,
-        std::set<int32_t> cp_group = {});
+        int qk_rope_head_dim = 0, int v_head_dim = 0, bool is_ptp128c_enabled = false, bool is_fp8_model = false,
+        bool skip_attn = false, int cp_size = 1, int cp_rank = 0, std::set<int32_t> cp_group = {});
 
     GPTAttentionPluginCommon(void const* data, size_t length);
 
@@ -415,6 +418,8 @@ protected:
     int32_t mSpecDecodingMaxGenerationLength = 1;
     bool mIsMLAEnabled = false;
     tensorrt_llm::kernels::mlaMetaParams mMLAParams;
+    bool mIsPTP128CEnabled = false;
+    bool mIsFP8Model = false;
     int mCpSize = 1;
     int mCpRank = 0;
     std::set<int32_t> mCpGroup = {};
@@ -438,6 +443,7 @@ protected:
     UniqPtrWNullCopy<tensorrt_llm::kernels::FusedMHARunnerV2> mFMHARunner;
     UniqPtrWNullCopy<tensorrt_llm::kernels::FusedMHARunnerV2> mDecoderFMHARunner;
     UniqPtrWNullCopy<tensorrt_llm::kernels::DecoderXQARunner> mDecoderXQARunner;
+    Fp8BlockScaleGemmRunnerPtr mGemmRunner;
 
     bool mMultiBlockMode;
     bool mEnableXQA;

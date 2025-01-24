@@ -119,8 +119,8 @@ public:
         bool use_cache = true, bool is_spec_decoding_enabled = false,
         bool spec_decoding_is_generation_length_variable = false, int spec_decoding_max_generation_length = 1,
         bool is_mla_enabled = false, int q_lora_rank = 0, int kv_lora_rank = 0, int qk_nope_head_dim = 0,
-        int qk_rope_head_dim = 0, int v_head_dim = 0, bool skip_attn = false, int cp_size = 1, int cp_rank = 0,
-        std::set<int32_t> cp_group = {});
+        int qk_rope_head_dim = 0, int v_head_dim = 0, bool is_ptp128c_enabled = false, bool is_fp8_model = false,
+        bool skip_attn = false, int cp_size = 1, int cp_rank = 0, std::set<int32_t> cp_group = {});
 
     GPTAttentionPlugin(void const* data, size_t length);
 
@@ -226,9 +226,12 @@ private:
         MROPE_POSITION_DELTAS,
         HOST_RUNTIME_PERF_KNOBS,
         HOST_CONTEXT_PROGRESS,
-        MLA_FUSED_Q_PROJ_TENSOR,
         MLA_Q_B_PROJ_TENSOR,
         MLA_KV_B_PROJ_TENSOR,
+        MLA_K_B_PROJ_TRANS_TENSOR,
+        MLA_Q_B_SCALE_TENSOR,
+        MLA_KV_B_SCALE_TENSOR,
+        MLA_K_B_TRANS_SCALE_TENSOR,
         SKIP_ATTN,
         LOGN_SCALING,
         ENUM_SIZE, // Used to count the number of IdxEntry, must put in last

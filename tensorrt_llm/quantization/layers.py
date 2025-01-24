@@ -36,12 +36,13 @@ from ..parameter import Parameter
 
 # isort: off
 from .functional import (
-    dequantize, fp8_rowwise_gemm, fp8_rowwise_rms_norm, postprocess_fp8_rowwise,
-    postprocess_weight_only, postprocess_weight_only_groupwise, quantize,
-    quantize_fp8_per_token, quantize_per_token, quantize_tensor,
-    validate_group_size, smooth_quant_gemm, smooth_quant_layer_norm,
-    smooth_quant_rms_norm, weight_only_groupwise_quant_matmul,
-    weight_only_quant_matmul, qserve_gemm_per_group, qserve_gemm_per_channel)
+    dequantize, fp8_current_scaling_gemm, fp8_rowwise_gemm,
+    fp8_rowwise_rms_norm, postprocess_fp8_rowwise, postprocess_weight_only,
+    postprocess_weight_only_groupwise, quantize, quantize_fp8_per_token,
+    quantize_per_token, quantize_tensor, validate_group_size, smooth_quant_gemm,
+    smooth_quant_layer_norm, smooth_quant_rms_norm,
+    weight_only_groupwise_quant_matmul, weight_only_quant_matmul,
+    qserve_gemm_per_group, qserve_gemm_per_channel)
 # isort: on
 from .mode import QuantMode
 
@@ -1616,6 +1617,177 @@ class FP8RowLinear(RowLinear):
             return weights.reshape(1, ).to(torch.float32)
         elif tllm_key.endswith("weight"):
             return weights.view(torch.float8_e4m3fn)
+        elif tllm_key.endswith("bias"):
+            return weights.to(str_dtype_to_torch(self.bias.dtype))
+
+
+class FP8CurrentScalingLinear(Linear):
+
+    def __init__(self,
+                 in_features,
+                 out_features,
+                 bias=False,
+                 dtype=None,
+                 tp_group=None,
+                 tp_size=1,
+                 gather_output=True,
+                 prefer_managed_weight=True,
+                 is_qkv=False,
+                 quantize_weights_on_demand=False):
+        super().__init__(in_features,
+                         out_features,
+                         bias=bias,
+                         dtype=dtype,
+                         tp_group=tp_group,
+                         tp_size=tp_size,
+                         gather_output=gather_output,
+                         prefer_managed_weight=prefer_managed_weight,
+                         is_qkv=is_qkv)
+        self.quantize_weights_on_demand = quantize_weights_on_demand
+        if quantize_weights_on_demand:
+            self.weight = Parameter(shape=(self.out_features, self.in_features),
+                                    dtype=dtype,
+                                    prefer_managed=self.prefer_managed_weight)
+        else:
+            self.weight = Parameter(shape=(self.out_features, self.in_features),
+                                    dtype='fp8',
+                                    prefer_managed=self.prefer_managed_weight)
+            self.weights_scaling_factor = Parameter(shape=(math.ceil(self.out_features / 128), \
+                math.ceil(self.in_features / 128)), dtype=trt.float32)
+
+        # TODO: modify this for checkpoint loading
+        self.tllm_to_externel_key_dict = {
+            "weight": "weight",
+        }
+
+        if not quantize_weights_on_demand:
+            self.tllm_to_externel_key_dict.update(
+                {"weights_scaling_factor": "weight_scale_inv"})
+
+    def forward(self, x, in_scales=None, lora_runtime_params=None):
+        weights_scaling_factor = None
+        w_in = self.weight.value
+        need_quantize_acts_on_demand = (x.dtype != trt.fp8)
+        need_quantize_weights_on_demand = self.quantize_weights_on_demand
+        if not need_quantize_acts_on_demand:
+            assert in_scales is not None, "FP8 input requires activation scales."
+        if not need_quantize_weights_on_demand:
+            weights_scaling_factor = self.weights_scaling_factor.value
+
+        gemm_output = fp8_current_scaling_gemm(x, w_in, weights_scaling_factor,
+                                               in_scales,
+                                               need_quantize_acts_on_demand,
+                                               need_quantize_weights_on_demand)
+
+        return self.collect_and_bias(gemm_output)
+
+    def postprocess(self, tllm_key, weights, **kwargs):
+        # TODO: add checkpoint conversion logic
+        if tllm_key.endswith("scaling_factor"):
+            if isinstance(weights, list) and len(weights) == 2:
+                left = weights[0].to(torch.float32)
+                right = weights[1].to(torch.float32)
+                weights = torch.cat(
+                    [left, right],
+                    dim=0,
+                )
+                return weights
+            else:
+                return weights.to(torch.float32)
+        elif tllm_key.endswith("weight"):
+            weight_dtype = str_dtype_to_torch(
+                self.dtype
+            ) if self.quantize_weights_on_demand else torch.float8_e4m3fn
+            if isinstance(weights, list) and len(weights) == 2:
+                left = weights[0].view(weight_dtype)
+                right = weights[1].view(weight_dtype)
+                weights = torch.cat(
+                    [left, right],
+                    dim=0,
+                )
+                return weights
+            else:
+                return weights.view(weight_dtype)
+        elif tllm_key.endswith("bias"):
+            return weights.to(str_dtype_to_torch(self.bias.dtype))
+
+
+class FP8CurrentScalingRowLinear(RowLinear):
+
+    def __init__(self,
+                 in_features,
+                 out_features,
+                 bias=False,
+                 dtype=None,
+                 tp_group=None,
+                 tp_size=1,
+                 prefer_managed_weight=True,
+                 is_expert=False,
+                 quantize_weights_on_demand=False):
+        super().__init__(in_features,
+                         out_features,
+                         bias=bias,
+                         dtype=dtype,
+                         tp_group=tp_group,
+                         tp_size=tp_size,
+                         prefer_managed_weight=prefer_managed_weight,
+                         is_expert=is_expert)
+        self.quantize_weights_on_demand = quantize_weights_on_demand
+        if quantize_weights_on_demand:
+            self.weight = Parameter(
+                shape=(self.out_features, self.in_features),
+                dtype=dtype,
+                prefer_managed=self.prefer_managed_weight,
+            )
+        else:
+            self.weight = Parameter(
+                shape=(self.out_features, self.in_features),
+                dtype="fp8",
+                prefer_managed=self.prefer_managed_weight,
+            )
+            self.weights_scaling_factor = Parameter(shape=(math.ceil(self.out_features / 128), \
+                math.ceil(self.in_features / 128)), dtype=trt.float32)
+
+        self.tllm_to_externel_key_dict = {
+            "weight": "weight",
+        }
+
+        if not quantize_weights_on_demand:
+            self.tllm_to_externel_key_dict.update(
+                {"weights_scaling_factor": "weight_scale_inv"})
+
+    def forward(self,
+                x,
+                in_scales=None,
+                lora_runtime_params=None,
+                all_reduce_params=None):
+
+        weights_scaling_factor = None
+        w_in = self.weight.value
+
+        need_quantize_acts_on_demand = (x.dtype != trt.fp8)
+        need_quantize_weights_on_demand = self.quantize_weights_on_demand
+        if not need_quantize_acts_on_demand:
+            assert in_scales is not None, "FP8 input requires activation scales."
+        if not need_quantize_weights_on_demand:
+            weights_scaling_factor = self.weights_scaling_factor.value
+        gemm_output = fp8_current_scaling_gemm(x, w_in, weights_scaling_factor,
+                                               in_scales,
+                                               need_quantize_acts_on_demand,
+                                               need_quantize_weights_on_demand)
+
+        return self.collect_and_bias(gemm_output,
+                                     all_reduce_params=all_reduce_params)
+
+    def postprocess(self, tllm_key, weights, **kwargs):
+        # TODO: add checkpoint conversion logic
+        if tllm_key.endswith("scaling_factor"):
+            return weights.to(torch.float32)
+        elif tllm_key.endswith("weight"):
+            weight_dtype = str_dtype_to_torch(
+                self.dtype
+            ) if self.quantize_weights_on_demand else torch.float8_e4m3fn
+            return weights.view(weight_dtype)
         elif tllm_key.endswith("bias"):
             return weights.to(str_dtype_to_torch(self.bias.dtype))
 

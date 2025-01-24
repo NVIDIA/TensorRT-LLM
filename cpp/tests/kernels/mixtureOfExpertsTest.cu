@@ -239,6 +239,7 @@ protected:
 
     bool mUseBias = true;
     bool mUseLora = false;
+    bool mUseDeepSeek = false;
 
     bool mIsGated = false;
     int64_t mGatedMultiplier = 1;
@@ -288,8 +289,8 @@ protected:
         // Expert weights
         size_t const weight_size = hidden_size * (hidden_size * 4) * num_experts * sizeof(WeightStorage) * num_gemms;
         // Workspace size
-        size_t const workspace_size = this->mMoERunner.getWorkspaceSize(
-            num_tokens, hidden_size, hidden_size * 4, num_experts, k, this->mActType, mNormMode, {}, mUseLora);
+        size_t const workspace_size = this->mMoERunner.getWorkspaceSize(num_tokens, hidden_size, hidden_size * 4,
+            num_experts, k, this->mActType, mNormMode, {}, mUseLora, mUseDeepSeek);
         // The input/output buffers
         size_t const in_out_size = 2 * num_tokens * hidden_size * sizeof(DataType);
 
@@ -333,8 +334,8 @@ protected:
             mTotalTokens += num_tokens;
         }
 
-        size_t workspace_size = mMoERunner.getWorkspaceSize(
-            mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK, mActType, mNormMode, parallelism_config, mUseLora);
+        size_t workspace_size = mMoERunner.getWorkspaceSize(mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK,
+            mActType, mNormMode, parallelism_config, mUseLora, mUseDeepSeek);
 
         auto const stream = mStream->get();
 
@@ -776,12 +777,14 @@ protected:
         }
 
         LoraParams lora_params;
+        BlockScaleParams blockscale_params;
 
         mMoERunner.setTactic(tactic1, tactic2);
         mMoERunner.runMoe(mInputTensor, mInputProbabilities, weight1_ptr, bias1_ptr, mActType, weight2_ptr, bias2_ptr,
             quant_params, mTotalTokens, mHiddenSize, mInterSize / parallelism_config.tp_size, mNumExperts, mK,
             mWorkspace, mFinalOutput, mFinished, mActiveRows, mScaleProbs, mSourceToExpandedMap, mSelectedExpert,
-            mSparseMixerEpsilon, parallelism_config, mNormMode, mUseLora, lora_params, stream);
+            mSparseMixerEpsilon, parallelism_config, mNormMode, mUseLora, lora_params, mUseDeepSeek, blockscale_params,
+            stream);
 
         check_cuda_error(cudaStreamSynchronize(stream));
     }
