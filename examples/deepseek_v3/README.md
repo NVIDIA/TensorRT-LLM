@@ -24,7 +24,6 @@ This document shows how to build and run the `DeepSeek-v3` model in TensorRT-LLM
 - TP: Tensor Parallel
 - EP: Expert Parallel
 - IB: Inflight Batching
-- FP8: Support for FP8 is currently in progress and will be released soon
 
 ***Please Note:***
 - Prefer using BF16 over FP16 for DeepSeek-V3 since model original training precision is FP8 and we found direct convert FP8 -> FP16 may cause unknown accuracy issues.
@@ -48,9 +47,12 @@ cp /path/to/DeepSeek-V3/config.json /path/to/DeepSeek-V3/configuration_deepseek.
 
 ## Hardware
 
-The DeepSeek-V3 model requires at least 32x80G GPU memory, model contains 660B parameters, roughly 1.3TB memory (with BF16 precision).
+The DeepSeek-V3 model requires at least 16x80G GPU memory, model contains 660B parameters, roughly 1.3TB memory (with BF16 precision).
 
 ***Caution: Current TRT-LLM MLA kernel only supports Hopper architecture (SM90). Ampere architecture (SM80 & SM86) will be supported in the future release.***
+
+Please follow the instructions [here](https://github.com/NVIDIA/TensorRT-LLM/blob/deepseek/docs/source/installation/build-from-source-linux.md#building-a-tensorrt-llm-docker-image
+) to achieve a correct docker image.
 
 ## Overview
 
@@ -61,6 +63,8 @@ The TensorRT-LLM DeepSeek-V3 implementation can be found in [tensorrt_llm/models
 In addition, there are three shared files in the parent folder [`examples`](../) can be used for inference and evaluation:
 
 * [`../run.py`](../run.py) to run the model inference output by giving an input text.
+
+* [`../mmlu.py`](../mmlu.py) to running score script from https://github.com/declare-lab/instruct-eval to compare HF model and TensorRT-LLM model on the MMLU dataset.
 
 
 ## Usage
@@ -171,3 +175,85 @@ and the output will be like:
 Input [Text 0]: "Today is a nice day."
 Output [Text 0 Beam 0]: " I am going to the park with my friends. We are going to play soccer. We are going"
 ```
+
+At last, we can evaluate the model with [mmlu.py](../mmlu.py) script:
+
+
+```bash
+# Download MMLU dataset
+mkdir mmlu_data && cd mmlu_data
+wget https://people.eecs.berkeley.edu/~hendrycks/data.tar && tar -xf data.tar
+# Run MMLU evaluation
+python3 mmlu.py \
+        --hf_model_dir ${MODEL_DIR} \
+        --engine_dir ./trtllm_engines/deepseek_v3/fp8/tp16-sel4096-isl2048-bs4 \
+        --data_dir mmlu_data \
+        --test_trt_llm 2>&1 | tee ${ENGINE_DIR}/test_with_mmlu.log
+```
+
+and the output will be like:
+
+```
+Average accuracy 0.926 - high_school_macroeconomics
+Average accuracy 0.752 - high_school_mathematics
+Average accuracy 0.954 - high_school_microeconomics
+Average accuracy 0.848 - high_school_physics
+Average accuracy 0.967 - high_school_psychology
+Average accuracy 0.861 - high_school_statistics
+Average accuracy 0.956 - high_school_us_history
+Average accuracy 0.954 - high_school_world_history
+Average accuracy 0.861 - human_aging
+Average accuracy 0.931 - human_sexuality
+Average accuracy 0.975 - international_law
+Average accuracy 0.907 - jurisprudence
+Average accuracy 0.920 - logical_fallacies
+Average accuracy 0.848 - machine_learning
+Average accuracy 0.951 - management
+Average accuracy 0.957 - marketing
+Average accuracy 0.950 - medical_genetics
+Average accuracy 0.957 - miscellaneous
+Average accuracy 0.870 - moral_disputes
+Average accuracy 0.798 - moral_scenarios
+Average accuracy 0.918 - nutrition
+Average accuracy 0.916 - philosophy
+Average accuracy 0.932 - prehistory
+Average accuracy 0.869 - professional_accounting
+Average accuracy 0.714 - professional_law
+Average accuracy 0.956 - professional_medicine
+Average accuracy 0.908 - professional_psychology
+Average accuracy 0.800 - public_relations
+Average accuracy 0.869 - security_studies
+Average accuracy 0.960 - sociology
+Average accuracy 0.950 - us_foreign_policy
+Average accuracy 0.578 - virology
+Average accuracy 0.930 - world_religions
+Average accuracy 0.852 - math
+Average accuracy 0.874 - health
+Average accuracy 0.905 - physics
+Average accuracy 0.936 - business
+Average accuracy 0.958 - biology
+Average accuracy 0.825 - chemistry
+Average accuracy 0.888 - computer science
+Average accuracy 0.912 - economics
+Average accuracy 0.890 - engineering
+Average accuracy 0.851 - philosophy
+Average accuracy 0.917 - other
+Average accuracy 0.932 - history
+Average accuracy 0.944 - geography
+Average accuracy 0.904 - politics
+Average accuracy 0.936 - psychology
+Average accuracy 0.949 - culture
+Average accuracy 0.744 - law
+Average accuracy 0.883 - STEM
+Average accuracy 0.827 - humanities
+Average accuracy 0.926 - social sciences
+Average accuracy 0.898 - other (business, health, misc.)
+Average accuracy: 0.877
+```
+
+**Known Issue**
+
+1. The memory allocation for MoE is too large.
+
+This issue prevents running larger batch sizes and long sequence inputs. We will optimize and fix this issue soon.
+
