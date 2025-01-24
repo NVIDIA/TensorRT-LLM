@@ -47,9 +47,12 @@ class IdxEntry(Enum):
     MROPE_POSITION_DELTAS = auto()
     HOST_RUNTIME_PERF_KNOBS = auto()
     HOST_CONTEXT_PROGRESS = auto()
-    MLA_FUSED_Q_PROJ_TENSOR = auto()
     MLA_Q_B_PROJ_TENSOR = auto()
     MLA_KV_B_PROJ_TENSOR = auto()
+    MLA_K_B_PROJ_TRANS_TENSOR = auto()
+    MLA_Q_B_SCALE_TENSOR = auto()
+    MLA_KV_B_SCALE_TENSOR = auto()
+    MLA_K_B_TRANS_SCALE_TENSOR = auto()
     LOGN_SCALING = auto()
 
 
@@ -78,6 +81,9 @@ class IdxEntryParser:
         self.is_spec_decoding_enabled = bool(
             plugin_info.pfc_as_list['is_spec_decoding_enabled'][0])
         self.is_mla_enabled = bool(plugin_info.pfc_as_list['is_mla_enabled'][0])
+        self.is_ptp128c_enabled = bool(
+            plugin_info.pfc_as_list['is_ptp128c_enabled'][0])
+        self.is_fp8_model = bool(plugin_info.pfc_as_list['is_fp8_model'][0])
         self.use_logn_scaling = bool(
             plugin_info.pfc_as_list['use_logn_scaling'][0])
         self.init_entry_to_index()
@@ -157,11 +163,17 @@ class IdxEntryParser:
             return True
         elif entry == IdxEntry.HOST_CONTEXT_PROGRESS:
             return True
-        elif entry == IdxEntry.MLA_FUSED_Q_PROJ_TENSOR:
-            return self.is_mla_enabled
         elif entry == IdxEntry.MLA_Q_B_PROJ_TENSOR:
             return self.is_mla_enabled
         elif entry == IdxEntry.MLA_KV_B_PROJ_TENSOR:
+            return self.is_mla_enabled
+        elif entry == IdxEntry.MLA_K_B_PROJ_TRANS_TENSOR:
+            return self.is_mla_enabled and self.is_ptp128c_enabled and self.is_fp8_model
+        elif entry == IdxEntry.MLA_Q_B_SCALE_TENSOR:
+            return self.is_mla_enabled and self.is_ptp128c_enabled and self.is_fp8_model
+        elif entry == IdxEntry.MLA_KV_B_SCALE_TENSOR:
+            return self.is_mla_enabled and self.is_ptp128c_enabled and self.is_fp8_model
+        elif entry == IdxEntry.MLA_K_B_TRANS_SCALE_TENSOR:
             return self.is_mla_enabled
         elif entry == IdxEntry.LOGN_SCALING:
             return self.use_logn_scaling

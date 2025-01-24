@@ -9,16 +9,20 @@ from ..layers import (MLP, Attention, ColumnLinear, Embedding, GatedMLP,
 from ..layers.moe import MixtureOfExperts
 from ..models.modeling_utils import LayerQuantConfig, QuantConfig
 from ..parameter import Parameter
-from .layers import (FP8Linear, FP8RowLinear, Fp8RowwiseAttention,
-                     Fp8RowwiseGatedMLP, Fp8RowwiseMLP, Fp8RowwiseRmsNorm,
-                     Int8SmoothQuantLinear, Int8SmoothQuantRowLinear,
-                     QServeAttention, QServeGatedMLP, QServeMLP, QServeRmsNorm,
-                     SmoothQuantAttention, SmoothQuantGatedMLP,
-                     SmoothQuantLayerNorm, SmoothQuantMLP, SmoothQuantRmsNorm,
-                     WeightOnlyGroupwiseQuantColumnLinear,
-                     WeightOnlyGroupwiseQuantRowLinear,
-                     WeightOnlyQuantColumnLinear, WeightOnlyQuantEmbedding,
-                     WeightOnlyQuantRowLinear)
+
+# isort: off
+from .layers import (
+    FP8CurrentScalingLinear, FP8CurrentScalingRowLinear, FP8Linear,
+    FP8RowLinear, FP8RowLinear, Fp8RowwiseAttention, Fp8RowwiseGatedMLP,
+    Fp8RowwiseMLP, Fp8RowwiseRmsNorm, Int8SmoothQuantLinear,
+    Int8SmoothQuantRowLinear, QServeAttention, QServeGatedMLP, QServeMLP,
+    QServeRmsNorm, SmoothQuantAttention, SmoothQuantGatedMLP,
+    SmoothQuantLayerNorm, SmoothQuantMLP, SmoothQuantRmsNorm,
+    WeightOnlyGroupwiseQuantColumnLinear, WeightOnlyGroupwiseQuantRowLinear,
+    WeightOnlyQuantColumnLinear, WeightOnlyQuantEmbedding,
+    WeightOnlyQuantRowLinear)
+# isort: on
+
 from .mode import W8A8_SQ_PLUGIN_LIST, QuantAlgo, QuantMode
 
 
@@ -35,7 +39,6 @@ def quantize_layers(
         '*position_embedding',
         '*block_embedding',
         '*shared_expert_gate',
-        '*fused_a',
     ]
 
     for name, module, parent in model.named_modules_with_parent():
@@ -71,8 +74,12 @@ def quantize_layers(
             if isinstance(module, ColumnLinear):
                 init_params[
                     "out_features"] = module.out_features * module.tp_size
+                if quant_config.quant_mode.has_fp8_quantize_weights_on_demand():
+                    init_params["quantize_weights_on_demand"] = True
             elif isinstance(module, RowLinear):
                 init_params["in_features"] = module.in_features * module.tp_size
+                if quant_config.quant_mode.has_fp8_quantize_weights_on_demand():
+                    init_params["quantize_weights_on_demand"] = True
             if preprocess_init_params is not None:
                 preprocess_init_params(init_params, name, module)
             quant_layer = quant_cls(**init_params)
@@ -217,6 +224,22 @@ def fp8_quantize(model, quant_config: QuantConfig):
     quant_map = {
         ColumnLinear: FP8Linear,
         RowLinear: FP8RowLinear,
+    }
+
+    model = quantize_layers(
+        model,
+        quant_config,
+        quant_map,
+    )
+    return model
+
+
+def fp8_current_scaling_quantize(model, quant_config: QuantConfig):
+    assert quant_config.quant_mode.has_fp8_current_scaling()
+
+    quant_map = {
+        ColumnLinear: FP8CurrentScalingLinear,
+        RowLinear: FP8CurrentScalingRowLinear,
     }
 
     model = quantize_layers(
@@ -542,6 +565,8 @@ def quantize(model, quant_config: Union[QuantConfig, LayerQuantConfig]):
 
         if layer_quant_mode.has_fp8_qdq():
             module = fp8_quantize(module, layer_quant_cfg)
+        elif layer_quant_mode.has_fp8_current_scaling():
+            module = fp8_current_scaling_quantize(module, layer_quant_cfg)
         elif layer_quant_mode.has_fp8_rowwise():
             module = fp8_rowwise_quantize(module, layer_quant_cfg)
         elif layer_quant_mode.is_qserve_w4a8():

@@ -369,6 +369,7 @@ set(TRTLLM_LINK_LIBS
     selective_scan_src
     fpA_intB_gemm_src
     moe_gemm_src
+    fp8_blockscale_gemm_lib
     fb_gemm_src
     gemm_swiglu_sm90_src
     cutlass_src
@@ -376,6 +377,13 @@ set(TRTLLM_LINK_LIBS
     runtime_src
     userbuffers_src
     ${DECODER_SHARED_TARGET})
+
+set(BLOCKSCALEGEMM_LIB_LOC
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernels/cutlass_kernels/fp8_blockscale_gemm/libfp8_blockscale_gemm.a"
+)
+add_library(fp8_blockscale_gemm_lib STATIC IMPORTED)
+set_property(TARGET fp8_blockscale_gemm_lib PROPERTY IMPORTED_LOCATION
+                                                     ${BLOCKSCALEGEMM_LIB_LOC})
 
 if(ENABLE_MULTI_DEVICE)
   set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} ${MPI_C_LIBRARIES} ${NCCL_LIB})

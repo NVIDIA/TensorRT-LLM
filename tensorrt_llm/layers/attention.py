@@ -1956,6 +1956,13 @@ class DeepseekV2Attention(Attention):
         self.rotary_scaling = rotary_scaling
         self.shard_dim = 1
 
+        self.is_ptp128c_enabled_flag = False
+        self.is_fp8_model_flag = False
+        if quant_mode.has_fp8_current_scaling():
+            self.is_ptp128c_enabled_flag = True
+            if not quant_mode.has_fp8_quantize_weights_on_demand():
+                self.is_fp8_model_flag = True
+
         def yarn_get_mscale(scale=1, mscale=1):
             if scale <= 1:
                 return 1.0
@@ -2015,20 +2022,46 @@ class DeepseekV2Attention(Attention):
 
         self.kv_a_layernorm = RmsNorm(kv_lora_rank, dtype=dtype, eps=eps)
 
-        self.fused_q_proj = Parameter(
-            shape=(self.num_attention_heads *
-                   (self.kv_lora_rank + self.qk_rope_head_dim),
-                   self.q_lora_rank),
-            dtype=dtype)
+        if quant_mode.has_fp8_current_scaling(
+        ) and not quant_mode.has_fp8_quantize_weights_on_demand():
+            self.kv_b_proj_scale = Parameter(
+                shape=(int(self.num_attention_heads * self.qk_nope_head_dim /
+                           128 * 2), int(self.kv_lora_rank / 128)),
+                dtype='float32')
+            self.k_b_proj_trans_scale = Parameter(
+                shape=(int(self.num_attention_heads * self.kv_lora_rank / 128),
+                       int(self.qk_nope_head_dim / 128)),
+                dtype='float32')
+            self.q_b_proj_scale = Parameter(shape=(int(
+                self.num_attention_heads *
+                (self.qk_nope_head_dim + self.qk_rope_head_dim) / 128),
+                                                   int(self.q_lora_rank / 128)),
+                                            dtype='float32')
+            set_obj_attrs(self.q_b_proj_scale, {
+                "weight_loader": self.weight_loader,
+            })
+            set_obj_attrs(self.k_b_proj_trans_scale, {
+                "weight_loader": self.weight_loader,
+            })
+            set_obj_attrs(self.kv_b_proj_scale, {
+                "weight_loader": self.weight_loader,
+            })
+        
+        mla_weight_type = dtype if quant_mode.has_fp8_quantize_weights_on_demand() else 'fp8' 
+
         self.kv_b_proj = Parameter(
             shape=(self.num_attention_heads * self.qk_nope_head_dim * 2,
                    self.kv_lora_rank),
-            dtype=dtype)
+            dtype=mla_weight_type)
+        self.k_b_proj_trans = Parameter(
+            shape=(self.num_attention_heads * self.kv_lora_rank,
+                   self.qk_nope_head_dim),
+            dtype=mla_weight_type)
         self.q_b_proj = Parameter(
             shape=(self.num_attention_heads *
                    (self.qk_nope_head_dim + self.qk_rope_head_dim),
                    self.q_lora_rank),
-            dtype=dtype)
+            dtype=mla_weight_type)
         self.dense = RowLinear(tp_size * self.num_attention_heads *
                                self.v_head_dim,
                                hidden_size,
@@ -2036,13 +2069,13 @@ class DeepseekV2Attention(Attention):
                                dtype=dtype,
                                tp_group=tp_group,
                                tp_size=tp_size)
-        set_obj_attrs(self.fused_q_proj, {
-            "weight_loader": self.weight_loader,
-        })
         set_obj_attrs(self.q_b_proj, {
             "weight_loader": self.weight_loader,
         })
         set_obj_attrs(self.kv_b_proj, {
+            "weight_loader": self.weight_loader,
+        })
+        set_obj_attrs(self.k_b_proj_trans, {
             "weight_loader": self.weight_loader,
         })
 
@@ -2206,9 +2239,17 @@ class DeepseekV2Attention(Attention):
                 qk_nope_head_dim=self.qk_nope_head_dim,
                 qk_rope_head_dim=self.qk_rope_head_dim,
                 v_head_dim=self.v_head_dim,
-                fused_q_proj=self.fused_q_proj.value,
+                is_ptp128c_enabled_flag=self.is_ptp128c_enabled_flag,
+                is_fp8_model_flag=self.is_fp8_model_flag,
+                k_b_proj_trans=self.k_b_proj_trans.value,
                 q_b_proj=self.q_b_proj.value,
-                kv_b_proj=self.kv_b_proj.value)
+                kv_b_proj=self.kv_b_proj.value,
+                q_b_scale=self.q_b_proj_scale.value
+                if self.is_fp8_model_flag else None,
+                kv_b_scale=self.kv_b_proj_scale.value
+                if self.is_fp8_model_flag else None,
+                k_b_trans_scale=self.k_b_proj_trans_scale.value
+                if self.is_fp8_model_flag else None)
 
         context = self.dense(context)
 
@@ -2227,77 +2268,96 @@ class DeepseekV2Attention(Attention):
             else:
                 return torch.chunk(v, tp_size, dim=dim)[idx].contiguous()
 
-        if tllm_key.endswith("kv_b_proj"):
+        if tllm_key.endswith("kv_b_proj") or tllm_key.endswith(
+                "kv_b_proj_scale"):
+            if tllm_key.endswith("kv_b_proj"):
+                qk_nope_head_dim = self.qk_nope_head_dim
+                v_head_dim = self.v_head_dim
+                kv_lora_rank = self.kv_lora_rank
+            else:
+                qk_nope_head_dim = int(self.qk_nope_head_dim / 128)
+                v_head_dim = int(self.v_head_dim / 128)
+                kv_lora_rank = int(self.kv_lora_rank / 128)
             kv_b_proj = weights.unflatten(0, [
                 self.num_attention_heads * self.tp_size,
-                self.qk_nope_head_dim + self.v_head_dim
+                qk_nope_head_dim + v_head_dim
             ])
             splited_kv_b_proj = split(kv_b_proj,
                                       self.tp_size,
                                       self.tp_rank,
                                       dim=0)
             k_nope_weight, v_weight = splited_kv_b_proj.split(
-                [self.qk_nope_head_dim, self.v_head_dim],
+                [qk_nope_head_dim, v_head_dim],
                 dim=1,
             )
             kv_b_proj_weight = torch.concat([
                 k_nope_weight.reshape(
-                    self.num_attention_heads * self.qk_nope_head_dim,
-                    self.kv_lora_rank),
-                v_weight.reshape(self.num_attention_heads * self.v_head_dim,
-                                 self.kv_lora_rank)
+                    self.num_attention_heads * qk_nope_head_dim, kv_lora_rank),
+                v_weight.reshape(self.num_attention_heads * v_head_dim,
+                                 kv_lora_rank)
             ],
                                             dim=0)
             return {tllm_key: kv_b_proj_weight}
-        elif tllm_key.endswith("q_b_proj"):
-            q_b_proj = weights.unflatten(0, [
-                self.num_attention_heads * self.tp_size,
-                self.qk_nope_head_dim + self.qk_rope_head_dim
-            ])
-            splited_q_b_proj = split(q_b_proj,
-                                     self.tp_size,
-                                     self.tp_rank,
-                                     dim=0)
-            q_b_proj_weight = splited_q_b_proj.reshape(
-                self.num_attention_heads *
-                (self.qk_nope_head_dim + self.qk_rope_head_dim),
-                self.q_lora_rank)
+        elif tllm_key.endswith("q_b_proj") or tllm_key.endswith(
+                "q_b_proj_scale"):
+            if tllm_key.endswith("q_b_proj"):
+                q_b_proj = weights.unflatten(0, [
+                    self.num_attention_heads * self.tp_size,
+                    self.qk_nope_head_dim + self.qk_rope_head_dim
+                ])
+                splited_q_b_proj = split(q_b_proj,
+                                         self.tp_size,
+                                         self.tp_rank,
+                                         dim=0)
+                q_b_proj_weight = splited_q_b_proj.reshape(
+                    self.num_attention_heads *
+                    (self.qk_nope_head_dim + self.qk_rope_head_dim),
+                    self.q_lora_rank)
+            else:
+                splited_q_b_proj = split(weights,
+                                         self.tp_size,
+                                         self.tp_rank,
+                                         dim=0)
+                q_b_proj_weight = splited_q_b_proj.reshape(
+                    int(self.num_attention_heads *
+                        (self.qk_nope_head_dim + self.qk_rope_head_dim) / 128),
+                    int(self.q_lora_rank / 128))
             return {tllm_key: q_b_proj_weight}
-        elif tllm_key.endswith("fused_q_proj"):
-            assert isinstance(weights, list) and len(weights) == 2
-            q_b_proj = weights[0].unflatten(0, [
-                self.num_attention_heads * self.tp_size,
-                self.qk_nope_head_dim + self.qk_rope_head_dim
-            ])
-            splited_q_b_proj = split(q_b_proj,
-                                     self.tp_size,
-                                     self.tp_rank,
-                                     dim=0)
-            kv_b_proj = weights[1].unflatten(0, [
-                self.num_attention_heads * self.tp_size,
-                self.qk_nope_head_dim + self.v_head_dim
-            ])
-            splited_kv_b_proj = split(kv_b_proj,
-                                      self.tp_size,
-                                      self.tp_rank,
-                                      dim=0)
-            q_nope_weight, q_pe_weight = splited_q_b_proj.split(
-                [self.qk_nope_head_dim, self.qk_rope_head_dim],
-                dim=1,
-            )
-            k_nope_weight, _ = splited_kv_b_proj.split(
-                [self.qk_nope_head_dim, self.v_head_dim],
-                dim=1,
-            )
-            fused_q_nope_weight = torch.einsum(
-                'hdq,hdk->hkq',
-                q_nope_weight,
-                k_nope_weight,
-            )
-            fused_q_weight = torch.cat(
-                [fused_q_nope_weight, q_pe_weight],
-                dim=1,
-            ).flatten(start_dim=0, end_dim=1)
-            return {tllm_key: fused_q_weight}
+        elif tllm_key.endswith("k_b_proj_trans") or tllm_key.endswith(
+                "k_b_proj_trans_scale"):
+            if tllm_key.endswith("k_b_proj_trans"):
+                kv_b_proj = weights.unflatten(0, [
+                    self.num_attention_heads * self.tp_size,
+                    self.qk_nope_head_dim + self.v_head_dim
+                ])
+                splited_kv_b_proj = split(kv_b_proj,
+                                          self.tp_size,
+                                          self.tp_rank,
+                                          dim=0)
+                k_nope_weight, v_weight = splited_kv_b_proj.split(
+                    [self.qk_nope_head_dim, self.v_head_dim],
+                    dim=1,
+                )
+                k_nope_weight_trans = k_nope_weight.transpose(2, 1).reshape(
+                    self.num_attention_heads * self.kv_lora_rank,
+                    self.qk_nope_head_dim)
+            else:
+                kv_b_proj_scale = weights.unflatten(0, [
+                    self.num_attention_heads * self.tp_size,
+                    self.qk_nope_head_dim // 128 + self.v_head_dim // 128
+                ])
+                splited_kv_b_proj_scale = split(kv_b_proj_scale,
+                                                self.tp_size,
+                                                self.tp_rank,
+                                                dim=0)
+                k_nope_scale, v_scale = splited_kv_b_proj_scale.split(
+                    [self.qk_nope_head_dim // 128, self.v_head_dim // 128],
+                    dim=1,
+                )
+                k_nope_weight_trans = k_nope_scale.transpose(2, 1).reshape(
+                    self.num_attention_heads * self.kv_lora_rank // 128,
+                    self.qk_nope_head_dim // 128)
+
+            return {tllm_key: k_nope_weight_trans}
         else:
             return {tllm_key: weights}

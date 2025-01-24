@@ -191,6 +191,14 @@ class PluginConfig(metaclass=PluginConfigMeta):
             "activation and per channel static scales for weights."
             "Note: It also requires same calibration in checkpoint."
         })
+    _fp8_current_scaling_gemm_plugin: Optional[str] = field(
+        default=None,
+        init=False,
+        metadata={
+            "help":
+            "The quantized GEMM for fp8, which uses per block dynamic scales for "
+            "activation and per block static scales for weights."
+        })
     _qserve_gemm_plugin: Optional[str] = field(
         default=None,
         init=False,
@@ -504,6 +512,10 @@ class PluginConfig(metaclass=PluginConfigMeta):
         # self.layernorm_quantization_plugin = dtype
         self.quantize_per_token_plugin = True
         self.quantize_tensor_plugin = True
+        return self
+
+    def set_fp8_current_scaling_gemm_plugins(self, dtype: str = "auto"):
+        self.fp8_current_scaling_gemm_plugin = dtype
         return self
 
     def set_context_fmha(self, context_fmha_type=ContextFMHAType.enabled):

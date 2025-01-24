@@ -238,6 +238,19 @@ def _moe_plugin(moe_config,
             "max_low_rank", np.array(lora_max_low_rank, dtype=np.int32),
             trt.PluginFieldType.INT32)
 
+    # Customized plugin inputs for DeepSeek-V3
+    use_deepseek = trt.PluginField(
+        "use_deepseek",
+        np.array([int(quant_mode.has_fp8_current_scaling())], dtype=np.int32),
+        trt.PluginFieldType.INT32)
+
+    use_deepseek_with_native_fp8_weights = not quant_mode.has_fp8_quantize_weights_on_demand(
+    )
+    use_deepseek_with_native_fp8_weights = trt.PluginField(
+        "use_deepseek_with_native_fp8_weights",
+        np.array([int(use_deepseek_with_native_fp8_weights)], dtype=np.int32),
+        trt.PluginFieldType.INT32)
+
     pfc_inputs = [
         p_remove_input_padding, p_num_experts, p_top_k, p_expert_hidden_size,
         p_expert_inter_size, p_activation_type, p_type_id, p_weight_type_id,
@@ -249,6 +262,9 @@ def _moe_plugin(moe_config,
 
     if use_lora:
         pfc_inputs += [p_lora_type_id, p_max_low_rank]
+
+    if quant_mode.has_fp8_current_scaling():
+        pfc_inputs += [use_deepseek, use_deepseek_with_native_fp8_weights]
 
     pfc = trt.PluginFieldCollection(pfc_inputs)
 
@@ -274,6 +290,12 @@ def _moe_plugin(moe_config,
         assert expert_scale_2
         plugin_inputs += [expert_scale_1, expert_scale_2]
 
+    if quant_mode.has_fp8_current_scaling(
+    ) and not quant_mode.has_fp8_quantize_weights_on_demand():
+        assert expert_scale_1
+        assert expert_scale_2
+        plugin_inputs += [expert_scale_1, expert_scale_2]
+
     # Add conditional inputs
     if quant_mode.has_fp8_qdq():
         assert expert_scale_3
@@ -283,6 +305,12 @@ def _moe_plugin(moe_config,
         assert quant_mode.has_fp8_qdq()
         assert output_dtype == trt.fp8
         plugin_inputs += [expert_scale_4]
+
+    if quant_mode.has_fp8_current_scaling(
+    ) and hidden_states_raw.dtype == trt.fp8:
+        assert expert_scale_3
+        assert expert_scale_4
+        plugin_inputs += [expert_scale_3, expert_scale_4]
 
     if use_lora:
         if quant_mode.has_fp8_qdq():
@@ -353,6 +381,11 @@ class MOEWeightWrapper(Module):
         self.tp_dim = tp_dim
         self.is_padded = False
 
+        if quant_mode.has_fp8_current_scaling(
+        ) and not quant_mode.has_fp8_quantize_weights_on_demand():
+            self.dtype = 'fp8'
+            self.weight_dtype = 'fp8'
+
         if quant_mode.is_weight_only():
             bytes_per_col_scale = 2 if quant_mode.is_int4_weight_only() else 1
             # We use a different shape here because the quantized weights have their own layout
@@ -365,7 +398,7 @@ class MOEWeightWrapper(Module):
             self.register_parameter('per_channel_scale', None)
 
         self.weight = Parameter(shape=self.expert_shape,
-                                dtype=weight_dtype,
+                                dtype=self.weight_dtype,
                                 prefer_managed=True)
 
         if has_bias:
@@ -379,12 +412,20 @@ class MOEWeightWrapper(Module):
                                                        dtype=trt.float32)
             self.weights_scaling_factor = Parameter(shape=(experts_per_node, 1),
                                                     dtype=trt.float32)
+        elif quant_mode.has_fp8_current_scaling(
+        ) and not quant_mode.has_fp8_quantize_weights_on_demand():
+            self.register_parameter('activation_scaling_factor', None)
+            self.weights_scaling_factor = Parameter(shape=(experts_per_node,
+                                                           out_features // 128,
+                                                           in_features // 128),
+                                                    dtype=trt.float32)
         else:
             self.register_parameter('activation_scaling_factor', None)
             self.register_parameter('weights_scaling_factor', None)
 
     def postprocess(self, tllm_key, weights, **kwargs):
-        if tllm_key.endswith("weight"):
+        if tllm_key.endswith("weight") or tllm_key.endswith(
+                "weights_scaling_factor"):
             if isinstance(weights, torch.Tensor):
                 weights = [weights]
             if "fc" in tllm_key:
@@ -395,9 +436,11 @@ class MOEWeightWrapper(Module):
                                     dim=-2)
             elif "proj" in tllm_key:
                 weights = torch.stack(weights)
-            weights = weights.to(str_dtype_to_torch(self.dtype))
+            if tllm_key.endswith("weight"):
+                weights = weights.to(str_dtype_to_torch(self.dtype))
 
-        if not self.quant_mode.has_any_quant():
+        if not self.quant_mode.has_any_quant(
+        ) or self.quant_mode.has_fp8_current_scaling():
             return weights
         elif self.quant_mode.is_weight_only():
             if "per_channel_scale" in tllm_key:
@@ -476,14 +519,18 @@ class MixtureOfExperts(Module):
             self.weight_dtype = trt.int8
         elif quant_mode.has_fp8_qdq():
             self.weight_dtype = trt.fp8
-
+        elif quant_mode.has_fp8_current_scaling(
+        ) and not quant_mode.has_fp8_quantize_weights_on_demand():
+            self.weight_dtype = trt.fp8
         rank_experts = self.mapping.ep_experts(self.num_experts)
         self.wrapper_tllm_to_externel_key_dict = {
             "mlp":
             "block_sparse_moe",
             "proj": [f"experts.{expert}.w2" for expert in rank_experts],
             "fc": [f"experts.{expert}.w3" for expert in rank_experts] +
-            [f"experts.{expert}.w1" for expert in rank_experts]
+            [f"experts.{expert}.w1" for expert in rank_experts],
+            "weights_scaling_factor":
+            "weight_scale_inv",
         }
 
         # Since output dimension is usually low (in the order of 10s), no TP at
@@ -649,6 +696,32 @@ class MixtureOfExperts(Module):
                 raise RuntimeError(
                     "Cannot output FP8 value without knowing quantization parameter"
                 )
+        elif self.quant_mode.has_fp8_current_scaling(
+        ) and not self.quant_mode.has_fp8_quantize_weights_on_demand():
+            assert self.fc.weight.value.dtype == trt.fp8, (
+                "mlp fc weight dtype should be fp8 if not quantize on demand.")
+            assert self.proj.weight.value.dtype == trt.fp8, (
+                "mlp proj weight dtype should be fp8 if not quantize on demand."
+            )
+            hidden_states_quant = hidden_states
+            if hidden_states_quant.dtype != trt.fp8:
+                pass
+
+            dtype_quant = self.dtype
+            weight_dtype_quant = trt.fp8
+
+            fc1_weight_scales = self.fc.weights_scaling_factor.value
+            fc2_weight_scales = self.proj.weights_scaling_factor.value
+            # self.fc.activation_scaling_factor.value
+            # self.proj.activation_scaling_factor.value
+
+            scale_1 = fc1_weight_scales
+            scale_2 = fc2_weight_scales
+            scale_3 = None  # TODO(Jerry Shi): change to fc1_act_scales if cs is fused in RMSNorm
+            scale_4 = None  # TODO(Jerry Shi): change to fc2_act_scales if cs is fused in Swiglu
+            scale_5 = None
+
+            output_dtype_quant = self.dtype
 
         else:
             hidden_states_quant = hidden_states

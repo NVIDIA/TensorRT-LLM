@@ -1148,6 +1148,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
     disable_weight_only_quant_plugin = model.config.disable_weight_only_quant_plugin if hasattr(
         model.config, 'disable_weight_only_quant_plugin') else False
     use_fp8_rowwise = model.config.quant_mode.has_fp8_rowwise()
+    use_fp8_current_scaling = model.config.quant_mode.has_fp8_current_scaling()
 
     if build_config.plugin_config.manage_weights:
         if use_weight_only and disable_weight_only_quant_plugin:
@@ -1167,6 +1168,11 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
 
     if use_fp8_rowwise:
         network.plugin_config.set_fp8_rowwise_quant_plugins(model.config.dtype)
+
+    if use_fp8_current_scaling:
+        network.plugin_config.set_fp8_current_scaling_gemm_plugins(
+            model.config.dtype)
+
     nccl_plugin = model.config.dtype if model.config.mapping.world_size > 1 else None
     network.plugin_config.set_nccl_plugin(nccl_plugin)
 

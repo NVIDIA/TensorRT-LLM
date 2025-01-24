@@ -4837,9 +4837,14 @@ def gpt_attention(
     qk_nope_head_dim: int = 0,
     qk_rope_head_dim: int = 0,
     v_head_dim: int = 0,
-    fused_q_proj: Optional[Tensor] = None,
+    is_ptp128c_enabled_flag: bool = False,
+    is_fp8_model_flag: bool = False,
     q_b_proj: Optional[Tensor] = None,
     kv_b_proj: Optional[Tensor] = None,
+    k_b_proj_trans: Optional[Tensor] = None,
+    q_b_scale: Optional[Tensor] = None,
+    kv_b_scale: Optional[Tensor] = None,
+    k_b_trans_scale: Optional[Tensor] = None,
     skip_attn=None,
     cp_group: List[int] = [0],
     cp_size: int = 1,
@@ -5247,6 +5252,12 @@ def gpt_attention(
     v_head_dim = trt.PluginField("v_head_dim",
                                  np.array(v_head_dim, dtype=np.int32),
                                  trt.PluginFieldType.INT32)
+    is_ptp128c_enabled = trt.PluginField(
+        "is_ptp128c_enabled", np.array(is_ptp128c_enabled_flag, dtype=np.int8),
+        trt.PluginFieldType.INT8)
+    is_fp8_model = trt.PluginField("is_fp8_model",
+                                   np.array(is_fp8_model_flag, dtype=np.int8),
+                                   trt.PluginFieldType.INT8)
     p_dtype = default_net().plugin_config.gpt_attention_plugin
     pf_type = trt.PluginField(
         "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
@@ -5366,7 +5377,8 @@ def gpt_attention(
         is_spec_decoding_enabled, spec_decoding_is_generation_length_variable,
         spec_decoding_max_generation_length, is_mla_enabled, q_lora_rank,
         kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim,
-        skip_attn_pf, cp_size, cp_rank, cp_group, use_logn_scaling
+        is_ptp128c_enabled, is_fp8_model, skip_attn_pf, cp_size, cp_rank,
+        cp_group, use_logn_scaling
     ])
 
     attn_plug = attn_plg_creator.create_plugin("causal_attn", pfc)
@@ -5463,10 +5475,15 @@ def gpt_attention(
         plug_inputs += [host_context_progress]
 
     if is_mla_enabled_flag:
-        assert fused_q_proj is not None
         assert q_b_proj is not None
         assert kv_b_proj is not None
-        plug_inputs += [fused_q_proj, q_b_proj, kv_b_proj]
+        assert k_b_proj_trans is not None
+        plug_inputs += [q_b_proj, kv_b_proj, k_b_proj_trans]
+        if is_ptp128c_enabled_flag and is_fp8_model_flag:
+            assert q_b_scale is not None
+            assert kv_b_scale is not None
+            assert k_b_trans_scale is not None
+            plug_inputs += [q_b_scale, kv_b_scale, k_b_trans_scale]
 
     if skip_attn is not None:
         plug_inputs += [skip_attn]

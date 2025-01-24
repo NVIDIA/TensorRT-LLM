@@ -255,9 +255,9 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* qkv_output, T const*
 }
 
 template <typename T, int BLOCK_SIZE, int K_DIM, int ROPE_DIM, typename KVCacheBuffer>
-__global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T const* fuse_buf, KVCacheBuffer kv_cache,
-    float2 const* cos_sin_cache, size_t head_num, int head_size, int c_q, int c_k, int total_s_len, int* seqQOffset,
-    uint32_t* fmha_tile_counter, int32_t const* kv_cache_lengths, int* seqKVOffsets)
+__global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_buf, T const* fuse_buf,
+    KVCacheBuffer kv_cache, float2 const* cos_sin_cache, size_t head_num, int head_size, int c_q, int c_k,
+    int total_s_len, int* seqQOffset, uint32_t* fmha_tile_counter, int32_t const* kv_cache_lengths, int* seqKVOffsets)
 {
 
     // Constants.
@@ -322,12 +322,12 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T const*
             }
             else
             {
-                auto const src_q_global_offset = static_cast<size_t>(global_token_idx) * head_num * (c_k + ROPE_DIM)
-                    + (c_k + ROPE_DIM) * head_idx + c_k;
+                auto const src_q_global_offset
+                    = static_cast<size_t>(global_token_idx) * head_num * (head_size + ROPE_DIM)
+                    + (head_size + ROPE_DIM) * head_idx + head_size;
                 for (int i = 0; i < 2; ++i)
                 {
-                    ref[i] = *reinterpret_cast<VecT const*>(
-                        &qkv_output[src_q_global_offset + src_bias + i * ELTS_PER_VEC]);
+                    ref[i] = *reinterpret_cast<VecT const*>(&q_buf[src_q_global_offset + src_bias + i * ELTS_PER_VEC]);
                 }
             }
 
@@ -451,7 +451,7 @@ void invokeMLARopeGeneration(mlaParams<T>& params, KVCacheBuffer kv_cache_buffer
     dim3 grid(int(tensorrt_llm::common::divUp(params.acc_q_len, 32)), params.head_num + 1 + 8);
     auto head_size = params.meta.qk_nope_head_dim;
     applyMLARopeAndAssignQKVKernelGeneration<T, 256, 512, 64, KVCacheBuffer>
-        <<<grid, 256, 0, stream>>>(params.attention_input_buf, params.fused_a_input, kv_cache_buffer,
+        <<<grid, 256, 0, stream>>>(params.attention_input_buf, params.q_buf, params.fused_a_input, kv_cache_buffer,
             params.cos_sin_cache, params.head_num, head_size, params.meta.q_lora_rank, params.meta.kv_lora_rank,
             params.acc_q_len, params.seqQOffset, params.fmha_tile_counter, params.cache_seq_lens, params.cu_kv_seqlens);
 }

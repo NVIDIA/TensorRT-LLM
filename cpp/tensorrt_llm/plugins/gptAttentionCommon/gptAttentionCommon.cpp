@@ -426,8 +426,8 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads,
     bool use_paged_context_fmha, bool use_fp8_context_fmha, bool has_full_attention_mask, bool use_cache,
     bool is_spec_decoding_enabled, bool spec_decoding_is_generation_length_variable,
     int32_t spec_decoding_max_generation_length, bool is_mla_enabled, int q_lora_rank, int kv_lora_rank,
-    int qk_nope_head_dim, int qk_rope_head_dim, int v_head_dim, bool skip_attn, int cp_size, int cp_rank,
-    std::set<int32_t> cp_group)
+    int qk_nope_head_dim, int qk_rope_head_dim, int v_head_dim, bool is_ptp128c_enabled, bool is_fp8_model,
+    bool skip_attn, int cp_size, int cp_rank, std::set<int32_t> cp_group)
     : mLayerIdx(layer_idx)
     , mNumHeads(num_heads)
     , mVisionStart(vision_start)
@@ -478,6 +478,8 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads,
     , mSpecDecodingMaxGenerationLength(spec_decoding_max_generation_length)
     , mIsMLAEnabled(is_mla_enabled)
     , mMLAParams({q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim})
+    , mIsPTP128CEnabled(is_ptp128c_enabled)
+    , mIsFP8Model(is_fp8_model)
     , mCpSize(cp_size)
     , mCpRank(cp_rank)
     , mCpGroup(move(cp_group))
@@ -616,6 +618,8 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(void const* data, size_t leng
     read(d, mSpecDecodingMaxGenerationLength);
     read(d, mIsMLAEnabled);
     read(d, mMLAParams);
+    read(d, mIsPTP128CEnabled);
+    read(d, mIsFP8Model);
     read(d, mNbMultiBlockSemaphores);
     read(d, mSkipAttn);
     read(d, mCpSize);
@@ -725,16 +729,38 @@ size_t GPTAttentionPluginCommon::getWorkspaceSizeForGeneration(
     // MLA use fmha instead of XQA in generation
     if (mIsMLAEnabled)
     {
-        size_t cu_seqlens_size = sizeof(int) * (max_num_tokens + 1);
+        size_t cu_seqlens_size = sizeof(int) * (max_num_seq + 1);
         size_t fmha_scheduler_counter = sizeof(uint32_t);
-        size_t o_buffer_size = size * max_num_tokens * mNumHeads * mMLAParams.kv_lora_rank;
-        int const NUM_BUFFERS = 5;
+        size_t q_buffer_size = size * max_num_seq * mNumHeads * (mMLAParams.q_lora_rank + mMLAParams.qk_rope_head_dim);
+        size_t o_buffer_size = size * max_num_seq * mNumHeads * (mMLAParams.kv_lora_rank);
+        size_t act_buffer_size = 0;
+        size_t weight_buffer_size = 0;
+        if (mIsPTP128CEnabled)
+        {
+            act_buffer_size
+                = std::max(mGemmRunner->getActWorkspaceSize(max_num_seq,
+                               mMLAParams.q_lora_rank + mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim),
+                    mGemmRunner->getActWorkspaceSize(
+                        max_num_seq, mNumHeads * (mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim)));
+            if (!mIsFP8Model)
+            {
+                weight_buffer_size = std::max(mGemmRunner->getWeightWorkspaceSize(mNumHeads
+                                                      * (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim),
+                                                  mMLAParams.q_lora_rank),
+                    mGemmRunner->getWeightWorkspaceSize(
+                        mNumHeads * mMLAParams.qk_nope_head_dim * 2, mMLAParams.kv_lora_rank));
+            }
+        }
+        int const NUM_BUFFERS = 8;
         size_t workspaces[NUM_BUFFERS];
         workspaces[0] = CUBLAS_WORKSPACE_SIZE;
         workspaces[1] = cu_seqlens_size; // cu_q_len
         workspaces[2] = cu_seqlens_size; // cu_kv_len
         workspaces[3] = fmha_scheduler_counter;
-        workspaces[4] = o_buffer_size;
+        workspaces[4] = q_buffer_size;
+        workspaces[5] = o_buffer_size;
+        workspaces[6] = act_buffer_size;
+        workspaces[7] = weight_buffer_size;
         generation_workspace_size = tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
         return generation_workspace_size;
     }
@@ -818,45 +844,164 @@ int GPTAttentionPluginCommon::mlaPreContext(
     auto c_k = mMLAParams.kv_lora_rank;
     auto context_head_size = mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim;
     auto v_head_dim = mMLAParams.v_head_dim;
-
-    // kv = self.kv_b_proj(compressed_kv) [b*s, c_k] * [c_k, h * (d_h * 2)] -> [b*s, h * (d_h * 2)]
+    if (!mIsPTP128CEnabled)
     {
-        auto transa = CUBLAS_OP_T;
-        auto transb = CUBLAS_OP_N;
-        int m = params.head_num * context_head_size;
-        int n = params.acc_q_len;
-        int k = c_q;
-        int lda = k, ldb = c_q + c_k + rope_dim;
-        int ldc
-            = params.head_num * (2 * context_head_size + v_head_dim); // output shape: [(b * s), (3 * h * (d_h + rope)]
-        mCublasWrapper->createDescriptors(transa, transb, m, n, k, lda, ldb, ldc);
-        mCublasWrapper->Gemm(
-            transa, transb, m, n, k, params.q_b_proj, lda, params.fused_a_input, ldb, params.attention_input_buf, ldc);
-        mCublasWrapper->destroyDescriptors();
+        {
+            auto transa = CUBLAS_OP_T;
+            auto transb = CUBLAS_OP_N;
+            int m = params.head_num * context_head_size;
+            int n = params.acc_q_len;
+            int k = c_q;
+            int lda = k, ldb = c_q + c_k + rope_dim;
+            int ldc = params.head_num
+                * (2 * context_head_size + v_head_dim); // output shape: [(b * s), (3 * h * (d_h + rope)]
+            mCublasWrapper->createDescriptors(transa, transb, m, n, k, lda, ldb, ldc);
+            mCublasWrapper->Gemm(transa, transb, m, n, k, params.q_b_proj, lda, params.fused_a_input, ldb,
+                params.attention_input_buf, ldc);
+            mCublasWrapper->destroyDescriptors();
+        }
+
+        {
+            auto transa = CUBLAS_OP_T;
+            auto transb = CUBLAS_OP_N;
+            int m = mMLAParams.qk_nope_head_dim;
+            int n = params.acc_q_len;
+            int k = c_k;
+            // int lda = k, ldb = k + params.rope_dim + params.c_q;
+            // int ldc = (params.head_size + params.rope_dim) * params.head_num; //params.head_size * params.c_k;
+            int lda = k, ldb = c_q + c_k + rope_dim;
+            int ldc = params.head_num * (2 * context_head_size + v_head_dim);
+            mCublasWrapper->createDescriptors(transa, transb, m, n, k, lda, ldb, ldc);
+            mCublasWrapper->stridedBatchedGemm(transa, transb, m, n, k, params.kv_b_proj, lda,
+                mMLAParams.qk_nope_head_dim * c_k, params.fused_a_input + c_q, ldb, 0,
+                params.attention_input_buf + static_cast<size_t>(params.head_num) * context_head_size,
+                params.head_num * (context_head_size * 2 + v_head_dim), context_head_size, params.head_num, 1.0f, 0.0);
+
+            mCublasWrapper->Gemm(transa, transb, params.head_num * m, n, k,
+                params.kv_b_proj + mMLAParams.qk_nope_head_dim * c_k * params.head_num, lda, params.fused_a_input + c_q,
+                ldb, params.attention_input_buf + 2 * static_cast<size_t>(params.head_num) * context_head_size, ldc);
+            mCublasWrapper->destroyDescriptors();
+        }
     }
-
+    else
     {
-        auto transa = CUBLAS_OP_T;
-        auto transb = CUBLAS_OP_N;
-        int m = mMLAParams.qk_nope_head_dim;
-        int n = params.acc_q_len;
-        int k = c_k;
-        // int lda = k, ldb = k + params.rope_dim + params.c_q;
-        // int ldc = (params.head_size + params.rope_dim) * params.head_num; //params.head_size * params.c_k;
-        int lda = k, ldb = c_q + c_k + rope_dim;
-        int ldc = params.head_num * (context_head_size * 2 + v_head_dim);
-        mCublasWrapper->createDescriptors(transa, transb, m, n, k, lda, ldb, ldc);
+        int8_t* workspace_byte_ptr = reinterpret_cast<int8_t*>(params.workspace);
+        size_t offset = CUBLAS_WORKSPACE_SIZE;
 
-        mCublasWrapper->stridedBatchedGemm(transa, transb, m, n, k, params.kv_b_proj, lda,
-            mMLAParams.qk_nope_head_dim * c_k, params.fused_a_input + c_q, ldb, 0,
-            params.attention_input_buf + static_cast<size_t>(params.head_num) * context_head_size,
-            params.head_num * (context_head_size * 2 + v_head_dim), context_head_size, params.head_num, 1.0f, 0.0);
-        mCublasWrapper->stridedBatchedGemm(transa, transb, m, n, k,
-            params.kv_b_proj + mMLAParams.qk_nope_head_dim * c_k * params.head_num, lda, v_head_dim * c_k,
-            params.fused_a_input + c_q, ldb, 0,
-            params.attention_input_buf + 2 * static_cast<size_t>(params.head_num) * context_head_size,
-            params.head_num * (context_head_size * 2 + v_head_dim), v_head_dim, params.head_num, 1.0f, 0.0);
-        mCublasWrapper->destroyDescriptors();
+        size_t act_size = mGemmRunner->getFP8DataSize(params.acc_q_len, c_q + c_k + rope_dim, true);
+        size_t act_scale_size = mGemmRunner->getActScaleSize(params.acc_q_len, c_q + c_k + rope_dim);
+        __nv_fp8_e4m3* act_buffer
+            = reinterpret_cast<__nv_fp8_e4m3*>(nextWorkspacePtr(workspace_byte_ptr, offset, act_size));
+        float* act_scale_buffer
+            = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, act_scale_size));
+        size_t act_offset = offset;
+
+        mGemmRunner->fp8CS1x128(act_buffer, act_scale_buffer,
+            reinterpret_cast<__nv_bfloat16 const*>(params.fused_a_input), c_q + c_k + rope_dim, params.acc_q_len,
+            stream);
+        sync_check_cuda_error();
+
+        // mat_a: [params.acc_q_len, c_q], mat_b: [c_q, params.head_num * context_head_size]
+        //
+        {
+            int m = params.head_num * context_head_size;
+            int n = params.acc_q_len;
+            int k = c_q;
+            int lda = k, ldb = c_q + c_k + rope_dim;
+            int ldc = params.head_num
+                * (2 * context_head_size + v_head_dim); // output shape: [(b * s), (3 * h * (d_h + rope)]
+
+            __nv_fp8_e4m3 const* q_gemm_weight_ptr;
+            float const* q_gemm_scale_ptr;
+            if (mIsFP8Model)
+            {
+                q_gemm_weight_ptr = reinterpret_cast<__nv_fp8_e4m3 const*>(params.q_b_proj);
+                q_gemm_scale_ptr = reinterpret_cast<float const*>(params.q_b_scale);
+            }
+            else
+            {
+                size_t q_gemm_size = mGemmRunner->getFP8DataSize(params.head_num * context_head_size, c_q, false);
+                size_t q_gemm_scale_size = mGemmRunner->getWeightScaleSize(params.head_num * context_head_size, c_q);
+                __nv_fp8_e4m3* q_weight_buffer
+                    = reinterpret_cast<__nv_fp8_e4m3*>(nextWorkspacePtr(workspace_byte_ptr, offset, q_gemm_size));
+                float* q_scale_buffer
+                    = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, q_gemm_scale_size));
+                mGemmRunner->fp8CS128x128(q_weight_buffer, q_scale_buffer,
+                    reinterpret_cast<__nv_bfloat16 const*>(params.q_b_proj), c_q, params.head_num * context_head_size,
+                    stream);
+
+                q_gemm_weight_ptr = reinterpret_cast<__nv_fp8_e4m3 const*>(q_weight_buffer);
+                q_gemm_scale_ptr = reinterpret_cast<float const*>(q_scale_buffer);
+            }
+
+            // npcgemm2::fp8_gemm_run(act_buffer, ldb, const_cast<__nv_fp8_e4m3*>(q_gemm_weight_ptr), lda,
+            //     reinterpret_cast<__nv_bfloat16*>(params.attention_input_buf), ldc, n, m, k, act_scale_buffer,
+            //     const_cast<float*>(q_gemm_scale_ptr), stream);
+            mGemmRunner->gemm(act_buffer, ldb, const_cast<__nv_fp8_e4m3*>(q_gemm_weight_ptr), lda,
+                reinterpret_cast<__nv_bfloat16*>(params.attention_input_buf), ldc, n, m, k, act_scale_buffer,
+                const_cast<float*>(q_gemm_scale_ptr), stream);
+            sync_check_cuda_error();
+        }
+
+        {
+            offset = act_offset;
+            __nv_fp8_e4m3 const* kv_gemm_weight_ptr;
+            float const* kv_gemm_scale_ptr;
+            if (mIsFP8Model)
+            {
+                kv_gemm_weight_ptr = reinterpret_cast<__nv_fp8_e4m3 const*>(params.kv_b_proj);
+                kv_gemm_scale_ptr = reinterpret_cast<float const*>(params.kv_b_scale);
+            }
+            else
+            {
+                size_t kv_gemm_size
+                    = mGemmRunner->getFP8DataSize(params.head_num * mMLAParams.qk_nope_head_dim * 2, c_k, false);
+                size_t kv_gemm_scale_size
+                    = mGemmRunner->getWeightScaleSize(params.head_num * mMLAParams.qk_nope_head_dim * 2, c_k);
+                __nv_fp8_e4m3* kv_weight_buffer
+                    = reinterpret_cast<__nv_fp8_e4m3*>(nextWorkspacePtr(workspace_byte_ptr, offset, kv_gemm_size));
+                float* kv_scale_buffer
+                    = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, kv_gemm_scale_size));
+                mGemmRunner->fp8CS128x128(kv_weight_buffer, kv_scale_buffer,
+                    reinterpret_cast<__nv_bfloat16 const*>(params.kv_b_proj), c_k,
+                    params.head_num * mMLAParams.qk_nope_head_dim * 2, stream);
+
+                kv_gemm_weight_ptr = reinterpret_cast<__nv_fp8_e4m3 const*>(kv_weight_buffer);
+                kv_gemm_scale_ptr = reinterpret_cast<float const*>(kv_scale_buffer);
+            }
+
+            auto transa = CUBLAS_OP_T;
+            auto transb = CUBLAS_OP_N;
+            int m = mMLAParams.qk_nope_head_dim;
+            int n = params.acc_q_len;
+            int k = c_k;
+
+            int shape_n_4_align = ((params.acc_q_len - 1) / 4 + 1) * 4;
+            int lda = k, ldb = c_q + c_k + rope_dim;
+            int ldc = params.head_num * (2 * context_head_size + v_head_dim);
+
+            mGemmRunner->strideBatchGemm(reinterpret_cast<__nv_bfloat16*>(params.attention_input_buf)
+                    + static_cast<size_t>(params.head_num) * context_head_size,
+                ldc, context_head_size, act_buffer + c_q, ldb, 0, const_cast<__nv_fp8_e4m3*>(kv_gemm_weight_ptr), lda,
+                m * k, params.head_num, shape_n_4_align, m, k, stream, act_scale_buffer + shape_n_4_align * (c_q / 128),
+                0, const_cast<float*>(kv_gemm_scale_ptr));
+            sync_check_cuda_error();
+            // npcgemm2::fp8_gemm_run(act_buffer + c_q, ldb,
+            //     const_cast<__nv_fp8_e4m3*>(kv_gemm_weight_ptr) + params.head_num * m * k, lda,
+            //     reinterpret_cast<__nv_bfloat16*>(
+            //         params.attention_input_buf + 2 * static_cast<size_t>(params.head_num) * context_head_size),
+            //     ldc, n, params.head_num * m, k, act_scale_buffer + shape_n_4_align * (c_q / 128),
+            //     const_cast<float*>(kv_gemm_scale_ptr) + params.head_num * (k / 128) * (m / 128), stream);
+
+            mGemmRunner->gemm(act_buffer + c_q, ldb,
+                const_cast<__nv_fp8_e4m3*>(kv_gemm_weight_ptr) + params.head_num * m * k, lda,
+                reinterpret_cast<__nv_bfloat16*>(
+                    params.attention_input_buf + 2 * static_cast<size_t>(params.head_num) * context_head_size),
+                ldc, n, params.head_num * m, k, act_scale_buffer + shape_n_4_align * (c_q / 128),
+                const_cast<float*>(kv_gemm_scale_ptr) + params.head_num * (k / 128) * (m / 128), stream);
+            sync_check_cuda_error();
+            mCublasWrapper->destroyDescriptors();
+        }
     }
 
     return 0;
@@ -917,34 +1062,143 @@ int GPTAttentionPluginCommon::mlaGeneration(
     int8_t* workspace_byte_ptr = reinterpret_cast<int8_t*>(params.workspace);
     size_t offset = CUBLAS_WORKSPACE_SIZE;
 
-    // output[b, s, :1, h * (d_h + rope)] = self.q_b_proj(q_buf) [b*s, c_q] * [c_q, h * (d_h + rope)] -> [b*s, h * (d_h
-    // + rope)]
-    {
-        auto transa = CUBLAS_OP_T;
-        auto transb = CUBLAS_OP_N;
-        int m = params.head_num * (mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim);
-        int n = params.acc_q_len;
-        int k = mMLAParams.q_lora_rank;
-        int lda = k, ldb = mMLAParams.q_lora_rank + mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
-        int ldc = m;
-        mCublasWrapper->createDescriptors(transa, transb, m, n, k, lda, ldb, ldc);
-        mCublasWrapper->Gemm(transa, transb, m, n, k, params.fused_q_proj, lda, params.fused_a_input, ldb,
-            params.attention_input_buf, ldc);
-        mCublasWrapper->destroyDescriptors();
-    }
-
     size_t const cu_seqlens_size = sizeof(int) * (params.batch_size + 1);
     size_t const fmha_scheduler_counter = sizeof(uint32_t);
+    size_t q_buffer_size = size * batch_beam * mNumHeads * (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim);
     size_t o_buffer_size = size * batch_beam * mNumHeads * mMLAParams.kv_lora_rank;
     int* cu_q_seqlens = reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, cu_seqlens_size));
     int* cu_kv_seqlens = reinterpret_cast<int*>(nextWorkspacePtr(workspace_byte_ptr, offset, cu_seqlens_size));
     uint32_t* fmha_tile_counter_ptr
         = reinterpret_cast<uint32_t*>(nextWorkspacePtr(workspace_byte_ptr, offset, fmha_scheduler_counter));
+    T* q_buffer = reinterpret_cast<T*>(nextWorkspacePtr(workspace_byte_ptr, offset, q_buffer_size));
     T* o_buffer = reinterpret_cast<T*>(nextWorkspacePtr(workspace_byte_ptr, offset, o_buffer_size));
+    size_t quant_offset = offset;
+
+    if (!mIsPTP128CEnabled)
+    {
+        {
+            auto transa = CUBLAS_OP_T;
+            auto transb = CUBLAS_OP_N;
+            int m = params.head_num * (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim);
+            int n = params.acc_q_len;
+            int k = mMLAParams.q_lora_rank;
+            int lda = k, ldb = mMLAParams.q_lora_rank + mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
+            int ldc = m;
+            mCublasWrapper->createDescriptors(transa, transb, m, n, k, lda, ldb, ldc);
+            mCublasWrapper->Gemm(
+                transa, transb, m, n, k, params.q_b_proj, lda, params.fused_a_input, ldb, q_buffer, ldc);
+            mCublasWrapper->destroyDescriptors();
+        }
+
+        {
+            auto transa = CUBLAS_OP_T;
+            auto transb = CUBLAS_OP_N;
+            int m = mMLAParams.kv_lora_rank;
+            int n = params.acc_q_len;
+            int k = mMLAParams.qk_nope_head_dim;
+            int lda = k, ldb = params.head_num * (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim);
+            int ldc = params.head_num * (mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim);
+            mCublasWrapper->createDescriptors(transa, transb, m, n, k, lda, ldb, ldc);
+            mCublasWrapper->stridedBatchedGemm(transa, transb, m, n, k, params.k_b_proj_trans, lda,
+                mMLAParams.qk_nope_head_dim * mMLAParams.kv_lora_rank, q_buffer, ldb,
+                mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim, params.attention_input_buf, ldc,
+                mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim, params.head_num, 1.0f, 0.0);
+            mCublasWrapper->destroyDescriptors();
+        }
+    }
+    else
+    {
+        {
+            int m = params.head_num * (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim);
+            int n = params.acc_q_len;
+            int k = mMLAParams.q_lora_rank;
+            int lda = k, ldb = mMLAParams.q_lora_rank + mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
+            int ldc = m;
+            size_t act_size = mGemmRunner->getFP8DataSize(n, ldb, true);
+            size_t act_scale_size = mGemmRunner->getActScaleSize(n, ldb);
+            __nv_fp8_e4m3* act_buffer
+                = reinterpret_cast<__nv_fp8_e4m3*>(nextWorkspacePtr(workspace_byte_ptr, offset, act_size));
+            float* act_scale_buffer
+                = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, act_scale_size));
+            __nv_fp8_e4m3 const* q_gemm_weight_ptr;
+            float const* q_gemm_scale_ptr;
+            if (mIsFP8Model)
+            {
+                q_gemm_weight_ptr = reinterpret_cast<__nv_fp8_e4m3 const*>(params.q_b_proj);
+                q_gemm_scale_ptr = reinterpret_cast<float const*>(params.q_b_scale);
+            }
+            else
+            {
+                size_t q_gemm_size = mGemmRunner->getFP8DataSize(m, lda, false);
+                size_t q_gemm_scale_size = mGemmRunner->getWeightScaleSize(m, lda);
+                __nv_fp8_e4m3* q_gemm_weight_buffer
+                    = reinterpret_cast<__nv_fp8_e4m3*>(nextWorkspacePtr(workspace_byte_ptr, offset, q_gemm_size));
+                float* q_gemm_scale_buffer
+                    = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, q_gemm_scale_size));
+                mGemmRunner->fp8CS128x128(q_gemm_weight_buffer, q_gemm_scale_buffer,
+                    reinterpret_cast<__nv_bfloat16 const*>(params.q_b_proj), lda, m, stream);
+                q_gemm_weight_ptr = reinterpret_cast<__nv_fp8_e4m3 const*>(q_gemm_weight_buffer);
+                q_gemm_scale_ptr = reinterpret_cast<float const*>(q_gemm_scale_buffer);
+            }
+            mGemmRunner->fp8CS1x128(act_buffer, act_scale_buffer,
+                reinterpret_cast<__nv_bfloat16 const*>(params.fused_a_input), ldb, n, stream);
+            mGemmRunner->gemm(act_buffer, ldb, const_cast<__nv_fp8_e4m3*>(q_gemm_weight_ptr), lda,
+                reinterpret_cast<__nv_bfloat16*>(q_buffer), ldc, n, m, k, act_scale_buffer,
+                const_cast<float*>(q_gemm_scale_ptr), stream);
+        }
+        {
+            offset = quant_offset;
+            int m = mMLAParams.kv_lora_rank;
+            int n = params.acc_q_len;
+            int k = mMLAParams.qk_nope_head_dim;
+            int lda = k, ldb = mMLAParams.qk_nope_head_dim;
+            int ldc = params.head_num * (mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim);
+            size_t act_size = mGemmRunner->getFP8DataSize(n, params.head_num * mMLAParams.qk_nope_head_dim, true);
+            size_t act_scale_size = mGemmRunner->getActScaleSize(n, params.head_num * mMLAParams.qk_nope_head_dim);
+            __nv_fp8_e4m3* act_buffer
+                = reinterpret_cast<__nv_fp8_e4m3*>(nextWorkspacePtr(workspace_byte_ptr, offset, act_size));
+            float* act_scale_buffer
+                = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, act_scale_size));
+            __nv_fp8_e4m3 const* k_gemm_weight_ptr;
+            float const* k_gemm_scale_ptr;
+            if (mIsFP8Model)
+            {
+                k_gemm_weight_ptr = reinterpret_cast<__nv_fp8_e4m3 const*>(params.k_b_proj_trans);
+                k_gemm_scale_ptr = reinterpret_cast<float const*>(params.k_b_trans_scale);
+            }
+            else
+            {
+                size_t k_gemm_size
+                    = mGemmRunner->getFP8DataSize(params.head_num * m, mMLAParams.qk_nope_head_dim, false);
+                size_t k_gemm_scale_size
+                    = mGemmRunner->getWeightScaleSize(params.head_num * m, mMLAParams.qk_nope_head_dim);
+                __nv_fp8_e4m3* k_gemm_weight_buffer
+                    = reinterpret_cast<__nv_fp8_e4m3*>(nextWorkspacePtr(workspace_byte_ptr, offset, k_gemm_size));
+                float* k_gemm_scale_buffer
+                    = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, k_gemm_scale_size));
+                mGemmRunner->fp8CS128x128(k_gemm_weight_buffer, k_gemm_scale_buffer,
+                    reinterpret_cast<__nv_bfloat16 const*>(params.k_b_proj_trans), mMLAParams.qk_nope_head_dim,
+                    params.head_num * m, stream);
+                k_gemm_weight_ptr = reinterpret_cast<__nv_fp8_e4m3 const*>(k_gemm_weight_buffer);
+                k_gemm_scale_ptr = reinterpret_cast<float const*>(k_gemm_scale_buffer);
+            }
+            int shape_n_4_align = ((n - 1) / 4 + 1) * 4;
+            mGemmRunner->fp8CS1x128Reshape(act_buffer, act_scale_buffer,
+                reinterpret_cast<__nv_bfloat16 const*>(q_buffer), mMLAParams.qk_nope_head_dim, params.head_num, n,
+                mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim, stream);
+
+            mGemmRunner->strideBatchGemm(reinterpret_cast<__nv_bfloat16*>(params.attention_input_buf), ldc,
+                mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim, act_buffer, ldb, n * k,
+                const_cast<__nv_fp8_e4m3*>(k_gemm_weight_ptr), lda, m * k, params.head_num, n, m, k, stream,
+                act_scale_buffer, shape_n_4_align * (mMLAParams.qk_nope_head_dim / 128),
+                const_cast<float*>(k_gemm_scale_ptr));
+        }
+    }
 
     params.seqQOffset = cu_q_seqlens;
     params.cu_kv_seqlens = cu_kv_seqlens;
     params.fmha_tile_counter = fmha_tile_counter_ptr;
+    params.q_buf = q_buffer;
 
     invokeMLARopeGeneration<T>(params, kv_cache_buffer, stream);
 
@@ -980,22 +1234,68 @@ int GPTAttentionPluginCommon::mlaGeneration(
 
     // Run the fmha kernel
     mDecoderFMHARunner->run(fmhaParams);
-
+    if (!mIsPTP128CEnabled)
     {
-        auto transa = CUBLAS_OP_T;
-        auto transb = CUBLAS_OP_N;
+        {
+            auto transa = CUBLAS_OP_T;
+            auto transb = CUBLAS_OP_N;
+            int m = mMLAParams.v_head_dim;
+            int n = params.batch_size;
+            int k = mMLAParams.kv_lora_rank;
+            int lda = k, ldb = k;
+            int ldc = m; // params.head_size * params.c_k;
+            mCublasWrapper->createDescriptors(transa, transb, m, n, k, lda, ldb, ldc);
+
+            mCublasWrapper->stridedBatchedGemm(transa, transb, m, n, k,
+                params.kv_b_proj + params.head_num * mMLAParams.kv_lora_rank * mMLAParams.qk_nope_head_dim, lda,
+                mMLAParams.v_head_dim * mMLAParams.kv_lora_rank, o_buffer, ldb * params.head_num, ldb,
+                params.context_buf, ldc * params.head_num, ldc, params.head_num, 1.0f, 0.0);
+            mCublasWrapper->destroyDescriptors();
+        }
+    }
+    else
+    {
+        // ??? 16 128
+        offset = quant_offset;
         int m = mMLAParams.v_head_dim;
         int n = params.batch_size;
         int k = mMLAParams.kv_lora_rank;
+        int h = params.head_num;
         int lda = k, ldb = k;
-        int ldc = m; // params.head_size * params.c_k;
-        mCublasWrapper->createDescriptors(transa, transb, m, n, k, lda, ldb, ldc);
+        int ldc = h * m;
+        size_t act_size = mGemmRunner->getFP8DataSize(n, h * k, true);
+        size_t act_scale_size = mGemmRunner->getActScaleSize(n, h * k);
+        __nv_fp8_e4m3* act_buffer
+            = reinterpret_cast<__nv_fp8_e4m3*>(nextWorkspacePtr(workspace_byte_ptr, offset, act_size));
+        float* act_scale_buffer
+            = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, act_scale_size));
+        __nv_fp8_e4m3 const* v_gemm_weight_ptr;
+        float const* v_gemm_scale_ptr;
+        if (mIsFP8Model)
+        {
+            v_gemm_weight_ptr = reinterpret_cast<__nv_fp8_e4m3 const*>(params.kv_b_proj) + h * k * m;
+            v_gemm_scale_ptr = reinterpret_cast<float const*>(params.kv_b_scale) + h * (k / 128) * (m / 128);
+        }
+        else
+        {
+            size_t v_gemm_size = mGemmRunner->getFP8DataSize(h * m, k, false);
+            size_t v_gemm_scale_size = mGemmRunner->getWeightScaleSize(h * m, k);
+            __nv_fp8_e4m3* v_gemm_weight_buffer
+                = reinterpret_cast<__nv_fp8_e4m3*>(nextWorkspacePtr(workspace_byte_ptr, offset, v_gemm_size));
+            float* v_gemm_scale_buffer
+                = reinterpret_cast<float*>(nextWorkspacePtr(workspace_byte_ptr, offset, v_gemm_scale_size));
+            mGemmRunner->fp8CS128x128(v_gemm_weight_buffer, v_gemm_scale_buffer,
+                reinterpret_cast<__nv_bfloat16 const*>(params.kv_b_proj) + h * m * k, k, h * m, stream);
 
-        mCublasWrapper->stridedBatchedGemm(transa, transb, m, n, k,
-            params.kv_b_proj + params.head_num * mMLAParams.kv_lora_rank * mMLAParams.qk_nope_head_dim, lda,
-            mMLAParams.v_head_dim * mMLAParams.kv_lora_rank, o_buffer, ldb * params.head_num, ldb, params.context_buf,
-            ldc * params.head_num, ldc, params.head_num, 1.0f, 0.0);
-        mCublasWrapper->destroyDescriptors();
+            v_gemm_weight_ptr = reinterpret_cast<__nv_fp8_e4m3 const*>(v_gemm_weight_buffer);
+            v_gemm_scale_ptr = reinterpret_cast<float const*>(v_gemm_scale_buffer);
+        }
+        int shape_n_4_align = ((n - 1) / 4 + 1) * 4;
+        mGemmRunner->fp8CS1x128Reshape(
+            act_buffer, act_scale_buffer, reinterpret_cast<__nv_bfloat16 const*>(o_buffer), k, h, n, k, stream);
+        mGemmRunner->strideBatchGemm(reinterpret_cast<__nv_bfloat16*>(params.context_buf), ldc, m, act_buffer, ldb,
+            n * k, const_cast<__nv_fp8_e4m3*>(v_gemm_weight_ptr), lda, m * k, params.head_num, n, m, k, stream,
+            act_scale_buffer, shape_n_4_align * (k / 128), const_cast<float*>(v_gemm_scale_ptr));
     }
 
     sync_check_cuda_error();
@@ -2368,6 +2668,17 @@ int GPTAttentionPluginCommon::initialize() noexcept
             // Only deepseek must using fmha.
             TLLM_CHECK_WITH_INFO(mFMHARunner->isFmhaSupported() && mDecoderFMHARunner->isFmhaSupported(),
                 "Deepseek should be supported by fmha in context and generation part.");
+
+            if (mIsPTP128CEnabled && mIsFP8Model)
+            {
+                mGemmRunner = std::make_shared<tensorrt_llm::kernels::small_m_gemm::CutlassFp8BlockScaleGemmRunner<
+                    __nv_bfloat16, __nv_fp8_e4m3, __nv_bfloat16>>();
+            }
+            else if (mIsPTP128CEnabled && !mIsFP8Model)
+            {
+                mGemmRunner = std::make_shared<tensorrt_llm::kernels::small_m_gemm::CutlassFp8BlockScaleGemmRunner<
+                    __nv_bfloat16, __nv_bfloat16, __nv_bfloat16>>();
+            }
         }
 
         // Fall back to unfused MHA kernels if not supported.
@@ -2448,8 +2759,8 @@ size_t GPTAttentionPluginCommon::getCommonSerializationSize() const noexcept
         + sizeof(mPagedContextFMHA) + sizeof(mFP8ContextFMHA) + sizeof(mHasFullAttentionMask) + sizeof(mUseKVCache)
         + sizeof(mUnfuseQkvGemm) + sizeof(mUseLognScaling) + sizeof(mIsSpecDecodingEnabled) + sizeof(mUseSpecDecoding)
         + sizeof(mSpecDecodingIsGenerationLengthVariable) + sizeof(mSpecDecodingMaxGenerationLength)
-        + sizeof(mNbMultiBlockSemaphores) + sizeof(mIsMLAEnabled) + sizeof(mMLAParams) + sizeof(mSkipAttn)
-        + sizeof(uint32_t) // size of DecoderXQARunnerResource buffer.
+        + sizeof(mNbMultiBlockSemaphores) + sizeof(mIsMLAEnabled) + sizeof(mMLAParams) + sizeof(mIsPTP128CEnabled)
+        + sizeof(mIsFP8Model) + sizeof(mSkipAttn) + sizeof(uint32_t) // size of DecoderXQARunnerResource buffer.
         + sizeof(mCpSize) + sizeof(mCpRank) + sizeof(int32_t) * mCpGroup.size()
         + DecoderXQARunner::getResourceGlobal()->getSerializationSize();
 }
@@ -2507,6 +2818,8 @@ void GPTAttentionPluginCommon::serializeCommon(void* buffer) const noexcept
     write(d, mSpecDecodingMaxGenerationLength);
     write(d, mIsMLAEnabled);
     write(d, mMLAParams);
+    write(d, mIsPTP128CEnabled);
+    write(d, mIsFP8Model);
     write(d, mNbMultiBlockSemaphores);
     write(d, mSkipAttn);
     write(d, mCpSize);
@@ -2617,6 +2930,8 @@ GPTAttentionPluginCreatorCommon::GPTAttentionPluginCreatorCommon()
     mPluginAttributes.emplace_back(PluginField("qk_nope_head_dim", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("qk_rope_head_dim", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("v_head_dim", nullptr, PluginFieldType::kINT32, 0));
+    mPluginAttributes.emplace_back(PluginField("is_ptp128c_enabled", nullptr, PluginFieldType::kINT8, 0));
+    mPluginAttributes.emplace_back(PluginField("is_fp8_model", nullptr, PluginFieldType::kINT8, 0));
     mPluginAttributes.emplace_back(PluginField("skip_attn", nullptr, PluginFieldType::kINT8, 0));
     mPluginAttributes.emplace_back(PluginField("cp_size", nullptr, PluginFieldType::kINT32, 0));
     mPluginAttributes.emplace_back(PluginField("cp_rank", nullptr, PluginFieldType::kINT32, 0));

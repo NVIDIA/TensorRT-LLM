@@ -19,6 +19,7 @@
 
 #include "tensorrt_llm/batch_manager/contextProgress.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
@@ -63,8 +64,8 @@ GPTAttentionPlugin::GPTAttentionPlugin(int layer_idx, int num_heads, int vision_
     bool use_paged_context_fmha, bool use_fp8_context_fmha, bool has_full_attention_mask, bool use_cache,
     bool is_spec_decoding_enabled, bool spec_decoding_is_generation_length_variable,
     int spec_decoding_max_generation_length, bool is_mla_enabled, int q_lora_rank, int kv_lora_rank,
-    int qk_nope_head_dim, int qk_rope_head_dim, int v_head_dim, bool skip_attn, int cp_size, int cp_rank,
-    std::set<int32_t> cp_group)
+    int qk_nope_head_dim, int qk_rope_head_dim, int v_head_dim, bool is_ptp128c_enabled, bool is_fp8_model,
+    bool skip_attn, int cp_size, int cp_rank, std::set<int32_t> cp_group)
     : GPTAttentionPluginCommon(layer_idx, num_heads, vision_start, vision_length, num_kv_heads, layer_idx_in_cache_pool,
         head_size, unidirectional, q_scaling, attn_logit_softcapping_scale, position_embedding_type,
         rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale_type, rotary_embedding_scale,
@@ -74,9 +75,8 @@ GPTAttentionPlugin::GPTAttentionPlugin(int layer_idx, int num_heads, int vision_
         type, max_context_length, qkv_bias_enabled, cross_attention, max_distance, pos_shift_enabled,
         dense_context_fmha, use_paged_context_fmha, use_fp8_context_fmha, has_full_attention_mask, use_cache,
         is_spec_decoding_enabled, spec_decoding_is_generation_length_variable, spec_decoding_max_generation_length,
-        is_mla_enabled, q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim, skip_attn, cp_size,
-
-        cp_rank, cp_group)
+        is_mla_enabled, q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim, is_ptp128c_enabled,
+        is_fp8_model, skip_attn, cp_size, cp_rank, cp_group)
 {
     initEntryIdx();
 }
@@ -128,6 +128,12 @@ std::string GPTAttentionPlugin::toString(IdxEntry const& entry) const
     case IdxEntry::LONG_ROPE_ROTARY_COS_SIN: return "LONG_ROPE_ROTARY_COS_SIN";
     case IdxEntry::HOST_RUNTIME_PERF_KNOBS: return "HOST_RUNTIME_PERF_KNOBS";
     case IdxEntry::HOST_CONTEXT_PROGRESS: return "HOST_CONTEXT_PROGRESS";
+    case IdxEntry::MLA_Q_B_PROJ_TENSOR: return "MLA_Q_B_PROJ_TENSOR";
+    case IdxEntry::MLA_KV_B_PROJ_TENSOR: return "MLA_KV_B_PROJ_TENSOR";
+    case IdxEntry::MLA_K_B_PROJ_TRANS_TENSOR: return "MLA_K_B_PROJ_TRANS_TENSOR";
+    case IdxEntry::MLA_Q_B_SCALE_TENSOR: return "MLA_Q_B_SCALE_TENSOR";
+    case IdxEntry::MLA_KV_B_SCALE_TENSOR: return "MLA_KV_B_SCALE_TENSOR";
+    case IdxEntry::MLA_K_B_TRANS_SCALE_TENSOR: return "MLA_K_B_TRANS_SCALE_TENSOR";
     case IdxEntry::SKIP_ATTN: return "SKIP_ATTN";
     case IdxEntry::ENUM_SIZE: return "ENUM_SIZE";
     }
@@ -179,9 +185,12 @@ bool GPTAttentionPlugin::isEntryUsed(IdxEntry const& entry) const
     case IdxEntry::MROPE_POSITION_DELTAS: return isMRoPE();
     case IdxEntry::HOST_RUNTIME_PERF_KNOBS: return true;
     case IdxEntry::HOST_CONTEXT_PROGRESS: return true;
-    case IdxEntry::MLA_FUSED_Q_PROJ_TENSOR: return mIsMLAEnabled;
     case IdxEntry::MLA_Q_B_PROJ_TENSOR: return mIsMLAEnabled;
     case IdxEntry::MLA_KV_B_PROJ_TENSOR: return mIsMLAEnabled;
+    case IdxEntry::MLA_K_B_PROJ_TRANS_TENSOR: return mIsMLAEnabled;
+    case IdxEntry::MLA_Q_B_SCALE_TENSOR: return mIsMLAEnabled && mIsPTP128CEnabled && mIsFP8Model;
+    case IdxEntry::MLA_KV_B_SCALE_TENSOR: return mIsMLAEnabled && mIsPTP128CEnabled && mIsFP8Model;
+    case IdxEntry::MLA_K_B_TRANS_SCALE_TENSOR: return mIsMLAEnabled && mIsPTP128CEnabled && mIsFP8Model;
     case IdxEntry::SKIP_ATTN: return mSkipAttn;
     default: return false;
     }
@@ -322,6 +331,20 @@ bool GPTAttentionPlugin::supportsFormatCombination(
     {
         posCaseLine = __LINE__;
         result = inOut[pos].type == nvinfer1::DataType::kFLOAT;
+    }
+    else if (mIsMLAEnabled && mIsPTP128CEnabled && mIsFP8Model
+        && (pos == getIdx(IdxEntry::MLA_Q_B_SCALE_TENSOR) || pos == getIdx(IdxEntry::MLA_KV_B_SCALE_TENSOR)
+            || pos == getIdx(IdxEntry::MLA_K_B_TRANS_SCALE_TENSOR)))
+    {
+        posCaseLine = __LINE__;
+        result = inOut[pos].type == nvinfer1::DataType::kFLOAT && inOut[pos].format == TensorFormat::kLINEAR;
+    }
+    else if (mIsMLAEnabled && mIsPTP128CEnabled && mIsFP8Model
+        && (pos == getIdx(IdxEntry::MLA_Q_B_PROJ_TENSOR) || pos == getIdx(IdxEntry::MLA_KV_B_PROJ_TENSOR)
+            || pos == getIdx(IdxEntry::MLA_K_B_PROJ_TRANS_TENSOR)))
+    {
+        posCaseLine = __LINE__;
+        result = inOut[pos].type == nvinfer1::DataType::kFP8 && inOut[pos].format == TensorFormat::kLINEAR;
     }
     else if (isLongRoPE()
         && (pos == getIdx(IdxEntry::LONG_ROPE_ROTARY_INV_FREQ) || pos == getIdx(IdxEntry::LONG_ROPE_ROTARY_COS_SIN)))
@@ -555,6 +578,7 @@ size_t GPTAttentionPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* in
         = getWorkspaceSizeForGeneration(type, max_num_seq, max_kv_cache_length, max_num_tokens);
 
     size_t attention_input_workspace_size = 0;
+    size_t context_mla_fp8_quant_size = 0;
     if (mIsMLAEnabled)
     {
         int32_t const size_per_head
@@ -565,6 +589,25 @@ size_t GPTAttentionPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* in
         size_t workspaces[1];
         workspaces[0] = attention_input_size;
         attention_input_workspace_size = tensorrt_llm::common::calculateTotalWorkspaceSize(workspaces, 1);
+
+        if (mIsPTP128CEnabled)
+        {
+            size_t act_quant_size = mGemmRunner->getActWorkspaceSize(
+                max_num_tokens, mMLAParams.qk_nope_head_dim + mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim);
+            size_t weight_size = 0;
+            if (!mIsFP8Model)
+            {
+                weight_size = std::max(mGemmRunner->getWeightWorkspaceSize(
+                                           mNumHeads * (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim),
+                                           mMLAParams.q_lora_rank),
+                    mGemmRunner->getWeightWorkspaceSize(
+                        2 * mNumHeads * mMLAParams.qk_nope_head_dim, mMLAParams.kv_lora_rank));
+            }
+            size_t workspaces[2];
+            workspaces[0] = act_quant_size;
+            workspaces[1] = weight_size;
+            context_mla_fp8_quant_size = tensorrt_llm::common::calculateTotalWorkspaceSize(workspaces, 2);
+        }
     }
     else if (mUnfuseQkvGemm)
     {
@@ -579,7 +622,8 @@ size_t GPTAttentionPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* in
         attention_input_workspace_size = tensorrt_llm::common::calculateTotalWorkspaceSize(workspaces, 1);
     }
 
-    return std::max(context_workspace_size, generation_workspace_size) + attention_input_workspace_size;
+    return std::max(context_mla_fp8_quant_size, std::max(context_workspace_size, generation_workspace_size))
+        + attention_input_workspace_size;
 }
 
 static size_t getStride(nvinfer1::Dims const& dims, int n)
@@ -668,9 +712,10 @@ mlaParams<T> GPTAttentionPlugin::enqueueMLAPreprocess(int32_t localNbSeq, int32_
 {
     auto const* input = static_cast<T const*>(inputs[getIdx(IdxEntry::QKV_TENSOR)]);
 
-    auto const* fused_q_proj = static_cast<T const*>(inputs[getIdx(IdxEntry::MLA_FUSED_Q_PROJ_TENSOR)]);
     auto const* q_b_proj = static_cast<T const*>(inputs[getIdx(IdxEntry::MLA_Q_B_PROJ_TENSOR)]);
     auto const* kv_b_proj = static_cast<T const*>(inputs[getIdx(IdxEntry::MLA_KV_B_PROJ_TENSOR)]);
+    auto const* k_b_proj_trans = static_cast<T const*>(inputs[getIdx(IdxEntry::MLA_K_B_PROJ_TRANS_TENSOR)]);
+
     float2 const* cos_sin_cache = static_cast<float2 const*>(inputs[getIdx(IdxEntry::ROTARY_COS_SIN)]);
 
     AttentionOutT* context_buf_ = static_cast<AttentionOutT*>(outputs[0]);
@@ -678,14 +723,20 @@ mlaParams<T> GPTAttentionPlugin::enqueueMLAPreprocess(int32_t localNbSeq, int32_
     mlaParams<T> mla_params;
     mla_params.fused_a_input = input;
     mla_params.context_buf = reinterpret_cast<T*>(context_buf_);
-    mla_params.fused_q_proj = fused_q_proj;
     mla_params.q_b_proj = q_b_proj;
     mla_params.kv_b_proj = kv_b_proj;
+    mla_params.k_b_proj_trans = k_b_proj_trans;
     mla_params.cos_sin_cache = cos_sin_cache;
     mla_params.batch_size = localNbSeq;
     mla_params.acc_q_len = localNbTokens;
     mla_params.head_num = mNumHeads;
     mla_params.meta = mMLAParams;
+    if (mIsPTP128CEnabled && mIsFP8Model)
+    {
+        mla_params.q_b_scale = static_cast<float const*>(inputs[getIdx(IdxEntry::MLA_Q_B_SCALE_TENSOR)]);
+        mla_params.kv_b_scale = static_cast<float const*>(inputs[getIdx(IdxEntry::MLA_KV_B_SCALE_TENSOR)]);
+        mla_params.k_b_trans_scale = static_cast<float const*>(inputs[getIdx(IdxEntry::MLA_K_B_TRANS_SCALE_TENSOR)]);
+    }
 
     // {
     //     __nv_bfloat16 *h_input;
@@ -1363,6 +1414,8 @@ IPluginV2* GPTAttentionPluginCreator::createPlugin(char const* name, PluginField
             static_cast<int32_t>(p.getScalar<int32_t>("qk_nope_head_dim").value()),
             static_cast<int32_t>(p.getScalar<int32_t>("qk_rope_head_dim").value()),
             static_cast<int32_t>(p.getScalar<int32_t>("v_head_dim").value()),
+            static_cast<int8_t>(p.getScalar<int8_t>("is_ptp128c_enabled").value()),
+            static_cast<int8_t>(p.getScalar<int8_t>("is_fp8_model").value()),
             static_cast<bool>(p.getScalar<int8_t>("skip_attn").value()),
             static_cast<int32_t>(p.getScalar<int32_t>("cp_size").value()),
             static_cast<int32_t>(p.getScalar<int32_t>("cp_rank").value()),

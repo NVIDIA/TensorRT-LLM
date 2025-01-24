@@ -77,23 +77,10 @@ def parse_arguments():
         'To shard it along hidden dimension, set embedding_sharding_dim=1'
         'Note: embedding sharing is only enabled when embedding_sharding_dim=0')
 
-    parser.add_argument(
-        '--use_weight_only',
-        default=False,
-        action="store_true",
-        help='Quantize weights for the various GEMMs to INT4/INT8.'
-        'See --weight_only_precision to set the precision')
-    parser.add_argument(
-        '--weight_only_precision',
-        const='int8',
-        type=str,
-        nargs='?',
-        default='int8',
-        choices=['int8', 'int4'],
-        help=
-        'Define the precision for the weights when using weight-only quantization.'
-        'You must also use --use_weight_only for that argument to have an impact.'
-    )
+    parser.add_argument('--use_fp8_weights',
+                        default=False,
+                        action="store_true",
+                        help='Use native FP8 weights of DeepSeek-V3.')
 
     parser.add_argument('--output_dir',
                         type=str,
@@ -131,36 +118,18 @@ def parse_arguments():
         help=
         'Only save the model config w/o read and converting weights, be careful, this is for debug only'
     )
-    parser.add_argument(
-        '--disable_weight_only_quant_plugin',
-        default=False,
-        action="store_true",
-        help=
-        'By default, using plugin implementation for weight quantization. Enabling disable_weight_only_quant_plugin flag will use ootb implementation instead of plugin.'
-        'You must also use --use_weight_only for that argument to have an impact'
-    )
-    # Add quantization related feature later
+
     args = parser.parse_args()
 
     return args
-
-
-def precision_to_config(precision, quant_config) -> QuantConfig:
-    '''update config dict for weight-only quantization
-    '''
-    quant_config = QuantConfig()
-    precision_to_algo = {'int8': QuantAlgo.W8A16, 'int4': QuantAlgo.W4A16}
-    quant_config.quant_algo = precision_to_algo.get(precision)
-    return quant_config
 
 
 def args_to_quant_config(args: argparse.Namespace) -> QuantConfig:
     '''return config dict with quantization info based on the command line args
     '''
     quant_config = QuantConfig()
-    if args.use_weight_only:
-        quant_config = precision_to_config(args.weight_only_precision,
-                                           quant_config)
+    if args.use_fp8_weights:
+        quant_config.quant_algo = QuantAlgo.FP8_CURRENT_SCALING
     return quant_config
 
 
