@@ -13,21 +13,22 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 #ifndef TOP_LEVEL_DIR
 #error "Define TOP_LEVEL_DIR"
 #endif
 
-#include <gtest/gtest.h>
-
+#include "tensorrt_llm/runtime/gptSession.h"
 #include "modelSpec.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/common/stlUtils.h"
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
-#include "tensorrt_llm/runtime/gptSession.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
 #include "tensorrt_llm/runtime/utils/numpyUtils.h"
+
+#include <gtest/gtest.h>
 
 #include <algorithm>
 #include <filesystem>

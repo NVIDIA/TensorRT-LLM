@@ -285,36 +285,51 @@ ChunkCumsumKernelFunc getChunkCumsumKernel(int B_, int L_, int H_, int P_, int G
         return func;
     };
 
-    if (Q_ == 256 && H % 16 == 0)
+    if (Q == 256)
     {
-        if (compute >= (1LL << 29))
-            return set(16, 8, chunk_cumsum_kernel<256, 16, 8, Tp_, Wt_>);
-        else if (compute >= (1LL << 0))
-            return set(8, 8, chunk_cumsum_kernel<256, 8, 8, Tp_, Wt_>);
+        if (H % 16 == 0)
+        {
+            if (compute >= (1LL << 29))
+                return set(16, 8, chunk_cumsum_kernel<256, 16, 8, Tp_, Wt_>);
+            else
+                return set(8, 8, chunk_cumsum_kernel<256, 8, 8, Tp_, Wt_>);
+        }
+        if (H % 8 == 0)
+        {
+            if (compute >= (1LL << 29))
+                return set(16, 8, chunk_cumsum_kernel<256, 16, 8, Tp_, Wt_>);
+            else
+                return set(8, 8, chunk_cumsum_kernel<256, 8, 8, Tp_, Wt_>);
+        }
     }
-
-    if (Q_ == 256 && H % 8 == 0)
+    if (Q == 128)
     {
-        if (compute >= (1LL << 0))
-            return set(8, 8, chunk_cumsum_kernel<256, 8, 8, Tp_, Wt_>);
-    }
-
-    if (Q_ == 128 && H % 16 == 0)
-    {
-        if (compute >= (1LL << 27))
-            return set(16, 8, chunk_cumsum_kernel<128, 16, 8, Tp_, Wt_>);
-        else if (compute >= (1LL << 26))
-            return set(8, 8, chunk_cumsum_kernel<128, 8, 8, Tp_, Wt_>);
-        else if (compute >= (1LL << 0))
-            return set(8, 4, chunk_cumsum_kernel<128, 8, 4, Tp_, Wt_>);
-    }
-
-    if (Q_ == 128 && H % 8 == 0)
-    {
-        if (compute >= (1LL << 26))
-            return set(8, 8, chunk_cumsum_kernel<128, 8, 8, Tp_, Wt_>);
-        else if (compute >= (1LL << 0))
-            return set(8, 4, chunk_cumsum_kernel<128, 8, 4, Tp_, Wt_>);
+        if (H % 16 == 0)
+        {
+            if (compute >= (1LL << 27))
+                return set(16, 8, chunk_cumsum_kernel<128, 16, 8, Tp_, Wt_>);
+            else if (compute >= (1LL << 26))
+                return set(8, 8, chunk_cumsum_kernel<128, 8, 8, Tp_, Wt_>);
+            else if (compute >= (1LL << 12))
+                return set(8, 4, chunk_cumsum_kernel<128, 8, 4, Tp_, Wt_>);
+            else if (compute >= (1LL << 9))
+                return set(8, 8, chunk_cumsum_kernel<128, 8, 8, Tp_, Wt_>);
+            else
+                return set(8, 4, chunk_cumsum_kernel<128, 8, 4, Tp_, Wt_>);
+        }
+        if (H % 8 == 0)
+        {
+            if (compute >= (1LL << 27))
+                return set(16, 8, chunk_cumsum_kernel<128, 16, 8, Tp_, Wt_>);
+            else if (compute >= (1LL << 26))
+                return set(8, 8, chunk_cumsum_kernel<128, 8, 8, Tp_, Wt_>);
+            else if (compute >= (1LL << 12))
+                return set(8, 4, chunk_cumsum_kernel<128, 8, 4, Tp_, Wt_>);
+            else if (compute >= (1LL << 9))
+                return set(8, 8, chunk_cumsum_kernel<128, 8, 8, Tp_, Wt_>);
+            else
+                return set(8, 4, chunk_cumsum_kernel<128, 8, 4, Tp_, Wt_>);
+        }
     }
 
     return nullptr;

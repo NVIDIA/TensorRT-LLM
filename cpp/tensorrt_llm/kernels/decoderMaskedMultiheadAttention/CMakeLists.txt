@@ -16,6 +16,9 @@
 #
 
 file(GLOB_RECURSE SRC_CPP *.cpp)
+# Initialize empty list of src cuda files.
+set(SRC_CU)
+set(SRC_CU_EXTRA)
 
 # Exclude files in nvrtcWrapper folder.
 list(FILTER SRC_CPP EXCLUDE REGEX ".*nvrtcWrapper/src.*")
@@ -24,6 +27,7 @@ filter_cuda_archs("80" SRC_CPP)
 filter_cuda_archs("86" SRC_CPP)
 filter_cuda_archs("89" SRC_CPP)
 filter_cuda_archs("90" SRC_CPP)
+filter_cuda_archs("120" SRC_CPP)
 
 set(basic_heads 32 64 128)
 foreach(HEAD ${basic_heads})
@@ -56,13 +60,18 @@ foreach(HEAD ${extra_heads})
 endforeach()
 
 if(NOT WIN32)
-  add_library(decoder_attention_src OBJECT ${SRC_CPP} ${SRC_CU})
+  add_library(decoder_attention_src OBJECT ${SRC_CPP})
 
   # Split some sources to shared library for Linux
-  add_library(${DECODER_SHARED_TARGET} SHARED ${SRC_CU_EXTRA})
-  set_property(TARGET ${DECODER_SHARED_TARGET}
+  add_library(${DECODER_SHARED_TARGET_0} SHARED ${SRC_CU})
+  set_property(TARGET ${DECODER_SHARED_TARGET_0}
                PROPERTY POSITION_INDEPENDENT_CODE ON)
-  set_property(TARGET ${DECODER_SHARED_TARGET}
+  set_property(TARGET ${DECODER_SHARED_TARGET_0}
+               PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  add_library(${DECODER_SHARED_TARGET_1} SHARED ${SRC_CU_EXTRA})
+  set_property(TARGET ${DECODER_SHARED_TARGET_1}
+               PROPERTY POSITION_INDEPENDENT_CODE ON)
+  set_property(TARGET ${DECODER_SHARED_TARGET_1}
                PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 else()
   add_library(decoder_attention_src OBJECT ${SRC_CPP} ${SRC_CU} ${SRC_CU_EXTRA})

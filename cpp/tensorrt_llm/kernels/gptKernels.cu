@@ -222,6 +222,28 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
         compute_padding_offset(smemEncoderSeqQOffsets, params.maxEncoderQSeqLength, params.encoderPaddingOffsets);
     }
 
+    // Compuate tokens Info (batchIdx, tokenIdxInSeq).
+    if (params.tokensInfo != nullptr)
+    {
+        // The begin of the sequence.
+        int seqBegin = params.removePadding ? smemSeqQOffsets[batchIdx] : batchIdx * params.maxQSeqLength;
+        // The end of the sequence.
+        int seqEnd = params.removePadding ? smemSeqQOffsets[batchIdx + 1] : (batchIdx + 1) * params.maxQSeqLength;
+        // FIXME(Eagle): the last sequence needs to consider the paddings.
+        if (batchIdx == (params.batchSize - 1))
+        {
+            seqEnd = std::max(params.numTokens, seqEnd);
+        }
+        // The length of the sequence.
+        int seqLength = seqEnd - seqBegin;
+
+        // Iterate over the tokens to update the number of padded elements.
+        for (int tokenIdx = threadIdx.x; tokenIdx < seqLength; tokenIdx += blockDim.x)
+        {
+            params.tokensInfo[seqBegin + tokenIdx] = make_int2(batchIdx, tokenIdx);
+        }
+    };
+
     // Each block generates the rotary embedding inv_freq tensor for the corresponding sequence.
     int zid = 2 * threadIdx.x;
     int halfRotaryEmbeddingDim = params.rotaryEmbeddingDim / 2;
@@ -254,10 +276,13 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
             params.fmhaTileCounter[0] = 0u;
         }
         // Take the quantization scales into consideration.
+        float dequantScaleQ = params.dequantScaleQ ? params.dequantScaleQ[0] : 1.f;
+        float dequantScaleKv = params.dequantScaleKv ? params.dequantScaleKv[0] : 1.f;
+        float quantScaleO = params.quantScaleO ? params.quantScaleO[0] : 1.f;
         if (params.fmhaBmm1Scale)
         {
             // The scale after fmha bmm1.
-            params.fmhaBmm1Scale[0] = params.dequantScaleQkv[0] * params.dequantScaleQkv[0] * params.fmhaHostBmm1Scale;
+            params.fmhaBmm1Scale[0] = dequantScaleQ * dequantScaleKv * params.fmhaHostBmm1Scale;
             // The scale prepared for log2 optimization.
             constexpr float kLog2e = 1.4426950408889634074f;
             params.fmhaBmm1Scale[1] = params.fmhaBmm1Scale[0] * kLog2e;
@@ -265,7 +290,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
         if (params.fmhaBmm2Scale)
         {
             // The scale after fmha bmm2.
-            params.fmhaBmm2Scale[0] = params.quantScaleO[0] * params.dequantScaleQkv[0];
+            params.fmhaBmm2Scale[0] = quantScaleO * dequantScaleKv;
         }
     }
 }

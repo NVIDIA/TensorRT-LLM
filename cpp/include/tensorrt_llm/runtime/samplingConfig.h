@@ -298,6 +298,17 @@ public:
         return valid;
     }
 
+    template <typename T>
+    bool useDefaultValues(OptVec<T> const& vec, T defaultValue)
+    {
+        bool useDefault{true};
+        if (vec)
+        {
+            useDefault = std::all_of(vec->begin(), vec->end(), [defaultValue](T elem) { return elem == defaultValue; });
+        }
+        return useDefault;
+    }
+
 public:
     SizeType32 beamWidth;
     std::optional<SizeType32> numReturnSequences;

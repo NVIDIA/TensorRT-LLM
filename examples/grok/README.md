@@ -79,7 +79,6 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_8gpus_bf16 \
 # Run Grok-1 with 8 GPUs
 mpirun -n 8 --allow-run-as-root \
     python ../run.py \
-    --max_output_len 50 \
     --input_text "The answer to life the universe and everything is of course" \
     --engine_dir ./tmp/grok-1/trt_engines/bf16/8-gpus \
     --max_output_len 50 --top_p 1 --top_k 8 --temperature 0.3 \

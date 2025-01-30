@@ -116,7 +116,8 @@ setup(
             'libs/libnvinfer_plugin_tensorrt_llm.so',
             'libs/libtensorrt_llm_nvrtc_wrapper.so',
             'libs/libtensorrt_llm_ucx_wrapper.so',
-            'libs/libdecoder_attention.so',
+            'libs/libdecoder_attention_0.so',
+            'libs/libdecoder_attention_1.so',
             'bindings.*.so',
         ]) + [
             'bindings/*.pyi', 'tools/plugin_gen/templates/*',

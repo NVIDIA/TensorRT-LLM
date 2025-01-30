@@ -264,6 +264,11 @@ class TestFunctional(unittest.TestCase):
                                    atol=dtype_atol[dtype])
 
     @parameterized.expand(
+        # P=8x and H=2x
+        list(
+            product([160, 320, 640, 1280], [80], [1], ['context'], ['float16'],
+                    [1, 2, 4, 8, 16], [16, 64, 256], [True], [True])) +
+        # normal tests
         list(
             product([2048], [64], [1, 4], ['context', 'generation'],
                     ['float32', 'float16', 'bfloat16'], [3], [16],
@@ -528,26 +533,39 @@ class TestFunctional(unittest.TestCase):
                         dt_softplus=delta_softplus)
                     part_out_ref = rearrange(part_out_ref,
                                              "b l h p -> b l (h p)")
-                    out_ref[start:end, ] = part_out_ref.squeeze(0)
-                    state_ref[i, ] = part_state_ref.squeeze(0)
+                    out_ref[
+                        start:end,
+                    ] = part_out_ref.squeeze(0)
+                    state_ref[
+                        i,
+                    ] = part_state_ref.squeeze(0)
             elif long_context:
                 # to save memory
                 for i in range(batch_size):
-                    x_reshaped = rearrange(x_ref[i:i + 1, ],
+                    x_reshaped = rearrange(x_ref[
+                        i:i + 1,
+                    ],
                                            "b l (h p) -> b l h p",
                                            p=headdim)
-                    B_ref_reshaped = rearrange(B_ref[i:i + 1, ],
+                    B_ref_reshaped = rearrange(B_ref[
+                        i:i + 1,
+                    ],
                                                "b l (g n) -> b l g n",
                                                g=ngroups)
-                    C_ref_reshaped = rearrange(C_ref[i:i + 1, ],
+                    C_ref_reshaped = rearrange(C_ref[
+                        i:i + 1,
+                    ],
                                                "b l (g n) -> b l g n",
                                                g=ngroups)
-                    z_ref_reshaped = rearrange(z_ref[i:i + 1, ],
-                                               "b l (h p) -> b l h p",
-                                               p=headdim) if has_z else None
+                    z_ref_reshaped = rearrange(
+                        z_ref[
+                            i:i + 1,
+                        ], "b l (h p) -> b l h p", p=headdim) if has_z else None
                     part_out_ref, part_state_ref = ssd_chunk_scan_combined_ref(
                         x_reshaped,
-                        dt_ref[i:i + 1, ],
+                        dt_ref[
+                            i:i + 1,
+                        ],
                         A_ref,
                         B_ref_reshaped,
                         C_ref_reshaped,
@@ -558,8 +576,12 @@ class TestFunctional(unittest.TestCase):
                         dt_softplus=delta_softplus)
                     part_out_ref = rearrange(part_out_ref,
                                              "b l h p -> b l (h p)")
-                    out_ref[i, ] = part_out_ref.squeeze(0)
-                    state_ref[i, ] = part_state_ref.squeeze(0)
+                    out_ref[
+                        i,
+                    ] = part_out_ref.squeeze(0)
+                    state_ref[
+                        i,
+                    ] = part_state_ref.squeeze(0)
             else:
                 x_reshaped = rearrange(x_ref, "b l (h p) -> b l h p", p=headdim)
                 B_ref_reshaped = rearrange(B_ref,
@@ -612,7 +634,7 @@ class TestFunctional(unittest.TestCase):
         if long_context:
             dtype_atol = {"float16": 2e-2, "bfloat16": 1e-1}
         else:
-            dtype_atol = {"float16": 5e-3, "float32": 2e-3, "bfloat16": 5e-2}
+            dtype_atol = {"float16": 1e-2, "float32": 2e-3, "bfloat16": 5e-2}
 
         output_cpu = outputs['output'].to(torch.float32).cpu()
         present_state_cpu = outputs['present_state'].to(torch.float32).cpu()

@@ -1,12 +1,17 @@
 ### Generate text with guided decoding
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import GuidedDecodingParams
+from tensorrt_llm.llmapi import BuildConfig, GuidedDecodingParams
 
 
 def main():
 
+    # TODO(jiahanc): Clean up build_config when use_paged_context_fmha is by default enabled
+    build_config = BuildConfig()
+    build_config.plugin_config.use_paged_context_fmha = True
+
     # Specify the guided decoding backend; xgrammar is supported currently.
     llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+              build_config=build_config,
               guided_decoding_backend='xgrammar')
 
     # An example from json-mode-eval

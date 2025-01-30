@@ -145,7 +145,7 @@ public:
 
     using OperatorClass = cutlass::arch::OpClassTensorOp;
     using AccType = float;
-    // be careful, TypeC should align with HopperGroupedGemmInput::OutputTypeAdaptor_t<TypeA>
+    // be careful, TypeC should align with TmaWarpSpecializedGroupedGemmInput::OutputTypeAdaptor_t<TypeA>
     using TypeC = __nv_bfloat16;
     using LayoutB = typename LayoutDetails::Layout;
 

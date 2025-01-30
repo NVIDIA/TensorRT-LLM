@@ -58,6 +58,7 @@ Checkpoint saved in `output_dir` can be directly passed to `trtllm-build`.
 
 - model_dir: Hugging Face model path.
 - qformat: Specify the quantization algorithm applied to the checkpoint.
+    - nvfp4: Weights are quantized to NVFP4 block-wise with size 16. Actiavation global scale are calibrated.
     - fp8: Weights are quantized to FP8 tensor wise. Activation ranges are calibrated tensor wise.
     - int8_sq: Weights are smoothed and quantized to INT8 channel wise. Activation ranges are calibrated tensor wise.
     - int4_awq: Weights are re-scaled and block-wise quantized to INT4. Block size is specified by `awq_block_size`.

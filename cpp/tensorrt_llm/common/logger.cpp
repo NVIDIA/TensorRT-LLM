@@ -34,7 +34,7 @@ Logger::Logger()
         {
             if (levelName == "TRACE")
                 return TRACE;
-            if (levelName == "DEBUG")
+            if (levelName == "VERBOSE" || levelName == "DEBUG")
                 return DEBUG;
             if (levelName == "INFO")
                 return INFO;

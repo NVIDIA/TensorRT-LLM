@@ -80,8 +80,13 @@ ncclComm_t NcclCommunicator::createComm(int worldSize, int rank, mpi::MpiComm co
     }
     mpiComm.bcastValue(id, 0);
     ncclComm_t comm;
-    // Need static connection initialization for accurate KV cache size estimation
+// Need static connection initialization for accurate KV cache size estimation
+#if defined(_WIN32)
+    if (getenv("NCCL_RUNTIME_CONNECT") == nullptr)
+        _putenv_s("NCCL_RUNTIME_CONNECT", "0");
+#else
     setenv("NCCL_RUNTIME_CONNECT", "0", 0);
+#endif // _WIN32
     TLLM_NCCL_CHECK(ncclCommInitRank(&comm, worldSize, id, rank));
     return comm;
 #else

@@ -322,17 +322,22 @@ def convert_from_checkpoint(
                                    trt_llm_config.dtype)
             elif "ffw_up.w" in name and isinstance(ckpt_parser, JAXParser):
                 bias_name = name.replace("ffw_up.w", "ffw_up.b")
-                fc_param, gate_param = param[0, ].transpose(
-                    1, 0), param[1, ].transpose(1, 0)
+                fc_param, gate_param = param[
+                    0,
+                ].transpose(1, 0), param[
+                    1,
+                ].transpose(1, 0)
                 fc_param = split_matrix_tp(fc_param, tp_size, tp_rank, dim=0)
                 gate_param = split_matrix_tp(gate_param,
                                              tp_size,
                                              tp_rank,
                                              dim=0)
-                fc_bias = model_params[bias_name][0, ].reshape(
-                    intermediate_size)
-                gate_bias = model_params[bias_name][1, ].reshape(
-                    intermediate_size)
+                fc_bias = model_params[bias_name][
+                    0,
+                ].reshape(intermediate_size)
+                gate_bias = model_params[bias_name][
+                    1,
+                ].reshape(intermediate_size)
                 fc_bias = split_matrix_tp(fc_bias, tp_size, tp_rank, dim=0)
                 gate_bias = split_matrix_tp(gate_bias, tp_size, tp_rank, dim=0)
                 trt_llm_fc_name = trt_llm_name

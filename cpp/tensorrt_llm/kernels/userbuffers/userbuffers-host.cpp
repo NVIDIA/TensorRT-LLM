@@ -28,6 +28,7 @@
 namespace tensorrt_llm::runtime::ub
 {
 #define UB_ONESHOT_DEFAULT_VALUE 1
+#define UB_FORCE_ENABLE_ONESHOT_TOKEN_NUM_THRESHOLD 8
 
 #define MULTICAST_GB_TOTAL 512
 
@@ -141,7 +142,7 @@ int create_communicator_grouped2(communicator** comm, int pipegpus, int pipenode
     (*comm)->myrank = myrank;
     (*comm)->free_region = 0;
     (*comm)->launch_mode = LAUNCH_GPU | LAUNCH_CPU;
-    (*comm)->pdl_launch = 0;
+    (*comm)->pdl_launch = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
 
     cudaDeviceProp device_prop;
     TLLM_CUDA_CHECK(cudaGetDevice(&cur_dev));
@@ -157,6 +158,9 @@ int create_communicator_grouped2(communicator** comm, int pipegpus, int pipenode
         : (device_prop.major == 9 && !(*comm)->use_rr_kernel) ? 4
                                                               : 1;
     (*comm)->oneshot = getenv("UB_ONESHOT") ? atoi(getenv("UB_ONESHOT")) : UB_ONESHOT_DEFAULT_VALUE;
+    (*comm)->oneshot_force_enable_threshold = getenv("UB_ONESHOT_FORCE_ENABLE_THRESHOLD")
+        ? atoi(getenv("UB_ONESHOT_FORCE_ENABLE_THRESHOLD"))
+        : UB_FORCE_ENABLE_ONESHOT_TOKEN_NUM_THRESHOLD;
 
     if (ndev > 1)
     { // all visible devices

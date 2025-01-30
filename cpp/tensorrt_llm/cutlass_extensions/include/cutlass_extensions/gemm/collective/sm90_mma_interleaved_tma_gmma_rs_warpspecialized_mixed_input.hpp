@@ -1577,7 +1577,24 @@ private:
         convert_tensor(in, converted_inputs, a_vec_width);
 
         // Apply scales and broadcast across inputs, store in converted_inputs
-        cute::transform(converted_inputs, scales, converted_inputs, cute::multiplies{});
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < size<1>(converted_inputs); ++i)
+        {
+            CUTLASS_PRAGMA_UNROLL
+            for (int j = 0; j < size<0>(converted_inputs); ++j)
+            {
+                if constexpr (cute::is_same_v<typename EngineScale::value_type, cutlass::bfloat16_t>)
+                {
+                    converted_inputs(j, i)
+                        = bfloat16_t(__hmul(reinterpret_cast<__nv_bfloat16 const&>(converted_inputs(j, i)),
+                            reinterpret_cast<__nv_bfloat16 const&>(scales(j, i))));
+                }
+                else
+                {
+                    converted_inputs(j, i) *= scales(j, i);
+                }
+            }
+        }
 
         // Finally, we convert the scaled inputs to the mma type.
         convert_tensor(converted_inputs, out);
@@ -1601,8 +1618,25 @@ private:
         convert_tensor(in, converted_inputs, a_vec_width);
 
         // Apply scales and broadcast across inputs, store in converted_inputs
-        cute::transform(converted_inputs, scales, converted_inputs, cute::multiplies{});
-        cute::transform(converted_inputs, zeros, converted_inputs, cute::plus{});
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < size<1>(converted_inputs); ++i)
+        {
+            CUTLASS_PRAGMA_UNROLL
+            for (int j = 0; j < size<0>(converted_inputs); ++j)
+            {
+                if constexpr (cute::is_same_v<typename EngineScale::value_type, cutlass::bfloat16_t>)
+                {
+                    converted_inputs(j, i)
+                        = bfloat16_t(__hfma(reinterpret_cast<__nv_bfloat16 const&>(converted_inputs(j, i)),
+                            reinterpret_cast<__nv_bfloat16 const&>(scales(j, i)),
+                            reinterpret_cast<__nv_bfloat16 const&>(zeros(j, i))));
+                }
+                else
+                {
+                    converted_inputs(j, i) = converted_inputs(j, i) * scales(j, i) + zeros(j, i);
+                }
+            }
+        }
 
         // Finally, we convert the scaled inputs to the mma type.
         convert_tensor(converted_inputs, out);

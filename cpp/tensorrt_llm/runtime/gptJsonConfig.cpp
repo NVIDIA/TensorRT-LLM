@@ -38,7 +38,7 @@ namespace tc = tensorrt_llm::common;
 
 namespace
 {
-using Json = typename nlohmann::json::basic_json;
+using Json = nlohmann::json;
 
 template <typename FieldType>
 FieldType parseJsonFieldOr(Json const& json, std::string_view name, FieldType defaultValue)

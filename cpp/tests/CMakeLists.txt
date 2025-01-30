@@ -58,11 +58,15 @@ function(add_gtest test_name test_src)
   if(NOT ARGS_NO_TLLM_LINKAGE)
     target_link_libraries(${test_name} PUBLIC ${SHARED_TARGET}
                                               nvinfer_plugin_tensorrt_llm)
+    if(WIN32)
+      target_link_libraries(${test_name} PRIVATE context_attention_src)
+    endif()
   endif()
 
   target_compile_features(${test_name} PRIVATE cxx_std_17)
   target_compile_definitions(${test_name}
                              PUBLIC TOP_LEVEL_DIR="${TOP_LEVEL_DIR}")
+
   gtest_discover_tests(
     ${test_name}
     PROPERTIES ENVIRONMENT "CUDA_MODULE_LOADING=LAZY" DISCOVERY_MODE
@@ -159,6 +163,7 @@ set(LOOKAHEAD_DECODING_TEST_SRC layers/randomLlm.cpp
                                 layers/lookaheadDecodingLayerTest.cpp)
 add_gtest(lookaheadDecodingLayerTest "${LOOKAHEAD_DECODING_TEST_SRC}")
 add_gtest(eagleLayerTest layers/eagleLayerTest.cpp)
+add_gtest(testUtilsTest utils/utilsTest.cpp)
 
 add_gtest(
   gemmSwigluRunnerTest
@@ -192,6 +197,8 @@ foreach(target_name gemmSwigluRunnerTest;gemmSwigluKernelTestSm90Fp8)
     # No kernels should be parsed, unless hopper is specified. This is a build
     # time improvement
     target_compile_definitions(${target_name} PRIVATE COMPILE_HOPPER_TMA_GEMMS)
+    target_compile_definitions(${target_name}
+                               PRIVATE COMPILE_HOPPER_TMA_GROUPED_GEMMS)
   endif()
 
   # Suppress GCC note: the ABI for passing parameters with 64-byte alignment has

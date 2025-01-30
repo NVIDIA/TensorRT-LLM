@@ -14,6 +14,10 @@
  * limitations under the License.
  */
 #include "ub_interface.h"
+#include "tensorrt_llm/common/cudaDriverWrapper.h"
+#include <cuda_runtime.h>
+#include <cuda_runtime_api.h>
+
 #if ENABLE_MULTI_DEVICE
 namespace tensorrt_llm::runtime::ub
 {
@@ -49,7 +53,13 @@ communicator* ub_comm()
 
 bool ub_supported()
 {
-    return true;
+    int cur_dev;
+    TLLM_CUDA_CHECK(cudaGetDevice(&cur_dev));
+    // UB requires Multicast support
+    int mc_support;
+    TLLM_CU_CHECK(tensorrt_llm::common::CUDADriverWrapper::getInstance()->cuDeviceGetAttribute(
+        &mc_support, CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, cur_dev));
+    return mc_support;
 }
 }; // namespace tensorrt_llm::runtime::ub
 
@@ -76,6 +86,16 @@ int allreduce2_userbuff_inplace_rmsnorm_quant_launcher(int const handler, size_t
 {
     return allreduce2_userbuff_inplace_rmsnorm_quant_impl(handler, offset, out_handler, out_offset, elements,
         hidden_size, beta, gamma, eps, scalefactor, residual_in, residual_out, dataType, comm, stream);
+}
+
+int allreduce2_userbuff_inplace_rmsnorm_quant_fp4_launcher(int const handler, size_t const offset,
+    int const out_handler, size_t const out_offset, int const scale_handler, size_t const scale_offset,
+    size_t const elements, int const hidden_size, void* beta, void* gamma, float eps, float* scalefactor,
+    void* residual_in, void* residual_out, nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream)
+{
+    return allreduce2_userbuff_inplace_rmsnorm_quant_fp4_impl(handler, offset, out_handler, out_offset, scale_handler,
+        scale_offset, elements, hidden_size, beta, gamma, eps, scalefactor, residual_in, residual_out, dataType, comm,
+        stream);
 }
 } // namespace tensorrt_llm::kernels::ub
 #else
@@ -130,6 +150,14 @@ int allreduce2_userbuff_inplace_rmsnorm_quant_launcher(int const handler, size_t
     size_t const out_offset, size_t const elements, int const hidden_size, void* beta, void* gamma, float eps,
     float* scalefactor, void* residual_in, void* residual_out, nvinfer1::DataType dataType, communicator* comm,
     cudaStream_t stream)
+{
+    return 0;
+}
+
+int allreduce2_userbuff_inplace_rmsnorm_quant_fp4_launcher(int const handler, size_t const offset,
+    int const out_handler, size_t const out_offset, int const scale_handler, size_t const scale_offset,
+    size_t const elements, int const hidden_size, void* beta, void* gamma, float eps, float* scalefactor,
+    void* residual_in, void* residual_out, nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream)
 {
     return 0;
 }

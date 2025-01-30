@@ -104,6 +104,37 @@ enum class CutlassTileConfigSM90
     CtaShape256x128x128B,
 };
 
+enum class CutlassTileConfigSM100
+{
+    // Signals that we should run heuristics do choose a config
+    Undefined,
+
+    // Signals that we should run heuristics do choose a config
+    ChooseWithHeuristic,
+
+    /*
+     * Grouped GEMM
+     */
+    // M=64
+    CtaShape64x32x128B,
+    CtaShape64x64x128B,
+    CtaShape64x128x128B,
+    CtaShape64x256x128B,
+
+    // M=128
+    CtaShape128x32x128B,
+    CtaShape128x64x128B,
+    CtaShape128x128x128B,
+    CtaShape128x256x128B,
+    CtaShape128x128x256B,
+    CtaShape128x256x256B,
+
+    // M=256
+    CtaShape256x64x128B,
+    CtaShape256x128x128B,
+    CtaShape256x256x128B,
+};
+
 enum class MainloopScheduleType
 {
     AUTO // Automatically selects between pingpong and cooperative schedules on Hopper. On older architectures, this
@@ -122,6 +153,10 @@ enum class ClusterShape
     ClusterShape_2x1x1,
     ClusterShape_1x2x1,
     ClusterShape_2x2x1,
+    ClusterShape_1x4x1,
+    ClusterShape_4x2x1,
+    ClusterShape_2x4x1,
+    ClusterShape_4x4x1,
     ClusterShape_1x8x1,
     ClusterShape_8x1x1
 };
@@ -135,30 +170,36 @@ struct CutlassGemmConfig
         SIMT_ONLY = 1u << 1,
         INT8_ONLY = 1u << 2,
         HOPPER = 1u << 3,
-        GROUPED_GEMM = 1u << 4,
-        FP8_ONLY = 1u << 5,
+        BLACKWELL = 1u << 4,
+        GROUPED_GEMM = 1u << 5,
+        FP8_ONLY = 1u << 6,
+        FP4_ONLY = 1u << 7
     };
 
-    CutlassTileConfig tile_config = CutlassTileConfig::ChooseWithHeuristic;
+    CutlassTileConfig tile_config_sm80 = CutlassTileConfig::ChooseWithHeuristic;
     SplitKStyle split_k_style = SplitKStyle::NO_SPLIT_K;
     int split_k_factor = -1;
     int stages = -1;
 
     // config options for sm90
     CutlassTileConfigSM90 tile_config_sm90 = CutlassTileConfigSM90::ChooseWithHeuristic;
+    CutlassTileConfigSM100 tile_config_sm100 = CutlassTileConfigSM100::ChooseWithHeuristic;
     MainloopScheduleType mainloop_schedule = MainloopScheduleType::AUTO;
     EpilogueScheduleType epilogue_schedule = EpilogueScheduleType::AUTO;
     ClusterShape cluster_shape = ClusterShape::ClusterShape_1x1x1;
-    bool is_sm90 = false;
+    bool enableCudaKernel = false;
+    int sm_version = 80; // Use 80 as a catch all for <90
+    bool is_tma_warp_specialized = false;
 
-    CutlassGemmConfig() {}
+    CutlassGemmConfig() = default;
 
     CutlassGemmConfig(CutlassTileConfig tile_config, SplitKStyle split_k_style, int split_k_factor, int stages)
-        : tile_config(tile_config)
+        : tile_config_sm80(tile_config)
         , split_k_style(split_k_style)
         , split_k_factor(split_k_factor)
         , stages(stages)
-        , is_sm90(false)
+        , sm_version(80)
+        , enableCudaKernel(false)
     {
     }
 
@@ -168,27 +209,62 @@ struct CutlassGemmConfig
         , mainloop_schedule(mainloop_schedule)
         , epilogue_schedule(epilogue_schedule)
         , cluster_shape(cluster_shape)
-        , is_sm90(true)
+        , sm_version(90)
+        , is_tma_warp_specialized(true)
+        , enableCudaKernel(false)
     {
+    }
+
+    CutlassGemmConfig(CutlassTileConfigSM100 tile_config_sm100, MainloopScheduleType mainloop_schedule,
+        EpilogueScheduleType epilogue_schedule, ClusterShape cluster_shape)
+        : tile_config_sm100(tile_config_sm100)
+        , mainloop_schedule(mainloop_schedule)
+        , epilogue_schedule(epilogue_schedule)
+        , cluster_shape(cluster_shape)
+        , sm_version(100)
+        , is_tma_warp_specialized(true)
+        , enableCudaKernel(false)
+    {
+    }
+
+    int getTileConfigAsInt() const
+    {
+        if (sm_version == 120)
+            return (int) tile_config_sm80;
+        if (sm_version >= 100)
+            return (int) tile_config_sm100;
+        if (sm_version == 90)
+            return (int) tile_config_sm90;
+        if (sm_version < 90)
+            return (int) tile_config_sm80;
+        assert(false && "Invalid SM version");
+        return -1;
     }
 
     std::string toString() const
     {
         std::stringstream tactic;
         tactic << "Cutlass GEMM Tactic";
-        if (tile_config_sm90 != tensorrt_llm::cutlass_extensions::CutlassTileConfigSM90::ChooseWithHeuristic)
+        if (is_tma_warp_specialized && getTileConfigAsInt() != (int) CutlassTileConfigSM90::ChooseWithHeuristic)
         {
-            assert(is_sm90 && "Invalid cutlass GEMM config");
-            tactic << "\n\tstyle=TMA"
-                   << "\n\ttile shape ID: " << (int) tile_config_sm90 << "\n\tcluster shape ID: " << (int) cluster_shape
-                   << "\n\tmainloop sched: " << (int) mainloop_schedule << "\n\tepi sched: " << (int) epilogue_schedule;
+            assert(sm_version >= 90 && "Invalid cutlass GEMM config");
+            tactic << "\n\tstyle=TMA Warp Specialized"
+                   << "\n\tsm: " << sm_version << "\n\ttile shape ID: " << getTileConfigAsInt()
+                   << "\n\tcluster shape ID: " << (int) cluster_shape
+                   << "\n\tmainloop sched: " << (int) mainloop_schedule << "\n\tepi sched: " << (int) epilogue_schedule
+                   << "\n\tenable cuda kernel: " << (enableCudaKernel ? "true" : "false");
         }
-        else if (tile_config != tensorrt_llm::cutlass_extensions::CutlassTileConfig::ChooseWithHeuristic)
+        else if (tile_config_sm80 != tensorrt_llm::cutlass_extensions::CutlassTileConfig::ChooseWithHeuristic)
         {
-            assert(!is_sm90 && "Invalid cutlass GEMM config");
+            assert(sm_version < 90 && "Invalid cutlass GEMM config");
             tactic << "\n\tstyle=compatible"
-                   << "\n\ttile shape ID: " << (int) tile_config << "\n\tstages: " << (int) stages
-                   << "\n\tsplit k: " << (int) split_k_factor;
+                   << "\n\ttile shape ID: " << (int) tile_config_sm80 << "\n\tstages: " << (int) stages
+                   << "\n\tsplit k: " << (int) split_k_factor
+                   << "\n\tenable cuda kernel: " << (enableCudaKernel ? "true" : "false");
+        }
+        else if (enableCudaKernel)
+        {
+            tactic << "\n\tenable cuda kernel: " << (enableCudaKernel ? "true" : "false");
         }
         else
         {
@@ -202,19 +278,21 @@ struct CutlassGemmConfig
 inline std::ostream& operator<<(std::ostream& out, CutlassGemmConfig const& config)
 {
     // clang-format off
-    if (config.is_sm90)
+    if (config.is_tma_warp_specialized)
     {
-        out << "tile_config_sm90_enum: " << int(config.tile_config_sm90)
+        out << "tile_config_sm90_enum: " << config.getTileConfigAsInt()
             << ", mainloop_schedule_enum: " << int(config.mainloop_schedule)
             << ", epilogue_schedule_enum: " << int(config.epilogue_schedule)
-            << ", cluster_shape_enum: " << int(config.cluster_shape);
+            << ", cluster_shape_enum: " << int(config.cluster_shape)
+            << ", enable_cuda_kernel: " << (config.enableCudaKernel ? "true" : "false");
     }
     else
     {
-        out << "tile_config_enum: " << int(config.tile_config)
+        out << "tile_config_enum: " << config.getTileConfigAsInt()
             << ", split_k_style_enum: " << int(config.split_k_style)
             << ", split_k_factor: " << config.split_k_factor
-            << ", stages: " << config.stages;
+            << ", stages: " << config.stages
+            << ", enable_cuda_kernel: " << (config.enableCudaKernel ? "true" : "false");
     }
     // clang-format on
     return out;

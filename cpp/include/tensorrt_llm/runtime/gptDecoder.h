@@ -64,6 +64,10 @@ public:
 
     virtual SamplingConfig const& getSamplingConfig() = 0;
 
+    virtual void disableLookahead(
+        std::optional<SamplingConfig> const& samplingConfig, SizeType32 batchSize, TensorConstPtr batchSlots)
+        = 0;
+
     static std::unique_ptr<IGptDecoder> create(executor::DecodingMode const& mode, nvinfer1::DataType dtype,
         size_t maxBatchSize, size_t maxBeamWidth, size_t vocabSize, size_t vocabSizePadded, size_t maxSequenceLength,
         BufferManager::CudaStreamPtr const& stream,
@@ -95,6 +99,9 @@ public:
         return mSamplingConfig;
     }
 
+    void disableLookahead(
+        std::optional<SamplingConfig> const& samplingConfig, SizeType32 batchSize, TensorConstPtr batchSlots) override;
+
 private:
     std::shared_ptr<BufferManager> mManager;
     std::shared_ptr<tensorrt_llm::layers::DynamicDecodeLayer<T>> mDynamicDecodeLayer;
@@ -103,6 +110,8 @@ private:
     SamplingConfig mSamplingConfig;
 
     size_t mMaxBatchSize;
+    size_t mVocabSize;
+    size_t mVocabSizePadded;
 
     executor::DecodingMode mDecodingMode;
 };

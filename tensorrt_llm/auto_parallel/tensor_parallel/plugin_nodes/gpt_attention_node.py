@@ -43,7 +43,7 @@ class IdxEntry(Enum):
     SPEC_DECODING_GENERATION_LENGTHS = auto()
     SPEC_DECODING_PACKED_MASK = auto()
     SPEC_DECODING_POSITION_OFFSETS = auto()
-    MROPE_ROTARY_SIN_COS = auto()
+    MROPE_ROTARY_COS_SIN = auto()
     MROPE_POSITION_DELTAS = auto()
     HOST_RUNTIME_PERF_KNOBS = auto()
     HOST_CONTEXT_PROGRESS = auto()
@@ -149,7 +149,7 @@ class IdxEntryParser:
             return self.is_spec_decoding_enabled
         elif entry == IdxEntry.SPEC_DECODING_GENERATION_LENGTHS:
             return self.is_spec_decoding_enabled
-        elif entry == IdxEntry.MROPE_ROTARY_SIN_COS:
+        elif entry == IdxEntry.MROPE_ROTARY_COS_SIN:
             return self.position_embedding_type.is_mrope()
         elif entry == IdxEntry.MROPE_POSITION_DELTAS:
             return self.position_embedding_type.is_mrope()

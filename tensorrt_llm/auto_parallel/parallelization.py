@@ -2116,8 +2116,8 @@ class PrefixedGraphGroup(GraphGroupBase):
                 ):
                     size = output.nelement()
                     diff = (output - refer_output).abs()
-                    diff_index = (~torch.isnan(diff)) & (
-                        diff > (atol + rtol * refer_output.abs()))
+                    diff_index = (~torch.isnan(diff)) & (diff > (
+                        atol + rtol * refer_output.abs()))
                     diff_output = diff[diff_index]
                     diff_size = diff_output.nelement()
                     logger.warning(

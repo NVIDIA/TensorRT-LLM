@@ -27,7 +27,8 @@ from ...module import Module
 from ...plugin import init_all_reduce_helper
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
                               PretrainedConfig)
-from .convert import convert_deepseekv2, create_trt_config_from_hf
+from .config import DeepSeekV2Config
+from .convert import convert_deepseekv2
 
 
 class DeepseekV2DecoderLayer(Module):
@@ -37,7 +38,7 @@ class DeepseekV2DecoderLayer(Module):
         self.layer_idx = layer_idx
         self.config = config
 
-        ### Input layernorm in Deepseek v2 is same as Llama
+        # Input layernorm in Deepseek v2 is same as Llama
         self.input_layernorm = RmsNorm(normalized_shape=config.hidden_size,
                                        eps=config.norm_epsilon,
                                        dtype=config.dtype)
@@ -73,24 +74,17 @@ class DeepseekV2DecoderLayer(Module):
             tp_size=config.mapping.tp_size,
             tp_rank=config.mapping.tp_rank)
 
-        ### Added deepseek MoE and shared_experts
-        ### First decoder layer: MLA + dense MLP + input_layernorm(RMSNorm) + post_attention_layernorm(RMSNorm)
-        ### Rest decoder layer: MLA + MoE MLP + MoE Gate + shared_experts(MLP) + input_layernorm(RMSNorm) + post_attention_layernorm(RMSNorm)
-        ### Added MLA in co-testing phase, use standard attention for MoE testing
+        # Added deepseek MoE and shared_experts
+        # First decoder layer: MLA + dense MLP + input_layernorm(RMSNorm) + post_attention_layernorm(RMSNorm)
+        # Rest decoder layer: MLA + MoE MLP + MoE Gate + shared_experts(MLP) + input_layernorm(RMSNorm) + post_attention_layernorm(RMSNorm)
+        # Added MLA in co-testing phase, use standard attention for MoE testing
 
-        ### Distinguish dense MLP and MoE MLP
+        # Distinguish dense MLP and MoE MLP
         # dense_config = DenseConfig(intermediate_size=config.intermediate_size)
-        moe_config = MoeConfig(
-            num_experts=config.moe_num_experts,
-            shared_expert_intermediate_size=config.moe_num_shared_experts *
-            config.moe_inter_size,
-            top_k=config.moe_top_k,
-            normalization_mode=config.moe_renorm_mode,
-            device_limited_n_group=config.moe_n_group,
-            device_limited_topk_group=config.moe_topk_group,
-            device_limited_routed_scaling_factor=config.
-            moe_routed_scaling_factor)
-
+        moe_config = config.moe
+        # In case of moe_config is a dict
+        if isinstance(moe_config, dict):
+            moe_config = MoeConfig.from_dict(moe_config)
         # layer_config = LayerMLPConfig(config=[dense_config, moe_config], moe_layer_idx_min=0,
         #                             moe_layer_idx_max=config.num_hidden_layers,
         #                             total_num_layers=config.num_hidden_layers)
@@ -120,7 +114,7 @@ class DeepseekV2DecoderLayer(Module):
                           tp_size=config.mapping.tp_size,
                           **mlp_kwargs)
 
-        ### Pose layernorm in Deepseek v2 is same as Llama
+        # Pose layernorm in Deepseek v2 is same as Llama
         self.post_layernorm = RmsNorm(normalized_shape=config.hidden_size,
                                       eps=config.norm_epsilon,
                                       dtype=config.dtype)
@@ -221,6 +215,7 @@ class DeepseekV2Model(Module):
 
 
 class DeepseekV2ForCausalLM(DecoderModelForCausalLM):
+    config_class = DeepSeekV2Config
 
     def __init__(self, config: PretrainedConfig):
         transformer = DeepseekV2Model(config)
@@ -250,16 +245,12 @@ class DeepseekV2ForCausalLM(DecoderModelForCausalLM):
         assert hf_model is not None
         if mapping is None:
             mapping = Mapping()
-        config = create_trt_config_from_hf(model_dir,
-                                           dtype,
-                                           mapping=mapping,
-                                           override_fields=override_fields)
-        print(config)
-        pretrained_config = PretrainedConfig.from_dict(config)
-        pretrained_config.set_rank(mapping.rank)  # TODO:remove this hack
-
+        pretrained_config = DeepSeekV2Config.from_hugging_face(model_dir,
+                                                               dtype=dtype,
+                                                               mapping=mapping,
+                                                               **kwargs)
         if dtype == 'auto':
-            dtype = getattr(config, 'torch_dtype', None)
+            dtype = getattr(pretrained_config, 'torch_dtype', None)
         if dtype is None:
             dtype = 'float16'
         if isinstance(dtype, torch.dtype):
@@ -275,11 +266,11 @@ class DeepseekV2ForCausalLM(DecoderModelForCausalLM):
         deepseek = cls.from_config(pretrained_config)
         weights = convert_deepseekv2(
             hf_model,
-            config,
+            pretrained_config,
             mapping,
             dtype=dtype,
-            use_parallel_embedding=config.get('use_parallel_embedding', False),
-            sharding_dim=config.get('embedding_sharding_dim', 0))
+            use_parallel_embedding=pretrained_config.use_parallel_embedding,
+            sharding_dim=pretrained_config.embedding_sharding_dim)
         deepseek.load(weights)
 
         return deepseek

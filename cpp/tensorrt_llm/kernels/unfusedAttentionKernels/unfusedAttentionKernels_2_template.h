@@ -299,7 +299,7 @@ inline __device__ void apply_rotary_embedding_gptj(VecType& q, VecType& k, float
 }
 
 template <typename T, typename TCache, int Dh_MAX, bool ADD_BIAS, bool STORE_QKV, typename KVCacheBuffer,
-    RotaryPositionEmbeddingType ROTARY_TYPE, bool DYNAMIC_ROTARY_SCALING, bool FP8_OUTPUT>
+    RotaryPositionEmbeddingType ROTARY_TYPE, bool DYNAMIC_ROTARY_SCALING, bool FP8_OUTPUT, bool GEN_PHASE>
 __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuffer> params)
 {
     // This kernel add bias to QKV, which has shape [batch_size, seq_len, 3, head_num, size_per_head]
@@ -345,7 +345,7 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
     using TDst = TCache;
 
     // Variable sequence length.
-    bool const variable_sequence_length = params.cu_seq_lens != nullptr;
+    bool const variable_sequence_length = !GEN_PHASE && (params.cu_seq_lens != nullptr) && (params.seq_lens != nullptr);
 
     int const head_idx = blockIdx.y;
     // Block size is always 32 in the x dimension (handles one head size).
@@ -441,6 +441,9 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
                 k_wo_pos = k;
             }
 
+            // The offset of rotary_embedding_inv_freq.
+            // Dynamic rotary scaling might have different inv_freq values for different sequences.
+            size_t const inv_freq_buffer_offset = DYNAMIC_ROTARY_SCALING ? batch_idx * params.half_rotary_dim : 0;
             switch (ROTARY_TYPE)
             {
             // Rotate every two elements (need at two elements per thead).
@@ -451,14 +454,14 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
                 if (DYNAMIC_ROTARY_SCALING || rotary_position != cached_rotary_position)
                 {
                     apply_rotary_embedding_gptj<VecType, BaseType, ROTARY_COEF_VEC_SIZE, true>(q, k, rotary_coef_cache,
-                        params.rotary_embedding_inv_freq + batch_idx * params.half_rotary_dim, gptj_rotary_dim_idx,
+                        params.rotary_embedding_inv_freq + inv_freq_buffer_offset, gptj_rotary_dim_idx,
                         params.half_rotary_dim, rotary_position);
                     cached_rotary_position = rotary_position;
                 }
                 else
                 {
                     apply_rotary_embedding_gptj<VecType, BaseType, ROTARY_COEF_VEC_SIZE, false>(q, k, rotary_coef_cache,
-                        params.rotary_embedding_inv_freq + batch_idx * params.half_rotary_dim, gptj_rotary_dim_idx,
+                        params.rotary_embedding_inv_freq + inv_freq_buffer_offset, gptj_rotary_dim_idx,
                         params.half_rotary_dim, rotary_position);
                 }
                 break;
@@ -471,18 +474,16 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
                 if (DYNAMIC_ROTARY_SCALING || rotary_position != cached_rotary_position)
                 {
                     apply_rotary_embedding_gptneox<VecType, BaseType, ROTARY_COEF_VEC_SIZE, true>(q, q_pair, k, k_pair,
-                        first_half, rotary_coef_cache,
-                        params.rotary_embedding_inv_freq + batch_idx * params.half_rotary_dim, gptneox_rotary_dim_idx,
-                        params.half_rotary_dim, rotary_position, params.rotary_vision_start,
+                        first_half, rotary_coef_cache, params.rotary_embedding_inv_freq + inv_freq_buffer_offset,
+                        gptneox_rotary_dim_idx, params.half_rotary_dim, rotary_position, params.rotary_vision_start,
                         params.rotary_vision_length);
                     cached_rotary_position = rotary_position;
                 }
                 else
                 {
                     apply_rotary_embedding_gptneox<VecType, BaseType, ROTARY_COEF_VEC_SIZE, false>(q, q_pair, k, k_pair,
-                        first_half, rotary_coef_cache,
-                        params.rotary_embedding_inv_freq + batch_idx * params.half_rotary_dim, gptneox_rotary_dim_idx,
-                        params.half_rotary_dim, rotary_position, params.rotary_vision_start,
+                        first_half, rotary_coef_cache, params.rotary_embedding_inv_freq + inv_freq_buffer_offset,
+                        gptneox_rotary_dim_idx, params.half_rotary_dim, rotary_position, params.rotary_vision_start,
                         params.rotary_vision_length);
                 }
                 break;
@@ -506,7 +507,7 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
             // (!STORE_QKV) are used together as the original kv cache cannot be overwritten. In this case, new tokens'
             // kv will just be appended to the kv cache instead of overwriting it in a circular way. And the kv cache
             // will be overwritten after FMHA kernels.
-            if constexpr (STORE_QKV)
+            if constexpr (STORE_QKV || GEN_PHASE)
             {
                 // Write the new tokens' kv to the cyclic kv cache.
                 token_idx_in_kv_cache = params.kv_cache_buffer.getKVTokenIdx(token_idx_in_seq);
@@ -647,7 +648,7 @@ struct VecType<__nv_bfloat16>
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename T, typename TCache, int BLOCK_SIZE, int Dh, bool ADD_BIAS, bool STORE_QKV, bool FP8_OUTPUT,
-    typename KVCacheBuffer, RotaryPositionEmbeddingType ROTARY_TYPE>
+    bool GEN_PHASE, typename KVCacheBuffer, RotaryPositionEmbeddingType ROTARY_TYPE>
 __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBuffer> params)
 {
     // This kernel add bias to QKV, which has shape [batch_size, seq_len, 3, head_num, size_per_head]
@@ -693,12 +694,11 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
     // int8 / fp8 kv cache.
     constexpr bool ENABLE_8BITS_CACHE = sizeof(TCache) == 1;
 
-    // Block/Head idx.
-    int const batch_idx = blockIdx.y;
-    int const head_idx = blockIdx.z;
+    // Head idx.
+    int const head_idx = blockIdx.y;
 
     // Variable sequence length.
-    bool const variable_sequence_length = params.cu_seq_lens != nullptr;
+    bool const variable_sequence_length = params.tokens_info != nullptr && params.cu_seq_lens != nullptr;
     int const head_dim_vec_idx = (threadIdx.x % VECS_PER_HEAD);
     int const head_dim_idx = head_dim_vec_idx * ELTS_PER_VEC;
     bool const first_half = head_dim_idx < params.half_rotary_dim;
@@ -716,33 +716,51 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
 
     int const rotated_head_dim_offset = first_half ? params.half_rotary_dim : -params.half_rotary_dim;
     // Make sure there are multiple of tokens_per_block otherwise syncthreads will lead to deadlocks.
-    int const seq_len_loop_end
-        = int((params.max_input_seq_len + TOKENS_PER_BLOCK - 1) / TOKENS_PER_BLOCK) * TOKENS_PER_BLOCK;
+    int const tokens_loop_end = int((params.token_num + TOKENS_PER_BLOCK - 1) / TOKENS_PER_BLOCK) * TOKENS_PER_BLOCK;
 
     // Mainloop.
-    for (int local_token_idx = (threadIdx.x / VECS_PER_HEAD) + blockIdx.x * TOKENS_PER_BLOCK;
-         local_token_idx < seq_len_loop_end; local_token_idx += TOKENS_PER_BLOCK * gridDim.x)
+    for (int global_token_idx = (threadIdx.x / VECS_PER_HEAD) + blockIdx.x * TOKENS_PER_BLOCK;
+         global_token_idx < tokens_loop_end; global_token_idx += TOKENS_PER_BLOCK * gridDim.x)
     {
-        // The index of the token in the batch.
-        int const global_token_offset = (variable_sequence_length && params.remove_padding)
-            ? params.cu_seq_lens[batch_idx]
-            : batch_idx * params.max_input_seq_len;
+        // Global token idx bounded by num of tokens.
+        int bounded_global_token_idx = std::min(global_token_idx, params.token_num - 1);
+        // The batch_idx and token idx in the sequence.
+        int batch_idx, token_idx_in_seq;
+        if constexpr (GEN_PHASE)
+        {
+            batch_idx = bounded_global_token_idx;
+            token_idx_in_seq = 0;
+        }
+        else if (variable_sequence_length)
+        {
+            auto token_info = params.tokens_info[bounded_global_token_idx];
+            batch_idx = token_info.x;
+            token_idx_in_seq = token_info.y;
+        }
+        else
+        {
+            batch_idx = bounded_global_token_idx / params.max_input_seq_len;
+            token_idx_in_seq = bounded_global_token_idx % params.max_input_seq_len;
+        }
+        // The cache sequence length that includes the input sequence length.
         int const cache_seq_len = params.cache_seq_lens[batch_idx];
         int const actual_seq_len = variable_sequence_length ? params.seq_lens[batch_idx] : params.max_input_seq_len;
         // Chunked attention: takes past_kv_sequence_length into consideration.
         int const past_seq_len = (cache_seq_len - actual_seq_len);
-        int token_idx_in_kv_cache = past_seq_len + local_token_idx;
-        // The same as local_token_idx < actual_seq_len.
-        bool const valid_token = token_idx_in_kv_cache < cache_seq_len;
+        // Is it a valid token to be stored ?
+        bool valid_token = GEN_PHASE || (token_idx_in_seq < actual_seq_len);
+        // Make sure token_idx_in_seq is within the bound of actual_seq_len.
+        token_idx_in_seq = std::min(actual_seq_len - 1, token_idx_in_seq);
+        int token_idx_in_kv_cache = past_seq_len + token_idx_in_seq;
+        // The same as token_idx_in_seq < actual_seq_len.
+        valid_token = valid_token && (token_idx_in_kv_cache < cache_seq_len);
         // Limit the token_idx to cache seq length (we need all threads in this block to be involved).
         token_idx_in_kv_cache = std::min(token_idx_in_kv_cache, cache_seq_len - 1);
-        local_token_idx = std::min(local_token_idx, actual_seq_len - 1);
-        int const global_token_idx = local_token_idx + global_token_offset;
 
         // NOTE: only spec decoding needs the position offsets.
         // In the generation phase, we assume all sequences should have the same input length.
         int const rotary_position = params.spec_decoding_position_offsets != nullptr
-            ? (params.spec_decoding_position_offsets[local_token_idx + batch_idx * params.max_input_seq_len]
+            ? (params.spec_decoding_position_offsets[token_idx_in_seq + batch_idx * params.max_input_seq_len]
                 + cache_seq_len - actual_seq_len)
             : token_idx_in_kv_cache;
 
@@ -750,11 +768,11 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
         //   src QKV: [batch, time, 3, head_num, size_per_head]
         // head_num != kv_head_num:
         //   src QKV: [batch, time, head_num * size_per_head + 2 * kv_head_num * size_per_head]
-        auto const src_q_idx = static_cast<size_t>(global_token_idx) * params.hidden_size + hidden_idx;
+        auto const src_q_idx = static_cast<size_t>(bounded_global_token_idx) * params.hidden_size + hidden_idx;
         auto const src_k_idx
-            = static_cast<size_t>(global_token_idx) * params.hidden_size + src_k_offset + hidden_idx_kv;
+            = static_cast<size_t>(bounded_global_token_idx) * params.hidden_size + src_k_offset + hidden_idx_kv;
         auto const src_v_idx
-            = static_cast<size_t>(global_token_idx) * params.hidden_size + src_v_offset + hidden_idx_kv;
+            = static_cast<size_t>(bounded_global_token_idx) * params.hidden_size + src_v_offset + hidden_idx_kv;
 
         auto q = *reinterpret_cast<VecT const*>(&params.qkv_input[src_q_idx]);
         auto k = *reinterpret_cast<VecT const*>(&params.qkv_input[src_k_idx]);
@@ -784,9 +802,10 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
 
         // Cos/sin cache.
         [[maybe_unused]] float2 const* rotary_coef_cache_buffer = nullptr;
-        if (params.mrope_rotary_sin_cos != nullptr)
+        if (params.mrope_rotary_cos_sin != nullptr)
         {
-            rotary_coef_cache_buffer = params.mrope_rotary_sin_cos + batch_idx * params.rotary_embedding_max_positions
+            rotary_coef_cache_buffer = params.mrope_rotary_cos_sin
+                + batch_idx * params.rotary_embedding_max_positions * params.half_rotary_dim
                 + static_cast<size_t>(rotary_position) * params.half_rotary_dim;
         }
         else
@@ -840,16 +859,17 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
 
         auto const channelIdx = head_dim_vec_idx;
         auto const tokenIdxLowerBound = max(cache_seq_len - params.cyclic_kv_cache_len, 0);
-        bool const cyclic_kv_cache = cache_seq_len > params.cyclic_kv_cache_len;
-        bool const useKVCache = params.kv_cache_buffer.data != nullptr;
+        bool const useKVCache = GEN_PHASE || params.kv_cache_buffer.data != nullptr;
         bool valid_kv_cache_pos = useKVCache // In KV-cache-less mode. No need to store KV values
             && (token_idx_in_kv_cache >= tokenIdxLowerBound);
         // Additional kv cache blocks will be allocated if sliding window attention and paged kv context fmha
         // (!STORE_QKV) are used together as the original kv cache cannot be overwritten. In this case, new tokens' kv
         // will just be appended to the kv cache instead of overwriting it in a circular way. And the kv cache will be
         // overwritten after FMHA kernels.
-        if constexpr (STORE_QKV)
+        if constexpr (STORE_QKV || GEN_PHASE)
         {
+            bool const cyclic_kv_cache = cache_seq_len > params.cyclic_kv_cache_len;
+
             // Write the new tokens' kv to the cyclic kv cache.
             token_idx_in_kv_cache
                 = cyclic_kv_cache ? (token_idx_in_kv_cache % params.cyclic_kv_cache_len) : token_idx_in_kv_cache;
@@ -861,7 +881,7 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
             valid_kv_cache_pos = useKVCache;
             if (past_seq_len >= params.cyclic_kv_cache_len)
             {
-                token_idx_in_kv_cache = params.cyclic_kv_cache_len + local_token_idx;
+                token_idx_in_kv_cache = params.cyclic_kv_cache_len + token_idx_in_seq;
             }
         }
 
@@ -881,7 +901,7 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
         // Only update valid tokens.
         if (valid_token)
         {
-            auto const dst_q_idx = static_cast<size_t>(global_token_idx) * params.q_hidden_size + hidden_idx;
+            auto const dst_q_idx = static_cast<size_t>(bounded_global_token_idx) * params.q_hidden_size + hidden_idx;
             VecT* q_ptr = STORE_QKV ? reinterpret_ptr<T, VecT>(params.qkv_input, src_q_idx)
                                     : reinterpret_ptr<T, VecT>(params.q_output, dst_q_idx);
 
@@ -952,7 +972,7 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
 }
 
 // Use more blocks for the batch dimension in the generation phase.
-#define APPLY_BIAS_ROPE_UPDATE_KV_CACHE(Dh_MAX, ADD_BIAS, STORE_QKV, DYNAMIC_ROTARY_SCALING, FP8_OUTPUT)               \
+#define APPLY_BIAS_ROPE_UPDATE_KV_CACHE(Dh_MAX, ADD_BIAS, GEN_PHASE, STORE_QKV, DYNAMIC_ROTARY_SCALING, FP8_OUTPUT)    \
     dim3 block(WARP_SIZE, 1);                                                                                          \
     dim3 grid(params.max_input_seq_len, params.head_num);                                                              \
     grid.z = std::min(int(divUp(params.multi_processor_count * WARPS_PER_SM, grid.x * grid.y)),                        \
@@ -962,43 +982,43 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
         || params.position_embedding_type == PositionEmbeddingType::kROPE_M)                                           \
     {                                                                                                                  \
         applyBiasRopeUpdateKVCache<T, TCache, Dh_MAX, ADD_BIAS, STORE_QKV, KVCacheBuffer,                              \
-            RotaryPositionEmbeddingType::GPT_NEOX, DYNAMIC_ROTARY_SCALING, FP8_OUTPUT>                                 \
+            RotaryPositionEmbeddingType::GPT_NEOX, DYNAMIC_ROTARY_SCALING, FP8_OUTPUT, GEN_PHASE>                      \
             <<<grid, block, 0, stream>>>(params);                                                                      \
     }                                                                                                                  \
     else if (params.position_embedding_type == PositionEmbeddingType::kROPE_GPTJ)                                      \
     {                                                                                                                  \
         applyBiasRopeUpdateKVCache<T, TCache, Dh_MAX, ADD_BIAS, STORE_QKV, KVCacheBuffer,                              \
-            RotaryPositionEmbeddingType::GPTJ, DYNAMIC_ROTARY_SCALING, FP8_OUTPUT>                                     \
+            RotaryPositionEmbeddingType::GPTJ, DYNAMIC_ROTARY_SCALING, FP8_OUTPUT, GEN_PHASE>                          \
             <<<grid, block, 0, stream>>>(params);                                                                      \
     }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
         applyBiasRopeUpdateKVCache<T, TCache, Dh_MAX, ADD_BIAS, STORE_QKV, KVCacheBuffer,                              \
-            RotaryPositionEmbeddingType::NONE, DYNAMIC_ROTARY_SCALING, FP8_OUTPUT>                                     \
+            RotaryPositionEmbeddingType::NONE, DYNAMIC_ROTARY_SCALING, FP8_OUTPUT, GEN_PHASE>                          \
             <<<grid, block, 0, stream>>>(params);                                                                      \
     }
 
-#define DYNAMIC_ROTARY_SCALING_AND_FP8_OUTPUT_DISPATCH(ADD_BIAS, STORE_QKV)                                            \
+#define DYNAMIC_ROTARY_SCALING_AND_FP8_OUTPUT_DISPATCH(ADD_BIAS, GEN_PHASE, STORE_QKV)                                 \
     if (dynamic_rotary_scaling)                                                                                        \
     {                                                                                                                  \
         if (params.quantized_fp8_output)                                                                               \
         {                                                                                                              \
-            APPLY_BIAS_ROPE_UPDATE_KV_CACHE(Dh_MAX, ADD_BIAS, STORE_QKV, true, true);                                  \
+            APPLY_BIAS_ROPE_UPDATE_KV_CACHE(Dh_MAX, ADD_BIAS, GEN_PHASE, STORE_QKV, true, true);                       \
         }                                                                                                              \
         else                                                                                                           \
         {                                                                                                              \
-            APPLY_BIAS_ROPE_UPDATE_KV_CACHE(Dh_MAX, ADD_BIAS, STORE_QKV, true, false);                                 \
+            APPLY_BIAS_ROPE_UPDATE_KV_CACHE(Dh_MAX, ADD_BIAS, GEN_PHASE, STORE_QKV, true, false);                      \
         }                                                                                                              \
     }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
         if (params.quantized_fp8_output)                                                                               \
         {                                                                                                              \
-            APPLY_BIAS_ROPE_UPDATE_KV_CACHE(Dh_MAX, ADD_BIAS, STORE_QKV, false, true);                                 \
+            APPLY_BIAS_ROPE_UPDATE_KV_CACHE(Dh_MAX, ADD_BIAS, GEN_PHASE, STORE_QKV, false, true);                      \
         }                                                                                                              \
         else                                                                                                           \
         {                                                                                                              \
-            APPLY_BIAS_ROPE_UPDATE_KV_CACHE(Dh_MAX, ADD_BIAS, STORE_QKV, false, false);                                \
+            APPLY_BIAS_ROPE_UPDATE_KV_CACHE(Dh_MAX, ADD_BIAS, GEN_PHASE, STORE_QKV, false, false);                     \
         }                                                                                                              \
     }
 
@@ -1007,6 +1027,8 @@ void kernelDispatchHeadSize(QKVPreprocessingParams<T, KVCacheBuffer> params, cud
 {
     bool const add_bias = params.qkv_bias != nullptr;
     bool const store_packed_qkv = !params.separate_q_kv_output;
+    bool const generation_phase
+        = (params.kv_cache_buffer.data != nullptr) && (params.max_input_seq_len == 1) && params.generation_phase;
     bool const dynamic_rotary_scaling = params.rotary_scale_type == RotaryScalingType::kDYNAMIC
         && params.max_input_seq_len > params.rotary_embedding_max_positions;
 
@@ -1020,24 +1042,52 @@ void kernelDispatchHeadSize(QKVPreprocessingParams<T, KVCacheBuffer> params, cud
 
     if (add_bias)
     {
-        if (store_packed_qkv)
+        if (generation_phase)
         {
-            DYNAMIC_ROTARY_SCALING_AND_FP8_OUTPUT_DISPATCH(true, true);
+            if (store_packed_qkv)
+            {
+                DYNAMIC_ROTARY_SCALING_AND_FP8_OUTPUT_DISPATCH(true, true, true);
+            }
+            else
+            {
+                DYNAMIC_ROTARY_SCALING_AND_FP8_OUTPUT_DISPATCH(true, true, false);
+            }
         }
         else
         {
-            DYNAMIC_ROTARY_SCALING_AND_FP8_OUTPUT_DISPATCH(true, false);
+            if (store_packed_qkv)
+            {
+                DYNAMIC_ROTARY_SCALING_AND_FP8_OUTPUT_DISPATCH(true, false, true);
+            }
+            else
+            {
+                DYNAMIC_ROTARY_SCALING_AND_FP8_OUTPUT_DISPATCH(true, false, false);
+            }
         }
     }
     else
     {
-        if (store_packed_qkv)
+        if (generation_phase)
         {
-            DYNAMIC_ROTARY_SCALING_AND_FP8_OUTPUT_DISPATCH(false, true);
+            if (store_packed_qkv)
+            {
+                DYNAMIC_ROTARY_SCALING_AND_FP8_OUTPUT_DISPATCH(false, true, true);
+            }
+            else
+            {
+                DYNAMIC_ROTARY_SCALING_AND_FP8_OUTPUT_DISPATCH(false, true, false);
+            }
         }
         else
         {
-            DYNAMIC_ROTARY_SCALING_AND_FP8_OUTPUT_DISPATCH(false, false);
+            if (store_packed_qkv)
+            {
+                DYNAMIC_ROTARY_SCALING_AND_FP8_OUTPUT_DISPATCH(false, false, true);
+            }
+            else
+            {
+                DYNAMIC_ROTARY_SCALING_AND_FP8_OUTPUT_DISPATCH(false, false, false);
+            }
         }
     }
 }
@@ -1066,48 +1116,50 @@ void kernelV1Dispatch(QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStrea
     }
 }
 
-#define APPLY_BIAS_ROPE_UPDATE_KV_CACHE_V2(ADD_BIAS, STORE_QKV, FP8_OUTPUT)                                            \
+#define APPLY_BIAS_ROPE_UPDATE_KV_CACHE_V2(ADD_BIAS, GEN_PHASE, STORE_QKV, FP8_OUTPUT)                                 \
     dim3 block(BLOCK_SIZE);                                                                                            \
-    dim3 grid(int(divUp(params.max_input_seq_len, tokens_per_cuda_block)), params.batch_size, params.head_num);        \
+    dim3 grid(1, params.head_num);                                                                                     \
+    int num_blocks_for_tokens = int(divUp(params.token_num, tokens_per_cuda_block));                                   \
+    calGridSizeWithBestEfficiency(block, grid, num_blocks_for_tokens, params.multi_processor_count, 1024);             \
     if (params.position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX                                        \
         || params.position_embedding_type == PositionEmbeddingType::kLONG_ROPE                                         \
         || params.position_embedding_type == PositionEmbeddingType::kROPE_M)                                           \
     {                                                                                                                  \
-        applyBiasRopeUpdateKVCacheV2<T, TCache, BLOCK_SIZE, Dh, ADD_BIAS, STORE_QKV, FP8_OUTPUT, KVCacheBuffer,        \
-            RotaryPositionEmbeddingType::GPT_NEOX><<<grid, block, 0, stream>>>(params);                                \
+        applyBiasRopeUpdateKVCacheV2<T, TCache, BLOCK_SIZE, Dh, ADD_BIAS, STORE_QKV, FP8_OUTPUT, GEN_PHASE,            \
+            KVCacheBuffer, RotaryPositionEmbeddingType::GPT_NEOX><<<grid, block, 0, stream>>>(params);                 \
     }                                                                                                                  \
     else if (params.position_embedding_type == PositionEmbeddingType::kROPE_GPTJ)                                      \
     {                                                                                                                  \
-        applyBiasRopeUpdateKVCacheV2<T, TCache, BLOCK_SIZE, Dh, ADD_BIAS, STORE_QKV, FP8_OUTPUT, KVCacheBuffer,        \
-            RotaryPositionEmbeddingType::GPTJ><<<grid, block, 0, stream>>>(params);                                    \
+        applyBiasRopeUpdateKVCacheV2<T, TCache, BLOCK_SIZE, Dh, ADD_BIAS, STORE_QKV, FP8_OUTPUT, GEN_PHASE,            \
+            KVCacheBuffer, RotaryPositionEmbeddingType::GPTJ><<<grid, block, 0, stream>>>(params);                     \
     }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
-        applyBiasRopeUpdateKVCacheV2<T, TCache, BLOCK_SIZE, Dh, ADD_BIAS, STORE_QKV, FP8_OUTPUT, KVCacheBuffer,        \
-            RotaryPositionEmbeddingType::NONE><<<grid, block, 0, stream>>>(params);                                    \
+        applyBiasRopeUpdateKVCacheV2<T, TCache, BLOCK_SIZE, Dh, ADD_BIAS, STORE_QKV, FP8_OUTPUT, GEN_PHASE,            \
+            KVCacheBuffer, RotaryPositionEmbeddingType::NONE><<<grid, block, 0, stream>>>(params);                     \
     }
 
-#define STORE_QKV_AND_FP8_OUTPUT_DISPATCH(ADD_BIAS)                                                                    \
+#define STORE_QKV_AND_FP8_OUTPUT_DISPATCH(ADD_BIAS, GEN_PHASE)                                                         \
     if (store_packed_qkv)                                                                                              \
     {                                                                                                                  \
         if (params.quantized_fp8_output)                                                                               \
         {                                                                                                              \
-            APPLY_BIAS_ROPE_UPDATE_KV_CACHE_V2(ADD_BIAS, true, true);                                                  \
+            APPLY_BIAS_ROPE_UPDATE_KV_CACHE_V2(ADD_BIAS, GEN_PHASE, true, true);                                       \
         }                                                                                                              \
         else                                                                                                           \
         {                                                                                                              \
-            APPLY_BIAS_ROPE_UPDATE_KV_CACHE_V2(ADD_BIAS, true, false);                                                 \
+            APPLY_BIAS_ROPE_UPDATE_KV_CACHE_V2(ADD_BIAS, GEN_PHASE, true, false);                                      \
         }                                                                                                              \
     }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
         if (params.quantized_fp8_output)                                                                               \
         {                                                                                                              \
-            APPLY_BIAS_ROPE_UPDATE_KV_CACHE_V2(ADD_BIAS, false, true);                                                 \
+            APPLY_BIAS_ROPE_UPDATE_KV_CACHE_V2(ADD_BIAS, GEN_PHASE, false, true);                                      \
         }                                                                                                              \
         else                                                                                                           \
         {                                                                                                              \
-            APPLY_BIAS_ROPE_UPDATE_KV_CACHE_V2(ADD_BIAS, false, false);                                                \
+            APPLY_BIAS_ROPE_UPDATE_KV_CACHE_V2(ADD_BIAS, GEN_PHASE, false, false);                                     \
         }                                                                                                              \
     }
 
@@ -1119,14 +1171,30 @@ void kernelV2DispatchHeadSize(QKVPreprocessingParams<T, KVCacheBuffer> params, c
     int const vecs_per_head = (params.size_per_head * sizeof(T) / 16);
     TLLM_CHECK_WITH_INFO(BLOCK_SIZE % vecs_per_head == 0, "Kernel block should be able to handle entire heads.");
     int const tokens_per_cuda_block = BLOCK_SIZE / vecs_per_head;
+    bool generation_phase
+        = (params.kv_cache_buffer.data != nullptr) && (params.max_input_seq_len == 1) && params.generation_phase;
 
     if (add_bias)
     {
-        STORE_QKV_AND_FP8_OUTPUT_DISPATCH(true);
+        if (generation_phase)
+        {
+            STORE_QKV_AND_FP8_OUTPUT_DISPATCH(true, true);
+        }
+        else
+        {
+            STORE_QKV_AND_FP8_OUTPUT_DISPATCH(true, false);
+        }
     }
     else
     {
-        STORE_QKV_AND_FP8_OUTPUT_DISPATCH(false);
+        if (generation_phase)
+        {
+            STORE_QKV_AND_FP8_OUTPUT_DISPATCH(false, true);
+        }
+        else
+        {
+            STORE_QKV_AND_FP8_OUTPUT_DISPATCH(false, false);
+        }
     }
 }
 
@@ -1346,15 +1414,17 @@ void invokeApplyBiasRopeUpdateKVCacheDispatch(QKVPreprocessingParams<T, KVCacheB
         || params.max_kv_seq_len > params.rotary_embedding_max_positions;
     bool const has_rotary_cos_sin_cache = params.rotary_coef_cache_buffer != nullptr;
     bool const has_sink_tokens = params.sink_token_len > 0;
+    bool const use_v1_for_mrope
+        = params.position_embedding_type == PositionEmbeddingType::kROPE_M && params.mrope_rotary_cos_sin == nullptr;
     // V2 implementation requires multiple of paired 16 bytes for gpt-neox rotation.
     bool const support_rotary_for_v2 = (params.position_embedding_type != PositionEmbeddingType::kROPE_GPT_NEOX
-                                           && params.position_embedding_type != PositionEmbeddingType::kLONG_ROPE
-                                           && params.position_embedding_type == PositionEmbeddingType::kROPE_M)
+                                           && params.position_embedding_type != PositionEmbeddingType::kLONG_ROPE)
         || params.rotary_embedding_dim % 16 == 0;
 
     // Use v2 kernel for absolute_position_embedding.
     if (!absolute_position_embedding
-        && (long_seq_rotary_support || !has_rotary_cos_sin_cache || has_sink_tokens || !support_rotary_for_v2))
+        && (long_seq_rotary_support || !has_rotary_cos_sin_cache || has_sink_tokens || !support_rotary_for_v2
+            || use_v1_for_mrope))
     {
         kernelV1Dispatch<T, TCache, KVCacheBuffer>(params, stream);
         return;

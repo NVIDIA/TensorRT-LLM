@@ -48,6 +48,15 @@ _bindings_dtype_to_torch_dtype_dict = {
 SamplingConfigType = Union[SamplingConfig, trtllm.SamplingConfig]
 
 
+def _world_config_to_mapping(world_config: WorldConfig):
+    return Mapping(world_size=world_config.size,
+                   rank=world_config.rank,
+                   gpus_per_node=world_config.gpus_per_node,
+                   tp_size=world_config.tensor_parallelism,
+                   pp_size=world_config.pipeline_parallelism,
+                   cp_size=world_config.context_parallelism)
+
+
 class ModelRunnerCpp(ModelRunnerMixin):
     """
     An interface class that wraps Executor and provides generation methods.
@@ -69,50 +78,46 @@ class ModelRunnerCpp(ModelRunnerMixin):
         self.max_seq_len = max_seq_len
         self.max_beam_width = max_beam_width
         self.model_config = model_config
-        self.mapping = Mapping(world_size=world_config.size,
-                               rank=world_config.rank,
-                               gpus_per_node=world_config.gpus_per_node,
-                               tp_size=world_config.tensor_parallelism,
-                               pp_size=world_config.pipeline_parallelism,
-                               cp_size=world_config.context_parallelism)
+        self.mapping = _world_config_to_mapping(world_config)
         self.world_config = world_config
         self.use_kv_cache = use_kv_cache
         self.lora_manager = lora_manager
 
     @classmethod
-    def from_dir(
-        cls,
-        engine_dir: str,
-        *,
-        lora_dir: Optional[str] = None,
-        rank: int = 0,
-        max_batch_size: Optional[int] = None,
-        max_input_len: Optional[int] = None,
-        max_output_len: Optional[int] = None,
-        max_beam_width: Optional[int] = None,
-        max_attention_window_size: Optional[list[int]] = None,
-        sink_token_length: Optional[int] = None,
-        kv_cache_free_gpu_memory_fraction: Optional[float] = None,
-        cross_kv_cache_fraction: Optional[float] = None,
-        medusa_choices: list[list[int]] | None = None,
-        eagle_choices: list[list[int]] | None = None,
-        eagle_posterior_threshold: float | None = None,
-        lookahead_config: list[int] | None = None,
-        debug_mode: bool = False,
-        lora_ckpt_source: str = "hf",
-        gpu_weights_percent: float = 1,
-        max_tokens_in_paged_kv_cache: int | None = None,
-        kv_cache_enable_block_reuse: bool = False,
-        enable_chunked_context: bool = False,
-        is_enc_dec: bool = False,
-        multi_block_mode: bool = True,
-        enable_context_fmha_fp32_acc: Optional[bool] = None,
-        cuda_graph_mode: Optional[bool] = None,
-        logits_processor_map: Optional[Dict[str, LogitsProcessor]] = None,
-        device_ids: List[int] | None = None,
-        is_orchestrator_mode: bool = False,
-        use_runtime_defaults: bool = True,
-    ) -> 'ModelRunnerCpp':
+    def from_dir(cls,
+                 engine_dir: str,
+                 *,
+                 lora_dir: Optional[str] = None,
+                 rank: int = 0,
+                 max_batch_size: Optional[int] = None,
+                 max_input_len: Optional[int] = None,
+                 max_output_len: Optional[int] = None,
+                 max_beam_width: Optional[int] = None,
+                 max_attention_window_size: Optional[list[int]] = None,
+                 sink_token_length: Optional[int] = None,
+                 kv_cache_free_gpu_memory_fraction: Optional[float] = None,
+                 cross_kv_cache_fraction: Optional[float] = None,
+                 medusa_choices: list[list[int]] | None = None,
+                 eagle_choices: list[list[int]] | None = None,
+                 eagle_posterior_threshold: float | None = None,
+                 lookahead_config: list[int] | None = None,
+                 debug_mode: bool = False,
+                 lora_ckpt_source: str = "hf",
+                 gpu_weights_percent: float = 1,
+                 max_tokens_in_paged_kv_cache: int | None = None,
+                 kv_cache_enable_block_reuse: bool = False,
+                 enable_chunked_context: bool = False,
+                 is_enc_dec: bool = False,
+                 multi_block_mode: bool = True,
+                 enable_context_fmha_fp32_acc: Optional[bool] = None,
+                 cuda_graph_mode: Optional[bool] = None,
+                 logits_processor_map: Optional[Dict[str,
+                                                     LogitsProcessor]] = None,
+                 device_ids: List[int] | None = None,
+                 is_orchestrator_mode: bool = False,
+                 use_runtime_defaults: bool = True,
+                 backend: Optional[str] = None,
+                 py_executor_config: dict = {}) -> 'ModelRunnerCpp':
         """
         Create a ModelRunnerCpp instance from an engine directory.
 
@@ -287,9 +292,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                                        gpus_per_node=gpus_per_node)
         assert rank == world_config.rank
 
+        engine_config = EngineConfig.from_json_file(f"{engine_dir}/config.json")
         if model_config.use_lora_plugin and rank == 0:
-            engine_config = EngineConfig.from_json_file(
-                f"{engine_dir}/config.json")
             lora_manager = LoraManager()
             if lora_dir is None:
                 config_lora_dir = engine_config.build_config.lora_config.lora_dir
@@ -428,10 +432,25 @@ class ModelRunnerCpp(ModelRunnerMixin):
             trtllm_config.logits_post_processor_config = logits_proc_config
 
         use_default_executor = True
+        use_default_executor = not hasattr(trtllm_config, "backend")
         if use_default_executor:
             executor = trtllm.Executor(Path(engine_dir),
                                        trtllm.ModelType.DECODER_ONLY,
                                        trtllm_config)
+        else:
+            from ..pyexecutor.backend_registries.backend_registry import \
+                unique_create_executor
+            from ..pyexecutor.config import update_executor_config
+            update_executor_config(
+                trtllm_config,
+                backend=backend,
+                mapping=_world_config_to_mapping(world_config),
+                build_config=engine_config.build_config,
+                trt_engine_dir=engine_dir,
+                **py_executor_config)
+            executor = unique_create_executor(Path(engine_dir),
+                                              trtllm.ModelType.DECODER_ONLY,
+                                              trtllm_config)
 
         profiler.stop('load tensorrt_llm engine')
 
@@ -818,11 +837,11 @@ class ModelRunnerCpp(ModelRunnerMixin):
     def _prepare_mrope_executor(self, batch_input_ids_list, mrope: MropeParams):
         mrope_configs = len(batch_input_ids_list) * [None]
         if mrope != None:
-            mrope_rotary_sin_cos = mrope.mrope_rotary_sin_cos
+            mrope_rotary_cos_sin = mrope.mrope_rotary_cos_sin
             assert isinstance(
-                mrope_rotary_sin_cos,
-                torch.Tensor), "mrope_rotary_sin_cos should be torch.Tensor"
-            mrope_rotary_sin_cos_data = mrope_rotary_sin_cos.to(
+                mrope_rotary_cos_sin,
+                torch.Tensor), "mrope_rotary_cos_sin should be torch.Tensor"
+            mrope_rotary_cos_sin_data = mrope_rotary_cos_sin.to(
                 dtype=torch.float32).to(torch.device('cpu'))
 
             mrope_position_deltas = mrope.mrope_position_deltas
@@ -834,7 +853,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
 
             mrope_configs = [
                 trtllm.MropeConfig(
-                    mrope_rotary_sin_cos=mrope_rotary_sin_cos_data[i],
+                    mrope_rotary_cos_sin=mrope_rotary_cos_sin_data[i],
                     mrope_position_deltas=mrope_position_deltas_data[i])
                 for i in range(len(batch_input_ids_list))
             ]

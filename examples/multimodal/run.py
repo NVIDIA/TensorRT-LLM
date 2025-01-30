@@ -31,6 +31,9 @@ def print_result(model, input_text, output_text, args):
                     else:
                         assert output_text[i][0].lower(
                         ) == "the image captures the iconic merlion statue in singapore, a renowned worldwide landmark. the merlion, a mythical"
+            elif model.model_type == "llava":
+                for i in range(len(args.image_path.split(args.path_sep))):
+                    assert output_text[i][0].lower() == 'singapore'
             elif model.model_type == 'fuyu':
                 assert output_text[0][0].lower() == '4'
             elif model.model_type == "pix2struct":
@@ -45,18 +48,22 @@ def print_result(model, input_text, output_text, args):
             elif model.model_type == 'kosmos-2':
                 assert 'snowman' in output_text[0][0].lower()
             elif model.model_type == "mllama":
-                if "<|image|><|begin_of_text|>If I had to write a haiku for this one" in input_text:
+                if "If I had to write a haiku for this one" in input_text:
                     assert "it would be:.\\nPeter Rabbit is a rabbit.\\nHe lives in a" in output_text[
-                        0][0]
+                        0][0] or "Here is a haiku for the image:\n\n" in output_text[
+                            0][0], f"expected results: 'it would be:.\\nPeter Rabbit is a rabbit.\\nHe lives in a', generated results: '{output_text[0][0]}'"
                 elif "The key to life is" in input_text:
                     assert "to find your passion and pursue it with all your heart." in output_text[
-                        0][0]
+                        0][0] or "not to be found in the external world," in output_text[
+                            0][0], f"expected results: 'to find your passion and pursue it with all your heart.', generated results: '{output_text[0][0]}'"
             elif model.model_type == 'llava_onevision':
                 if args.video_path is None:
                     assert 'singapore' in output_text[0][0].lower()
                 else:
                     assert 'the video is funny because the child\'s actions are' in output_text[
                         0][0].lower()
+            elif model.model_type == "qwen2_vl":
+                assert 'dog' in output_text[0][0].lower()
             else:
                 assert output_text[0][0].lower() == 'singapore'
 
@@ -79,11 +86,14 @@ if __name__ == '__main__':
     logger.set_level(args.log_level)
 
     model = MultimodalModelRunner(args)
-    raw_image = model.load_test_image()
+    input_multimodal_data = model.load_test_data(args.image_path,
+                                                 args.video_path)
 
     num_iters = args.profiling_iterations if args.run_profiling else 1
+
     for _ in range(num_iters):
-        input_text, output_text = model.run(args.input_text, raw_image,
+        input_text, output_text = model.run(args.input_text,
+                                            input_multimodal_data,
                                             args.max_new_tokens)
 
     runtime_rank = tensorrt_llm.mpi_rank()

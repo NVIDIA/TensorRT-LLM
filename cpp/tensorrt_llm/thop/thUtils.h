@@ -57,6 +57,10 @@
 namespace torch_ext
 {
 
+// TODO: switch to use torch native fp4 dtype when ready
+constexpr auto FLOAT4_E2M1X2 = torch::ScalarType::Byte; // uint8_t
+constexpr auto SF_DTYPE = torch::ScalarType::Byte;      // uint8_t
+
 template <typename T>
 inline T* get_ptr(torch::Tensor& t)
 {
@@ -76,5 +80,11 @@ template <typename T>
 tensorrt_llm::runtime::ITensor::UniquePtr convert_tensor(torch::Tensor tensor);
 
 size_t sizeBytes(torch::Tensor tensor);
+
+// from: cpp/tensorrt_llm/plugins/common/gemmPluginProfiler.h
+int nextPowerOfTwo(int v);
+
+// from: cpp/tensorrt_llm/plugins/lowLatencyGemmPlugin/lowLatencyGemmPlugin.cpp
+std::optional<float> getFloatEnv(char const* name);
 
 } // namespace torch_ext

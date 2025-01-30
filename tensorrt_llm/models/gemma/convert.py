@@ -828,9 +828,10 @@ class QuantizeModifiers:
 
     @classmethod
     def from_args(cls, args: Namespace) -> "QuantizeModifiers":
-        return cls(
-            **{k: v
-               for k, v in vars(args).items() if k in cls.__annotations__})
+        return cls(**{
+            k: v
+            for k, v in vars(args).items() if k in cls.__annotations__
+        })
 
 
 def non_modelopt_quantize_if_needed(

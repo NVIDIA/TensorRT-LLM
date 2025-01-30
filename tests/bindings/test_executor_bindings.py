@@ -848,12 +848,23 @@ def test_output_config():
     assert config.return_context_logits == False
     assert config.return_generation_logits == False
     assert config.exclude_input_from_output == False
+    assert config.return_encoder_output == False
+    assert config.return_perf_metrics == False
+    assert config.additional_model_outputs == None
 
-    config = trtllm.OutputConfig(True, False, True, False)
+    config = trtllm.OutputConfig(
+        True, False, True, False, True, False,
+        list([trtllm.AdditionalModelOutput("topKLogits", True)]))
     assert config.return_log_probs == True
     assert config.return_context_logits == False
     assert config.return_generation_logits == True
     assert config.exclude_input_from_output == False
+    assert config.return_encoder_output == True
+    assert config.return_perf_metrics == False
+    assert len(config.additional_model_outputs) == 1
+    additional_model_output = config.additional_model_outputs[0]
+    assert additional_model_output.name == "topKLogits"
+    assert additional_model_output.gather_context == True
 
 
 def test_external_draft_tokens_config():
@@ -882,10 +893,10 @@ def test_prompt_tuning_config():
 
 
 def test_mrope_config():
-    mrope_rotary_sin_cos = torch.ones(1, 4194304)
+    mrope_rotary_cos_sin = torch.ones(1, 4194304)
     mrope_position_deltas = torch.tensor([-50])
-    config = trtllm.MropeConfig(mrope_rotary_sin_cos, mrope_position_deltas)
-    assert (config.mrope_rotary_sin_cos == mrope_rotary_sin_cos).all()
+    config = trtllm.MropeConfig(mrope_rotary_cos_sin, mrope_position_deltas)
+    assert (config.mrope_rotary_cos_sin == mrope_rotary_cos_sin).all()
     assert (config.mrope_position_deltas == mrope_position_deltas).all()
 
 
@@ -952,7 +963,7 @@ def test_guided_decoding_params():
         trtllm.GuidedDecodingParams(
             trtllm.GuidedDecodingParams.GuideType.JSON_SCHEMA)
 
-    regex = "\d+"
+    regex = r"\d+"
     guided_decoding_params = trtllm.GuidedDecodingParams(
         trtllm.GuidedDecodingParams.GuideType.REGEX, guide=regex)
     assert guided_decoding_params.guide_type == trtllm.GuidedDecodingParams.GuideType.REGEX
@@ -1032,6 +1043,9 @@ def test_result():
     result.finish_reasons = [trtllm.FinishReason.LENGTH]
     result.sequence_index = 1
     result.is_sequence_final = True
+    result.additional_outputs = [
+        trtllm.AdditionalOutput("topKLogits", torch.ones(1, 4, 100))
+    ]
     assert result.is_final is True
     assert result.output_token_ids == [[1, 2, 3]]
     assert result.cum_log_probs == [1.0, 2.0, 3.0]
@@ -1042,6 +1056,10 @@ def test_result():
     assert result.finish_reasons == [trtllm.FinishReason.LENGTH]
     assert result.sequence_index == 1
     assert result.is_sequence_final is True
+    assert len(result.additional_outputs) == 1
+    additional_output = result.additional_outputs[0]
+    assert additional_output.name == "topKLogits"
+    assert (additional_output.output == torch.ones(1, 4, 100)).all()
 
 
 def test_response():
@@ -1103,7 +1121,7 @@ def test_scheduler_config():
 
 def test_kv_cache_config():
     config = trtllm.KvCacheConfig()
-    assert config.enable_block_reuse == False
+    assert config.enable_block_reuse == True
     assert config.max_tokens is None
     assert config.max_attention_window is None
     assert config.sink_token_length is None
@@ -1114,7 +1132,7 @@ def test_kv_cache_config():
     assert config.secondary_offload_min_priority == None
     assert config.event_buffer_max_size == 0
 
-    config.enable_block_reuse = True
+    config.enable_block_reuse = False
     config.max_tokens = 1
     config.max_attention_window = [2]
     config.sink_token_length = 3
@@ -1124,7 +1142,7 @@ def test_kv_cache_config():
     config.onboard_blocks = False
     config.secondary_offload_min_priority = 50
     config.event_buffer_max_size = 1024
-    assert config.enable_block_reuse == True
+    assert config.enable_block_reuse == False
     assert config.max_tokens == 1
     assert config.max_attention_window == [2]
     assert config.sink_token_length == 3
@@ -1438,6 +1456,7 @@ def test_executor_config():
         trtllm.GuidedDecodingConfig(
             trtllm.GuidedDecodingConfig.GuidedDecodingBackend.XGRAMMAR,
             encoded_vocab=["eos", "a", "b", "c", "d"]),
+        "additional_output_names": ["topKLogits"]
     }
     config = trtllm.ExecutorConfig(**kwargs)
     for k, v in kwargs.items():
@@ -1455,6 +1474,9 @@ def test_executor_config():
     assert isinstance(config.spec_dec_config, trtllm.SpeculativeDecodingConfig)
     assert isinstance(config.guided_decoding_config,
                       trtllm.GuidedDecodingConfig)
+    assert isinstance(config.additional_output_names, list)
+    assert len(config.additional_output_names) == 1
+    assert config.additional_output_names[0] == "topKLogits"
 
 
 def test_parallel_config():
@@ -1753,7 +1775,7 @@ def test_request_perf_metrics(streaming: bool, model_path):
         assert kv_cache_metrics.num_total_allocated_blocks == 1
         assert kv_cache_metrics.num_new_allocated_blocks == 1
         assert kv_cache_metrics.num_reused_blocks == 0
-        assert kv_cache_metrics.num_missed_blocks == 0
+        assert kv_cache_metrics.num_missed_blocks == 1
         assert kv_cache_metrics.kv_cache_hit_rate == 0
 
         assert perf_metrics.first_iter == 0
@@ -2033,6 +2055,7 @@ def test_executor_config_pickle():
         if "config" not in k:
             assert getattr(config, k) == v
 
+    config.backend = 'pytorch'
 
     pickle.dumps(config)
     config_copy = pickle.loads(pickle.dumps(config))
@@ -2052,6 +2075,7 @@ def test_executor_config_pickle():
     assert config.extended_runtime_perf_knob_config.multi_block_mode == config_copy.extended_runtime_perf_knob_config.multi_block_mode
     assert config.debug_config.debug_input_tensors == config_copy.debug_config.debug_input_tensors
     assert config.max_seq_idle_microseconds == config_copy.max_seq_idle_microseconds
+    assert config.backend == config_copy.backend
     assert config.spec_dec_config.fast_logits == config_copy.spec_dec_config.fast_logits
 
 
@@ -2123,3 +2147,11 @@ def test_runtime_defaults():
     default_runtime_defaults = trtllm.RuntimeDefaults()
     for key in all_field_names:
         assert getattr(default_runtime_defaults, key) == None
+
+
+def test_DynamicBatchConfig_pickle():
+    config = trtllm.DynamicBatchConfig(enable_batch_size_tuning=True,
+                                       enable_max_num_tokens_tuning=True,
+                                       dynamic_batch_moving_average_window=128)
+    config_copy = pickle.loads(pickle.dumps(config))
+    assert config.enable_batch_size_tuning == config_copy.enable_batch_size_tuning

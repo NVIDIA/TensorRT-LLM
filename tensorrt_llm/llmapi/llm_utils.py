@@ -49,8 +49,7 @@ from ..bindings.executor import (BatchingType, CapacitySchedulerPolicy,
                                  ExtendedRuntimePerfKnobConfig, KvCacheConfig,
                                  LookaheadDecodingConfig, PeftCacheConfig,
                                  SchedulerConfig)
-from ..builder import (BuildConfig, Engine, EngineConfig, _init_max_seq_len,
-                       build)
+from ..builder import BuildConfig, Engine, EngineConfig, build
 from ..logger import logger
 from ..mapping import Mapping
 from ..models.automodel import MODEL_MAP, AutoConfig, AutoModelForCausalLM
@@ -76,6 +75,7 @@ class _ParallelConfig:
     cp_size: int = 1
     moe_tp_size: int = 1
     moe_ep_size: int = 1
+    cp_config: dict = field(default_factory=dict)
     auto_parallel: bool = False
 
     _world_size: int = field(default=1, init=False)
@@ -97,6 +97,7 @@ class _ParallelConfig:
 
     @property
     def world_size(self) -> bool:
+
         if self.auto_parallel:
             if self.tp_size > 1 or self.pp_size > 1 or self.cp_size > 1:
                 raise RuntimeError(
@@ -116,14 +117,23 @@ class _ParallelConfig:
         elif (not self.auto_parallel
               ) and world_size != self.tp_size * self.pp_size * self.cp_size:
             raise ValueError(
-                f"world_size {world_size} should be equal to tp_size * pp_size * cp_size {self.tp_size * self.pp_size * self.cp_size} "
-                "in non-auto_parallel mode.\n"
-                "For non-auto-parallel mode, the world_size is not needed to set"
+                f"world_size {world_size} should be equal to tp_size * pp_size {self.tp_size * self.pp_size * self.cp_size} "
             )
 
     @property
     def is_multi_gpu(self) -> bool:
         return self.world_size > 1
+
+    def to_mapping(self) -> Mapping:
+        return Mapping(world_size=self.world_size,
+                       rank=mpi_rank(),
+                       tp_size=self.tp_size,
+                       pp_size=self.pp_size,
+                       cp_size=self.cp_size,
+                       cp_config=self.cp_config,
+                       moe_tp_size=self.moe_tp_size,
+                       moe_ep_size=self.moe_ep_size,
+                       auto_parallel=self.auto_parallel)
 
 
 @dataclass(slots=True)
@@ -391,6 +401,8 @@ class LlmArgs:
 
     moe_expert_parallel_size: Optional[int] = None
 
+    cp_config: Optional[dict] = field(default_factory=dict)
+
     auto_parallel: bool = False
 
     auto_parallel_world_size: int = 1
@@ -467,6 +479,8 @@ class LlmArgs:
     max_batch_size: Optional[int] = None
     max_num_tokens: Optional[int] = None
 
+    # backend to use
+    backend: Optional[str] = None
 
     def __post_init__(self):
         # TODO[chunweiy]: Enable this option in the future
@@ -479,7 +493,7 @@ class LlmArgs:
         else:
             self.tokenizer = tokenizer_factory(
                 self.tokenizer,
-                rust_remote_code=self.trust_remote_code,
+                trust_remote_code=self.trust_remote_code,
                 use_fast=self.tokenizer_mode != 'slow')
 
         if torch.cuda.get_device_properties(0).major < 8:
@@ -500,6 +514,7 @@ class LlmArgs:
             cp_size=self.context_parallel_size,
             moe_tp_size=self.moe_tensor_parallel_size,
             moe_ep_size=self.moe_expert_parallel_size,
+            cp_config=self.cp_config,
             auto_parallel=self.auto_parallel)
         if self.parallel_config.auto_parallel:
             self.parallel_config.world_size = self.auto_parallel_world_size
@@ -569,7 +584,8 @@ class LlmArgs:
         speculative_model_obj = _ModelWrapper(
             self.speculative_model
         ) if self.speculative_model is not None else None
-        if model_obj.is_local_model:
+        if model_obj.is_local_model and getattr(self, 'backend',
+                                                None) != 'pytorch':
             # Load parallel_config from the engine.
             self.model_format = ModelLoader.get_model_format(self.model)
 
@@ -1003,19 +1019,8 @@ class ModelLoader:
             self.llm_args.speculative_model
         ) if self.llm_args.speculative_model is not None else None
         self.convert_checkpoint_options = self.llm_args._convert_checkpoint_options
-        self.rank = mpi_rank() if llm_args.parallel_config.is_multi_gpu else 0
-        if llm_args.parallel_config.is_multi_gpu and not llm_args.parallel_config.auto_parallel:
-            self.mapping = Mapping(
-                tp_size=llm_args.parallel_config.tp_size,
-                pp_size=llm_args.parallel_config.pp_size,
-                cp_size=llm_args.parallel_config.cp_size,
-                moe_tp_size=llm_args.parallel_config.moe_tp_size,
-                moe_ep_size=llm_args.parallel_config.moe_ep_size,
-                rank=self.rank,
-                world_size=llm_args.parallel_config.world_size,
-            )
-        else:
-            self.mapping = Mapping()
+        self.rank = mpi_rank()
+        self.mapping = llm_args.parallel_config.to_mapping()
 
         self._build_pipeline = []
 
@@ -1024,7 +1029,7 @@ class ModelLoader:
             Path] = self.model_obj.model_dir if self.model_obj.is_local_model else None
 
         self._speculative_model_dir: Optional[
-            PATH] = self.speculative_model_obj.model_dir if self.speculative_model_obj is not None and self.model_obj.is_local_model else None
+            Path] = self.speculative_model_obj.model_dir if self.speculative_model_obj is not None and self.model_obj.is_local_model else None
         self._model_info: Optional[_ModelInfo] = None
         self._model_format = self.llm_args.model_format
 
@@ -1274,7 +1279,8 @@ class ModelLoader:
         if self.speculative_model_obj:
             self._speculative_model_dir = mpi_broadcast(speculative_model_dir,
                                                         root=0)
-            self.speculative_model_dir = self._speculative_model_dir
+            self.speculative_model_obj.model_dir = self._speculative_model_dir
+
             assert self.speculative_model_obj.is_local_model
 
     def _load_model_from_hf(self):
@@ -1284,6 +1290,52 @@ class ModelLoader:
             self._model_dir, self.llm_args.trust_remote_code,
             hasattr(self.llm_args, "speculative_model")
             and self.llm_args.speculative_model)
+
+        # Update quant_config if it's ModelOpt quantized ckpt
+        user_quant_config = self.llm_args.quant_config
+        hf_quant_config_path = Path(self._model_dir) / "hf_quant_config.json"
+        if hf_quant_config_path.exists():
+            logger.info(
+                f"Found {hf_quant_config_path}, pre-quantized checkpoints are used."
+            )
+            already_quantized = True
+            with open(hf_quant_config_path, "r") as f:
+                hf_quant_config = json.load(f)
+                hf_quant_algo = hf_quant_config["quantization"].get(
+                    "quant_algo")
+                if hf_quant_algo == "FP8" and user_quant_config.quant_algo \
+                        and user_quant_config.quant_algo != QuantAlgo.FP8:
+                    raise ValueError(
+                        f"Expecting quant_algo to be FP8, got {user_quant_config.quant_algo}."
+                    )
+                user_quant_config.quant_algo = hf_quant_algo
+                logger.info(f"quant_algo is set to {hf_quant_algo}")
+
+                hf_kv_cache_quant_algo = hf_quant_config["quantization"].get(
+                    "kv_cache_quant_algo")
+                if hf_kv_cache_quant_algo != user_quant_config.kv_cache_quant_algo:
+                    if user_quant_config.kv_cache_quant_algo is None:
+                        user_quant_config.kv_cache_quant_algo = hf_kv_cache_quant_algo
+                        logger.info(
+                            f"kv_cache_quant_algo is set to {hf_kv_cache_quant_algo}"
+                        )
+                    elif user_quant_config.kv_cache_quant_algo == QuantAlgo.FP8 and hf_kv_cache_quant_algo is None:
+                        logger.warning(
+                            f"User specified kv_cache_quant_algo {user_quant_config.kv_cache_quant_algo} "
+                            f"will overwrite {hf_kv_cache_quant_algo} from {hf_quant_config_path}."
+                        )
+                    else:
+                        raise ValueError(
+                            f"User specified kv_cache_quant_algo {user_quant_config.kv_cache_quant_algo}, "
+                            f"while it's {hf_kv_cache_quant_algo} in {hf_quant_config_path}."
+                        )
+        else:
+            already_quantized = False
+
+        # FP4 Gemm force to use plugin.
+        if self.llm_args.quant_config.quant_mode.has_nvfp4():
+            self.llm_args.build_config.plugin_config.gemm_plugin = "nvfp4"
+
         if self.llm_args.load_format == 'dummy':
             config = model_cls.config_class.from_hugging_face(
                 str(self._model_dir),
@@ -1293,7 +1345,7 @@ class ModelLoader:
                 **self.convert_checkpoint_options,
             )
             self.model = model_cls(config)
-        elif self.llm_args.quant_config.requires_calibration:
+        elif self.llm_args.quant_config.requires_calibration and not already_quantized:
             assert self.workspace is not None
             checkpoint_dir = f"{self.workspace}/quantized-checkpoint"
             if self.rank == 0:
@@ -1489,7 +1541,23 @@ class CachedModelLoader:
                 )
                 self.llm_build_stats.engine_dir = self.model_loader.model_obj.model_dir
                 return self.llm_build_stats.engine_dir, self._hf_model_dir
+        from tensorrt_llm._torch.pyexecutor.backend_registries.backend_registry import \
+            get_backend_info
+        if (self.llm_args.backend is not None) and get_backend_info(
+                self.llm_args.backend, 'need_hf_model'):
+            if self.model_loader.model_obj.is_hub_model:
+                hf_folder = download_hf_model(
+                    self.model_loader.model_obj.model_name,
+                    self.llm_args.revision)
+                self._hf_model_dir = hf_folder
+            else:
+                self._hf_model_dir = self.model_loader.model_obj.model_dir
 
+            if self.llm_args.quant_config.quant_algo is not None:
+                logger.warning(
+                    "QuantConfig for pytorch backend is ignored. You can load"
+                    "quantized model with hf_quant_config.json directly.")
+            return None, self._hf_model_dir
 
         return self._build_model(), self._hf_model_dir
 
@@ -1548,10 +1616,7 @@ class CachedModelLoader:
         assert self._hf_model_dir is not None
         return AutoConfig.from_hugging_face(
             self._hf_model_dir,
-            mapping=Mapping(world_size=self.llm_args.parallel_config.world_size,
-                            tp_size=self.llm_args.parallel_config.tp_size,
-                            pp_size=self.llm_args.parallel_config.pp_size,
-                            cp_size=self.llm_args.parallel_config.cp_size),
+            mapping=self.llm_args.parallel_config.to_mapping(),
             quant_config=self.llm_args.quant_config,
             dtype=self.llm_args.dtype)
 

@@ -24,7 +24,7 @@
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_preprocessors.h"
-#include "tensorrt_llm/kernels/mixtureOfExperts/moe_kernels.h"
+#include "tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_kernels.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 
@@ -270,6 +270,12 @@ using SafeFP8 = __nv_fp8_e4m3;
 using SafeFP8 = void;
 #endif
 
+#ifdef ENABLE_FP4
+using SafeFP4 = __nv_fp4_e2m1;
+#else
+using SafeFP4 = void;
+#endif
+
 template <class TypeTuple_>
 class MixtureOfExpertsBenchmark : public ::benchmark::Fixture
 {
@@ -278,10 +284,11 @@ public:
     using WeightType = typename TypeTuple_::WeightType;
     using OutputType = typename TypeTuple_::OutputType;
     constexpr static bool INT4 = std::is_same_v<WeightType, cutlass::uint4b_t>;
+    constexpr static bool FP4 = std::is_same_v<DataType, SafeFP4>;
     constexpr static bool FP8 = std::is_same_v<DataType, SafeFP8>;
     constexpr static bool INT_QUANT = !std::is_same_v<DataType, WeightType>;
-    using WeightStorage = std::conditional_t<INT_QUANT, uint8_t, WeightType>;
-    constexpr static int WEIGHT_ELEM_PER_BYTE = INT4 ? 2 : 1;
+    using WeightStorage = std::conditional_t<INT_QUANT || FP4, uint8_t, WeightType>;
+    constexpr static int WEIGHT_ELEM_PER_BYTE = (INT4 || FP4) ? 2 : 1;
     int const BASE_HIDDEN_SIZE = 64 / sizeof(WeightType) * WEIGHT_ELEM_PER_BYTE;
 
     std::vector<BufferManager::IBufferPtr> managed_buffers;
@@ -296,6 +303,8 @@ public:
     {
         if (FP8)
             return nvinfer1::DataType::kFP8;
+        if (FP4)
+            return nvinfer1::DataType::kFP4;
         if (INT_QUANT && INT4)
             return nvinfer1::DataType::kINT4; // Hack to distinguish int4, use unsigned
         if (INT_QUANT)
@@ -315,9 +324,13 @@ public:
     template <class T>
     constexpr static auto typeToDtypeID()
     {
-        if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
+        if constexpr (std::is_same_v<T, SafeFP8>)
         {
             return nvinfer1::DataType::kFP8;
+        }
+        else if constexpr (std::is_same_v<T, SafeFP4>)
+        {
+            return nvinfer1::DataType::kINT64;
         }
         else if constexpr (std::is_same_v<T, uint8_t>)
         {
@@ -351,8 +364,12 @@ public:
 #ifndef ENABLE_FP8
         static_assert(!FP8, "FP8 Tests enabled on unsupported CUDA version");
 #endif
+#ifndef ENABLE_FP4
+        static_assert(!FP4, "FP4 Tests enabled on unsupported CUDA version");
+#endif
         bool should_skip_unsupported_fp8 = getSMVersion() < 89 && FP8;
-        return should_skip_unsupported_fp8;
+        bool should_skip_unsupported_fp4 = getSMVersion() < 100 && FP4;
+        return should_skip_unsupported_fp8 || should_skip_unsupported_fp4;
     }
 
     // Deprecated, just here to suppress warnings
@@ -402,6 +419,14 @@ public:
     float* mExpertFP8Scale1{};
     float* mExpertFP8Scale2{};
     float* mExpertFP8Scale3{};
+
+    float* mExpertFP4ActScale1{};
+    using ElementSF = tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::ElementSF;
+    ElementSF* mExpertFP4WeightSf1{};
+    float* mExpertFP4GlobalScale1{};
+    float* mExpertFP4ActScale2{};
+    ElementSF* mExpertFP4WeightSf2{};
+    float* mExpertFP4GlobalScale2{};
 
     DataType* mExpertBias1{};
     DataType* mExpertBias2{};
@@ -461,9 +486,8 @@ public:
         mWorkspace = allocBuffer<char>(workspace_size);
         size_t const expert_matrix_size = mNumExperts * mHiddenSize * mInterSize;
 
-        mExpertWeight1
-            = allocBuffer<WeightStorage>(expert_matrix_size * mGatedMultiplier / WEIGHT_ELEM_PER_BYTE - 8192);
-        mExpertWeight2 = allocBuffer<WeightStorage>(expert_matrix_size / WEIGHT_ELEM_PER_BYTE - 8192);
+        mExpertWeight1 = allocBuffer<WeightStorage>(expert_matrix_size * mGatedMultiplier / WEIGHT_ELEM_PER_BYTE);
+        mExpertWeight2 = allocBuffer<WeightStorage>(expert_matrix_size / WEIGHT_ELEM_PER_BYTE);
 
         mExpertBias1 = nullptr;
         mExpertBias2 = nullptr;
@@ -487,6 +511,21 @@ public:
             mExpertFP8Scale3 = allocBuffer<float>(mNumExperts);
 
             mQuantParams = QuantParams::FP8(mExpertFP8Scale1, mExpertFP8Scale2, mExpertFP8Scale3);
+        }
+        else if constexpr (FP4)
+        {
+            mExpertFP4ActScale1 = allocBuffer<float>(1);
+            mExpertFP4WeightSf1 = allocBuffer<ElementSF>(num_experts * gated_inter * mHiddenSize
+                / tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::BlockScaleVectorSize);
+            mExpertFP4GlobalScale1 = allocBuffer<float>(num_experts);
+
+            mExpertFP4ActScale2 = allocBuffer<float>(1);
+            mExpertFP4WeightSf2 = allocBuffer<ElementSF>(num_experts * mInterSize * mHiddenSize
+                / tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::BlockScaleVectorSize);
+            mExpertFP4GlobalScale2 = allocBuffer<float>(num_experts);
+
+            mQuantParams = QuantParams::FP4(mExpertFP4ActScale1, mExpertFP4WeightSf1, mExpertFP4GlobalScale1,
+                mExpertFP4ActScale2, mExpertFP4WeightSf2, mExpertFP4GlobalScale2);
         }
 
         mInputProbabilities = allocBuffer<float>(mTotalTokens * mNumExperts);

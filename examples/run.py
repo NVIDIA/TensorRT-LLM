@@ -639,8 +639,8 @@ def main(args):
                     frequency_penalty=args.frequency_penalty,
                     stop_words_list=stop_words_list,
                     bad_words_list=bad_words_list,
-                    output_cum_log_probs=(args.output_cum_log_probs_npy !=
-                                          None),
+                    output_cum_log_probs=(args.output_cum_log_probs_npy
+                                          != None),
                     output_log_probs=(args.output_log_probs_npy != None),
                     random_seed=args.random_seed,
                     lora_uids=args.lora_task_uids,

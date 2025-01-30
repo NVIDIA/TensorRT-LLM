@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantTypeUtils.cuh"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
+#include "tensorrt_llm/kernels/quantization.cuh"
 #include "tensorrt_llm/kernels/quantization.h"
 #include <float.h>
 
@@ -28,66 +29,6 @@ namespace tensorrt_llm
 {
 namespace kernels
 {
-
-__global__ void quantizedKernel(char4* dst, float4 const* src, int64_t const sizeDiv4, float const* scalePtr)
-{
-    for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < sizeDiv4; idx += blockDim.x * gridDim.x)
-    {
-        float const scale = __ldg(scalePtr);
-        char4 tmp;
-        float4 const floatTmp = __ldg(src + idx);
-        tmp.x = cuda_cast<int8_t>(floatTmp.x * scale);
-        tmp.y = cuda_cast<int8_t>(floatTmp.y * scale);
-        tmp.z = cuda_cast<int8_t>(floatTmp.z * scale);
-        tmp.w = cuda_cast<int8_t>(floatTmp.w * scale);
-        dst[idx] = tmp;
-    }
-}
-
-__global__ void quantizedKernel(char4* dst, half2 const* src, int64_t const sizeDiv4, float const* scalePtr)
-{
-    for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < sizeDiv4; idx += blockDim.x * gridDim.x)
-    {
-        float const scale = __ldg(scalePtr);
-        char4 tmp;
-        int srcId = idx << 1;
-
-        uint2 const h2 = __ldg(reinterpret_cast<uint2 const*>(src + srcId));
-
-        half2 const half2Tmp = reinterpret_cast<half2 const&>(h2.x);
-        half2 const half2Tmp2 = reinterpret_cast<half2 const&>(h2.y);
-
-        tmp.x = cuda_cast<int8_t>(cuda_cast<float>(half2Tmp.x) * scale);
-        tmp.y = cuda_cast<int8_t>(cuda_cast<float>(half2Tmp.y) * scale);
-        tmp.z = cuda_cast<int8_t>(cuda_cast<float>(half2Tmp2.x) * scale);
-        tmp.w = cuda_cast<int8_t>(cuda_cast<float>(half2Tmp2.y) * scale);
-        dst[idx] = tmp;
-    }
-}
-
-#ifdef ENABLE_BF16
-__global__ void quantizedKernel(char4* dst, __nv_bfloat162 const* src, int64_t const sizeDiv4, float const* scalePtr)
-{
-    for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < sizeDiv4; idx += blockDim.x * gridDim.x)
-    {
-        float const scale = __ldg(scalePtr);
-        char4 tmp;
-        int srcId = idx << 1;
-
-        uint2 const h2 = __ldg(reinterpret_cast<uint2 const*>(src + srcId));
-
-        __nv_bfloat162 const bfloat162Tmp = reinterpret_cast<__nv_bfloat162 const&>(h2.x);
-        __nv_bfloat162 const bfloat162Tmp2 = reinterpret_cast<__nv_bfloat162 const&>(h2.y);
-
-        tmp.x = cuda_cast<int8_t>(cuda_cast<float>(bfloat162Tmp.x) * scale);
-        tmp.y = cuda_cast<int8_t>(cuda_cast<float>(bfloat162Tmp.y) * scale);
-        tmp.z = cuda_cast<int8_t>(cuda_cast<float>(bfloat162Tmp2.x) * scale);
-        tmp.w = cuda_cast<int8_t>(cuda_cast<float>(bfloat162Tmp2.y) * scale);
-
-        dst[idx] = tmp;
-    }
-}
-#endif
 
 template <typename T>
 void invokeQuantization(
@@ -127,185 +68,6 @@ template void invokeQuantization<__nv_bfloat16>(int8_t* dst, __nv_bfloat16 const
 #endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <typename T, int NUM_ELTS>
-struct DstVec
-{
-    static_assert("not implemented.");
-};
-
-template <>
-struct DstVec<float2, 2>
-{
-    using Type = uint32_t;
-};
-
-template <>
-struct DstVec<half2, 4>
-{
-    using Type = uint2;
-};
-
-#ifdef ENABLE_BF16
-
-template <>
-struct DstVec<__nv_bfloat162, 4>
-{
-    using Type = uint2;
-};
-
-#endif // ENABLE_BF16
-
-template <typename T>
-struct DstVec<T, 4>
-{
-    static_assert(sizeof(T) == 4, "not implemented.");
-    using Type = uint32_t;
-};
-
-template <typename T>
-struct DstVec<T, 8>
-{
-    static_assert(sizeof(T) == 2, "not implemented.");
-    using Type = uint2;
-};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-// Helper function of getting the absMax of all elements in the vector after clamping.
-// Pack two elements in order to use possible hmax2 instructions.
-template <typename T>
-inline __device__ void clampAndAbsMax(T& localMax, uint4& vec, T const clampMin, T const clampMax)
-{
-    static constexpr int NUM_ELTS = sizeof(uint4) / sizeof(T);
-
-#pragma unroll
-    for (int i = 0; i < NUM_ELTS; ++i)
-    {
-        T& val = reinterpret_cast<T*>(&vec)[i];
-        val = cuda_clamp(val, clampMin, clampMax);
-        localMax = cuda_max(localMax, cuda_abs(val));
-    }
-}
-
-// Helper function of quantizing the vector and storing it to global memory.
-// Pack two elements in order to use fast convert instructions.
-template <typename T, typename QuantT, bool USE_SMEM>
-inline __device__ void quantizeAndStore(
-    QuantT* dstPtr, uint4 vec, T const clampMin, T const clampMax, float const scaleOrigQuant)
-{
-    static constexpr int NUM_ELTS = sizeof(uint4) / sizeof(T);
-
-    using DstVecType = typename DstVec<T, NUM_ELTS>::Type;
-    DstVecType dstVec;
-#pragma unroll
-    for (int i = 0; i < NUM_ELTS; ++i)
-    {
-        T val = reinterpret_cast<T*>(&vec)[i];
-        // Values loaded from smem has already been clamped.
-        if constexpr (!USE_SMEM)
-        {
-            val = cuda_clamp(val, clampMin, clampMax);
-        }
-        float2 val2 = cuda_cast<float2>(val);
-        val2.x *= scaleOrigQuant;
-        val2.y *= scaleOrigQuant;
-        QuantT quantVal = cuda_cast<QuantT>(val2);
-        reinterpret_cast<QuantT*>(&dstVec)[i] = quantVal;
-    }
-    // Store to destination buffer.
-    *reinterpret_cast<DstVecType*>(dstPtr) = dstVec;
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <typename T, typename QuantT, bool USE_SMEM>
-__global__ void perTokenQuantization(QuantT* dst, T const* src, int64_t const numRows, int64_t const numCols,
-    float const* clampPtr, float* scalePtr, float* sumPtr, bool hasFp8MinScaling)
-{
-    // Smem buffer.
-    extern __shared__ uint4 smemBuffer[];
-
-    // The clamping minimum / maximum values.
-    T const clampMin = cuda_cast<T>(clampPtr ? clampPtr[0] : -FLT_MAX);
-    T const clampMax = cuda_cast<T>(clampPtr ? clampPtr[1] : FLT_MAX);
-
-    // Pack two elements in order to use higher through instructions.
-    using T2 = typename packed_as<T, 2>::type;
-    using QuantT2 = typename packed_as<QuantT, 2>::type;
-    T2 const clampMin2 = cuda_cast<T2, T>(clampMin);
-    T2 const clampMax2 = cuda_cast<T2, T>(clampMax);
-
-    // The quantized data type's maximum value (upper-bound).
-    static constexpr float MAX_QUANT_VAL = QuantTypeStaticVals<QuantT>::MAX_VAL;
-    // The minimum scaling factor (lower-bound).
-    static constexpr float MIN_SCALING_FACTOR = QuantTypeStaticVals<QuantT>::MIN_SCALING_FACTOR;
-    static constexpr float MIN_SCALING_FACTOR_RCP = QuantTypeStaticVals<QuantT>::MIN_SCALING_FACTOR_RCP;
-
-    // The number of elements in the packed uint4 vec.
-    static constexpr int NUM_ELTS_PER_VEC = sizeof(uint4) / sizeof(T);
-    static constexpr int NUM_ELTS2_PER_VEC = sizeof(uint4) / sizeof(T2);
-
-    // The number of vectors in the column.
-    int const numColVecs = numCols / NUM_ELTS_PER_VEC;
-    // The vector pointers for src.
-    uint4 const* srcVec = reinterpret_cast<uint4 const*>(src) + blockIdx.x * numColVecs;
-    // The pointer for dst.
-    QuantT* dstRow = dst + blockIdx.x * numCols;
-    // T const* srcRow = src + blockIdx.x * numCols;
-
-    T2 localMax2 = cuda_cast<T2, T>(T(1e-6f));
-    float2 localSum2 = {0.f, 0.f};
-
-    for (int i = threadIdx.x; i < numColVecs; i += blockDim.x)
-    {
-        uint4 vec = srcVec[i];
-
-#pragma unroll
-        for (int j = 0; j < NUM_ELTS2_PER_VEC; ++j)
-        {
-            T2& val2 = reinterpret_cast<T2*>(&vec)[j];
-            val2 = cuda_clamp(val2, clampMin2, clampMax2);
-            localMax2 = cuda_max(localMax2, cuda_abs(val2));
-            // TODO: template the version that requires sum to avoid dynamic branching.
-            if (sumPtr != nullptr)
-            {
-                localSum2.x += cuda_cast<float>(val2.x);
-                localSum2.y += cuda_cast<float>(val2.y);
-            }
-        }
-        // Avoid reloading from global memory.
-        if constexpr (USE_SMEM)
-        {
-            smemBuffer[i] = vec;
-        }
-    }
-    float const rowMax = blockAllReduceMax(cuda_cast<float>(cuda_max<T, T2>(localMax2)));
-    if (threadIdx.x == 0)
-    {
-        scalePtr[blockIdx.x]
-            = hasFp8MinScaling ? cuda_max(rowMax / MAX_QUANT_VAL, MIN_SCALING_FACTOR) : (rowMax / MAX_QUANT_VAL);
-    }
-
-    if (sumPtr != nullptr)
-    {
-        float rowSum[1] = {cuda_sum<float>(localSum2)};
-        blockReduceSumV2<float, 1>(rowSum);
-        if (threadIdx.x == 0)
-        {
-            sumPtr[blockIdx.x] = rowSum[0];
-        }
-    }
-
-    float const scaleOrigQuant
-        = hasFp8MinScaling ? fminf(MAX_QUANT_VAL / rowMax, MIN_SCALING_FACTOR_RCP) : MAX_QUANT_VAL / rowMax;
-    for (int i = threadIdx.x; i < numColVecs; i += blockDim.x)
-    {
-        uint4 vec = USE_SMEM ? smemBuffer[i] : srcVec[i];
-        QuantT2* dstPtr = reinterpret_cast<QuantT2*>(dstRow + i * NUM_ELTS_PER_VEC);
-        quantizeAndStore<T2, QuantT2, USE_SMEM>(dstPtr, vec, clampMin2, clampMax2, scaleOrigQuant);
-    }
-}
 
 // Do per-token (row) quantization from fp16/bf16/fp32 to int8/fp8_e4m3.
 template <typename T, typename QuantT>
@@ -365,5 +127,65 @@ INSTANTIATE_INVOKE_PER_TOKEN_QUANTIZATION(__nv_bfloat16, __nv_fp8_e4m3);
 #endif
 #endif
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// FP4 Quantization
+
+template <typename T>
+void invokeFP4Quantization(int m, int n, T const* input, float const* SFScale, int64_t* output, int32_t* SFOuput,
+    bool useUE8M0, int multiProcessorCount, cudaStream_t stream)
+{
+    // Grid, Block size.
+    // Each thread converts 8 values.
+    dim3 block(std::min(int(n / CVT_FP4_ELTS_PER_THREAD), 512));
+    // Get number of blocks per SM (assume we can fully utilize the SM).
+    int const numBlocksPerSM = 2048 / block.x;
+    dim3 grid(std::min(int(m), multiProcessorCount * numBlocksPerSM));
+
+    // Launch the cvt kernel.
+    if (useUE8M0)
+    {
+        cvt_fp16_to_fp4<T, true><<<grid, block, 0, stream>>>(
+            m, n, input, SFScale, reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOuput));
+    }
+    else
+    {
+        cvt_fp16_to_fp4<T, false><<<grid, block, 0, stream>>>(
+            m, n, input, SFScale, reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOuput));
+    }
+}
+
+#ifdef ENABLE_FP8
+template <>
+void invokeFP4Quantization(int m, int n, __nv_fp8_e4m3 const* input, float const* SFScale, int64_t* output,
+    int32_t* SFOuput, bool useUE8M0, int multiProcessorCount, cudaStream_t stream)
+{
+    // Grid, Block size.
+    // Each thread converts 16 values.
+    dim3 block(std::min(int(n / CVT_FP8_TO_FP4_ELTS_PER_THREAD), 512));
+    // Get number of blocks per SM (assume we can fully utilize the SM).
+    int const numBlocksPerSM = 2048 / block.x;
+    dim3 grid(std::min(int(m), multiProcessorCount * numBlocksPerSM));
+
+    // Launch the cvt kernel.
+    if (useUE8M0)
+    {
+        cvt_fp8_to_fp4<true><<<grid, block, 0, stream>>>(
+            m, n, input, SFScale, reinterpret_cast<uint64_t*>(output), reinterpret_cast<uint32_t*>(SFOuput));
+    }
+    else
+    {
+        cvt_fp8_to_fp4<false><<<grid, block, 0, stream>>>(
+            m, n, input, SFScale, reinterpret_cast<uint64_t*>(output), reinterpret_cast<uint32_t*>(SFOuput));
+    }
+}
+#endif
+
+// Instantiate the function.
+template void invokeFP4Quantization(int m, int n, half const* input, float const* SFScale, int64_t* output,
+    int32_t* SFOuput, bool useUE8M0, int multiProcessorCount, cudaStream_t stream);
+#ifdef ENABLE_BF16
+template void invokeFP4Quantization(int m, int n, __nv_bfloat16 const* input, float const* SFScale, int64_t* output,
+    int32_t* SFOuput, bool useUE8M0, int multiProcessorCount, cudaStream_t stream);
+#endif
 } // namespace kernels
 } // namespace tensorrt_llm

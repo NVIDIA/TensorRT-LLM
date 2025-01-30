@@ -5,6 +5,7 @@ import weakref
 from enum import Enum
 from typing import Callable, List, Optional
 
+import tensorrt as trt
 import torch
 from safetensors import safe_open
 from tqdm import tqdm
@@ -61,6 +62,7 @@ class ModelWeightsLoader:
             "input_layernorm": "input_layernorm",
             "post_layernorm": "post_attention_layernorm",
             "kv_cache_scaling_factor": ["k_proj.k_scale", "v_proj.v_scale"],
+            "kv_cache_rcp_scaling_factor": ["k_proj.k_scale", "v_proj.v_scale"],
         }
         self.tllm_to_externel_key_dict.update(customized_key_dict)
 
@@ -356,7 +358,8 @@ class ModelWeightsLoader:
             if param.is_buffer:
                 continue
             w_shape = weights[tllm_key].shape
-            if w_shape != param.shape:
+            # WAR for 4bit datatype shape mismatch.
+            if w_shape != param.shape and param.dtype != trt.fp4:
                 logger.warning(
                     f'{tllm_key} has invalid shape {w_shape}. Expected {param.shape}.'
                 )

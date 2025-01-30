@@ -279,9 +279,10 @@ class Session(object):
         ]
         outputs_info = self.infer_shapes(inputs_info)
         outputs = {
-            t.name: torch.empty(tuple(t.shape),
-                                dtype=trt_dtype_to_torch(t.dtype),
-                                device='cuda')
+            t.name:
+            torch.empty(tuple(t.shape),
+                        dtype=trt_dtype_to_torch(t.dtype),
+                        device='cuda')
             for t in outputs_info
         }
         with _scoped_stream() as stream:

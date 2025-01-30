@@ -209,6 +209,10 @@ public:
 
     [[nodiscard]] nvinfer1::DataType getLogitDataType() const;
 
+    [[nodiscard]] nvinfer1::DataType getTensorDataType(std::string const& name) const;
+
+    [[nodiscard]] nvinfer1::Dims getTensorShape(std::string const& name) const;
+
     //! @brief This function performs the generation loop.
     //! @details Given input tensors to read from, output tensors to populate, that member function
     //!          can be produced or each sequence has reached completion (due to the production

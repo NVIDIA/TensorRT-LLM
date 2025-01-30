@@ -20,8 +20,8 @@
 #include "NvInferPlugin.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
+#include "tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_kernels.h"
 #include "tensorrt_llm/kernels/lora/lora.h"
-#include "tensorrt_llm/kernels/mixtureOfExperts/moe_kernels.h"
 #include "tensorrt_llm/plugins/common/gemmPluginProfiler.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include "tensorrt_llm/plugins/cudaStreamPlugin/cudaStreamPlugin.h"
@@ -223,8 +223,9 @@ private:
     WorkspaceInfo setupWorkspace(void* base_ptr, int64_t num_tokens, int num_reqs = 0) const;
 
     kernels::MOEParallelismConfig getParallelismConfig() const;
-    kernels::QuantParams getQuantParams(void const* scale_1, void const* scale_2, void const* scale_3 = nullptr,
-        void const* scale_4 = nullptr, void const* scale_5 = nullptr) const;
+    kernels::QuantParams getQuantParams(nvinfer1::PluginTensorDesc const* inputDesc, void const* const* inputs,
+        int scale_1_idx = -1, int scale_2_idx = -1, int scale_3_idx = -1, int scale_4_idx = -1, int scale_5_idx = -1,
+        int scale_6_idx = -1) const;
 
     int getNumLoraRequests(nvinfer1::PluginTensorDesc const* input_tensor) const;
     kernels::LoraParams getLoraParams(
@@ -285,6 +286,11 @@ private:
         return hasExpertFp8QuantScales() && mOutputType == nvinfer1::DataType::kFP8;
     }
 
+    bool hasFP4QuantScales() const
+    {
+        return mQuantMode.hasNvfp4();
+    }
+
     bool useSideStream() const
     {
         return mSideStreamId > 0;
@@ -315,6 +321,9 @@ private:
         return getExpertBias2Index() + hasFinishedTensor();
     }
 
+    /*
+     * Weight-Only int quant scales
+     */
     IndexType getExpertIntQuantScale1Index() const
     {
         return getFinishedTensorIndex() + hasExpertIntQuantScales();
@@ -325,6 +334,9 @@ private:
         return getExpertIntQuantScale1Index() + hasExpertIntQuantScales();
     }
 
+    /*
+     * FP8 Quant Scales
+     */
     IndexType getExpertFP8Dequant1Index() const
     {
         return getExpertIntQuantScale2Index() + hasExpertFp8QuantScales();
@@ -350,9 +362,45 @@ private:
         return getExpertFP8QuantFinalIndex() + (hasExpertFp8QuantScales() && hasLora());
     }
 
+    /*
+     * FP4 Quant Scales
+     */
+    IndexType getFP4GlobalActSF1Index() const
+    {
+        return getInputFP8DequantIndex() + hasFP4QuantScales();
+    }
+
+    IndexType getFP4WeightSF1Index() const
+    {
+        return getFP4GlobalActSF1Index() + hasFP4QuantScales();
+    }
+
+    IndexType getFP4GlobalSF1Index() const
+    {
+        return getFP4WeightSF1Index() + hasFP4QuantScales();
+    }
+
+    IndexType getFP4GlobalActSF2Index() const
+    {
+        return getFP4GlobalSF1Index() + hasFP4QuantScales();
+    }
+
+    IndexType getFP4WeightSF2Index() const
+    {
+        return getFP4GlobalActSF2Index() + hasFP4QuantScales();
+    }
+
+    IndexType getFP4GlobalSF2Index() const
+    {
+        return getFP4WeightSF2Index() + hasFP4QuantScales();
+    }
+
+    /*
+     * LoRA params
+     */
     IndexType getLoraFC1WeightPtrsIndex() const
     {
-        return getInputFP8DequantIndex() + hasLora();
+        return getFP4GlobalSF2Index() + hasLora();
     }
 
     IndexType getLoraFC1RanksIndex() const
@@ -432,9 +480,9 @@ private:
     /**
      * Get quantization dimension scaling factor
      */
-    int getWeightPackedElements() const
+    std::pair<int, int> getWeightPackedElements() const
     {
-        return mQuantMode.hasInt4Weights() ? 2 : 1;
+        return {1, mQuantMode.hasInt4Weights() ? 2 : 1};
     }
 };
 

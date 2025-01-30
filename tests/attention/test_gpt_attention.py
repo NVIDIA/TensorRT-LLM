@@ -30,7 +30,8 @@ from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
 from transformers.models.gpt_bigcode.modeling_gpt_bigcode import \
     GPTBigCodeAttention
 from transformers.models.gptj.modeling_gptj import GPTJAttention
-from transformers.models.llama.modeling_llama import LlamaAttention
+from transformers.models.llama.modeling_llama import (LlamaAttention,
+                                                      LlamaRotaryEmbedding)
 
 import tensorrt_llm
 from tensorrt_llm import Tensor
@@ -46,8 +47,9 @@ from tensorrt_llm.runtime.memory_pools.pools_kv_cache_manager import \
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.util import (getSMVersion, skip_bf16_fp32_accum,
-                        skip_bf16_pre_ampere, skip_fp8_pre_ada,
-                        skip_fp32_accum_pre_ampere, unittest_name_func)
+                        skip_bf16_pre_ampere, skip_blackwell_for_fmha_tests,
+                        skip_fp8_pre_ada, skip_fp32_accum_pre_ampere,
+                        unittest_name_func)
 
 from tensorrt_llm.runtime.memory_pools.memory_pools_allocator import \
     MemoryPoolsAllocator
@@ -130,7 +132,7 @@ class TestFunctional(unittest.TestCase):
         # test cases for grouped-query attention
         test_cases += list(
             product(['llama_attention'], [ContextFMHAType.disabled],
-                    ['bfloat16', 'float16'], [None], [2], [4], [8], [32],
+                    ['bfloat16', 'float16'], [None], [2], [64], [8], [32],
                     [2, 4], [False], [1], [False], [False]))
         test_cases += list(
             product(['llama_attention'], [ContextFMHAType.enabled], ['float32'],
@@ -145,7 +147,7 @@ class TestFunctional(unittest.TestCase):
                 ['bfloat16', 'float32'],
                 [None],
                 [2],
-                [4],
+                [64],
                 [8],
                 [32],
                 [2, 4],
@@ -344,6 +346,20 @@ class TestFunctional(unittest.TestCase):
                     None,
                 ]))
 
+        # Trtllm-gen base tests.
+        test_cases += list(
+            product(['trtllm_gen'], [100], ['llama_attention'],
+                    [ContextFMHAType.enabled], ['float16', 'bfloat16'],
+                    ['fp8', None], [32], [198], [32], [32, 64, 128], [8],
+                    [True], [1], [False, True], [False]))
+
+        # Trtllm-gen multi-block mode.
+        test_cases += list(
+            product(['trtllm_gen'], [100], ['llama_attention'],
+                    [ContextFMHAType.enabled], ['float16', 'bfloat16'],
+                    ['fp8', None], [2], [1783], [32], [32, 64, 128], [8],
+                    [True], [1], [False, True], [False]))
+
         return test_cases
 
     @parameterized.expand(load_test_cases, name_func=unittest_name_func)
@@ -373,12 +389,18 @@ class TestFunctional(unittest.TestCase):
         os.environ['TRTLLM_FORCE_XQA'] = '1'
         use_int8_kv_cache = True if kv_cache_dtype == 'int8' else False
         use_fp8_kv_cache = True if kv_cache_dtype == 'fp8' else False
-        output_atol = 2e-2 if kv_cache_dtype == 'int8' else 2e-3
+        if use_int8_kv_cache:
+            output_atol = 2e-2
+        elif use_fp8_kv_cache:
+            output_atol = 8e-3
+        else:
+            output_atol = 2e-3
         if kv_cache_dtype is None:
             kv_cache_dtype = dtype
+
         # skip tests based on the gpu_arch_lists
         if gpu_arch != 'all':
-            assert gpu_arch in [70, 80, 86, 89, 90]
+            assert gpu_arch in [70, 80, 86, 89, 90, 100]
             if getSMVersion() != gpu_arch:
                 pytest.skip(
                     "Skip the test as the target gpu arch doesn't match this gpu arch."
@@ -389,6 +411,11 @@ class TestFunctional(unittest.TestCase):
         skip_fp32_accum_pre_ampere(context_fmha_type)
         skip_bf16_fp32_accum(dtype, context_fmha_type)
         skip_fp8_pre_ada(use_fp8_kv_cache)
+        skip_blackwell_for_fmha_tests(context_fmha_type, head_size)
+
+        # Skip custom mask tests for Blackwell
+        if getSMVersion() == 100 and custom_mask_input:
+            pytest.skip("Custom masked is not supported by TRTLLM-GEN for now.")
 
         if num_kv_heads == 0:
             num_kv_heads = num_heads
@@ -831,6 +858,8 @@ class TestFunctional(unittest.TestCase):
                 #       See input_lengths below.
                 configuration.max_position_embeddings = (
                     in_len // 2) + out_len - (out_len // 2)
+            rotary_emb = LlamaRotaryEmbedding(config=configuration,
+                                              device='cuda')
         attention = AttentionCls(configuration, layer_idx=0).cuda().eval()
         if attention_type == 'gpt2_attention':
             attention.c_attn.weight = torch.nn.parameter.Parameter(
@@ -1168,17 +1197,19 @@ class TestFunctional(unittest.TestCase):
                         use_cache=True,
                         attention_mask=attention_mask)
                 elif attention_type == 'llama_attention':
+                    position_embeddings = rotary_emb(input_tensor, position_ids)
                     attention_mask = attention_mask + AttentionMaskConverter._make_causal_mask(
                         input_tensor.shape[:2],
                         dtype=str_dtype_to_torch(dtype),
                         device='cuda',
                         past_key_values_length=0)
-                    torch_output, _, torch_present = attention(
+                    torch_present = DynamicCache()
+                    torch_output = attention(
                         input_tensor,
-                        past_key_value=DynamicCache(),
-                        position_ids=position_ids,
+                        past_key_value=torch_present,
+                        position_embeddings=position_embeddings,
                         attention_mask=attention_mask,
-                        use_cache=True)
+                        use_cache=True)[0]
                     torch_present = torch_present.to_legacy_cache()
                 elif attention_type == 'gptj_attention':
                     torch_output, torch_present = attention(
@@ -1194,9 +1225,9 @@ class TestFunctional(unittest.TestCase):
                         tgt_len=in_len)
                     # source shape = (b, 1, s_query, s_key)
                     # target shape = (b, s_query, h, s_key)
-                    attention_mask = (attention_mask >= 0).permute(
-                        [0, 2, 1, 3]).expand(batch_size, in_len, num_heads,
-                                             in_len)
+                    attention_mask = (attention_mask
+                                      >= 0).permute([0, 2, 1, 3]).expand(
+                                          batch_size, in_len, num_heads, in_len)
                     torch_output, torch_present = attention(
                         input_tensor,
                         layer_past=None,
@@ -1238,6 +1269,7 @@ class TestFunctional(unittest.TestCase):
                     context_host_runtime_perf_knobs, host_context_progress)
                 del session
                 session = None
+
                 # Note: Volta has larger errors.
                 # We speculate it’s because Volta’s TC is smaller and more calculations are required,
                 # which may lead to more error accumulation.
@@ -1312,19 +1344,21 @@ class TestFunctional(unittest.TestCase):
                         use_cache=True,
                         attention_mask=attention_mask)
                 elif attention_type == 'llama_attention':
+                    position_embeddings = rotary_emb(input_tensor, position_ids)
                     attention_mask = attention_mask + AttentionMaskConverter._make_causal_mask(
                         input_tensor.shape[:2],
                         dtype=str_dtype_to_torch(dtype),
                         device='cuda',
                         past_key_values_length=in_len + step - 1)
                     # llama uses DynamicCache
-                    torch_output, _, torch_present = attention(
+                    torch_present = DynamicCache.from_legacy_cache(
+                        torch_present)
+                    torch_output = attention(
                         input_tensor,
-                        past_key_value=DynamicCache.from_legacy_cache(
-                            torch_present),
-                        position_ids=position_ids,
+                        past_key_value=torch_present,
+                        position_embeddings=position_embeddings,
                         attention_mask=attention_mask,
-                        use_cache=True)
+                        use_cache=True)[0]
                     torch_present = torch_present.to_legacy_cache()
                 elif attention_type == 'gptj_attention':
                     torch_output, torch_present = attention(
@@ -1337,9 +1371,9 @@ class TestFunctional(unittest.TestCase):
                     # source shape = (b, 1, 1, s_key)
                     # target shape = (b, 1, h, s_key)
                     key_seqlen = in_len + step  # ctx_attention_mask.shape[1]
-                    attention_mask = (attention_mask >= 0).permute(
-                        [0, 2, 1, 3]).expand(batch_size, 1, num_heads,
-                                             key_seqlen)
+                    attention_mask = (attention_mask
+                                      >= 0).permute([0, 2, 1, 3]).expand(
+                                          batch_size, 1, num_heads, key_seqlen)
                     torch_output, torch_present = attention(
                         input_tensor,
                         layer_past=torch_present,

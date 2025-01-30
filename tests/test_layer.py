@@ -1320,16 +1320,24 @@ class TestLayer(unittest.TestCase):
             mamba_layer.D.value = torch_to_numpy(D.detach().cpu())
             mamba_layer.dt_bias.value = torch_to_numpy(dt_bias.detach().cpu())
             mamba_layer.in_proj_x.weight.value = torch_to_numpy(
-                mamba_torch.in_proj.weight[0:d_inner, ].detach().cpu())
+                mamba_torch.in_proj.weight[
+                    0:d_inner,
+                ].detach().cpu())
             mamba_layer.in_proj_z.weight.value = torch_to_numpy(
-                mamba_torch.in_proj.weight[d_inner:, ].detach().cpu())
+                mamba_torch.in_proj.weight[
+                    d_inner:,
+                ].detach().cpu())
             mamba_layer.out_proj.weight.value = torch_to_numpy(
                 mamba_torch.out_proj.weight.detach().cpu())
             if bias:
                 mamba_layer.in_proj_x.bias.value = torch_to_numpy(
-                    mamba_torch.in_proj.bias[0:d_inner, ].detach().cpu())
+                    mamba_torch.in_proj.bias[
+                        0:d_inner,
+                    ].detach().cpu())
                 mamba_layer.in_proj_z.bias.value = torch_to_numpy(
-                    mamba_torch.in_proj.bias[d_inner:, ].detach().cpu())
+                    mamba_torch.in_proj.bias[
+                        d_inner:,
+                    ].detach().cpu())
                 mamba_layer.out_proj.bias.value = torch_to_numpy(
                     mamba_torch.out_proj.bias.detach().cpu())
             mamba_layer.conv1d.weight.value = torch_to_numpy(
@@ -1439,14 +1447,19 @@ class TestLayer(unittest.TestCase):
                                    ssm_state_trt_llm,
                                    atol=dtype_atol[dtype])
 
-    @parameterized.expand(list(
-        product([3], [16], [1], [1024], [128], [64], [256], [1, 4],
-                ['context', 'generation'], ["float32", "float16", "bfloat16"],
-                [True, False], [True, False])) + list(
-                    product([16], [16], [1], [160, 320, 640], [128], [80],
-                            [256], [1], ['context', 'generation'],
-                            ["float16", "bfloat16"], [True], [True])),
-                          name_func=unittest_name_func)
+    @parameterized.expand(
+        # simple tests
+        list(
+            product([3], [16], [1], [1024], [128], [64], [256], [1, 4],
+                    ['context', 'generation'],
+                    ["float32", "float16", "bfloat16"], [True, False],
+                    [True, False])) +
+        # P=8x and H=2x
+        list(
+            product([2, 4, 8, 16], [16], [1], [160, 320, 640], [128], [80],
+                    [256], [1], ['context', 'generation'], ["float16"], [True],
+                    [True])),
+        name_func=unittest_name_func)
     def test_mamba2(self, batch_size, in_seq_len, out_seq_len, d_model, d_state,
                     headdim, chunk_size, ngroups, req_type, dtype,
                     remove_padding, use_plugin):

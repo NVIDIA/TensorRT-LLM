@@ -35,7 +35,8 @@ from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
 from transformers.models.gpt_bigcode.modeling_gpt_bigcode import \
     GPTBigCodeAttention
 from transformers.models.gptj.modeling_gptj import GPTJAttention
-from transformers.models.llama.modeling_llama import LlamaAttention
+from transformers.models.llama.modeling_llama import (LlamaAttention,
+                                                      LlamaRotaryEmbedding)
 
 import tensorrt_llm
 import tensorrt_llm.quantization.layers
@@ -590,12 +591,9 @@ class TestFunctional(unittest.TestCase):
                 # NOTE: in_len is also halved because in case the other half is treated as padding.
                 configuration.max_position_embeddings = (
                     in_len // 2) + out_len - (out_len // 2)
-        attention = AttentionCls(configuration).cuda().eval()
-        if isinstance(attention, LlamaAttention):
-            from transformers.models.llama.modeling_llama import \
-                LlamaRotaryEmbedding
-            attention.rotary_emb = LlamaRotaryEmbedding(config=configuration,
-                                                        device="cuda")
+            rotary_emb = LlamaRotaryEmbedding(config=configuration,
+                                              device='cuda')
+        attention = AttentionCls(configuration, layer_idx=0).cuda().eval()
         if attention_type == 'gpt2_attention':
             attention.c_attn.weight = torch.nn.parameter.Parameter(
                 data=weight.clone().detach(), requires_grad=False)
@@ -769,18 +767,20 @@ class TestFunctional(unittest.TestCase):
                     use_cache=True,
                     attention_mask=attention_mask)
             elif attention_type == 'llama_attention':
+                position_embeddings = rotary_emb(input, position_ids)
                 attention_mask = attention_mask + AttentionMaskConverter._make_causal_mask(
                     input.shape[:2],
                     dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
                     device='cuda',
                     past_key_values_length=(0 if step == 0 else in_len + step -
                                             1))
-                torch_output, _, torch_present = attention(
+                torch_output = attention(
                     input,
                     past_key_value=layer_past,
-                    position_ids=position_ids,
+                    position_embeddings=position_embeddings,
                     attention_mask=attention_mask,
-                    use_cache=True)
+                    use_cache=True)[0]
+                torch_present = layer_past
             elif attention_type == 'gptj_attention':
                 torch_output, torch_present = attention(
                     input,

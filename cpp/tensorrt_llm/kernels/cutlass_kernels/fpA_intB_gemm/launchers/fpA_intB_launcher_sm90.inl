@@ -72,7 +72,8 @@ void sm90_generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType 
 #ifdef COMPILE_HOPPER_TMA_GEMMS
     using CutlassActivationType = typename TllmToCutlassTypeAdapter<ActivationType>::type;
 
-    if constexpr (!should_filter_sm90_gemm_problem_shape_v<CTAShape, ClusterShape, ActivationType>)
+    if constexpr (!should_filter_tma_warp_specialized_gemm_problem_shape_v<cutlass::arch::Sm90, CTAShape, ClusterShape,
+                      ActivationType>)
     {
         using CutlassWeightType = typename TllmToCutlassTypeAdapter<WeightType>::type;
 
@@ -137,8 +138,9 @@ void sm90_generic_mixed_gemm_kernelLauncher(ActivationType const* A, WeightType 
                 RoundStyle>,                                                    // alpha * acc + bias
             cutlass::epilogue::fusion::Sm90ScalarBroadcast<ElementAccumulator>, // alpha
             cutlass::epilogue::fusion::Sm90AccFetch,                            // acc
-            cutlass::epilogue::fusion::Sm90ColBroadcast<0, TileShape, CutlassBiasType, Stride<_1, _0, _0>,
-                AlignmentBias>                                                  // bias
+            cutlass::epilogue::fusion::Sm90ColBroadcast<0, TileShape, CutlassBiasType, CutlassBiasType,
+                Stride<_1, _0, _0>,
+                AlignmentBias> // bias
             >;
 
         using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<ArchTag, OperatorClass,

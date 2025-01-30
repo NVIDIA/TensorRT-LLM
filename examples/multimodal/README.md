@@ -11,15 +11,17 @@ We first describe how to run each model on a single GPU. We then provide general
 - [CogVLM](#cogvlm)
 - [Deplot](#deplot)
 - [Fuyu](#fuyu)
+- [InternVL2](#internvl2)
 - [Kosmos-2](#kosmos-2)
 - [LLaVA, LLaVa-NeXT, LLaVA-OneVision and VILA](#llava-llava-next-llava-onevision-and-vila)
+- [MLLaMA](#mllama)
 - [NeVA](#neva)
 - [Nougat](#nougat)
 - [Phi-3-vision](#phi-3-vision)
-- [Video NeVA](#video-neva)
-- [InternVL2](#internvl2)
 - [Qwen2-VL](#qwen2-vl)
-- [Enabling tensor parallelism for multi-GPU](#enabling-tensor-parallelism-for-multi-gpu)
+- [Video NeVA](#video-neva)
+- [Dataset Evaluation](#dataset-evaluation)
+- [Enabling Tensor Parallelism for multi-GPU](#enabling-tensor-parallelism-for-multi-gpu)
 
 ## BLIP2
 
@@ -318,6 +320,88 @@ Currently, CogVLM only support bfloat16 precision.
         --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu
     ```
 
+## InternVL2
+
+[InternVL Family](https://github.com/OpenGVLab/InternVL): Closing the Gap to Commercial Multimodal Models with Open-Source Suites —— A Pioneering Open-Source Alternative to GPT-4o. Here we show how to deploy InternVL2‑1B/InternVL2‑2B/InternVL2‑4B/InternVL2‑8B/InternVL2‑26B in TensorRT-LLM.
+
+Firstly, please install transformers with 4.37.2
+```bash
+    pip install transformers==4.37.2
+```
+
+1. Download Huggingface weights
+    - For InternVL2-1B
+        ```bash
+        export MODEL_NAME="InternVL2-1B"
+        git clone https://huggingface.co/OpenGVLab/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
+        export LLM_MODEL_NAME="qwen"
+        ```
+
+    - For InternVL2-2B/InternVL2‑8B/InternVL2‑26B
+        ```bash
+        export MODEL_NAME="InternVL2-2B" # or InternVL2‑8B, InternVL2‑26B
+        git clone https://huggingface.co/OpenGVLab/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
+        export LLM_MODEL_NAME="internlm2"
+        ```
+
+    - For InternVL2-4B
+        ```bash
+        export MODEL_NAME="InternVL2-4B"
+        git clone https://huggingface.co/OpenGVLab/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
+        export LLM_MODEL_NAME="phi"
+        ```
+
+2. Convert Huggingface weights into TRT-LLM checkpoints
+    ```bash
+    python ../${LLM_MODEL_NAME}/convert_checkpoint.py \
+            --model_dir tmp/hf_models/${MODEL_NAME} \
+            --output_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu  \
+            --dtype float16
+    ```
+
+3. Build TRT engines
+    ```bash
+    trtllm-build \
+        --checkpoint_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu \
+        --output_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu \
+        --gemm_plugin auto \
+        --max_batch_size 1 \
+        --max_input_len 4096 \
+        --max_seq_len 4608 \
+        --max_multimodal_len 3328
+    ```
+
+4. Generate TensorRT engines for visual components and combine everything into final pipeline.
+    ```bash
+    python build_visual_engine.py --model_type internvl --model_path tmp/hf_models/${MODEL_NAME}
+    python run.py \
+        --hf_model_dir tmp/hf_models/${MODEL_NAME} \
+        --visual_engine_dir tmp/trt_engines/${MODEL_NAME}/vision_encoder \
+        --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu/ \
+        --image_path tmp/hf_models/${MODEL_NAME}/examples/image1.jpg
+    ```
+
+5. (Optional) FP8 and INT8 SmoothQuant quantization is supported for the InternVL2-4B variant (LLM model only).
+
+   ```bash
+   # FP8 quantization
+   python ../quantization/quantize.py \
+        --model_dir tmp/hf_models/${MODEL_NAME} \
+        --output_dir tmp/trt_models/${MODEL_NAME}/fp8/1-gpu \
+        --dtype bfloat16 \
+        --qformat fp8 \
+        --kv_cache_dtype fp8
+
+   # INT8 SmoothQuant quantization
+   python ../quantization/quantize.py \
+        --model_dir tmp/hf_models/${MODEL_NAME} \
+        --output_dir tmp/trt_models/${MODEL_NAME}/int8/1-gpu \
+        --dtype bfloat16 \
+        --qformat int8_sq
+   ```
+
+   Then follow the same `trtllm-build`, `build_visual_engine.py` and `run.py` steps as before.
+
 ## Kosmos-2
 
 1. Download Huggingface weights
@@ -395,7 +479,7 @@ Currently, CogVLM only support bfloat16 precision.
         git clone https://github.com/Efficient-Large-Model/VILA.git ${VILA_PATH}
 
         # download VILA checkpoints
-        export MODEL_NAME="vila1.5-3b"
+        export MODEL_NAME="vila1.5-3b" # NOTE: name must contain vila or VILA! it's used to identify whether we need to register the non-HF VILA codebase in HF Auto class
         git clone https://huggingface.co/Efficient-Large-Model/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
     ```
 
@@ -440,7 +524,7 @@ Currently, CogVLM only support bfloat16 precision.
         --max_batch_size 1 \
         --max_input_len 2048 \
         --max_seq_len 2560 \
-        --max_multimodal_len 4096 # 1 (max_batch_size) * 4096 (num_visual_features)
+        --max_multimodal_len 196 # 1 (max_batch_size) * 196 (num_visual_features)
 
     # for LLaVA-OneVision
     python ../qwen/convert_checkpoint.py \
@@ -477,8 +561,19 @@ Currently, CogVLM only support bfloat16 precision.
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
         --visual_engine_dir tmp/trt_engines/${MODEL_NAME}/vision_encoder \
         --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu \
-        --input_text "Question: which city is this? Answer:" # for LLaVA and for LLaVA-NeXT
+        --input_text "\n Which city is this?" # for LLaVA and for LLaVA-NeXT
+
+    python run.py \
+        --max_new_tokens 30 \
+        --hf_model_dir tmp/hf_models/${MODEL_NAME} \
+        --visual_engine_dir tmp/trt_engines/${MODEL_NAME}/vision_encoder \
+        --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu \
+        --image_path=https://github.com/Efficient-Large-Model/VILA/raw/main/demo_images/av.png,https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png \
+        --input_text "\n Please elaborate what you see in the images?","\n Which city is this?" \
+        --batch_size=2 # for LLaVA
     ```
+
+    Note that Llava can support N <one image, one prompt text> pairs inference batching, `--batch_size=N` should be used. There should be N images listed under `--image_path` and N text prompts listed under `--input_text`. Don't forget to set the `--max_batch_size` and `--max_multimodal_len` during engine building.
 
     For LLaVA-OneVision, you can use either image or video as inputs.
     ```bash
@@ -520,14 +615,14 @@ Currently, CogVLM only support bfloat16 precision.
         --visual_engine_dir tmp/trt_engines/${MODEL_NAME}/vision_encoder \
         --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu \
         --image_path=av.png,https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png \
-        --input_text="<image>\n Please elaborate what you see in the images?" \
+        --input_text="<image>\n Please elaborate what you see in the images?","<image>\n Which city is this?" \
         --batch_size=2 \
         --check_accuracy # for VILA mode 2
     ```
 
     Note that VILA can support different modes in terms of batching:
     - Mode 1: if you want to query N images as a whole using a prompt, `--batch_size=1` should be used (which is the default value). Example is given above.
-    - Mode 2: if you want to query N images individually using the same prompt (replicated), `--batch_size=N` should be used. Don't forget to set the `--max_batch_size` and `--max_multimodal_len` during engine building.
+    - Mode 2: if you want to query N <one image, one prompt text> pairs, `--batch_size=N` should be used. There should be N images listed under `--image_path` and N text prompts listed under `--input_text`. Don't forget to set the `--max_batch_size` and `--max_multimodal_len` during engine building.
 
     Note: use `--run_profiling` for performance measurement, use `--check_accuracy` for accuracy check.
 
@@ -554,6 +649,119 @@ Currently, CogVLM only support bfloat16 precision.
    ```
 
    Then follow the same `trtllm-build` and `run.py` steps as before. NOTE: for `trtllm-build` command, do not use `--use_fused_mlp=enable` in these quantization modes.
+
+## MLLaMA
+
+This section shows how to build and run a LLaMA-3.2 Vision model in TensorRT-LLM. We use [Llama-3.2-11B-Vision/](https://huggingface.co/meta-llama/Llama-3.2-11B-Vision) as an example.
+
+For LLaMA-3.2 text model, please refer to the [examples/llama/README.md](../llama/README.md) because it shares the model architecture of llama.
+
+### Support data types <!-- omit from toc -->
+  * BF16
+  * Tensor Parallel
+  * INT8 & INT4 Weight-Only
+  * FP8
+
+### Build and run vision model <!-- omit from toc -->
+
+* build engine of vision encoder model
+
+```bash
+python examples/multimodal/build_visual_engine.py --model_type mllama \
+                                                  --model_path Llama-3.2-11B-Vision/ \
+                                                  --output_dir /tmp/mllama/trt_engines/encoder/
+```
+
+* build engine of decoder model
+
+```bash
+python examples/mllama/convert_checkpoint.py --model_dir Llama-3.2-11B-Vision/ \
+                              --output_dir /tmp/mllama/trt_ckpts \
+                              --dtype bfloat16
+
+python3 -m tensorrt_llm.commands.build \
+            --checkpoint_dir /tmp/mllama/trt_ckpts \
+            --output_dir /tmp/mllama/trt_engines/decoder/ \
+            --max_num_tokens 4096 \
+            --max_seq_len 2048 \
+            --workers 1 \
+            --gemm_plugin auto \
+            --max_batch_size 4 \
+            --max_encoder_input_len 4100 \
+            --input_timing_cache model.cache
+```
+
+Note that for instruct Vision model, please set the `max_encoder_input_len` as `6404`.
+
+* Run test on multimodal/run.py with C++ runtime
+
+```bash
+python3 examples/multimodal/run.py --visual_engine_dir /tmp/mllama/trt_engines/encoder/ \
+                                   --visual_engine_name visual_encoder.engine \
+                                   --llm_engine_dir /tmp/mllama/trt_engines/decoder/ \
+                                   --hf_model_dir Llama-3.2-11B-Vision/ \
+                                   --image_path https://huggingface.co/datasets/huggingface/documentation-images/resolve/0052a70beed5bf71b92610a43a52df6d286cd5f3/diffusers/rabbit.jpg \
+                                   --input_text "<|image|><|begin_of_text|>If I had to write a haiku for this one" \
+                                   --max_new_tokens 50 \
+                                   --batch_size 2
+
+Use model_runner_cpp by default. To switch to model_runner, set `--use_py_session` in the command mentioned above.
+
+python3 examples/multimodal/eval.py --visual_engine_dir /tmp/mllama/trt_engines/encoder/ \
+                                   --visual_engine_name visual_encoder.engine \
+                                   --llm_engine_dir /tmp/mllama/trt_engines/decoder/ \
+                                   --hf_model_dir Llama-3.2-11B-Vision/ \
+                                   --test_trtllm \
+                                   --accuracy_threshold 65 \
+                                   --eval_task lmms-lab/ai2d
+```
+
+### Run MLLaMA decoder part by FP8 <!-- omit from toc -->
+
+```bash
+# install modelopt 0.21.0
+pip install nvidia-modelopt[torch]~=0.21.0
+
+python ./examples/quantization/quantize.py --model_dir Llama-3.2-11B-Vision/ \
+                                           --dtype bfloat16 \
+                                           --qformat fp8 \
+                                           --output_dir /tmp/llama-3.2-11B-Vision/fp8/ \
+                                           --kv_cache_dtype fp8 \
+                                           --calib_size 512 \
+                                           --calib_dataset scienceqa
+
+python3 -m tensorrt_llm.commands.build \
+            --checkpoint_dir /tmp/llama-3.2-11B-Vision/fp8/ \
+            --output_dir /tmp/trt_engines/llama-3.2-11B-Vision/decoder/fp8/ \
+            --max_num_tokens 4096 \
+            --max_seq_len 2048 \
+            --workers 1 \
+            --gemm_plugin auto \
+            --max_batch_size 4 \
+            --max_encoder_input_len 4100 \
+            --input_timing_cache model.cache \
+            --use_paged_context_fmha enable \
+            --use_fp8_context_fmha enable
+
+python3 examples/multimodal/run.py --visual_engine_dir /tmp/mllama/trt_engines/encoder/ \
+                                   --visual_engine_name visual_encoder.engine \
+                                   --llm_engine_dir /tmp/trt_engines/llama-3.2-11B-Vision/decoder/fp8/ \
+                                   --hf_model_dir Llama-3.2-11B-Vision/ \
+                                   --image_path https://huggingface.co/datasets/huggingface/documentation-images/resolve/0052a70beed5bf71b92610a43a52df6d286cd5f3/diffusers/rabbit.jpg \
+                                   --input_text "<|image|><|begin_of_text|>If I had to write a haiku for this one" \
+                                   --max_new_tokens 50 \
+                                   --batch_size 2
+
+python3 examples/multimodal/eval.py --visual_engine_dir /tmp/mllama/trt_engines/encoder/ \
+                                   --visual_engine_name visual_encoder.engine \
+                                   --llm_engine_dir /tmp/trt_engines/llama-3.2-11B-Vision/decoder/fp8/ \
+                                   --hf_model_dir Llama-3.2-11B-Vision/ \
+                                   --test_trtllm \
+                                   --accuracy_threshold 65 \
+                                   --eval_task lmms-lab/ai2d
+```
+
+Note that for instruct Vision model, please set the `max_encoder_input_len` as `6404`.
 
 ## NeVA
 
@@ -698,6 +906,45 @@ Currently, CogVLM only support bfloat16 precision.
         --image_path=https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png
     ```
 
+## Qwen2-VL
+[Qwen2-VL Family](https://github.com/QwenLM/Qwen2-VL): is the latest version of the vision language models in the Qwen model families. Here we show how to deploy Qwen2-VL 2B and 7B in TensorRT-LLM.
+
+Firstly, please install transformers and qwen-vl-utils
+```bash
+    pip install -r requirements-qwen2vl.txt
+```
+1. Download Huggingface weights
+    ```bash
+    export MODEL_NAME="Qwen2-VL-7B-Instruct" # or Qwen2-VL-2B-Instruct
+    git clone https://huggingface.co/Qwen/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
+    ```
+
+2. Convert Huggingface weights into TRT-LLM checkpoints and build TRT engines using scripts in `examples/qwen`.
+    ```bash
+    python3 ../qwen/convert_checkpoint.py \
+        --model_dir=tmp/hf_models/${MODEL_NAME} \
+        --output_dir=tmp/trt_models/${MODEL_NAME}/fp16/1-gpu \
+        --dtype float16
+
+    trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu \
+        --output_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu \
+        --gemm_plugin=float16 \
+        --gpt_attention_plugin=float16 \
+        --max_batch_size=4 \
+        --max_input_len=2048 --max_seq_len=3072 \
+        --max_multimodal_len=1296 #(max_batch_size) * 324 (num_visual_features), this's for image_shape=[504,504]
+    ```
+
+3. Generate TensorRT engines for visual components and combine everything into final pipeline.
+    ```bash
+    python build_visual_engine.py --model_type qwen2_vl --model_path tmp/hf_models/${MODEL_NAME}
+
+    python3 run.py \
+        --hf_model_dir tmp/hf_models/${MODEL_NAME} \
+        --visual_engine_dir tmp/trt_engines/${MODEL_NAME}/vision_encoder \
+        --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu/
+    ```
+
 ## Video NeVA
 
 [Video NeVA](https://github.com/NVIDIA/NeMo/blob/main/docs/source/multimodal/mllm/video_neva.rst) is a groundbreaking addition to the NeMo Multimodal ecosystem that could work with video modality. This model seamlessly integrates large language-centric models with a vision encoder, that can be deployed in TensorRT-LLM.
@@ -744,130 +991,64 @@ Currently, CogVLM only support bfloat16 precision.
 
     Note: use `--run_profiling` for performance measurement, use `--check_accuracy` for accuracy check.
 
-## InternVL2
+## Dataset Evaluation
 
-[InternVL Family](https://github.com/OpenGVLab/InternVL): Closing the Gap to Commercial Multimodal Models with Open-Source Suites —— A Pioneering Open-Source Alternative to GPT-4o. Here we show how to deploy InternVL2‑1B/InternVL2‑2B/InternVL2‑4B/InternVL2‑8B/InternVL2‑26B in TensorRT-LLM.
+This section explains how to evaluate datasets using our provided script, including supported models and configurations.
 
-Firstly, please install transformers with 4.37.2
+### Evaluation Command <!-- omit from toc -->
+To run an evaluation, use the following command:
+
 ```bash
-    pip install transformers==4.37.2
+python ./examples/multimodal/eval.py \
+    --model_type <model_type> \
+    --visual_engine_dir <visual_engine_dir> \
+    --llm_engine_dir <llm_engine_dir> \
+    --hf_model_dir <hf_model_dir> \
+    --dataset_dir <dataset_dir> \
+    --test_trtllm (or --test_hf, or both) \
+    --accuracy_threshold <threshold> \
+    --eval_task <eval_task> \
+    --max_ite 20 \
+    --visual_engine_name <visual_engine_name>
 ```
 
-1. Download Huggingface weights
-    - For InternVL2-1B
-        ```bash
-        export MODEL_NAME="InternVL2-1B"
-        git clone https://huggingface.co/OpenGVLab/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
-        export LLM_MODEL_NAME="qwen"
-        ```
+### Parameters <!-- omit from toc -->
+- `--model_type`: Specify the model type to evaluate.
+- `--visual_engine_dir`: Path to the visual engine directory.
+- `--llm_engine_dir`: Path to the LLM engine directory.
+- `--hf_model_dir`: Path to the Hugging Face model directory.
+- `--dataset_dir`: Path to the dataset directory. If not specified, will load the dataset from HF with the `--eval_task` as dataset tag.
+- `--test_trtllm` or `--test_hf`: Specify which evaluation framework to use. Both can be used simultaneously.
+- `--accuracy_threshold`: Set the accuracy threshold for evaluation.
+- `--eval_task`: Specify the evaluation task. Supported tasks: `['lmms-lab/ai2d', 'lmms-lab/VQAv2', 'lmms-lab/MME']`. Default to `'lmms-lab/VQAv2'`.
+- `--max_ite`: Maximum number of iterations, default to 20.
+- `--visual_engine_name`: Name of the visual engine.
 
-    - For InternVL2-2B/InternVL2‑8B/InternVL2‑26B
-        ```bash
-        export MODEL_NAME="InternVL2-2B" # or InternVL2‑8B, InternVL2‑26B
-        git clone https://huggingface.co/OpenGVLab/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
-        export LLM_MODEL_NAME="internlm2"
-        ```
+### Supported Evaluation Tasks <!-- omit from toc -->
+The following evaluation tasks are supported:
+- `lmms-lab/ai2d`
+- `lmms-lab/VQAv2`
+- `lmms-lab/MME`
 
-    - For InternVL2-4B
-        ```bash
-        export MODEL_NAME="InternVL2-4B"
-        git clone https://huggingface.co/OpenGVLab/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
-        export LLM_MODEL_NAME="phi"
-        ```
+### Supported Model Types <!-- omit from toc -->
+The script supports the following model types:
+- `blip2`
+- `fuyu`
+- `kosmos-2`
+- `llava`
+- `llava_next`
+- `llava_onevision`
+- `phi-3-vision`
+- `qwen2_vl`
+- `mllama`
+- `vila`
+- `cogvlm`
+- `neva`
+- `internvl`
 
-2. Convert Huggingface weights into TRT-LLM checkpoints
-    ```bash
-    python ../${LLM_MODEL_NAME}/convert_checkpoint.py \
-            --model_dir tmp/hf_models/${MODEL_NAME} \
-            --output_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu  \
-            --dtype float16
-    ```
+**Note:** The models `vila`, `cogvlm`, `neva`, and `internvl` do not support the `--test_hf` evaluation framework.
 
-3. Build TRT engines
-    ```bash
-    trtllm-build \
-        --checkpoint_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu \
-        --output_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu \
-        --gemm_plugin auto \
-        --max_batch_size 1 \
-        --max_input_len 4096 \
-        --max_seq_len 4608 \
-        --max_multimodal_len 3328
-    ```
-
-4. Generate TensorRT engines for visual components and combine everything into final pipeline.
-    ```bash
-    python build_visual_engine.py --model_type internvl --model_path tmp/hf_models/${MODEL_NAME}
-    python run.py \
-        --hf_model_dir tmp/hf_models/${MODEL_NAME} \
-        --visual_engine_dir tmp/trt_engines/${MODEL_NAME}/vision_encoder \
-        --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu/ \
-        --image_path tmp/hf_models/${MODEL_NAME}/examples/image1.jpg
-    ```
-
-5. (Optional) FP8 and INT8 SmoothQuant quantization is supported for the InternVL2-4B variant (LLM model only).
-
-   ```bash
-   # FP8 quantization
-   python ../quantization/quantize.py \
-        --model_dir tmp/hf_models/${MODEL_NAME} \
-        --output_dir tmp/trt_models/${MODEL_NAME}/fp8/1-gpu \
-        --dtype bfloat16 \
-        --qformat fp8 \
-        --kv_cache_dtype fp8
-
-   # INT8 SmoothQuant quantization
-   python ../quantization/quantize.py \
-        --model_dir tmp/hf_models/${MODEL_NAME} \
-        --output_dir tmp/trt_models/${MODEL_NAME}/int8/1-gpu \
-        --dtype bfloat16 \
-        --qformat int8_sq
-   ```
-
-   Then follow the same `trtllm-build`, `build_visual_engine.py` and `run.py` steps as before.
-
-## Qwen2-VL
-[Qwen2-VL Family](https://github.com/QwenLM/Qwen2-VL): is the latest version of the vision language models in the Qwen model families. Here we show how to deploy Qwen2-VL 2B and 7B in TensorRT-LLM.
-
-Firstly, please install transformers and qwen-vl-utils
-```bash
-    pip install git+https://github.com/huggingface/transformers@21fac7abba2a37fae86106f87fcf9974fd1e3830 accelerate
-    pip install qwen-vl-utils
-```
-1. Download Huggingface weights
-    ```bash
-    export MODEL_NAME="Qwen2-VL-7B-Instruct" # or Qwen2-VL-2B-Instruct
-    git clone https://huggingface.co/Qwen/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
-    ```
-
-2. Convert Huggingface weights into TRT-LLM checkpoints and build TRT engines using scripts in `examples/qwen`.
-    ```bash
-    python3 ../qwen/convert_checkpoint.py \
-        --model_dir=tmp/hf_models/${MODEL_NAME} \
-        --output_dir=tmp/trt_models/${MODEL_NAME}/fp16/1-gpu \
-        --dtype float16
-
-    trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu \
-        --output_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu \
-        --gemm_plugin=float16 \
-        --gpt_attention_plugin=float16 \
-        --max_batch_size=4 \
-        --max_input_len=2048 --max_seq_len=3072 \
-        --max_prompt_embedding_table_size=14208
-    ```
-
-3. Generate TensorRT engines for visual components and combine everything into final pipeline.
-    ```bash
-    python build_visual_engine.py --model_type qwen2_vl --model_path tmp/hf_models/${MODEL_NAME}
-
-    python3 run.py \
-        --hf_model_dir tmp/hf_models/${MODEL_NAME} \
-        --visual_engine_dir tmp/trt_engines/${MODEL_NAME}/vision_encoder \
-        --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/fp16/1-gpu/
-    ```
-
-
-## Enabling tensor parallelism for multi-GPU
+## Enabling Tensor Parallelism for multi-GPU
 
 The LLM part of the pipeline can be run on multiple GPUs using tensor parallelism.
 The visual encoder will be replicated on each GPU and operate in a data parallel fashion.

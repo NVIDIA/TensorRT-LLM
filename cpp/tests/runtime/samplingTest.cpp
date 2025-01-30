@@ -13,11 +13,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef TOP_LEVEL_DIR
-#error "Define TOP_LEVEL_DIR"
-#endif
-
-#include <gtest/gtest.h>
 
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/layers/dynamicDecodeLayer.h"
@@ -25,6 +20,8 @@
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/gptDecoder.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
+
+#include <gtest/gtest.h>
 
 using namespace tensorrt_llm::runtime;
 

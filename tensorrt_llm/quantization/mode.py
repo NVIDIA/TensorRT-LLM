@@ -38,6 +38,7 @@ class QuantAlgo(StrEnum, metaclass=BaseEnumMeta):
     FP8_PER_CHANNEL_PER_TOKEN = auto()
     INT8 = auto()
     MIXED_PRECISION = auto()
+    NVFP4 = auto()
     NO_QUANT = auto()
 
 
@@ -80,6 +81,8 @@ class QuantMode(IntFlag):
     FP8_ROWWISE = auto()
     # W4A8 qserve
     W4A8_QSERVE = auto()
+    # FP4
+    NVFP4 = auto()
 
     # The smallest power-of-two that is not used by a flag. Do not call auto() after that line.
     COUNT = auto()
@@ -155,6 +158,9 @@ class QuantMode(IntFlag):
     def has_fp8_rowwise(self):
         return self._any(self.FP8_ROWWISE)
 
+    def has_nvfp4(self):
+        return self._any(self.NVFP4)
+
     def has_weight_quant(self):
         return self._any(self.INT4_WEIGHTS | self.INT8_WEIGHTS)
 
@@ -162,7 +168,8 @@ class QuantMode(IntFlag):
         return self._any(self.INT4_WEIGHTS | self.INT8_WEIGHTS
                          | self.ACTIVATIONS
                          | self.INT8_KV_CACHE | self.FP8_KV_CACHE
-                         | self.FP8_QDQ | self.FP8_ROWWISE)
+                         | self.FP8_QDQ | self.FP8_ROWWISE | self.W4A8_QSERVE
+                         | self.NVFP4)
 
     def set_int8_kv_cache(self):
         return self | self.INT8_KV_CACHE
@@ -187,6 +194,7 @@ class QuantMode(IntFlag):
                          use_fp8_kv_cache=False,
                          use_fp8_qdq=False,
                          use_fp8_rowwise=False,
+                         use_nvfp4=False,
                          use_w4a8_qserve=False):
 
         def raise_error():
@@ -201,6 +209,7 @@ class QuantMode(IntFlag):
                              f"{use_fp8_kv_cache=}"
                              f"{use_fp8_qdq=}"
                              f"{use_fp8_rowwise=}"
+                             f"{use_nvfp4=}"
                              f"{use_w4a8_qserve=}")
 
         # We must quantize weights when we quantize activations.
@@ -245,6 +254,9 @@ class QuantMode(IntFlag):
 
         if use_fp8_rowwise:
             mode = mode | QuantMode.FP8_ROWWISE | QuantMode.PER_TOKEN | QuantMode.PER_CHANNEL
+
+        if use_nvfp4:
+            mode = mode | QuantMode.NVFP4
 
         # W4A8 QServe
         if use_w4a8_qserve:
@@ -319,6 +331,8 @@ class QuantMode(IntFlag):
             quant_mode = QuantMode.from_description(use_fp8_qdq=True)
         elif quant_algo == QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN:
             quant_mode = QuantMode.from_description(use_fp8_rowwise=True)
+        elif quant_algo == QuantAlgo.NVFP4:
+            quant_mode = QuantMode.from_description(use_nvfp4=True)
         else:
             quant_mode = QuantMode(0)
 
@@ -345,6 +359,8 @@ class QuantMode(IntFlag):
             self.has_fp8_qdq(),
             'enable_fp8_rowwise':
             self.has_fp8_rowwise(),
+            'enable_nvfp4':
+            self.has_nvfp4(),
             'fp8_kv_cache':
             self.has_fp8_kv_cache(),
             'use_weight_only':

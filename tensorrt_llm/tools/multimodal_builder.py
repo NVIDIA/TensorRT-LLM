@@ -407,6 +407,8 @@ def build_llava_engine(args):
 
         hf_config = AutoConfig.from_pretrained(args.model_path)
         hf_config.vision_config._attn_implementation = "eager"
+        # Need to setup at hf_config._attn_implementation after transformers >= 4.46
+        hf_config._attn_implementation = "eager"
         model = LlavaForConditionalGeneration.from_pretrained(
             args.model_path, torch_dtype=torch.float16, config=hf_config)
         wrapper = LlavaVisionWrapper(

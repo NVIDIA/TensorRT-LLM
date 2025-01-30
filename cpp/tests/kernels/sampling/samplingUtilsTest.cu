@@ -13,9 +13,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef TOP_LEVEL_DIR
-#error "Define TOP_LEVEL_DIR"
-#endif
 
 #include "tensorrt_llm/runtime/gptDecoder.h"
 #include "tests/kernels/sampling/samplingTest.h"

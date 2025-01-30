@@ -19,6 +19,7 @@ This document shows how to build and run a LLaMA model in TensorRT-LLM on both s
       - [AWQ](#awq)
       - [GPTQ](#gptq)
     - [w4aINT8 quantization (QServe)](#w4aint8-quantization-qserve)
+    - [NVFP4 quantization](#nvfp4-quantization)
     - [Run](#run)
     - [Multi-GPU multi-node (MGMN) support](#multi-gpu-multi-node-mgmn-support)
     - [Summarization using the LLaMA model](#summarization-using-the-llama-model)
@@ -830,6 +831,36 @@ Please follow the steps to run the model using QServe w4aINT8:
                --output_dir path/to/trtllm/engine \
                --gemm_plugin auto
    ```
+
+### NVFP4 quantization
+
+TRTLLM supports NVFP4 precision with blocksize=16 for both activations and GEMM weights.
+
+Please follow the steps to run the model using:
+
+1. Weight quantization and activation calibration using modelopt:
+
+    ```bash
+    python example/quantization/quantize.py --model_dir path/to/huggingface/ckpt/ \
+                                            --output_dir path/to/trtllm/ckpt/ \
+                                            --dtype float16  \
+                                            --qformat nvfp4 \
+                                            --kv_cache_dtype fp8 \
+                                            --tp_size 1
+    ```
+
+2. Build engine:
+
+    ```bash
+    trtllm-build --checkpoint_dir path/to/trtllm/ckpt/ \
+                 --output_dir path/to/trtllm/engine
+
+    # with FP8 paged context FMHA for better performance
+    trtllm-build --checkpoint_dir path/to/trtllm/ckpt/ \
+                 --output_dir path/to/trtllm/engine \
+                 --use_paged_context_fmha enable \
+                 --use_fp8_context_fmha enable
+    ```
 
 ### Run
 

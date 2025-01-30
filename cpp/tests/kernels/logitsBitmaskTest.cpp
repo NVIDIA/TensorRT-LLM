@@ -13,15 +13,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef TOP_LEVEL_DIR
-#error "Define TOP_LEVEL_DIR"
-#endif
-
-#include <gtest/gtest.h>
 
 #include "tensorrt_llm/kernels/logitsBitmask.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
+
+#include <gtest/gtest.h>
 
 #include <cstdint>
 #include <random>
@@ -55,7 +52,8 @@ public:
         std::vector<int32_t> index(batchSize);
         std::iota(index.begin(), index.end(), 0);
         std::shuffle(index.begin(), index.end(), generator);
-        std::uniform_int_distribution<int32_t> dist(-1024, 1024);
+        std::uniform_int_distribution<BitmaskT> dist(
+            std::numeric_limits<BitmaskT>::min(), std::numeric_limits<BitmaskT>::max());
 
         mBatchSize = batchSize;
         mVocabSizePadded = vocabSizePadded;

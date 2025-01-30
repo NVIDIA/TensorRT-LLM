@@ -237,6 +237,11 @@ public:
         return tensorrt_llm::common::getDTypeSize(static_cast<nvinfer1::DataType>(*this));
     }
 
+    [[nodiscard]] constexpr std::size_t getSizeInBits() const noexcept
+    {
+        return tensorrt_llm::common::getDTypeSizeInBits(static_cast<nvinfer1::DataType>(*this));
+    }
+
 private:
     nvinfer1::DataType mDataType;
     bool mUnsigned;
@@ -428,6 +433,8 @@ public:
     //!
     [[nodiscard]] virtual DataType getDataType() const = 0;
 
+    [[nodiscard]] static char const* getDataTypeName(DataType dataType);
+
     [[nodiscard]] virtual char const* getDataTypeName() const;
 
     //!
@@ -566,7 +573,7 @@ protected:
     //!
     [[nodiscard]] std::size_t toBytes(std::size_t size) const
     {
-        return size * BufferDataType(getDataType()).getSize();
+        return size * BufferDataType(getDataType()).getSizeInBits() / 8;
     }
 };
 

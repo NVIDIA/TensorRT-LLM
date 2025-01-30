@@ -89,47 +89,58 @@ GPTAttentionPlugin::GPTAttentionPlugin(void const* data, size_t length)
 
 std::string GPTAttentionPlugin::toString(IdxEntry const& entry) const
 {
+#define TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(name)                                                                        \
+    case IdxEntry::name: return #name
+
     switch (entry)
     {
-    case IdxEntry::QKV_TENSOR: return "QKV_TENSOR";
-    case IdxEntry::K_TENSOR: return "K_TENSOR";
-    case IdxEntry::V_TENSOR: return "V_TENSOR";
-    case IdxEntry::ATTENTION_MASK: return "ATTENTION_MASK";
-    case IdxEntry::ATTENTION_PACKED_MASK: return "ATTENTION_PACKED_MASK";
-    case IdxEntry::SEQUENCE_LENGTH: return "SEQUENCE_LENGTH";
-    case IdxEntry::HOST_PAST_KEY_VALUE_LENGTHS: return "HOST_PAST_KEY_VALUE_LENGTHS";
-    case IdxEntry::HOST_MAX_ATTENTION_WINDOW: return "HOST_MAX_ATTENTION_WINDOW";
-    case IdxEntry::HOST_SINK_TOKEN_LENGTH: return "HOST_SINK_TOKEN_LENGTH";
-    case IdxEntry::CONTEXT_LENGTHS: return "CONTEXT_LENGTHS";
-    case IdxEntry::CACHE_INDIR: return "CACHE_INDIR";
-    case IdxEntry::REQUEST_TYPES: return "REQUEST_TYPES";
-    case IdxEntry::KV_CACHE_BLOCK_OFFSETS: return "KV_CACHE_BLOCK_OFFSETS";
-    case IdxEntry::HOST_KV_CACHE_BLOCK_OFFSETS: return "HOST_KV_CACHE_BLOCK_OFFSETS";
-    case IdxEntry::HOST_KV_CACHE_POOL_POINTERS: return "HOST_KV_CACHE_POOL_POINTERS";
-    case IdxEntry::HOST_KV_CACHE_POOL_MAPPING: return "HOST_KV_CACHE_POOL_MAPPING";
-    case IdxEntry::PAST_KEY_VALUE: return "PAST_KEY_VALUE";
-    case IdxEntry::KV_CACHE_QUANTIZATION_SCALE: return "KV_CACHE_QUANTIZATION_SCALE";
-    case IdxEntry::KV_CACHE_DEQUANTIZATION_SCALE: return "KV_CACHE_DEQUANTIZATION_SCALE";
-    case IdxEntry::ATTENTION_OUTPUT_QUANTIZATION_SCALE: return "ATTENTION_OUTPUT_QUANTIZATION_SCALE";
-    case IdxEntry::ROTARY_INV_FREQ: return "ROTARY_INV_FREQ";
-    case IdxEntry::ROTARY_COS_SIN: return "ROTARY_COS_SIN";
-    case IdxEntry::ALIBI_SLOPES: return "ALIBI_SLOPES";
-    case IdxEntry::RELATIVE_ATTENTION_BIAS: return "RELATIVE_ATTENTION_BIAS";
-    case IdxEntry::CROSS_KV: return "CROSS_KV";
-    case IdxEntry::CROSS_KV_LENGTH: return "CROSS_KV_LENGTH";
-    case IdxEntry::ENCODER_INPUT_LENGTH: return "ENCODER_INPUT_LENGTH";
-    case IdxEntry::HOST_CONTEXT_LENGTH: return "HOST_CONTEXT_LENGTH";
-    case IdxEntry::QKV_BIAS_TENSOR: return "QKV_BIAS_TENSOR";
-    case IdxEntry::SPEC_DECODING_GENERATION_LENGTHS: return "SPEC_DECODING_GENERATION_LENGTHS";
-    case IdxEntry::SPEC_DECODING_PACKED_MASK: return "SPEC_DECODING_PACKED_MASK";
-    case IdxEntry::SPEC_DECODING_POSITION_OFFSETS: return "SPEC_DECODING_POSITION_OFFSETS";
-    case IdxEntry::LONG_ROPE_ROTARY_INV_FREQ: return "LONG_ROPE_ROTARY_INV_FREQ";
-    case IdxEntry::LONG_ROPE_ROTARY_COS_SIN: return "LONG_ROPE_ROTARY_COS_SIN";
-    case IdxEntry::HOST_RUNTIME_PERF_KNOBS: return "HOST_RUNTIME_PERF_KNOBS";
-    case IdxEntry::HOST_CONTEXT_PROGRESS: return "HOST_CONTEXT_PROGRESS";
-    case IdxEntry::SKIP_ATTN: return "SKIP_ATTN";
-    case IdxEntry::ENUM_SIZE: return "ENUM_SIZE";
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(QKV_TENSOR);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(K_TENSOR);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(V_TENSOR);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(ATTENTION_MASK);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(ATTENTION_PACKED_MASK);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(SEQUENCE_LENGTH);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(HOST_PAST_KEY_VALUE_LENGTHS);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(HOST_MAX_ATTENTION_WINDOW);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(HOST_SINK_TOKEN_LENGTH);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(CONTEXT_LENGTHS);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(CACHE_INDIR);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(REQUEST_TYPES);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(KV_CACHE_BLOCK_OFFSETS);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(HOST_KV_CACHE_BLOCK_OFFSETS);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(HOST_KV_CACHE_POOL_POINTERS);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(HOST_KV_CACHE_POOL_MAPPING);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(PAST_KEY_VALUE);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(KV_CACHE_QUANTIZATION_SCALE);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(KV_CACHE_DEQUANTIZATION_SCALE);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(ATTENTION_OUTPUT_QUANTIZATION_SCALE);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(ROTARY_INV_FREQ);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(ROTARY_COS_SIN);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(ALIBI_SLOPES);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(RELATIVE_ATTENTION_BIAS);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(CROSS_KV);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(CROSS_KV_LENGTH);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(ENCODER_INPUT_LENGTH);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(HOST_CONTEXT_LENGTH);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(QKV_BIAS_TENSOR);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(SPEC_DECODING_GENERATION_LENGTHS);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(SPEC_DECODING_PACKED_MASK);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(SPEC_DECODING_POSITION_OFFSETS);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(SPEC_DECODING_USE);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(LONG_ROPE_ROTARY_INV_FREQ);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(LONG_ROPE_ROTARY_COS_SIN);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(MROPE_ROTARY_COS_SIN);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(MROPE_POSITION_DELTAS);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(HOST_RUNTIME_PERF_KNOBS);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(HOST_CONTEXT_PROGRESS);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(MLA_FUSED_Q_PROJ_TENSOR);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(MLA_Q_B_PROJ_TENSOR);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(MLA_KV_B_PROJ_TENSOR);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(SKIP_ATTN);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(LOGN_SCALING);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(ENUM_SIZE);
     }
+#undef TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING
     TLLM_LOG_TRACE(common::fmtstr("Missing string description for IdxEntry enum %lu.\n", static_cast<size_t>(entry)));
     return "";
 }
@@ -157,7 +168,7 @@ bool GPTAttentionPlugin::isEntryUsed(IdxEntry const& entry) const
     case IdxEntry::PAST_KEY_VALUE: return useKVCache() && !mPagedKVCache;
     case IdxEntry::KV_CACHE_QUANTIZATION_SCALE: return useKVCache() && mKVCacheQuantMode.hasKvCacheQuant();
     case IdxEntry::KV_CACHE_DEQUANTIZATION_SCALE: return useKVCache() && mKVCacheQuantMode.hasKvCacheQuant();
-    case IdxEntry::ATTENTION_OUTPUT_QUANTIZATION_SCALE: return mFP8ContextFMHA && mKVCacheQuantMode.hasFp8Qdq();
+    case IdxEntry::ATTENTION_OUTPUT_QUANTIZATION_SCALE: return mFP8ContextFMHA;
     case IdxEntry::ROTARY_INV_FREQ: return isRoPE();
     case IdxEntry::ROTARY_COS_SIN: return isRoPE() || mIsMLAEnabled;
     case IdxEntry::ALIBI_SLOPES: return isALiBi();
@@ -171,9 +182,10 @@ bool GPTAttentionPlugin::isEntryUsed(IdxEntry const& entry) const
     case IdxEntry::SPEC_DECODING_GENERATION_LENGTHS: return mIsSpecDecodingEnabled;
     case IdxEntry::SPEC_DECODING_PACKED_MASK: return mIsSpecDecodingEnabled;
     case IdxEntry::SPEC_DECODING_POSITION_OFFSETS: return mIsSpecDecodingEnabled;
+    case IdxEntry::SPEC_DECODING_USE: return mIsSpecDecodingEnabled;
     case IdxEntry::LONG_ROPE_ROTARY_INV_FREQ: return isLongRoPE();
     case IdxEntry::LONG_ROPE_ROTARY_COS_SIN: return isLongRoPE();
-    case IdxEntry::MROPE_ROTARY_SIN_COS: return isMRoPE();
+    case IdxEntry::MROPE_ROTARY_COS_SIN: return isMRoPE();
     case IdxEntry::MROPE_POSITION_DELTAS: return isMRoPE();
     case IdxEntry::HOST_RUNTIME_PERF_KNOBS: return true;
     case IdxEntry::HOST_CONTEXT_PROGRESS: return true;
@@ -221,7 +233,7 @@ int GPTAttentionPlugin::getGenerationInputSequenceLength(
     if (mRemovePadding)
     {
         // Speculative decoding mode might need variable generation input sequence length.
-        if (mIsSpecDecodingEnabled)
+        if (mIsSpecDecodingEnabled && mUseSpecDecoding)
         {
             TLLM_CHECK_WITH_INFO(mCpSize <= 1, "Context Parallel does not support speculative decoding mode for now");
             // SPEC_DECODING_POSITION_OFFSETS: [batch_size, max_generation_input_length].
@@ -285,12 +297,13 @@ bool GPTAttentionPlugin::supportsFormatCombination(
         || (isEntryUsed(IdxEntry::SPEC_DECODING_POSITION_OFFSETS)
             && pos == getIdx(IdxEntry::SPEC_DECODING_POSITION_OFFSETS))
         || (isEntryUsed(IdxEntry::SPEC_DECODING_GENERATION_LENGTHS)
-            && pos == getIdx(IdxEntry::SPEC_DECODING_GENERATION_LENGTHS)))
+            && pos == getIdx(IdxEntry::SPEC_DECODING_GENERATION_LENGTHS))
+        || (isEntryUsed(IdxEntry::SPEC_DECODING_USE) && pos == getIdx(IdxEntry::SPEC_DECODING_USE)))
     {
         posCaseLine = __LINE__;
         result = inOut[pos].type == nvinfer1::DataType::kINT32;
     }
-    else if (isMRoPE() && (pos == getIdx(IdxEntry::MROPE_ROTARY_SIN_COS)))
+    else if (isMRoPE() && (pos == getIdx(IdxEntry::MROPE_ROTARY_COS_SIN)))
     {
         return inOut[pos].type == nvinfer1::DataType::kFLOAT;
     }
@@ -458,6 +471,7 @@ void GPTAttentionPlugin::configurePluginImpl(nvinfer1::DynamicPluginTensorDesc c
         /*qkv_bias=*/nullptr,
         /*attention_mask*/ nullptr,
         /*rotary_inv_freq*/ nullptr,
+        /*rotary_cos_sin*/ nullptr,
         /*input_seq_length=*/0,
         /*sequence_lengths=*/nullptr,
         /*past_kv_length=*/0,
@@ -481,9 +495,9 @@ void GPTAttentionPlugin::configurePluginImpl(nvinfer1::DynamicPluginTensorDesc c
         num_requests,
         /*max_blocks_per_sequence=*/0,
         /*cache_indir=*/nullptr,
+        /*semaphores=*/nullptr,
         /*workspace=*/nullptr,
         /*max_context_kv_len_list=*/nullptr,
-        /*mrope_rotary_sin_cos*/ nullptr,
         /*mrope_position_deltas*/ nullptr,
 
     };
@@ -724,6 +738,17 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         + inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims.d[getPackedTensorHiddenDimIndex(mRemovePadding)]
             * size_t(tokenIdxBeg);
 
+    bool changeSpecDecodingMode = false;
+    if (mIsSpecDecodingEnabled)
+    {
+        bool useSpecDecoding
+            = static_cast<bool>(reinterpret_cast<int const*>(inputs[getIdx(IdxEntry::SPEC_DECODING_USE)])[0]);
+        changeSpecDecodingMode = mUseSpecDecoding != useSpecDecoding;
+        mUseSpecDecoding = useSpecDecoding;
+        // change mMultiBlockMode to default
+        mMultiBlockMode = mUseSpecDecoding ? false : true;
+    }
+
     [[maybe_unused]] mlaParams<T> mla_params;
     if (mIsMLAEnabled)
     {
@@ -779,8 +804,8 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         rotary_cos_sin = reinterpret_cast<float2 const*>(inputs[getIdx(inputName)]);
     }
 
-    auto const mrope_rotary_sin_cos
-        = isMRoPE() ? reinterpret_cast<float2 const*>(inputs[getIdx(IdxEntry::MROPE_ROTARY_SIN_COS)]) : nullptr;
+    auto const mrope_rotary_cos_sin
+        = isMRoPE() ? reinterpret_cast<float2 const*>(inputs[getIdx(IdxEntry::MROPE_ROTARY_COS_SIN)]) : nullptr;
 
     auto const mrope_position_deltas
         = isMRoPE() ? reinterpret_cast<int32_t const*>(inputs[getIdx(IdxEntry::MROPE_POSITION_DELTAS)]) : nullptr;
@@ -952,7 +977,7 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
     int const* spec_decoding_position_offsets = nullptr;
     int const* spec_decoding_generation_lengths = nullptr;
     int num_decoding_draft_tokens = 0;
-    if (mIsSpecDecodingEnabled)
+    if (mIsSpecDecodingEnabled && mUseSpecDecoding)
     {
         // Second dimension of spec_decoding_position_offsets is num_decoding_draft_tokens + 1.
         // [batch_size, num_decoding_draft_tokens + 1]
@@ -978,11 +1003,11 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         }
     }
 
-    int32_t const* max_context_kv_len_list = useKVCache()
+    int32_t const* host_past_kv_len_list = useKVCache()
         ? static_cast<int const*>(inputs[getIdx(IdxEntry::HOST_PAST_KEY_VALUE_LENGTHS)]) + seqIdxBeg
         : nullptr;
     int32_t const max_context_kv_len = useKVCache()
-        ? *std::max_element(max_context_kv_len_list, max_context_kv_len_list + localNbSeq)
+        ? *std::max_element(host_past_kv_len_list, host_past_kv_len_list + localNbSeq)
         : max_context_q_len;
 
     int const* host_context_lengths
@@ -1014,7 +1039,7 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
             context_q_lengths, sequence_kv_length, kv_scale_orig_quant, kv_scale_quant_orig,
             attention_output_orig_quant, alibi_slopes, context_buf_, key_value_cache, block_offsets, host_block_offsets,
             host_primary_pool_pointer, host_secondary_pool_pointer, batch_size, localNbTokens, max_blocks_per_sequence,
-            host_context_lengths, workspace, mrope_rotary_sin_cos, mrope_position_deltas};
+            host_context_lengths, workspace, mrope_rotary_cos_sin};
 
         enqueue_params.runtime_perf_knobs = runtime_perf_knobs;
         if (isRelativePosition())
@@ -1088,7 +1113,7 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         int const input_seq_length = getGenerationInputSequenceLength(inputDesc, localNbSeq, localNbTokens);
         int const max_past_kv_length = isCrossAttention() ? max_encoder_context_len : max_context_kv_len;
         auto qkvDims = inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims;
-        TLLM_CHECK_WITH_INFO(input_seq_length == 1 || mIsSpecDecodingEnabled,
+        TLLM_CHECK_WITH_INFO(input_seq_length == 1 || (mIsSpecDecodingEnabled && mUseSpecDecoding),
             "Only speculative decoding mode supports input length > 1 in the generation phase, input_seq_length=%d, "
             "mIsSpecDecodingEnabled=%s, nDims=%d, (" FMT_DIM ", " FMT_DIM ", " FMT_DIM ")",
             input_seq_length, mIsSpecDecodingEnabled ? "true" : "false", qkvDims.nbDims, qkvDims.d[0], qkvDims.d[1],
@@ -1096,12 +1121,12 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         TLLM_CHECK_WITH_INFO(
             input_seq_length == num_decoding_draft_tokens + 1, "The generation input length is not expected.");
         EnqueueGenerationParams<T> enqueue_params{attention_input, qkv_bias, attention_mask, rotary_inv_freq,
-            input_seq_length, sequence_kv_length, max_past_kv_length, beamWidth, context_q_lengths, kv_scale_orig_quant,
-            kv_scale_quant_orig, attention_output_orig_quant, alibi_slopes, context_buf_, key_value_cache,
-            block_offsets, host_primary_pool_pointer, host_secondary_pool_pointer, attention_mask_stride,
-            max_attention_window_size, cyclic_attention_window_size, max_cyclic_attention_window_size,
-            can_use_one_more_block, sink_token_length, num_requests, max_blocks_per_sequence, cache_indir,
-            mMultiBlockSemaphores.get(), workspace, max_context_kv_len_list, mrope_rotary_sin_cos,
+            rotary_cos_sin, input_seq_length, sequence_kv_length, max_past_kv_length, beamWidth, context_q_lengths,
+            kv_scale_orig_quant, kv_scale_quant_orig, attention_output_orig_quant, alibi_slopes, context_buf_,
+            key_value_cache, block_offsets, host_primary_pool_pointer, host_secondary_pool_pointer,
+            attention_mask_stride, max_attention_window_size, cyclic_attention_window_size,
+            max_cyclic_attention_window_size, can_use_one_more_block, sink_token_length, num_requests,
+            max_blocks_per_sequence, cache_indir, mMultiBlockSemaphores.get(), workspace, host_past_kv_len_list,
             mrope_position_deltas};
         enqueue_params.host_context_lengths = host_context_lengths;
         enqueue_params.runtime_perf_knobs = runtime_perf_knobs;
@@ -1121,7 +1146,7 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
             enqueue_params.encoder_input_lengths
                 = reinterpret_cast<int const*>(inputs[getIdx(IdxEntry::ENCODER_INPUT_LENGTH)]) + seqIdxBeg;
         }
-        if (mIsSpecDecodingEnabled)
+        if (mIsSpecDecodingEnabled && mUseSpecDecoding)
         {
             enqueue_params.spec_decoding_packed_mask = spec_decoding_packed_mask;
             enqueue_params.spec_decoding_position_offsets = spec_decoding_position_offsets;
@@ -1130,6 +1155,12 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
             enqueue_params.spec_decoding_max_generation_length = mSpecDecodingMaxGenerationLength;
         }
         enqueue_params.total_num_input_tokens = localNbTokens;
+
+        if (changeSpecDecodingMode)
+        {
+            // mUseSpecDecoding is changed, need to re-prepare the DecoderXQARunner
+            prepareEnqueueGeneration<T, KVCacheBuffer>(enqueue_params);
+        }
 
         // Current mlaGeneration will using fmha to do attention, so we don't go into enqueueGeneration
         if (mIsMLAEnabled)

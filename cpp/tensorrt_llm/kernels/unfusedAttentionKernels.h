@@ -69,6 +69,31 @@ enum class RotaryPositionEmbeddingType
     GPT_NEOX,
 };
 
+inline void calGridSizeWithBestEfficiency(
+    dim3 const block, dim3& grid, int numNeededBlockX, int multiProcessorCount, int availableThreadsPerSm)
+{
+    int numThreadsPerBlock = block.x * block.y * block.z;
+    int numAvailableBlocksPerWave = int(availableThreadsPerSm / numThreadsPerBlock) * multiProcessorCount;
+    int numBatchBlocks = grid.y * grid.z;
+
+    // The best wave efficiency it can achieve with different number of blocks.
+    float bestEfficiency = 0.f;
+    int selectedBlockX = 0;
+    // Iterate over all possible number of blocks in the x dimension.
+    for (int blockX = 1; blockX <= numNeededBlockX; ++blockX)
+    {
+        float numWaves = float(blockX * numBatchBlocks) / numAvailableBlocksPerWave;
+        float efficiency = numWaves / std::ceil(numWaves);
+        if (efficiency > bestEfficiency)
+        {
+            bestEfficiency = efficiency;
+            selectedBlockX = blockX;
+        }
+    }
+    // Update grid.x.
+    grid.x = selectedBlockX;
+}
+
 template <typename T, typename KVCacheBuffer>
 struct QKVPreprocessingParams
 {
@@ -89,6 +114,8 @@ struct QKVPreprocessingParams
 
     // Logn scaling pointer, of shape {max_position_embedding_length}
     float const* logn_scaling{nullptr};
+    // The (batch_idx, token_idx_in_seq) int2 buffer of shape {num_tokens}.
+    int2 const* tokens_info{nullptr};
     // list of sequence lengths, of shape {batch_size + 1}
     int const* seq_lens{nullptr};
     // list sequence lengths for the cache, of shape {batch_size + 1}
@@ -109,7 +136,7 @@ struct QKVPreprocessingParams
     float const* kvScaleOrigQuant{nullptr};
     int const* spec_decoding_position_offsets{nullptr};
 
-    float2 const* mrope_rotary_sin_cos{nullptr};
+    float2 const* mrope_rotary_cos_sin{nullptr};
     int32_t const* mrope_position_deltas{nullptr};
 
     // Scalars.
@@ -136,6 +163,7 @@ struct QKVPreprocessingParams
     KvCacheDataType cache_type{};
     bool separate_q_kv_output{false};
     bool quantized_fp8_output{false};
+    bool generation_phase{false};
     int multi_processor_count{0};
     int rotary_vision_start{0};
     int rotary_vision_length{0};
@@ -164,6 +192,7 @@ struct QKVPreprocessingParams
         ss << "q_output: " << q_output << std::endl;
         ss << "kv_cache_buffer: " << kv_cache_buffer.data << std::endl;
         ss << "qkv_bias: " << qkv_bias << std::endl;
+        ss << "tokens_info: " << tokens_info << std::endl;
         ss << "seq_lens: "
            << *(runtime::ITensor::wrap(
                   (void*) seq_lens, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batch_size})));
@@ -207,6 +236,7 @@ struct QKVPreprocessingParams
         ss << "cache_type: " << static_cast<int>(cache_type) << std::endl;
         ss << "separate_q_kv_output: " << std::boolalpha << separate_q_kv_output << std::endl;
         ss << "quantized_fp8_output: " << quantized_fp8_output << std::endl;
+        ss << "generation_phase: " << generation_phase << std::endl;
         ss << "multi_processor_count: " << multi_processor_count << std::endl;
 
         return ss.str();

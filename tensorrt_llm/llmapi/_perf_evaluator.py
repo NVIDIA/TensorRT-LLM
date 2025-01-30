@@ -15,6 +15,7 @@ import tqdm
 from tensorrt_llm import logger
 
 from .._utils import release_gc
+from ..bindings.executor import SchedulerConfig
 from ..profiler import device_memory_info, host_memory_info
 from . import LLM, KvCacheConfig, SamplingParams
 from .llm import LLM, SamplingParams
@@ -265,6 +266,13 @@ class LLMPerfEvaluator:
         if "kv_cache_free_gpu_mem_fraction" in kwargs:
             kvcache_extra_params["free_gpu_memory_fraction"] = kwargs.pop(
                 "kv_cache_free_gpu_mem_fraction")
+        if "enable_kv_cache_reuse" in kwargs:
+            kvcache_extra_params["enable_block_reuse"] = kwargs.pop(
+                "enable_kv_cache_reuse")
+        if "kv_cache_max_tokens" in kwargs:
+            kv_cache_max_tokens = kwargs.pop("kv_cache_max_tokens")
+            if kv_cache_max_tokens is not None:
+                kvcache_extra_params["max_tokens"] = kv_cache_max_tokens
 
         enable_chunked_prefill = kwargs.pop("chunked_context", True)
 
@@ -274,11 +282,17 @@ class LLMPerfEvaluator:
         print_colored(f"kvcache_extra_params: {kvcache_extra_params}\n",
                       "green")
 
+        if "capacity_scheduler_policy" in kwargs:
+            kwargs["scheduler_config"] = SchedulerConfig(
+                capacity_scheduler_policy=kwargs.pop(
+                    "capacity_scheduler_policy"))
+
         try:
             kv_cache_config = KvCacheConfig(
                 **kvcache_extra_params) if kvcache_extra_params else None
             if kv_cache_config is not None:
                 kwargs['kv_cache_config'] = kv_cache_config
+
             llm = LLM(model,
                       skip_tokenizer_init=True,
                       enable_chunked_prefill=enable_chunked_prefill,
@@ -344,7 +358,9 @@ class LLMPerfEvaluator:
                        is_warmup: bool = False,
                        tqdm_bar: tqdm.tqdm = None):
             nonlocal sample_offset
-            num_samples = self.warmup if is_warmup else len(self.samples)
+            num_samples = min(self.warmup,
+                              self.concurrency) if is_warmup else len(
+                                  self.samples)
 
             while sample_offset < num_samples:
                 sample = self.samples[sample_offset]

@@ -172,6 +172,26 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_mixtral_2gpu \
              --workers 2
 ```
 
+### NVFP4 Post-Training Quantization
+
+Mixtral supports NVFP4 quantization.
+
+```bash
+# Quantize HF Mixtral into FP8 and export trtllm checkpoint
+python ../quantization/quantize.py --model_dir ./Mixtral-8x7B-v0.1 \
+                                   --dtype float16 \
+                                   --qformat nvfp4 \
+                                   --kv_cache_dtype fp8 \
+                                   --output_dir ./tllm_checkpoint_mixtral_nvfp4_1gpu \
+                                   --calib_size 512 \
+                                   --tp_size 1
+
+# Build trtllm engines from the trtllm checkpoint
+# Enable fp8 context fmha to get further acceleration by setting `--use_fp8_context_fmha enable`
+trtllm-build --checkpoint_dir ./tllm_checkpoint_mixtral_nvfp4_1gpu \
+             --output_dir ./engine_outputs
+```
+
 ## OOTB
 
 Mixtral supports OOTB operation without the plugin, however this comes at a significant performance cost. Users should prefer using the plugin path whenever possible
