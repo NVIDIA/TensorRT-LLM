@@ -1,0 +1,3 @@
+git+https://github.com/huggingface/transformers@21fac7abba2a37fae86106f87fcf9974fd1e3830
+accelerate
+qwen-vl-utils

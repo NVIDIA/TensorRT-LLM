@@ -29,7 +29,7 @@ namespace kv_cache
 {
 class CommState;
 class CacheState;
-class SocketState;
+struct SocketState;
 } // namespace kv_cache
 
 class Serialization
@@ -54,6 +54,11 @@ public:
     [[nodiscard]] static OutputConfig deserializeOutputConfig(std::istream& is);
     static void serialize(OutputConfig const& config, std::ostream& os);
     [[nodiscard]] static size_t serializedSize(OutputConfig const& config);
+
+    // OutputConfig::AdditionalModelOutput
+    [[nodiscard]] static OutputConfig::AdditionalModelOutput deserializeAdditionalModelOutput(std::istream& is);
+    static void serialize(OutputConfig::AdditionalModelOutput const& additionalModelOutput, std::ostream& os);
+    [[nodiscard]] static size_t serializedSize(OutputConfig::AdditionalModelOutput const& additionalModelOutput);
 
     // ExternalDraftTokensConfig
     [[nodiscard]] static ExternalDraftTokensConfig deserializeExternalDraftTokensConfig(std::istream& is);
@@ -119,6 +124,11 @@ public:
     [[nodiscard]] static Result deserializeResult(std::istream& is);
     static void serialize(Result const& result, std::ostream& os);
     [[nodiscard]] static size_t serializedSize(Result const& result);
+
+    // AdditionalOutput
+    [[nodiscard]] static AdditionalOutput deserializeAdditionalOutput(std::istream& is);
+    static void serialize(AdditionalOutput const& additionalOutput, std::ostream& os);
+    [[nodiscard]] static size_t serializedSize(AdditionalOutput const& additionalOutput);
 
     // Response
     [[nodiscard]] static Response deserializeResponse(std::istream& is);

@@ -201,7 +201,8 @@ class CompletionRequest(OpenAIBaseModel):
     @model_validator(mode="before")
     @classmethod
     def check_logprobs(cls, data):
-        if "top_logprobs" in data or "logprobs" in data:
+        if ("top_logprobs" in data and data.get("top_logprobs")) or \
+            ("logprobs" in data and data.get("logprobs")):
             raise ValueError("returning log probs is not supported")
         return data
 
@@ -217,7 +218,8 @@ class CompletionRequest(OpenAIBaseModel):
     @classmethod
     def verify_multi_responses(cls, data):
         best_of = data.get("best_of")
-        if best_of and best_of < data.get("n"):
+        n = data.get("n")
+        if best_of and n and best_of < n:
             raise ValueError("best_of should not be smaller than n")
         return data
 

@@ -83,8 +83,6 @@ public:
      */
     bool shouldUse(XQAParams const& xqaParams, bool forConfigurePlugin);
 
-    size_t getWorkspaceSize(int max_num_tokens);
-
     void prepare(XQAParams const& xqa_params)
     {
         this->prepareForRun(xqa_params);

@@ -165,6 +165,10 @@ def parse_arguments():
                         action="store_true",
                         default=False,
                         help="Enable FP8 per-tensor quantization")
+    parser.add_argument("--use_nvfp4",
+                        action="store_true",
+                        default=False,
+                        help="Enable NVFP4 quantization")
     parser.add_argument("--use_fp8_rowwise",
                         action="store_true",
                         default=False,
@@ -303,6 +307,8 @@ def args_to_quant_config(args: argparse.Namespace) -> QuantConfig:
                                            args.group_size, quant_config)
     elif args.use_fp8:
         quant_config.quant_algo = QuantAlgo.FP8
+    elif args.use_nvfp4:
+        quant_config.quant_algo = QuantAlgo.NVFP4
     elif args.smoothquant:
         quant_config.smoothquant_val = args.smoothquant
         if args.per_channel:

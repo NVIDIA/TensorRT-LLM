@@ -25,6 +25,7 @@ import pytest
 import torch
 from parameterized import parameterized
 from transformers import MistralConfig, MistralForCausalLM
+from transformers.cache_utils import DynamicCache
 
 import tensorrt_llm
 from tensorrt_llm import Builder
@@ -283,7 +284,7 @@ class TestMistralAndArctic(unittest.TestCase):
             with torch.no_grad():
                 hf_outputs = hf_mistral.forward(ctx_ids,
                                                 use_cache=True,
-                                                past_key_values=[])
+                                                past_key_values=DynamicCache())
             torch.cuda.synchronize()
             ref = hf_outputs.logits[:, -1, :]
 

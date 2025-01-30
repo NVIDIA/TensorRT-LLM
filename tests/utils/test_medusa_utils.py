@@ -179,7 +179,8 @@ def generate_medusa_info(medusa_choices,
 
     # Move the tensors in the dictionary to the specified device
     medusa_buffers = {
-        k: v.clone().to(device)
+        k:
+        v.clone().to(device)
         if isinstance(v, torch.Tensor) else torch.tensor(v, device=device)
         for k, v in medusa_buffers.items()
     }

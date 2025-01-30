@@ -43,6 +43,13 @@ extern "C"
         TLLM_XQA_JIT_QGMMA = 1
     } tllmXqaJitKernelType;
 
+    typedef enum
+    {
+        TLLM_XQA_JIT_ROPE_NONE = 0,
+        TLLM_XQA_JIT_ROPE_NEOX = 1,
+        TLLM_XQA_JIT_ROPE_GPTJ = 2
+    } tllmXqaJitRopeStyle;
+
     typedef struct
     {
         // Compute capability, e.g. 89.
@@ -61,6 +68,10 @@ extern "C"
         int kv_cache_data_type;
 
         tllmXqaJitKernelType kernel_type;
+
+        bool fp8_output;
+        bool use_input_kv;
+        tllmXqaJitRopeStyle rope_style; // useful only when use_input_kv is true.
     } tllmXqaJitContext;
 
     // tllmXqaJitProgram is an opaque handle for a program.

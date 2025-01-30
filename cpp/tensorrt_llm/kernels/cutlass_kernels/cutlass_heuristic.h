@@ -27,12 +27,11 @@ namespace kernels
 namespace cutlass_kernels
 {
 
-template <class TileShape, class ClusterShape, class ActivationType>
-struct should_filter_sm90_gemm_problem_shape
+template <class ArchTag, class TileShape, class ClusterShape, class ActivationType>
+struct should_filter_tma_warp_specialized_gemm_problem_shape
 {
 #ifdef FAST_BUILD
-    constexpr static int TILE_K = 128 * 8 / cutlass::sizeof_bits<ActivationType>::value;
-    using SupportedCtaShape = cute::Shape<cute::_128, cute::_128, cute::Int<TILE_K>>;
+    using SupportedCtaShape = cute::Shape<cute::_128, cute::_128, decltype(cute::get<2>(TileShape{}))>;
     using SupportedCgaShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
 
     constexpr static bool value
@@ -41,9 +40,9 @@ struct should_filter_sm90_gemm_problem_shape
     constexpr static bool value = false;
 #endif
 };
-template <class TileShape, class ClusterShape, class ActivationType>
-constexpr static bool should_filter_sm90_gemm_problem_shape_v
-    = should_filter_sm90_gemm_problem_shape<TileShape, ClusterShape, ActivationType>::value;
+template <class ArchTag, class TileShape, class ClusterShape, class ActivationType>
+constexpr static bool should_filter_tma_warp_specialized_gemm_problem_shape_v
+    = should_filter_tma_warp_specialized_gemm_problem_shape<ArchTag, TileShape, ClusterShape, ActivationType>::value;
 
 std::vector<tensorrt_llm::cutlass_extensions::CutlassGemmConfig> get_candidate_configs(
     int sm, int const max_split_k, tensorrt_llm::cutlass_extensions::CutlassGemmConfig::CandidateConfigTypeParam const);

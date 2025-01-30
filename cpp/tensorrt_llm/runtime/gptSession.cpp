@@ -1361,3 +1361,15 @@ void GptSession::CudaGraphExecutor::prepareNextGraph(TllmRuntime const& runtime,
     uploadToStream(stream);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
+
+nvinfer1::DataType GptSession::getTensorDataType(std::string const& name) const
+{
+    auto const& engine = mRuntime->getEngine();
+    return engine.getTensorDataType(name.c_str());
+}
+
+nvinfer1::Dims GptSession::getTensorShape(std::string const& name) const
+{
+    auto const& engine = mRuntime->getEngine();
+    return engine.getTensorShape(name.c_str());
+}

@@ -44,6 +44,7 @@ from ..quantization.layers import (FP8Linear, Fp8RowwiseFusedGatedMLP,
                                    WeightOnlyQuantRowLinear)
 from ..quantization.mode import (KV_CACHE_QUANT_ALGO_LIST, QUANT_ALGO_LIST,
                                  W8A8_SQ_PLUGIN_LIST, QuantAlgo)
+from ..quantization.utils.fp4_utils import float4_sf_dtype
 from ..top_model_mixin import TopModelMixin
 from .convert_utils import weight_only_quantize_dict
 from .generation_mixin import GenerationMixin
@@ -145,8 +146,8 @@ class QuantConfig:
     @property
     def requires_modelopt_quantization(self):
         if self.quant_algo in [
-                QuantAlgo.W4A16_AWQ, QuantAlgo.FP8,
-                QuantAlgo.W8A8_SQ_PER_CHANNEL, QuantAlgo.W4A8_AWQ,
+                QuantAlgo.NVFP4, QuantAlgo.FP8, QuantAlgo.W4A16_AWQ,
+                QuantAlgo.W4A8_AWQ, QuantAlgo.W8A8_SQ_PER_CHANNEL,
                 QuantAlgo.MIXED_PRECISION
         ]:
             return True
@@ -156,16 +157,24 @@ class QuantConfig:
             return False
 
     def get_quant_cfg(self, module_name=None):
+        if self.exclude_modules is not None:
+            for exclude_module in self.exclude_modules:
+                if exclude_module == module_name or (
+                        exclude_module.endswith('*')
+                        and module_name.startswith(exclude_module[:-1])):
+                    return LayerQuantConfig(quant_algo=None,
+                                            quantized_layers={})
         return self
 
     def get_modelopt_qformat(self):
         algo_to_modelopt_map = {
             QuantAlgo.W8A16: "int8_wo",
             QuantAlgo.W4A16: "int4_wo",
+            QuantAlgo.NVFP4: "nvfp4",
+            QuantAlgo.FP8: "fp8",
             QuantAlgo.W4A16_AWQ: "int4_awq",
-            QuantAlgo.W4A8_AWQ: 'w4a8_awq',
-            QuantAlgo.FP8: 'fp8',
-            QuantAlgo.W8A8_SQ_PER_CHANNEL: 'int8_sq',
+            QuantAlgo.W4A8_AWQ: "w4a8_awq",
+            QuantAlgo.W8A8_SQ_PER_CHANNEL: "int8_sq",
         }
         assert self.quant_algo != QuantAlgo.MIXED_PRECISION, f"We don't support mixed precision in QuantConfig"
         if self.quant_algo is not None:
@@ -262,10 +271,11 @@ class LayerQuantConfig(QuantConfig):
 
     def get_modelopt_qformat(self):
         algo_to_modelopt_map = {
+            QuantAlgo.NVFP4: "nvfp4",
+            QuantAlgo.FP8: "fp8",
             QuantAlgo.W4A16_AWQ: "int4_awq",
-            QuantAlgo.W4A8_AWQ: 'w4a8_awq',
-            QuantAlgo.FP8: 'fp8',
-            QuantAlgo.W8A8_SQ_PER_CHANNEL: 'int8_sq',
+            QuantAlgo.W4A8_AWQ: "w4a8_awq",
+            QuantAlgo.W8A8_SQ_PER_CHANNEL: "int8_sq",
         }
         assert self.quant_algo == QuantAlgo.MIXED_PRECISION, f"We only support mixed precision quantization in LayerQuantConfig"
         autoq_format = ','.join(
@@ -457,15 +467,8 @@ class PretrainedConfig:
     def get_quant_cfg(self, module_name: str):
         return self.quantization.get_quant_cfg(module_name)
 
-    def set_rank(self, rank):
-        self.mapping = Mapping(self.mapping.world_size,
-                               rank=rank,
-                               cp_size=self.mapping.cp_size,
-                               tp_size=self.mapping.tp_size,
-                               pp_size=self.mapping.pp_size,
-                               moe_tp_size=self.mapping.moe_tp_size,
-                               moe_ep_size=self.mapping.moe_ep_size,
-                               gpus_per_node=self.mapping.gpus_per_node)
+    def set_rank(self, rank: int):
+        self.mapping.rank = rank
 
     def get_config_group(self, group_cls: "Type[CG]") -> "CG":
         cfg = {k: v for k, v in self.to_dict().items() if k in group_cls.keys()}
@@ -525,14 +528,17 @@ class DecoderLayerList(ModuleList):
                 kwargs['mrope_params'] = mrope_params
             if default_net().plugin_config.reduce_fusion:
                 if layer_idx + self.layer_list[0] < self.layer_list[-1]:
-                    if default_net(
-                    ).plugin_config.user_buffer and self.quant_mode.has_fp8_qdq(
-                    ):
-                        qkv_activation_scaling_factor = constant(
-                            self[layer_idx + 1].attention.qkv.
-                            activation_scaling_factor.raw_value.copy())
-                    else:
-                        qkv_activation_scaling_factor = None
+                    qkv_activation_scaling_factor = None
+                    if default_net().plugin_config.user_buffer:
+                        qkv_linear = self[layer_idx + 1].attention.qkv
+                        if self.quant_mode.has_fp8_qdq():
+                            qkv_activation_scaling_factor = constant(
+                                qkv_linear.activation_scaling_factor.raw_value.
+                                copy())
+                        elif self.quant_mode.has_nvfp4():
+                            qkv_activation_scaling_factor = constant(
+                                qkv_linear.activation_global_scaling_factor.
+                                raw_value.copy())
                     kwargs['next_layer_input_layernorm_args'] = (
                         self[layer_idx + 1].input_layernorm.weight.value,
                         self[layer_idx + 1].input_layernorm.eps,
@@ -632,8 +638,10 @@ class PretrainedModel(Module,
             config.set_rank(rank)
 
         rank = config.mapping.rank
-        # tp_cp_pp rank -> tp_pp rank: because different cp ranks share the same ckpt
-        if config.mapping.cp_size > 1:
+        if config.mapping.auto_parallel:
+            rank = 0
+        elif config.mapping.cp_size > 1:
+            # tp_cp_pp rank -> tp_pp rank: because different cp ranks share the same ckpt
             tp_size = config.mapping.tp_size
             cp_size = config.mapping.cp_size
             rank = rank % tp_size + rank // (tp_size * cp_size) * tp_size
@@ -671,6 +679,7 @@ class PretrainedModel(Module,
             required_names.add(name)
 
         provided_names = set(weights.keys())
+
         if not required_names.issubset(provided_names):
             raise RuntimeError(
                 f"Required but not provided tensors:{required_names.difference(provided_names)}"
@@ -729,7 +738,7 @@ class PretrainedModel(Module,
         lora_target_modules: List[str] = None,
         opt_batch_size: int = 0,
         num_hidden_layers: int = None,
-        mrope_rotary_sin_cos_size: int = None,
+        mrope_rotary_cos_sin_size: int = None,
     ):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
             ranges of the dimensions of when using TRT dynamic shapes.
@@ -794,7 +803,7 @@ class PretrainedModel(Module,
             streamingllm=streamingllm,
             opt_batch_size=opt_batch_size,
             pp_reduce_scatter=pp_reduce_scatter,
-            mrope_rotary_sin_cos_size=mrope_rotary_sin_cos_size)
+            mrope_rotary_cos_sin_size=mrope_rotary_cos_sin_size)
 
         result = {
             'input_ids':
@@ -1421,7 +1430,13 @@ def set_fp8_context_fhma(model: PretrainedModel) -> PretrainedModel:
                 layer.dense, 'activation_scaling_factor'):
             scale = [1.0] / layer.dense.activation_scaling_factor.raw_value
             layer.attention_output_orig_quant_scale = Parameter(
-                value=scale.astype(np.float32))
+                value=scale.astype(np.float32), dtype='float32')
+        elif isinstance(layer, Attention) and hasattr(
+                layer.dense, 'activation_global_scaling_factor'):
+            scale = [1.0
+                     ] / layer.dense.activation_global_scaling_factor.raw_value
+            layer.attention_output_orig_quant_scale = Parameter(
+                value=scale.astype(np.float32), dtype='float32')
     return model
 
 
@@ -1493,16 +1508,18 @@ def optimize_cross_qkv(model):
         (type(attn.qkv) == ColumnLinear or type(attn.qkv) == FP8Linear):
             old_qkv = attn.qkv
             linear_class = type(old_qkv)
-            new_kv = linear_class(in_features=attn.hidden_size,
-                                  out_features=2 * attn.tp_size *
-                                  attn.num_attention_kv_heads *
-                                  attn.attention_head_size,
-                                  bias=old_qkv.bias,
-                                  dtype=old_qkv.dtype,
-                                  tp_group=old_qkv.tp_group,
-                                  tp_size=old_qkv.tp_size,
-                                  gather_output=old_qkv.gather_output,
-                                  is_qkv=False)
+            new_kv = linear_class(
+                in_features=attn.hidden_size,
+                out_features=2 * attn.tp_size * attn.num_attention_kv_heads *
+                attn.attention_head_size,
+                bias=old_qkv.bias,
+                dtype=old_qkv.dtype,
+                tp_group=old_qkv.tp_group,
+                tp_size=old_qkv.tp_size,
+                gather_output=old_qkv.gather_output,
+                prefer_managed_weight=old_qkv.prefer_managed_weight,
+                is_qkv=old_qkv.is_qkv,
+            )
 
             old_qkv_weight_value = old_qkv.weight.raw_value
             if (old_qkv_weight_value.shape == np.asarray([
@@ -1608,6 +1625,9 @@ def preprocess_perlayer_weights(weights,
                     weights[name.replace(
                         'weights_scaling_factor', 'alpha'
                     )] = activation_scaling_factor * weights_scaling_factor_2
+                    weights[name.replace('weights_scaling_factor',
+                                         'activation_scaling_factor'
+                                         )] = activation_scaling_factor
 
     # FP8
     elif quant_algo == QuantAlgo.FP8:
@@ -1630,7 +1650,40 @@ def preprocess_perlayer_weights(weights,
                 model_config.dtype)
             weights.pop('lm_head.weights_scaling_factor', None)
             weights.pop('lm_head.activation_scaling_factor', None)
-
+    # FP4
+    elif quant_algo == QuantAlgo.NVFP4:
+        # Interleave block scale for NVFP4 plugin.
+        for name in list(weights):
+            if name.endswith('weights_scaling_factor'):
+                ori_shape = weights[name].shape
+                new_name = name.replace('weights_scaling_factor',
+                                        'weights_block_scaling_factor')
+                weights[new_name] = weights[name]
+                weights[
+                    new_name +
+                    "_interleaved"] = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
+                        weights[name].view(float4_sf_dtype).cpu().contiguous(
+                        )).reshape(ori_shape).view(float4_sf_dtype)
+                weights.pop(name)
+            if name.endswith('weights_scaling_factor_2'):
+                new_name = name.replace('weights_scaling_factor_2',
+                                        'weights_global_scaling_factor')
+                weights[new_name] = weights[name]
+                weights.pop(name)
+            if name.endswith('activation_scaling_factor'):
+                new_name = name.replace('activation_scaling_factor',
+                                        'activation_global_scaling_factor')
+                weights[new_name] = weights[name]
+                weights.pop(name)
+        for name in list(weights):
+            if name.endswith('weights_global_scaling_factor'):
+                weight_global_sf = weights[name]
+                act_global_sf = weights[name.replace(
+                    'weights_global_scaling_factor',
+                    'activation_global_scaling_factor')]
+                weights[name.replace(
+                    'weights_global_scaling_factor',
+                    'alpha')] = act_global_sf * weight_global_sf
     elif quant_algo in [QuantAlgo.W4A16, QuantAlgo.W8A16]:
         weights = weight_only_quantize_dict(weights=weights,
                                             quant_algo=quant_algo,
@@ -1652,6 +1705,20 @@ def preprocess_weights(weights: Dict[str, torch.Tensor],
     quant_algo = quant_config.quant_algo
 
     pattern_info = ['fc', 'gate', 'proj', 'qkv', 'dense']
+
+    def add_kv_cache_rcp_scaling_factor(weights: Dict[str, torch.Tensor]):
+        new_entries = []
+        # The unified converter generate_tllm_weights() already generates these rcp weights, but legacy
+        # converters do not. Handle it here.
+        for name, param in weights.items():
+            if name.endswith('.kv_cache_scaling_factor'):
+                rcp_name = name.replace('kv_cache_scaling_factor',
+                                        'kv_cache_rcp_scaling_factor')
+                if rcp_name not in weights:
+                    new_entries.append((rcp_name, torch.reciprocal(param)))
+        weights.update(new_entries)
+
+    add_kv_cache_rcp_scaling_factor(weights)
 
     per_layer_weights = {}
 

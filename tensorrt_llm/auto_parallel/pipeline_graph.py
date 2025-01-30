@@ -973,8 +973,8 @@ class PipelineGraph:
                     layer_attrs['start'] = layer.as_trt().start
                 if layer.num_inputs < 4 or layer.get_input(3) is None:
                     attr_value = layer.as_trt().stride
-                    if attr_value != tuple(
-                        [1] * len(layer.get_output(0).shape)):
+                    if attr_value != tuple([1] *
+                                           len(layer.get_output(0).shape)):
                         layer_attrs['stride'] = attr_value
             layer.to_base_class()
 

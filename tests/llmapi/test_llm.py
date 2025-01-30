@@ -21,7 +21,8 @@ from tensorrt_llm.llmapi import (LLM, BuildCacheConfig, GuidedDecodingParams,
                                  KvCacheConfig, LookaheadDecodingConfig,
                                  MedusaDecodingConfig, NoStatsAvailable,
                                  SamplingParams)
-from tensorrt_llm.llmapi.llm_utils import BuildConfig, _ParallelConfig
+from tensorrt_llm.llmapi.llm_utils import (BuildConfig, QuantAlgo, QuantConfig,
+                                           _ParallelConfig)
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase, TransformersTokenizer
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 from tensorrt_llm.lora_manager import LoraConfig
@@ -30,7 +31,7 @@ from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 
 # isort: off
 from utils.llm_data import llm_models_root
-from utils.util import force_ampere, similar, skip_gpu_memory_less_than_40gb
+from utils.util import force_ampere, similar, skip_gpu_memory_less_than_40gb, skip_pre_hopper
 # isort: on
 
 # The unittests are based on the tiny-llama, which is fast to build and run.
@@ -136,6 +137,12 @@ alpaca_chinese_path = str(llm_models_root() / "datasets" / "silk-road" /
 
 prompts = ["A B C"]
 global_kvcache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
+
+# python api does not seem to support extra tokens needed for prompt tuning + reuse.
+# disable block reuse for those tests.
+# TODO: Add extra tokens to prompt tuning unit tests.
+global_kvcache_config_no_reuse = KvCacheConfig(free_gpu_memory_fraction=0.4,
+                                               enable_block_reuse=False)
 
 
 @force_ampere
@@ -770,6 +777,88 @@ def test_generate_with_embedding_bias():
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4))
 
 
+@force_ampere
+def test_invalid_embedding_bias():
+    tokenizer = transformers.AutoTokenizer.from_pretrained(llama_model_path)
+    biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
+    vocab_size_padded = 32000
+
+    # Should raise "Embedding bias data type must be same as model logits type"
+    embedding_bias = torch.zeros(vocab_size_padded, dtype=torch.float16)
+    embedding_bias[biased_word_id] = torch.finfo(torch.float16).max
+
+    llm = LLM(llama_model_path)
+    sampling_params = SamplingParams(max_tokens=6,
+                                     embedding_bias=embedding_bias)
+
+    try:
+        llm.generate(["A B C"], sampling_params=sampling_params)
+    except RequestError:
+        return
+
+    assert (0)
+
+
+@skip_pre_hopper
+def test_generate_with_embedding_bias_fp8():
+    tokenizer = transformers.AutoTokenizer.from_pretrained(llama_model_path)
+    biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
+    vocab_size_padded = 32000
+
+    quant_config = QuantConfig(quant_algo=QuantAlgo.FP8,
+                               kv_cache_quant_algo=QuantAlgo.FP8)
+    assert quant_config.quant_mode.has_any_quant()
+
+    llm = LLM(llama_model_path, quant_config=quant_config)
+
+    # FP32 embedding bias input (will be converted to FP16)
+    embedding_bias = torch.zeros(vocab_size_padded)
+    embedding_bias[biased_word_id] = torch.finfo(torch.float32).max
+    sampling_params = SamplingParams(max_tokens=6,
+                                     embedding_bias=embedding_bias)
+
+    for output in llm.generate(["A B C"], sampling_params=sampling_params):
+        print(output)
+        assert output.outputs[0].text == "Z Z Z Z Z Z"
+
+    # FP16 embedding bias input
+    embedding_bias = torch.zeros(vocab_size_padded, dtype=torch.float16)
+    embedding_bias[biased_word_id] = torch.finfo(torch.float16).max
+
+    sampling_params = SamplingParams(max_tokens=6,
+                                     embedding_bias=embedding_bias)
+
+    for output in llm.generate(["A B C"], sampling_params=sampling_params):
+        print(output)
+        assert output.outputs[0].text == "Z Z Z Z Z Z"
+
+
+@skip_pre_hopper
+def test_invalid_embedding_bias_fp8():
+    tokenizer = transformers.AutoTokenizer.from_pretrained(llama_model_path)
+    biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
+    vocab_size_padded = 32000
+
+    quant_config = QuantConfig(quant_algo=QuantAlgo.FP8,
+                               kv_cache_quant_algo=QuantAlgo.FP8)
+    assert quant_config.quant_mode.has_any_quant()
+
+    llm = LLM(llama_model_path, quant_config=quant_config)
+
+    # Should raise "Embedding bias tensor needs to be in CPU memory for casting"
+    embedding_bias = torch.zeros(vocab_size_padded, device='cuda')
+    embedding_bias[biased_word_id] = torch.finfo(torch.float32).max
+    sampling_params = SamplingParams(max_tokens=6,
+                                     embedding_bias=embedding_bias)
+
+    try:
+        llm.generate(["A B C"], sampling_params=sampling_params)
+    except RequestError:
+        return
+
+    assert (0)
+
+
 class MyLogitsPostProcessor:
 
     def __init__(self, biased_word_id):
@@ -814,7 +903,7 @@ def tinyllama_guided_decoding_test_harness(**llm_kwargs):
         answer: int
 
     json_schema = json.dumps(Answer.model_json_schema())
-    regex = "\d+"
+    regex = r"\d+"
     ebnf_grammar = "root ::= [0-9]+"
 
     sampling_params = [
@@ -898,13 +987,10 @@ def test_llm_api_medusa():
         print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
 
 
-# We are skipping on A30 since it OOM in CI
-def llama_lookahead_decoding_test_harness(**llm_kwargs):
+def tinyllama_lookahead_decoding_test_harness(**llm_kwargs):
     prompts = [
         "A B C",
     ]
-    hf_model_dir = get_model_path("llama-models/llama-7b-hf")
-
     lookahead_config = LookaheadDecodingConfig(max_window_size=3,
                                                max_ngram_size=3,
                                                max_verification_set_size=3)
@@ -924,7 +1010,7 @@ def llama_lookahead_decoding_test_harness(**llm_kwargs):
     references = [
         'D E F G H I J K',
     ]
-    llm_test_harness(hf_model_dir,
+    llm_test_harness(llama_model_path,
                      prompts,
                      references,
                      sampling_params=sampling_params,
@@ -934,9 +1020,9 @@ def llama_lookahead_decoding_test_harness(**llm_kwargs):
                      **llm_kwargs)
 
 
-@skip_gpu_memory_less_than_40gb
-def test_llama_lookahead_decoding():
-    llama_lookahead_decoding_test_harness()
+@force_ampere
+def test_tinyllama_lookahead_decoding():
+    tinyllama_lookahead_decoding_test_harness()
 
 
 @force_ampere
@@ -1071,7 +1157,8 @@ def llama_v2_7b_prompt_adapter_test_harness(**llm_kwargs):
 
 @skip_gpu_memory_less_than_40gb
 def test_llama_v2_7b_prompt_adapter():
-    llama_v2_7b_prompt_adapter_test_harness()
+    llama_v2_7b_prompt_adapter_test_harness(
+        kv_cache_config=global_kvcache_config_no_reuse)
 
 
 @force_ampere
@@ -1239,6 +1326,10 @@ def check_llm_return_context_logits(tp_size=1):
         assert isinstance(output.context_logits, torch.Tensor)
         print(output)
 
+    # Check the WAR for returning logits performance
+    if tp_size == 1:
+        assert isinstance(llm._executor, ExecutorBindingsWorker)
+
 
 def check_llm_return_generation_logits(tp_size=1):
     build_config = BuildConfig(gather_generation_logits=True)
@@ -1256,6 +1347,10 @@ def check_llm_return_generation_logits(tp_size=1):
     for output in llm.generate(prompts, sampling_params=sampling_params):
         assert isinstance(output.outputs[0].generation_logits, torch.Tensor)
         print(output)
+
+    # Check the WAR for returning logits performance
+    if tp_size == 1:
+        assert isinstance(llm._executor, ExecutorBindingsWorker)
 
 
 def test_llm_return_context_logits():
@@ -1455,18 +1550,31 @@ def test_llm_capture_request_error():
 
 def test_llm_api_jupyter_scenario():
 
-    llm = LLM(
-        model=llama_model_path,
-        kv_cache_config=global_kvcache_config,
-    )
-    sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
+    with LLM(
+            model=llama_model_path,
+            kv_cache_config=global_kvcache_config,
+    ) as llm:
 
-    async def task():
-        return llm.generate(["A", "B", "C", "D"], sampling_params)
+        sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
 
-    output = asyncio.run(task())
-    for token in output:
-        print(token)
+        async def task():
+            return llm.generate(["A", "B", "C", "D"], sampling_params)
+
+        output = asyncio.run(task())
+        for token in output:
+            print(token)
+
+
+def test_llm_dynamic_batch_config():
+    scheduler_config = tllm.SchedulerConfig(
+        dynamic_batch_config=tllm.DynamicBatchConfig(
+            enable_batch_size_tuning=True,
+            enable_max_num_tokens_tuning=True,
+            dynamic_batch_moving_average_window=128))
+    llm_test_harness(llama_model_path,
+                     prompts, ["D E F G H I J K"],
+                     sampling_params=SamplingParams(max_tokens=9),
+                     scheduler_config=scheduler_config)
 
 
 if __name__ == '__main__':

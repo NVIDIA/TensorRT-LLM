@@ -14,6 +14,10 @@
  * limitations under the License.
  */
 
+#ifndef TOP_LEVEL_DIR
+#error "Define TOP_LEVEL_DIR"
+#endif
+
 #include "tensorrt_llm/runtime/loraCache.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"

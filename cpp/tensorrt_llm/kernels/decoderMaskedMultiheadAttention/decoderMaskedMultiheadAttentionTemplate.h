@@ -1443,13 +1443,14 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
 
     // The head.
     unsigned const hi{blockIdx.x};
-    // The head index of keys and values adjusted for MQA/GQA.
-    int const qhead_per_kv{params.num_heads / params.num_kv_heads};
-    unsigned const hi_kv{hi / qhead_per_kv};
     // The number of heads.
     auto const num_heads = static_cast<unsigned>(params.num_heads);
     // The number of heads for keys and values adjusted for MQA/GQA.
     auto const num_heads_kv = static_cast<unsigned>(params.num_kv_heads);
+    // The head index of keys and values adjusted for MQA/GQA.
+    auto const qhead_per_kv{num_heads / num_heads_kv};
+    // The head index of keys and values adjusted for MQA/GQA.
+    unsigned const hi_kv{(hi / qhead_per_kv)};
 
     // The thread in the block.
     unsigned const tidx{threadIdx.x};
@@ -2433,7 +2434,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         // Store the values with bias back to global memory in the cache for V.
         //*reinterpret_cast<V_vec_k*>(&v_cache[params.timestep*Dh]) = v;
         // For MQA/GQA mode, write only with the first Q head of each group per KV head.
-        if (hi == (hi_kv * qhead_per_kv) && !DO_CROSS_ATTENTION)
+        if ((hi == (hi_kv * qhead_per_kv)) && !DO_CROSS_ATTENTION)
         {
             if (ENABLE_8BITS_KV_CACHE)
             {

@@ -655,6 +655,10 @@ void TllmRuntime::setUserBufferTensors(SizeType32 contextIndex, TensorMap& tenso
         {
             ubBuffer = tensorrt_llm::runtime::ub::ub_get(1).addr;
         }
+        else if (name[prefix.size()] == '2')
+        {
+            ubBuffer = tensorrt_llm::runtime::ub::ub_get(2).addr;
+        }
         else
         {
             TLLM_CHECK(false);
@@ -671,12 +675,17 @@ void TllmRuntime::initializeUserBuffer(SizeType32 tpSize, SizeType32 maxBatchSiz
     auto startsWith = [](std::string const& str, std::string const& prefix) -> bool
     { return str.size() > prefix.size() && str.compare(0, prefix.size(), prefix) == 0; };
     std::string prefix(tensorrt_llm::runtime::ub::tensor_prefix);
+    bool useNVFP4Model = false;
     for (auto const& name : mOutputTensorNames)
     {
         if (startsWith(name, prefix))
         {
             mUserBufferEnabled = true;
-            break;
+            if (name[prefix.size()] == '2')
+            {
+                useNVFP4Model = true;
+                break;
+            }
         }
     }
     if (!mUserBufferEnabled)
@@ -687,14 +696,16 @@ void TllmRuntime::initializeUserBuffer(SizeType32 tpSize, SizeType32 maxBatchSiz
     size_t realHiddenSize = hiddenSize * tpSize;
     size_t tokensNum = maxNumTokens.value_or(maxBatchSize * maxBeamWidth * maxSequenceLength);
     TLLM_CHECK(tokensNum > 0);
-    size_t maxMessageSize = tokensNum * realHiddenSize * sizeof(half);
+    size_t elemNum = tokensNum * realHiddenSize;
     TLLM_LOG_INFO("[UserBuffer] MaxBatchSize %d, maxBeamWidth %d, maxSequenceLength %d, maxNumTokens %d, select %lu",
         maxBatchSize, maxBeamWidth, maxSequenceLength, maxNumTokens.has_value() ? maxNumTokens.value() : 0, tokensNum);
-    TLLM_LOG_INFO("[UserBuffer] Allocated %.2f MiB for execution context memory.",
-        static_cast<double>(maxMessageSize * 2) / 1048576.0);
     tensorrt_llm::runtime::ub::ub_initialize(tpSize);
-    tensorrt_llm::runtime::ub::ub_allocate(0, maxMessageSize);
-    tensorrt_llm::runtime::ub::ub_allocate(1, maxMessageSize);
+    tensorrt_llm::runtime::ub::ub_allocate(0, elemNum * sizeof(half));
+    tensorrt_llm::runtime::ub::ub_allocate(1, elemNum * sizeof(half));
+    if (useNVFP4Model)
+    {
+        tensorrt_llm::runtime::ub::ub_allocate(2, elemNum * sizeof(uint8_t) / 16);
+    }
 }
 
 CudaStream const& TllmRuntime::getStream() const

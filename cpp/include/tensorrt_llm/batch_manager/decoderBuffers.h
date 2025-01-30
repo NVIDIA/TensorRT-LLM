@@ -141,6 +141,9 @@ public:
 
     void bcast(std::shared_ptr<mpi::MpiComm> const& commSession, bool returnLogProbs, SizeType32 maxBeamWidth,
         bool useMedusa, int root);
+
+    void enableLookaheadDecoding(SizeType32 maxNumSequences, SizeType32 maxTokensPerStep);
+    void disableLookaheadDecoding(SizeType32 maxNumSequences);
 };
 
 class SlotDecoderBuffers

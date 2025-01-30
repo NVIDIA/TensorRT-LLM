@@ -31,7 +31,7 @@
 
 namespace tensorrt_llm::batch_manager
 {
-struct DecoderBuffers;
+class DecoderBuffers;
 }
 
 namespace tensorrt_llm::runtime

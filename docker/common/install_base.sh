@@ -47,41 +47,23 @@ init_ubuntu() {
   pip3 uninstall -y tensorrt
 }
 
-install_gcc_centos() {
-  yum -y update
-  # Use GCC 9 because its STL officially supports C++ 17.
-  # https://gcc.gnu.org/gcc-9/changes.html
-  GCC_VERSION="9.5.0"
-  yum install -y gcc gcc-c++ file libtool make wget bzip2 bison yacc flex
-  wget -q ${GITHUB_URL}/gcc-mirror/gcc/archive/refs/tags/releases/gcc-${GCC_VERSION}.tar.gz -O /tmp/gcc-${GCC_VERSION}.tar.gz
-  tar -xf /tmp/gcc-${GCC_VERSION}.tar.gz -C /tmp/ && cd /tmp/gcc-releases-gcc-${GCC_VERSION}
-  ./contrib/download_prerequisites
-  ./configure --disable-multilib --enable-languages=c,c++ --with-pi
-  make -j$(nproc) && make install
-  echo 'export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib64' >> "${ENV}"
-  cd .. && rm -rf /tmp/gcc-*
-  yum clean all
-}
-
-init_centos_mirror() {
-  # Disable invalid mirrorlist.
-  sed -i -e 's/mirrorlist=/#mirrorlist=/g' /etc/yum.repos.d/CentOS-*
-  # Enable baseurl and replace "#baseurl=http://mirror.centos.org/centos/$releaseveer" with "baseurl=https://vault.centos.org/7.9.2009".
-  sed -E -i -e 's/#baseurl=http:\/\/mirror.centos.org\/centos\/(\$releasever|7)\/([[:alnum:]_-]*)\/\$basearch\//baseurl=https:\/\/vault.centos.org\/7.9.2009\/\2\/\$basearch\//g' /etc/yum.repos.d/CentOS-*
-}
-
-install_python_centos() {
+install_python_rockylinux() {
   PYTHON_VERSION=$1
   PYTHON_MAJOR="3"
   PYTHON_URL="https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tgz"
   PYTHON_ENV_FILE="/tmp/python${PYTHON_VERSION}_env"
-  yum -y update
-  yum -y install centos-release-scl-rh epel-release
-  init_centos_mirror
-  cat "/etc/yum.repos.d/CentOS-SCLo-scl-rh.repo"
-  yum-builddep -y python3 && yum remove -y python3
-  yum install -y wget yum-utils make gcc openssl11 openssl11-devel bzip2-devel libffi-devel zlib-devel
-  ln -sf /usr/lib64/pkgconfig/openssl11.pc /usr/lib64/pkgconfig/openssl.pc
+  dnf makecache --refresh
+  dnf install \
+    epel-release \
+	  curl \
+	  make \
+	  gcc \
+	  openssl-devel \
+	  bzip2-devel \
+	  libffi-devel \
+	  zlib-devel \
+	  xz-devel \
+	  -y
   curl -L ${PYTHON_URL} | tar -zx -C /tmp
   cd /tmp/Python-${PYTHON_VERSION}
   bash -c "./configure --enable-shared --prefix=/opt/python/${PYTHON_VERSION} --enable-ipv6 \
@@ -89,30 +71,36 @@ install_python_centos() {
   ln -s /opt/python/${PYTHON_VERSION}/bin/python3 /usr/local/bin/python
   echo "export PATH=\$PATH:/opt/python/${PYTHON_VERSION}/bin" >> "${PYTHON_ENV_FILE}"
   echo "source ${PYTHON_ENV_FILE}" >> "${ENV}"
-  yum clean all
+  dnf clean all
   cd .. && rm -rf /tmp/Python-${PYTHON_VERSION}
 }
 
-install_pyp_centos() {
+install_pyp_rockylinux() {
   bash -c "pip3 install 'urllib3<2.0' pytest"
 }
 
-install_devtoolset_centos() {
-  DEVTOOLSET_ENV_FILE="/tmp/devtoolset_env"
-  yum -y update
-  yum -y install centos-release-scl-rh epel-release
-  # https://gitlab.com/nvidia/container-images/cuda
+install_gcctoolset_rockylinux() {
+  dnf install -y gcc gcc-c++ file libtool make wget bzip2 bison flex
+  dnf clean all
+  DEVTOOLSET_ENV_FILE="/tmp/gcctoolset_env"
+  # https://catalog.ngc.nvidia.com/orgs/nvidia/containers/cuda
   echo 'export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda/lib64' >> "${ENV}"
-  CUDA_VERSION=$(nvcc --version | sed -n 's/^.*release \([0-9]\+\.[0-9]\+\).*$/\1/p')
-  YUM_CUDA=${CUDA_VERSION/./-}
-  # Consistent with manylinux2014 centos-7 based version
-  yum -y install vim wget git-lfs rh-git227 devtoolset-10 libffi-devel
-  yum -y install openmpi3 openmpi3-devel pigz
-  echo "source scl_source enable rh-git227" >> "${ENV}"
-  echo "source scl_source enable devtoolset-10" >> "${DEVTOOLSET_ENV_FILE}"
+  dnf install \
+	  vim \
+	  wget \
+	  git-lfs \
+	  gcc-toolset-13 \
+	  libffi-devel \
+	  -y
+  dnf install \
+	  openmpi \
+	  openmpi-devel \
+	  pigz \
+	  -y
+  echo "source scl_source enable gcc-toolset-13" >> "${DEVTOOLSET_ENV_FILE}"
   echo "source ${DEVTOOLSET_ENV_FILE}" >> "${ENV}"
-  echo 'export PATH=$PATH:/usr/lib64/openmpi3/bin' >> "${ENV}"
-  yum clean all
+  echo 'export PATH=$PATH:/usr/lib64/openmpi/bin' >> "${ENV}"
+  dnf clean all
 }
 
 # Install base packages depending on the base OS
@@ -122,12 +110,10 @@ case "$ID" in
   ubuntu)
     init_ubuntu
     ;;
-  centos)
-    init_centos_mirror
-    install_python_centos $1
-    install_pyp_centos
-    install_gcc_centos
-    install_devtoolset_centos
+  rocky)
+    install_python_rockylinux $1
+    install_pyp_rockylinux
+    install_gcctoolset_rockylinux
     ;;
   *)
     echo "Unable to determine OS..."

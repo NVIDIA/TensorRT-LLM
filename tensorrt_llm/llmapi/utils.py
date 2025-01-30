@@ -1,11 +1,14 @@
 import asyncio
+import collections
 import hashlib
 import io
 import os
 import sys
 import tempfile
 import threading
+import time
 import traceback
+import warnings
 import weakref
 from functools import cache, wraps
 from pathlib import Path
@@ -160,10 +163,12 @@ class DisabledTqdm(tqdm):
 
 
 def download_hf_model(model: str, revision: Optional[str] = None) -> Path:
+    ignore_patterns = ["original/**/*"]
     with get_file_lock(model):
         hf_folder = snapshot_download(
             model,
             local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+            ignore_patterns=ignore_patterns,
             revision=revision,
             tqdm_class=DisabledTqdm)
     return Path(hf_folder)
@@ -268,15 +273,22 @@ class ManagedThread(threading.Thread):
 
 @cache
 def enable_llm_debug() -> bool:
-    ''' Tell whether to enable the debug mode for LLM class.  '''
+    ''' Tell whether to enable the debug mode for LLM class. '''
     return os.environ.get("TLLM_LLM_ENABLE_DEBUG", "0") == "1"
 
 
+@cache
+def enable_worker_single_process_for_tp1() -> bool:
+    ''' Tell whether to make worker use single process for TP1.
+    This is helpful for return-logits performance and debugging. '''
+    return os.environ.get("TLLM_WORKER_USE_SINGLE_PROCESS", "0") == "1"
+
+
 class AsyncQueue:
-    '''
-    AsyncQueue is container containing `async_q` for `async get` and `sync_q` for sync `get`.
+    """
+    A queue-style container that provides both sync and async interface.
     This is used to provide a compatible interface for janus.Queue.
-    '''
+    """
 
     class EventLoopShutdownError(Exception):
         pass
@@ -285,65 +297,103 @@ class AsyncQueue:
         pass
 
     def __init__(self):
-        self._q = Queue()
-        self.async_q = _AsyncQueue(self._q)
-        self.sync_q = _SyncQueue(self.async_q, self.async_q._event)
+        self._q = collections.deque()
+        self._event = asyncio.Event()
+        self._tainted = False
+        self._sync_q = _SyncQueue(self)
+
+    @property
+    def sync_q(self):
+        return self._sync_q
+
+    def full(self) -> bool:
+        return len(self._q) == self._q.maxlen
+
+    def empty(self) -> bool:
+        return not self._q
+
+    def put(self, item) -> None:
+        self._q.append(item)
+        self._event.set()
+
+    # Decoupled put and notify.
+    # Deque is thread safe so we can put from outside the event loop.
+    # However, we have to schedule notify in event loop because it's not thread safe.
+    # In this case the notify part may get scheduled late, to the point that
+    # corresponding data in deque may have already been consumed.
+    # Avoid firing the event in this case.
+    def put_nowait(self, item) -> None:
+        self._q.append(item)
+
+    def notify(self) -> None:
+        if self._q:
+            self._event.set()
+
+    def unsafe_get(self):
+        # Unsafe get taints the queue, renders it unusable by async methods.
+        self._tainted = True
+        # Use exception to detect empty. Pre-check is not thread safe.
+        try:
+            return self._q.popleft()
+        except IndexError:
+            raise asyncio.QueueEmpty() from None
+
+    async def get(self, timeout=None):
+        if self._tainted:
+            raise AsyncQueue.MixedSyncAsyncAPIError()
+
+        if timeout is None or timeout > 0:
+            # This may raise asyncio.TimeoutError
+            await asyncio.wait_for(self._event.wait(), timeout=timeout)
+        elif not self._q:
+            raise asyncio.QueueEmpty()
+
+        res = self._q.popleft()
+        if not self._q:
+            self._event.clear()
+        return res
 
 
 class _SyncQueue:
-    '''
+    """
     A simplified Queue that provides a `put` method that is compatible with the asyncio event loop.
-    '''
+    """
 
     def __init__(self,
-                 queue: "_AsyncQueue",
-                 event: asyncio.Event,
+                 queue: "AsyncQueue",
                  loop: Optional[asyncio.AbstractEventLoop] = None):
         self._aq = queue
-        self._q = queue._q
-        self._event = event
         self._loop = loop or asyncio.get_event_loop()
 
-        # If this queue is tainted by sync get() call
-        self._tainted = False
+    async def _notify(self):
+        self._aq.notify()
 
     def put(self, item) -> None:
-
-        async def _set_event(queue: "_SyncQueue"):
-            if queue._q.qsize() != 0:
-                self._event.set()
-
-        self._q.put_nowait(item)
-        if self._tainted:
-            return
+        self._aq.put_nowait(item)
 
         if self._loop.is_running():
-            asyncio.run_coroutine_threadsafe(_set_event(self), self._loop)
+            asyncio.run_coroutine_threadsafe(self._notify(), self._loop)
         else:
             raise AsyncQueue.EventLoopShutdownError()
 
     def put_nowait(self, item) -> None:
-        ''' Put item without notify the event. '''
-        self._q.put_nowait(item)
+        """ Put item without notify the event. """
+        self._aq.put_nowait(item)
+
+    # Notify many queues in one coroutine, to cut down context switch overhead.
+    @staticmethod
+    async def _notify_many(queues: Iterable["_SyncQueue"]):
+        for queue in queues:
+            queue._aq.notify()
 
     @staticmethod
-    def notify_queues(loop: asyncio.AbstractEventLoop,
-                      queues: List["_SyncQueue"]) -> None:
-        ''' Notify the events in the loop. '''
-
-        async def _notify_queues(queues: Iterable["_SyncQueue"]):
-            for queue in queues:
-                # If _notify_queues get scheduled late,
-                # corresponding data in queue._q may have
-                # already been consumed.
-                # Avoid notify in this case.
-                if queue._q.qsize() != 0:
-                    queue.event.set()
+    def notify_many(loop: asyncio.AbstractEventLoop,
+                    queues: List["_SyncQueue"]) -> None:
+        """ Notify the events in the loop. """
 
         if loop.is_running():
             asyncio.run_coroutine_threadsafe(
-                _notify_queues(frozenset(q for q in queues if not q._tainted)),
-                loop)
+                _SyncQueue._notify_many(frozenset(queues)), loop)
         else:
             raise AsyncQueue.EventLoopShutdownError()
 
@@ -351,50 +401,24 @@ class _SyncQueue:
     def loop(self) -> asyncio.AbstractEventLoop:
         return self._loop
 
-    @property
-    def event(self) -> asyncio.Event:
-        return self._event
-
     def full(self) -> bool:
-        return self._q.full()
+        return self._aq.full()
 
     def get(self, timeout=None):
         # Here is the WAR for jupyter scenario where trt-llm detects the event loop existence.
         # However, this event loop launched by jupyter rather than trt-llm. It led the GenerationResult initialized
         # w/ AsyncQueue and call the get() unintentionally.
 
-        # However, we cannot make both sync and async method working correctly at the same time.
-        # Mark this queue tainted by sync method, so it can no longer be used by async method.
-        if not self._tainted:
-            self._tainted = True
-            self._aq.taint()
+        warnings.warn(
+            "LLM API is running in async mode because you have a running event loop,"
+            " but you are using sync API. This may lead to potential performance loss."
+        )
 
-        return self._q.get(timeout=timeout)
-
-
-class _AsyncQueue:
-    '''
-    A simplified asyncio.Queue that provides a `get` method that is compatible with the standard library Queue.
-    '''
-
-    def __init__(self, queue: Queue):
-        self._event = asyncio.Event()
-        self._q = queue
-
-    def taint(self):
-        """
-        Invalid this queue, because sync API is used.
-        """
-        self._q = None
-
-    async def get(self, timeout=None):
-        if self._q is None:
-            raise AsyncQueue.MixedSyncAsyncAPIError()
-
-        # This may raise asyncio.TimeoutError
-        await asyncio.wait_for(self._event.wait(), timeout=timeout)
-
-        res = self._q.get()
-        if self._q.qsize() == 0:
-            self._event.clear()
-        return res
+        # We can't call asyncio.run_coroutine_threadsafe(self._aq.get(), self.loop) and wait the returned Future,
+        # since we are in the same event loop, and we can't yield the thread while waiting result.
+        deadline = None if timeout is None else time.time() + timeout
+        while deadline is None or time.time() < deadline:
+            try:
+                return self._aq.unsafe_get()
+            except asyncio.QueueEmpty:
+                time.sleep(0.01)

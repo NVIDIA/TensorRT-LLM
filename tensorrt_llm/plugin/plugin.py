@@ -14,6 +14,7 @@
 # limitations under the License.
 import argparse
 import ctypes
+import os
 import platform
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field, fields
@@ -25,6 +26,7 @@ from typing import List, Optional, Tuple
 import tensorrt as trt
 
 from .._ipc_utils import IpcMemory, can_access_peer
+from .._utils import get_sm_version
 from ..bindings.internal.runtime import lamport_initialize_all
 from ..logger import logger
 from ..mapping import Mapping
@@ -81,7 +83,7 @@ DEFAULT_PLUGIN_DTYPE_OPTIONS = [
 PLUGIN_DTYPE_OPTIONS_MAP = {
     "gemm_swiglu_plugin": ["fp8", None],
     "gemm_plugin":
-    ["auto", "float16", "float32", "bfloat16", "int32", "fp8", None],
+    ["auto", "float16", "float32", "bfloat16", "int32", "fp8", "nvfp4", None],
     "low_latency_gemm_plugin": ["fp8", None],
     "low_latency_gemm_swiglu_plugin": ["fp8", None],
 }
@@ -174,6 +176,7 @@ class PluginConfig(metaclass=PluginConfigMeta):
             "Note: it's only affective for non-quantized gemm operations (except FP8)."
             "Note: For FP8, it also requires same calibration in checkpoint."
         })
+    _explicitly_disable_gemm_plugin: bool = False
     _gemm_swiglu_plugin: Optional[str] = field(
         default=None,
         init=False,
@@ -435,7 +438,15 @@ class PluginConfig(metaclass=PluginConfigMeta):
 
     @classmethod
     def from_arguments(cls, args: argparse.Namespace):
-        return cls.from_dict(vars(args))
+        args = vars(args)
+        obj = cls.from_dict(args)
+
+        # We want to know if the user explicitly disabled the gemm_plugin
+        # because nvfp4 gemm uses plugin by default currently
+        if 'gemm_plugin' in args and args['gemm_plugin'] == 'disable':
+            obj._explicitly_disable_gemm_plugin = True
+
+        return obj
 
     def to_dict(self):
         config = asdict(self)
@@ -459,6 +470,23 @@ class PluginConfig(metaclass=PluginConfigMeta):
                 setattr(self, field_name, None)
             elif field.type == bool or field_name == 'paged_kv_cache':
                 setattr(self, field_name, False)
+
+    def validate(self):
+        unsupported_plugins = {
+            # bert_attention_plugin is handled within BertAttention
+            100: [
+                'gemm_swiglu_plugin', 'fp8_rowwise_gemm_plugin',
+                'low_latency_gemm_plugin', 'low_latency_gemm_swiglu_plugin',
+                'bert_context_fmha_fp32_acc'
+            ]
+        }
+        sm = get_sm_version()
+        if sm in unsupported_plugins:
+            for plugin in unsupported_plugins[sm]:
+                val = getattr(self, plugin, None)
+                if val is not None and val != False:
+                    raise NotImplementedError(
+                        f"{plugin}={val} is not supported on SM {sm}.")
 
     @property
     def context_fmha_type(self):
@@ -521,6 +549,10 @@ class PluginConfig(metaclass=PluginConfigMeta):
         init_all_reduce_helper()
         return self
 
+    def set_lora_plugin(self, dtype: str = None):
+        self.lora_plugin = dtype
+        return self
+
 
 # Only plugin configs in this list will be exposed as `trtllm-build` arguments,
 # others are automatically enabled when needed, no need for users to control.
@@ -570,10 +602,14 @@ def add_plugin_argument(parser: argparse.ArgumentParser):
             plugin_dtype_options = DEFAULT_PLUGIN_DTYPE_OPTIONS
             if field_name in PLUGIN_DTYPE_OPTIONS_MAP:
                 plugin_dtype_options = PLUGIN_DTYPE_OPTIONS_MAP[field_name]
+            if field_name == "gemm_plugin":
+                default = field.default
+            else:
+                default = field.default if field.default else "disable"
             parser.add_argument(
                 "--" + field_name,
                 type=str,
-                default=field.default if field.default else "disable",
+                default=default,
                 choices=[x if x else "disable" for x in plugin_dtype_options],
                 help=help_message)
         elif field.type == bool:
@@ -589,6 +625,11 @@ def add_plugin_argument(parser: argparse.ArgumentParser):
                                 default=field.default,
                                 help=help_message)
     return parser
+
+
+def force_all_reduce_deterministic():
+    return os.getenv("FORCE_DETERMINISTIC", "0") == "1" or os.getenv(
+        "FORCE_ALL_REDUCE_DETERMINISTIC", "0") == "1"
 
 
 class CustomAllReduceHelper:
@@ -632,6 +673,10 @@ class CustomAllReduceHelper:
 
     @staticmethod
     def max_workspace_size_auto(tp_size: int) -> int:
+        if force_all_reduce_deterministic():
+            workspace_size = os.getenv("FORCE_ALLREDUCE_KERNEL_WORKSPACE_SIZE",
+                                       "1000000000")
+            return int(workspace_size)
         if tp_size <= 2:
             return 16_000_000
         return 8_000_000
@@ -640,10 +685,14 @@ class CustomAllReduceHelper:
     def allocate_workspace(mapping: Mapping,
                            size: int) -> Tuple[List[IpcMemory], "torch.tensor"]:
         import torch
+
+        # Force pull mode and disable lamport when force deterministic is enabled, for reducing device memory usage.
+        force_deterministic = force_all_reduce_deterministic()
         is_p2p_supported = can_access_peer(mapping)
-        ipc_buffers_ping = IpcMemory(mapping, size * mapping.tp_size,
+        ipc_buffers_size = size if force_deterministic else size * mapping.tp_size
+        ipc_buffers_ping = IpcMemory(mapping, ipc_buffers_size,
                                      is_p2p_supported)
-        ipc_buffers_pong = IpcMemory(mapping, size * mapping.tp_size,
+        ipc_buffers_pong = IpcMemory(mapping, ipc_buffers_size,
                                      is_p2p_supported)
         ipc_barriers_in = IpcMemory(
             mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size * 2,
@@ -651,11 +700,12 @@ class CustomAllReduceHelper:
         ipc_barriers_out = IpcMemory(
             mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size * 2,
             is_p2p_supported)
-        lamport_buffers_0 = IpcMemory(mapping, size * mapping.tp_size,
+        lamport_buffers_size = 1 if force_deterministic else size * mapping.tp_size
+        lamport_buffers_0 = IpcMemory(mapping, lamport_buffers_size,
                                       is_p2p_supported)
-        lamport_buffers_1 = IpcMemory(mapping, size * mapping.tp_size,
+        lamport_buffers_1 = IpcMemory(mapping, lamport_buffers_size,
                                       is_p2p_supported)
-        lamport_buffers_2 = IpcMemory(mapping, size * mapping.tp_size,
+        lamport_buffers_2 = IpcMemory(mapping, lamport_buffers_size,
                                       is_p2p_supported)
         rank = mapping.rank
         tp_rank = mapping.tp_rank

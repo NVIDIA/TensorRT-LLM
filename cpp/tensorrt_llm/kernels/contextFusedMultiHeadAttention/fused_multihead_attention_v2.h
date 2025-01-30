@@ -251,7 +251,8 @@ public:
     }
 
     // FMHA runner.
-    void run(Fused_multihead_attention_params_v2& params, Launch_params& launch_params, cudaStream_t stream) const
+    void run(
+        Fused_multihead_attention_params_v2& params, Launch_params& launch_params, cudaStream_t stream) const override
     {
         bool forceUnroll = useForceUnroll(params, launch_params);
         auto const findIter = mFunctions.find(hashFromParams(params, launch_params));

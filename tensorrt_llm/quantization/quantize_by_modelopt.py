@@ -22,6 +22,7 @@ import os
 import random
 import sys
 import time
+from importlib.metadata import version
 
 import numpy as np
 import torch
@@ -29,11 +30,13 @@ from accelerate.hooks import remove_hook_from_module
 from datasets import load_dataset
 from safetensors.torch import load_file, save_file
 from torch.utils.data import DataLoader
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import (AutoConfig, AutoModelForCausalLM, AutoProcessor,
+                          AutoTokenizer)
 
 from .._utils import release_gc, str_dtype_to_torch
 from ..logger import logger
 from ..mapping import Mapping
+from .image_processing import MllamaImageProcessor
 from .mode import QuantAlgo
 
 EMPTY_CFG = {
@@ -102,13 +105,17 @@ def quant_cfg_choices():
         "int4_wo": EMPTY_CFG,
         "full_prec": EMPTY_CFG,
     }
+    if hasattr(mtq, "NVFP4_DEFAULT_CFG"):
+        QUANT_CFG_CHOICES["nvfp4"] = mtq.NVFP4_DEFAULT_CFG
     return QUANT_CFG_CHOICES
 
 
 MODEL_NAME_PATTERN_MAP = {
     "GPT2": "gpt2",
     "Xverse": "llama",
+    "MllamaForConditionalGeneration": "mllama",
     "Llama": "llama",
+    "MllamaForCausalLM": "mllama",
     "Mistral": "llama",
     "GPTJ": "gptj",
     "FalconForCausalLM": "falcon",
@@ -125,6 +132,7 @@ MODEL_NAME_PATTERN_MAP = {
     "NemotronForCausalLM": "nemotron",
     "GPTBigCodeForCausalLM": "gpt_bigcode",
     "ArcticForCausalLM": "llama",
+    "PhiMoEForCausalLM": "phi3",
     "Phi3SmallForCausalLM": "phi3small",
     "Phi3ForCausalLM": "phi3",
     "Starcoder2ForCausalLM": "gptnext",
@@ -133,7 +141,11 @@ MODEL_NAME_PATTERN_MAP = {
     "Exaone": "exaone",
     "DeciLMForCausalLM": "deci",
     "DeepseekForCausalLM": "deepseek",
+    "GraniteForCausalLM": "granite",
+    "GraniteMoeForCausalLM": "granitemoe",
 }
+
+MULTIMODAL_DATASETS = ['scienceqa', 'science_qa']
 
 
 class _CustomDataset(torch.utils.data.Dataset):
@@ -173,6 +185,31 @@ def get_tokenizer(ckpt_path, max_seq_length=2048, model_type=None):
     return tokenizer
 
 
+def get_processor(ckpt_path, max_seq_length=2048, model_type=None, device=None):
+    logger.info(f"Initializing tokenizer from {ckpt_path}")
+    processor = AutoProcessor.from_pretrained(
+        ckpt_path,
+        model_max_length=max_seq_length,
+        padding_side="left",
+        trust_remote_code=True,
+    )
+
+    if processor.tokenizer.pad_token is None:
+        if model_type and model_type == "qwen":
+            # qwen use token id 151643 as pad and eos tokens
+            processor.tokenizer.eos_token = processor.tokenizer.convert_ids_to_tokens(
+                151643)
+            processor.tokenizer.pad_token = processor.tokenizer.convert_ids_to_tokens(
+                151643)
+        else:
+            processor.tokenizer.pad_token = processor.tokenizer.eos_token
+    assert processor.tokenizer.pad_token is not None, f"Pad token for {model_type} cannot be set!"
+
+    if model_type == 'mllama':
+        processor = MllamaImageProcessor(processor, device)
+    return processor
+
+
 def _get_vila_model(model_dir):
     sys.path.append(model_dir + "/../VILA")
     from llava.model import LlavaLlamaConfig, LlavaLlamaModel  # noqa
@@ -210,7 +247,10 @@ def _get_llava_qwen_model(model_dir, dtype, device):
     return model
 
 
-def get_model(ckpt_path: str, dtype: str = 'bfloat16', device: str = 'cuda'):
+def get_model(ckpt_path: str,
+              dtype: str = 'bfloat16',
+              device: str = 'cuda',
+              device_map: str = "auto"):
     logger.info(f"Initializing model from {ckpt_path}")
     # Note: VILA model is not in public HF model zoo yet. We need to explicitly import from the git repo
     hf_config = get_hf_config(ckpt_path)
@@ -223,6 +263,10 @@ def get_model(ckpt_path: str, dtype: str = 'bfloat16', device: str = 'cuda'):
     elif hf_config.model_type == "mpt":
         from transformers import MptForCausalLM
         model_cls = MptForCausalLM
+    elif hf_config.model_type == 'mllama':
+        from transformers import MllamaForConditionalGeneration
+        model_cls = MllamaForConditionalGeneration
+
     if "vila" in ckpt_path:
         model = _get_vila_model(ckpt_path)
     elif "llava-onevision-qwen2" in ckpt_path:
@@ -236,11 +280,12 @@ def get_model(ckpt_path: str, dtype: str = 'bfloat16', device: str = 'cuda'):
     else:
         model = model_cls.from_pretrained(
             ckpt_path,
-            device_map="auto" if device != "cpu" else "cpu",
+            device_map=device_map if device != "cpu" else "cpu",
             torch_dtype="auto",
             trust_remote_code=True)
         if hf_config.model_type in ["llava", "internvl_chat"]:
             model = model.language_model
+
     model.eval()
 
     model_dtype = next(model.parameters()).dtype
@@ -253,6 +298,8 @@ def get_model(ckpt_path: str, dtype: str = 'bfloat16', device: str = 'cuda'):
 
 
 def get_model_type(model):
+    if type(model).__name__ in MODEL_NAME_PATTERN_MAP:
+        return MODEL_NAME_PATTERN_MAP[type(model).__name__]
     for k, v in MODEL_NAME_PATTERN_MAP.items():
         if k.lower() in type(model).__name__.lower():
             return v
@@ -273,6 +320,13 @@ def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
             data_files="https://the-eye.eu/public/AI/pile/val.jsonl.zst",
             split="train")
         dataset = dataset["text"][:calib_size]
+    elif "scienceqa" in dataset_name_or_dir.lower(
+    ) or "science_qa" in dataset_name_or_dir.lower():
+        if os.path.isdir(dataset_name_or_dir):
+            dataset = load_dataset(dataset_name_or_dir, split="train")
+        else:
+            dataset = load_dataset("derek-thomas/ScienceQA", split="train")
+        dataset = dataset.select(range(calib_size))
     elif "cnn_dailymail" in dataset_name_or_dir:
         dataset = load_dataset(
             dataset_name_or_dir,
@@ -292,33 +346,48 @@ def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
             f"Unsupported dataset name or local repo directory: {dataset_name_or_dir}."
         )
 
-    batch_encoded = tokenizer.batch_encode_plus(dataset,
-                                                return_tensors="pt",
-                                                padding=True,
-                                                truncation=True,
-                                                max_length=block_size)
+    is_multimodal = False
+    for dataset_name in MULTIMODAL_DATASETS:
+        if dataset_name in dataset_name_or_dir:
+            is_multimodal = True
+    if is_multimodal:
+        # Apply the preprocessing function to the dataset
+        processed_dataset = dataset.map(tokenizer.preprocess_function,
+                                        batched=False,
+                                        remove_columns=dataset.column_names)
 
-    if device:
-        batch_encoded = batch_encoded.to(device)
-
-    if include_labels:
-        # Labels are needed when backward is called in the model.
-        # The labels should be a shifted version of the input_ids.
-        # However, we should not shift the input_ids here since the labels are shifted by
-        # Huggingface models during loss calculation as shown here -
-        # https://github.com/huggingface/transformers/blob/7f79a97399bb52aad8460e1da2f36577d5dccfed/src/transformers/models/llama/modeling_llama.py#L1093-L1095
-        batch_encoded["labels"] = torch.where(
-            batch_encoded["attention_mask"] > 0.5, batch_encoded["input_ids"],
-            -100)
-        batch_encoded = _CustomDataset(batch_encoded)
+        # Create DataLoader with the custom collate function
+        calib_dataloader = DataLoader(processed_dataset,
+                                      batch_size=batch_size,
+                                      shuffle=False,
+                                      collate_fn=tokenizer.collate_function)
     else:
-        # For backward compatibility, if labels are not needed, we only return input_ids.
-        batch_encoded = _CustomDataset(
-            {"input_ids": batch_encoded["input_ids"]})
+        batch_encoded = tokenizer.batch_encode_plus(dataset,
+                                                    return_tensors="pt",
+                                                    padding=True,
+                                                    truncation=True,
+                                                    max_length=block_size)
+        if device:
+            batch_encoded = batch_encoded.to(device)
 
-    calib_dataloader = DataLoader(batch_encoded,
-                                  batch_size=batch_size,
-                                  shuffle=False)
+        if include_labels:
+            # Labels are needed when backward is called in the model.
+            # The labels should be a shifted version of the input_ids.
+            # However, we should not shift the input_ids here since the labels are shifted by
+            # Huggingface models during loss calculation as shown here -
+            # https://github.com/huggingface/transformers/blob/7f79a97399bb52aad8460e1da2f36577d5dccfed/src/transformers/models/llama/modeling_llama.py#L1093-L1095
+            batch_encoded["labels"] = torch.where(
+                batch_encoded["attention_mask"] > 0.5,
+                batch_encoded["input_ids"], -100)
+            batch_encoded = _CustomDataset(batch_encoded)
+        else:
+            # For backward compatibility, if labels are not needed, we only return input_ids.
+            batch_encoded = _CustomDataset(
+                {"input_ids": batch_encoded["input_ids"]})
+
+        calib_dataloader = DataLoader(batch_encoded,
+                                      batch_size=batch_size,
+                                      shuffle=False)
 
     return calib_dataloader
 
@@ -336,7 +405,8 @@ def quantize_model(model, quant_cfg, calib_dataloader, batch_size, qformat,
             return
         with torch.no_grad():
             low_mem_mode = False
-            for _, data in enumerate(calib_dataloader):
+            for idx, data in enumerate(calib_dataloader):
+                logger.debug(f"Calibrating batch {idx}")
                 batch_size = data[list(data.keys())[0]].shape[0]
                 if batch_size == 1:
                     model(**data)
@@ -376,6 +446,13 @@ def quantize_model(model, quant_cfg, calib_dataloader, batch_size, qformat,
     start_time = time.time()
     if auto_quantize_bits:
         logger.info("Starting mixed precision quantization...")
+
+        from packaging import version as v
+        opt_kwargs = {}
+        modelopt_version = version('nvidia-modelopt')
+        if v.parse(modelopt_version) > v.parse("0.21"):
+            opt_kwargs['disabled_layers'] = ["*lm_head*"]
+
         model, search_history = mtq.auto_quantize(
             model,
             data_loader=calib_dataloader,
@@ -390,7 +467,7 @@ def quantize_model(model, quant_cfg, calib_dataloader, batch_size, qformat,
                 len(calib_dataloader), 128 // batch_size
             ),  # Limit the number of score steps to avoid long calibration time
             verbose=True,
-        )
+            **opt_kwargs)
         mtq.print_quant_summary(model)
 
         # We need to explicitly calibrate for kv cache quantization
@@ -517,7 +594,8 @@ def quantize_and_export(*,
                         medusa_hidden_act=None,
                         medusa_model_dir=None,
                         quant_medusa_head=None,
-                        auto_quantize_bits=None):
+                        auto_quantize_bits=None,
+                        device_map="auto"):
     '''
         Load model from the model_dir, call Modelopt to quantize the model, and then export
         the quantized model as TRT-LLM checkpoint
@@ -548,12 +626,17 @@ def quantize_and_export(*,
     hf_config = get_hf_config(model_dir)
     dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
 
-    model = get_model(model_dir, dtype, device=device)
+    model = get_model(model_dir, dtype, device=device, device_map=device_map)
     model_type = get_model_type(model)
     if "vila" in model_dir:
         tokenizer = get_tokenizer(model_dir + "/llm",
                                   max_seq_length=tokenizer_max_seq_length,
                                   model_type=model_type)
+    elif model_type == "mllama":
+        tokenizer = get_processor(model_dir,
+                                  max_seq_length=tokenizer_max_seq_length,
+                                  model_type=model_type,
+                                  device=device)
     else:
         tokenizer = get_tokenizer(model_dir,
                                   max_seq_length=tokenizer_max_seq_length,
@@ -627,6 +710,8 @@ def quantize_and_export(*,
             )
             model_type = f"unknown:{type(model).__name__}"
 
+        architecture = type(model).__name__
+
         export_path = output_dir
         start_time = time.time()
 
@@ -641,6 +726,8 @@ def quantize_and_export(*,
             "w4a8_awq": "W4A8_AWQ",
         }
 
+        if model_type == 'mllama':
+            model = model.language_model
         export_tensorrt_llm_checkpoint(
             model,
             model_type,
@@ -654,6 +741,7 @@ def quantize_and_export(*,
             tensorrt_llm_config = json.load(f)
 
         tensorrt_llm_config["model_type"] = model_type
+        tensorrt_llm_config["architecture"] = architecture
 
         # Workaround for wo quantization
         if qformat in ["int8_wo", "int4_wo", "full_prec"]:
@@ -676,7 +764,7 @@ def quantize_and_export(*,
             json.dump(tensorrt_llm_config, f, indent=4)
 
         # Workaround for Modelopt 0.9.x fp8_kv_cache knob issue
-        if qformat == 'fp8' and kv_cache_dtype is None:
+        if qformat in ['fp8', 'nvfp4'] and kv_cache_dtype is None:
             with open(f"{export_path}/config.json", "r") as f:
                 tensorrt_llm_config = json.load(f)
             tensorrt_llm_config["quantization"]["kv_cache_quant_algo"] = None
@@ -754,6 +842,21 @@ def quantize_and_export(*,
                                   num_medusa_heads, num_medusa_layers,
                                   max_draft_len, medusa_hidden_act,
                                   medusa_model_dir, quant_medusa_head)
+
+        # Workaround for mllama
+        if model_type == 'mllama':
+            from tensorrt_llm.models.mllama.config import MLLaMAConfig
+            config = MLLaMAConfig.from_hugging_face(
+                model_dir,
+                dtype=dtype,
+            )
+            for key, value in config.to_dict().items():
+                if key not in tensorrt_llm_config:
+                    tensorrt_llm_config[key] = value
+
+            with open(f"{export_path}/config.json", "w") as f:
+                json.dump(tensorrt_llm_config, f, indent=4)
+
         end_time = time.time()
         logger.info(
             "Quantized model exported to {} \nTotal time used {:.2f} s.".format(

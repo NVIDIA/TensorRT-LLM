@@ -10,6 +10,7 @@ import click
 import torch.cuda
 
 from tensorrt_llm import logger
+from tensorrt_llm.bindings.executor import CapacitySchedulerPolicy
 from tensorrt_llm.llmapi import BuildConfig
 from tensorrt_llm.llmapi._perf_evaluator import LLMPerfEvaluator
 from tensorrt_llm.llmapi.llm import ModelLoader
@@ -43,33 +44,68 @@ def cli():
     "--cpp-executable",
     type=str,
     default=None,
-    help="Path to the cpp executable, set it if you want to run the cpp benchmark"
-)
+    help=
+    "Path to the cpp executable, set it if you want to run the cpp benchmark")
+@click.option("--backend", type=str, default=None)
+@click.option("--torch-compile/--no-torch-compile", type=bool, default=False)
+@click.option("--torch-compile-fullgraph/--no-torch-compile-fullgraph",
+              type=bool,
+              default=False)
+@click.option("--torch-compile-inductor/--no-torch-compile-inductor",
+              type=bool,
+              default=False)
+@click.option("--cuda-graph/--no-cuda-graph", type=bool, default=False)
+@click.option("--cuda-graph-padding/--no-cuda-graph-padding",
+              type=bool,
+              default=False)
+@click.option("--cuda-graph-batch-sizes", type=str, default=None)
 @click.option("--return-context-logits", type=bool, default=False)
 @click.option("--return-generation-logits", type=bool, default=False)
 @click.option("--kv-cache-free-gpu-mem-fraction", type=float, default=None)
 @click.option("--log-level", type=str, default="warning", show_default=True)
 @click.option("--chunked-context/--no-chunked-context", type=bool, default=True)
+@click.option("--kv-cache-reuse/--no-kv-cache-reuse", type=bool, default=True)
+@click.option("--kv-cache-max-tokens", type=int, default=None)
+@click.option("--overlap-scheduler/--no-overlap-scheduler",
+              type=bool,
+              default=False)
+@click.option("--capacity_scheduler_policy",
+              type=str,
+              default="guaranteed_no_evict")
+@click.option("--fp8-kv-cache/--no-fp8-kv-cache", type=bool, default=False)
 def benchmark_main(
-        model_path: str,
-        samples_path: str,
-        report_path_prefix: str,
-        num_samples: Optional[int] = None,
-        tp_size: int = 1,
-        streaming: bool = False,
-        warmup: int = 2,
-        concurrency: Optional[int] = None,
-        max_num_tokens: int = 2048,
-        max_input_length: int = 200,
-        max_seq_length: int = 400,
-        max_batch_size: int = 128,
-        engine_output_dir: str = "",
-        cpp_executable: Optional[str] = None,
-        return_context_logits=False,
-        return_generation_logits=False,
-        kv_cache_free_gpu_mem_fraction: Optional[float] = None,
-        log_level: str = "warning",
-        chunked_context: bool = True):
+    model_path: str,
+    samples_path: str,
+    report_path_prefix: str,
+    num_samples: Optional[int] = None,
+    tp_size: int = 1,
+    streaming: bool = False,
+    warmup: int = 2,
+    concurrency: Optional[int] = None,
+    max_num_tokens: int = 2048,
+    max_input_length: int = 200,
+    max_seq_length: int = 400,
+    max_batch_size: int = 128,
+    engine_output_dir: str = "",
+    cpp_executable: Optional[str] = None,
+    return_context_logits=False,
+    return_generation_logits=False,
+    kv_cache_free_gpu_mem_fraction: Optional[float] = None,
+    backend: str = None,
+    torch_compile: bool = False,
+    torch_compile_fullgraph: bool = False,
+    torch_compile_inductor: bool = False,
+    cuda_graph: bool = False,
+    cuda_graph_padding: bool = False,
+    cuda_graph_batch_sizes: Optional[str] = None,
+    log_level: str = "warning",
+    chunked_context: bool = True,
+    kv_cache_reuse: bool = True,
+    kv_cache_max_tokens: int = None,
+    overlap_scheduler: bool = False,
+    capacity_scheduler_policy: str = "guaranteed_no_evict",
+    fp8_kv_cache: bool = False,
+):
     ''' Run the benchmark on LLM API.
     If `cpp_executable_path` is provided, it will run the cpp benchmark as well.
     '''
@@ -100,6 +136,44 @@ def benchmark_main(
                                    max_input_len=max_input_length,
                                    max_seq_len=max_seq_length,
                                    max_batch_size=max_batch_size)
+        from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
+        use_cuda_graph = False
+        cuda_graph_batch_sizes = None
+        cuda_graph_max_batch_size = 0
+        cuda_graph_padding_enabled = False
+        enable_overlap_scheduler = False
+        if cuda_graph:
+            use_cuda_graph = True
+            if cuda_graph_batch_sizes is not None:
+                batch_sizes = [
+                    int(size) for size in cuda_graph_batch_sizes.split(",")
+                ]
+                cuda_graph_batch_sizes = batch_sizes
+                cuda_graph_padding_enabled = True
+            else:
+                padding = cuda_graph_padding or max_batch_size <= 256
+                cuda_graph_max_batch_size = max_batch_size
+                cuda_graph_padding_enabled = padding
+        if overlap_scheduler:
+            enable_overlap_scheduler = overlap_scheduler
+        pytorch_config = PyTorchConfig(
+            use_cuda_graph=use_cuda_graph,
+            cuda_graph_batch_sizes=cuda_graph_batch_sizes,
+            cuda_graph_max_batch_size=cuda_graph_max_batch_size,
+            cuda_graph_padding_enabled=cuda_graph_padding_enabled,
+            enable_overlap_scheduler=enable_overlap_scheduler,
+            kv_cache_dtype="fp8" if fp8_kv_cache else "auto",
+            torch_compile_enabled=torch_compile,
+            torch_compile_inductor_enabled=torch_compile_inductor,
+            torch_compile_fullgraph=torch_compile_fullgraph)
+
+        nonlocal capacity_scheduler_policy
+        if capacity_scheduler_policy == "static_batch":
+            capacity_scheduler_policy = CapacitySchedulerPolicy.STATIC_BATCH
+        elif capacity_scheduler_policy == "max_utilization":
+            capacity_scheduler_policy = CapacitySchedulerPolicy.MAX_UTILIZATION
+        else:
+            capacity_scheduler_policy = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
 
         evaluator = LLMPerfEvaluator.create(
             model=model_path,
@@ -115,7 +189,12 @@ def benchmark_main(
             return_context_logits=return_context_logits,
             return_generation_logits=return_generation_logits,
             kv_cache_free_gpu_mem_fraction=kv_cache_free_gpu_mem_fraction,
+            backend=backend,
+            pytorch_backend_config=pytorch_config,
             chunked_context=chunked_context,
+            enable_kv_cache_reuse=kv_cache_reuse,
+            kv_cache_max_tokens=kv_cache_max_tokens,
+            capacity_scheduler_policy=capacity_scheduler_policy,
         )
         assert evaluator
         report = evaluator.run()
@@ -152,6 +231,8 @@ def benchmark_main(
             command = f"mpirun -n {tp_size} {command}"
         if chunked_context:
             command = f"{command} --enable_chunked_context"
+        if not kv_cache_reuse:
+            command = f"{command} --enable_kv_cache_reuse=false"
         print_colored(f'cpp benchmark command: {command}\n', "grey")
         output = subprocess.run(command,
                                 check=True,

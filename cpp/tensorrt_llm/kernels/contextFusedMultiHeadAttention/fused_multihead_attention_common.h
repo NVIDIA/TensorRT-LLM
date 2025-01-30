@@ -105,6 +105,8 @@ struct MHARunnerFixedParams
     int numQHeads;
     // The number of Kv Heads.
     int numKvHeads;
+    // The number of tokens per kv cache block.
+    int numTokensPerBlock;
     // The head size.
     int headSize;
     // The head size of V.
@@ -151,7 +153,9 @@ struct MHARunnerFixedParams
         output += ", attention_input_layout = ";
         switch (attentionInputLayout)
         {
-        case AttentionInputLayout::PACKED_QKV: output += "packed_qkv"; break;
+        case AttentionInputLayout::PACKED_QKV:
+            output += "packed_qkv, num_tokens_per_block = " + std::to_string(numTokensPerBlock);
+            break;
         case AttentionInputLayout::Q_CONTIGUOUS_KV: output += "q_contiguous_kv"; break;
         case AttentionInputLayout::Q_PAGED_KV: output += "q_paged_kv"; break;
         default: TLLM_CHECK_WITH_INFO(false, "not supported.");
@@ -211,6 +215,7 @@ struct MHARunnerParams
     float const* scaleBmm2Ptr;
     // The cuda stream.
     cudaStream_t stream;
+    // Force using fp32 accumulation data type.
     bool forceFp32Acc = false;
 };
 

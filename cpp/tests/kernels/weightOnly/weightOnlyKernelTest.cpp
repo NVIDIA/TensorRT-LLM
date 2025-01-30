@@ -252,6 +252,7 @@ float run_cutlass_kernel(wo::Params& params, int warmup, int iter)
     cudaEvent_t begin, end;
     cudaEventCreate(&begin);
     cudaEventCreate(&end);
+
     auto configs = get_configs(gemm, params.k);
     int ws_bytes = gemm.getWorkspaceSize(params.m, params.n, params.k);
     char* ws_ptr = nullptr;
@@ -259,26 +260,46 @@ float run_cutlass_kernel(wo::Params& params, int warmup, int iter)
         cudaMalloc(&ws_ptr, ws_bytes);
     float fast_time = 1e8;
     auto best_config = configs[0];
+    int cfg_i = 0;
     for (auto& config : configs)
     {
-        for (int i = 0; i < 2; ++i)
+        float time = std::numeric_limits<float>::max();
+        try
         {
-            exec_cutlass_kernel<KT>(scaled_act.data(), gemm, params, config, ws_ptr, ws_bytes, s);
+            for (int i = 0; i < 2; ++i)
+            {
+                exec_cutlass_kernel<KT>(scaled_act.data(), gemm, params, config, ws_ptr, ws_bytes, s);
+            }
+            cudaEventRecord(begin, s);
+            for (int i = 0; i < 5; ++i)
+            {
+                exec_cutlass_kernel<KT>(scaled_act.data(), gemm, params, config, ws_ptr, ws_bytes, s);
+            }
+            cudaEventRecord(end, s);
+            cudaEventSynchronize(end);
+            cudaEventElapsedTime(&time, begin, end);
         }
-        cudaEventRecord(begin, s);
-        for (int i = 0; i < 5; ++i)
+        catch (std::exception const& e)
         {
-            exec_cutlass_kernel<KT>(scaled_act.data(), gemm, params, config, ws_ptr, ws_bytes, s);
+            std::ostringstream msg;
+            msg << "Cannot profile configuration " << cfg_i;
+            if constexpr (std::is_same_v<decltype(config), tensorrt_llm::cutlass_extensions::CutlassGemmConfig>)
+            {
+                msg << ": " << config.toString();
+            }
+            msg << "\n (for"
+                << " m=" << params.m << ", n=" << params.n << ", k=" << params.k << ")"
+                << ", reason: \"" << e.what() << "\". Skipped\n";
+            std::cout << msg.str();
+            cudaGetLastError(); // Reset the last cudaError to cudaSuccess.
+            continue;
         }
-        cudaEventRecord(end, s);
-        cudaEventSynchronize(end);
-        float time;
-        cudaEventElapsedTime(&time, begin, end);
         if (time < fast_time)
         {
             fast_time = time;
             best_config = config;
         }
+        cfg_i++;
     }
 
     for (int i = 0; i < warmup; ++i)
@@ -306,7 +327,7 @@ template <wo::KernelType KT>
 bool benchmark_and_verify(int m, int n, int k, int groupsize, int warmup, int iter)
 {
     std::srand(20240123);
-    simple_assert(m <= 4);
+    simple_assert(m <= 16);
     if constexpr (cutlassTypeMapper<KT>::QuantOp == cutlass::WeightOnlyQuantOp::PER_COLUMN_SCALE_ONLY)
     {
         simple_assert(groupsize == 0);
@@ -371,8 +392,8 @@ bool benchmark_and_verify(int m, int n, int k, int groupsize, int warmup, int it
     d_out.copy_to(h_out2.data());
     float quant_scale = 1.f / (1 << (WSizeInBits - 1));
     bool pass = compare<AType>(h_out1.data(), h_out2.data(), m * n, quant_scale);
-    printf("cuda kernel cost time %.6f, cutlass kernel cost time %.6f, cuda speedup %.3f\n\n", time1, time2,
-        time2 / time1);
+    printf("cuda kernel cost time %.3f us, cutlass kernel cost time %.3f us, cuda speedup %.2f\n\n", time1 * 1000,
+        time2 * 1000, time2 / time1);
     return pass;
 }
 
@@ -381,9 +402,9 @@ TEST(Kernel, WeightOnly)
     int const arch = tensorrt_llm::common::getSMVersion();
     bool pass;
     int warmup = 10, iter = 30;
-    std::vector<int> ms{1, 2, 3, 4};
-    std::vector<int> ns{2048, 4096};
-    std::vector<int> ks{2048, 4096};
+    std::vector<int> ms{2, 4, 6, 8, 10, 12, 14};
+    std::vector<int> ns{4096};
+    std::vector<int> ks{2048};
     for (auto m : ms)
     {
         for (auto n : ns)

@@ -679,8 +679,6 @@ def convert_hf_model(*, hf_model: "AutoModelForCausalLM", mapping: Mapping,
             attn_dense_weight = attn_dense_weight.t()
             int8_weights = generate_int8(
                 attn_dense_weight, act_range.get(prefix + 'self_attn.o_proj'))
-            # import pdb
-            # pdb.set_trace()
             weights.update(
                 get_tllm_linear_sq_weight(
                     int8_weights,

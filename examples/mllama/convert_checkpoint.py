@@ -12,7 +12,7 @@ from tensorrt_llm._utils import release_gc
 from tensorrt_llm.layers import MoeConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models import MLLaMAModel
+from tensorrt_llm.models import MLLaMAForCausalLM
 from tensorrt_llm.models.convert_utils import infer_dtype
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
@@ -298,7 +298,7 @@ def update_quant_config_from_hf(quant_config, hf_config) -> QuantConfig:
 #                       moe_tp_size=args.moe_tp_size,
 #                       moe_ep_size=args.moe_ep_size,
 #                       rank=rank)
-#     llama = MLLaMAModel.from_meta_ckpt(
+#     llama = MLLaMAForCausalLM.from_meta_ckpt(
 #         args.meta_ckpt_dir,
 #         args.dtype,
 #         quant_config=args_to_quant_config(args),
@@ -322,7 +322,7 @@ def args_to_build_options(args):
 def from_cli_args(args):
     n_kv_head = args.n_kv_head if args.n_kv_head is not None else args.n_head
     config = {
-        'architecture': "MLLaMAModel",
+        'architecture': "MLLaMAForCausalLM",
         'dtype': infer_dtype(args.dtype),
         'logits_dtype': 'float32',
         'num_hidden_layers': args.n_layer,
@@ -384,14 +384,15 @@ def convert_and_save_hf(args):
                           moe_tp_size=args.moe_tp_size,
                           moe_ep_size=args.moe_ep_size)
         # TODO: support moe quantization for tp + ep
-        MLLaMAModel.quantize(args.model_dir,
-                             args.output_dir,
-                             dtype=args.dtype,
-                             mapping=mapping,
-                             quant_config=quant_config,
-                             device='cpu' if args.load_model_on_cpu else 'cuda',
-                             calib_dataset=args.calib_dataset,
-                             **override_fields)
+        MLLaMAForCausalLM.quantize(
+            args.model_dir,
+            args.output_dir,
+            dtype=args.dtype,
+            mapping=mapping,
+            quant_config=quant_config,
+            device='cpu' if args.load_model_on_cpu else 'cuda',
+            calib_dataset=args.calib_dataset,
+            **override_fields)
     else:
         # When not loading by shard, preload one complete model and then slice per rank weights from this
         # this saves the disk reloading time
@@ -403,7 +404,7 @@ def convert_and_save_hf(args):
                               moe_tp_size=args.moe_tp_size,
                               moe_ep_size=args.moe_ep_size)
             tik = time.time()
-            llama = MLLaMAModel.from_hugging_face(
+            llama = MLLaMAForCausalLM.from_hugging_face(
                 model_dir,
                 args.dtype,
                 mapping=mapping,

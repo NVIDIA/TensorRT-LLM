@@ -38,6 +38,7 @@ def get_redrafter_tensor_names() -> List[str]:
         'spec_decoding_generation_lengths',
         'spec_decoding_position_offsets',
         'spec_decoding_packed_mask',
+        'spec_decoding_use',
     ] + get_redrafter_specific_tensor_names()
 
 
@@ -121,6 +122,9 @@ def init_allocate_redrafter_tensors(session, batch_size):
         [batch_size, session.max_draft_tokens + 1],
         dtype=torch.int32,
         device=session.device)
+    session.spec_decoding_use = torch.tensor([1],
+                                             dtype=torch.int32,
+                                             device="cpu")
     session.accepted_beam_index = torch.zeros([batch_size],
                                               dtype=torch.int32,
                                               device=session.device)
@@ -145,6 +149,7 @@ def init_allocate_redrafter_tensors(session, batch_size):
         'spec_decoding_position_offsets'] = session.spec_decoding_position_offsets
     session.buffer[
         'spec_decoding_packed_mask'] = session.spec_decoding_packed_mask
+    session.buffer['spec_decoding_use'] = session.spec_decoding_use
     session.buffer[
         'next_spec_decoding_generation_lengths'] = session.next_spec_decoding_generation_lengths
     session.buffer['next_draft_tokens'] = session.next_draft_tokens
@@ -174,6 +179,7 @@ def set_redrafter_ctx_tensors(session, add_tensor, add_tensor_with_bs):
     add_tensor(session.buffer['num_accepted_tokens'], 'num_accepted_tokens')
     add_tensor(session.buffer['accepted_beam_index'], 'accepted_beam_index')
     add_tensor(session.buffer['packed_position_ids'], 'packed_position_ids')
+    add_tensor(session.buffer['spec_decoding_use'], 'spec_decoding_use')
     # add all input tensors
     add_tensor_with_bs(session.buffer['spec_decoding_generation_lengths'],
                        'spec_decoding_generation_lengths', 0)
@@ -211,6 +217,7 @@ def set_redrafter_gen_tensors(session, batch_size, add_tensor,
     add_tensor(session.buffer['num_accepted_tokens'], 'num_accepted_tokens')
     add_tensor(session.buffer['accepted_beam_index'], 'accepted_beam_index')
     add_tensor(session.buffer['packed_position_ids'], 'packed_position_ids')
+    add_tensor(session.buffer['spec_decoding_use'], 'spec_decoding_use')
     # add all input tensors
     add_tensor(session.buffer['spec_decoding_generation_lengths'],
                'spec_decoding_generation_lengths')

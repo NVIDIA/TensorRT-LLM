@@ -7,8 +7,9 @@ import torch
 
 import tensorrt_llm
 from tensorrt_llm import PluginBase, Tensor
-from tensorrt_llm._utils import torch_dtype_to_str, torch_dtype_to_trt
-from tensorrt_llm.python_plugin import SymTensor, TensorWrapper, trtllm_plugin
+from tensorrt_llm._utils import (TensorWrapper, torch_dtype_to_str,
+                                 torch_dtype_to_trt)
+from tensorrt_llm.python_plugin import SymTensor, trtllm_plugin
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "../"))
 from plugin_wrapper_utils import DummyPlugin

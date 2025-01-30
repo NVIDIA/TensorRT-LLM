@@ -53,7 +53,8 @@ public:
     static ITensor::Shape shape(at::IntArrayRef const& sizes)
     {
         TLLM_CHECK(sizes.size() <= ITensor::Shape::MAX_DIMS);
-        ITensor::Shape shape{static_cast<runtime::SizeType32>(sizes.size())};
+        ITensor::Shape shape;
+        shape.nbDims = static_cast<runtime::SizeType32>(sizes.size());
         using dimType = std::remove_reference_t<decltype(shape.d[0])>;
         for (std::size_t i = 0; i < sizes.size(); ++i)
         {

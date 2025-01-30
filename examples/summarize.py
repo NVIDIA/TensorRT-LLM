@@ -414,8 +414,8 @@ def main(args):
         ppls = [[] for _ in range(batch_size)]
         if eval_ppl and batch_size == 1:
             # Only for batch size of 1
-            seq_lens = (output_ids != end_id).logical_and(
-                output_ids != pad_id).sum(dim=-1)
+            seq_lens = (output_ids
+                        != end_id).logical_and(output_ids != pad_id).sum(dim=-1)
             context_logits = context_outputs['logits']
             # Remove the first generation logits which are same to last context logits
             generation_logits = outputs['scores'][1:]
@@ -519,6 +519,10 @@ def main(args):
                 enable_chunked_context=args.enable_chunked_context,
                 multi_block_mode=args.multi_block_mode,
                 cuda_graph_mode=args.cuda_graph_mode)
+            if args.backend is not None:
+                runner_kwargs.update(
+                    backend=args.backend,
+                    py_executor_config={'hf_model_dir': args.hf_model_dir})
         runner_kwargs.update(
             enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc)
         if args.prompt_lookup_config is not None:
@@ -743,15 +747,15 @@ def main(args):
                             f'  {key} : {computed_metrics_tensorrt_llm[key]*100}'
                         )
                     if args.check_accuracy and beam_idx == 0:
-                        assert computed_metrics_tensorrt_llm[
-                            'rouge1'] * 100 > args.tensorrt_llm_rouge1_threshold
+                        rouge1 = computed_metrics_tensorrt_llm['rouge1'] * 100
+                        assert rouge1 > args.tensorrt_llm_rouge1_threshold, f"[FAILED] rouge1 ({rouge1}) is smaller than threshold ({args.tensorrt_llm_rouge1_threshold})."
                 if args.eval_ppl:
                     logger.info(
                         f"  Per-token perplexity: {np.mean(ppls_trt_llm[beam_idx])}"
                     )
                     if args.check_accuracy and beam_idx == 0:
                         avg_ppl = np.mean(ppls_trt_llm[beam_idx])
-                        assert avg_ppl < args.tensorrt_llm_ppl_threshold, f"[FAILED] average PPL ({avg_ppl}) is larger than threshold ({args.tensorrt_llm_ppl_threshold})"
+                        assert avg_ppl < args.tensorrt_llm_ppl_threshold, f"[FAILED] average PPL ({avg_ppl}) is larger than threshold ({args.tensorrt_llm_ppl_threshold})."
         if test_hf:
             np.random.seed(0)  # rouge score use sampling to compute the score
             logger.info(

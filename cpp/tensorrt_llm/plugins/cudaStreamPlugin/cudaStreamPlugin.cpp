@@ -119,7 +119,7 @@ int CudaStreamPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinf
         auto const resource_name = nvinfer1::pluginInternal::SideStream::getResourceKey(mSideStreamId);
         nvinfer1::pluginInternal::SideStream side_stream{};
         mSideStreamPtr = reinterpret_cast<nvinfer1::pluginInternal::SideStream*>(
-            getPluginRegistry()->acquirePluginResource(resource_name, &side_stream));
+            getPluginRegistry()->acquirePluginResource(resource_name.c_str(), &side_stream));
     }
     mSideStreamPtr->waitSideStreamOnMainStream(stream);
     size_t count = 1;
@@ -168,7 +168,7 @@ void CudaStreamPlugin::terminate() noexcept
     if (mSideStreamPtr)
     {
         auto const resource_name = nvinfer1::pluginInternal::SideStream::getResourceKey(mSideStreamId);
-        getPluginRegistry()->releasePluginResource(resource_name);
+        getPluginRegistry()->releasePluginResource(resource_name.c_str());
         mSideStreamPtr = nullptr;
     }
 }

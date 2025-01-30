@@ -15,6 +15,7 @@ from ..bindings import executor as tllm
 from ..builder import EngineConfig
 from ..executor import (GenerationExecutor, GenerationResult, LoRARequest,
                         PromptAdapterRequest)
+from ..inputs import PromptInputs, create_input_processor, prompt_inputs
 from ..logger import logger
 from ..sampling_params import SamplingParams
 from .llm_utils import (LLMARGS_DOCSTRING, CachedModelLoader, LlmArgs,
@@ -82,9 +83,6 @@ class RequestOutput(GenerationResult):
         ]
 
 
-PromptInputs = Union[str, List[int]]
-
-
 @append_docstring(LLMARGS_DOCSTRING)
 class LLM:
     """LLM class is the main class for running a LLM model.
@@ -110,6 +108,8 @@ class LLM:
         self.mpi_session: Optional[MpiSession] = None
 
         try:
+            self.pytorch_backend_config = kwargs.pop('pytorch_backend_config',
+                                                     None)
             self.args = LlmArgs.from_kwargs(
                 model=model,
                 tokenizer=tokenizer,
@@ -122,6 +122,7 @@ class LLM:
                 tokenizer_revision=tokenizer_revision,
                 speculative_model=speculative_model,
                 **kwargs)
+
         except Exception as e:
             logger.error(
                 f"Failed to parse the arguments for the LLM constructor: {e}")
@@ -157,13 +158,13 @@ class LLM:
             self.llm_build_stats = LlmBuildStats()
 
             self._build_model()
-
+            self.input_processor = create_input_processor(model, self.tokenizer)
         except Exception as e:
             if self.mpi_session is not None:
                 self.mpi_session.shutdown()
             raise e
 
-        exception_handler.register(self, '_shutdown')
+        exception_handler.register(self, 'shutdown')
         atexit.register(LLM._shutdown_wrapper, weakref.ref(self))
 
     @property
@@ -180,6 +181,7 @@ class LLM:
                                      Sequence[LoRARequest]]] = None,
         prompt_adapter_request: Optional[Union[
             PromptAdapterRequest, Sequence[PromptAdapterRequest]]] = None,
+        queries: Optional[Union[PromptInputs, Sequence[PromptInputs]]] = None,
     ) -> Union[RequestOutput, List[RequestOutput]]:
         """Generate output for the given prompts in the synchronous mode.
         Synchronous generation accepts either single prompt or batched prompts.
@@ -194,17 +196,24 @@ class LLM:
                 if any. Defaults to None.
             prompt_adapter_request (PromptAdapterRequest, Sequence[PromptAdapterRequest], optional):
                 Prompt Adapter request to use for generation, if any. Defaults to None.
-
+            queries (PromptInputs or Sequence[PromptInputs]): The query text or token ids.
+                it can be single prompt or batched prompts. it is used for star attention to run long context tasks.
         Returns:
             Union[RequestOutput, List[RequestOutput]]: The output data of the completion request to the LLM.
         """
-        if isinstance(inputs, str) or isinstance(inputs[0], str):
-            unbatched = isinstance(inputs, str)
-        else:
-            unbatched = isinstance(inputs[0], int)
+        unbatched = not isinstance(inputs, list)
+        if not unbatched:
+            if isinstance(inputs[0], int):
+                unbatched = True
 
         if unbatched:
             inputs = [inputs]
+            if queries:
+                queries = [queries]
+
+        inputs = [prompt_inputs(i) for i in inputs]
+        if queries:
+            queries = [prompt_inputs(i) for i in queries]
 
         futures = []
         for i, request_inputs in enumerate(inputs):
@@ -220,7 +229,9 @@ class LLM:
                 pa_req = prompt_adapter_request[i]
             else:
                 pa_req = prompt_adapter_request
+            request_queries = None if queries is None else queries[i]
             future = self.generate_async(request_inputs,
+                                         queries=request_queries,
                                          sampling_params=sp,
                                          lora_request=lora_req,
                                          prompt_adapter_request=pa_req,
@@ -245,6 +256,7 @@ class LLM:
         lora_request: Optional[LoRARequest] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         streaming: bool = False,
+        queries: Optional[PromptInputs] = None,
     ) -> RequestOutput:
         """Generate output for the given prompt in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -259,31 +271,52 @@ class LLM:
                 use for generation, if any. Defaults to None.
             streaming (bool): Whether to use the streaming mode for the generation. Defaults to
                 False.
+            queries (PromptInputs or Sequence[PromptInputs]): The query text or token ids.
+                it can be single prompt or batched prompts. it is used for star attention to run long context tasks.
 
         Returns:
             RequestOutput: The output data of the completion request to the LLM.
         """
         sampling_params = self._prepare_sampling_params(sampling_params)
 
-        if isinstance(inputs, str):
-            prompt_token_ids = self._prepare_prompt_token_ids(
-                inputs, sampling_params)
-            prompt = inputs
-        elif isinstance(inputs, list) and isinstance(inputs[0], int):
-            prompt_token_ids = inputs
+        inputs = prompt_inputs(inputs)
+        if queries is not None:
+            queries = prompt_inputs(queries)
+
+        query_token_ids = None
+        prompt_tuning_config = None
+        if "prompt_token_ids" in inputs:
+            prompt_token_ids = inputs['prompt_token_ids']
             prompt = None
+            if queries is not None:
+                query_token_ids = queries['prompt_token_ids']
+        elif "prompt" in inputs:
+            prompt_token_ids, extra_processed_inputs = self.input_processor(
+                inputs, sampling_params)
+            prompt = inputs['prompt']
+            if queries is not None:
+                query_token_ids, _ = self.input_processor(
+                    queries, sampling_params)
+            if extra_processed_inputs is not None:
+                prompt_tuning_config = extra_processed_inputs.get(
+                    'prompt_tuning_config')
         else:
             raise TypeError(
                 f"The inputs must be type str or list of int, but got {type(inputs)}"
             )
 
-        self._check_arguments(prompt_token_ids, sampling_params)
+        self._check_arguments(
+            len(prompt_token_ids),
+            len(query_token_ids) if query_token_ids is not None else 0,
+            sampling_params)
         result = self._executor.generate_async(
             prompt_token_ids,
+            query_token_ids=query_token_ids,
             sampling_params=sampling_params,
             lora_request=lora_request,
             prompt_adapter_request=prompt_adapter_request,
             streaming=streaming,
+            prompt_tuning_config=prompt_tuning_config,
         )
         return RequestOutput(result, prompt, self.tokenizer)
 
@@ -315,21 +348,6 @@ class LLM:
         '''
         return await self._executor.aget_stats(timeout=timeout)
 
-    def _prepare_prompt_token_ids(self, prompt: str,
-                                  sampling_params: SamplingParams) -> List[int]:
-        if self.tokenizer is None:
-            raise ValueError("tokenizer is required to tokenize string prompt")
-
-        if sampling_params.truncate_prompt_tokens is None:
-            return self.tokenizer.encode(
-                prompt, add_special_tokens=sampling_params.add_special_tokens)
-        else:
-            return self.tokenizer.encode(
-                prompt,
-                add_special_tokens=sampling_params.add_special_tokens,
-                truncation=True,
-                max_length=sampling_params.truncate_prompt_tokens)
-
     def _prepare_sampling_params(
             self,
             sampling_params: Optional[SamplingParams] = None) -> SamplingParams:
@@ -353,8 +371,11 @@ class LLM:
                 f"The sampling_params must be type SamplingParams or None, but got {type(sampling_params)}"
             )
 
-    def _check_arguments(self, prompt_token_ids: List[int],
+    def _check_arguments(self, prompt_len: int, query_len: int,
                          sampling_params: SamplingParams) -> None:
+
+        if getattr(self.args, 'backend', None) == 'pytorch':
+            return
 
         build_config = self.args.build_config
 
@@ -363,14 +384,13 @@ class LLM:
             built_enging_cfg = json.load(f)
         max_seq_len = built_enging_cfg['build_config'][
             'max_seq_len'] if 'build_config' in built_enging_cfg else build_config.max_seq_len
-
-        prompt_len = len(prompt_token_ids)
-
         # TODO: Remove this check and left the request verification to cpp runtime
-        if (not self.args.enable_chunked_prefill
-            ) and prompt_len + sampling_params.max_tokens > max_seq_len:
+
+        if (not self.args.enable_chunked_prefill) and (
+                prompt_len / self.args.parallel_config.cp_size + query_len +
+                sampling_params.max_tokens > max_seq_len):
             raise ValueError(
-                f"The sum of prompt length ({prompt_len}) and max_tokens ({sampling_params.max_tokens}) should not exceed "
+                f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}) and query length ({query_len}) max_tokens ({sampling_params.max_tokens}) should not exceed "
                 f"max_seq_len ({build_config.max_seq_len})")
 
         if sampling_params.beam_width > build_config.max_beam_width:
@@ -436,8 +456,19 @@ class LLM:
         if self.args.extended_runtime_perf_knob_config is not None:
             executor_config.extended_runtime_perf_knob_config = self.args.extended_runtime_perf_knob_config
 
-        trt_engine_dir = (self._engine_dir
-                          if self._engine_dir is not None else None)
+        from tensorrt_llm._torch.pyexecutor.config import update_executor_config
+        update_executor_config(
+            executor_config,
+            backend=self.args.backend,
+            pytorch_backend_config=self.pytorch_backend_config,
+            mapping=self.args.parallel_config.to_mapping(),
+            build_config=self.args.build_config,
+            hf_model_dir=self._hf_model_dir,
+            trt_engine_dir=self._engine_dir)
+        executor_config.llm_parallel_config = self.args.parallel_config
+        return_logits = self.args.build_config and (
+            self.args.build_config.gather_context_logits
+            or self.args.build_config.gather_generation_logits)
         self._executor = self._executor_cls.create(
             self._engine_dir,
             executor_config=executor_config,
@@ -446,6 +477,7 @@ class LLM:
             mpi_session=self.mpi_session,
             reuse_mpi_comm=external_mpi_comm_available(
                 self.args.parallel_config.world_size),
+            return_logits=return_logits,
         )
 
     def _try_load_tokenizer(self) -> Optional[TokenizerBase]:
@@ -466,6 +498,9 @@ class LLM:
 
     @property
     def tokenizer(self) -> Optional[TokenizerBase]:
+        if hasattr(self, "input_processor"):
+            if hasattr(self.input_processor, "tokenizer"):
+                return self.input_processor.tokenizer
         return self._tokenizer
 
     def save(self, engine_dir: str):
@@ -483,9 +518,10 @@ class LLM:
         if self._engine_dir.absolute() != os.path.abspath(engine_dir):
             shutil.copytree(self._engine_dir, engine_dir, dirs_exist_ok=True)
 
-    def _shutdown(self):
+    def shutdown(self):
         if hasattr(self, "_executor") and self._executor is not None:
             self._executor.shutdown()
+            self._executor = None
 
         if self.mpi_session is not None:
             self.mpi_session.shutdown()
@@ -496,18 +532,18 @@ class LLM:
         # Retrieve the instance if it still exists
         instance = self_ref()
         if instance is not None:
-            instance._shutdown()
+            instance.shutdown()
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> bool:
         del exc_value, traceback
-        self._shutdown()
+        self.shutdown()
         return False  # propagate exceptions
 
     def __getstate__(self):
         raise RuntimeError("LLM object can not be pickled.")
 
     def __del__(self):
-        self._shutdown()
+        self.shutdown()

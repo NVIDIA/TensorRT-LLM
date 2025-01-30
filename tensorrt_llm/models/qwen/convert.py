@@ -1032,7 +1032,7 @@ def load_weights_from_hf_gptq_model(hf_model, config: QWenConfig):
 
     model_params = {k: v for k, v in hf_model.state_dict().items()}
     torch.cuda.empty_cache()
-    valid_types = ('qwen', 'qwen2')
+    valid_types = ('qwen', 'qwen2', 'qwen2_vl')
     assert qwen_type in valid_types, f"Unsupported Qwen type: {qwen_type}, only {valid_types} are supported for GPTQ."
     layer_prefix = "transformer.h." if qwen_type == 'qwen' else "model.layers."
     key_list = get_qwen_key_list(qwen_type)

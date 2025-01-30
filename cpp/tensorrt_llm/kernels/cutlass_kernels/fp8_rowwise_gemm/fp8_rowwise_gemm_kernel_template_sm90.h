@@ -111,12 +111,12 @@ struct DeviceGemmFp8RowwiseSm90
                                                                           // setting in the Collective Builder
     // Implement rowwise scaling epilogue.
     using XScale = cutlass::epilogue::fusion::Sm90ColBroadcast<0, TileShape, ElementComputeEpilogue,
-        cute::Stride<cute::Int<1>, cute::Int<0>, cute::Int<0>>>;
+        ElementComputeEpilogue, cute::Stride<cute::Int<1>, cute::Int<0>, cute::Int<0>>>;
 
     using WScale = cutlass::epilogue::fusion::Sm90RowBroadcast<0, TileShape, ElementComputeEpilogue,
-        cute::Stride<cute::Int<0>, cute::Int<1>, cute::Int<0>>>;
+        ElementComputeEpilogue, cute::Stride<cute::Int<0>, cute::Int<1>, cute::Int<0>>>;
 
-    using Bias = cutlass::epilogue::fusion::Sm90RowBroadcast<0, TileShape, ElementBias,
+    using Bias = cutlass::epilogue::fusion::Sm90RowBroadcast<0, TileShape, ElementBias, ElementBias,
         cute::Stride<cute::Int<0>, cute::Int<1>, cute::Int<0>>>;
 
     using Accum = cutlass::epilogue::fusion::Sm90AccFetch;

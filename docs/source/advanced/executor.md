@@ -102,6 +102,36 @@ Each request can be optionally specified with a `GuidedDecodingParams`, which de
 
 The latter three types should be used with the schema/regex/grammar provided to `GuidedDecodingParams`.
 
+### Obtaining Arbitrary Output Tensors
+The executor API gives the user the possibility to read the arbitrary outputs from the model. For example, it is possible to obtain hidden states or logits.
+
+#### Mark Tensors As Output
+For a tensor to be obtainable using this feature, it needs to be marked as an output in your TensorRT engine, as part of the engine building process.
+
+#### Configure The Executor
+Assuming the TensorRT engine you are planning to use has a tensor named `TopKLogits` marked as output, you should then configure the `Executor` to read from this output tensor by passing its name to the `ExecutorConfig` configuration object:
+```cpp
+auto const executorConfig = ExecutorConfig{};
+
+// ... set more configuration options if needed
+
+executorConfig.setAdditionalOutputNames(std::vector<std::string>{"TopKLogits"});
+
+// ... create the `Executor` instance
+```
+
+### Request Additional Output
+Construct a request to enqueue in the executor to query this tensor output:
+```cpp
+std::vector<executor::OutputConfig::AdditionalModelOutput> additionalOutputs{
+    executor::OutputConfig::AdditionalModelOutput{"TopKLogits", /*whether or not to get the output for the context too */ true}};
+executor::Request request{requestTokens, parameters.maxOutputLength, true, executor::SamplingConfig{},
+    executor::OutputConfig{false, false, false, true, false, false, additionalOutputs}};
+executor.enqueueRequest(request);
+```
+
+The output can be found at the `additionalOutputs` property of each response.
+
 ## C++ Executor API Example
 
 Two C++ examples are provided that shows how to use the Executor API and can be found in the [`examples/cpp/executor`](source:examples/cpp/executor/) folder.

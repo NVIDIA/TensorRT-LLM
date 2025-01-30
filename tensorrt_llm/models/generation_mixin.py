@@ -543,7 +543,7 @@ class GenerationMixin:
         streamingllm: bool = False,
         opt_batch_size=None,
         pp_reduce_scatter: bool = False,
-        mrope_rotary_sin_cos_size: int = None,
+        mrope_rotary_cos_sin_size: int = None,
     ):
 
         enable_ctx_gen_opt_profiles = GenerationMixin.has_ctx_gen_opt_profiles(
@@ -812,6 +812,13 @@ class GenerationMixin:
                     ('spec_decoding_packed_mask_dim1', packed_mask_len_range),
                 ]),
             )
+            spec_decoding_use = Tensor(name='spec_decoding_use',
+                                       dtype=trt.int32,
+                                       shape=[1],
+                                       dim_range=OrderedDict([
+                                           ('spec_decoding_use_dim',
+                                            [1] * num_profiles),
+                                       ]))
             spec_decoding_params = SpecDecodingParams(
                 spec_decoding_is_generation_length_variable=
                 spec_decoding_is_generation_length_variable,
@@ -819,19 +826,21 @@ class GenerationMixin:
                 spec_decoding_generation_lengths=
                 spec_decoding_generation_lengths,
                 spec_decoding_position_offsets=spec_decoding_position_offsets,
-                spec_decoding_packed_mask=spec_decoding_packed_mask)
+                spec_decoding_packed_mask=spec_decoding_packed_mask,
+                spec_decoding_use=spec_decoding_use)
 
         mrope_params = None
-        if mrope_rotary_sin_cos_size is not None:
-            mrope_rotary_sin_cos = Tensor(
-                name='mrope_rotary_sin_cos',
+        if mrope_rotary_cos_sin_size is not None:
+            mrope_rotary_cos_sin = Tensor(
+                name='mrope_rotary_cos_sin',
                 dtype=trt.float32,
-                shape=[-1, mrope_rotary_sin_cos_size],
+                shape=[-1, mrope_rotary_cos_sin_size],
                 dim_range=OrderedDict([
                     ('batch_size_beam_width', bb_range),
-                    ('mult_dim', [mrope_rotary_sin_cos_size] * num_profiles),
+                    ('mult_dim', [mrope_rotary_cos_sin_size] * num_profiles),
                 ]),
             )
+
             mrope_position_deltas = Tensor(
                 name='mrope_position_deltas',
                 dtype=trt.int32,
@@ -839,9 +848,8 @@ class GenerationMixin:
                 dim_range=OrderedDict([('batch_size_beam_width', bb_range),
                                        ('mult_dim_delta', [1] * num_profiles)]),
             )
-
             mrope_params = MropeParams(
-                mrope_rotary_sin_cos=mrope_rotary_sin_cos,
+                mrope_rotary_cos_sin=mrope_rotary_cos_sin,
                 mrope_position_deltas=mrope_position_deltas,
             )
 

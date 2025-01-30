@@ -111,10 +111,14 @@ class GemmaConfig(PretrainedConfig):
 
         return {
             **super().to_dict(),
-            **{f: getattr(self, f)
-               for f in self.GEMMA_ADDED_FIELDS},
-            **({f: getattr(self, f)
-                for f in self.GEMMA2_ADDED_FIELDS} if self.is_gemma_2 else {})
+            **{
+                f: getattr(self, f)
+                for f in self.GEMMA_ADDED_FIELDS
+            },
+            **({
+                f: getattr(self, f)
+                for f in self.GEMMA2_ADDED_FIELDS
+            } if self.is_gemma_2 else {})
         }
 
     @classmethod

@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <initializer_list>
 #include <string>
 
 #ifndef _WIN32
@@ -33,6 +35,12 @@ inline bool setThreadName(std::string const& name)
     auto const ret = pthread_setname_np(pthread_self(), name.c_str());
     return !ret;
 #endif
+}
+
+template <typename T>
+bool contains(std::initializer_list<T> const& c, T const& v)
+{
+    return std::find(c.begin(), c.end(), v) != c.end();
 }
 
 } // namespace tensorrt_llm::common

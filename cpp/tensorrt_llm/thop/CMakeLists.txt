@@ -12,7 +12,7 @@
 # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations under
 # the License.
-add_library(th_utils STATIC thUtils.cu)
+add_library(th_utils STATIC thUtils.cpp)
 set_property(TARGET th_utils PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET th_utils PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 target_link_libraries(th_utils PUBLIC ${TORCH_LIBRARIES} ${CUBLAS_LIB}
@@ -22,16 +22,23 @@ add_library(
   th_common SHARED
   allgatherOp.cpp
   allreduceOp.cpp
+  attentionOp.cpp
   convertSpecDecodingMaskToPackedMaskOp.cpp
+  cutlassScaledMM.cpp
+  cublasScaledMM.cpp
   dynamicDecodeOp.cpp
   fmhaPackMaskOp.cpp
   fp8Op.cpp
+  fp4Op.cpp
+  fp4Gemm.cpp
+  fp4Quantize.cpp
   gatherTreeOp.cpp
   moeOp.cpp
   ncclCommunicatorOp.cpp
   parallelDecodeKVCacheUpdateOp.cpp
   redrafterCurandOp.cpp
   relativeAttentionBiasOp.cpp
+  userbuffersFinalizeOp.cpp
   weightOnlyQuantOp.cpp)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(th_common PRIVATE ${TORCH_LIBRARIES} th_utils
@@ -48,4 +55,6 @@ if(NOT WIN32)
     th_common
     PROPERTIES LINK_FLAGS
                "-Wl,-rpath='$ORIGIN' ${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
+else()
+  target_link_libraries(th_common PRIVATE context_attention_src)
 endif()

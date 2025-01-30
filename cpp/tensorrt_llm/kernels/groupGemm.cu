@@ -226,7 +226,7 @@ void groupedGemm(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vecto
         }
         else if (minKN >= 1)
         {
-            groupedGemmType_<16, 32, 64, 16, 32, 64, 8, 1, 1>(problem_sizes, ptrA, ptrB, ptrC, ptrD,
+            groupedGemmType_<16, 32, 64, 16, 32, 64, 8, 1, 2>(problem_sizes, ptrA, ptrB, ptrC, ptrD,
                 gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize, dataType, stream);
         }
     }

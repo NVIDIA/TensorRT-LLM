@@ -8,6 +8,7 @@ from typing import (Any, Callable, ClassVar, Dict, List, Optional, Set, Tuple,
 
 import tensorrt as trt
 
+from ._utils import trt_gte
 from .logger import logger
 from .network import Network
 
@@ -150,6 +151,10 @@ class Layer:
         trt.LayerType.NORMALIZATION: trt.INormalizationLayer,
         trt.LayerType.CAST: trt.ICastLayer,
     }
+
+    if trt_gte(10, 8):
+        TRT_LAYER_TYPE_TO_LAYER[
+            trt.LayerType.DYNAMIC_QUANTIZE] = trt.IQuantizeLayer
 
     def as_layer(self) -> Any:
         '''
@@ -628,8 +633,8 @@ class FuseAttentionWithBiasPass(PatternRewriter):
                 return False
             plugin_flayer = FLayerInfoMemo.instance().get(layer.name)
             input = plugin_flayer.raw_inputs['qkv']
-            if input is None or isinstance(
-                    input, list) or len(list(input.get_users())) != 1:
+            if input is None or isinstance(input, list) or len(
+                    list(input.get_users())) != 1:
                 return False
             parent_layer = input.get_parent()
             if not self.is_elementwise_sum(parent_layer):

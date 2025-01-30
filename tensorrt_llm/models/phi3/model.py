@@ -43,8 +43,8 @@ class Phi3DecoderLayer(Module):
             attention_head_size = hidden_size / num_attention_heads
             q_scaling = attention_head_size**.5
 
-            block_sparse = (
-                (layer_idx + 1) % config.dense_attention_every_n_layers) != 0
+            block_sparse = ((layer_idx + 1) %
+                            config.dense_attention_every_n_layers) != 0
             attention_mask_type = AttentionMaskType.blocksparse if block_sparse else AttentionMaskType.causal
 
             block_sparse_attn_params = BlockSparseAttnParams(

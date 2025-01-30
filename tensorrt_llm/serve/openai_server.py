@@ -80,7 +80,7 @@ class OpenAIServer:
         async def lifespan(app: FastAPI):
             # terminate rank0 worker
             yield
-            self.llm._shutdown()
+            self.llm.shutdown()
 
         self.app = FastAPI(lifespan=lifespan)
 

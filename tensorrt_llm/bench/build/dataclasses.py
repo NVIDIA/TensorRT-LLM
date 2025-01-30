@@ -48,7 +48,10 @@ class ModelConfig(BaseModel):
         """ Read the parameter count from HF safetensor metadata. """
         if model_hf_name == "EleutherAI/gpt-j-6b":  # GPT-J repo doesn't use safetensor format.
             param_count = 6053381344
+        elif model_hf_name == "meta-llama/Llama-3.1-8B":
+            param_count = 8030261248
         else:
+            # TODO: This function requires HF token to access the metadata.
             metadata = get_safetensors_metadata(model_hf_name)
             param_count = metadata.parameter_count.get(
                 'F16', metadata.parameter_count.get('BF16', None))
