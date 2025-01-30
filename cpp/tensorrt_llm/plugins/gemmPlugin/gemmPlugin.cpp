@@ -114,8 +114,8 @@ bool CublasLtGemmPluginProfiler::checkTactic(int m, int n, int k, Config const& 
 
 void CublasLtGemmPluginProfiler::computeTmpSize(size_t maxM, size_t n, size_t k)
 {
-    size_t dataSize = typeSize(mType);
-    size_t outputDataSize = typeSize(mOutputType);
+    size_t dataSize = getDTypeSize(mType);
+    size_t outputDataSize = getDTypeSize(mOutputType);
 
     std::vector<size_t> workspaces = {
         maxM * k * dataSize,                   // A
@@ -184,11 +184,13 @@ GemmPlugin::GemmPlugin(void const* data, size_t length, GemmPlugin::PluginProfil
         (int) length, (int) (d - a));
 }
 
+thread_local CublasGemmWrapperPtr GemmPlugin::mCublasWrapper = nullptr;
+
 void GemmPlugin::init()
 {
-    mcublasHandle = getCublasHandle();
-    mcublasLtHandle = getCublasLtHandle();
-    mCublasWrapper = getCublasMMWrapper(mcublasHandle, mcublasLtHandle, nullptr, nullptr);
+    auto cublasHandle = getCublasHandle();
+    auto cublasLtHandle = getCublasLtHandle();
+    mCublasWrapper = std::make_shared<CublasMMWrapper>(cublasHandle, cublasLtHandle, nullptr, nullptr);
 
     mPluginProfiler->setTranspose(mTransA, mTransB);
     mPluginProfiler->setOutputType(mOutputType);
@@ -349,9 +351,12 @@ int GemmPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::P
     //     mat2 [K, N] (mTransB = False)
     // outputs
     //     mat [M, N]
-    mcublasHandle = getCublasHandle();
-    mcublasLtHandle = getCublasLtHandle();
-    mCublasWrapper = getCublasMMWrapper(mcublasHandle, mcublasLtHandle, nullptr, nullptr);
+    if (mCublasWrapper == nullptr)
+    {
+        auto cublasHandle = getCublasHandle();
+        auto cublasLtHandle = getCublasLtHandle();
+        mCublasWrapper = std::make_shared<CublasMMWrapper>(cublasHandle, cublasLtHandle, nullptr, nullptr);
+    }
     setGemmConfig();
 
     int const nbDimsA = inputDesc[0].dims.nbDims;

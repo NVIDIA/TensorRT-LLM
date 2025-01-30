@@ -18,8 +18,10 @@
 
 #include "tensorrt_llm/common/customAllReduceUtils.h"
 #include "tensorrt_llm/common/dataType.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
+#include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/kernels/userbuffers/ub_interface.h"
 #include <nccl.h>
 #include <unordered_set>
@@ -98,6 +100,34 @@ nvinfer1::IPluginV2DynamicExt* AllreducePlugin::clone() const noexcept
 nvinfer1::DimsExprs AllreducePlugin::getOutputDimensions(
     int outputIndex, nvinfer1::DimsExprs const* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
 {
+    if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4 && mStrategy == AllReduceStrategyType::UB && mScale)
+    {
+        if (outputIndex == 0)
+        {
+            DimsExprs ret;
+            ret.nbDims = inputs[0].nbDims;
+            for (int di = 0; di < ret.nbDims; ++di)
+            {
+                ret.d[di] = inputs[0].d[di];
+            }
+            return ret;
+        }
+        else if (outputIndex == 2)
+        {
+            DimsExprs ret;
+            ret.nbDims = inputs[0].nbDims;
+            for (int di = 0; di < ret.nbDims; ++di)
+            {
+                ret.d[di] = inputs[0].d[di];
+            }
+            auto dimM = exprBuilder.operation(
+                DimensionOperation::kCEIL_DIV, *ret.d[ret.nbDims - 2], *exprBuilder.constant(128));
+            ret.d[ret.nbDims - 2] = exprBuilder.operation(DimensionOperation::kPROD, *dimM, *exprBuilder.constant(128));
+            ret.d[ret.nbDims - 1] = exprBuilder.operation(
+                DimensionOperation::kCEIL_DIV, *ret.d[ret.nbDims - 1], *exprBuilder.constant(16));
+            return ret;
+        }
+    }
     return inputs[0];
 }
 
@@ -120,6 +150,8 @@ bool AllreducePlugin::supportsFormatCombination(
         ++fusion_op_extra_inputs;
         if (mAffine)
         {
+            if (mOp == AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM)
+                ++fusion_op_extra_inputs;
             ++fusion_op_extra_inputs;
         }
         if (mBias)
@@ -139,13 +171,30 @@ bool AllreducePlugin::supportsFormatCombination(
     {
         return (inOut[pos].type == nvinfer1::DataType::kINT64) && (inOut[pos].format == TensorFormat::kLINEAR);
     }
-    if (mOp != AllReduceFusionOp::NONE && mScale && pos == scale_idx)
+    if (mStrategy == AllReduceStrategyType::UB)
     {
-        return (inOut[pos].type == nvinfer1::DataType::kFLOAT) && (inOut[pos].format == TensorFormat::kLINEAR);
-    }
-    if (mStrategy == AllReduceStrategyType::UB && mOp != AllReduceFusionOp::NONE && mScale && pos == nbInputs)
-    {
-        return (inOut[pos].type == nvinfer1::DataType::kFP8) && (inOut[pos].format == TensorFormat::kLINEAR);
+        if (mScale && pos == scale_idx)
+        {
+            return (inOut[pos].type == nvinfer1::DataType::kFLOAT) && (inOut[pos].format == TensorFormat::kLINEAR);
+        }
+        if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4)
+        {
+            if (pos == nbInputs)
+            {
+                return (inOut[pos].type == nvinfer1::DataType::kFP4) && (inOut[pos].format == TensorFormat::kLINEAR);
+            }
+            if (pos == (nbInputs + 2))
+            {
+                return (inOut[pos].type == nvinfer1::DataType::kFP8) && (inOut[pos].format == TensorFormat::kLINEAR);
+            }
+        }
+        if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8)
+        {
+            if (pos == nbInputs)
+            {
+                return (inOut[pos].type == nvinfer1::DataType::kFP8) && (inOut[pos].format == TensorFormat::kLINEAR);
+            }
+        }
     }
     return (inOut[pos].type == mType) && (inOut[pos].format == TensorFormat::kLINEAR);
 }
@@ -166,16 +215,23 @@ AllReduceStrategyType AllreducePlugin::selectImplementation(
 {
     bool const isAuto = (mStrategy == AllReduceStrategyType::AUTO);
 
+    bool const forceDeterministic = common::getEnvForceDeterministicAllReduce();
     if (!mIsP2PSupported)
     {
         if (!isAuto)
         {
             TLLM_LOG_INFO("Since Peer to Peer not supported, fallback to AllReduceStrategy: NCCL");
         }
+        else if (forceDeterministic)
+        {
+            TLLM_LOG_WARNING(
+                "Since Peer to Peer not supported, fallback to AllReduceStrategy: NCCL. NCCL might produce "
+                "non-deterministic results.");
+        }
         return AllReduceStrategyType::NCCL;
     }
 
-    if (isAuto && !mIsNVLINKSupported)
+    if (isAuto && !mIsNVLINKSupported && !forceDeterministic)
     {
         return AllReduceStrategyType::NCCL;
     }
@@ -193,6 +249,10 @@ AllReduceStrategyType AllreducePlugin::selectImplementation(
         if (!isAuto)
         {
             strat = mStrategy;
+        }
+        else if (forceDeterministic)
+        {
+            strat = AllReduceStrategyType::ONESHOT;
         }
         else if (worldSize <= 2)
         {
@@ -225,7 +285,13 @@ AllReduceStrategyType AllreducePlugin::selectImplementation(
         {
             if (!isAuto)
             {
-                TLLM_LOG_WARNING("Since not alignment, fallback to AllReduceStrategy: NCCL");
+                TLLM_LOG_WARNING("Since not aligned, fallback to AllReduceStrategy: NCCL");
+            }
+            else if (forceDeterministic)
+            {
+                TLLM_LOG_WARNING(
+                    "Since not aligned, fallback to AllReduceStrategy: NCCL. NCCL might produce "
+                    "non-deterministic results.");
             }
             strat = AllReduceStrategyType::NCCL;
         }
@@ -235,6 +301,12 @@ AllReduceStrategyType AllreducePlugin::selectImplementation(
         if (!isAuto)
         {
             TLLM_LOG_WARNING("Since messageSize > maxWorkspace, fallback to AllReduceStrategy: NCCL");
+        }
+        else if (forceDeterministic)
+        {
+            TLLM_LOG_WARNING(
+                "Since messageSize > maxWorkspace, fallback to AllReduceStrategy: NCCL. NCCL might produce "
+                "non-deterministic results.");
         }
         strat = AllReduceStrategyType::NCCL;
     }
@@ -302,7 +374,7 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
 
     if (runtimeStrategy == AllReduceStrategyType::NCCL)
     {
-        if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
+        if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM || mOp == AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM)
         {
             NCCLCHECK(ncclAllReduce(inputs[0], outputs[1], size, (*getDtypeMap())[mType], ncclSum, *mNcclComm, stream));
             tensorrt_llm::kernels::AllReduceParams params;
@@ -318,12 +390,17 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
             params.fusion_params.bias_buffer = mBias ? inputs[fusion_ptr_idx++] : nullptr;
             params.fusion_params.residual_buffer = inputs[fusion_ptr_idx++];
             params.fusion_params.weight_buffer = mAffine ? inputs[fusion_ptr_idx++] : nullptr;
+            if (mOp == AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM)
+            {
+                params.fusion_params.weight_buffer_pre_residual_norm = mAffine ? inputs[fusion_ptr_idx++] : nullptr;
+            }
             params.local_output_buffer_ptr = outputs[0];
             params.elts_total = size;
             params.fusion_params.hidden_size = inputDesc[0].dims.d[inputDesc[0].dims.nbDims - 1];
             params.fusion_params.eps = mEps;
             params.fusion_params.intermediate_buffer = outputs[1];
-            tensorrt_llm::kernels::residualRmsNorm(params, mType, stream);
+            TLLM_LOG_DEBUG("residualRmsNorm called");
+            tensorrt_llm::kernels::residualRmsNorm(params, mType, stream, mOp);
         }
         else
         {
@@ -343,7 +420,7 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
         auto ub_buffer1 = tensorrt_llm::runtime::ub::ub_get(1);
         TLLM_CHECK(inputs[0] == ub_buffer0.addr);
         auto ub_comm = tensorrt_llm::runtime::ub::ub_comm();
-        if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
+        if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8)
         {
             TLLM_CHECK(mAffine);
             TLLM_CHECK(mScale);
@@ -354,6 +431,20 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
             tensorrt_llm::kernels::ub::allreduce2_userbuff_inplace_rmsnorm_quant_launcher(ub_buffer0.handle, 0,
                 ub_buffer1.handle, 0, size, hidden_size, nullptr, gamma, mEps, scale, residual, outputs[1], mType,
                 ub_comm, stream);
+        }
+        else if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4)
+        {
+            auto ub_buffer2 = tensorrt_llm::runtime::ub::ub_get(2);
+            TLLM_CHECK(mAffine);
+            TLLM_CHECK(mScale);
+            TLLM_CHECK(outputs[0] == ub_buffer1.addr);
+            TLLM_CHECK(outputs[2] == ub_buffer2.addr);
+            void* residual = const_cast<void*>(inputs[1]);
+            void* gamma = const_cast<void*>(inputs[2]);
+            float* scale = const_cast<float*>(reinterpret_cast<float const*>(inputs[3]));
+            tensorrt_llm::kernels::ub::allreduce2_userbuff_inplace_rmsnorm_quant_fp4_launcher(ub_buffer0.handle, 0,
+                ub_buffer1.handle, 0, ub_buffer2.handle, 0, size, hidden_size, nullptr, gamma, mEps, scale, residual,
+                outputs[1], mType, ub_comm, stream);
         }
         else if (mOp == AllReduceFusionOp::LAST_PROCESS_FOR_UB)
         {
@@ -366,12 +457,16 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
             TLLM_CUDA_CHECK(
                 cudaMemcpyAsync(outputs[0], ub_buffer0.addr, size * dtype_size, cudaMemcpyDeviceToDevice, stream));
         }
-        else
+        else if (mOp == AllReduceFusionOp::NONE)
         {
             tensorrt_llm::kernels::ub::allreduce2_userbuff_inplace_launcher(
                 ub_buffer0.handle, 0, size, mType, ub_comm, stream);
             TLLM_CUDA_CHECK(
                 cudaMemcpyAsync(outputs[0], ub_buffer0.addr, size * dtype_size, cudaMemcpyDeviceToDevice, stream));
+        }
+        else
+        {
+            TLLM_CHECK_WITH_INFO(false, "Unsupported UB allreduce fusion op");
         }
     }
     else
@@ -394,16 +489,18 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
         params.local_output_buffer_ptr = outputs[0];
         params.local_input_buffer_ptr = inputs[0];
         params.elts_total = size;
+
+        int fusion_ptr_idx = 2;
+        params.fusion_params.bias_buffer = mBias ? inputs[fusion_ptr_idx++] : nullptr;
+        params.fusion_params.residual_buffer = inputs[fusion_ptr_idx++];
+        params.fusion_params.weight_buffer = mAffine ? inputs[fusion_ptr_idx++] : nullptr;
+        if (mOp == AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM)
+            params.fusion_params.weight_buffer_pre_residual_norm = mAffine ? inputs[fusion_ptr_idx++] : nullptr;
+        params.fusion_params.hidden_size = hidden_size;
+        params.fusion_params.eps = mEps;
+        params.fusion_params.intermediate_buffer = outputs[1];
         if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
         {
-
-            int fusion_ptr_idx = 2;
-            params.fusion_params.bias_buffer = mBias ? inputs[fusion_ptr_idx++] : nullptr;
-            params.fusion_params.residual_buffer = inputs[fusion_ptr_idx++];
-            params.fusion_params.weight_buffer = mAffine ? inputs[fusion_ptr_idx++] : nullptr;
-            params.fusion_params.hidden_size = hidden_size;
-            params.fusion_params.eps = mEps;
-            params.fusion_params.intermediate_buffer = outputs[1];
             for (int i = 0; i < tpSize; ++i)
             {
                 params.fusion_params.lamport_peer_comm_buffer_ptrs[i]
@@ -414,6 +511,7 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
                     = reinterpret_cast<void**>(const_cast<void*>(inputs[1]))[tpSize * 6 + i];
             }
         }
+        TLLM_LOG_DEBUG("customAllReduce called");
         tensorrt_llm::kernels::customAllReduce(params, mType, runtimeStrategy, mConfig, mOp, stream);
     }
 
@@ -424,11 +522,24 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
 nvinfer1::DataType AllreducePlugin::getOutputDataType(
     int index, nvinfer1::DataType const* inputTypes, int nbInputs) const noexcept
 {
-    int fusion_op_extra_output = (mOp != AllReduceFusionOp::NONE ? 1 : 0);
-    assert(index <= fusion_op_extra_output);
-    if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM && mStrategy == AllReduceStrategyType::UB && mScale && index == 0)
+    TLLM_CHECK(index < getNbOutputs());
+    if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4)
     {
-        return nvinfer1::DataType::kFP8;
+        if (index == 0)
+        {
+            return nvinfer1::DataType::kFP4;
+        }
+        else if (index == 2)
+        {
+            return nvinfer1::DataType::kFP8;
+        }
+    }
+    if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8)
+    {
+        if (index == 0)
+        {
+            return nvinfer1::DataType::kFP8;
+        }
     }
     return inputTypes[0];
 }
@@ -447,7 +558,18 @@ char const* AllreducePlugin::getPluginVersion() const noexcept
 
 int AllreducePlugin::getNbOutputs() const noexcept
 {
-    return (mOp != AllReduceFusionOp::NONE ? 2 : 1);
+    if (mOp == AllReduceFusionOp::NONE)
+    {
+        return 1;
+    }
+    else if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4)
+    {
+        return 3;
+    }
+    else
+    {
+        return 2;
+    }
 }
 
 bool AllreducePlugin::isCustomAllReduceSupported(int ranks_per_node) const noexcept

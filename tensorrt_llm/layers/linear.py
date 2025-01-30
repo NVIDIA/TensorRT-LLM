@@ -180,7 +180,8 @@ class LinearBase(Module, metaclass=ABCMeta):
 
         self.tp_size = tp_size
         self.tp_group = tp_group
-        self.strict_dtype = self.dtype if strict_dtype else None
+        self.strict_dtype = str_dtype_to_trt(
+            self.dtype) if strict_dtype else None
 
         if bias:
             self.bias = Parameter(shape=(self.out_features, ), dtype=dtype)
@@ -214,8 +215,9 @@ class LinearBase(Module, metaclass=ABCMeta):
     def get_weight(self) -> Tensor:
         if default_net(
         ).plugin_config.manage_weights and self.prefer_managed_weight:
-            use_gemm_plugin = default_net(
-            ).plugin_config.gemm_plugin is not None
+            gemm_plugin = default_net().plugin_config.gemm_plugin
+            # nvfp4 plugin does not use this code path
+            use_gemm_plugin = gemm_plugin is not None and gemm_plugin != 'nvfp4'
             use_low_latency_gemm_plugin = default_net(
             ).plugin_config.low_latency_gemm_plugin == 'fp8'
             return self.weight.get_managed_tensor(
@@ -241,7 +243,7 @@ class LinearBase(Module, metaclass=ABCMeta):
             strict_dtype = str_dtype_to_trt(self.dtype) if isinstance(
                 self.dtype, str) else self.dtype
             x = low_latency_gemm(x, weight, alpha, strict_dtype)
-        elif gemm_plugin:
+        elif gemm_plugin and gemm_plugin != 'nvfp4':  # nvfp4 gemm plugin has its own implementation
             if gemm_plugin == 'fp8':
                 strict_dtype = str_dtype_to_trt(self.dtype) if isinstance(
                     self.dtype, str) else self.dtype
@@ -414,6 +416,7 @@ class Linear(LinearBase):
                                               -1)
                         weights[qkv_idx] = v.chunk(
                             tp_size, self.tp_dim)[config.mapping.tp_rank]
+
                 weights = torch.cat(weights)
             if using_head_as_leading_dim:
                 # Reorder [n_head, 3, head_dim, ...] into [3, n_head, head_dim, ...]

@@ -63,7 +63,7 @@ public:
 
 private:
     communicator* ub_comm_;
-    std::array<UBBuffer, 2> buffers_;
+    std::array<UBBuffer, 3> buffers_;
     bool is_initialized_;
     int tp_;
 };

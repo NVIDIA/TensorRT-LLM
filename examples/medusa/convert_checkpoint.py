@@ -15,7 +15,8 @@ import tensorrt_llm
 from tensorrt_llm._utils import numpy_to_torch
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models import PretrainedConfig, QWenForCausalLM
+from tensorrt_llm.models import (LLaMAForCausalLM, PretrainedConfig,
+                                 QWenForCausalLM)
 from tensorrt_llm.models.convert_utils import load_calib_dataset
 from tensorrt_llm.models.llama.convert import load_weights_from_hf_by_shard
 from tensorrt_llm.models.medusa.weight import (capture_activation_range,
@@ -30,7 +31,10 @@ except ImportError:
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_dir', type=str, default=None)
+    parser.add_argument(
+        '--model_dir',
+        type=str,
+        help="base model or Medusa-enhanced quantized model from ModelOpt")
     parser.add_argument('--meta_ckpt_dir', type=str, default=None)
     parser.add_argument('--tp_size',
                         type=int,
@@ -174,7 +178,7 @@ def parse_arguments():
     return args
 
 
-if __name__ == '__main__':
+def main():
     # TODO(qijun): Currently, the convert script depends on a torch op:
     # torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix,
     # which is included in tensorrt_llm Python package. Otherwise, the convert
@@ -233,6 +237,26 @@ if __name__ == '__main__':
         }
         args.rotary_scaling = rotary_scaling
 
+    # ModelOpt quantized ckpt
+    quant_config_file = Path(args.model_dir) / "hf_quant_config.json"
+
+    if quant_config_file.exists():
+        with open(quant_config_file, 'r') as f:
+            quant_config = json.load(f)
+
+        is_modelopt_ckpt = quant_config.get("producer",
+                                            {}).get("name") == "modelopt"
+        if is_modelopt_ckpt:  # quantized ckpt
+            args.medusa_model_dir = args.model_dir
+            args.num_medusa_heads = hf_config.medusa["num_medusa_heads"]
+            args.num_medusa_layers = hf_config.medusa["num_medusa_layers"]
+            if args.smoothquant or args.calib_dataset:
+                logger.warning(
+                    "Checkpoint is already quantized. All quantization-related flags will be ignored."
+                )
+    else:
+        is_modelopt_ckpt = False
+
     config = {
         'architecture': 'MedusaForCausalLM',
         'dtype': args.dtype,
@@ -268,7 +292,12 @@ if __name__ == '__main__':
     if args.model_type == "qwen2":
         config['qwen_type'] = args.model_type
 
-    if args.use_weight_only:
+    if is_modelopt_ckpt:
+        with open(quant_config_file, "r") as f:
+            hf_quant_config = json.load(f)
+            for key, value in hf_quant_config.get("quantization", {}).items():
+                config['quantization'][key] = value
+    elif args.use_weight_only:
         if args.weight_only_precision == 'int8':
             config['quantization']['quant_algo'] = QuantAlgo.W8A16
         elif args.weight_only_precision == 'int4':
@@ -317,7 +346,7 @@ if __name__ == '__main__':
         if args.model_type == "qwen2":
             model = QWenForCausalLM.from_hugging_face(args.model_dir,
                                                       args.dtype)
-        else:
+        elif not is_modelopt_ckpt:
             hf_model = LlamaForCausalLM if args.model_type != "mixtral" else MixtralForCausalLM
             model = hf_model.from_pretrained(
                 args.model_dir,
@@ -345,7 +374,9 @@ if __name__ == '__main__':
         'hf_model': model,
         'act_range': act_range,
         'llama_qkv_para': llama_qkv_para,
-        'llama_smoother': llama_smoother
+        'llama_smoother': llama_smoother,
+        'config': config,
+        'is_modelopt_ckpt': is_modelopt_ckpt
     }
 
     def covert_and_save(rank, convert_args):
@@ -353,6 +384,14 @@ if __name__ == '__main__':
                           rank=rank,
                           tp_size=args.tp_size,
                           pp_size=args.pp_size)
+
+        if convert_args["is_modelopt_ckpt"]:
+            convert_args["hf_model"] = LLaMAForCausalLM.from_hugging_face(
+                args.model_dir,
+                args.dtype,
+                mapping=mapping,
+                quant_config=convert_args["config"]["quantization"],
+                load_by_shard=args.load_by_shard)
 
         if args.use_weight_only and args.weight_only_precision == 'int4_gptq':
             assert False, "Never supported"
@@ -362,7 +401,8 @@ if __name__ == '__main__':
                     args.model_dir, PretrainedConfig.from_dict(config))
 
             else:
-                if args.model_type == "qwen2":
+                if args.model_type == "qwen2" or convert_args[
+                        "is_modelopt_ckpt"]:
                     weights = {
                         name: numpy_to_torch(param.raw_value)
                         for name, param in
@@ -391,10 +431,11 @@ if __name__ == '__main__':
                     config_file = Path(args.medusa_model_dir) / "config.json"
                     with open(config_file) as fp:
                         config = json.load(fp)
-                    num_medusa_heads_from_config = config.get(
-                        'medusa_num_heads', args.num_medusa_heads)
-                    args.num_medusa_layers = config.get('medusa_num_layers',
-                                                        args.num_medusa_layers)
+                    if not convert_args["is_modelopt_ckpt"]:
+                        num_medusa_heads_from_config = config.get(
+                            'medusa_num_heads', args.num_medusa_heads)
+                        args.num_medusa_layers = config.get(
+                            'medusa_num_layers', args.num_medusa_layers)
                     if args.num_medusa_heads is None:
                         args.num_medusa_heads = num_medusa_heads_from_config
 
@@ -408,7 +449,8 @@ if __name__ == '__main__':
                         dtype=args.dtype,
                         use_weight_only=args.use_weight_only,
                         plugin_weight_only_quant_type=
-                        plugin_weight_only_quant_type)
+                        plugin_weight_only_quant_type,
+                        is_modelopt_ckpt=convert_args["is_modelopt_ckpt"])
                     weights.update(medusa_weights)
 
         safetensors.torch.save_file(
@@ -437,3 +479,7 @@ if __name__ == '__main__':
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
     print(f'Total time of converting checkpoints: {t}')
+
+
+if __name__ == '__main__':
+    main()

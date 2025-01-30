@@ -684,7 +684,7 @@ BmmChunkKernelFunc getBmmChunkKernel(int B_, int L_, int H_, int P_, int G_, int
         if (useTma)
         {
             {
-                std::array<uint64_t, 2> tensorStrides{2uL * N, 2uL * (H * P + 2 * G * N)};
+                std::array<uint64_t, 2> tensorStrides{2uL * N, 2uL * (H * P_ + 2 * G * N)};
                 std::array<uint64_t, 3> tensorSizes{1uL * N, 1uL * G, 1uL * numTokens_};
                 std::array<uint32_t, 3> traveralStrides{1u, 1u, 1u};
                 std::array<uint32_t, 3> boxSizes{(uint32_t) tileK, 1u, (uint32_t) tileM};
@@ -695,7 +695,7 @@ BmmChunkKernelFunc getBmmChunkKernel(int B_, int L_, int H_, int P_, int G_, int
                     CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
             }
             {
-                std::array<uint64_t, 2> tensorStrides{2uL * N, 2uL * (H * P + 2 * G * N)};
+                std::array<uint64_t, 2> tensorStrides{2uL * N, 2uL * (H * P_ + 2 * G * N)};
                 std::array<uint64_t, 3> tensorSizes{1uL * N, 1uL * G, 1uL * numTokens_};
                 std::array<uint32_t, 3> traveralStrides{1u, 1u, 1u};
                 std::array<uint32_t, 3> boxSizes{(uint32_t) tileK, 1u, (uint32_t) tileN};
@@ -710,149 +710,169 @@ BmmChunkKernelFunc getBmmChunkKernel(int B_, int L_, int H_, int P_, int G_, int
         return func;
     };
 
-    if (isHopper_) // Hopper kernel
+    if (Q == 256 && isHopper_ == false)
     {
 #ifndef FAST_BUILD
-        if (Q_ == 256 && N_ >= 256)
+        if (N >= 256)
         {
-            if (compute >= (1LL << 38))
-                return set(128, 128, 64, 4, 1, 2, 1, bmm_chunk_hopper<256, 128, 128, 64, 4, 1, 2, 0, 2, Tp_>);
-            else if (compute >= (1LL << 37))
-                return set(64, 128, 64, 4, 1, 2, 1, bmm_chunk_hopper<256, 64, 128, 64, 4, 1, 2, 0, 8, Tp_>);
-            else if (compute >= (1LL << 0))
-                return set(64, 64, 64, 2, 2, 2, 0, bmm_chunk_kernel<256, 64, 64, 64, 2, 2, 2, 2, 2, Tp_>);
-        }
-
-        if (Q_ == 256 && N_ >= 128)
-        {
-            if (compute >= (1LL << 37))
-                return set(128, 128, 64, 4, 1, 2, 1, bmm_chunk_hopper<256, 128, 128, 64, 4, 1, 2, 0, 2, Tp_>);
-            else if (compute >= (1LL << 0))
+            if (compute >= (1LL << 39))
+                return set(128, 128, 64, 2, 2, 2, 0, bmm_chunk_kernel<256, 128, 128, 64, 2, 2, 2, 1, 2, Tp_>);
+            else if (compute >= (1LL << 38))
+                return set(64, 128, 64, 1, 4, 2, 0, bmm_chunk_kernel<256, 64, 128, 64, 1, 4, 2, 2, 4, Tp_>);
+            else if (compute >= (1LL << 32))
+                return set(64, 64, 64, 2, 2, 2, 0, bmm_chunk_kernel<256, 64, 64, 64, 2, 2, 2, 2, 1, Tp_>);
+            else if (compute >= (1LL << 31))
+                return set(64, 128, 64, 1, 4, 2, 0, bmm_chunk_kernel<256, 64, 128, 64, 1, 4, 2, 2, 4, Tp_>);
+            else
                 return set(64, 64, 64, 2, 2, 2, 0, bmm_chunk_kernel<256, 64, 64, 64, 2, 2, 2, 2, 1, Tp_>);
         }
-
+        if (N >= 128)
+        {
+            if (compute >= (1LL << 39))
+                return set(128, 128, 64, 2, 2, 2, 0, bmm_chunk_kernel<256, 128, 128, 64, 2, 2, 2, 1, 2, Tp_>);
+            else if (compute >= (1LL << 37))
+                return set(64, 128, 64, 1, 4, 2, 0, bmm_chunk_kernel<256, 64, 128, 64, 1, 4, 2, 2, 4, Tp_>);
+            else
+                return set(64, 64, 64, 2, 2, 2, 0, bmm_chunk_kernel<256, 64, 64, 64, 2, 2, 2, 2, 1, Tp_>);
+        }
 #endif
-        if (Q_ == 256 && N_ >= 64)
+        if (N >= 64)
+        {
+            if (compute >= (1LL << 39))
+                return set(128, 128, 32, 2, 2, 2, 0, bmm_chunk_kernel<256, 128, 128, 32, 2, 2, 2, 2, 8, Tp_>);
+            else if (compute >= (1LL << 38))
+                return set(128, 64, 32, 2, 2, 2, 0, bmm_chunk_kernel<256, 128, 64, 32, 2, 2, 2, 2, 1, Tp_>);
+            else if (compute >= (1LL << 37))
+                return set(128, 128, 32, 2, 2, 2, 0, bmm_chunk_kernel<256, 128, 128, 32, 2, 2, 2, 2, 8, Tp_>);
+            else if (compute >= (1LL << 33))
+                return set(128, 64, 32, 2, 2, 2, 0, bmm_chunk_kernel<256, 128, 64, 32, 2, 2, 2, 2, 1, Tp_>);
+            else if (compute >= (1LL << 32))
+                return set(64, 64, 32, 2, 2, 2, 0, bmm_chunk_kernel<256, 64, 64, 32, 2, 2, 2, 2, 1, Tp_>);
+            else if (compute >= (1LL << 31))
+                return set(128, 64, 32, 2, 2, 2, 0, bmm_chunk_kernel<256, 128, 64, 32, 2, 2, 2, 2, 1, Tp_>);
+            else
+                return set(64, 64, 32, 2, 2, 2, 0, bmm_chunk_kernel<256, 64, 64, 32, 2, 2, 2, 2, 1, Tp_>);
+        }
+    }
+    else if (Q == 256 && isHopper_)
+    {
+#ifndef FAST_BUILD
+        if (N >= 256)
+        {
+            if (compute >= (1LL << 42))
+                return set(128, 128, 64, 4, 1, 2, 1, bmm_chunk_hopper<256, 128, 128, 64, 4, 1, 2, 0, 8, Tp_>);
+            else if (compute >= (1LL << 41))
+                return set(128, 128, 64, 4, 1, 2, 1, bmm_chunk_hopper<256, 128, 128, 64, 4, 1, 2, 0, 2, Tp_>);
+            else if (compute >= (1LL << 40))
+                return set(128, 128, 64, 4, 1, 2, 1, bmm_chunk_hopper<256, 128, 128, 64, 4, 1, 2, 0, 8, Tp_>);
+            else if (compute >= (1LL << 38))
+                return set(128, 128, 64, 4, 1, 2, 1, bmm_chunk_hopper<256, 128, 128, 64, 4, 1, 2, 0, 2, Tp_>);
+            else if (compute >= (1LL << 37))
+                return set(64, 128, 64, 4, 1, 2, 1, bmm_chunk_hopper<256, 64, 128, 64, 4, 1, 2, 0, 1, Tp_>);
+            else if (compute >= (1LL << 32))
+                return set(64, 64, 64, 2, 2, 2, 0, bmm_chunk_kernel<256, 64, 64, 64, 2, 2, 2, 2, 1, Tp_>);
+            else if (compute >= (1LL << 30))
+                return set(64, 128, 64, 1, 4, 2, 0, bmm_chunk_kernel<256, 64, 128, 64, 1, 4, 2, 2, 4, Tp_>);
+            else
+                return set(64, 64, 64, 2, 2, 2, 0, bmm_chunk_kernel<256, 64, 64, 64, 2, 2, 2, 2, 1, Tp_>);
+        }
+        if (N >= 128)
+        {
+            if (compute >= (1LL << 42))
+                return set(128, 128, 64, 4, 1, 2, 1, bmm_chunk_hopper<256, 128, 128, 64, 4, 1, 2, 0, 8, Tp_>);
+            else if (compute >= (1LL << 41))
+                return set(128, 128, 64, 4, 1, 2, 1, bmm_chunk_hopper<256, 128, 128, 64, 4, 1, 2, 0, 2, Tp_>);
+            else if (compute >= (1LL << 40))
+                return set(128, 128, 64, 4, 1, 2, 1, bmm_chunk_hopper<256, 128, 128, 64, 4, 1, 2, 0, 8, Tp_>);
+            else if (compute >= (1LL << 39))
+                return set(128, 128, 64, 4, 1, 2, 1, bmm_chunk_hopper<256, 128, 128, 64, 4, 1, 2, 0, 2, Tp_>);
+            else if (compute >= (1LL << 38))
+                return set(128, 128, 64, 4, 1, 2, 1, bmm_chunk_hopper<256, 128, 128, 64, 4, 1, 2, 0, 8, Tp_>);
+            else if (compute >= (1LL << 37))
+                return set(64, 128, 64, 4, 1, 2, 1, bmm_chunk_hopper<256, 64, 128, 64, 4, 1, 2, 0, 1, Tp_>);
+            else if (compute >= (1LL << 31))
+                return set(64, 64, 64, 2, 2, 2, 0, bmm_chunk_kernel<256, 64, 64, 64, 2, 2, 2, 2, 1, Tp_>);
+            else if (compute >= (1LL << 30))
+                return set(64, 128, 64, 1, 4, 2, 0, bmm_chunk_kernel<256, 64, 128, 64, 1, 4, 2, 2, 4, Tp_>);
+            else
+                return set(64, 64, 64, 2, 2, 2, 0, bmm_chunk_kernel<256, 64, 64, 64, 2, 2, 2, 2, 1, Tp_>);
+        }
+#endif
+        if (N >= 64)
         {
             if (compute >= (1LL << 38))
                 return set(64, 256, 32, 4, 1, 2, 1, bmm_chunk_hopper<256, 64, 256, 32, 4, 1, 2, 0, 1, Tp_>);
             else if (compute >= (1LL << 37))
                 return set(64, 128, 32, 4, 1, 2, 1, bmm_chunk_hopper<256, 64, 128, 32, 4, 1, 2, 0, 4, Tp_>);
             else if (compute >= (1LL << 36))
-                return set(64, 128, 32, 4, 1, 2, 1, bmm_chunk_hopper<256, 64, 128, 32, 4, 1, 2, 0, 1, Tp_>);
+                return set(128, 128, 32, 2, 2, 2, 0, bmm_chunk_kernel<256, 128, 128, 32, 2, 2, 2, 2, 8, Tp_>);
             else if (compute >= (1LL << 35))
-                return set(128, 64, 32, 2, 2, 2, 0, bmm_chunk_kernel<256, 128, 64, 32, 2, 2, 2, 2, 4, Tp_>);
-            else if (compute >= (1LL << 0))
+                return set(128, 64, 32, 2, 2, 2, 0, bmm_chunk_kernel<256, 128, 64, 32, 2, 2, 2, 2, 1, Tp_>);
+            else
                 return set(64, 64, 32, 2, 2, 2, 0, bmm_chunk_kernel<256, 64, 64, 32, 2, 2, 2, 2, 1, Tp_>);
         }
-
+    }
+    if (Q == 128 && isHopper_ == false)
+    {
 #ifndef FAST_BUILD
-        if (Q_ == 128 && N_ >= 256)
+        if (N >= 256)
         {
             if (compute >= (1LL << 39))
-                return set(128, 128, 64, 8, 1, 2, 1, bmm_chunk_hopper<128, 128, 128, 64, 8, 1, 2, 0, 1, Tp_>);
+                return set(128, 128, 64, 4, 2, 2, 0, bmm_chunk_kernel<128, 128, 128, 64, 4, 2, 2, 1, 1, Tp_>);
             else if (compute >= (1LL << 37))
-                return set(64, 128, 64, 4, 1, 2, 1, bmm_chunk_hopper<128, 64, 128, 64, 4, 1, 2, 0, 1, Tp_>);
+                return set(64, 128, 32, 1, 4, 2, 0, bmm_chunk_kernel<128, 64, 128, 32, 1, 4, 2, 2, 1, Tp_>);
             else if (compute >= (1LL << 36))
-                return set(64, 128, 64, 4, 1, 2, 1, bmm_chunk_hopper<128, 64, 128, 64, 4, 1, 2, 0, 8, Tp_>);
-            else if (compute >= (1LL << 35))
-                return set(64, 128, 64, 4, 2, 2, 1, bmm_chunk_hopper<128, 64, 128, 64, 4, 2, 2, 0, 1, Tp_>);
-            else if (compute >= (1LL << 0))
-                return set(64, 64, 64, 2, 2, 2, 0, bmm_chunk_kernel<128, 64, 64, 64, 2, 2, 2, 1, 8, Tp_>);
-        }
-
-        if (Q_ == 128 && N_ >= 128)
-        {
-            if (compute >= (1LL << 39))
-                return set(128, 128, 64, 8, 1, 2, 1, bmm_chunk_hopper<128, 128, 128, 64, 8, 1, 2, 0, 1, Tp_>);
-            else if (compute >= (1LL << 37))
-                return set(64, 128, 64, 4, 1, 2, 1, bmm_chunk_hopper<128, 64, 128, 64, 4, 1, 2, 0, 1, Tp_>);
-            else if (compute >= (1LL << 35))
-                return set(64, 128, 64, 4, 1, 2, 1, bmm_chunk_hopper<128, 64, 128, 64, 4, 1, 2, 0, 8, Tp_>);
-            else if (compute >= (1LL << 0))
+                return set(128, 128, 64, 4, 2, 2, 0, bmm_chunk_kernel<128, 128, 128, 64, 4, 2, 2, 1, 1, Tp_>);
+            else
                 return set(64, 64, 64, 2, 2, 2, 0, bmm_chunk_kernel<128, 64, 64, 64, 2, 2, 2, 2, 1, Tp_>);
         }
-
-        if (Q_ == 128 && N_ >= 64)
+        if (N >= 128)
+        {
+            if (compute >= (1LL << 38))
+                return set(128, 128, 64, 4, 2, 2, 0, bmm_chunk_kernel<128, 128, 128, 64, 4, 2, 2, 1, 1, Tp_>);
+            else if (compute >= (1LL << 37))
+                return set(64, 128, 32, 1, 4, 2, 0, bmm_chunk_kernel<128, 64, 128, 32, 1, 4, 2, 2, 1, Tp_>);
+            else if (compute >= (1LL << 36))
+                return set(128, 128, 64, 4, 2, 2, 0, bmm_chunk_kernel<128, 128, 128, 64, 4, 2, 2, 1, 1, Tp_>);
+            else
+                return set(64, 64, 64, 2, 2, 2, 0, bmm_chunk_kernel<128, 64, 64, 64, 2, 2, 2, 2, 1, Tp_>);
+        }
+#endif
+        if (N >= 64)
+        {
+            if (compute >= (1LL << 34))
+                return set(64, 128, 32, 1, 4, 2, 0, bmm_chunk_kernel<128, 64, 128, 32, 1, 4, 2, 2, 1, Tp_>);
+            else
+                return set(64, 64, 32, 2, 2, 2, 0, bmm_chunk_kernel<128, 64, 64, 32, 2, 2, 2, 2, 1, Tp_>);
+        }
+    }
+    else if (Q == 128 && isHopper_)
+    {
+#ifndef FAST_BUILD
+        if (N >= 256)
+        {
+            if (compute >= (1LL << 36))
+                return set(64, 128, 64, 4, 1, 2, 1, bmm_chunk_hopper<128, 64, 128, 64, 4, 1, 2, 0, 1, Tp_>);
+            else
+                return set(64, 64, 64, 2, 2, 2, 0, bmm_chunk_kernel<128, 64, 64, 64, 2, 2, 2, 2, 1, Tp_>);
+        }
+        if (N >= 128)
+        {
+            if (compute >= (1LL << 36))
+                return set(64, 128, 64, 4, 1, 2, 1, bmm_chunk_hopper<128, 64, 128, 64, 4, 1, 2, 0, 1, Tp_>);
+            else
+                return set(64, 64, 64, 2, 2, 2, 0, bmm_chunk_kernel<128, 64, 64, 64, 2, 2, 2, 2, 1, Tp_>);
+        }
+#endif
+        if (N >= 64)
         {
             if (compute >= (1LL << 35))
                 return set(64, 128, 32, 4, 1, 2, 1, bmm_chunk_hopper<128, 64, 128, 32, 4, 1, 2, 0, 1, Tp_>);
             else if (compute >= (1LL << 34))
-                return set(64, 64, 32, 4, 1, 2, 1, bmm_chunk_hopper<128, 64, 64, 32, 4, 1, 2, 0, 2, Tp_>);
-            else if (compute >= (1LL << 0))
+                return set(64, 128, 32, 1, 4, 2, 0, bmm_chunk_kernel<128, 64, 128, 32, 1, 4, 2, 2, 1, Tp_>);
+            else
                 return set(64, 64, 32, 2, 2, 2, 0, bmm_chunk_kernel<128, 64, 64, 32, 2, 2, 2, 2, 1, Tp_>);
         }
-
-#endif
-    }
-    else // non Hopper kernel
-    {
-#ifndef FAST_BUILD
-        if (Q_ == 256 && N_ >= 256)
-        {
-            if (compute >= (1LL << 40))
-                return set(128, 128, 64, 2, 2, 2, 0, bmm_chunk_kernel<256, 128, 128, 64, 2, 2, 2, 1, 2, Tp_>);
-            else if (compute >= (1LL << 38))
-                return set(128, 128, 64, 2, 4, 2, 0, bmm_chunk_kernel<256, 128, 128, 64, 2, 4, 2, 1, 4, Tp_>);
-            else if (compute >= (1LL << 36))
-                return set(64, 64, 64, 2, 2, 2, 0, bmm_chunk_kernel<256, 64, 64, 64, 2, 2, 2, 2, 1, Tp_>);
-            else if (compute >= (1LL << 0))
-                return set(64, 64, 64, 2, 2, 3, 0, bmm_chunk_kernel<256, 64, 64, 64, 2, 2, 3, 2, 4, Tp_>);
-        }
-
-        if (Q_ == 256 && N_ >= 128)
-        {
-            if (compute >= (1LL << 39))
-                return set(128, 128, 64, 2, 2, 2, 0, bmm_chunk_kernel<256, 128, 128, 64, 2, 2, 2, 1, 2, Tp_>);
-            else if (compute >= (1LL << 37))
-                return set(128, 64, 64, 2, 2, 2, 0, bmm_chunk_kernel<256, 128, 64, 64, 2, 2, 2, 2, 2, Tp_>);
-            else if (compute >= (1LL << 0))
-                return set(64, 64, 64, 2, 2, 2, 0, bmm_chunk_kernel<256, 64, 64, 64, 2, 2, 2, 2, 1, Tp_>);
-        }
-
-#endif
-        if (Q_ == 256 && N_ >= 64)
-        {
-            if (compute >= (1LL << 37))
-                return set(128, 128, 32, 2, 2, 2, 0, bmm_chunk_kernel<256, 128, 128, 32, 2, 2, 2, 2, 8, Tp_>);
-            else if (compute >= (1LL << 34))
-                return set(128, 64, 32, 2, 2, 2, 0, bmm_chunk_kernel<256, 128, 64, 32, 2, 2, 2, 2, 1, Tp_>);
-            else if (compute >= (1LL << 0))
-                return set(64, 64, 32, 2, 2, 2, 0, bmm_chunk_kernel<256, 64, 64, 32, 2, 2, 2, 2, 8, Tp_>);
-        }
-
-#ifndef FAST_BUILD
-        if (Q_ == 128 && N_ >= 256)
-        {
-            if (compute >= (1LL << 39))
-                return set(128, 128, 64, 2, 2, 2, 0, bmm_chunk_kernel<128, 128, 128, 64, 2, 2, 2, 1, 1, Tp_>);
-            else if (compute >= (1LL << 36))
-                return set(64, 128, 64, 1, 4, 2, 0, bmm_chunk_kernel<128, 64, 128, 64, 1, 4, 2, 1, 1, Tp_>);
-            else if (compute >= (1LL << 35))
-                return set(64, 64, 64, 2, 2, 2, 0, bmm_chunk_kernel<128, 64, 64, 64, 2, 2, 2, 2, 1, Tp_>);
-            else if (compute >= (1LL << 0))
-                return set(64, 64, 64, 2, 2, 4, 0, bmm_chunk_kernel<128, 64, 64, 64, 2, 2, 4, 2, 8, Tp_>);
-        }
-
-        if (Q_ == 128 && N_ >= 128)
-        {
-            if (compute >= (1LL << 36))
-                return set(128, 128, 64, 4, 2, 2, 0, bmm_chunk_kernel<128, 128, 128, 64, 4, 2, 2, 1, 1, Tp_>);
-            else if (compute >= (1LL << 0))
-                return set(64, 64, 64, 2, 2, 2, 0, bmm_chunk_kernel<128, 64, 64, 64, 2, 2, 2, 2, 1, Tp_>);
-        }
-
-        if (Q_ == 128 && N_ >= 64)
-        {
-            if (compute >= (1LL << 37))
-                return set(64, 128, 32, 1, 4, 2, 0, bmm_chunk_kernel<128, 64, 128, 32, 1, 4, 2, 2, 1, Tp_>);
-            else if (compute >= (1LL << 34))
-                return set(128, 128, 32, 2, 2, 2, 0, bmm_chunk_kernel<128, 128, 128, 32, 2, 2, 2, 2, 1, Tp_>);
-            else if (compute >= (1LL << 0))
-                return set(64, 64, 32, 2, 2, 2, 0, bmm_chunk_kernel<128, 64, 64, 32, 2, 2, 2, 2, 8, Tp_>);
-        }
-
-#endif
     }
 
     return nullptr;

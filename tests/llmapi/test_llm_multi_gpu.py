@@ -59,6 +59,12 @@ def engine_from_checkpoint() -> tempfile.TemporaryDirectory:
 # shrink the kv_cache_config to avoid OOM in CI
 global_kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
 
+# python api does not seem to support extra tokens needed for prompt tuning + reuse.
+# disable block reuse for those tests.
+# TODO: Add extra tokens to prompt tuning unit tests.
+global_kv_cache_config_no_reuse = KvCacheConfig(free_gpu_memory_fraction=0.4,
+                                                enable_block_reuse=False)
+
 
 @skip_single_gpu
 def test_llm_loading_from_ckpt_for_tp2(
@@ -236,7 +242,7 @@ def test_llama_7b_multi_lora_tp2():
 @skip_single_gpu
 def test_llama_v2_7b_prompt_adapter_tp2():
     llama_v2_7b_prompt_adapter_test_harness(
-        tensor_parallel_size=2, kv_cache_config=global_kv_cache_config)
+        tensor_parallel_size=2, kv_cache_config=global_kv_cache_config_no_reuse)
 
 
 @skip_single_gpu

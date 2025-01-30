@@ -55,9 +55,9 @@ template <class ElementPairA_, class GmemLayoutATag_, int AlignmentA, class Elem
 struct CollectiveBuilderInterleaved<arch::Sm90, arch::OpClassTensorOp, ElementPairA_, GmemLayoutATag_, AlignmentA,
     ElementPairB_, GmemLayoutBTag_, AlignmentB, ElementAccumulator, TileShape_MNK, ClusterShape_MNK, StageCountType,
     KernelScheduleType,
-    cute::enable_if_t<(cute::is_same_v<KernelScheduleType, KernelTmaWarpSpecializedMixedInput>
-        || cute::is_same_v<KernelScheduleType, KernelTmaWarpSpecializedPingpongMixedInput>
-        || cute::is_same_v<KernelScheduleType, KernelTmaWarpSpecializedCooperativeMixedInput>)>>
+    cute::enable_if_t<(cute::is_same_v<KernelScheduleType, KernelTmaWarpSpecialized>
+        || cute::is_same_v<KernelScheduleType, KernelTmaWarpSpecializedPingpong>
+        || cute::is_same_v<KernelScheduleType, KernelTmaWarpSpecializedCooperative>)>>
 {
 
 private:
@@ -107,9 +107,8 @@ public:
     static constexpr cute::GMMA::Major TiledMmaGmmaMajorB = SwapAB ? GmmaMajorA : GmmaMajorB;
 
     using ElementMma = cute::conditional_t<IsATransformed, ElementB, ElementA>;
-    using AtomLayoutMNK
-        = cute::conditional_t<cute::is_same_v<KernelScheduleType, KernelTmaWarpSpecializedCooperativeMixedInput>,
-            Layout<Shape<_2, _1, _1>>, Layout<Shape<_1, _1, _1>>>;
+    using AtomLayoutMNK = cute::conditional_t<cute::is_same_v<KernelScheduleType, KernelTmaWarpSpecializedCooperative>,
+        Layout<Shape<_2, _1, _1>>, Layout<Shape<_1, _1, _1>>>;
 
     using TiledMma
         = decltype(cute::make_tiled_mma(cute::GMMA::rs_op_selector<ElementMma, ElementMma, ElementAccumulator,
@@ -132,8 +131,8 @@ public:
         = detail::compute_stage_count_or_override_single_affine_transformed_input<detail::sm90_smem_capacity_bytes,
             RealElementA, RealElementB, ElementScale, ElementZero, TileShape_MNK>(StageCountType{});
 
-    using SmemCopyAtomA = cute::conditional_t<SwapAB, void, Copy_Atom<cute::DefaultCopy, ElementA>>;
-    using SmemCopyAtomB = cute::conditional_t<SwapAB, Copy_Atom<cute::DefaultCopy, ElementB>, void>;
+    using SmemCopyAtomA = cute::conditional_t<SwapAB, void, Copy_Atom<cute::AutoVectorizingCopy, ElementA>>;
+    using SmemCopyAtomB = cute::conditional_t<SwapAB, Copy_Atom<cute::AutoVectorizingCopy, ElementB>, void>;
 
     using DispatchPolicy
         = MainloopSm90TmaGmmaRmemAWarpSpecializedMixedInput<PipelineStages, ClusterShape_MNK, KernelScheduleType>;

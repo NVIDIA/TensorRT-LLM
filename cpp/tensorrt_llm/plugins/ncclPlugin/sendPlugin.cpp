@@ -135,8 +135,13 @@ int SendPlugin::initialize() noexcept
     ncclUniqueId id;
     ncclGetUniqueId(&id);
     COMM_SESSION.sendValue(id, mTgtRank, 0);
-    // Need static connection initialization for accurate KV cache size estimation
+// Need static connection initialization for accurate KV cache size estimation
+#if defined(_WIN32)
+    if (getenv("NCCL_RUNTIME_CONNECT") == nullptr)
+        _putenv_s("NCCL_RUNTIME_CONNECT", "0");
+#else
     setenv("NCCL_RUNTIME_CONNECT", "0", 0);
+#endif // _WIN32
     NCCLCHECK(ncclCommInitRank(&mComm, 2, id, 0));
     return 0;
 }

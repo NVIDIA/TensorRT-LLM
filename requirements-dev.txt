@@ -9,6 +9,7 @@ pybind11
 pybind11-stubgen
 pytest-asyncio
 pytest-cov
+pytest-csv
 pytest-forked
 pytest-xdist
 pytest-timeout

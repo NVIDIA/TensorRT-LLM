@@ -116,8 +116,8 @@ struct AcceptDraftTokensByIdsWithPathsParams
         TLLM_CHECK(acceptedLengths);
         TLLM_CHECK(paths);
         TLLM_CHECK(bestPathIds);
-        TLLM_CHECK((curTokensPerStep == nullptr) ^ (targetTokensPerStep == nullptr) == 0);
-        TLLM_CHECK((medusaLogits == nullptr) ^ (logitsPtrs == nullptr) == 0);
+        TLLM_CHECK(((curTokensPerStep == nullptr) ^ (targetTokensPerStep == nullptr)) == 0);
+        TLLM_CHECK(((medusaLogits == nullptr) ^ (logitsPtrs == nullptr)) == 0);
 
         TLLM_CHECK(batchSize > 0);
         TLLM_CHECK(batchSize <= maxBatchSize);

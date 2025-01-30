@@ -44,7 +44,7 @@ class DimRange(object):
             self.min = [dim 0 min, dim 1 min]
             self.opt = [dim 0 opt, dim 1 opt]
             self.max = [dim 0 max, dim 1 max]
-        For static dimension, it has min==opt==max, thus the \p shape param in the ctor can be an integer
+        For static dimension, it has min==opt==max, thus the shape param in the ctor can be an integer
     '''
 
     def __init__(self, shape: List[Union[int, List[int], Tuple[int, int, int]]],
@@ -669,6 +669,7 @@ class PositionEmbeddingType(IntEnum):
     chatglm = 7
     yarn = 8
     mrope = 9
+    deferred = 10  # Apply customized positional embedding by using an external embedder. K will be cached before embedding.
 
     def is_rope(self) -> bool:
         return self in [
@@ -680,6 +681,9 @@ class PositionEmbeddingType(IntEnum):
 
     def is_alibi(self) -> bool:
         return self in [self.alibi, self.alibi_with_scale]
+
+    def is_deferred(self) -> bool:
+        return self in [self.deferred]
 
     @staticmethod
     def choices() -> List[str]:
@@ -1140,7 +1144,9 @@ def gemm_swiglu(input: Tensor,
     return _create_tensor(layer.get_output(0), layer)
 
 
-def constant(ndarray: np.ndarray) -> Tensor:
+def constant(ndarray: np.ndarray,
+             as_dtype: trt.DataType | None = None,
+             as_shape=None) -> Tensor:
     '''
     Add a constant layer.
 
@@ -1156,13 +1162,18 @@ def constant(ndarray: np.ndarray) -> Tensor:
     Returns:
         The tensor produced by the inserted layer.
     '''
-    weights = trt.Weights(np_dtype_to_trt(ndarray.dtype), ndarray.ctypes.data,
-                          ndarray.size)
+    trt_dtype = np_dtype_to_trt(ndarray.dtype) if as_dtype is None else as_dtype
+    trt_shape = trt.Dims(
+        ndarray.shape) if as_shape is None else trt.Dims(as_shape)
+    trt_count = 1
+    for i in range(len(trt_shape)):
+        trt_count *= trt_shape[i]
+    weights = trt.Weights(trt_dtype, ndarray.ctypes.data, trt_count)
     # Prevent underlying numpy array from going out of scope
     default_net().register_ndarray(ndarray)
-    layer = default_trtnet().add_constant(trt.Dims(ndarray.shape), weights)
+    layer = default_trtnet().add_constant(trt_shape, weights)
     if not default_net().strongly_typed:
-        layer.set_output_type(0, np_dtype_to_trt(ndarray.dtype))
+        layer.set_output_type(0, trt_dtype)
     tensor = _create_tensor(layer.get_output(0), layer)
     # TODO: remove this WAR after https://nvbugs/4359151 fixed.
     set_np_weight(default_trtnet(), layer.name, ndarray)
@@ -2374,9 +2385,9 @@ def cumsum(input: Tensor, dim: int, prefer_plugin: bool = True) -> Tensor:
                                                          to_array=False),
                                      reduction_length,
                                      dtype='int64')
-            lower_triangle = cast(
-                unsqueeze(reduction_range, 0) <= unsqueeze(reduction_range, 1),
-                dtype=input.dtype)
+            lower_triangle = cast(unsqueeze(reduction_range, 0)
+                                  <= unsqueeze(reduction_range, 1),
+                                  dtype=input.dtype)
             output = sum(unsqueeze(input, -2) * lower_triangle, dim=-1)
             return output
     else:
@@ -3726,6 +3737,9 @@ class AllReduceFusionOp(IntFlag):
     NONE = 0
     RESIDUAL_RMS_NORM = 1
     LAST_PROCESS_FOR_UB = 2
+    RESIDUAL_RMS_PREPOST_NORM = 3
+    RESIDUAL_RMS_NORM_QUANT_FP8 = 4
+    RESIDUAL_RMS_NORM_QUANT_NVFP4 = 5
 
 
 class AllReduceParams():
@@ -3738,6 +3752,7 @@ class AllReduceParams():
                  residual: Optional[Tensor] = None,
                  norm_weight: Optional[Tensor] = None,
                  scale: Optional[Tensor] = None,
+                 norm_pre_residual_weight: Optional[Tensor] = None,
                  eps: float = 1e-06):
         self.strategy = strategy
         self.config = config
@@ -3746,6 +3761,7 @@ class AllReduceParams():
         self.residual = residual
         self.norm_weight = norm_weight
         self.scale = scale
+        self.norm_pre_residual_weight = norm_pre_residual_weight
         self.eps = eps
         assert fusion_op == AllReduceFusionOp.NONE or (residual is not None)
 
@@ -3796,6 +3812,7 @@ def create_allreduce_plugin(
         "eps", np.array([float(all_reduce_params.eps)], np.float32),
         trt.PluginFieldType.FLOAT32)
     pfc.append(p_eps)
+
     p_affine = trt.PluginField(
         "affine", np.array([int(all_reduce_params.has_affine())], np.int8),
         trt.PluginFieldType.INT8)
@@ -3820,6 +3837,9 @@ def create_allreduce_plugin(
         plug_inputs.append(all_reduce_params.residual.trt_tensor)
         if all_reduce_params.has_affine() == 1:
             plug_inputs.append(all_reduce_params.norm_weight.trt_tensor)
+            if all_reduce_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_PREPOST_NORM:
+                plug_inputs.append(
+                    all_reduce_params.norm_pre_residual_weight.trt_tensor)
         if all_reduce_params.has_scale() == 1:
             plug_inputs.append(all_reduce_params.scale.trt_tensor)
 
@@ -3901,8 +3921,9 @@ def allreduce(
                                       layer).cast(tensor.dtype)
         if all_reduce_params.strategy == AllReduceStrategy.UB and all_reduce_params.has_scale(
         ) == 1:
-            # data type: trt.DataType.FP8
             final_output = _create_tensor(layer.get_output(0), layer)
+            if all_reduce_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
+                scale_factor = _create_tensor(layer.get_output(2), layer)
         else:
             final_output = _create_tensor(layer.get_output(0),
                                           layer).cast(tensor.dtype)
@@ -3910,6 +3931,10 @@ def allreduce(
             if all_reduce_params.has_scale() == 1:
                 final_output.mark_output("allreduce_ub_1_" +
                                          str(allreduce_ub_counter))
+                if all_reduce_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
+                    scale_factor.mark_output("allreduce_ub_2_" +
+                                             str(allreduce_ub_counter))
+                    return (final_output, scale_factor), inter_output
             else:
                 assert all_reduce_params.fusion_op == AllReduceFusionOp.LAST_PROCESS_FOR_UB
                 inter_output.mark_output("allreduce_ub_1_" +
@@ -4816,9 +4841,10 @@ def gpt_attention(
     spec_decoding_generation_lengths: Tensor = None,
     spec_decoding_position_offsets: Tensor = None,
     spec_decoding_packed_mask: Tensor = None,
+    spec_decoding_use: Tensor = None,
     long_rope_rotary_inv_freq: Optional[Tensor] = None,
     long_rope_rotary_cos_sin: Optional[Tensor] = None,
-    mrope_rotary_sin_cos: Tensor = None,
+    mrope_rotary_cos_sin: Tensor = None,
     mrope_position_deltas: Tensor = None,
     host_runtime_perf_knobs: Optional[Tensor] = None,
     host_context_progress: Tensor = None,
@@ -4850,7 +4876,7 @@ def gpt_attention(
 
     Parameters:
         qkv: Tensor (On GPU)
-            The input QKV tensor. Its shape is [batch_beam_size, max_seqlen, qkv_dim] in padded mode and [1, num_tokens, qkv_dim] in
+            The input QKV tensor. Its shape is [batch_beam_size, max_seqlen, qkv_dim] in padded mode and [num_tokens, qkv_dim] in
             packed mode. Where qkv_dim depends on using MQA, GQA, or MHA. See QKV Input in docs/source/advanced/gpt-attention.md,
 
         past_key_value: Tensor (On GPU)
@@ -5103,7 +5129,7 @@ def gpt_attention(
 
     assert host_request_types is not None
     assert (alibi_slopes is not None) == (position_embedding_type.is_alibi())
-    assert (mrope_rotary_sin_cos
+    assert (mrope_rotary_cos_sin
             is not None) == (position_embedding_type.is_mrope())
     attn_plg_creator = trt.get_plugin_registry().get_plugin_creator(
         'GPTAttention', '1', TRT_LLM_PLUGIN_NAMESPACE)
@@ -5432,19 +5458,20 @@ def gpt_attention(
         # add position_ids as well only if speculative decoding mode
         assert spec_decoding_position_offsets is not None
         assert spec_decoding_generation_lengths is not None
+        assert spec_decoding_use is not None
         plug_inputs += [
             spec_decoding_generation_lengths, spec_decoding_packed_mask,
-            spec_decoding_position_offsets
+            spec_decoding_position_offsets, spec_decoding_use
         ]
 
     if long_rope_rotary_inv_freq is not None:
         assert long_rope_rotary_cos_sin is not None
         plug_inputs += [long_rope_rotary_inv_freq, long_rope_rotary_cos_sin]
 
-    if mrope_rotary_sin_cos is not None:
+    if mrope_rotary_cos_sin is not None:
         assert mrope_position_deltas is not None
         plug_inputs += [
-            mrope_rotary_sin_cos,
+            mrope_rotary_cos_sin,
             mrope_position_deltas,
         ]
     if host_runtime_perf_knobs is not None:
@@ -5897,6 +5924,7 @@ ACT2FN = {
     'identity': identity,
     'silu': silu,
     'softplus': softplus,
+    'relu2': squared_relu,
     'squared-relu': squared_relu,
     'swiglu': swiglu,
     'fast-swiglu': swiglu,

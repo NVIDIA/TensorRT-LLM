@@ -25,8 +25,8 @@ namespace tensorrt_llm
 namespace kernels
 {
 
-constexpr int32_t kBitsPerMaskElement = 32;
-constexpr int32_t kThreadsPerBlock = 512;
+int32_t constexpr kBitsPerMaskElement = 32;
+int32_t constexpr kThreadsPerBlock = 256;
 
 template <typename T>
 __device__ T GetNegativeInfinity()
@@ -40,31 +40,58 @@ __device__ half GetNegativeInfinity<half>()
     return __float2half(-INFINITY);
 }
 
-template <typename T>
-__global__ void __launch_bounds__(512) logitsBitmaskKernel(
+template <typename T, typename PackedT>
+__global__ void __launch_bounds__(kThreadsPerBlock) logitsBitmaskKernel(
     T** __restrict__ logits, uint32_t const** __restrict__ bitmask, int32_t vocabSizePadded, int32_t bitmaskSize)
 {
-    int batchIdx = blockIdx.y;
-    int bitmaskIdx = blockDim.x * blockIdx.x + threadIdx.x;
-    if (bitmaskIdx >= bitmaskSize)
-    {
-        return;
-    }
+    int constexpr kAlignment = sizeof(PackedT) / sizeof(T);
+    int const batchIdx = blockIdx.y;
 
-    uint32_t bitmaskVal = bitmask[batchIdx][bitmaskIdx];
-    T* logitsPtr = logits[batchIdx] + bitmaskIdx * kBitsPerMaskElement;
-    for (int i = 0; i < kBitsPerMaskElement; ++i)
+    int const logitsGmemOffset = kThreadsPerBlock * blockIdx.x * kBitsPerMaskElement;
+    T* logitsGmemPtr = logits[batchIdx] + logitsGmemOffset;
+    __shared__ T logitsSmem[kThreadsPerBlock * kBitsPerMaskElement];
+
+#pragma unroll
+    for (int offset = 0; offset < kThreadsPerBlock * kBitsPerMaskElement; offset += kThreadsPerBlock * kAlignment)
     {
-        if (bitmaskIdx * kBitsPerMaskElement + i >= vocabSizePadded)
+        int localOffset = offset + threadIdx.x * kAlignment;
+        if (logitsGmemOffset + localOffset >= vocabSizePadded)
         {
             break;
         }
-        if (!(bitmaskVal & 1))
+        *reinterpret_cast<PackedT*>(logitsSmem + localOffset)
+            = *reinterpret_cast<PackedT*>(logitsGmemPtr + localOffset);
+    }
+    __syncthreads();
+
+    int const bitmaskIdx = kThreadsPerBlock * blockIdx.x + threadIdx.x;
+    uint32_t const bitmaskVal = bitmask[batchIdx][bitmaskIdx];
+
+#pragma unroll
+    for (int i = 0; i < kBitsPerMaskElement; ++i)
+    {
+        int offset = (i + threadIdx.x) % warpSize;
+        if (bitmaskIdx * kBitsPerMaskElement + offset >= vocabSizePadded)
         {
-            // TODO(enweiz): Fix uncoalesced global memory access here.
-            logitsPtr[i] = GetNegativeInfinity<T>();
+            continue;
         }
-        bitmaskVal >>= 1;
+        if (!((bitmaskVal >> offset) & 1))
+        {
+            logitsSmem[threadIdx.x * kBitsPerMaskElement + offset] = GetNegativeInfinity<T>();
+        }
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int offset = 0; offset < kThreadsPerBlock * kBitsPerMaskElement; offset += kThreadsPerBlock * kAlignment)
+    {
+        int localOffset = offset + threadIdx.x * kAlignment;
+        if (logitsGmemOffset + localOffset >= vocabSizePadded)
+        {
+            break;
+        }
+        *reinterpret_cast<PackedT*>(logitsGmemPtr + localOffset)
+            = *reinterpret_cast<PackedT*>(logitsSmem + localOffset);
     }
 }
 
@@ -76,7 +103,22 @@ void invokeLogitsBitmask(
     dim3 grid(ceilDiv(bitmaskSize, kThreadsPerBlock), batchSize);
     dim3 block(kThreadsPerBlock);
 
-    logitsBitmaskKernel<T><<<grid, block, 0, stream>>>(logits, bitmask, vocabSizePadded, bitmaskSize);
+    if (vocabSizePadded % (sizeof(float4) / sizeof(T)) == 0)
+    {
+        logitsBitmaskKernel<T, float4><<<grid, block, 0, stream>>>(logits, bitmask, vocabSizePadded, bitmaskSize);
+    }
+    else if (vocabSizePadded % (sizeof(float2) / sizeof(T)) == 0)
+    {
+        logitsBitmaskKernel<T, float2><<<grid, block, 0, stream>>>(logits, bitmask, vocabSizePadded, bitmaskSize);
+    }
+    else if (vocabSizePadded % (sizeof(float) / sizeof(T)) == 0)
+    {
+        logitsBitmaskKernel<T, float><<<grid, block, 0, stream>>>(logits, bitmask, vocabSizePadded, bitmaskSize);
+    }
+    else
+    {
+        logitsBitmaskKernel<T, T><<<grid, block, 0, stream>>>(logits, bitmask, vocabSizePadded, bitmaskSize);
+    }
 }
 
 template void invokeLogitsBitmask<float>(

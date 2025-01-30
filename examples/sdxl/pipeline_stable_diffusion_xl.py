@@ -314,9 +314,10 @@ class StableDiffusionXLPipeline(
             TensorInfo('time_ids', trt.DataType.HALF, [2, 6]),
         ])
         self.outputs = {
-            t.name: torch.empty(tuple(t.shape),
-                                dtype=trt_dtype_to_torch(t.dtype),
-                                device='cuda')
+            t.name:
+            torch.empty(tuple(t.shape),
+                        dtype=trt_dtype_to_torch(t.dtype),
+                        device='cuda')
             for t in output_info
         }
 

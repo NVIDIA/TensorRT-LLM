@@ -25,16 +25,10 @@ import tensorrt as trt
 import torch
 
 from ._common import default_trtnet
-from ._utils import (np_dtype_to_torch, np_dtype_to_trt, str_dtype_to_torch,
-                     str_dtype_to_trt, torch_dtype_to_np_typestr,
+from ._utils import (TensorWrapper, np_dtype_to_trt, str_dtype_to_trt,
                      torch_dtype_to_trt, trt_dtype_to_torch)
 from .functional import Tensor, _create_tensor
 from .plugin.plugin import TRT_LLM_PLUGIN_NAMESPACE
-
-
-def volume(d: Sequence[int]):
-    return np.prod(d)
-
 
 _plugin_registered = dict()
 
@@ -57,77 +51,6 @@ class PluginInfo:
         return (self.plugin_name == obj.plugin_name
                 and self.plugin_namespace == obj.plugin_namespace
                 and self.plugin_version == obj.plugin_version)
-
-
-class TensorWrapper:
-    """
-    A wrapper wraps raw data pointer to a tensor-like object. Could be compatibale with openai triton kernel and be converted to `torch.Tensor` with zero-copy overhead.
-    """
-
-    def __init__(
-        self,
-        data_ptr: int,
-        dtype: Union[torch.dtype, str, np.dtype, trt.DataType],
-        shape: Sequence[int],
-    ):
-        self._data_ptr = data_ptr
-        self.dtype = dtype
-        self.shape = shape
-
-    def data_ptr(self):
-        return self._data_ptr
-
-    @property
-    def dtype(self):
-        return self._dtype
-
-    @property
-    def shape(self):
-        return getattr(self, "_shape", None)
-
-    @dtype.setter
-    def dtype(self, dtype: Union[torch.dtype, str, np.dtype, trt.DataType]):
-        if isinstance(dtype, torch.dtype):
-            self._dtype = dtype
-        elif isinstance(dtype, str):
-            self._dtype = str_dtype_to_torch(dtype)
-        elif isinstance(dtype, np.dtype):
-            self._dtype = np_dtype_to_torch(dtype)
-        elif isinstance(dtype, trt.DataType):
-            self._dtype = trt_dtype_to_torch(dtype)
-        else:
-            raise TypeError(f"Unsupported dtype: {dtype}")
-
-    @shape.setter
-    def shape(self, shape: Sequence[int]):
-        self._shape = tuple(int(i) for i in shape)
-
-    def numel(self):
-        return volume(self.shape)
-
-    @property
-    def __cuda_array_interface__(self):
-        return {
-            "shape": self.shape,
-            "typestr": torch_dtype_to_np_typestr(self.dtype),
-            "data": (self.data_ptr() if self.numel() > 0 else 0, False),
-            "version": 3,
-        }
-
-    @staticmethod
-    def from_trt_desc(desc: trt.PluginTensorDesc, pointer: int):
-        return TensorWrapper(pointer, trt_dtype_to_torch(desc.type), desc.dims)
-
-
-def convert_to_torch_tensor(
-        tensor: Union[TensorWrapper, torch.Tensor]) -> torch.Tensor:
-    """
-    This function is to convert the `TensorWrapper` to torch.Tensor.
-    """
-    if isinstance(tensor, torch.Tensor):
-        return tensor
-
-    return torch.as_tensor(tensor).view(tensor.dtype)
 
 
 def make_expr(

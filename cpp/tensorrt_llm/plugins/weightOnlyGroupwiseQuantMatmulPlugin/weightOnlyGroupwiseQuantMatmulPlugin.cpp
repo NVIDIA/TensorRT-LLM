@@ -59,27 +59,40 @@ void WeightOnlyGroupwiseQuantGemmPluginProfiler::runTactic(int m, int n, int k,
     half* outputPtr = reinterpret_cast<half*>(nextWorkspacePtr(reinterpret_cast<int8_t*>(biasesPtr), m * sizeof(half)));
     char* workspacePtr
         = reinterpret_cast<char*>(nextWorkspacePtr(reinterpret_cast<int8_t*>(outputPtr), m * originalN * sizeof(half)));
-
     if ((mQuantAlgo & ZERO) == 0)
     {
         zerosPtr = nullptr;
     }
-
     if ((mQuantAlgo & BIAS) == 0)
     {
         biasesPtr = nullptr;
     }
 
-    int const wsSize = mRunner->getWorkspaceSize(m, originalN, k);
-    if (mQuantAlgo & INT8_WEIGHT)
+    if (tactic.enableCudaKernel)
     {
-        mRunner->gemm(actPtr, reinterpret_cast<int8_t*>(weightPtr), inputScalesPtr, zerosPtr, biasesPtr, outputPtr, m,
-            originalN, k, mGroupSize, tactic, workspacePtr, wsSize, stream);
+        // run CUDA kernel
+        void const* pre_quant_scale_ptr = nullptr;
+        bool apply_alpha_in_advance = false;
+        float alpha = 1.0;
+        tensorrt_llm::kernels::weight_only::Params params{actPtr, pre_quant_scale_ptr, weightPtr, inputScalesPtr,
+            zerosPtr, biasesPtr, outputPtr, alpha, m, originalN, k, mGroupSize, mCudaKernelType,
+            apply_alpha_in_advance};
+        tensorrt_llm::kernels::weight_only::kernel_launcher(mArch, params, stream);
     }
     else
     {
-        mRunner->gemm(actPtr, reinterpret_cast<cutlass::uint4b_t*>(weightPtr), inputScalesPtr, zerosPtr, biasesPtr,
-            outputPtr, m, originalN, k, mGroupSize, tactic, workspacePtr, wsSize, stream);
+        // run CUTLASS kernel
+        int const wsSize = mRunner->getWorkspaceSize(m, originalN, k);
+        if (mQuantAlgo & INT8_WEIGHT)
+        {
+            mRunner->gemm(actPtr, reinterpret_cast<int8_t*>(weightPtr), inputScalesPtr, zerosPtr, biasesPtr, outputPtr,
+                m, originalN, k, mGroupSize, tactic, workspacePtr, wsSize, stream);
+        }
+        else
+        {
+            mRunner->gemm(actPtr, reinterpret_cast<cutlass::uint4b_t*>(weightPtr), inputScalesPtr, zerosPtr, biasesPtr,
+                outputPtr, m, originalN, k, mGroupSize, tactic, workspacePtr, wsSize, stream);
+        }
     }
 }
 
@@ -262,7 +275,10 @@ void WeightOnlyGroupwiseQuantMatmulPlugin::init(nvinfer1::DataType type, int qua
     }
     mPluginProfiler->setQuantAlgo(mQuantAlgo);
     mPluginProfiler->setGroupSize(mGroupSize);
-
+    if (mCudaKernelEnabled)
+    {
+        mPluginProfiler->setCudaKernelType(mCudaKernelType, mArch);
+    }
     mGemmId = GemmIdCore(mDims.n, mDims.k, mType);
 }
 
@@ -275,7 +291,7 @@ nvinfer1::IPluginV2DynamicExt* WeightOnlyGroupwiseQuantMatmulPlugin::clone() con
 
 void WeightOnlyGroupwiseQuantMatmulPlugin::configGemm()
 {
-    mPluginProfiler->profileTactics(m_weightOnlyGroupwiseGemmRunner, mType, mDims, mGemmId);
+    mPluginProfiler->profileTactics(m_weightOnlyGroupwiseGemmRunner, mType, mDims, mGemmId, mCudaKernelEnabled);
 }
 
 nvinfer1::DimsExprs WeightOnlyGroupwiseQuantMatmulPlugin::getOutputDimensions(
@@ -351,7 +367,6 @@ void WeightOnlyGroupwiseQuantMatmulPlugin::configurePlugin(nvinfer1::DynamicPlug
 {
     auto const minM = std::accumulate(in[0].min.d, in[0].min.d + in[0].min.nbDims - 1, 1, std::multiplies<int>());
     auto const maxM = std::accumulate(in[0].max.d, in[0].max.d + in[0].max.nbDims - 1, 1, std::multiplies<int>());
-
     int const maxK = in[0].max.d[in[0].max.nbDims - 1];
 
     // Quantized weights are packed in FP16 format (INT4*4 -> FP16, INT8*2 -> FP16)
@@ -378,6 +393,25 @@ size_t WeightOnlyGroupwiseQuantMatmulPlugin::getWorkspaceSize(nvinfer1::PluginTe
     return m_workspaceMaxSize;
 }
 
+template <typename ActType>
+void pre_quant_scale_for_act(int const m, int const k, int const mQuantAlgo, int const mPreQuantScaleInputIdx,
+    void const* const* inputs, void* workspace, cudaStream_t stream)
+{
+    // Apply pre-quant per channel scale on activations
+    if (mQuantAlgo & FP8_ALPHA)
+    {
+        tensorrt_llm::kernels::apply_per_channel_scale_kernel_launcher<ActType, __nv_fp8_e4m3>(
+            reinterpret_cast<__nv_fp8_e4m3*>(workspace), reinterpret_cast<ActType const*>(inputs[0]),
+            reinterpret_cast<ActType const*>(inputs[mPreQuantScaleInputIdx]), m, k, stream);
+    }
+    else
+    {
+        tensorrt_llm::kernels::apply_per_channel_scale_kernel_launcher<ActType, ActType>(
+            reinterpret_cast<ActType*>(workspace), reinterpret_cast<ActType const*>(inputs[0]),
+            reinterpret_cast<ActType const*>(inputs[mPreQuantScaleInputIdx]), m, k, stream);
+    }
+}
+
 int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
     cudaStream_t stream) noexcept
@@ -402,9 +436,16 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(nvinfer1::PluginTensorDesc con
     int const n = TLLM_INT32_CAST(inputDesc[mWeightInputIdx].dims.d[1]);
     int const k = TLLM_INT32_CAST(inputDesc[0].dims.d[inputDesc[0].dims.nbDims - 1]);
 
-    bool use_cuda_kernel = m < SMALL_M_FAST_PATH && mCudaKernelEnabled;
-    bool use_pre_quant_scale = mQuantAlgo & PRE_QUANT_SCALE;
+    // get best tactic and check if CUDA kernel should be used
+    bool use_cuda_kernel = false;
+    auto const& bestTactic = mPluginProfiler->getBestConfig(m, mGemmId);
+    TLLM_CHECK_WITH_INFO(bestTactic,
+        "No valid weight only groupwise GEMM tactic(It is usually caused by the failure to execute all "
+        "candidate configurations of the CUTLASS kernel, please pay attention to the warning information "
+        "when building the engine.)");
+    use_cuda_kernel = bestTactic->enableCudaKernel;
 
+    bool use_pre_quant_scale = mQuantAlgo & PRE_QUANT_SCALE;
     half const* zeros_ptr = (mQuantAlgo & ZERO) ? reinterpret_cast<half const*>(inputs[mZerosInputIdx]) : nullptr;
     half const* biases_ptr = (mQuantAlgo & BIAS) ? reinterpret_cast<half const*>(inputs[mBiasesInputIdx]) : nullptr;
     half const* act_ptr = reinterpret_cast<half const*>(inputs[0]);
@@ -420,34 +461,12 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(nvinfer1::PluginTensorDesc con
         act_ptr = reinterpret_cast<half const*>(workspace);
         if (mType == nvinfer1::DataType::kHALF)
         {
-            if (mQuantAlgo & FP8_ALPHA)
-            {
-                tensorrt_llm::kernels::apply_per_channel_scale_kernel_launcher<half, __nv_fp8_e4m3>(
-                    reinterpret_cast<__nv_fp8_e4m3*>(workspace), reinterpret_cast<half const*>(inputs[0]),
-                    reinterpret_cast<half const*>(inputs[mPreQuantScaleInputIdx]), m, k, stream);
-            }
-            else
-            {
-                tensorrt_llm::kernels::apply_per_channel_scale_kernel_launcher<half, half>(
-                    reinterpret_cast<half*>(workspace), reinterpret_cast<half const*>(inputs[0]),
-                    reinterpret_cast<half const*>(inputs[mPreQuantScaleInputIdx]), m, k, stream);
-            }
+            pre_quant_scale_for_act<half>(m, k, mQuantAlgo, mPreQuantScaleInputIdx, inputs, workspace, stream);
         }
 #if defined(ENABLE_BF16)
         else if (mType == nvinfer1::DataType::kBF16)
         {
-            if (mQuantAlgo & FP8_ALPHA)
-            {
-                tensorrt_llm::kernels::apply_per_channel_scale_kernel_launcher<__nv_bfloat16, __nv_fp8_e4m3>(
-                    reinterpret_cast<__nv_fp8_e4m3*>(workspace), reinterpret_cast<__nv_bfloat16 const*>(inputs[0]),
-                    reinterpret_cast<__nv_bfloat16 const*>(inputs[mPreQuantScaleInputIdx]), m, k, stream);
-            }
-            else
-            {
-                tensorrt_llm::kernels::apply_per_channel_scale_kernel_launcher<__nv_bfloat16, __nv_bfloat16>(
-                    reinterpret_cast<__nv_bfloat16*>(workspace), reinterpret_cast<__nv_bfloat16 const*>(inputs[0]),
-                    reinterpret_cast<__nv_bfloat16 const*>(inputs[mPreQuantScaleInputIdx]), m, k, stream);
-            }
+            pre_quant_scale_for_act<__nv_bfloat16>(m, k, mQuantAlgo, mPreQuantScaleInputIdx, inputs, workspace, stream);
         }
 #endif
     }
@@ -464,35 +483,24 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(nvinfer1::PluginTensorDesc con
 
     if (use_cuda_kernel)
     {
+        // Apply CUDA kernel
         void const* pre_quant_scale_ptr = nullptr;
         if (use_pre_quant_scale)
             pre_quant_scale_ptr = inputs[mPreQuantScaleInputIdx];
         void const* cuda_kernel_act_ptr = inputs[0];
-        void const* cuda_kernel_act_scale_ptr = pre_quant_scale_ptr;
         void const* cuda_kernel_weight_ptr = inputs[mWeightInputIdx];
         void const* cuda_kernel_scales_ptr = inputs[mScalesInputIdx];
-        void const* cuda_kernel_zeros_ptr = zeros_ptr;
-        void const* cuda_kernel_bias_ptr = biases_ptr;
         void* cuda_kernel_out_ptr = outputs[0];
-        tensorrt_llm::kernels::weight_only::Params params{cuda_kernel_act_ptr, cuda_kernel_act_scale_ptr,
-            cuda_kernel_weight_ptr, cuda_kernel_scales_ptr, cuda_kernel_zeros_ptr, cuda_kernel_bias_ptr,
-            cuda_kernel_out_ptr, alpha, m, real_n, k, mGroupSize, mCudaKernelType,
-            static_cast<bool>(mQuantAlgo & FP8_ALPHA)};
+        tensorrt_llm::kernels::weight_only::Params params{cuda_kernel_act_ptr, pre_quant_scale_ptr,
+            cuda_kernel_weight_ptr, cuda_kernel_scales_ptr, zeros_ptr, biases_ptr, cuda_kernel_out_ptr, alpha, m,
+            real_n, k, mGroupSize, mCudaKernelType, static_cast<bool>(mQuantAlgo & FP8_ALPHA)};
         tensorrt_llm::kernels::weight_only::kernel_launcher(mArch, params, stream);
     }
     else
     {
+        // Apply CUTLASS kernel
         int const ws_bytes = m_weightOnlyGroupwiseGemmRunner->getWorkspaceSize(m, real_n, k);
-
         int32_t* weight_ptr = const_cast<int32_t*>(reinterpret_cast<int32_t const*>(inputs[mWeightInputIdx]));
-
-        auto const& bestTactic = mPluginProfiler->getBestConfig(m, mGemmId);
-        TLLM_CHECK_WITH_INFO(bestTactic,
-            "No valid weight only groupwise GEMM tactic(It is usually caused by the failure to execute all "
-            "candidate "
-            "configurations of the CUTLASS kernel, please pay attention to the warning information when building "
-            "the "
-            "engine.)");
         m_weightOnlyGroupwiseGemmRunner->gemm(act_ptr, weight_ptr, inputs[mScalesInputIdx], zeros_ptr, biases_ptr,
             alpha, outputs[0], m, real_n, k, mGroupSize, *bestTactic,
             reinterpret_cast<char*>(workspace) + m * k * sizeof(half), ws_bytes, stream);

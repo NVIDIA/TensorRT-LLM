@@ -20,8 +20,8 @@ import tensorrt as trt
 import torch
 
 from .._common import default_net, precision
-from .._utils import (fp32_array, int32_array, is_same_dtype, set_obj_attrs,
-                      trt_dtype_to_np, trt_dtype_to_str)
+from .._utils import (fp32_array, get_sm_version, int32_array, is_same_dtype,
+                      set_obj_attrs, trt_dtype_to_np, trt_dtype_to_str)
 
 # isort: off
 from ..functional import (
@@ -40,8 +40,6 @@ from ..quantization.functional import dequantize, quantize
 from .linear import ColumnLinear, RowLinear
 from .lora import LoraRuntimeParams
 from .normalization import GroupNorm, LayerNorm, RmsNorm
-
-from ..functional import maximum  # isort:skip
 
 layernorm_map = {
     LayerNormType.LayerNorm: LayerNorm,
@@ -249,23 +247,25 @@ class SpecDecodingParams:
                  spec_decoding_max_generation_length: int = 1,
                  spec_decoding_generation_lengths: Tensor = None,
                  spec_decoding_position_offsets: Tensor = None,
-                 spec_decoding_packed_mask: Tensor = None):
+                 spec_decoding_packed_mask: Tensor = None,
+                 spec_decoding_use: Tensor = None):
 
         self.spec_decoding_is_generation_length_variable = spec_decoding_is_generation_length_variable
         self.spec_decoding_max_generation_length = spec_decoding_max_generation_length
         self.spec_decoding_generation_lengths = spec_decoding_generation_lengths
         self.spec_decoding_position_offsets = spec_decoding_position_offsets
         self.spec_decoding_packed_mask = spec_decoding_packed_mask
+        self.spec_decoding_use = spec_decoding_use
 
 
 class MropeParams:
 
     def __init__(
         self,
-        mrope_rotary_sin_cos: Tensor = None,
+        mrope_rotary_cos_sin: Tensor = None,
         mrope_position_deltas: Tensor = None,
     ):
-        self.mrope_rotary_sin_cos = mrope_rotary_sin_cos
+        self.mrope_rotary_cos_sin = mrope_rotary_cos_sin
         self.mrope_position_deltas = mrope_position_deltas
 
 
@@ -699,6 +699,16 @@ class Attention(Module):
         # Fill nothing.
         return attention_params
 
+    def _get_output_orig_quant_scale(self):
+        attention_output_orig_quant_scale = self.attention_output_orig_quant_scale.value if self.attention_output_orig_quant_scale is not None else None
+        if attention_output_orig_quant_scale is not None and (
+                default_net().plugin_config.gemm_plugin == 'nvfp4'
+                or self.quant_mode.has_nvfp4()):
+            # The scale was intended for nvfp4 quantization: max_value * scale = fp4_max * fp8_max
+            # So if we want to quantize the output to fp8, the scale should be divided by fp4_max
+            attention_output_orig_quant_scale = attention_output_orig_quant_scale / 6.0
+        return attention_output_orig_quant_scale
+
     def forward(
         self,
         hidden_states: Tensor,
@@ -719,7 +729,7 @@ class Attention(Module):
         skip_attn=None,
     ):
         attention_input = hidden_states
-        assert isinstance(hidden_states, Tensor)
+        assert isinstance(hidden_states, (Tensor, tuple))
 
         spec_decoding_params = SpecDecodingParams(
         ) if spec_decoding_params is None else spec_decoding_params
@@ -988,20 +998,11 @@ class Attention(Module):
 
             # KV cache scales.
             if self.kv_cache_scaling_factor is not None:
-                kv_orig_quant_scale = constant(fp32_array(
-                    [1.0])) / self.kv_cache_scaling_factor.value
+                kv_orig_quant_scale = self.kv_cache_rcp_scaling_factor.value
                 kv_quant_orig_scale = self.kv_cache_scaling_factor.value
             else:
                 kv_orig_quant_scale = None
                 kv_quant_orig_scale = None
-
-            # Attention output scales
-            assert (
-                not default_net().plugin_config.use_fp8_context_fmha
-            ) or self.quant_mode.has_fp8_qdq(
-            ), "FP8 Context FMHA must be used together with the fp8 quantization workflow."
-
-            attention_output_orig_quant_scale = self.attention_output_orig_quant_scale.value if self.attention_output_orig_quant_scale is not None else None
 
             # The rotary inv freq can be pre-computed.
             rotary_inv_freq = getattr(attention_params, "rotary_inv_freq", None)
@@ -1063,8 +1064,8 @@ class Attention(Module):
                 rotary_cos_sin=rotary_cos_sin,
                 kv_orig_quant_scale=kv_orig_quant_scale,
                 kv_quant_orig_scale=kv_quant_orig_scale,
-                attention_output_orig_quant_scale=
-                attention_output_orig_quant_scale,
+                attention_output_orig_quant_scale=self.
+                _get_output_orig_quant_scale(),
                 kv_cache_quant_mode=self.quant_mode,
                 max_context_length=attention_params.max_context_length,
                 mask_type=self.attention_mask_type,
@@ -1110,9 +1111,10 @@ class Attention(Module):
                 spec_decoding_position_offsets,
                 spec_decoding_packed_mask=spec_decoding_params.
                 spec_decoding_packed_mask,
+                spec_decoding_use=spec_decoding_params.spec_decoding_use,
                 long_rope_rotary_inv_freq=long_rope_rotary_inv_freq,
                 long_rope_rotary_cos_sin=long_rope_rotary_cos_sin,
-                mrope_rotary_sin_cos=mrope_params.mrope_rotary_sin_cos,
+                mrope_rotary_cos_sin=mrope_params.mrope_rotary_cos_sin,
                 mrope_position_deltas=mrope_params.mrope_position_deltas,
                 attn_logit_softcapping_scale=self.max_attn_value,
                 host_runtime_perf_knobs=attention_params.
@@ -1181,8 +1183,8 @@ class Attention(Module):
 
                     embed_positions = concat([short, long], dim=0)
                     select = where(
-                        sequence_length <=
-                        self.original_max_position_embeddings, 0, 1)
+                        sequence_length
+                        <= self.original_max_position_embeddings, 0, 1)
                     embed_positions = slice(embed_positions,
                                             concat([select, 0, 0]),
                                             sizes=shape(short))
@@ -1459,10 +1461,14 @@ class Attention(Module):
             dense_lora_params = lora_layer_params.get_runtime_params(
                 0, "attn_dense")
 
-        if skip_attn is not None:
+        if skip_attn is not None and not default_net(
+        ).plugin_config.use_fp8_context_fmha:
             # This case is used when we can skip this attention layer directly.
             # The output would be undefined and not used if skip_attn is not None
             # and set skip_attn as True during runtime
+            # But when use_fp8_context_fmha is enabled, the output data type of
+            # attention_plugin is fp8. Since TRT's conditional layer does not support
+            # FP8 data type yet, we cannot use it to skip the computation in such case.
 
             dense_conditional = Conditional(skip_attn)
             skip_case = dense_conditional.add_input(attention_input)
@@ -1474,7 +1480,8 @@ class Attention(Module):
                              lora_runtime_params=dense_lora_params,
                              all_reduce_params=all_reduce_params)
 
-        if skip_attn is not None:
+        if skip_attn is not None and not default_net(
+        ).plugin_config.use_fp8_context_fmha:
             context = dense_conditional.add_output(skip_case, context)
 
         if use_cache:
@@ -1492,13 +1499,22 @@ class Attention(Module):
     def postprocess(self, tllm_key, weights, **kwargs):
         if tllm_key.endswith("kv_cache_scaling_factor"):
             if weights is None:
-                return {tllm_key: torch.ones(1, )}
+                return {tllm_key: torch.ones(1, ).float()}
             elif isinstance(weights, torch.Tensor):
-                return {tllm_key: weights}
+                return {tllm_key: weights.float()}
             elif None in weights:
-                return {tllm_key: torch.ones(1, )}
+                return {tllm_key: torch.ones(1, ).float()}
             else:
-                return {tllm_key: max(weights)}
+                return {tllm_key: max(weights).float()}
+        elif tllm_key.endswith("kv_cache_rcp_scaling_factor"):
+            if weights is None:
+                return {tllm_key: torch.ones(1, ).float()}
+            elif isinstance(weights, torch.Tensor):
+                return {tllm_key: torch.reciprocal(weights.float())}
+            elif None in weights:
+                return {tllm_key: torch.ones(1, ).float()}
+            else:
+                return {tllm_key: torch.reciprocal(max(weights).float())}
         else:
             return {tllm_key: weights}
 
@@ -1639,6 +1655,8 @@ class BertAttention(Module):
             # TRT plugin mode
             assert input_lengths is not None
             assert self.cp_size == 1
+            assert get_sm_version(
+            ) < 100, "bert_attention_plugin does not support SM >= 100"
             context = bert_attention(
                 qkv,
                 input_lengths,
@@ -1810,20 +1828,11 @@ class CogVLMAttention(Attention):
             ], 'Plugin only support masked MHA.'
 
             # KV cache scales.
-            kv_orig_quant_scale = constant(
-                fp32_array([1.0])
-            ) / self.kv_cache_scaling_factor.value if self.quant_mode.has_kv_cache_quant(
+            kv_orig_quant_scale = self.kv_cache_rcp_scaling_factor.value if self.quant_mode.has_kv_cache_quant(
             ) else None
             kv_quant_orig_scale = self.kv_cache_scaling_factor.value if self.quant_mode.has_kv_cache_quant(
             ) else None
 
-            # Attention output scales
-            assert (
-                not default_net().plugin_config.use_fp8_context_fmha
-            ) or self.quant_mode.has_fp8_qdq(
-            ), "FP8 Context FMHA must be used together with the fp8 quantization workflow."
-
-            attention_output_orig_quant_scale = self.attention_output_orig_quant_scale.value if self.attention_output_orig_quant_scale is not None else None
             context, past_key_value = gpt_attention(
                 qkv=qkv,
                 past_key_value=past_key_value,
@@ -1844,8 +1853,8 @@ class CogVLMAttention(Attention):
                 position_embedding_type=self.position_embedding_type,
                 kv_orig_quant_scale=kv_orig_quant_scale,
                 kv_quant_orig_scale=kv_quant_orig_scale,
-                attention_output_orig_quant_scale=
-                attention_output_orig_quant_scale,
+                attention_output_orig_quant_scale=self.
+                _get_output_orig_quant_scale(),
                 kv_cache_quant_mode=self.quant_mode,
                 max_context_length=attention_params.max_context_length,
                 mask_type=self.attention_mask_type,
@@ -1870,7 +1879,7 @@ class CogVLMAttention(Attention):
                 use_cache=use_cache,
                 spec_decoding_position_offsets=None,
                 spec_decoding_packed_mask=None,
-                mrope_rotary_sin_cos=None,
+                mrope_rotary_cos_sin=None,
                 mrope_position_deltas=None,
                 host_runtime_perf_knobs=attention_params.
                 host_runtime_perf_knobs,
@@ -2093,20 +2102,11 @@ class DeepseekV2Attention(Attention):
 
             # KV cache scales.
             if self.kv_cache_scaling_factor is not None:
-                kv_orig_quant_scale = constant(fp32_array(
-                    [1.0])) / self.kv_cache_scaling_factor.value
+                kv_orig_quant_scale = self.kv_cache_rcp_scaling_factor.value
                 kv_quant_orig_scale = self.kv_cache_scaling_factor.value
             else:
                 kv_orig_quant_scale = None
                 kv_quant_orig_scale = None
-
-            # Attention output scales
-            assert (
-                not default_net().plugin_config.use_fp8_context_fmha
-            ) or self.quant_mode.has_fp8_qdq(
-            ), "FP8 Context FMHA must be used together with the fp8 quantization workflow."
-
-            attention_output_orig_quant_scale = self.attention_output_orig_quant_scale.value if self.attention_output_orig_quant_scale is not None else None
 
             rotary_cos_sin = self.embed_positions_for_gpt_attention.value
 
@@ -2133,8 +2133,8 @@ class DeepseekV2Attention(Attention):
                 rotary_cos_sin=rotary_cos_sin,
                 kv_orig_quant_scale=kv_orig_quant_scale,
                 kv_quant_orig_scale=kv_quant_orig_scale,
-                attention_output_orig_quant_scale=
-                attention_output_orig_quant_scale,
+                attention_output_orig_quant_scale=self.
+                _get_output_orig_quant_scale(),
                 kv_cache_quant_mode=self.quant_mode,
                 max_context_length=attention_params.max_context_length,
                 mask_type=self.attention_mask_type,
@@ -2178,6 +2178,7 @@ class DeepseekV2Attention(Attention):
                 spec_decoding_position_offsets,
                 spec_decoding_packed_mask=spec_decoding_params.
                 spec_decoding_packed_mask,
+                spec_decoding_use=spec_decoding_params.spec_decoding_use,
                 attn_logit_softcapping_scale=self.max_attn_value,
                 host_runtime_perf_knobs=attention_params.
                 host_runtime_perf_knobs,

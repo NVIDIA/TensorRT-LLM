@@ -567,6 +567,7 @@ public:
 
     //!
     //! \brief Returns pointer to underlying array.
+    //! \details Return nullptr if size == 0 so behavior is consistent with BufferView.
     //!
     void* data() override
     {
@@ -575,6 +576,7 @@ public:
 
     //!
     //! \brief Returns pointer to underlying array.
+    //! \details Return nullptr if size == 0 so behavior is consistent with BufferView.
     //!
     [[nodiscard]] void const* data() const override
     {

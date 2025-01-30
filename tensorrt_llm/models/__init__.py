@@ -45,7 +45,7 @@ from .llama.model import LLaMAForCausalLM, LLaMAModel
 from .mamba.model import MambaForCausalLM
 from .medusa.config import MedusaConfig
 from .medusa.model import MedusaForCausalLm
-from .mllama.model import MLLaMAModel
+from .mllama.model import MLLaMAForCausalLM
 from .modeling_utils import (PretrainedConfig, PretrainedModel,
                              SpeculativeDecodingMode)
 from .mpt.model import MPTForCausalLM, MPTModel
@@ -121,7 +121,7 @@ __all__ = [
     'EagleForCausalLM',
     'SpeculativeDecodingMode',
     'CohereForCausalLM',
-    'MLLaMAModel',
+    'MLLaMAForCausalLM',
 ]
 
 MODEL_MAP = {
@@ -146,11 +146,14 @@ MODEL_MAP = {
     'MambaForCausalLM': MambaForCausalLM,
     'GPTNeoXForCausalLM': GPTNeoXForCausalLM,
     'GPTJForCausalLM': GPTJForCausalLM,
+    'MptForCausalLM': MPTForCausalLM,
     'MPTForCausalLM': MPTForCausalLM,
     'GLMModel': ChatGLMForCausalLM,
     'ChatGLMModel': ChatGLMForCausalLM,
     'ChatGLMForCausalLM': ChatGLMForCausalLM,
+    'ChatGLMForConditionalGeneration': ChatGLMForCausalLM,
     'LlamaForCausalLM': LLaMAForCausalLM,
+    'LlavaLlamaModel': LLaMAForCausalLM,
     'ExaoneForCausalLM': LLaMAForCausalLM,
     'MistralForCausalLM': LLaMAForCausalLM,
     'MixtralForCausalLM': LLaMAForCausalLM,
@@ -158,7 +161,10 @@ MODEL_MAP = {
     'Grok1ModelForCausalLM': GrokForCausalLM,
     'InternLMForCausalLM': LLaMAForCausalLM,
     'InternLM2ForCausalLM': LLaMAForCausalLM,
+    'GraniteForCausalLM': LLaMAForCausalLM,
+    'GraniteMoeForCausalLM': LLaMAForCausalLM,
     'MedusaForCausalLM': MedusaForCausalLm,
+    'MedusaLlamaForCausalLM': MedusaForCausalLm,
     'ReDrafterForCausalLM': ReDrafterForCausalLM,
     'BaichuanForCausalLM': BaichuanForCausalLM,
     'BaiChuanForCausalLM': BaichuanForCausalLM,
@@ -183,7 +189,9 @@ MODEL_MAP = {
     'DeepseekV2ForCausalLM': DeepseekV2ForCausalLM,
     'EagleForCausalLM': EagleForCausalLM,
     'CohereForCausalLM': CohereForCausalLM,
-    'MllamaForConditionalGeneration': MLLaMAModel,
+    'MLLaMAModel': MLLaMAForCausalLM,  # For modelopt
+    'MllamaForConditionalGeneration':
+    MLLaMAForCausalLM,  # For mllama load by Auto
     'BertForQuestionAnswering': BertForQuestionAnswering,
     'BertForSequenceClassification': BertForSequenceClassification,
     'BertModel': BertModel,

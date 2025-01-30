@@ -41,6 +41,19 @@ class GuidedDecodingParams:
 
 
 @dataclass(slots=True, kw_only=True)
+class AdditionalModelOutput:
+    """
+    An additional output to gather from the model.
+
+    Args:
+        name (str): The name of the additional output to gather from the model.
+        gather_context (bool): A value indicating whether or not to gather the additional output from the context too. Defaults to False.
+    """
+    name: str
+    gather_context: bool
+
+
+@dataclass(slots=True, kw_only=True)
 class SamplingParams:
     """
     Sampling parameters for text generation.
@@ -90,6 +103,7 @@ class SamplingParams:
         exclude_input_from_output (bool): Controls if output tokens in Result should include the input tokens. Default is true.
         return_encoder_output (bool): Controls if Result should contain encoder output hidden states (for encoder-only and encoder-decoder models). Default is false.
         return_perf_metrics (bool): Controls if Result should contain the performance metrics for this request. Default is false.
+        additional_model_outputs (list[AdditionalModelOutput], optional): The additional outputs to gather from the model.
 
         lookahead_config (LookaheadDecodingConfig , optional): Lookahead decoding config. Defaults to None.
         guided_decoding (GuidedDecodingParams, optional): Guided decoding params. Defaults to None.
@@ -164,6 +178,7 @@ class SamplingParams:
     exclude_input_from_output: bool = True
     return_encoder_output: bool = False
     return_perf_metrics: bool = False
+    additional_model_outputs: Optional[list[AdditionalModelOutput]] = None
 
     # Lookahead decoding config
     lookahead_config: Optional[tllme.LookaheadDecodingConfig] = None
@@ -384,7 +399,8 @@ class SamplingParams:
         expected_fields = [
             "return_log_probs", "return_context_logits",
             "return_generation_logits", "exclude_input_from_output",
-            "return_encoder_output", "return_perf_metrics"
+            "return_encoder_output", "return_perf_metrics",
+            "additional_model_outputs"
         ]
         found_fields = [
             f for f in dir(tllme.OutputConfig) if not f.startswith('__')

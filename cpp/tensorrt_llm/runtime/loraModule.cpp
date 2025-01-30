@@ -33,21 +33,22 @@ std::vector<LoraModule> LoraModule::createLoraModules(std::vector<std::string> c
 
     for (auto const& moduleName : loraModuleNames)
     {
-        auto t = toModuleType(moduleName);
+        auto const qOutSize = numHeads * attnHeadSize;
+        auto const kvOutSize = numKvHeads * attnHeadSize;
+        auto const t = toModuleType(moduleName);
         switch (t)
         {
 
         case ModuleType::kATTN_QKV:
         case ModuleType::kCROSS_ATTN_QKV:
-            modules.emplace_back(
-                t, hidden, (numHeads * attnHeadSize + 2 * numKvHeads * attnHeadSize), false, true, -1, 0);
+            modules.emplace_back(t, hidden, (qOutSize + 2 * kvOutSize), false, true, -1, 0);
             break;
         case ModuleType::kATTN_Q:
+        case ModuleType::kCROSS_ATTN_Q: modules.emplace_back(t, hidden, qOutSize, false, true, -1, 0); break;
         case ModuleType::kATTN_K:
-        case ModuleType::kATTN_V:
-        case ModuleType::kCROSS_ATTN_Q:
         case ModuleType::kCROSS_ATTN_K:
-        case ModuleType::kCROSS_ATTN_V: modules.emplace_back(t, hidden, hidden, false, true, -1, 0); break;
+        case ModuleType::kATTN_V:
+        case ModuleType::kCROSS_ATTN_V: modules.emplace_back(t, hidden, kvOutSize, false, true, -1, 0); break;
         case ModuleType::kATTN_DENSE:
         case ModuleType::kCROSS_ATTN_DENSE: modules.emplace_back(t, hidden, hidden, false, true, 1, -1); break;
         case ModuleType::kMLP_H_TO_4H: modules.emplace_back(t, hidden, mlpHidden, false, true, -1, 0); break;

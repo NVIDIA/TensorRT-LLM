@@ -425,7 +425,7 @@ void printAbsMean(T const* buf, uint64_t size, cudaStream_t stream, std::string 
     cudaDeviceSynchronize();
     check_cuda_error(cudaGetLastError());
     double sum = 0.0f;
-    uint64_t zero_count = 0;
+    size_t zero_count = 0;
     float max_val = -1e10;
     bool find_inf = false;
     for (uint64_t i = 0; i < size; i++)
@@ -442,8 +442,8 @@ void printAbsMean(T const* buf, uint64_t size, cudaStream_t stream, std::string 
         }
         max_val = max_val > abs(float(h_tmp[i])) ? max_val : abs(float(h_tmp[i]));
     }
-    TLLM_LOG_INFO("%20s size: %u, abs mean: %f, abs sum: %f, abs max: %f, find inf: %s", name.c_str(), size, sum / size,
-        sum, max_val, find_inf ? "true" : "false");
+    TLLM_LOG_INFO("%20s size: %u, abs mean: %f, abs sum: %f, abs max: %f, zero count: %zu, find inf: %s", name.c_str(),
+        size, sum / size, sum, zero_count, max_val, find_inf ? "true" : "false");
     delete[] h_tmp;
     cudaDeviceSynchronize();
     check_cuda_error(cudaGetLastError());

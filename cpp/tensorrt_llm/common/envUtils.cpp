@@ -31,10 +31,17 @@ std::optional<int32_t> getIntEnv(char const* name)
         return std::nullopt;
     }
     int32_t const val = std::stoi(env);
-    if (val <= 0)
+    return {val};
+};
+
+std::optional<size_t> getUInt64Env(char const* name)
+{
+    char const* const env = std::getenv(name);
+    if (env == nullptr)
     {
         return std::nullopt;
     }
+    size_t const val = std::stoull(env);
     return {val};
 };
 
@@ -48,36 +55,34 @@ static bool getBoolEnv(char const* name)
 // XQA kernels (optimized kernels for generation phase).
 bool forceXQAKernels()
 {
-    static bool const forceXQA = (getIntEnv("TRTLLM_FORCE_XQA").value_or(0) != 0);
+    static bool const forceXQA
+        = (getIntEnv("TRTLLM_FORCE_XQA").value_or(0) != 0) || getEnvForceDeterministicAttention();
     return forceXQA;
 }
 
 std::optional<bool> getEnvEnableXQAJIT()
 {
-    static bool init = false;
-    static bool exists = false;
-    static bool enableXQAJIT = false;
-    if (!init)
+    static std::optional<bool> val = []
     {
-        init = true;
-        char const* enable_xqa_jit_var = std::getenv("TRTLLM_ENABLE_XQA_JIT");
-        if (enable_xqa_jit_var)
+        std::optional<bool> val = std::nullopt;
+        auto const tmp = getIntEnv("TRTLLM_ENABLE_XQA_JIT");
+        if (tmp.has_value())
         {
-            exists = true;
-            if (enable_xqa_jit_var[0] == '1' && enable_xqa_jit_var[1] == '\0')
-            {
-                enableXQAJIT = true;
-            }
+            val = static_cast<bool>(tmp.value());
         }
-    }
-    if (exists)
+        return val;
+    }();
+    return val;
+}
+
+std::optional<int> getEnvXqaBlocksPerSequence()
+{
+    static auto const xqaBlocksPerSeq = []()
     {
-        return enableXQAJIT;
-    }
-    else
-    {
-        return std::nullopt;
-    }
+        auto const val = getIntEnv("TRTLLM_XQA_BLOCKS_PER_SEQUENCE");
+        return (val.has_value() && *val <= 0) ? std::nullopt : val;
+    }();
+    return xqaBlocksPerSeq;
 }
 
 // Tune the number of blocks per sequence for accuracy/performance purpose.
@@ -199,4 +204,59 @@ bool getEnvParallelCacheSend()
     return parallelCacheSend;
 }
 
+bool getEnvRequestKVCacheSerial()
+{
+    static bool const requestKVCacheSerial = getBoolEnv("TRTLLM_REQUEST_KV_CACHE_SERIAL");
+    return requestKVCacheSerial;
+}
+
+bool getEnvDisableKVCacheTransferOverlap()
+{
+    static bool const disableKVCacheTransferOverlap = getBoolEnv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP");
+    return disableKVCacheTransferOverlap;
+}
+
+bool getEnvDisableReceiveKVCacheParallel()
+{
+    static bool const disableReceiveParallel = getBoolEnv("TRTLLM_DISABLE_KVCACHE_RECEIVE_PARALLEL");
+    return disableReceiveParallel;
+}
+
+bool getEnvTryZCopyForKVCacheTransfer()
+{
+    static bool const zcopyForSysmmetricKVCache = getBoolEnv("TRTLLM_TRY_ZCOPY_FOR_KVCACHE_TRANSFER");
+    return zcopyForSysmmetricKVCache;
+}
+
+bool getEnvForceDeterministic()
+{
+    static bool const forceDeterministic = getBoolEnv("FORCE_DETERMINISTIC");
+    return forceDeterministic;
+}
+
+bool getEnvForceDeterministicMOE()
+{
+    static bool const forceDeterministic = getBoolEnv("FORCE_MOE_KERNEL_DETERMINISTIC") || getEnvForceDeterministic();
+    return forceDeterministic;
+}
+
+bool getEnvForceDeterministicAttention()
+{
+    static bool const forceDeterministic
+        = getBoolEnv("FORCE_ATTENTION_KERNEL_DETERMINISTIC") || getEnvForceDeterministic();
+    return forceDeterministic;
+}
+
+bool getEnvForceDeterministicAllReduce()
+{
+    static bool const forceDeterministic = getBoolEnv("FORCE_ALL_REDUCE_DETERMINISTIC") || getEnvForceDeterministic();
+    return forceDeterministic;
+}
+
+size_t getEnvAllReduceWorkspaceSize()
+{
+    static size_t const workspaceSize
+        = getUInt64Env("FORCE_ALLREDUCE_KERNEL_WORKSPACE_SIZE").value_or(1000 * 1000 * 1000);
+    return workspaceSize;
+}
 } // namespace tensorrt_llm::common

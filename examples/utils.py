@@ -16,6 +16,7 @@ import json
 import os
 import subprocess
 import sys
+from argparse import BooleanOptionalAction
 from functools import partial
 from os.path import abspath, dirname
 from pathlib import Path
@@ -447,7 +448,8 @@ def add_common_args(parser):
     )
     parser.add_argument(
         '--kv_cache_enable_block_reuse',
-        action='store_true',
+        default=True,
+        action=BooleanOptionalAction,
         help=
         'Enables block reuse in kv cache (only available with cpp session).',
     )
@@ -494,5 +496,6 @@ def add_common_args(parser):
         "It is automatically enabled for num_beams>1 (only available with cpp session). "
         "WARNING: using this option may increase network usage significantly (quadratically w.r.t output length)."
     )
+    parser.add_argument('--backend', type=str, default=None)
 
     return parser

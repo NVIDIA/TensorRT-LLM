@@ -26,8 +26,8 @@ import numpy as np
 import tensorrt as trt
 
 from ._common import _is_building, check_max_num_tokens, serialize_engine
-from ._utils import (np_bfloat16, np_float8, str_dtype_to_trt, to_json_file,
-                     trt_gte)
+from ._utils import (get_sm_version, np_bfloat16, np_float8, str_dtype_to_trt,
+                     to_json_file, trt_gte)
 from .auto_parallel import auto_parallel
 from .auto_parallel.config import AutoParallelConfig
 from .bindings import KVCacheType
@@ -404,7 +404,7 @@ class Builder():
                     continue
                 if param._get_weights(network) is None:
                     if not param.is_buffer:
-                        logger.info(
+                        logger.debug(
                             f"Parameter {name} {param.raw_value.shape} {param.raw_value.dtype} was created"
                             " but unused in forward method, so not materialized to TRT network"
                         )
@@ -502,9 +502,8 @@ class BuildConfig:
     plugin_config: PluginConfig = field(default_factory=PluginConfig)
     use_strip_plan: bool = False
     max_encoder_input_len: int = 1024  # for enc-dec DecoderModel
-    use_fused_mlp: bool = True
     dry_run: bool = False
-    visualize_network: bool = False
+    visualize_network: str = None
     monitor_memory: bool = False
     use_mrope: bool = False
 
@@ -591,7 +590,6 @@ class BuildConfig:
             config.get('auto_parallel_config', {}))
         max_encoder_input_len = config.pop('max_encoder_input_len', 1024)
         weight_streaming = config.pop('weight_streaming', False)
-        use_fused_mlp = config.pop('use_fused_mlp', True)
         use_strip_plan = config.pop('use_strip_plan', False)
 
         if plugin_config is None:
@@ -600,7 +598,7 @@ class BuildConfig:
             plugin_config.update_from_dict(config["plugin_config"])
 
         dry_run = config.pop('dry_run', False)
-        visualize_network = config.pop('visualize_network', False)
+        visualize_network = config.pop('visualize_network', None)
         monitor_memory = config.pop('monitor_memory', False)
         use_mrope = config.pop('use_mrope', False)
 
@@ -631,7 +629,6 @@ class BuildConfig:
             max_encoder_input_len=max_encoder_input_len,
             weight_sparsity=weight_sparsity,
             weight_streaming=weight_streaming,
-            use_fused_mlp=use_fused_mlp,
             plugin_config=plugin_config,
             dry_run=dry_run,
             visualize_network=visualize_network,
@@ -819,7 +816,7 @@ def optimize_model_with_config(model: PretrainedModel,
     gemm_swiglu_plugin = build_config.plugin_config.gemm_swiglu_plugin
     low_latency_gemm_swiglu_plugin = build_config.plugin_config.low_latency_gemm_swiglu_plugin
     if gemm_swiglu_plugin or low_latency_gemm_swiglu_plugin:
-        if not build_config.use_fused_mlp:
+        if not build_config.plugin_config.use_fused_mlp:
             raise RuntimeError(
                 "GemmSwiGLU plugin requires --use_fused_mlp flag")
         if gemm_swiglu_plugin not in [
@@ -843,7 +840,8 @@ def optimize_model_with_config(model: PretrainedModel,
         model,
         share_embedding_table=True,
         use_ootb_moe=build_config.plugin_config.moe_plugin is None,
-        use_fused_mlp=(build_config.use_fused_mlp and not is_enc_dec
+        use_fused_mlp=(build_config.plugin_config.use_fused_mlp
+                       and not is_enc_dec
                        and not (is_recurrent_gemma and is_fp8)
                        and not use_auto_parallel),
         gemm_swiglu_plugin_dtype=gemm_swiglu_plugin,
@@ -853,9 +851,9 @@ def optimize_model_with_config(model: PretrainedModel,
         use_prompt_tuning=(build_config.max_prompt_embedding_table_size > 0),
         use_lora=build_config.plugin_config.lora_plugin is not None,
         max_lora_rank=build_config.lora_config.max_lora_rank,
-        use_fp8_context_fmha=(
-            QuantAlgo.FP8 == model.config.quantization.quant_algo
-            and build_config.plugin_config.use_fp8_context_fmha),
+        use_fp8_context_fmha=(model.config.quantization.quant_algo in [
+            QuantAlgo.FP8, QuantAlgo.W4A8_AWQ, QuantAlgo.NVFP4
+        ] and build_config.plugin_config.use_fp8_context_fmha),
         use_optimize_cross_qkv=True,
     )
 
@@ -987,7 +985,7 @@ def serialize_managed_weights(managed_weights: dict[str, np.ndarray],
         f.write(header_json.encode())
         for name, value in managed_weights.items():
             logger.debug(f"Serializing managed weight: {name}")
-            buf = value.tobytes()
+            buf = value.data
             f.write(buf)
 
 
@@ -1027,7 +1025,7 @@ def deserialize_managed_weights(path: str | Path) -> dict[str, np.ndarray]:
 
 def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
     '''Build engine from given model and optimization options specified in the build_config
-       WARNING: this function may change the given \p model object state in some optimization passes
+       WARNING: this function may change the given model object state in some optimization passes
        to avoid cloning a model since normally the LLM models consumes large memory.
        Create a new fresh model object if you need to build with different options.
     '''
@@ -1040,8 +1038,10 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
     _init_max_seq_len(model.config, build_config)
 
     if build_config.plugin_config.reduce_fusion and (
-            model.config.mapping.tp_size == 1 or
+            model.config.mapping.tp_size == 1
+            or model.config.mapping.pp_size != 1 or
         (model.config.architecture != "LlamaForCausalLM"
+         and model.config.architecture != "Gemma2ForCausalLM"
          and model.config.architecture != "MedusaForCausalLM")):
         logger.warning('Overriding reduce_fusion to False')
         build_config.plugin_config.reduce_fusion = False
@@ -1054,7 +1054,10 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
         build_config.strongly_typed = True
 
     if hasattr(model.config, 'max_draft_len'):
-        build_config.max_draft_len = model.config.max_draft_len
+        # If model.config has 'max_draft_len' but build_config not specified,
+        # use the value of model.config.max_draft_len to set the value of build_config.max_draft_len
+        if build_config.max_draft_len == 0:
+            build_config.max_draft_len = model.config.max_draft_len
 
     if hasattr(model.config, 'redrafter_num_beams') and hasattr(
             model.config, 'redrafter_draft_len_per_beam'):
@@ -1100,7 +1103,8 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
 
     if build_config.plugin_config.use_paged_context_fmha:
         if (model.config.quant_mode.has_fp8_kv_cache()
-                and not model.config.quant_mode.has_fp8_qdq()):
+                and not model.config.quantization.quant_algo
+                in [QuantAlgo.FP8, QuantAlgo.W4A8_AWQ, QuantAlgo.NVFP4]):
             raise RuntimeError(
                 "FP8 Paged Context FMHA only works with fp8 quantization workflow currently."
             )
@@ -1113,6 +1117,19 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
         if model.config.quant_mode.has_int8_kv_cache():
             raise RuntimeError(
                 "Paged Context FMHA doesn't work with int8 kv cache currently.")
+
+    if get_sm_version() >= 100 and get_sm_version() < 120:
+        if model.config.quant_mode.is_int8_weight_only(
+        ) or model.config.quant_mode.is_int4_weight_only(
+        ) or model.config.quant_mode.has_int8_kv_cache():
+            raise RuntimeError(
+                "INT8/INT4 quantization is not supported on SM>=100.")
+        if model.config.quant_mode.has_act_and_weight_quant():
+            raise RuntimeError("SmoothQuant is not supported on SM>=100.")
+        if model.config.quant_mode.has_per_channel_scaling(
+        ) or model.config.quant_mode.has_per_token_dynamic_scaling():
+            raise RuntimeError(
+                "Per-channel or per-token scaling is not supported on SM>=100.")
 
     model = optimize_model_with_config(model, build_config)
 
@@ -1146,6 +1163,12 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
     disable_weight_only_quant_plugin = model.config.disable_weight_only_quant_plugin if hasattr(
         model.config, 'disable_weight_only_quant_plugin') else False
     use_fp8_rowwise = model.config.quant_mode.has_fp8_rowwise()
+    use_fp4_gemm = model.config.quant_mode.has_nvfp4()
+    if use_fp4_gemm and network.plugin_config._explicitly_disable_gemm_plugin is False:
+        logger.info(
+            'NVFP4 quantization detected, by default enabling NVFP4 GEMM plugin. To use OOTB GEMM, please explicitly set gemm_plugin to "disable"'
+        )
+        network.plugin_config.gemm_plugin = "nvfp4"
 
     if build_config.plugin_config.manage_weights:
         if use_weight_only and disable_weight_only_quant_plugin:
@@ -1162,7 +1185,6 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
         network.plugin_config.set_smooth_quant_plugins(model.config.dtype)
     if use_qserve:
         network.plugin_config.set_qserve_plugins(model.config.dtype)
-
     if use_fp8_rowwise:
         network.plugin_config.set_fp8_rowwise_quant_plugins(model.config.dtype)
     nccl_plugin = model.config.dtype if model.config.mapping.world_size > 1 else None
@@ -1203,7 +1225,8 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
             build_config.lora_config.lora_target_modules
         }
 
-        if model.config.architecture == "DecoderModel" or model.config.architecture == "MllamaForConditionalGeneration":
+        if model.config.architecture == "DecoderModel" or "mllama" in model.config.architecture.lower(
+        ):
             prepare_input_args["max_seq_len"] = build_config.max_seq_len
             prepare_input_args[
                 "max_decoder_input_len"] = build_config.max_input_len
@@ -1227,7 +1250,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
                 "spec_decoding_is_generation_length_variable"] = True
         if model.config.architecture == "Qwen2VLForConditionalGeneration":
             prepare_input_args[
-                'mrope_rotary_sin_cos_size'] = model.config.max_position_embeddings * model.config.rotary_embedding_dim
+                'mrope_rotary_cos_sin_size'] = model.config.max_position_embeddings * model.config.rotary_embedding_dim
         if build_config.speculative_decoding_mode == SpeculativeDecodingMode.EAGLE and not build_config.plugin_config.use_paged_context_fmha:
             logger.warning(
                 "Paged Context FMHA is required for EAGLE. Turning it on")
@@ -1252,9 +1275,9 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
             mapping = network.auto_parallel_config["mapping"]
             model.config.mapping = mapping
 
-    if build_config.visualize_network:
+    if build_config.visualize_network is not None:
         with net_guard(network):
-            network.to_onnx(f'rank{model.config.mapping.rank}.onnx')
+            network.to_onnx(build_config.visualize_network)
 
     # Network -> Engine
     logger.info(

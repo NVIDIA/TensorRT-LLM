@@ -1,4 +1,5 @@
 import argparse
+import os
 import subprocess
 import sys
 
@@ -50,14 +51,18 @@ def test_pip_install():
                         help="The wheel path")
     args = parser.parse_args()
 
-    print("##########  Install required system libs  ##########")
-    subprocess.check_call(f"apt-get -y install python3-pip libopenmpi-dev",
-                          shell=True)
+    if not os.path.exists("/usr/local/mpi/bin/mpicc"):
+        print("##########  Install required system libs  ##########")
+        subprocess.check_call("apt-get -y install python3-pip libopenmpi-dev",
+                              shell=True)
+
     download_wheel(args)
     print("##########  Install tensorrt_llm package  ##########")
     subprocess.check_call("pip3 install tensorrt_llm-*.whl", shell=True)
     print("##########  Test import tensorrt_llm  ##########")
-    subprocess.check_call('python3 -c "import tensorrt_llm"', shell=True)
+    subprocess.check_call(
+        'python3 -c "import tensorrt_llm; print(tensorrt_llm.__version__)"',
+        shell=True)
     print("##########  Test quickstart example  ##########")
     subprocess.check_call("python3 ../examples/llm-api/quickstart_example.py",
                           shell=True)

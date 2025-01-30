@@ -25,7 +25,7 @@ from tensorrt_llm.models.llama.model import LLaMAForCausalLM, LLaMAModel
 from ..._common import default_net, default_trtnet
 from ..._utils import pad_vocab_size
 from ...bindings import KVCacheType
-from ...functional import (Tensor, _create_tensor, concat,
+from ...functional import (Tensor, _create_tensor, cast, concat,
                            gather_last_token_logits, index_select, shape)
 from ...layers import AttentionParams, ColumnLinear, SpecDecodingParams
 from ...module import Module, ModuleList
@@ -524,13 +524,11 @@ def eagle_prepare_drafter_inputs_plugin(
 
 class EagleNet(Module):
 
-    def __init__(
-        self,
-        config,
-    ):
+    def __init__(self, config, logits_dtype):
         super().__init__()
         self.drafter = LLaMAModel(config)
         self.config = config
+        self.logits_dtype = logits_dtype
 
         vocab_size_padded = pad_vocab_size(config.vocab_size,
                                            config.mapping.tp_size)
@@ -566,7 +564,8 @@ class EagleNet(Module):
             hidden_states = gather_last_token_logits(
                 hidden_states, last_token_indices,
                 default_net().plugin_config.remove_input_padding)
-            return self.lm_head(hidden_states), hidden_states, cache
+            return cast(self.lm_head(hidden_states),
+                        dtype=self.logits_dtype), hidden_states, cache
 
         return None, hidden_states, cache
 
@@ -596,7 +595,8 @@ class EagleForCausalLM(LLaMAForCausalLM):
         eagle_net_config.layer_idx_offset = config.num_hidden_layers
         if self.mapping.is_last_pp_rank():
             self.eagle_nets = ModuleList([
-                EagleNet(config=eagle_net_config)
+                EagleNet(config=eagle_net_config,
+                         logits_dtype=config.logits_dtype)
                 for _ in range(self.num_eagle_layers)
             ])
         self.max_draft_len = config.max_draft_len
@@ -614,7 +614,7 @@ class EagleForCausalLM(LLaMAForCausalLM):
             host_gen_eagle_net_context_lengths,
             host_gen_eagle_net_past_key_value_lengths,
             hidden_size_batch_level_starts, input_gen_tokens,
-            input_spec_decoding_generation_lengths):
+            input_spec_decoding_generation_lengths, spec_decoding_use):
 
         drafter_inputs = eagle_prepare_drafter_inputs_plugin(
             layer_idx, self.num_eagle_layers, self.max_non_leaves_per_layer,
@@ -648,7 +648,8 @@ class EagleForCausalLM(LLaMAForCausalLM):
         if layer_idx > 0:
             spec_decoding_params = SpecDecodingParams(
                 True, self.max_draft_len, spec_decoding_generation_lengths,
-                spec_decoding_position_offsets, spec_decoding_packed_mask)
+                spec_decoding_position_offsets, spec_decoding_packed_mask,
+                spec_decoding_use)
 
         # Get hidden states for accepted ids
         hidden_states = self._slice_hidden_states(hidden_states,
@@ -820,7 +821,8 @@ class EagleForCausalLM(LLaMAForCausalLM):
                 hidden_size_batch_level_starts=hidden_size_batch_level_starts,
                 input_gen_tokens=input_gen_tokens,
                 input_spec_decoding_generation_lengths=spec_decoding_params.
-                spec_decoding_generation_lengths)
+                spec_decoding_generation_lengths,
+                spec_decoding_use=spec_decoding_params.spec_decoding_use)
 
             def single_eagle_net_iter(next_draft_tokens, next_draft_lens):
                 # Run EAGLE Net
@@ -906,6 +908,7 @@ class EagleForCausalLM(LLaMAForCausalLM):
 
         if self.mapping.is_last_pp_rank():
             lm_logits, hidden_states, all_hidden_states = hidden_states
+            lm_logits = cast(lm_logits, self.config.logits_dtype)
             # Call eagle logic to accept prev draft tokens and predict next draft tokens
             next_draft_tokens = self._eagle_fwd_helper(lm_logits,
                                                        all_hidden_states, *args,
@@ -1099,10 +1102,7 @@ class EagleForCausalLM(LLaMAForCausalLM):
                                              ]))
         greedy_sampling = Tensor(name='greedy_sampling',
                                  dtype=trt.int32,
-                                 shape=[1],
-                                 dim_range=OrderedDict([
-                                     ('greedy_sampling_flag', [1]),
-                                 ]))
+                                 shape=[1])
 
         use_dynamic_tree = Tensor(name='use_dynamic_tree',
                                   dtype=trt.bool,

@@ -13,16 +13,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef TOP_LEVEL_DIR
-#error "Define TOP_LEVEL_DIR"
-#endif
 
 #include "tests/kernels/sampling/samplingTest.h"
-#include <random>
 
-namespace tc = tensorrt_llm::common;
 namespace tk = tensorrt_llm::kernels;
-namespace trk = tensorrt_llm::runtime::kernels;
 
 using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::tests::kernels::sampling;

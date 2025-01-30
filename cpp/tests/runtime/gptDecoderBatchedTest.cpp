@@ -142,7 +142,7 @@ void checkSequenceLengths(
 void verifyResults(BufferManager& manager, GptDecoderBatched const& decoder,
     std::vector<SamplingConfig> const& samplingConfigs, std::vector<SizeType32> const& inputLengths,
     std::vector<SizeType32> const& sequenceLengths, SizeType32 batchSize, SizeType32 maxBeamWidth,
-    SizeType32 maxSeqLength, SizeType32 inputTokenId, SizeType32 expectedTokenId, SizeType32 padId)
+    SizeType32 maxSeqLength, SizeType32 inputTokenId, SizeType32 expectedTokenId, SizeType32 endId)
 {
     auto outputsIds = decoder.getIds();
     // TODO: test parentIds
@@ -182,7 +182,7 @@ void verifyResults(BufferManager& manager, GptDecoderBatched const& decoder,
             begin = end;
             end = outputPtr + maxSeqLength;
             ASSERT_LE(begin, end) << "bad max length " << maxSeqLength;
-            ASSERT_THAT(std::vector(begin, end), ::testing::Each(padId)) << "padding: "
+            ASSERT_THAT(std::vector(begin, end), ::testing::Each(endId)) << "padding: "
                                                                          << "b:" << b << " bw: " << bw;
         }
     }
@@ -211,7 +211,6 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& sa
     BufferManager manager(streamPtr);
 
     TokenIdType constexpr endId{50257};
-    TokenIdType constexpr padId{50257};
 
     auto const dataType = modelConfig.getDataType();
     auto const vocabSizePadded = modelConfig.getVocabSizePadded(worldConfig.getSize());
@@ -281,7 +280,7 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& sa
     EXPECT_THAT(finished, ::testing::Each(false));
 
     verifyResults(manager, decoder, samplingConfigs, inputLengths, expectedLengths, batchSize, maxBeamWidth,
-        maxSeqLength, inputTokenId, expectedTokenId, padId);
+        maxSeqLength, inputTokenId, expectedTokenId, endId);
 
     // run decoder for 1 step
     decoder.forward(outputs, inputs);
@@ -291,7 +290,7 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& sa
     EXPECT_THAT(decoder.getFinished(), ::testing::Each(false));
 
     verifyResults(manager, decoder, samplingConfigs, inputLengths, expectedLengths, batchSize, maxBeamWidth,
-        maxSeqLength, inputTokenId, expectedTokenId, padId);
+        maxSeqLength, inputTokenId, expectedTokenId, endId);
 
     // run decoder for 1 step
     decoder.forward(outputs, inputs);
@@ -301,7 +300,7 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& sa
     EXPECT_THAT(decoder.getFinished(), ::testing::Each(true));
 
     verifyResults(manager, decoder, samplingConfigs, inputLengths, expectedLengths, batchSize, maxBeamWidth,
-        maxSeqLength, inputTokenId, expectedTokenId, padId);
+        maxSeqLength, inputTokenId, expectedTokenId, endId);
 
     EXPECT_NO_THROW(decoder.forward(outputs, inputs));
     checkSequenceLengths(*outputs.sequenceLengths, expectedLengths, manager);
@@ -334,7 +333,6 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
     BufferManager manager(streamPtr);
 
     TokenIdType constexpr endId{50257};
-    TokenIdType constexpr padId{50257};
 
     auto const dataType = modelConfig.getDataType();
     auto const vocabSizePadded = modelConfig.getVocabSizePadded(worldConfig.getSize());
@@ -432,7 +430,7 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
     }
 
     verifyResults(manager, decoder, samplingConfigs, inputLengths, expectedLengths, batchSize, maxBeamWidth,
-        maxSeqLength, inputTokenId, expectedTokenId, padId);
+        maxSeqLength, inputTokenId, expectedTokenId, endId);
 }
 
 void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& samplingConfigs,
@@ -463,7 +461,6 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
     BufferManager manager(streamPtr);
 
     TokenIdType constexpr endId{50257};
-    TokenIdType constexpr padId{50257};
 
     auto const dataType = modelConfig.getDataType();
     auto const vocabSizePadded = modelConfig.getVocabSizePadded(worldConfig.getSize());
@@ -521,7 +518,7 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
     EXPECT_THAT(finished, ::testing::Each(false));
 
     verifyResults(manager, decoder, samplingConfigs, inputLengths, expectedLengths, batchSize, maxBeamWidth,
-        maxSeqLength, inputTokenId, expectedTokenId, padId);
+        maxSeqLength, inputTokenId, expectedTokenId, endId);
 
     // run decoder for 1 step
     decoder.forward(outputs, inputs);
@@ -531,7 +528,7 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
     EXPECT_THAT(decoder.getFinished(), ::testing::Each(false));
 
     verifyResults(manager, decoder, samplingConfigs, inputLengths, expectedLengths, batchSize, maxBeamWidth,
-        maxSeqLength, inputTokenId, expectedTokenId, padId);
+        maxSeqLength, inputTokenId, expectedTokenId, endId);
 }
 
 } // namespace

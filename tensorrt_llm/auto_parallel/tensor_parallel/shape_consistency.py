@@ -240,8 +240,8 @@ class ShapeConsistencyManager(object):
                         b_target_pair = (b_index, [])
 
                 # skip (S1, S0) -> S10
-                if f_target_pair[1] and b_target_pair[
-                        1] and f_target_pair[1][0] >= b_target_pair[1][0]:
+                if f_target_pair[1] and b_target_pair[1] and f_target_pair[1][
+                        0] >= b_target_pair[1][0]:
                     continue
                 f_shard_list, b_shard_list = self.all_to_all_simulator(
                     f_target_pair, b_target_pair)

@@ -17,10 +17,18 @@ def model_name():
     return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 
 
+@pytest.fixture(scope="module", params=[None, 'pytorch'])
+def backend(request):
+    return request.param
+
+
 @pytest.fixture(scope="module")
-def server(model_name: str):
+def server(model_name: str, backend: str):
     model_path = get_model_path(model_name)
-    args = ["--max_beam_width", "4"]
+    if backend == "pytorch":
+        args = ["--backend", f"{backend}"]
+    else:
+        args = ["--max_beam_width", "4"]
     with RemoteOpenAIServer(model_path, args) as remote_server:
         yield remote_server
 
@@ -98,46 +106,62 @@ def test_single_completion(client: openai.OpenAI, model_name):
 
 
 @pytest.mark.asyncio(loop_scope="module")
-async def test_batch_completions(async_client: openai.AsyncOpenAI, model_name):
-    # test both text and token IDs
-    for prompts in (["Hello, my name is"] * 2, [[0, 0, 0, 0, 0]] * 2):
-        # test simple list
-        batch = await async_client.completions.create(
-            model=model_name,
-            prompt=prompts,
-            max_tokens=5,
-            temperature=0.0,
-        )
-        assert len(batch.choices) == 2
-        assert batch.choices[0].text == batch.choices[1].text
+@pytest.mark.parametrize("prompts",
+                         [["Hello, my name is"] * 2, [[0, 0, 0, 0, 0]] * 2])
+async def test_batch_completions(async_client: openai.AsyncOpenAI, model_name,
+                                 prompts):
+    # test simple list
+    batch = await async_client.completions.create(
+        model=model_name,
+        prompt=prompts,
+        max_tokens=5,
+        temperature=0.0,
+    )
+    assert len(batch.choices) == 2
+    assert batch.choices[0].text == batch.choices[1].text
 
-        batch = await async_client.completions.create(
-            model=model_name,
-            prompt=prompts,
-            n=2,
-            max_tokens=5,
-            temperature=0.0,
-            extra_body=dict(use_beam_search=True),
-        )
-        assert len(batch.choices) == 4
-        assert batch.choices[0].text != batch.choices[
-            1].text, "beam search should be different"
-        assert batch.choices[0].text == batch.choices[
-            2].text, "two copies of the same prompt should be the same"
-        assert batch.choices[1].text == batch.choices[
-            3].text, "two copies of the same prompt should be the same"
 
-        # test streaming
-        batch = await async_client.completions.create(
-            model=model_name,
-            prompt=prompts,
-            max_tokens=5,
-            temperature=0.0,
-            stream=True,
-        )
-        texts = [""] * 2
-        async for chunk in batch:
-            assert len(chunk.choices) == 1
-            choice = chunk.choices[0]
-            texts[choice.index] += choice.text
-        assert texts[0] == texts[1]
+@pytest.mark.asyncio(loop_scope="module")
+@pytest.mark.parametrize("prompts",
+                         [["Hello, my name is"] * 2, [[0, 0, 0, 0, 0]] * 2])
+async def test_batch_completions_beam_search(async_client: openai.AsyncOpenAI,
+                                             model_name, prompts, backend):
+    # test beam search
+    if backend == 'pytorch':
+        pytest.skip("Beam search is not supported in PyTorch backend yet")
+    batch = await async_client.completions.create(
+        model=model_name,
+        prompt=prompts,
+        n=2,
+        max_tokens=5,
+        temperature=0.0,
+        extra_body=dict(use_beam_search=True),
+    )
+    assert len(batch.choices) == 4
+    assert batch.choices[0].text != batch.choices[
+        1].text, "beam search should be different"
+    assert batch.choices[0].text == batch.choices[
+        2].text, "two copies of the same prompt should be the same"
+    assert batch.choices[1].text == batch.choices[
+        3].text, "two copies of the same prompt should be the same"
+
+
+@pytest.mark.asyncio(loop_scope="module")
+@pytest.mark.parametrize("prompts",
+                         [["Hello, my name is"] * 2, [[0, 0, 0, 0, 0]] * 2])
+async def test_batch_completions_streaming(async_client: openai.AsyncOpenAI,
+                                           model_name, prompts):
+    # test streaming
+    batch = await async_client.completions.create(
+        model=model_name,
+        prompt=prompts,
+        max_tokens=5,
+        temperature=0.0,
+        stream=True,
+    )
+    texts = [""] * 2
+    async for chunk in batch:
+        assert len(chunk.choices) == 1
+        choice = chunk.choices[0]
+        texts[choice.index] += choice.text
+    assert texts[0] == texts[1]

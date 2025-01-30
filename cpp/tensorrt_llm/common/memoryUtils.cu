@@ -444,8 +444,6 @@ template int loadWeightFromBin(
 template int loadWeightFromBin(
     __nv_fp8_e4m3* ptr, std::vector<size_t> shape, std::string filename, TRTLLMCudaDataType model_file_type);
 #endif
-template int loadWeightFromBin(
-    int* ptr, std::vector<size_t> shape, std::string filename, TRTLLMCudaDataType model_file_type);
 
 template <typename T_IN, typename T_OUT>
 __global__ void cudaD2DcpyConvert(T_OUT* dst, const T_IN* src, const size_t size)

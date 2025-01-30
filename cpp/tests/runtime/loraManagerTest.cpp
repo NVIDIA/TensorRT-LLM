@@ -14,8 +14,11 @@
  * limitations under the License.
  */
 
-#include <gtest/gtest.h>
+#ifndef TOP_LEVEL_DIR
+#error "Define TOP_LEVEL_DIR"
+#endif
 
+#include "tensorrt_llm/runtime/loraManager.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -24,13 +27,14 @@
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/loraCache.h"
-#include "tensorrt_llm/runtime/loraManager.h"
 #include "tensorrt_llm/runtime/loraModule.h"
 #include "tensorrt_llm/runtime/loraUtils.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include "tensorrt_llm/runtime/utils/numpyUtils.h"
+
+#include <gtest/gtest.h>
 
 #include <memory>
 #include <string>

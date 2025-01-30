@@ -73,7 +73,7 @@ std::shared_ptr<tb::LlmRequest> LlmRequest::toTrtLlm() const
     auto badWordsList = from_torch(mBadWordsList);
     auto stopWordsList = from_torch(mStopWordsList);
     auto promptEmbeddingTable = from_torch(mPromptEmbeddingTable);
-    auto mropeRotarySinCos = from_torch(mMropeRotarySinCos);
+    auto mropeRotaryCosSin = from_torch(mMropeRotaryCosSin);
 
     auto loraWeights = from_torch(mLoraWeights);
     auto loraConfig = from_torch(mLoraConfig);
@@ -85,7 +85,7 @@ std::shared_ptr<tb::LlmRequest> LlmRequest::toTrtLlm() const
     return std::make_shared<tb::LlmRequest>(mRequestId, mMaxNewTokens,
         std::make_shared<std::vector<TokenIdType>>(mTokens.at(0)), mSamplingConfig, mIsStreaming, mEndId, mPadId,
         embeddingBias, badWordsList, stopWordsList, mPositionIds, promptEmbeddingTable, mPromptVocabSize,
-        mropeRotarySinCos, mMropePositionDeltas, mLoraTaskId, loraWeights, loraConfig, mLookaheadConfig,
+        mropeRotaryCosSin, mMropePositionDeltas, mLoraTaskId, loraWeights, loraConfig, mLookaheadConfig,
         mKvCacheRetentionConfig, returnLogProbs(), mReturnContextLogits, mReturnGenerationLogits, mDraftTokens,
         draftLogits, mExcludeInputFromOutput, callbackAdapter(mLogitsPostProcessor), mApplyLogitsPostProcessorBatched,
         mEncoderTokens, mReturnEncoderOutput, mClientId, mPriority, encoderInputFeatures, mEncoderOutputLength,

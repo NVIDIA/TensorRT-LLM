@@ -13,19 +13,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef TOP_LEVEL_DIR
-#error "Define TOP_LEVEL_DIR"
-#endif
-
-#include <gtest/gtest.h>
 
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/banRepeatNgram.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
-#include <algorithm>
+
 #include <curand_kernel.h>
-#include <random>
+#include <gtest/gtest.h>
+
+#include <algorithm>
 
 namespace tk = tensorrt_llm::kernels;
 namespace tc = tensorrt_llm::common;

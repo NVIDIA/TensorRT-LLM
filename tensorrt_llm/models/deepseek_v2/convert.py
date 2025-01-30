@@ -18,7 +18,7 @@ import time
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM
 
-from tensorrt_llm.layers import MoeConfig
+from tensorrt_llm.layers import MoeConfig  # TODO: remove this import
 
 from ..._utils import pad_vocab_size, release_gc
 from ...mapping import Mapping
@@ -28,7 +28,7 @@ from ..convert_utils import get_tllm_linear_weight
 OVERRIDE_HIDDEN_LAYERS = None  # 2
 
 
-## Convert config parameters to dict
+# Convert config parameters to dict TODO: remove this function and change CI test
 def create_trt_config_from_hf(model_dir,
                               dtype,
                               mapping: Mapping,
@@ -236,31 +236,22 @@ def convert_deepseekv2(hf_model,
     tik = time.time()
     model_params = dict(hf_model.named_parameters())
     dtype = getattr(torch, dtype)
-    moe_config = MoeConfig(
-        num_experts=config['moe_num_experts'],
-        shared_expert_intermediate_size=config['moe_num_shared_experts'] *
-        config['moe_inter_size'],
-        top_k=config['moe_top_k'],
-        normalization_mode=config['moe_renorm_mode'],
-        device_limited_n_group=config['moe_n_group'],
-        device_limited_topk_group=config['moe_topk_group'],
-        device_limited_routed_scaling_factor=config['moe_routed_scaling_factor']
-    )
+    moe_config = config.moe
 
-    layers_range = mapping.pp_layers(config['num_hidden_layers'])
+    layers_range = mapping.pp_layers(config.num_hidden_layers)
 
     def convert_layer(l):
         prefix = f'model.layers.{l}.'
         trtllm_prex = f'transformer.layers.{l - layers_range[0]}.'
         # Fuse matrices for compression
         # Split matrices for decompression
-        q_lora_rank = config['q_lora_rank']
-        kv_lora_rank = config['kv_lora_rank']
-        num_heads = config['num_attention_heads']
-        qk_nope_head_dim = config['qk_nope_head_dim']
-        qk_rope_head_dim = config['qk_rope_head_dim']
-        v_head_dim = config['v_head_dim']
-        hidden_size = config['hidden_size']
+        q_lora_rank = config.q_lora_rank
+        kv_lora_rank = config.kv_lora_rank
+        num_heads = config.num_attention_heads
+        qk_nope_head_dim = config.qk_nope_head_dim
+        qk_rope_head_dim = config.qk_rope_head_dim
+        v_head_dim = config.v_head_dim
+        hidden_size = config.hidden_size
 
         if q_lora_rank is not None:
             q_a_proj_weight = get_weight(model_params,
@@ -540,11 +531,11 @@ def convert_deepseekv2(hf_model,
     if hf_model.config.tie_word_embeddings:
         # lm_head.weight has the same weights as embedding
         if mapping.is_last_pp_rank():
-            if config['vocab_size'] % mapping.tp_size != 0:
+            if config.vocab_size % mapping.tp_size != 0:
                 # padding
-                vocab_size_padded = pad_vocab_size(config['vocab_size'],
+                vocab_size_padded = pad_vocab_size(config.vocab_size,
                                                    mapping.tp_size)
-                pad_width = vocab_size_padded - config['vocab_size']
+                pad_width = vocab_size_padded - config.vocab_size
                 v = torch.nn.functional.pad(v, (0, 0, 0, pad_width), 'constant',
                                             0)
             weights['lm_head.weight'] = split(v, mapping.tp_size,
@@ -559,11 +550,11 @@ def convert_deepseekv2(hf_model,
     lm_head_weights = get_weight(model_params, 'lm_head', dtype)
 
     if mapping.is_last_pp_rank():
-        if config['vocab_size'] % mapping.tp_size != 0:
+        if config.vocab_size % mapping.tp_size != 0:
             # padding
-            vocab_size_padded = pad_vocab_size(config['vocab_size'],
+            vocab_size_padded = pad_vocab_size(config.vocab_size,
                                                mapping.tp_size)
-            pad_width = vocab_size_padded - config['vocab_size']
+            pad_width = vocab_size_padded - config.vocab_size
             lm_head_weights = torch.nn.functional.pad(lm_head_weights,
                                                       (0, 0, 0, pad_width),
                                                       'constant',

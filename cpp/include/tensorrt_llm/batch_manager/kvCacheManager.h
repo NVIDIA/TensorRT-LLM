@@ -70,14 +70,16 @@ using OptionalRef = tensorrt_llm::common::OptionalRef<T>;
 
 struct BlockKey
 {
-    bool hasLora;
-    LoraTaskIdType loraTaskId;
+    bool hasLora = false;
+    bool usesExtraIds = false;
+    LoraTaskIdType loraTaskId = 0;
     VecUniqueTokens uniqueTokens;
 
     BlockKey() = default;
 
-    explicit BlockKey(bool hasLora, LoraTaskIdType loraTaskId, VecUniqueTokens uniqueTokens)
+    explicit BlockKey(bool hasLora, bool usesExtraIds, LoraTaskIdType loraTaskId, VecUniqueTokens uniqueTokens)
         : hasLora{hasLora}
+        , usesExtraIds(usesExtraIds)
         , loraTaskId{loraTaskId}
         , uniqueTokens{std::move(uniqueTokens)}
     {
@@ -85,7 +87,8 @@ struct BlockKey
 
     bool operator==(BlockKey const& other) const noexcept
     {
-        return (hasLora == other.hasLora && loraTaskId == other.loraTaskId && uniqueTokens == other.uniqueTokens);
+        return (hasLora == other.hasLora && usesExtraIds == other.usesExtraIds && loraTaskId == other.loraTaskId
+            && uniqueTokens == other.uniqueTokens);
     }
 };
 
@@ -104,14 +107,15 @@ struct BlockKeyHasher
             a = ((a >> 16) ^ a) * 0x45d9f3b;
             a = ((a >> 16) ^ a) * 0x45d9f3b;
             a = (a >> 16) ^ a;
-
-            uint64_t b = uniqueToken.tokenExtraId;
-            b = (b ^ (b >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
-            b = (b ^ (b >> 27)) * UINT64_C(0x94d049bb133111eb);
-            b = b ^ (b >> 31);
-
             seed ^= a + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-            seed ^= b + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+            if (blockKey.usesExtraIds)
+            {
+                uint64_t b = uniqueToken.tokenExtraId;
+                b = (b ^ (b >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+                b = (b ^ (b >> 27)) * UINT64_C(0x94d049bb133111eb);
+                b = b ^ (b >> 31);
+                seed ^= b + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+            }
         }
 
         uint64_t c = blockKey.loraTaskId;
@@ -192,9 +196,13 @@ public:
 
     [[nodiscard]] VecUniqueTokens const& getUniqueTokens() const;
 
-    BlockPtr getPrevBlock() const;
+    BlockPtr const& getPrevBlock() const;
 
     void setPrevBlock(BlockPtr prevBlock);
+
+    BlockPtr const& getPrevBlockInSeq() const;
+
+    void setPrevBlockInSeq(BlockPtr prevBlock);
 
     void addNextBlock(BlockKey const& blockKey, BlockPtr block);
 
@@ -223,6 +231,9 @@ public:
 
     void setHash(size_t hash);
 
+    // set hash automatically from block key and previous block in sequence
+    void setHash();
+
     size_t getHash() const;
 
 private:
@@ -242,8 +253,11 @@ private:
     // Key of this block in mNextBlocks map in block pointed to by mPrevBlock
     BlockKey mBlockKey;
 
-    // Previous block in sequence
+    // Previous block in reuse tree, or nullptr if not reusing
     BlockPtr mPrevBlock;
+
+    // Previous block in sequence, == nullptr for first block, == mPrevBlock if reusing and not first
+    BlockPtr mPrevBlockInSeq;
 
     // Next block(s) in sequence(s)
     NextBlockMap mNextBlocks;
@@ -421,6 +435,8 @@ public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
     using CacheType = tensorrt_llm::batch_manager::kv_cache_manager::CacheType;
     using BaseEvictionPolicy = tensorrt_llm::batch_manager::eviction_policy::BaseEvictionPolicy;
+    using BlockMap = std::unordered_multimap<size_t, BlockPtr>;
+    using BlockMapIterRange = std::pair<BlockMap::const_iterator, BlockMap::const_iterator>;
 
     explicit BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead,
         SizeType32 tokensPerBlock, SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool,
@@ -432,6 +448,8 @@ public:
     ~BlockManager();
 
     void allocatePools(nvinfer1::DataType dtype, bool useUvm);
+
+    void releasePools();
 
     void startScheduling();
 
@@ -500,6 +518,16 @@ public:
     [[nodiscard]] SizeType32 getMaxNumBlocks() const noexcept
     {
         return static_cast<SizeType32>(mAllBlocksById.size());
+    }
+
+    [[nodiscard]] BlockPtr const& getBlockById(KVCacheBlock::IdType blockId) const
+    {
+        return mAllBlocksById.at(blockId);
+    }
+
+    [[nodiscard]] BlockMapIterRange getBlocksByHash(size_t hash) const
+    {
+        return mContextBlocksByHash.equal_range(hash);
     }
 
     [[nodiscard]] SizeType32 getTokensPerBlock() const noexcept
@@ -624,6 +652,10 @@ private:
     void claimLeafBlock(BlockPtr block, std::optional<executor::RetentionPriority> priority = std::nullopt,
         std::optional<std::chrono::milliseconds> durationMs = std::nullopt);
 
+    void addBlockToHashMap(BlockPtr block);
+
+    void removeBlockFromHashMap(BlockPtr block);
+
 private:
     // Number of blocks in pools
     SizeType32 mNumPrimaryBlocks;
@@ -654,6 +686,8 @@ private:
     SizeType32 mTokensPerBlock;
     // List of all blocks by idx
     std::vector<BlockPtr> mAllBlocksById;
+    // List of all context blocks by hash
+    BlockMap mContextBlocksByHash;
     // Dummy block acting as root for BlockToken searches
     BlockPtr mCachedBlocksRoot;
     // KV cache type (self or cross)
@@ -692,6 +726,8 @@ public:
     virtual ~BaseKVCacheManager() {}
 
     virtual void allocatePools(nvinfer1::DataType dtype, bool useUvm = false) = 0;
+
+    virtual void releasePools() = 0;
 
     virtual void startScheduling() = 0;
 
@@ -786,6 +822,10 @@ public:
 
     virtual std::vector<std::vector<SizeType32>> const& getCacheBlockIds(LlmRequest::RequestIdType requestId) const = 0;
 
+    virtual std::vector<std::vector<std::vector<SizeType32>>> getBatchCacheBlockIds(
+        std::vector<LlmRequest::RequestIdType> const& requestIds) const
+        = 0;
+
     virtual runtime::ITensor::SharedPtr getPrimaryPool(SizeType32 layer_idx) const = 0;
     virtual SizeType32 getPoolLayerIdx(SizeType32 layer_idx) const = 0;
 
@@ -834,7 +874,7 @@ public:
         SizeType32 sinkTokenLength, CudaStreamPtr stream, std::optional<SizeType32> maxSequenceLength,
         bool enableBlockReuse = false, bool onboardBlocks = true, CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
-        std::shared_ptr<KVCacheEventManager> eventManager = nullptr);
+        std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enableHashKey = false);
 
     KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool, SizeType32 maxNumSequences,
@@ -856,9 +896,11 @@ public:
         SizeType32 sinkTokenLength, int64_t stream, std::optional<SizeType32> maxSequenceLength,
         bool enableBlockReuse = false, bool onboardBlocks = true, CacheType cacheType = CacheType::kSELF);
 
-    ~KVCacheManager() {}
+    ~KVCacheManager() override = default;
 
     void allocatePools(nvinfer1::DataType dtype, bool useUvm = false) override;
+
+    void releasePools() override;
 
     void startScheduling() override;
 
@@ -897,7 +939,7 @@ public:
         return mBlockManager.getNumAllocNewBlocks();
     }
 
-    [[nodiscard]] SizeType32 getNumReusedBlocks() const noexcept
+    [[nodiscard]] SizeType32 getNumReusedBlocks() const noexcept override
     {
         return mBlockManager.getNumReusedBlocks();
     }
@@ -907,7 +949,7 @@ public:
         return mBlockManager.getNumMissedBlocks();
     }
 
-    [[nodiscard]] KvCacheStats getKvCacheStats() const
+    [[nodiscard]] KvCacheStats getKvCacheStats() const override
     {
         KvCacheStats kvCacheStats;
         kvCacheStats.maxNumBlocks = getMaxNumBlocks();
@@ -930,12 +972,12 @@ public:
     }
 
     [[nodiscard]] std::deque<executor::KVCacheEvent> getLatestEvents(
-        std::optional<std::chrono::milliseconds> timeout = std::nullopt) const
+        std::optional<std::chrono::milliseconds> timeout = std::nullopt) const override
     {
         return mBlockManager.getLatestEvents(timeout);
     }
 
-    [[nodiscard]] BlockManager const& getBlockManager() const
+    [[nodiscard]] BlockManager const& getBlockManager() const override
     {
         return mBlockManager;
     }
@@ -993,6 +1035,11 @@ public:
         return mEnableBlockReuse;
     }
 
+    [[nodiscard]] bool isEnableHashKey() const
+    {
+        return mEnableHashKey;
+    }
+
     [[nodiscard]] bool isUseOneMoreBlock() const override
     {
         return mUseOneMoreBlock;
@@ -1046,6 +1093,9 @@ public:
     bool schedulingHasFreeBlocks(SizeType32 numRequired = 1) const override;
 
     std::vector<std::vector<SizeType32>> const& getCacheBlockIds(LlmRequest::RequestIdType requestId) const override;
+
+    std::vector<std::vector<std::vector<SizeType32>>> getBatchCacheBlockIds(
+        std::vector<LlmRequest::RequestIdType> const& requestIds) const override;
 
     runtime::ITensor::SharedPtr getPrimaryPool(SizeType32 layer_idx) const override;
 
@@ -1114,6 +1164,8 @@ private:
     std::unordered_map<LlmRequest::RequestIdType, GenerationRequest> mSequences;
     // Whether to cache KV pages for reuse
     bool mEnableBlockReuse;
+    // Whether enable finding blocks by their hash, ignored when reuse enabled
+    bool mEnableHashKey;
     // Whether use one more block for each sequence
     bool mUseOneMoreBlock;
     // buffers for static tensors, will be created after allocating pools

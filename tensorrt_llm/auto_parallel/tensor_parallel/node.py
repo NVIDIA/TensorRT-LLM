@@ -361,8 +361,8 @@ class Node(ABC):
         for output in self.outputs:
             if output.broadcast_across_batch:
                 for bs in batch_dims:
-                    if output.shape[
-                            bs] == 1 and output.shape[bs] != out_data_shape[bs]:
+                    if output.shape[bs] == 1 and output.shape[
+                            bs] != out_data_shape[bs]:
                         output.attrs["broadcast_dims"].append(bs)
 
     def _recover_bcast_partition_dict(self, partition_dict, op_data):

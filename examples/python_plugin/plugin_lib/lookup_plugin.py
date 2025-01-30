@@ -18,8 +18,8 @@ from typing import Sequence
 import torch
 
 from tensorrt_llm import PluginBase
-from tensorrt_llm.python_plugin import (SymTensor, TensorWrapper,
-                                        convert_to_torch_tensor, trtllm_plugin)
+from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
+from tensorrt_llm.python_plugin import SymTensor, trtllm_plugin
 
 from .lookup_kernel import lookup_kernel
 

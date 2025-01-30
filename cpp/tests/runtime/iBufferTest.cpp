@@ -16,6 +16,7 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include <tensorrt_llm/runtime/bufferView.h>
 
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
@@ -85,4 +86,59 @@ TEST(IBufferTest, bufferCastOrNullForSharedPtrWithoutConstValue)
     auto ptr = bufferCastOrNull<float>(buffer);
     static_assert(std::is_same<decltype(ptr), float const*>::value);
     ASSERT_TRUE(ptr == nullptr);
+}
+
+TEST(IBufferTest, accessDataPtrEmptyInit)
+{
+    IBuffer::SharedPtr buffer = BufferManager::cpu(0, TRTDataType<float>::value);
+    auto data = buffer->data();
+    ASSERT_TRUE(data == nullptr);
+
+    buffer->resize(16);
+    data = buffer->data();
+    ASSERT_TRUE(data != nullptr);
+}
+
+TEST(IBufferTest, accessDataPtr)
+{
+    IBuffer::SharedPtr buffer = BufferManager::cpu(16, TRTDataType<float>::value);
+    auto data = buffer->data();
+    ASSERT_TRUE(data != nullptr);
+
+    buffer->resize(0);
+    data = buffer->data();
+    ASSERT_TRUE(data == nullptr);
+}
+
+TEST(IBufferTest, accessDataConstPtr)
+{
+    IBuffer::SharedConstPtr buffer = BufferManager::cpu(16, TRTDataType<float>::value);
+    auto data = buffer->data();
+    ASSERT_TRUE(data != nullptr);
+}
+
+TEST(IBufferTest, BufferView)
+{
+    IBuffer::SharedPtr buffer = BufferManager::cpu(16, TRTDataType<float>::value);
+    auto view = std::make_unique<BufferView>(buffer, 0, 8);
+
+    EXPECT_EQ(view->getSize(), buffer->getSize() / 2);
+
+    EXPECT_NE(view->data(), nullptr);
+    EXPECT_NE(buffer->data(), nullptr);
+
+    EXPECT_NO_THROW(view->release());
+    EXPECT_EQ(view->data(), nullptr);
+    EXPECT_NE(buffer->data(), nullptr);
+}
+
+TEST(IBufferTest, BufferEmptyView)
+{
+    IBuffer::SharedPtr buffer = BufferManager::cpu(16, TRTDataType<float>::value);
+    auto view = std::make_unique<BufferView>(buffer, 0, 0);
+
+    EXPECT_EQ(view->getSize(), 0);
+
+    EXPECT_EQ(view->data(), nullptr);
+    EXPECT_NE(buffer->data(), nullptr);
 }

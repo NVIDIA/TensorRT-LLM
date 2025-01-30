@@ -105,6 +105,24 @@ void DynamicDecodeLayer<T>::initializeLayers()
 }
 
 template <typename T>
+void DynamicDecodeLayer<T>::disableLookahead(DecoderDomain const& decoderDomain, SizeType32 batchSize,
+    TensorConstPtr batchSlots, std::shared_ptr<BaseSetupParams> const& baseSetupParams,
+    std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    mDecodingMode = executor::DecodingMode::TopKTopP();
+    mDecoderDomain = std::move(decoderDomain);
+    initializeLayers();
+    if (batchSize > 0)
+    {
+        setup(batchSize, 1, batchSlots, baseSetupParams, workspace);
+    }
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+template <typename T>
 void DynamicDecodeLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, TensorConstPtr batchSlots,
     std::shared_ptr<BaseSetupParams> const& baseSetupParams,
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)

@@ -42,6 +42,7 @@ namespace tensorrt_llm::plugins
 
 using WeightOnlyGemmRunner = tensorrt_llm::kernels::cutlass_kernels::CutlassFpAIntBGemmRunnerInterface;
 using WeightOnlyGemmRunnerPtr = std::shared_ptr<WeightOnlyGemmRunner>;
+using KernelType = tensorrt_llm::kernels::weight_only::KernelType;
 
 class WeightOnlyGroupwiseQuantGemmPluginProfiler
     : public GemmPluginProfiler<tensorrt_llm::cutlass_extensions::CutlassGemmConfig, WeightOnlyGemmRunnerPtr,
@@ -60,6 +61,12 @@ public:
         mGroupSize = groupSize;
     }
 
+    void setCudaKernelType(KernelType cudaKernelType, int arch)
+    {
+        mCudaKernelType = cudaKernelType;
+        mArch = arch;
+    }
+
 protected:
     void runTactic(int m, int n, int k, Config const& tactic, char* workspace, cudaStream_t const& stream) override;
 
@@ -70,6 +77,8 @@ protected:
 private:
     int mQuantAlgo;
     int mGroupSize;
+    KernelType mCudaKernelType;
+    int mArch;
 };
 
 class WeightOnlyGroupwiseQuantMatmulPlugin : public BasePlugin
@@ -131,7 +140,6 @@ private:
 
     // When M is smaller than this value, we trigger a fast path
     // I.e. a tailored kernel instead of cutlass.
-    static constexpr int SMALL_M_FAST_PATH = 5;
 
     int mQuantAlgo;
 

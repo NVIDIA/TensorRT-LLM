@@ -43,7 +43,7 @@ class MLLaMAConfig(PretrainedConfig):
                  has_attention_qkvo_bias=False,
                  has_mlp_bias=False,
                  has_model_final_layernorm=True,
-                 model_type='MLLaMAModel',
+                 model_type='MLLaMAForCausalLM',
                  skip_cross_kv=False,
                  mlp_type=MLPType.GatedMLP,
                  has_embedding_scale=False,
@@ -236,7 +236,7 @@ class MLLaMAConfig(PretrainedConfig):
             rotary_scaling = meta_config.get("rope_scaling")
 
         # meta checkpoint don't have vocab_size|hidden_act|rotary_base specified, use same default value as HF
-        return cls(architecture="MLLaMAModel",
+        return cls(architecture="MLLaMAForCausalLM",
                    dtype=dtype,
                    num_hidden_layers=meta_config["n_layers"],
                    num_attention_heads=n_head,

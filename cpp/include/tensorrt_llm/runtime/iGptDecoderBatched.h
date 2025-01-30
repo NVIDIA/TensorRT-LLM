@@ -30,6 +30,11 @@
 #include <utility>
 #include <vector>
 
+namespace tensorrt_llm::batch_manager
+{
+class LlmRequest;
+}
+
 namespace tensorrt_llm::runtime
 {
 
@@ -100,6 +105,8 @@ class IGptDecoderBatched : public virtual IStatefulGptDecoder
 {
 public:
     using CudaStreamPtr = std::shared_ptr<CudaStream>;
+    using LlmRequestPtr = std::shared_ptr<tensorrt_llm::batch_manager::LlmRequest>;
+    using RequestVector = std::vector<LlmRequestPtr>;
     using TensorPtr = std::shared_ptr<ITensor>;
     using DecoderFinishedEventPtr = std::unique_ptr<decoder_batch::DecoderFinishedEvent const>;
 
@@ -111,6 +118,9 @@ public:
 
     //! @brief Setup buffers for Lookahead decoding.
     virtual void setupLookahead(LookaheadDecodingBuffers lookaheadDecodingBuffers) = 0;
+
+    //! @brief Disable Lookahead decoding.
+    virtual void disableLookahead(SizeType32 maxBatchSize, RequestVector const& genRequests) = 0;
 
     //! @brief Run one step for all requests without blocking the host process and return the token for synchronization.
     virtual DecoderFinishedEventPtr forwardAsync(decoder_batch::Output& output, decoder_batch::Input const& input) = 0;
