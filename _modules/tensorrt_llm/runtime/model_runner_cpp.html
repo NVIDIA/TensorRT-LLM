@@ -47,6 +47,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../quick-start-guide.html">Quick Start Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../torch.html">PyTorch Backend</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../release-notes.html">Release Notes</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Installation</span></p>
@@ -116,7 +117,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-best-practices.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/introduction.html">Best Practices</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -210,6 +211,15 @@
 <span class="n">SamplingConfigType</span> <span class="o">=</span> <span class="n">Union</span><span class="p">[</span><span class="n">SamplingConfig</span><span class="p">,</span> <span class="n">trtllm</span><span class="o">.</span><span class="n">SamplingConfig</span><span class="p">]</span>
 
 
+<span class="k">def</span><span class="w"> </span><span class="nf">_world_config_to_mapping</span><span class="p">(</span><span class="n">world_config</span><span class="p">:</span> <span class="n">WorldConfig</span><span class="p">):</span>
+    <span class="k">return</span> <span class="n">Mapping</span><span class="p">(</span><span class="n">world_size</span><span class="o">=</span><span class="n">world_config</span><span class="o">.</span><span class="n">size</span><span class="p">,</span>
+                   <span class="n">rank</span><span class="o">=</span><span class="n">world_config</span><span class="o">.</span><span class="n">rank</span><span class="p">,</span>
+                   <span class="n">gpus_per_node</span><span class="o">=</span><span class="n">world_config</span><span class="o">.</span><span class="n">gpus_per_node</span><span class="p">,</span>
+                   <span class="n">tp_size</span><span class="o">=</span><span class="n">world_config</span><span class="o">.</span><span class="n">tensor_parallelism</span><span class="p">,</span>
+                   <span class="n">pp_size</span><span class="o">=</span><span class="n">world_config</span><span class="o">.</span><span class="n">pipeline_parallelism</span><span class="p">,</span>
+                   <span class="n">cp_size</span><span class="o">=</span><span class="n">world_config</span><span class="o">.</span><span class="n">context_parallelism</span><span class="p">)</span>
+
+
 <div class="viewcode-block" id="ModelRunnerCpp">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelRunnerCpp">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">ModelRunnerCpp</span><span class="p">(</span><span class="n">ModelRunnerMixin</span><span class="p">):</span>
@@ -233,12 +243,7 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">max_seq_len</span> <span class="o">=</span> <span class="n">max_seq_len</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">max_beam_width</span> <span class="o">=</span> <span class="n">max_beam_width</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">model_config</span> <span class="o">=</span> <span class="n">model_config</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span> <span class="o">=</span> <span class="n">Mapping</span><span class="p">(</span><span class="n">world_size</span><span class="o">=</span><span class="n">world_config</span><span class="o">.</span><span class="n">size</span><span class="p">,</span>
-                               <span class="n">rank</span><span class="o">=</span><span class="n">world_config</span><span class="o">.</span><span class="n">rank</span><span class="p">,</span>
-                               <span class="n">gpus_per_node</span><span class="o">=</span><span class="n">world_config</span><span class="o">.</span><span class="n">gpus_per_node</span><span class="p">,</span>
-                               <span class="n">tp_size</span><span class="o">=</span><span class="n">world_config</span><span class="o">.</span><span class="n">tensor_parallelism</span><span class="p">,</span>
-                               <span class="n">pp_size</span><span class="o">=</span><span class="n">world_config</span><span class="o">.</span><span class="n">pipeline_parallelism</span><span class="p">,</span>
-                               <span class="n">cp_size</span><span class="o">=</span><span class="n">world_config</span><span class="o">.</span><span class="n">context_parallelism</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span> <span class="o">=</span> <span class="n">_world_config_to_mapping</span><span class="p">(</span><span class="n">world_config</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">world_config</span> <span class="o">=</span> <span class="n">world_config</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">use_kv_cache</span> <span class="o">=</span> <span class="n">use_kv_cache</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">lora_manager</span> <span class="o">=</span> <span class="n">lora_manager</span>
@@ -246,39 +251,40 @@
 <div class="viewcode-block" id="ModelRunnerCpp.from_dir">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelRunnerCpp.from_dir">[docs]</a>
     <span class="nd">@classmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">from_dir</span><span class="p">(</span>
-        <span class="bp">cls</span><span class="p">,</span>
-        <span class="n">engine_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
-        <span class="o">*</span><span class="p">,</span>
-        <span class="n">lora_dir</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="n">rank</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
-        <span class="n">max_batch_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="n">max_input_len</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="n">max_output_len</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="n">max_beam_width</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="n">max_attention_window_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="n">sink_token_length</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="n">kv_cache_free_gpu_memory_fraction</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="n">cross_kv_cache_fraction</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="n">medusa_choices</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="n">eagle_choices</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="n">eagle_posterior_threshold</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="n">lookahead_config</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="n">debug_mode</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
-        <span class="n">lora_ckpt_source</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;hf&quot;</span><span class="p">,</span>
-        <span class="n">gpu_weights_percent</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
-        <span class="n">max_tokens_in_paged_kv_cache</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="n">kv_cache_enable_block_reuse</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
-        <span class="n">enable_chunked_context</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
-        <span class="n">is_enc_dec</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
-        <span class="n">multi_block_mode</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
-        <span class="n">enable_context_fmha_fp32_acc</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="n">cuda_graph_mode</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="n">logits_processor_map</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">LogitsProcessor</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="n">device_ids</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="n">is_orchestrator_mode</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
-        <span class="n">use_runtime_defaults</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
-    <span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;ModelRunnerCpp&#39;</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_dir</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span>
+                 <span class="n">engine_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+                 <span class="o">*</span><span class="p">,</span>
+                 <span class="n">lora_dir</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">rank</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
+                 <span class="n">max_batch_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">max_input_len</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">max_output_len</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">max_beam_width</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">max_attention_window_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">sink_token_length</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">kv_cache_free_gpu_memory_fraction</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">cross_kv_cache_fraction</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">medusa_choices</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">eagle_choices</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">eagle_posterior_threshold</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">lookahead_config</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">debug_mode</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+                 <span class="n">lora_ckpt_source</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;hf&quot;</span><span class="p">,</span>
+                 <span class="n">gpu_weights_percent</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
+                 <span class="n">max_tokens_in_paged_kv_cache</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">kv_cache_enable_block_reuse</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+                 <span class="n">enable_chunked_context</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+                 <span class="n">is_enc_dec</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+                 <span class="n">multi_block_mode</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+                 <span class="n">enable_context_fmha_fp32_acc</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">cuda_graph_mode</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">logits_processor_map</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span>
+                                                     <span class="n">LogitsProcessor</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">device_ids</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">is_orchestrator_mode</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+                 <span class="n">use_runtime_defaults</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+                 <span class="n">backend</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">py_executor_config</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="p">{})</span> <span class="o">-&gt;</span> <span class="s1">&#39;ModelRunnerCpp&#39;</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">        Create a ModelRunnerCpp instance from an engine directory.</span>
 
@@ -453,9 +459,8 @@
                                        <span class="n">gpus_per_node</span><span class="o">=</span><span class="n">gpus_per_node</span><span class="p">)</span>
         <span class="k">assert</span> <span class="n">rank</span> <span class="o">==</span> <span class="n">world_config</span><span class="o">.</span><span class="n">rank</span>
 
+        <span class="n">engine_config</span> <span class="o">=</span> <span class="n">EngineConfig</span><span class="o">.</span><span class="n">from_json_file</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">engine_dir</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">model_config</span><span class="o">.</span><span class="n">use_lora_plugin</span> <span class="ow">and</span> <span class="n">rank</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
-            <span class="n">engine_config</span> <span class="o">=</span> <span class="n">EngineConfig</span><span class="o">.</span><span class="n">from_json_file</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">engine_dir</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">)</span>
             <span class="n">lora_manager</span> <span class="o">=</span> <span class="n">LoraManager</span><span class="p">()</span>
             <span class="k">if</span> <span class="n">lora_dir</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="n">config_lora_dir</span> <span class="o">=</span> <span class="n">engine_config</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">lora_config</span><span class="o">.</span><span class="n">lora_dir</span>
@@ -594,10 +599,25 @@
             <span class="n">trtllm_config</span><span class="o">.</span><span class="n">logits_post_processor_config</span> <span class="o">=</span> <span class="n">logits_proc_config</span>
 
         <span class="n">use_default_executor</span> <span class="o">=</span> <span class="kc">True</span>
+        <span class="n">use_default_executor</span> <span class="o">=</span> <span class="ow">not</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">trtllm_config</span><span class="p">,</span> <span class="s2">&quot;backend&quot;</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">use_default_executor</span><span class="p">:</span>
             <span class="n">executor</span> <span class="o">=</span> <span class="n">trtllm</span><span class="o">.</span><span class="n">Executor</span><span class="p">(</span><span class="n">Path</span><span class="p">(</span><span class="n">engine_dir</span><span class="p">),</span>
                                        <span class="n">trtllm</span><span class="o">.</span><span class="n">ModelType</span><span class="o">.</span><span class="n">DECODER_ONLY</span><span class="p">,</span>
                                        <span class="n">trtllm_config</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="kn">from</span><span class="w"> </span><span class="nn">..pyexecutor.backend_registries.backend_registry</span><span class="w"> </span><span class="kn">import</span> \
+                <span class="n">unique_create_executor</span>
+            <span class="kn">from</span><span class="w"> </span><span class="nn">..pyexecutor.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">update_executor_config</span>
+            <span class="n">update_executor_config</span><span class="p">(</span>
+                <span class="n">trtllm_config</span><span class="p">,</span>
+                <span class="n">backend</span><span class="o">=</span><span class="n">backend</span><span class="p">,</span>
+                <span class="n">mapping</span><span class="o">=</span><span class="n">_world_config_to_mapping</span><span class="p">(</span><span class="n">world_config</span><span class="p">),</span>
+                <span class="n">build_config</span><span class="o">=</span><span class="n">engine_config</span><span class="o">.</span><span class="n">build_config</span><span class="p">,</span>
+                <span class="n">trt_engine_dir</span><span class="o">=</span><span class="n">engine_dir</span><span class="p">,</span>
+                <span class="o">**</span><span class="n">py_executor_config</span><span class="p">)</span>
+            <span class="n">executor</span> <span class="o">=</span> <span class="n">unique_create_executor</span><span class="p">(</span><span class="n">Path</span><span class="p">(</span><span class="n">engine_dir</span><span class="p">),</span>
+                                              <span class="n">trtllm</span><span class="o">.</span><span class="n">ModelType</span><span class="o">.</span><span class="n">DECODER_ONLY</span><span class="p">,</span>
+                                              <span class="n">trtllm_config</span><span class="p">)</span>
 
         <span class="n">profiler</span><span class="o">.</span><span class="n">stop</span><span class="p">(</span><span class="s1">&#39;load tensorrt_llm engine&#39;</span><span class="p">)</span>
 
@@ -988,11 +1008,11 @@
     <span class="k">def</span><span class="w"> </span><span class="nf">_prepare_mrope_executor</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">batch_input_ids_list</span><span class="p">,</span> <span class="n">mrope</span><span class="p">:</span> <span class="n">MropeParams</span><span class="p">):</span>
         <span class="n">mrope_configs</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">batch_input_ids_list</span><span class="p">)</span> <span class="o">*</span> <span class="p">[</span><span class="kc">None</span><span class="p">]</span>
         <span class="k">if</span> <span class="n">mrope</span> <span class="o">!=</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">mrope_rotary_sin_cos</span> <span class="o">=</span> <span class="n">mrope</span><span class="o">.</span><span class="n">mrope_rotary_sin_cos</span>
+            <span class="n">mrope_rotary_cos_sin</span> <span class="o">=</span> <span class="n">mrope</span><span class="o">.</span><span class="n">mrope_rotary_cos_sin</span>
             <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span>
-                <span class="n">mrope_rotary_sin_cos</span><span class="p">,</span>
-                <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">),</span> <span class="s2">&quot;mrope_rotary_sin_cos should be torch.Tensor&quot;</span>
-            <span class="n">mrope_rotary_sin_cos_data</span> <span class="o">=</span> <span class="n">mrope_rotary_sin_cos</span><span class="o">.</span><span class="n">to</span><span class="p">(</span>
+                <span class="n">mrope_rotary_cos_sin</span><span class="p">,</span>
+                <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">),</span> <span class="s2">&quot;mrope_rotary_cos_sin should be torch.Tensor&quot;</span>
+            <span class="n">mrope_rotary_cos_sin_data</span> <span class="o">=</span> <span class="n">mrope_rotary_cos_sin</span><span class="o">.</span><span class="n">to</span><span class="p">(</span>
                 <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="s1">&#39;cpu&#39;</span><span class="p">))</span>
 
             <span class="n">mrope_position_deltas</span> <span class="o">=</span> <span class="n">mrope</span><span class="o">.</span><span class="n">mrope_position_deltas</span>
@@ -1004,7 +1024,7 @@
 
             <span class="n">mrope_configs</span> <span class="o">=</span> <span class="p">[</span>
                 <span class="n">trtllm</span><span class="o">.</span><span class="n">MropeConfig</span><span class="p">(</span>
-                    <span class="n">mrope_rotary_sin_cos</span><span class="o">=</span><span class="n">mrope_rotary_sin_cos_data</span><span class="p">[</span><span class="n">i</span><span class="p">],</span>
+                    <span class="n">mrope_rotary_cos_sin</span><span class="o">=</span><span class="n">mrope_rotary_cos_sin_data</span><span class="p">[</span><span class="n">i</span><span class="p">],</span>
                     <span class="n">mrope_position_deltas</span><span class="o">=</span><span class="n">mrope_position_deltas_data</span><span class="p">[</span><span class="n">i</span><span class="p">])</span>
                 <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">batch_input_ids_list</span><span class="p">))</span>
             <span class="p">]</span>
@@ -1324,7 +1344,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fed248f6620>
+<jinja2.runtime.BlockReference object at 0x7f657dfc54f0>
 
 <div class="footer">
     <p>

@@ -50,6 +50,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../torch.html">PyTorch Backend</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Installation</span></p>
@@ -119,7 +120,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../performance/perf-best-practices.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/introduction.html">Best Practices</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -165,41 +166,42 @@
   <section id="installing-on-linux">
 <span id="linux"></span><h1>Installing on Linux<a class="headerlink" href="#installing-on-linux" title="Link to this heading"></a></h1>
 <ol class="arabic">
-<li><p>Install TensorRT-LLM (tested on Ubuntu 22.04).</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sudo<span class="w"> </span>apt-get<span class="w"> </span>-y<span class="w"> </span>install<span class="w"> </span>libopenmpi-dev<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>pip3<span class="w"> </span>install<span class="w"> </span>tensorrt_llm
+<li><p>Install TensorRT-LLM (tested on Ubuntu 24.04).</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sudo<span class="w"> </span>apt-get<span class="w"> </span>-y<span class="w"> </span>install<span class="w"> </span>libopenmpi-dev<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>pip3<span class="w"> </span>install<span class="w"> </span>--upgrade<span class="w"> </span>setuptools<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>pip3<span class="w"> </span>install<span class="w"> </span>tensorrt_llm
 </pre></div>
 </div>
 </li>
-<li><p>Sanity check the installation by running the following in Python (tested on Python 3.10):</p>
-<div class="highlight-python3 notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
-
-<span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
-
-    <span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span>
-        <span class="s2">&quot;Hello, my name is&quot;</span><span class="p">,</span>
-        <span class="s2">&quot;The president of the United States is&quot;</span><span class="p">,</span>
-        <span class="s2">&quot;The capital of France is&quot;</span><span class="p">,</span>
-        <span class="s2">&quot;The future of AI is&quot;</span><span class="p">,</span>
-    <span class="p">]</span>
-    <span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">temperature</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span> <span class="n">top_p</span><span class="o">=</span><span class="mf">0.95</span><span class="p">)</span>
-
-    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">)</span>
-
-    <span class="n">outputs</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
-
-    <span class="c1"># Print the outputs.</span>
-    <span class="k">for</span> <span class="n">output</span> <span class="ow">in</span> <span class="n">outputs</span><span class="p">:</span>
-        <span class="n">prompt</span> <span class="o">=</span> <span class="n">output</span><span class="o">.</span><span class="n">prompt</span>
-        <span class="n">generated_text</span> <span class="o">=</span> <span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span>
-        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">, Generated text: </span><span class="si">{</span><span class="n">generated_text</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span>
-
-<span class="c1"># The entry point of the program need to be protected for spawning processes.</span>
-<span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
-    <span class="n">main</span><span class="p">()</span>
-</pre></div>
-</div>
-</li>
+<li><p>Sanity check the installation by running the following in Python (tested on Python 3.12):</p></li>
 </ol>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
+<span class="linenos"> 2</span>
+<span class="linenos"> 3</span>
+<span class="linenos"> 4</span><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
+<span class="linenos"> 5</span>
+<span class="linenos"> 6</span>    <span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span>
+<span class="linenos"> 7</span>        <span class="s2">&quot;Hello, my name is&quot;</span><span class="p">,</span>
+<span class="linenos"> 8</span>        <span class="s2">&quot;The president of the United States is&quot;</span><span class="p">,</span>
+<span class="linenos"> 9</span>        <span class="s2">&quot;The capital of France is&quot;</span><span class="p">,</span>
+<span class="linenos">10</span>        <span class="s2">&quot;The future of AI is&quot;</span><span class="p">,</span>
+<span class="linenos">11</span>    <span class="p">]</span>
+<span class="linenos">12</span>    <span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">temperature</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span> <span class="n">top_p</span><span class="o">=</span><span class="mf">0.95</span><span class="p">)</span>
+<span class="linenos">13</span>
+<span class="linenos">14</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">)</span>
+<span class="linenos">15</span>
+<span class="linenos">16</span>    <span class="n">outputs</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
+<span class="linenos">17</span>
+<span class="linenos">18</span>    <span class="c1"># Print the outputs.</span>
+<span class="linenos">19</span>    <span class="k">for</span> <span class="n">output</span> <span class="ow">in</span> <span class="n">outputs</span><span class="p">:</span>
+<span class="linenos">20</span>        <span class="n">prompt</span> <span class="o">=</span> <span class="n">output</span><span class="o">.</span><span class="n">prompt</span>
+<span class="linenos">21</span>        <span class="n">generated_text</span> <span class="o">=</span> <span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span>
+<span class="linenos">22</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">, Generated text: </span><span class="si">{</span><span class="n">generated_text</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span>
+<span class="linenos">23</span>
+<span class="linenos">24</span>
+<span class="linenos">25</span><span class="c1"># The entry point of the program need to be protected for spawning processes.</span>
+<span class="linenos">26</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
+<span class="linenos">27</span>    <span class="n">main</span><span class="p">()</span>
+</pre></div>
+</div>
 <p><strong>Known limitations</strong></p>
 <p>There are some known limitations when you pip install pre-built TensorRT-LLM wheel package.</p>
 <ol class="arabic">
@@ -245,7 +247,7 @@ Please install CUDA toolkit when you see the following message when running Mode
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fed14ce7820>
+<jinja2.runtime.BlockReference object at 0x7f658c9730e0>
 
 <div class="footer">
     <p>

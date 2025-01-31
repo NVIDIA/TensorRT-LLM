@@ -22,8 +22,8 @@
     <script src="../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="Generate Text Using Lookahead Decoding" href="llm_lookahead_decoding.html" />
-    <link rel="prev" title="Control generated text using logits post processor" href="llm_logits_processor.html" /> 
+    <link rel="next" title="Generate text" href="llm_inference.html" />
+    <link rel="prev" title="Generate Text Using Lookahead Decoding" href="llm_lookahead_decoding.html" /> 
 </head>
 
 <body class="wy-body-for-nav"> 
@@ -50,6 +50,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../torch.html">PyTorch Backend</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Installation</span></p>
@@ -70,17 +71,17 @@
 <li class="toctree-l1"><a class="reference internal" href="index.html">LLM Examples Introduction</a></li>
 <li class="toctree-l1"><a class="reference internal" href="customization.html">Common Customizations</a></li>
 <li class="toctree-l1 current"><a class="reference internal" href="llm_api_examples.html">Examples</a><ul class="current">
-<li class="toctree-l2"><a class="reference internal" href="llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_quantization.html">Generation with Quantization</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference_async.html">Generate Text Asynchronously</a></li>
-<li class="toctree-l2 current"><a class="current reference internal" href="#">Generate text with guided decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference_customize.html">Generate text</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_logits_processor.html">Control generated text using logits post processor</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
-<li class="toctree-l2"><a class="reference internal" href="llm_inference_distributed.html">Distributed LLM Generation</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm_medusa_decoding.html">Generate Text Using Medusa Decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm_lookahead_decoding.html">Generate Text Using Lookahead Decoding</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">Generate text with guided decoding</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_inference_customize.html">Generate text with customization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_inference_async_streaming.html">Generate Text in Streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_quantization.html">Generation with Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_inference_async.html">Generate Text Asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_logits_processor.html">Control generated text using logits post processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_inference_distributed.html">Distributed LLM Generation</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm_auto_parallel.html">Automatic Parallelism with LLM</a></li>
 </ul>
 </li>
@@ -133,7 +134,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../performance/perf-best-practices.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/introduction.html">Best Practices</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -182,49 +183,54 @@
 <p>Source <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llm-api/llm_guided_decoding.py">https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llm-api/llm_guided_decoding.py</a>.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="c1">### Generate text with guided decoding</span>
 <span class="linenos"> 2</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
-<span class="linenos"> 3</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">GuidedDecodingParams</span>
+<span class="linenos"> 3</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">BuildConfig</span><span class="p">,</span> <span class="n">GuidedDecodingParams</span>
 <span class="linenos"> 4</span>
 <span class="linenos"> 5</span>
 <span class="linenos"> 6</span><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
 <span class="linenos"> 7</span>
-<span class="linenos"> 8</span>    <span class="c1"># Specify the guided decoding backend; xgrammar is supported currently.</span>
-<span class="linenos"> 9</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">,</span>
-<span class="linenos">10</span>              <span class="n">guided_decoding_backend</span><span class="o">=</span><span class="s1">&#39;xgrammar&#39;</span><span class="p">)</span>
+<span class="linenos"> 8</span>    <span class="c1"># TODO(jiahanc): Clean up build_config when use_paged_context_fmha is by default enabled</span>
+<span class="linenos"> 9</span>    <span class="n">build_config</span> <span class="o">=</span> <span class="n">BuildConfig</span><span class="p">()</span>
+<span class="linenos">10</span>    <span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">use_paged_context_fmha</span> <span class="o">=</span> <span class="kc">True</span>
 <span class="linenos">11</span>
-<span class="linenos">12</span>    <span class="c1"># An example from json-mode-eval</span>
-<span class="linenos">13</span>    <span class="n">schema</span> <span class="o">=</span> <span class="s1">&#39;{&quot;title&quot;: &quot;WirelessAccessPoint&quot;, &quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: {&quot;ssid&quot;: {&quot;title&quot;: &quot;SSID&quot;, &quot;type&quot;: &quot;string&quot;}, &quot;securityProtocol&quot;: {&quot;title&quot;: &quot;SecurityProtocol&quot;, &quot;type&quot;: &quot;string&quot;}, &quot;bandwidth&quot;: {&quot;title&quot;: &quot;Bandwidth&quot;, &quot;type&quot;: &quot;string&quot;}}, &quot;required&quot;: [&quot;ssid&quot;, &quot;securityProtocol&quot;, &quot;bandwidth&quot;]}&#39;</span>
-<span class="linenos">14</span>
-<span class="linenos">15</span>    <span class="n">prompt</span> <span class="o">=</span> <span class="p">[{</span>
-<span class="linenos">16</span>        <span class="s1">&#39;role&#39;</span><span class="p">:</span>
-<span class="linenos">17</span>        <span class="s1">&#39;system&#39;</span><span class="p">,</span>
-<span class="linenos">18</span>        <span class="s1">&#39;content&#39;</span><span class="p">:</span>
-<span class="linenos">19</span>        <span class="s2">&quot;You are a helpful assistant that answers in JSON. Here&#39;s the json schema you must adhere to:</span><span class="se">\n</span><span class="s2">&lt;schema&gt;</span><span class="se">\n</span><span class="s2">{&#39;title&#39;: &#39;WirelessAccessPoint&#39;, &#39;type&#39;: &#39;object&#39;, &#39;properties&#39;: {&#39;ssid&#39;: {&#39;title&#39;: &#39;SSID&#39;, &#39;type&#39;: &#39;string&#39;}, &#39;securityProtocol&#39;: {&#39;title&#39;: &#39;SecurityProtocol&#39;, &#39;type&#39;: &#39;string&#39;}, &#39;bandwidth&#39;: {&#39;title&#39;: &#39;Bandwidth&#39;, &#39;type&#39;: &#39;string&#39;}}, &#39;required&#39;: [&#39;ssid&#39;, &#39;securityProtocol&#39;, &#39;bandwidth&#39;]}</span><span class="se">\n</span><span class="s2">&lt;/schema&gt;</span><span class="se">\n</span><span class="s2">&quot;</span>
-<span class="linenos">20</span>    <span class="p">},</span> <span class="p">{</span>
+<span class="linenos">12</span>    <span class="c1"># Specify the guided decoding backend; xgrammar is supported currently.</span>
+<span class="linenos">13</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">,</span>
+<span class="linenos">14</span>              <span class="n">build_config</span><span class="o">=</span><span class="n">build_config</span><span class="p">,</span>
+<span class="linenos">15</span>              <span class="n">guided_decoding_backend</span><span class="o">=</span><span class="s1">&#39;xgrammar&#39;</span><span class="p">)</span>
+<span class="linenos">16</span>
+<span class="linenos">17</span>    <span class="c1"># An example from json-mode-eval</span>
+<span class="linenos">18</span>    <span class="n">schema</span> <span class="o">=</span> <span class="s1">&#39;{&quot;title&quot;: &quot;WirelessAccessPoint&quot;, &quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: {&quot;ssid&quot;: {&quot;title&quot;: &quot;SSID&quot;, &quot;type&quot;: &quot;string&quot;}, &quot;securityProtocol&quot;: {&quot;title&quot;: &quot;SecurityProtocol&quot;, &quot;type&quot;: &quot;string&quot;}, &quot;bandwidth&quot;: {&quot;title&quot;: &quot;Bandwidth&quot;, &quot;type&quot;: &quot;string&quot;}}, &quot;required&quot;: [&quot;ssid&quot;, &quot;securityProtocol&quot;, &quot;bandwidth&quot;]}&#39;</span>
+<span class="linenos">19</span>
+<span class="linenos">20</span>    <span class="n">prompt</span> <span class="o">=</span> <span class="p">[{</span>
 <span class="linenos">21</span>        <span class="s1">&#39;role&#39;</span><span class="p">:</span>
-<span class="linenos">22</span>        <span class="s1">&#39;user&#39;</span><span class="p">,</span>
+<span class="linenos">22</span>        <span class="s1">&#39;system&#39;</span><span class="p">,</span>
 <span class="linenos">23</span>        <span class="s1">&#39;content&#39;</span><span class="p">:</span>
-<span class="linenos">24</span>        <span class="s2">&quot;I&#39;m currently configuring a wireless access point for our office network and I need to generate a JSON object that accurately represents its settings. The access point&#39;s SSID should be &#39;OfficeNetSecure&#39;, it uses WPA2-Enterprise as its security protocol, and it&#39;s capable of a bandwidth of up to 1300 Mbps on the 5 GHz band. This JSON object will be used to document our network configurations and to automate the setup process for additional access points in the future. Please provide a JSON object that includes these details.&quot;</span>
-<span class="linenos">25</span>    <span class="p">}]</span>
-<span class="linenos">26</span>    <span class="n">prompt</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">apply_chat_template</span><span class="p">(</span><span class="n">prompt</span><span class="p">,</span> <span class="n">tokenize</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-<span class="linenos">27</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span>
-<span class="linenos">28</span>
-<span class="linenos">29</span>    <span class="n">output</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompt</span><span class="p">,</span> <span class="n">sampling_params</span><span class="o">=</span><span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">50</span><span class="p">))</span>
-<span class="linenos">30</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Generated text (unguided): </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span>
-<span class="linenos">31</span>
-<span class="linenos">32</span>    <span class="n">output</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span>
-<span class="linenos">33</span>        <span class="n">prompt</span><span class="p">,</span>
-<span class="linenos">34</span>        <span class="n">sampling_params</span><span class="o">=</span><span class="n">SamplingParams</span><span class="p">(</span>
-<span class="linenos">35</span>            <span class="n">max_tokens</span><span class="o">=</span><span class="mi">50</span><span class="p">,</span> <span class="n">guided_decoding</span><span class="o">=</span><span class="n">GuidedDecodingParams</span><span class="p">(</span><span class="n">json</span><span class="o">=</span><span class="n">schema</span><span class="p">)))</span>
-<span class="linenos">36</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Generated text (guided): </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span>
-<span class="linenos">37</span>
-<span class="linenos">38</span>    <span class="c1"># Got output like</span>
-<span class="linenos">39</span>    <span class="c1"># Prompt: &quot;&lt;|system|&gt;\nYou are a helpful assistant that answers in JSON. Here&#39;s the json schema you must adhere to:\n&lt;schema&gt;\n{&#39;title&#39;: &#39;WirelessAccessPoint&#39;, &#39;type&#39;: &#39;object&#39;, &#39;properties&#39;: {&#39;ssid&#39;: {&#39;title&#39;: &#39;SSID&#39;, &#39;type&#39;: &#39;string&#39;}, &#39;securityProtocol&#39;: {&#39;title&#39;: &#39;SecurityProtocol&#39;, &#39;type&#39;: &#39;string&#39;}, &#39;bandwidth&#39;: {&#39;title&#39;: &#39;Bandwidth&#39;, &#39;type&#39;: &#39;string&#39;}}, &#39;required&#39;: [&#39;ssid&#39;, &#39;securityProtocol&#39;, &#39;bandwidth&#39;]}\n&lt;/schema&gt;\n&lt;/s&gt;\n&lt;|user|&gt;\nI&#39;m currently configuring a wireless access point for our office network and I need to generate a JSON object that accurately represents its settings. The access point&#39;s SSID should be &#39;OfficeNetSecure&#39;, it uses WPA2-Enterprise as its security protocol, and it&#39;s capable of a bandwidth of up to 1300 Mbps on the 5 GHz band. This JSON object will be used to document our network configurations and to automate the setup process for additional access points in the future. Please provide a JSON object that includes these details.&lt;/s&gt;\n&quot;</span>
-<span class="linenos">40</span>    <span class="c1"># Generated text (unguided): &#39;&lt;|assistant|&gt;\nHere\&#39;s a JSON object that accurately represents the settings of a wireless access point for our office network:\n\n```json\n{\n  &quot;title&quot;: &quot;WirelessAccessPoint&quot;,\n  &quot;&#39;</span>
-<span class="linenos">41</span>    <span class="c1"># Generated text (guided): &#39;{&quot;ssid&quot;: &quot;OfficeNetSecure&quot;, &quot;securityProtocol&quot;: &quot;WPA2-Enterprise&quot;, &quot;bandwidth&quot;: &quot;1300 Mbps&quot;}&#39;</span>
+<span class="linenos">24</span>        <span class="s2">&quot;You are a helpful assistant that answers in JSON. Here&#39;s the json schema you must adhere to:</span><span class="se">\n</span><span class="s2">&lt;schema&gt;</span><span class="se">\n</span><span class="s2">{&#39;title&#39;: &#39;WirelessAccessPoint&#39;, &#39;type&#39;: &#39;object&#39;, &#39;properties&#39;: {&#39;ssid&#39;: {&#39;title&#39;: &#39;SSID&#39;, &#39;type&#39;: &#39;string&#39;}, &#39;securityProtocol&#39;: {&#39;title&#39;: &#39;SecurityProtocol&#39;, &#39;type&#39;: &#39;string&#39;}, &#39;bandwidth&#39;: {&#39;title&#39;: &#39;Bandwidth&#39;, &#39;type&#39;: &#39;string&#39;}}, &#39;required&#39;: [&#39;ssid&#39;, &#39;securityProtocol&#39;, &#39;bandwidth&#39;]}</span><span class="se">\n</span><span class="s2">&lt;/schema&gt;</span><span class="se">\n</span><span class="s2">&quot;</span>
+<span class="linenos">25</span>    <span class="p">},</span> <span class="p">{</span>
+<span class="linenos">26</span>        <span class="s1">&#39;role&#39;</span><span class="p">:</span>
+<span class="linenos">27</span>        <span class="s1">&#39;user&#39;</span><span class="p">,</span>
+<span class="linenos">28</span>        <span class="s1">&#39;content&#39;</span><span class="p">:</span>
+<span class="linenos">29</span>        <span class="s2">&quot;I&#39;m currently configuring a wireless access point for our office network and I need to generate a JSON object that accurately represents its settings. The access point&#39;s SSID should be &#39;OfficeNetSecure&#39;, it uses WPA2-Enterprise as its security protocol, and it&#39;s capable of a bandwidth of up to 1300 Mbps on the 5 GHz band. This JSON object will be used to document our network configurations and to automate the setup process for additional access points in the future. Please provide a JSON object that includes these details.&quot;</span>
+<span class="linenos">30</span>    <span class="p">}]</span>
+<span class="linenos">31</span>    <span class="n">prompt</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">apply_chat_template</span><span class="p">(</span><span class="n">prompt</span><span class="p">,</span> <span class="n">tokenize</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="linenos">32</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span>
+<span class="linenos">33</span>
+<span class="linenos">34</span>    <span class="n">output</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompt</span><span class="p">,</span> <span class="n">sampling_params</span><span class="o">=</span><span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">50</span><span class="p">))</span>
+<span class="linenos">35</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Generated text (unguided): </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span>
+<span class="linenos">36</span>
+<span class="linenos">37</span>    <span class="n">output</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span>
+<span class="linenos">38</span>        <span class="n">prompt</span><span class="p">,</span>
+<span class="linenos">39</span>        <span class="n">sampling_params</span><span class="o">=</span><span class="n">SamplingParams</span><span class="p">(</span>
+<span class="linenos">40</span>            <span class="n">max_tokens</span><span class="o">=</span><span class="mi">50</span><span class="p">,</span> <span class="n">guided_decoding</span><span class="o">=</span><span class="n">GuidedDecodingParams</span><span class="p">(</span><span class="n">json</span><span class="o">=</span><span class="n">schema</span><span class="p">)))</span>
+<span class="linenos">41</span>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Generated text (guided): </span><span class="si">{</span><span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span>
 <span class="linenos">42</span>
-<span class="linenos">43</span>
-<span class="linenos">44</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
-<span class="linenos">45</span>    <span class="n">main</span><span class="p">()</span>
+<span class="linenos">43</span>    <span class="c1"># Got output like</span>
+<span class="linenos">44</span>    <span class="c1"># Prompt: &quot;&lt;|system|&gt;\nYou are a helpful assistant that answers in JSON. Here&#39;s the json schema you must adhere to:\n&lt;schema&gt;\n{&#39;title&#39;: &#39;WirelessAccessPoint&#39;, &#39;type&#39;: &#39;object&#39;, &#39;properties&#39;: {&#39;ssid&#39;: {&#39;title&#39;: &#39;SSID&#39;, &#39;type&#39;: &#39;string&#39;}, &#39;securityProtocol&#39;: {&#39;title&#39;: &#39;SecurityProtocol&#39;, &#39;type&#39;: &#39;string&#39;}, &#39;bandwidth&#39;: {&#39;title&#39;: &#39;Bandwidth&#39;, &#39;type&#39;: &#39;string&#39;}}, &#39;required&#39;: [&#39;ssid&#39;, &#39;securityProtocol&#39;, &#39;bandwidth&#39;]}\n&lt;/schema&gt;\n&lt;/s&gt;\n&lt;|user|&gt;\nI&#39;m currently configuring a wireless access point for our office network and I need to generate a JSON object that accurately represents its settings. The access point&#39;s SSID should be &#39;OfficeNetSecure&#39;, it uses WPA2-Enterprise as its security protocol, and it&#39;s capable of a bandwidth of up to 1300 Mbps on the 5 GHz band. This JSON object will be used to document our network configurations and to automate the setup process for additional access points in the future. Please provide a JSON object that includes these details.&lt;/s&gt;\n&quot;</span>
+<span class="linenos">45</span>    <span class="c1"># Generated text (unguided): &#39;&lt;|assistant|&gt;\nHere\&#39;s a JSON object that accurately represents the settings of a wireless access point for our office network:\n\n```json\n{\n  &quot;title&quot;: &quot;WirelessAccessPoint&quot;,\n  &quot;&#39;</span>
+<span class="linenos">46</span>    <span class="c1"># Generated text (guided): &#39;{&quot;ssid&quot;: &quot;OfficeNetSecure&quot;, &quot;securityProtocol&quot;: &quot;WPA2-Enterprise&quot;, &quot;bandwidth&quot;: &quot;1300 Mbps&quot;}&#39;</span>
+<span class="linenos">47</span>
+<span class="linenos">48</span>
+<span class="linenos">49</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
+<span class="linenos">50</span>    <span class="n">main</span><span class="p">()</span>
 </pre></div>
 </div>
 </section>
@@ -233,14 +239,14 @@
            </div>
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
-        <a href="llm_logits_processor.html" class="btn btn-neutral float-left" title="Control generated text using logits post processor" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
-        <a href="llm_lookahead_decoding.html" class="btn btn-neutral float-right" title="Generate Text Using Lookahead Decoding" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+        <a href="llm_lookahead_decoding.html" class="btn btn-neutral float-left" title="Generate Text Using Lookahead Decoding" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="llm_inference.html" class="btn btn-neutral float-right" title="Generate text" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fed14a27a60>
+<jinja2.runtime.BlockReference object at 0x7f658c8b8440>
 
 <div class="footer">
     <p>

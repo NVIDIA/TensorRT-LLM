@@ -50,6 +50,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../torch.html">PyTorch Backend</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Installation</span></p>
@@ -128,7 +129,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../performance/perf-best-practices.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/introduction.html">Best Practices</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -183,10 +184,10 @@
 <p>KV cache reuse requires the model to be built for paged context attention. This is done with <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code>:</p>
 <p><code class="docutils literal notranslate"><span class="pre">trtllm-build</span> <span class="pre">--use_paged_context_fmha</span> <span class="pre">enable</span></code></p>
 <ol class="arabic simple" start="2">
-<li><p>KV cache reuse must be enabled in KVCacheManager</p></li>
+<li><p>KV cache reuse is enabled by default in KVCacheManager</p></li>
 </ol>
-<p>If you are running gptManagerBenchmark application, you can enable kv cache reuse with a command-line switch:</p>
-<p><code class="docutils literal notranslate"><span class="pre">gptManagerBenchmark</span> <span class="pre">--enable_kv_cache_reuse</span> <span class="pre">enable</span></code></p>
+<p>If you are running gptManagerBenchmark application, you can disable kv cache reuse with a command-line switch:</p>
+<p><code class="docutils literal notranslate"><span class="pre">gptManagerBenchmark</span> <span class="pre">--enable_kv_cache_reuse</span> <span class="pre">enable=false</span></code></p>
 <p>If you are running a Triton server, you can enable kv cache reuse with a parameter:</p>
 <div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">parameters</span><span class="p">:</span> <span class="p">{</span>
   <span class="n">key</span><span class="p">:</span> <span class="s2">&quot;enable_kv_cache_reuse&quot;</span>
@@ -196,14 +197,14 @@
 <span class="p">}</span>
 </pre></div>
 </div>
-<p>If you are writing your own application using Executor API, you can enable kv cache reuse by including <code class="docutils literal notranslate"><span class="pre">enableBlockReuse=true</span></code> when you create the <code class="docutils literal notranslate"><span class="pre">KvCacheConfig</span></code> object.</p>
-<p>GptManager API has been deprecated, but if you have an old application that is using GptManager API, you can enable kv cache reuse with an optional parameter:</p>
+<p>If you are writing your own application using Executor API, you can enable kv cache reuse by including <code class="docutils literal notranslate"><span class="pre">enableBlockReuse=true</span></code> when you create the <code class="docutils literal notranslate"><span class="pre">KvCacheConfig</span></code> object. Note that this is the default, if you wish to disable kv cache reuse, pass <code class="docutils literal notranslate"><span class="pre">enableBlockReuse=false</span></code> instead.</p>
+<p>GptManager API has been deprecated, but if you have an old application that is using GptManager API, you can enable or disable kv cache reuse with an optional parameter:</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">TrtGptModelOptionalParams</span></code> class encapsulates the following fields:</p>
 <ul>
 <li><p><code class="docutils literal notranslate"><span class="pre">kvCacheConfig</span></code></p>
 <ul>
-<li><p><code class="docutils literal notranslate"><span class="pre">enableBlockReuse</span></code> (default: <code class="docutils literal notranslate"><span class="pre">false</span></code>) allow reuse of previously computed KV cache blocks across requests. This is expected to optimize memory use and computation.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">enableBlockReuse</span></code> (default: <code class="docutils literal notranslate"><span class="pre">true</span></code>) allow reuse of previously computed KV cache blocks across requests. This is expected to optimize memory use and computation.</p></li>
 </ul>
 </li>
 </ul>
@@ -285,7 +286,7 @@ Assume vocaburlay size is 100, which means normal text token ids are in range [0
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fed1539f040>
+<jinja2.runtime.BlockReference object at 0x7f658d008230>
 
 <div class="footer">
     <p>

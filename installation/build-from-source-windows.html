@@ -50,6 +50,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../torch.html">PyTorch Backend</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Installation</span></p>
@@ -131,7 +132,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../performance/perf-best-practices.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/introduction.html">Best Practices</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -186,7 +187,7 @@
 <li><p>Install prerequisites listed in our <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/installation/windows.html">Installing on Windows</a> document.</p></li>
 <li><p>Install <a class="reference external" href="https://cmake.org/download/">CMake</a>, version 3.27.7 is recommended, and select the option to add it to the system path.</p></li>
 <li><p>Download and install <a class="reference external" href="https://visualstudio.microsoft.com/">Visual Studio 2022</a>.</p></li>
-<li><p>Download and unzip <a class="reference external" href="https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.7.0/zip/TensorRT-10.7.0.23.Windows.win10.cuda-12.6.zip">TensorRT 10.7.0.23</a>.</p></li>
+<li><p>Download and unzip <a class="reference external" href="https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.8.0/zip/TensorRT-10.8.0.43.Windows.win10.cuda-12.8.zip">TensorRT 10.8.0.43</a>.</p></li>
 </ol>
 </section>
 <section id="building-a-tensorrt-llm-docker-image">
@@ -238,7 +239,7 @@ git<span class="w"> </span>submodule<span class="w"> </span>update<span class="w
 <ol class="arabic simple" start="2">
 <li><p>Build TensorRT-LLM. This command generates <code class="docutils literal notranslate"><span class="pre">build\tensorrt_llm-*.whl</span></code>.</p></li>
 </ol>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>.<span class="se">\s</span>cripts<span class="se">\b</span>uild_wheel.py<span class="w"> </span>-a<span class="w"> </span><span class="s2">&quot;89-real&quot;</span><span class="w"> </span>--trt_root<span class="w"> </span>C:<span class="se">\w</span>orkspace<span class="se">\T</span>ensorRT-10.7.0.23<span class="se">\</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>.<span class="se">\s</span>cripts<span class="se">\b</span>uild_wheel.py<span class="w"> </span>-a<span class="w"> </span><span class="s2">&quot;89-real&quot;</span><span class="w"> </span>--trt_root<span class="w"> </span>C:<span class="se">\w</span>orkspace<span class="se">\T</span>ensorRT-10.8.0.43<span class="se">\</span>
 </pre></div>
 </div>
 <ol class="arabic simple" start="3">
@@ -251,7 +252,7 @@ git<span class="w"> </span>submodule<span class="w"> </span>update<span class="w
 <p><strong>Prerequisites</strong></p>
 <ol class="arabic">
 <li><p>Install all prerequisites (<code class="docutils literal notranslate"><span class="pre">git</span></code>, <code class="docutils literal notranslate"><span class="pre">python</span></code>, <code class="docutils literal notranslate"><span class="pre">CUDA</span></code>) listed in our <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/installation/windows.html">Installing on Windows</a> document.</p></li>
-<li><p>Install Nsight NVTX. TensorRT-LLM on Windows currently depends on NVTX assets that do not come packaged with the CUDA 12.6.3 installer. To install these assets, download the <a class="reference external" href="https://developer.nvidia.com/cuda-11-8-0-download-archive?target_os=Windows&amp;amp;target_arch=x86_64">CUDA 11.8 Toolkit</a>.</p>
+<li><p>Install Nsight NVTX. TensorRT-LLM on Windows currently depends on NVTX assets that do not come packaged with the CUDA 12.8.0 installer. To install these assets, download the <a class="reference external" href="https://developer.nvidia.com/cuda-11-8-0-download-archive?target_os=Windows&amp;amp;target_arch=x86_64">CUDA 11.8 Toolkit</a>.</p>
 <ol class="arabic simple">
 <li><p>During installation, select <strong>Advanced installation</strong>.</p></li>
 <li><p>Nsight NVTX is located in the CUDA drop-down.</p></li>
@@ -276,7 +277,7 @@ git<span class="w"> </span>submodule<span class="w"> </span>update<span class="w
 <ol class="arabic">
 <li><p>Install <a class="reference external" href="https://cmake.org/download/">CMake</a>, version 3.27.7 is recommended, and select the option to add it to the system path.</p></li>
 <li><p>Download and install <a class="reference external" href="https://visualstudio.microsoft.com/">Visual Studio 2022</a>. When prompted to select more Workloads, check <strong>Desktop development with C++</strong>.</p></li>
-<li><p>Download and unzip <a class="reference external" href="https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.7.0/zip/TensorRT-10.7.0.23.Windows.win10.cuda-12.6.zip">TensorRT 10.7.0.23</a>. Move the folder to a location you can reference later, such as <code class="docutils literal notranslate"><span class="pre">%USERPROFILE%\inference\TensorRT</span></code>.</p>
+<li><p>Download and unzip <a class="reference external" href="https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.8.0/zip/TensorRT-10.8.0.43.Windows.win10.cuda-12.8.zip">TensorRT 10.8.0.43</a>. Move the folder to a location you can reference later, such as <code class="docutils literal notranslate"><span class="pre">%USERPROFILE%\inference\TensorRT</span></code>.</p>
 <ol class="arabic simple">
 <li><p>Add the libraries for TensorRT  to your system’s <code class="docutils literal notranslate"><span class="pre">Path</span></code> environment variable. Your <code class="docutils literal notranslate"><span class="pre">Path</span></code> should include a line like this:</p></li>
 </ol>
@@ -392,7 +393,7 @@ pip<span class="w"> </span>uninstall<span class="w"> </span>-y<span class="w"> <
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fed14c5c790>
+<jinja2.runtime.BlockReference object at 0x7f658c934fe0>
 
 <div class="footer">
     <p>

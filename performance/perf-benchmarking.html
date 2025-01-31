@@ -22,7 +22,7 @@
     <script src="../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="Best Practices for Tuning the Performance of TensorRT-LLM" href="perf-best-practices.html" />
+    <link rel="next" title="Introduction" href="introduction.html" />
     <link rel="prev" title="Overview" href="perf-overview.html" /> 
 </head>
 
@@ -50,6 +50,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../torch.html">PyTorch Backend</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Installation</span></p>
@@ -119,39 +120,46 @@
 <ul class="current">
 <li class="toctree-l1"><a class="reference internal" href="perf-overview.html">Overview</a></li>
 <li class="toctree-l1 current"><a class="current reference internal" href="#">Benchmarking</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="#supported-networks-for-benchmarking">Supported Networks for Benchmarking</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#support-quantization-modes">Support Quantization Modes</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#inflight-benchmarking-with-a-dataset">Inflight Benchmarking with a Dataset</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#throughput-benchmarking">Throughput Benchmarking</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#limitations-and-caveats">Limitations and Caveats</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#validated-networks-for-benchmarking">Validated Networks for Benchmarking</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#supported-quantization-modes">Supported Quantization Modes</a></li>
+</ul>
+</li>
 <li class="toctree-l3"><a class="reference internal" href="#quickstart">Quickstart</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#workflow">Workflow</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#workflow">Workflow</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#preparing-a-dataset">Preparing a Dataset</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="#preparing-a-dataset">Preparing a Dataset</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="#using-prepare-dataset-py-to-create-synthetic-datasets">Using prepare_dataset.py to Create Synthetic Datasets</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#building-a-benchmark-engine">Building a Benchmark Engine</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#default-build-behavior">Default Build Behavior</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#other-build-modes">Other Build Modes</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#parallelism-mapping-support">Parallelism Mapping Support</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#example-of-build-subcommand-output">Example of Build Subcommand Output:</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="#building-a-benchmark-engine">Building a Benchmark Engine</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="#how-to-build-the-engine">How to Build the Engine</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#parallelism-mapping-support">Parallelism Mapping Support</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#example-of-build-subcommand-output">Example of Build Subcommand Output:</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#max-throughput-benchmark">Max Throughput Benchmark</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#how-the-benchmarker-works">How the Benchmarker Works</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="#max-throughput-benchmark">Max Throughput Benchmark</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="#how-the-benchmarker-works">How the Benchmarker Works</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#running-with-the-pytorch-workflow">Running with the PyTorch Workflow</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#quantization-in-the-pytorch-flow">Quantization in the PyTorch Flow</a></li>
+</ul>
+</li>
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="#low-latency-benchmark">Low Latency Benchmark</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="#low-latency-tensorrt-llm-engine-for-llama-3-70b">Low Latency TensorRT-LLM Engine for Llama-3 70B</a><ul>
 <li class="toctree-l4"><a class="reference internal" href="#benchmarking-a-non-medusa-low-latency-engine">Benchmarking a non-Medusa Low Latency Engine</a></li>
-<li class="toctree-l4"><a class="reference internal" href="#building-a-medusa-low-latency-engine">Building a Medusa Low-Latency Engine</a></li>
 </ul>
 </li>
+<li class="toctree-l3"><a class="reference internal" href="#building-a-medusa-low-latency-engine">Building a Medusa Low-Latency Engine</a></li>
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="#summary">Summary</a></li>
 </ul>
 </li>
-<li class="toctree-l1"><a class="reference internal" href="perf-best-practices.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="introduction.html">Best Practices</a></li>
 <li class="toctree-l1"><a class="reference internal" href="perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -201,9 +209,25 @@
 <p>This benchmarking suite is a work in progress.
 Expect breaking API changes.</p>
 </div>
-<p>TensorRT-LLM provides the <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> CLI, a packaged benchmarking utility.</p>
-<section id="supported-networks-for-benchmarking">
-<h2>Supported Networks for Benchmarking<a class="headerlink" href="#supported-networks-for-benchmarking" title="Link to this heading"></a></h2>
+<p>TensorRT-LLM provides the <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> CLI, a packaged benchmarking utility that aims to make it
+easier for users to reproduce our officially published <a class="reference internal" href="perf-overview.html#throughput-measurements"><span class="std std-ref">performance overiew</span></a>. <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> provides the follows:</p>
+<ul class="simple">
+<li><p>A streamlined way to build tuned engines for benchmarking for a variety of models and platforms.</p></li>
+<li><p>An entirely Python workflow for benchmarking.</p></li>
+<li><p>Ability to benchmark various flows and features within TensorRT-LLM.</p></li>
+</ul>
+<p><code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> executes all benchmarks using [in-flight batching] – for more information see
+the <a class="reference internal" href="../advanced/gpt-attention.html#in-flight-batching"><span class="std std-ref">this section</span></a> that describes the concept
+in further detail.</p>
+<section id="throughput-benchmarking">
+<h2>Throughput Benchmarking<a class="headerlink" href="#throughput-benchmarking" title="Link to this heading"></a></h2>
+<section id="limitations-and-caveats">
+<h3>Limitations and Caveats<a class="headerlink" href="#limitations-and-caveats" title="Link to this heading"></a></h3>
+<section id="validated-networks-for-benchmarking">
+<h4>Validated Networks for Benchmarking<a class="headerlink" href="#validated-networks-for-benchmarking" title="Link to this heading"></a></h4>
+<p>While <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> should be able to run any network that TensorRT-LLM supports, the following are the list
+that have been validated extensively and is the same listing as seen on the
+<a class="reference internal" href="perf-overview.html"><span class="std std-doc">Performance Overview</span></a> page.</p>
 <ul class="simple">
 <li><p><a class="reference external" href="https://huggingface.co/meta-llama/Llama-2-7b-hf">meta-llama/Llama-2-7b-hf</a></p></li>
 <li><p><a class="reference external" href="https://huggingface.co/meta-llama/Llama-2-70b-hf">meta-llama/Llama-2-70b-hf</a></p></li>
@@ -221,54 +245,52 @@ Expect breaking API changes.</p>
 <li><p><a class="reference external" href="https://huggingface.co/meta-llama/Llama-3.1-405B-Instruct">meta-llama/Llama-3.1-405B-Instruct</a></p></li>
 <li><p><a class="reference external" href="https://huggingface.co/mistralai/Mixtral-8x7B-v0.1-Instruct">mistralai/Mixtral-8x7B-v0.1-Instruct</a></p></li>
 </ul>
-<blockquote>
-<div><p>The <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> CLI tool can automatically download the model from Hugging Face Model Hub.
+<div class="admonition tip">
+<p class="admonition-title">Tip</p>
+<p><code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> can automatically download the model from Hugging Face Model Hub.
 Export your token in the <code class="docutils literal notranslate"><span class="pre">HF_TOKEN</span></code> environment variable.</p>
-</div></blockquote>
+</div>
 </section>
-<section id="support-quantization-modes">
-<h2>Support Quantization Modes<a class="headerlink" href="#support-quantization-modes" title="Link to this heading"></a></h2>
-<p>TensorRT-LLM supports a number of quantization modes:</p>
+<section id="supported-quantization-modes">
+<h4>Supported Quantization Modes<a class="headerlink" href="#supported-quantization-modes" title="Link to this heading"></a></h4>
+<p><code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> supports the following quantization modes:</p>
 <ul class="simple">
 <li><p>None (no quantization applied)</p></li>
-<li><p>W8A16</p></li>
-<li><p>W4A16</p></li>
-<li><p>W4A16_AWQ</p></li>
-<li><p>W4A8_AWQ</p></li>
-<li><p>W4A16_GPTQ</p></li>
-<li><p>FP8</p></li>
-<li><p>INT8</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">FP8</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">NVFP4</span></code></p></li>
 </ul>
 <p>For more information about quantization, refer to <a class="reference internal" href="../reference/precision.html"><span class="std std-doc">Numerical Precision</span></a> and
 the <a class="reference internal" href="../reference/precision.html#support-matrix"><span class="std std-ref">support matrix</span></a> of the supported quantization methods for each network.</p>
+<div class="admonition tip">
+<p class="admonition-title">Tip</p>
+<p>Although TensorRT-LLM supports more quantization modes than listed above, <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> currently only configures for
+a smaller subset.</p>
+</div>
 </section>
-<section id="inflight-benchmarking-with-a-dataset">
-<h2>Inflight Benchmarking with a Dataset<a class="headerlink" href="#inflight-benchmarking-with-a-dataset" title="Link to this heading"></a></h2>
-<p>This section covers how to benchmark TensorRT-LLM using inflight batching.</p>
+</section>
 <section id="quickstart">
 <h3>Quickstart<a class="headerlink" href="#quickstart" title="Link to this heading"></a></h3>
 <p>This quick start focuses on running a short max throughput benchmark on
-<code class="docutils literal notranslate"><span class="pre">meta-llama/Llama-2-7b-hf</span></code> on a synthetic dataset with a uniform distribution of prompts with ISL:OSL
+<code class="docutils literal notranslate"><span class="pre">meta-llama/Llama-3.1-8B</span></code> on a synthetic dataset with a uniform distribution of prompts with ISL:OSL
 of 128:128.
 To run the benchmark from start to finish, run the following commands:</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>benchmarks/cpp/prepare_dataset.py<span class="w"> </span>--stdout<span class="w"> </span>--tokenizer<span class="w"> </span>meta-llama/Llama-2-7b-hf<span class="w"> </span>token-norm-dist<span class="w"> </span>--input-mean<span class="w"> </span><span class="m">128</span><span class="w"> </span>--output-mean<span class="w"> </span><span class="m">128</span><span class="w"> </span>--input-stdev<span class="w"> </span><span class="m">0</span><span class="w"> </span>--output-stdev<span class="w"> </span><span class="m">0</span><span class="w"> </span>--num-requests<span class="w"> </span><span class="m">3000</span><span class="w"> </span>&gt;<span class="w"> </span>/tmp/synthetic_128_128.txt
-trtllm-bench<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-2-7b-hf<span class="w"> </span>build<span class="w"> </span>--dataset<span class="w"> </span>/tmp/synthetic_128_128.txt<span class="w"> </span>--quantization<span class="w"> </span>FP8
-trtllm-bench<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-2-7b-hf<span class="w"> </span>throughput<span class="w"> </span>--dataset<span class="w"> </span>/tmp/synthetic_128_128.txt<span class="w"> </span>--engine_dir<span class="w"> </span>/tmp/meta-llama/Llama-2-7b-hf/tp_1_pp_1
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>benchmarks/cpp/prepare_dataset.py<span class="w"> </span>--stdout<span class="w"> </span>--tokenizer<span class="w"> </span>meta-llama/Llama-3.1-8B<span class="w"> </span>token-norm-dist<span class="w"> </span>--input-mean<span class="w"> </span><span class="m">128</span><span class="w"> </span>--output-mean<span class="w"> </span><span class="m">128</span><span class="w"> </span>--input-stdev<span class="w"> </span><span class="m">0</span><span class="w"> </span>--output-stdev<span class="w"> </span><span class="m">0</span><span class="w"> </span>--num-requests<span class="w"> </span><span class="m">3000</span><span class="w"> </span>&gt;<span class="w"> </span>/tmp/synthetic_128_128.txt
+trtllm-bench<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-3.1-8B<span class="w"> </span>build<span class="w"> </span>--dataset<span class="w"> </span>/tmp/synthetic_128_128.txt<span class="w"> </span>--quantization<span class="w"> </span>FP8
+trtllm-bench<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-3.1-8B<span class="w"> </span>throughput<span class="w"> </span>--dataset<span class="w"> </span>/tmp/synthetic_128_128.txt<span class="w"> </span>--engine_dir<span class="w"> </span>/tmp/meta-llama/Llama-3.1-8B/tp_1_pp_1
 </pre></div>
 </div>
-<p>And that’s it!
-After the benchmark completes, <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> prints a summary with summary metrics.</p>
+<p>After the benchmark completes, <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> prints a summary with summary metrics.</p>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="o">===========================================================</span>
 <span class="o">=</span><span class="w"> </span>ENGINE<span class="w"> </span><span class="nv">DETAILS</span>
 <span class="o">===========================================================</span>
-Model:<span class="w">                  </span>meta-llama/Llama-2-7b-hf
-Engine<span class="w"> </span>Directory:<span class="w">       </span>/tmp/meta-llama/Llama-2-7b-hf/tp_1_pp_1
-TensorRT-LLM<span class="w"> </span>Version:<span class="w">   </span><span class="m">0</span>.12.0
-Dtype:<span class="w">                  </span>float16
+Model:<span class="w">                  </span>meta-llama/Llama-3.1-8B
+Engine<span class="w"> </span>Directory:<span class="w">       </span>/tmp/meta-llama/Llama-3.1-8B/tp_1_pp_1
+TensorRT-LLM<span class="w"> </span>Version:<span class="w">   </span><span class="m">0</span>.17.0
+Dtype:<span class="w">                  </span>bfloat16
 KV<span class="w"> </span>Cache<span class="w"> </span>Dtype:<span class="w">         </span>FP8
 Quantization:<span class="w">           </span>FP8
-Max<span class="w"> </span>Input<span class="w"> </span>Length:<span class="w">       </span><span class="m">2048</span>
-Max<span class="w"> </span>Sequence<span class="w"> </span>Length:<span class="w">    </span><span class="nv">4098</span>
+Max<span class="w"> </span>Input<span class="w"> </span>Length:<span class="w">       </span><span class="m">256</span>
+Max<span class="w"> </span>Sequence<span class="w"> </span>Length:<span class="w">    </span><span class="nv">256</span>
 
 <span class="o">===========================================================</span>
 <span class="o">=</span><span class="w"> </span>WORLD<span class="w"> </span>+<span class="w"> </span>RUNTIME<span class="w"> </span><span class="nv">INFORMATION</span>
@@ -278,17 +300,19 @@ PP<span class="w"> </span>Size:<span class="w">                </span><span clas
 Max<span class="w"> </span>Runtime<span class="w"> </span>Batch<span class="w"> </span>Size:<span class="w"> </span><span class="m">4096</span>
 Max<span class="w"> </span>Runtime<span class="w"> </span>Tokens:<span class="w">     </span><span class="m">8192</span>
 Scheduling<span class="w"> </span>Policy:<span class="w">      </span>Guaranteed<span class="w"> </span>No<span class="w"> </span>Evict
-KV<span class="w"> </span>Memory<span class="w"> </span>Percentage:<span class="w">   </span><span class="m">99</span>.0%
-Issue<span class="w"> </span>Rate<span class="w"> </span><span class="o">(</span>req/sec<span class="o">)</span>:<span class="w">   </span><span class="m">3</span>.680275266452667e+18
+KV<span class="w"> </span>Memory<span class="w"> </span>Percentage:<span class="w">   </span><span class="m">90</span>.00%
+Issue<span class="w"> </span>Rate<span class="w"> </span><span class="o">(</span>req/sec<span class="o">)</span>:<span class="w">   </span><span class="m">5</span>.0689E+14
+
 <span class="o">===========================================================</span>
-<span class="o">=</span><span class="w"> </span><span class="nv">STATISTICS</span>
+<span class="o">=</span><span class="w"> </span>PERFORMANCE<span class="w"> </span><span class="nv">OVERVIEW</span>
 <span class="o">===========================================================</span>
 Number<span class="w"> </span>of<span class="w"> </span>requests:<span class="w">             </span><span class="m">3000</span>
-Average<span class="w"> </span>Input<span class="w"> </span>Length<span class="w"> </span><span class="o">(</span>tokens<span class="o">)</span>:<span class="w">  </span><span class="m">128</span>.0
-Average<span class="w"> </span>Output<span class="w"> </span>Length<span class="w"> </span><span class="o">(</span>tokens<span class="o">)</span>:<span class="w"> </span><span class="m">128</span>.0
-Token<span class="w"> </span>Throughput<span class="w"> </span><span class="o">(</span>tokens/sec<span class="o">)</span>:<span class="w">  </span><span class="m">23405</span>.927228471104
-Request<span class="w"> </span>Throughput<span class="w"> </span><span class="o">(</span>req/sec<span class="o">)</span>:<span class="w">   </span><span class="m">182</span>.8588064724305
-Total<span class="w"> </span>Latency<span class="w"> </span><span class="o">(</span>seconds<span class="o">)</span>:<span class="w">        </span><span class="m">16</span>.406100739
+Average<span class="w"> </span>Input<span class="w"> </span>Length<span class="w"> </span><span class="o">(</span>tokens<span class="o">)</span>:<span class="w">  </span><span class="m">128</span>.0000
+Average<span class="w"> </span>Output<span class="w"> </span>Length<span class="w"> </span><span class="o">(</span>tokens<span class="o">)</span>:<span class="w"> </span><span class="m">128</span>.0000
+Token<span class="w"> </span>Throughput<span class="w"> </span><span class="o">(</span>tokens/sec<span class="o">)</span>:<span class="w">  </span><span class="m">28390</span>.4265
+Request<span class="w"> </span>Throughput<span class="w"> </span><span class="o">(</span>req/sec<span class="o">)</span>:<span class="w">   </span><span class="m">221</span>.8002
+Total<span class="w"> </span>Latency<span class="w"> </span><span class="o">(</span>ms<span class="o">)</span>:<span class="w">             </span><span class="m">13525</span>.6862
+
 <span class="o">===========================================================</span>
 </pre></div>
 </div>
@@ -298,15 +322,12 @@ Total<span class="w"> </span>Latency<span class="w"> </span><span class="o">(</s
 <p>The workflow for <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> is composed of the following steps:</p>
 <ol class="arabic simple">
 <li><p>Prepare a dataset to drive the inflight batching benchmark.</p></li>
-<li><p>Build a benchmark engine using <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">build</span></code> subcommand.</p></li>
+<li><p>Build a benchmark engine using <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">build</span></code> subcommand (not required for <a class="reference internal" href="#running-with-the-pytorch-workflow">PyTorch flow</a>).</p></li>
 <li><p>Run the max throughput benchmark using the <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">throughput</span></code> subcommand or low latency benchmark using the <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">latency</span></code> subcommand.</p></li>
 </ol>
-</section>
-</section>
 <section id="preparing-a-dataset">
-<h2>Preparing a Dataset<a class="headerlink" href="#preparing-a-dataset" title="Link to this heading"></a></h2>
-<p>The inflight benchmark utilizes a fixed JSON schema so that it is simple and
-straightforward to specify requests. The schema is defined as follows:</p>
+<h4>Preparing a Dataset<a class="headerlink" href="#preparing-a-dataset" title="Link to this heading"></a></h4>
+<p>The throughput benchmark utilizes a fixed JSON schema to specify requests. The schema is defined as follows:</p>
 <table class="docutils align-default">
 <thead>
 <tr class="row-odd"><th class="head text-left"><p>Key</p></th>
@@ -326,8 +347,8 @@ straightforward to specify requests. The schema is defined as follows:</p>
 <td class="text-center"><p>String</p></td>
 <td class="text-left"><p>Input text for a generation request.</p></td>
 </tr>
-<tr class="row-even"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">logits</span></code></p></td>
-<td class="text-center"><p>N*</p></td>
+<tr class="row-even"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">input_ids</span></code></p></td>
+<td class="text-center"><p>Y*</p></td>
 <td class="text-center"><p>List[Integer]</p></td>
 <td class="text-left"><p>List of logits that make up the request prompt.</p></td>
 </tr>
@@ -338,9 +359,12 @@ straightforward to specify requests. The schema is defined as follows:</p>
 </tr>
 </tbody>
 </table>
-<p>Prompt and logits are mutually exclusive, but one of <code class="docutils literal notranslate"><span class="pre">prompt</span></code> or <code class="docutils literal notranslate"><span class="pre">logits</span></code> is required.
-If you specify <code class="docutils literal notranslate"><span class="pre">logits</span></code>, the <code class="docutils literal notranslate"><span class="pre">prompt</span></code> entry is ignored for request generation.</p>
-<p>Refer to the following examples of valid entries for the inflight benchmark:</p>
+<div class="admonition tip">
+<p class="admonition-title">Tip</p>
+<p>* Specifying <code class="docutils literal notranslate"><span class="pre">prompt</span></code> or <code class="docutils literal notranslate"><span class="pre">input_ids</span></code> is required. However, you can not have both prompts and logits (<code class="docutils literal notranslate"><span class="pre">input_ids</span></code>)
+defined at the same time. If you specify <code class="docutils literal notranslate"><span class="pre">input_ids</span></code>, the <code class="docutils literal notranslate"><span class="pre">prompt</span></code> entry is ignored for request generation.</p>
+</div>
+<p>Refer to the following examples of valid entries for the benchmark:</p>
 <ul>
 <li><p>Entries with a human-readable prompt and no logits.</p>
 <div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span><span class="nt">&quot;task_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;prompt&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Generate an infinite response to the following: This is the song that never ends, it goes on and on my friend.&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;output_tokens&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1000</span><span class="p">}</span>
@@ -349,8 +373,8 @@ If you specify <code class="docutils literal notranslate"><span class="pre">logi
 </div>
 </li>
 <li><p>Entries which contain logits.</p>
-<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span><span class="nt">&quot;task_id&quot;</span><span class="p">:</span><span class="mi">0</span><span class="p">,</span><span class="nt">&quot;logits&quot;</span><span class="p">:[</span><span class="mi">863</span><span class="p">,</span><span class="mi">22056</span><span class="p">,</span><span class="mi">25603</span><span class="p">,</span><span class="mi">11943</span><span class="p">,</span><span class="mi">8932</span><span class="p">,</span><span class="mi">13195</span><span class="p">,</span><span class="mi">3132</span><span class="p">,</span><span class="mi">25032</span><span class="p">,</span><span class="mi">21747</span><span class="p">,</span><span class="mi">22213</span><span class="p">],</span><span class="nt">&quot;output_tokens&quot;</span><span class="p">:</span><span class="mi">128</span><span class="p">}</span>
-<span class="p">{</span><span class="nt">&quot;task_id&quot;</span><span class="p">:</span><span class="mi">1</span><span class="p">,</span><span class="nt">&quot;logits&quot;</span><span class="p">:[</span><span class="mi">14480</span><span class="p">,</span><span class="mi">13598</span><span class="p">,</span><span class="mi">15585</span><span class="p">,</span><span class="mi">6591</span><span class="p">,</span><span class="mi">1252</span><span class="p">,</span><span class="mi">8259</span><span class="p">,</span><span class="mi">30990</span><span class="p">,</span><span class="mi">26778</span><span class="p">,</span><span class="mi">7063</span><span class="p">,</span><span class="mi">30065</span><span class="p">,</span><span class="mi">21764</span><span class="p">,</span><span class="mi">11023</span><span class="p">,</span><span class="mi">1418</span><span class="p">],</span><span class="nt">&quot;output_tokens&quot;</span><span class="p">:</span><span class="mi">128</span><span class="p">}</span>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span><span class="nt">&quot;task_id&quot;</span><span class="p">:</span><span class="mi">0</span><span class="p">,</span><span class="nt">&quot;input_ids&quot;</span><span class="p">:[</span><span class="mi">863</span><span class="p">,</span><span class="mi">22056</span><span class="p">,</span><span class="mi">25603</span><span class="p">,</span><span class="mi">11943</span><span class="p">,</span><span class="mi">8932</span><span class="p">,</span><span class="mi">13195</span><span class="p">,</span><span class="mi">3132</span><span class="p">,</span><span class="mi">25032</span><span class="p">,</span><span class="mi">21747</span><span class="p">,</span><span class="mi">22213</span><span class="p">],</span><span class="nt">&quot;output_tokens&quot;</span><span class="p">:</span><span class="mi">128</span><span class="p">}</span>
+<span class="p">{</span><span class="nt">&quot;task_id&quot;</span><span class="p">:</span><span class="mi">1</span><span class="p">,</span><span class="nt">&quot;input_ids&quot;</span><span class="p">:[</span><span class="mi">14480</span><span class="p">,</span><span class="mi">13598</span><span class="p">,</span><span class="mi">15585</span><span class="p">,</span><span class="mi">6591</span><span class="p">,</span><span class="mi">1252</span><span class="p">,</span><span class="mi">8259</span><span class="p">,</span><span class="mi">30990</span><span class="p">,</span><span class="mi">26778</span><span class="p">,</span><span class="mi">7063</span><span class="p">,</span><span class="mi">30065</span><span class="p">,</span><span class="mi">21764</span><span class="p">,</span><span class="mi">11023</span><span class="p">,</span><span class="mi">1418</span><span class="p">],</span><span class="nt">&quot;output_tokens&quot;</span><span class="p">:</span><span class="mi">128</span><span class="p">}</span>
 </pre></div>
 </div>
 </li>
@@ -362,29 +386,28 @@ To simplify passing the data, a complete JSON entry is on each line so that the 
 can simply read a line and assume a complete entry. When creating a dataset, be sure that a complete
 JSON entry is on every line.</p>
 </div>
-<section id="using-prepare-dataset-py-to-create-synthetic-datasets">
-<h3>Using prepare_dataset.py to Create Synthetic Datasets<a class="headerlink" href="#using-prepare-dataset-py-to-create-synthetic-datasets" title="Link to this heading"></a></h3>
 <p>In order to prepare a synthetic dataset, you can use the provided script in the <code class="docutils literal notranslate"><span class="pre">benchmarks/cpp</span></code>
 directory. For example, to generate a synthetic dataset of 1000 requests with a uniform ISL/OSL of
-128/128 for <a class="reference external" href="https://huggingface.co/meta-llama/Llama-2-7b">Llama-2-7b</a>, simply run:</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>benchmarks/cpp/prepare_dataset.py<span class="w"> </span>--stdout<span class="w"> </span>--tokenizer<span class="w"> </span>meta-llama/Llama-2-7b-hf<span class="w"> </span>token-norm-dist<span class="w"> </span>--input-mean<span class="w"> </span><span class="m">128</span><span class="w"> </span>--output-mean<span class="w"> </span><span class="m">128</span><span class="w"> </span>--input-stdev<span class="w"> </span><span class="m">0</span><span class="w"> </span>--output-stdev<span class="w"> </span><span class="m">0</span><span class="w"> </span>--num-requests<span class="w"> </span><span class="m">1000</span><span class="w"> </span>&gt;<span class="w"> </span>/tmp/synthetic_128_128.txt
+128/128 for <a class="reference external" href="https://huggingface.co/meta-llama/Llama-3.1-8B">meta-llama/Llama-3.1-8B</a>, run:</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>benchmarks/cpp/prepare_dataset.py<span class="w"> </span>--stdout<span class="w"> </span>--tokenizer<span class="w"> </span>meta-llama/Llama-3.1-8B<span class="w"> </span>token-norm-dist<span class="w"> </span>--input-mean<span class="w"> </span><span class="m">128</span><span class="w"> </span>--output-mean<span class="w"> </span><span class="m">128</span><span class="w"> </span>--input-stdev<span class="w"> </span><span class="m">0</span><span class="w"> </span>--output-stdev<span class="w"> </span><span class="m">0</span><span class="w"> </span>--num-requests<span class="w"> </span><span class="m">1000</span><span class="w"> </span>&gt;<span class="w"> </span>/tmp/synthetic_128_128.txt
 </pre></div>
 </div>
-<p>You can pipe the above command to a file to reuse the same dataset, or simply pipe its output to the
-benchmark script (example below).</p>
 </section>
 </section>
 <section id="building-a-benchmark-engine">
-<h2>Building a Benchmark Engine<a class="headerlink" href="#building-a-benchmark-engine" title="Link to this heading"></a></h2>
-<p>The <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> CLI tool provides the <code class="docutils literal notranslate"><span class="pre">build</span></code> subcommand to build the TRT-LLM engines for max throughput benchmark.</p>
-<section id="how-to-build-the-engine">
-<h3>How to Build the Engine<a class="headerlink" href="#how-to-build-the-engine" title="Link to this heading"></a></h3>
-<p>To build an engine for benchmarking, you can specify the dataset generated with <code class="docutils literal notranslate"><span class="pre">prepare_dataset.py</span></code> through <code class="docutils literal notranslate"><span class="pre">--dataset</span></code> option.
-The <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code>’s tuning heuristic uses the high-level statistics of the dataset (average ISL/OSL, max sequence length) to optimize engine build settings.
-The following command builds an FP8 quantized engine optimized using the dataset’s ISL/OSL.</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-2-7b-hf<span class="w"> </span>build<span class="w"> </span>--quantization<span class="w"> </span>FP8<span class="w"> </span>--dataset<span class="w"> </span>/tmp/synthetic_128_128.txt
+<h3>Building a Benchmark Engine<a class="headerlink" href="#building-a-benchmark-engine" title="Link to this heading"></a></h3>
+<section id="default-build-behavior">
+<h4>Default Build Behavior<a class="headerlink" href="#default-build-behavior" title="Link to this heading"></a></h4>
+<p>The <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> CLI tool provides the <code class="docutils literal notranslate"><span class="pre">build</span></code> subcommand to build the TRT-LLM engines for max throughput benchmark.
+To build an engine for benchmarking, you can specify the dataset generated with <code class="docutils literal notranslate"><span class="pre">prepare_dataset.py</span></code> through <code class="docutils literal notranslate"><span class="pre">--dataset</span></code> option.
+By default, <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code>’s tuning heuristic uses the high-level statistics of the dataset (average ISL/OSL, max sequence length)
+to optimize engine build settings. The following command builds an FP8 quantized engine optimized using the dataset’s ISL/OSL.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-3.1-8B<span class="w"> </span>build<span class="w"> </span>--quantization<span class="w"> </span>FP8<span class="w"> </span>--dataset<span class="w"> </span>/tmp/synthetic_128_128.txt
 </pre></div>
 </div>
+</section>
+<section id="other-build-modes">
+<h4>Other Build Modes<a class="headerlink" href="#other-build-modes" title="Link to this heading"></a></h4>
 <p>The build subcommand also provides other ways to build the engine where users have larger control over the tuning values.</p>
 <ul class="simple">
 <li><p>Build engine with self-defined tuning values:
@@ -393,7 +416,7 @@ You specify the tuning values to build the engine with by setting <code class="d
 If no value is specified, the default <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> and <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code> values of <code class="docutils literal notranslate"><span class="pre">2048</span></code> and <code class="docutils literal notranslate"><span class="pre">8192</span></code> are used.
 The following command builds an FP8 quantized engine by specifying the engine tuning values.</p></li>
 </ul>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-2-7b-hf<span class="w"> </span>build<span class="w"> </span>--quantization<span class="w"> </span>FP8<span class="w"> </span>--max_seq_len<span class="w"> </span><span class="m">4096</span><span class="w"> </span>--max_batch_size<span class="w"> </span><span class="m">1024</span><span class="w"> </span>--max_num_tokens<span class="w"> </span><span class="m">2048</span>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-3.1-8B<span class="w"> </span>build<span class="w"> </span>--quantization<span class="w"> </span>FP8<span class="w"> </span>--max_seq_len<span class="w"> </span><span class="m">4096</span><span class="w"> </span>--max_batch_size<span class="w"> </span><span class="m">1024</span><span class="w"> </span>--max_num_tokens<span class="w"> </span><span class="m">2048</span>
 </pre></div>
 </div>
 <ul class="simple">
@@ -402,44 +425,54 @@ In this experimental mode, you can provide hints to <code class="docutils litera
 Generally, the target ISL and OSL aligns with the average ISL and OSL of the dataset, but you can experiment with different values to optimize the engine using this mode.
 The following command builds an FP8 quantized engine and optmizes for ISL:OSL targets of 128:128.</p></li>
 </ul>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-2-7b-hf<span class="w"> </span>build<span class="w"> </span>--quantization<span class="w"> </span>FP8<span class="w"> </span>--max_seq_len<span class="w"> </span><span class="m">4096</span><span class="w"> </span>--target_isl<span class="w"> </span><span class="m">128</span><span class="w"> </span>--target_osl<span class="w"> </span><span class="m">128</span>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-3.1-8B<span class="w"> </span>build<span class="w"> </span>--quantization<span class="w"> </span>FP8<span class="w"> </span>--max_seq_len<span class="w"> </span><span class="m">4096</span><span class="w"> </span>--target_isl<span class="w"> </span><span class="m">128</span><span class="w"> </span>--target_osl<span class="w"> </span><span class="m">128</span>
 </pre></div>
 </div>
 </section>
 <section id="parallelism-mapping-support">
-<h3>Parallelism Mapping Support<a class="headerlink" href="#parallelism-mapping-support" title="Link to this heading"></a></h3>
+<h4>Parallelism Mapping Support<a class="headerlink" href="#parallelism-mapping-support" title="Link to this heading"></a></h4>
 <p>The <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">build</span></code> subcommand supports combinations of tensor-parallel (TP) and pipeline-parallel (PP) mappings as long as the world size (<code class="docutils literal notranslate"><span class="pre">tp_size</span> <span class="pre">x</span> <span class="pre">pp_size</span></code>) <code class="docutils literal notranslate"><span class="pre">&lt;=</span></code> <code class="docutils literal notranslate"><span class="pre">8</span></code>. The parallelism mapping in build subcommad is controlled by <code class="docutils literal notranslate"><span class="pre">--tp_size</span></code> and <code class="docutils literal notranslate"><span class="pre">--pp_size</span></code> options. The following command builds an engine with TP2-PP2 mapping.</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-2-7b-hf<span class="w"> </span>build<span class="w"> </span>--quantization<span class="w"> </span>FP8<span class="w"> </span>--dataset<span class="w"> </span>/tmp/synthetic_128_128.txt<span class="w"> </span>--tp_size<span class="w"> </span><span class="m">2</span><span class="w"> </span>--pp_size<span class="w"> </span><span class="m">2</span>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-3.1-8B<span class="w"> </span>build<span class="w"> </span>--quantization<span class="w"> </span>FP8<span class="w"> </span>--dataset<span class="w"> </span>/tmp/synthetic_128_128.txt<span class="w"> </span>--tp_size<span class="w"> </span><span class="m">2</span><span class="w"> </span>--pp_size<span class="w"> </span><span class="m">2</span>
 </pre></div>
 </div>
 </section>
 <section id="example-of-build-subcommand-output">
-<h3>Example of Build Subcommand Output:<a class="headerlink" href="#example-of-build-subcommand-output" title="Link to this heading"></a></h3>
-<p>The output of the <code class="docutils literal notranslate"><span class="pre">build</span></code> subcommand looks similar to the snippet below (for <code class="docutils literal notranslate"><span class="pre">meta-llama/Llama-2-7b-hf</span></code>):</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-2-7b-hf<span class="w"> </span>build<span class="w"> </span>--dataset<span class="w"> </span>/tmp/synthetic_128_128.txt<span class="w"> </span>--quantization<span class="w"> </span>FP8
-<span class="o">[</span>TensorRT-LLM<span class="o">]</span><span class="w"> </span>TensorRT-LLM<span class="w"> </span>version:<span class="w"> </span><span class="m">0</span>.12.0
-<span class="o">[</span><span class="m">08</span>/12/2024-19:13:06<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Found<span class="w"> </span>dataset.
-<span class="o">[</span><span class="m">08</span>/12/2024-19:13:07<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span>
+<h4>Example of Build Subcommand Output:<a class="headerlink" href="#example-of-build-subcommand-output" title="Link to this heading"></a></h4>
+<p>The output of the <code class="docutils literal notranslate"><span class="pre">build</span></code> subcommand looks similar to the snippet below (for <code class="docutils literal notranslate"><span class="pre">meta-llama/Llama-3.1-8B</span></code>):</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>user@387b12598a9e:/scratch/code/trt-llm/tekit_2025$<span class="w"> </span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-3.1-8B<span class="w"> </span>build<span class="w"> </span>--dataset<span class="w"> </span>/tmp/synthetic_128_128.txt<span class="w"> </span>--quantization<span class="w"> </span>FP8
+<span class="o">[</span>TensorRT-LLM<span class="o">]</span><span class="w"> </span>TensorRT-LLM<span class="w"> </span>version:<span class="w"> </span><span class="m">0</span>.17.0
+<span class="o">[</span><span class="m">01</span>/18/2025-00:55:14<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Found<span class="w"> </span>dataset.
+<span class="o">[</span><span class="m">01</span>/18/2025-00:55:14<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span>
 <span class="o">===========================================================</span>
 <span class="o">=</span><span class="w"> </span>DATASET<span class="w"> </span><span class="nv">DETAILS</span>
 <span class="o">===========================================================</span>
 Max<span class="w"> </span>Input<span class="w"> </span>Sequence<span class="w"> </span>Length:<span class="w">      </span><span class="m">128</span>
 Max<span class="w"> </span>Output<span class="w"> </span>Sequence<span class="w"> </span>Length:<span class="w">     </span><span class="m">128</span>
 Max<span class="w"> </span>Sequence<span class="w"> </span>Length:<span class="w">    </span><span class="m">256</span>
+Target<span class="w"> </span><span class="o">(</span>Average<span class="o">)</span><span class="w"> </span>Input<span class="w"> </span>Sequence<span class="w"> </span>Length:<span class="w"> </span><span class="m">128</span>
+Target<span class="w"> </span><span class="o">(</span>Average<span class="o">)</span><span class="w"> </span>Output<span class="w"> </span>Sequence<span class="w"> </span>Length:<span class="w">        </span><span class="m">128</span>
 Number<span class="w"> </span>of<span class="w"> </span>Sequences:<span class="w">    </span><span class="nv">3000</span>
 <span class="o">===========================================================</span>
 
 
-<span class="o">[</span><span class="m">08</span>/12/2024-19:13:07<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Set<span class="w"> </span>multiple_profiles<span class="w"> </span>to<span class="w"> </span>True.
-<span class="o">[</span><span class="m">08</span>/12/2024-19:13:07<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Set<span class="w"> </span>use_paged_context_fmha<span class="w"> </span>to<span class="w"> </span>True.
-<span class="o">[</span><span class="m">08</span>/12/2024-19:13:07<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Set<span class="w"> </span>use_fp8_context_fmha<span class="w"> </span>to<span class="w"> </span>True.
-<span class="o">[</span><span class="m">08</span>/12/2024-19:13:07<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span>
+<span class="o">[</span><span class="m">01</span>/18/2025-00:55:14<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Max<span class="w"> </span>batch<span class="w"> </span>size<span class="w"> </span>and<span class="w"> </span>max<span class="w"> </span>num<span class="w"> </span>tokens<span class="w"> </span>are<span class="w"> </span>not<span class="w"> </span>provided,<span class="w"> </span>use<span class="w"> </span>tuning<span class="w"> </span>heuristics<span class="w"> </span>or<span class="w"> </span>pre-defined<span class="w"> </span>setting<span class="w"> </span>from<span class="w"> </span>trtllm-bench.
+<span class="o">[</span><span class="m">01</span>/18/2025-00:55:14<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Estimated<span class="w"> </span>total<span class="w"> </span>available<span class="w"> </span>memory<span class="w"> </span><span class="k">for</span><span class="w"> </span>KV<span class="w"> </span>cache:<span class="w"> </span><span class="m">132</span>.37<span class="w"> </span>GB
+<span class="o">[</span><span class="m">01</span>/18/2025-00:55:14<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Estimated<span class="w"> </span>total<span class="w"> </span>KV<span class="w"> </span>cache<span class="w"> </span>memory:<span class="w"> </span><span class="m">125</span>.75<span class="w"> </span>GB
+<span class="o">[</span><span class="m">01</span>/18/2025-00:55:14<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Estimated<span class="w"> </span>max<span class="w"> </span>number<span class="w"> </span>of<span class="w"> </span>requests<span class="w"> </span><span class="k">in</span><span class="w"> </span>KV<span class="w"> </span>cache<span class="w"> </span>memory:<span class="w"> </span><span class="m">8048</span>.16
+<span class="o">[</span><span class="m">01</span>/18/2025-00:55:14<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Estimated<span class="w"> </span>max<span class="w"> </span>batch<span class="w"> </span>size<span class="w"> </span><span class="o">(</span>after<span class="w"> </span>fine-tune<span class="o">)</span>:<span class="w"> </span><span class="m">4096</span>
+<span class="o">[</span><span class="m">01</span>/18/2025-00:55:14<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Estimated<span class="w"> </span>max<span class="w"> </span>num<span class="w"> </span>tokens<span class="w"> </span><span class="o">(</span>after<span class="w"> </span>fine-tune<span class="o">)</span>:<span class="w"> </span><span class="m">8192</span>
+<span class="o">[</span><span class="m">01</span>/18/2025-00:55:14<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Set<span class="w"> </span>dtype<span class="w"> </span>to<span class="w"> </span>bfloat16.
+<span class="o">[</span><span class="m">01</span>/18/2025-00:55:14<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Set<span class="w"> </span>multiple_profiles<span class="w"> </span>to<span class="w"> </span>True.
+<span class="o">[</span><span class="m">01</span>/18/2025-00:55:14<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Set<span class="w"> </span>use_paged_context_fmha<span class="w"> </span>to<span class="w"> </span>True.
+<span class="o">[</span><span class="m">01</span>/18/2025-00:55:14<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Set<span class="w"> </span>use_fp8_context_fmha<span class="w"> </span>to<span class="w"> </span>True.
+<span class="o">[</span><span class="m">01</span>/18/2025-00:55:14<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span>
 <span class="o">===========================================================</span>
 <span class="o">=</span><span class="w"> </span>ENGINE<span class="w"> </span>BUILD<span class="w"> </span><span class="nv">INFO</span>
 <span class="o">===========================================================</span>
-Model<span class="w"> </span>Name:<span class="w">             </span>meta-llama/Llama-2-7b-hf
+Model<span class="w"> </span>Name:<span class="w">             </span>meta-llama/Llama-3.1-8B
+Model<span class="w"> </span>Path:<span class="w">             </span>None
 Workspace<span class="w"> </span>Directory:<span class="w">    </span>/tmp
-Engine<span class="w"> </span>Directory:<span class="w">       </span>/tmp/meta-llama/Llama-2-7b-hf/tp_1_pp_1
+Engine<span class="w"> </span>Directory:<span class="w">       </span>/tmp/meta-llama/Llama-3.1-8B/tp_1_pp_1
 
 <span class="o">===========================================================</span>
 <span class="o">=</span><span class="w"> </span>ENGINE<span class="w"> </span>CONFIGURATION<span class="w"> </span><span class="nv">DETAILS</span>
@@ -447,40 +480,48 @@ Engine<span class="w"> </span>Directory:<span class="w">       </span>/tmp/meta-
 Max<span class="w"> </span>Sequence<span class="w"> </span>Length:<span class="w">            </span><span class="m">256</span>
 Max<span class="w"> </span>Batch<span class="w"> </span>Size:<span class="w">                 </span><span class="m">4096</span>
 Max<span class="w"> </span>Num<span class="w"> </span>Tokens:<span class="w">                 </span><span class="m">8192</span>
-Quantization:<span class="w">                   </span><span class="nv">FP8</span>
+Quantization:<span class="w">                   </span>FP8
+KV<span class="w"> </span>Cache<span class="w"> </span>Dtype:<span class="w">                 </span><span class="nv">FP8</span>
 <span class="o">===========================================================</span>
 
 Loading<span class="w"> </span>Model:<span class="w"> </span><span class="o">[</span><span class="m">1</span>/3<span class="o">]</span><span class="w">    </span>Downloading<span class="w"> </span>HF<span class="w"> </span>model
-Downloaded<span class="w"> </span>model<span class="w"> </span>to<span class="w"> </span>/data/models--meta-llama--Llama-2-7b-hf/snapshots/01c7f73d771dfac7d292323805ebc428287df4f9
-Time:<span class="w"> </span><span class="m">0</span>.115s
+Downloaded<span class="w"> </span>model<span class="w"> </span>to<span class="w"> </span>/data/models--meta-llama--Llama-3.1-8B/snapshots/d04e592bb4f6aa9cfee91e2e20afa771667e1d4b
+Time:<span class="w"> </span><span class="m">0</span>.321s
 Loading<span class="w"> </span>Model:<span class="w"> </span><span class="o">[</span><span class="m">2</span>/3<span class="o">]</span><span class="w">    </span>Loading<span class="w"> </span>HF<span class="w"> </span>model<span class="w"> </span>to<span class="w"> </span>memory
+Loading<span class="w"> </span>checkpoint<span class="w"> </span>shards:<span class="w"> </span><span class="m">100</span>%<span class="p">|</span>█████████████████████████████████████████████████████████████████████████████████████████████████████<span class="p">|</span><span class="w"> </span><span class="m">4</span>/4<span class="w"> </span><span class="o">[</span><span class="m">00</span>:59&lt;<span class="m">00</span>:00,<span class="w"> </span><span class="m">14</span>.79s/it<span class="o">]</span>
+Generating<span class="w"> </span>train<span class="w"> </span>split:<span class="w"> </span><span class="m">100</span>%<span class="p">|</span>████████████████████████████████████████████████████████████████████████████████████<span class="p">|</span><span class="w"> </span><span class="m">287113</span>/287113<span class="w"> </span><span class="o">[</span><span class="m">00</span>:06&lt;<span class="m">00</span>:00,<span class="w"> </span><span class="m">41375</span>.57<span class="w"> </span>examples/s<span class="o">]</span>
+Generating<span class="w"> </span>validation<span class="w"> </span>split:<span class="w"> </span><span class="m">100</span>%<span class="p">|</span>█████████████████████████████████████████████████████████████████████████████████<span class="p">|</span><span class="w"> </span><span class="m">13368</span>/13368<span class="w"> </span><span class="o">[</span><span class="m">00</span>:00&lt;<span class="m">00</span>:00,<span class="w"> </span><span class="m">41020</span>.63<span class="w"> </span>examples/s<span class="o">]</span>
+Generating<span class="w"> </span><span class="nb">test</span><span class="w"> </span>split:<span class="w"> </span><span class="m">100</span>%<span class="p">|</span>███████████████████████████████████████████████████████████████████████████████████████<span class="p">|</span><span class="w"> </span><span class="m">11490</span>/11490<span class="w"> </span><span class="o">[</span><span class="m">00</span>:00&lt;<span class="m">00</span>:00,<span class="w"> </span><span class="m">41607</span>.11<span class="w"> </span>examples/s<span class="o">]</span>
+Inserted<span class="w"> </span><span class="m">675</span><span class="w"> </span>quantizers
+/usr/local/lib/python3.12/dist-packages/modelopt/torch/quantization/model_quant.py:71:<span class="w"> </span>DeprecationWarning:<span class="w"> </span>forward_loop<span class="w"> </span>should<span class="w"> </span>take<span class="w"> </span>model<span class="w"> </span>as<span class="w"> </span>argument,<span class="w"> </span>but<span class="w"> </span>got<span class="w"> </span>forward_loop<span class="w"> </span>without<span class="w"> </span>any<span class="w"> </span>arguments.<span class="w"> </span>This<span class="w"> </span>usage<span class="w"> </span>will<span class="w"> </span>be<span class="w"> </span>deprecated<span class="w"> </span><span class="k">in</span><span class="w"> </span>future<span class="w"> </span>versions.
+<span class="w">  </span>warnings.warn<span class="o">(</span>
+Disable<span class="w"> </span>lm_head<span class="w"> </span>quantization<span class="w"> </span><span class="k">for</span><span class="w"> </span>TRT-LLM<span class="w"> </span><span class="nb">export</span><span class="w"> </span>due<span class="w"> </span>to<span class="w"> </span>deployment<span class="w"> </span>limitations.
 current<span class="w"> </span>rank:<span class="w"> </span><span class="m">0</span>,<span class="w"> </span>tp<span class="w"> </span>rank:<span class="w"> </span><span class="m">0</span>,<span class="w"> </span>pp<span class="w"> </span>rank:<span class="w"> </span><span class="m">0</span>
-Time:<span class="w"> </span><span class="m">60</span>.786s
+Time:<span class="w"> </span><span class="m">122</span>.568s
 Loading<span class="w"> </span>Model:<span class="w"> </span><span class="o">[</span><span class="m">3</span>/3<span class="o">]</span><span class="w">    </span>Building<span class="w"> </span>TRT-LLM<span class="w"> </span>engine
-Time:<span class="w"> </span><span class="m">163</span>.331s
+/usr/local/lib/python3.12/dist-packages/tensorrt/__init__.py:85:<span class="w"> </span>DeprecationWarning:<span class="w"> </span>Context<span class="w"> </span>managers<span class="w"> </span><span class="k">for</span><span class="w"> </span>TensorRT<span class="w"> </span>types<span class="w"> </span>are<span class="w"> </span>deprecated.<span class="w"> </span>Memory<span class="w"> </span>will<span class="w"> </span>be<span class="w"> </span>freed<span class="w"> </span>automatically<span class="w"> </span>when<span class="w"> </span>the<span class="w"> </span>reference<span class="w"> </span>count<span class="w"> </span>reaches<span class="w"> </span><span class="m">0</span>.
+<span class="w">  </span>warnings.warn<span class="o">(</span>
+Time:<span class="w"> </span><span class="m">53</span>.820s
 Loading<span class="w"> </span>model<span class="w"> </span><span class="k">done</span>.
-Total<span class="w"> </span>latency:<span class="w"> </span><span class="m">224</span>.232s
-<span class="o">[</span>TensorRT-LLM<span class="o">][</span>INFO<span class="o">]</span><span class="w"> </span>Engine<span class="w"> </span>version<span class="w"> </span><span class="m">0</span>.12.0<span class="w"> </span>found<span class="w"> </span><span class="k">in</span><span class="w"> </span>the<span class="w"> </span>config<span class="w"> </span>file,<span class="w"> </span>assuming<span class="w"> </span>engine<span class="o">(</span>s<span class="o">)</span><span class="w"> </span>built<span class="w"> </span>by<span class="w"> </span>new<span class="w"> </span>builder<span class="w"> </span>API.
+Total<span class="w"> </span>latency:<span class="w"> </span><span class="m">176</span>.709s
 
 &lt;snip<span class="w"> </span>verbose<span class="w"> </span>logging&gt;
 
-<span class="o">[</span><span class="m">08</span>/12/2024-19:17:09<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span>
-
 <span class="o">===========================================================</span>
-ENGINE<span class="w"> </span>SAVED:<span class="w"> </span>/tmp/meta-llama/Llama-2-7b-hf/tp_1_pp_1
+ENGINE<span class="w"> </span>SAVED:<span class="w"> </span>/tmp/meta-llama/Llama-3.1-8B/tp_1_pp_1
 <span class="o">===========================================================</span>
 </pre></div>
 </div>
-<p>The engine in this case will be written to <code class="docutils literal notranslate"><span class="pre">/tmp/meta-llama/Llama-2-7b-hf/tp_1_pp_1</span></code> (the end of the log).</p>
+<p>The engine in this case will be written to <code class="docutils literal notranslate"><span class="pre">/tmp/meta-llama/Llama-3.1-8B/tp_1_pp_1</span></code> (the end of the log).</p>
 </section>
 </section>
 <section id="max-throughput-benchmark">
-<h2>Max Throughput Benchmark<a class="headerlink" href="#max-throughput-benchmark" title="Link to this heading"></a></h2>
+<h3>Max Throughput Benchmark<a class="headerlink" href="#max-throughput-benchmark" title="Link to this heading"></a></h3>
 <p>The <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> command line tool provides a max throughput benchmark that is accessible via the
-<code class="docutils literal notranslate"><span class="pre">throughput</span></code> subcommand. This benchmark tests a TensorRT-LLM engine under maximum load to provide an
+<code class="docutils literal notranslate"><span class="pre">throughput</span></code> subcommand. This benchmark tests a TensorRT-LLM engine or PyTorch backend under maximum load to provide an
 upper bound throughput number.</p>
 <section id="how-the-benchmarker-works">
-<h3>How the Benchmarker Works<a class="headerlink" href="#how-the-benchmarker-works" title="Link to this heading"></a></h3>
+<h4>How the Benchmarker Works<a class="headerlink" href="#how-the-benchmarker-works" title="Link to this heading"></a></h4>
 <p>The benchmarker reads a data file where a single line contains
 a complete JSON request entry as specified in <a class="reference internal" href="#preparing-a-dataset"><span class="std std-ref">Preparing a Dataset</span></a>.
 The process that the benchmarker is as follows:</p>
@@ -492,41 +533,41 @@ list of logits. Otherwise, tokenize the <code class="docutils literal notranslat
 </ol>
 <p>To run the benchmarker, run the following commands with the <a class="reference internal" href="#building-a-benchmark-engine">engine</a> and
 <a class="reference internal" href="#preparing-a-dataset">dataset</a> generated from previous steps:</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-2-7b-hf<span class="w"> </span>throughput<span class="w"> </span>--dataset<span class="w"> </span>/tmp/synthetic_128_128.txt<span class="w"> </span>--engine_dir<span class="w"> </span>/tmp/meta-llama/Llama-2-7b-hf/tp_1_pp_1
-<span class="o">[</span>TensorRT-LLM<span class="o">]</span><span class="w"> </span>TensorRT-LLM<span class="w"> </span>version:<span class="w"> </span><span class="m">0</span>.12.0
-<span class="o">[</span><span class="m">08</span>/12/2024-19:36:48<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Preparing<span class="w"> </span>to<span class="w"> </span>run<span class="w"> </span>throughput<span class="w"> </span>benchmark...
-<span class="o">[</span><span class="m">08</span>/12/2024-19:36:49<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Setting<span class="w"> </span>up<span class="w"> </span>benchmarker<span class="w"> </span>and<span class="w"> </span>infrastructure.
-<span class="o">[</span><span class="m">08</span>/12/2024-19:36:49<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Ready<span class="w"> </span>to<span class="w"> </span>start<span class="w"> </span>benchmark.
-<span class="o">[</span><span class="m">08</span>/12/2024-19:36:49<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Initializing<span class="w"> </span>Executor.
-<span class="o">[</span>TensorRT-LLM<span class="o">][</span>INFO<span class="o">]</span><span class="w"> </span>Engine<span class="w"> </span>version<span class="w"> </span><span class="m">0</span>.12.0<span class="w"> </span>found<span class="w"> </span><span class="k">in</span><span class="w"> </span>the<span class="w"> </span>config<span class="w"> </span>file,<span class="w"> </span>assuming<span class="w"> </span>engine<span class="o">(</span>s<span class="o">)</span><span class="w"> </span>built<span class="w"> </span>by<span class="w"> </span>new<span class="w"> </span>builder<span class="w"> </span>API.
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-3.1-8B<span class="w"> </span>throughput<span class="w"> </span>--dataset<span class="w"> </span>/tmp/synthetic_128_128.txt<span class="w"> </span>--engine_dir<span class="w"> </span>/tmp/meta-llama/Llama-3.1-8B/tp_1_pp_1
+<span class="o">[</span>TensorRT-LLM<span class="o">]</span><span class="w"> </span>TensorRT-LLM<span class="w"> </span>version:<span class="w"> </span><span class="m">0</span>.17.0
+<span class="o">[</span><span class="m">01</span>/18/2025-01:01:13<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Preparing<span class="w"> </span>to<span class="w"> </span>run<span class="w"> </span>throughput<span class="w"> </span>benchmark...
+<span class="o">[</span><span class="m">01</span>/18/2025-01:01:13<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Setting<span class="w"> </span>up<span class="w"> </span>throughput<span class="w"> </span>benchmark.
 
 &lt;snip<span class="w"> </span>verbose<span class="w"> </span>logging&gt;
 
-<span class="o">[</span>TensorRT-LLM<span class="o">][</span>INFO<span class="o">]</span><span class="w"> </span>Executor<span class="w"> </span>instance<span class="w"> </span>created<span class="w"> </span>by<span class="w"> </span>worker
-<span class="o">[</span><span class="m">08</span>/12/2024-19:36:58<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Starting<span class="w"> </span>response<span class="w"> </span>daemon...
-<span class="o">[</span><span class="m">08</span>/12/2024-19:36:58<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Executor<span class="w"> </span>started.
-<span class="o">[</span><span class="m">08</span>/12/2024-19:36:58<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Request<span class="w"> </span>serving<span class="w"> </span>started.
-<span class="o">[</span><span class="m">08</span>/12/2024-19:36:58<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Starting<span class="w"> </span>statistics<span class="w"> </span>collection.
-<span class="o">[</span><span class="m">08</span>/12/2024-19:36:58<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Benchmark<span class="w"> </span>started.
-<span class="o">[</span><span class="m">08</span>/12/2024-19:36:58<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Collecting<span class="w"> </span>live<span class="w"> </span>stats...
-<span class="o">[</span><span class="m">08</span>/12/2024-19:36:59<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Request<span class="w"> </span>serving<span class="w"> </span>stopped.
-<span class="o">[</span><span class="m">08</span>/12/2024-19:37:19<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Collecting<span class="w"> </span>last<span class="w"> </span>stats...
-<span class="o">[</span><span class="m">08</span>/12/2024-19:37:19<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Ending<span class="w"> </span>statistics<span class="w"> </span>collection.
-<span class="o">[</span><span class="m">08</span>/12/2024-19:37:19<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Stop<span class="w"> </span>received.
-<span class="o">[</span><span class="m">08</span>/12/2024-19:37:19<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Stopping<span class="w"> </span>response<span class="w"> </span>parsing.
-<span class="o">[</span><span class="m">08</span>/12/2024-19:37:19<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Collecting<span class="w"> </span>last<span class="w"> </span>responses<span class="w"> </span>before<span class="w"> </span>shutdown.
-<span class="o">[</span><span class="m">08</span>/12/2024-19:37:19<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Completed<span class="w"> </span>request<span class="w"> </span>parsing.
-<span class="o">[</span><span class="m">08</span>/12/2024-19:37:19<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Parsing<span class="w"> </span>stopped.
-<span class="o">[</span><span class="m">08</span>/12/2024-19:37:19<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Request<span class="w"> </span>generator<span class="w"> </span>successfully<span class="w"> </span>joined.
-<span class="o">[</span><span class="m">08</span>/12/2024-19:37:19<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Statistics<span class="w"> </span>process<span class="w"> </span>successfully<span class="w"> </span>joined.
-<span class="o">[</span><span class="m">08</span>/12/2024-19:37:19<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span>
+<span class="o">[</span><span class="m">01</span>/18/2025-01:01:26<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Setting<span class="w"> </span>up<span class="w"> </span><span class="k">for</span><span class="w"> </span>warmup...
+<span class="o">[</span><span class="m">01</span>/18/2025-01:01:26<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Running<span class="w"> </span>warmup.
+<span class="o">[</span><span class="m">01</span>/18/2025-01:01:26<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Starting<span class="w"> </span>benchmarking<span class="w"> </span>async<span class="w"> </span>task.
+<span class="o">[</span><span class="m">01</span>/18/2025-01:01:26<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Starting<span class="w"> </span>benchmark...
+<span class="o">[</span><span class="m">01</span>/18/2025-01:01:26<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Request<span class="w"> </span>submission<span class="w"> </span>complete.<span class="w"> </span><span class="o">[</span><span class="nv">count</span><span class="o">=</span><span class="m">2</span>,<span class="w"> </span><span class="nv">time</span><span class="o">=</span><span class="m">0</span>.0000s,<span class="w"> </span><span class="nv">rate</span><span class="o">=</span><span class="m">121847</span>.20<span class="w"> </span>req/s<span class="o">]</span>
+<span class="o">[</span><span class="m">01</span>/18/2025-01:01:28<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Benchmark<span class="w"> </span>complete.
+<span class="o">[</span><span class="m">01</span>/18/2025-01:01:28<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Stopping<span class="w"> </span>LLM<span class="w"> </span>backend.
+<span class="o">[</span><span class="m">01</span>/18/2025-01:01:28<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Cancelling<span class="w"> </span>all<span class="w"> </span><span class="m">0</span><span class="w"> </span>tasks<span class="w"> </span>to<span class="w"> </span>complete.
+<span class="o">[</span><span class="m">01</span>/18/2025-01:01:28<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>All<span class="w"> </span>tasks<span class="w"> </span>cancelled.
+<span class="o">[</span><span class="m">01</span>/18/2025-01:01:28<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>LLM<span class="w"> </span>Backend<span class="w"> </span>stopped.
+<span class="o">[</span><span class="m">01</span>/18/2025-01:01:28<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Warmup<span class="w"> </span><span class="k">done</span>.
+<span class="o">[</span><span class="m">01</span>/18/2025-01:01:28<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Starting<span class="w"> </span>benchmarking<span class="w"> </span>async<span class="w"> </span>task.
+<span class="o">[</span><span class="m">01</span>/18/2025-01:01:28<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Starting<span class="w"> </span>benchmark...
+<span class="o">[</span><span class="m">01</span>/18/2025-01:01:28<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Request<span class="w"> </span>submission<span class="w"> </span>complete.<span class="w"> </span><span class="o">[</span><span class="nv">count</span><span class="o">=</span><span class="m">3000</span>,<span class="w"> </span><span class="nv">time</span><span class="o">=</span><span class="m">0</span>.0012s,<span class="w"> </span><span class="nv">rate</span><span class="o">=</span><span class="m">2590780</span>.97<span class="w"> </span>req/s<span class="o">]</span>
+<span class="o">[</span><span class="m">01</span>/18/2025-01:01:42<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Benchmark<span class="w"> </span>complete.
+<span class="o">[</span><span class="m">01</span>/18/2025-01:01:42<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Stopping<span class="w"> </span>LLM<span class="w"> </span>backend.
+<span class="o">[</span><span class="m">01</span>/18/2025-01:01:42<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Cancelling<span class="w"> </span>all<span class="w"> </span><span class="m">0</span><span class="w"> </span>tasks<span class="w"> </span>to<span class="w"> </span>complete.
+<span class="o">[</span><span class="m">01</span>/18/2025-01:01:42<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>All<span class="w"> </span>tasks<span class="w"> </span>cancelled.
+<span class="o">[</span><span class="m">01</span>/18/2025-01:01:42<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>LLM<span class="w"> </span>Backend<span class="w"> </span>stopped.
+<span class="o">[</span><span class="m">01</span>/18/2025-01:01:42<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span>
+
 <span class="o">===========================================================</span>
 <span class="o">=</span><span class="w"> </span>ENGINE<span class="w"> </span><span class="nv">DETAILS</span>
 <span class="o">===========================================================</span>
-Model:<span class="w">                  </span>meta-llama/Llama-2-7b-hf
-Engine<span class="w"> </span>Directory:<span class="w">       </span>/tmp/meta-llama/Llama-2-7b-hf/tp_1_pp_1
-TensorRT-LLM<span class="w"> </span>Version:<span class="w">   </span><span class="m">0</span>.12.0
-Dtype:<span class="w">                  </span>float16
+Model:<span class="w">                  </span>meta-llama/Llama-3.1-8B
+Engine<span class="w"> </span>Directory:<span class="w">       </span>/tmp/meta-llama/Llama-3.1-8B/tp_1_pp_1
+TensorRT-LLM<span class="w"> </span>Version:<span class="w">   </span><span class="m">0</span>.17.0
+Dtype:<span class="w">                  </span>bfloat16
 KV<span class="w"> </span>Cache<span class="w"> </span>Dtype:<span class="w">         </span>FP8
 Quantization:<span class="w">           </span>FP8
 Max<span class="w"> </span>Input<span class="w"> </span>Length:<span class="w">       </span><span class="m">256</span>
@@ -540,31 +581,154 @@ PP<span class="w"> </span>Size:<span class="w">                </span><span clas
 Max<span class="w"> </span>Runtime<span class="w"> </span>Batch<span class="w"> </span>Size:<span class="w"> </span><span class="m">4096</span>
 Max<span class="w"> </span>Runtime<span class="w"> </span>Tokens:<span class="w">     </span><span class="m">8192</span>
 Scheduling<span class="w"> </span>Policy:<span class="w">      </span>Guaranteed<span class="w"> </span>No<span class="w"> </span>Evict
-KV<span class="w"> </span>Memory<span class="w"> </span>Percentage:<span class="w">   </span><span class="m">90</span>.0%
-Issue<span class="w"> </span>Rate<span class="w"> </span><span class="o">(</span>req/sec<span class="o">)</span>:<span class="w">   </span><span class="m">2</span>.0827970096792666e+19
+KV<span class="w"> </span>Memory<span class="w"> </span>Percentage:<span class="w">   </span><span class="m">90</span>.00%
+Issue<span class="w"> </span>Rate<span class="w"> </span><span class="o">(</span>req/sec<span class="o">)</span>:<span class="w">   </span><span class="m">5</span>.0689E+14
+
 <span class="o">===========================================================</span>
-<span class="o">=</span><span class="w"> </span><span class="nv">STATISTICS</span>
+<span class="o">=</span><span class="w"> </span>PERFORMANCE<span class="w"> </span><span class="nv">OVERVIEW</span>
 <span class="o">===========================================================</span>
 Number<span class="w"> </span>of<span class="w"> </span>requests:<span class="w">             </span><span class="m">3000</span>
-Average<span class="w"> </span>Input<span class="w"> </span>Length<span class="w"> </span><span class="o">(</span>tokens<span class="o">)</span>:<span class="w">  </span><span class="m">128</span>.0
-Average<span class="w"> </span>Output<span class="w"> </span>Length<span class="w"> </span><span class="o">(</span>tokens<span class="o">)</span>:<span class="w"> </span><span class="m">128</span>.0
-Token<span class="w"> </span>Throughput<span class="w"> </span><span class="o">(</span>tokens/sec<span class="o">)</span>:<span class="w">  </span><span class="m">18886</span>.813971319196
-Request<span class="w"> </span>Throughput<span class="w"> </span><span class="o">(</span>req/sec<span class="o">)</span>:<span class="w">   </span><span class="m">147</span>.55323415093122
-Total<span class="w"> </span>Latency<span class="w"> </span><span class="o">(</span>seconds<span class="o">)</span>:<span class="w">        </span><span class="m">20</span>.331645167
+Average<span class="w"> </span>Input<span class="w"> </span>Length<span class="w"> </span><span class="o">(</span>tokens<span class="o">)</span>:<span class="w">  </span><span class="m">128</span>.0000
+Average<span class="w"> </span>Output<span class="w"> </span>Length<span class="w"> </span><span class="o">(</span>tokens<span class="o">)</span>:<span class="w"> </span><span class="m">128</span>.0000
+Token<span class="w"> </span>Throughput<span class="w"> </span><span class="o">(</span>tokens/sec<span class="o">)</span>:<span class="w">  </span><span class="m">28390</span>.4265
+Request<span class="w"> </span>Throughput<span class="w"> </span><span class="o">(</span>req/sec<span class="o">)</span>:<span class="w">   </span><span class="m">221</span>.8002
+Total<span class="w"> </span>Latency<span class="w"> </span><span class="o">(</span>ms<span class="o">)</span>:<span class="w">             </span><span class="m">13525</span>.6862
+
 <span class="o">===========================================================</span>
 
-<span class="o">[</span>TensorRT-LLM<span class="o">][</span>INFO<span class="o">]</span><span class="w"> </span>Orchestrator<span class="w"> </span>sendReq<span class="w"> </span>thread<span class="w"> </span>exiting
-<span class="o">[</span>TensorRT-LLM<span class="o">][</span>INFO<span class="o">]</span><span class="w"> </span>Orchestrator<span class="w"> </span>recv<span class="w"> </span>thread<span class="w"> </span>exiting
-<span class="o">[</span>TensorRT-LLM<span class="o">][</span>INFO<span class="o">]</span><span class="w"> </span>Leader<span class="w"> </span>sendThread<span class="w"> </span>exiting
-<span class="o">[</span>TensorRT-LLM<span class="o">][</span>INFO<span class="o">]</span><span class="w"> </span>Leader<span class="w"> </span>recvReq<span class="w"> </span>thread<span class="w"> </span>exiting
+<span class="o">[</span><span class="m">01</span>/18/2025-01:01:42<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Thread<span class="w"> </span>proxy_dispatch_result_thread<span class="w"> </span>stopped.
 <span class="o">[</span>TensorRT-LLM<span class="o">][</span>INFO<span class="o">]</span><span class="w"> </span>Refreshed<span class="w"> </span>the<span class="w"> </span>MPI<span class="w"> </span><span class="nb">local</span><span class="w"> </span>session
 </pre></div>
 </div>
 </section>
 </section>
+<section id="running-with-the-pytorch-workflow">
+<h3>Running with the PyTorch Workflow<a class="headerlink" href="#running-with-the-pytorch-workflow" title="Link to this heading"></a></h3>
+<p>To benchmark the PyTorch backend (<code class="docutils literal notranslate"><span class="pre">tensorrt_llm._torch</span></code>), use the following command with <a class="reference internal" href="#preparing-a-dataset">dataset</a> generated from previous steps. With the PyTorch flow, you will not need to
+run <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">build</span></code>; the <code class="docutils literal notranslate"><span class="pre">throughput</span></code> benchmark initializes the backend by tuning against the
+dataset provided via <code class="docutils literal notranslate"><span class="pre">--dataset</span></code> (or the other build mode settings described <a class="reference internal" href="#other-build-modes">above</a>).
+Note that CUDA graph is enabled by default. You can add additional pytorch config with
+<code class="docutils literal notranslate"><span class="pre">--extra_llm_api_options</span></code> followed by the path to a YAML file. For more details, please refer to the
+help text by running the command with <code class="docutils literal notranslate"><span class="pre">--help</span></code>.</p>
+<div class="admonition tip">
+<p class="admonition-title">Tip</p>
+<p>The command below specifies the <code class="docutils literal notranslate"><span class="pre">--model_path</span></code> option. The model path is optional and used only when you want to run a locally
+stored checkpoint. When using <code class="docutils literal notranslate"><span class="pre">--model_path</span></code>, the <code class="docutils literal notranslate"><span class="pre">--model</span></code> is still required for reporting reasons and in order to look up parameters
+for build heuristics.</p>
+</div>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-3.1-8B<span class="w"> </span>--model_path<span class="w"> </span>/Ckpt/Path/To/Llama-3.1-8B<span class="w"> </span>throughput<span class="w"> </span>--dataset<span class="w"> </span>/tmp/synthetic_128_128.txt<span class="w"> </span>--backend<span class="w"> </span>pytorch
+
+<span class="c1"># Example output</span>
+&lt;snip<span class="w"> </span>verbose<span class="w"> </span>logging&gt;
+<span class="o">===========================================================</span>
+<span class="o">=</span><span class="w"> </span>PyTorch<span class="w"> </span><span class="nv">backend</span>
+<span class="o">===========================================================</span>
+Model:<span class="w">                  </span>meta-llama/Llama-3.1-8B
+Model<span class="w"> </span>Path:<span class="w">             </span>/Ckpt/Path/To/Llama-3.1-8B
+TensorRT-LLM<span class="w"> </span>Version:<span class="w">   </span><span class="m">0</span>.17.0
+Dtype:<span class="w">                  </span>bfloat16
+KV<span class="w"> </span>Cache<span class="w"> </span>Dtype:<span class="w">         </span>None
+Quantization:<span class="w">           </span><span class="nv">FP8</span>
+
+<span class="o">===========================================================</span>
+<span class="o">=</span><span class="w"> </span>WORLD<span class="w"> </span>+<span class="w"> </span>RUNTIME<span class="w"> </span><span class="nv">INFORMATION</span>
+<span class="o">===========================================================</span>
+TP<span class="w"> </span>Size:<span class="w">                </span><span class="m">1</span>
+PP<span class="w"> </span>Size:<span class="w">                </span><span class="m">1</span>
+Max<span class="w"> </span>Runtime<span class="w"> </span>Batch<span class="w"> </span>Size:<span class="w"> </span><span class="m">2048</span>
+Max<span class="w"> </span>Runtime<span class="w"> </span>Tokens:<span class="w">     </span><span class="m">4096</span>
+Scheduling<span class="w"> </span>Policy:<span class="w">      </span>Guaranteed<span class="w"> </span>No<span class="w"> </span>Evict
+KV<span class="w"> </span>Memory<span class="w"> </span>Percentage:<span class="w">   </span><span class="m">90</span>.00%
+Issue<span class="w"> </span>Rate<span class="w"> </span><span class="o">(</span>req/sec<span class="o">)</span>:<span class="w">   </span><span class="m">7</span>.6753E+14
+
+<span class="o">===========================================================</span>
+<span class="o">=</span><span class="w"> </span>PERFORMANCE<span class="w"> </span><span class="nv">OVERVIEW</span>
+<span class="o">===========================================================</span>
+Number<span class="w"> </span>of<span class="w"> </span>requests:<span class="w">             </span><span class="m">3000</span>
+Average<span class="w"> </span>Input<span class="w"> </span>Length<span class="w"> </span><span class="o">(</span>tokens<span class="o">)</span>:<span class="w">  </span><span class="m">128</span>.0000
+Average<span class="w"> </span>Output<span class="w"> </span>Length<span class="w"> </span><span class="o">(</span>tokens<span class="o">)</span>:<span class="w"> </span><span class="m">128</span>.0000
+Token<span class="w"> </span>Throughput<span class="w"> </span><span class="o">(</span>tokens/sec<span class="o">)</span>:<span class="w">  </span><span class="m">20685</span>.5510
+Request<span class="w"> </span>Throughput<span class="w"> </span><span class="o">(</span>req/sec<span class="o">)</span>:<span class="w">   </span><span class="m">161</span>.6059
+Total<span class="w"> </span>Latency<span class="w"> </span><span class="o">(</span>ms<span class="o">)</span>:<span class="w">             </span><span class="m">18563</span>.6825
+</pre></div>
+</div>
+<section id="quantization-in-the-pytorch-flow">
+<h4>Quantization in the PyTorch Flow<a class="headerlink" href="#quantization-in-the-pytorch-flow" title="Link to this heading"></a></h4>
+<p>In order to run a quantized run with <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> utilizing the PyTorch flow, you will need to use a pre-quantized
+To run a quantized benchmark with <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> utilizing the PyTorch flow, you will need to use a pre-quantized
+checkpoint. For the Llama-3.1 models, TensorRT-LLM provides the following checkpoints via HuggingFace:</p>
+<ul class="simple">
+<li><p><a class="reference external" href="https://huggingface.co/nvidia/Llama-3.1-8B-Instruct-FP8"><code class="docutils literal notranslate"><span class="pre">nvidia/Llama-3.1-8B-Instruct-FP8</span></code></a></p></li>
+<li><p><a class="reference external" href="https://huggingface.co/nvidia/Llama-3.1-70B-Instruct-FP8"><code class="docutils literal notranslate"><span class="pre">nvidia/Llama-3.1-70B-Instruct-FP8</span></code></a></p></li>
+<li><p><a class="reference external" href="https://huggingface.co/nvidia/Llama-3.1-405B-Instruct-FP8"><code class="docutils literal notranslate"><span class="pre">nvidia/Llama-3.1-405B-Instruct-FP8</span></code></a></p></li>
+</ul>
+<p><code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> utilizes the <code class="docutils literal notranslate"><span class="pre">hf_quant_config.json</span></code> file present in the pre-quantized checkpoints above. The configuration
+file is present in checkpoints quantized with <a class="reference external" href="https://github.com/NVIDIA/TensorRT-Model-Optimizer">TensorRT Model Optimizer</a>
+and describes the compute and KV cache quantization that checkpoint was compiled with. For example, from the checkpoints
+above:</p>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;producer&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;modelopt&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;0.23.0rc1&quot;</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="nt">&quot;quantization&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;quant_algo&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;FP8&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;kv_cache_quant_algo&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span>
+<span class="w">    </span><span class="p">}</span>
+</pre></div>
+</div>
+<p>The checkpoints above are quantized to run with a compute precision of <code class="docutils literal notranslate"><span class="pre">FP8</span></code> and default to no KV cache quantization (full
+<code class="docutils literal notranslate"><span class="pre">FP16</span></code> cache). When running <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">throughput</span></code>. The benchmark will select a KV cache quantization that is best suited
+for the compute precision in the checkpoint automatically if <code class="docutils literal notranslate"><span class="pre">kv_cache_quant_algo</span></code> is specified as <code class="docutils literal notranslate"><span class="pre">null</span></code>, otherwise it will
+be forced to match the specified non-null KV cache quantization. The following are the mappings that <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> will
+follow when a checkpoint does not specify a KV cache quantization algorithm:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Checkpoint Compute Quant</p></th>
+<th class="head"><p>Checkpoint KV Cache Quant</p></th>
+<th class="head"><p><code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code></p></th>
+<th class="head"><p>Note</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">null</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">null</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">null</span></code></p></td>
+<td><p>In this case, a quantization config doesn’t exist.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">FP8</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">FP8</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">FP8</span></code></p></td>
+<td><p>Matches the checkpoint</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">FP8</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">null</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">FP8</span></code></p></td>
+<td><p>Set to <code class="docutils literal notranslate"><span class="pre">FP8</span></code> via benchmark</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">NVFP4</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">null</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">FP8</span></code></p></td>
+<td><p>Set to <code class="docutils literal notranslate"><span class="pre">FP8</span></code> via benchmark</p></td>
+</tr>
+</tbody>
+</table>
+<p>If you would like to force the KV cache quantizaton, you can specify the following in the YAML file to force the precision
+when the checkpoint precision is <code class="docutils literal notranslate"><span class="pre">null</span></code>:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">pytorch_backend_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">kv_cache_dtype</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;fp8&quot;</span>
+</pre></div>
+</div>
+<div class="admonition tip">
+<p class="admonition-title">Tip</p>
+<p>The two valid values for <code class="docutils literal notranslate"><span class="pre">kv_cache_dtype</span></code> are <code class="docutils literal notranslate"><span class="pre">auto</span></code> and <code class="docutils literal notranslate"><span class="pre">fp8</span></code>.</p>
+</div>
+</section>
+</section>
+</section>
 <section id="low-latency-benchmark">
 <h2>Low Latency Benchmark<a class="headerlink" href="#low-latency-benchmark" title="Link to this heading"></a></h2>
-<p>The low latency benchmark follows a similar workflow to the <a class="reference internal" href="#running-a-max-throughput-benchmark"><span class="xref myst">throughput benchmark</span></a>
+<p>The low latency benchmark follows a similar workflow to the <a class="reference internal" href="#max-throughput-benchmark">throughput benchmark</a>
 but requires building the engine separately from <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code>. Low latency benchmarks has the following modes:</p>
 <ul class="simple">
 <li><p>A single-request low-latency engine</p></li>
@@ -619,8 +783,9 @@ python<span class="w"> </span>../quantization/quantize.py<span class="w"> </span
 </pre></div>
 </div>
 </section>
+</section>
 <section id="building-a-medusa-low-latency-engine">
-<h4>Building a Medusa Low-Latency Engine<a class="headerlink" href="#building-a-medusa-low-latency-engine" title="Link to this heading"></a></h4>
+<h3>Building a Medusa Low-Latency Engine<a class="headerlink" href="#building-a-medusa-low-latency-engine" title="Link to this heading"></a></h3>
 <p>To build a Medusa-enabled engine requires checkpoints that contain Medusa heads.
 NVIDIA provides TensorRT-LLM checkpoints on the <a class="reference external" href="https://huggingface.co/nvidia">NVIDIA</a> page on Hugging Face.
 The checkpoints are pre-quantized and can be directly built after downloading them with the
@@ -682,7 +847,6 @@ The choices are specified with a YAML file like the following example (<code cla
 </div>
 </section>
 </section>
-</section>
 <section id="summary">
 <h2>Summary<a class="headerlink" href="#summary" title="Link to this heading"></a></h2>
 <p>The following table summarizes the commands needed for running benchmarks:</p>
@@ -741,13 +905,13 @@ The choices are specified with a YAML file like the following example (<code cla
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
         <a href="perf-overview.html" class="btn btn-neutral float-left" title="Overview" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
-        <a href="perf-best-practices.html" class="btn btn-neutral float-right" title="Best Practices for Tuning the Performance of TensorRT-LLM" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+        <a href="introduction.html" class="btn btn-neutral float-right" title="Introduction" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fed14262d10>
+<jinja2.runtime.BlockReference object at 0x7f658c128ce0>
 
 <div class="footer">
     <p>

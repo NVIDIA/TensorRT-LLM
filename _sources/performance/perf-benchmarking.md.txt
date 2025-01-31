@@ -7,9 +7,26 @@ This benchmarking suite is a work in progress.
 Expect breaking API changes.
 ```
 
-TensorRT-LLM provides the `trtllm-bench` CLI, a packaged benchmarking utility.
+TensorRT-LLM provides the `trtllm-bench` CLI, a packaged benchmarking utility that aims to make it
+easier for users to reproduce our officially published [performance overiew](./perf-overview.md#throughput-measurements). `trtllm-bench` provides the follows:
 
-#### Supported Networks for Benchmarking
+- A streamlined way to build tuned engines for benchmarking for a variety of models and platforms.
+- An entirely Python workflow for benchmarking.
+- Ability to benchmark various flows and features within TensorRT-LLM.
+
+`trtllm-bench` executes all benchmarks using [in-flight batching] -- for more information see
+the [this section](../advanced/gpt-attention.md#in-flight-batching) that describes the concept
+in further detail.
+
+## Throughput Benchmarking
+
+### Limitations and Caveats
+
+#### Validated Networks for Benchmarking
+
+While `trtllm-bench` should be able to run any network that TensorRT-LLM supports, the following are the list
+that have been validated extensively and is the same listing as seen on the
+[Performance Overview](./perf-overview.md) page.
 
 - [meta-llama/Llama-2-7b-hf](https://huggingface.co/meta-llama/Llama-2-7b-hf)
 - [meta-llama/Llama-2-70b-hf](https://huggingface.co/meta-llama/Llama-2-70b-hf)
@@ -27,59 +44,54 @@ TensorRT-LLM provides the `trtllm-bench` CLI, a packaged benchmarking utility.
 - [meta-llama/Llama-3.1-405B-Instruct](https://huggingface.co/meta-llama/Llama-3.1-405B-Instruct)
 - [mistralai/Mixtral-8x7B-v0.1-Instruct](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1-Instruct)
 
-> The `trtllm-bench` CLI tool can automatically download the model from Hugging Face Model Hub.
+```{tip}
+`trtllm-bench` can automatically download the model from Hugging Face Model Hub.
 Export your token in the `HF_TOKEN` environment variable.
+```
 
-#### Support Quantization Modes
+#### Supported Quantization Modes
 
-TensorRT-LLM supports a number of quantization modes:
+`trtllm-bench` supports the following quantization modes:
 
 - None (no quantization applied)
-- W8A16
-- W4A16
-- W4A16_AWQ
-- W4A8_AWQ
-- W4A16_GPTQ
-- FP8
-- INT8
+- `FP8`
+- `NVFP4`
 
 For more information about quantization, refer to [](../reference/precision.md) and
 the [support matrix](../reference/precision.md#support-matrix) of the supported quantization methods for each network.
 
-
-## Inflight Benchmarking with a Dataset
-
-This section covers how to benchmark TensorRT-LLM using inflight batching.
-
+```{tip}
+Although TensorRT-LLM supports more quantization modes than listed above, `trtllm-bench` currently only configures for
+a smaller subset.
+```
 
 ### Quickstart
 
 This quick start focuses on running a short max throughput benchmark on
-`meta-llama/Llama-2-7b-hf` on a synthetic dataset with a uniform distribution of prompts with ISL:OSL
+`meta-llama/Llama-3.1-8B` on a synthetic dataset with a uniform distribution of prompts with ISL:OSL
 of 128:128.
 To run the benchmark from start to finish, run the following commands:
 
 ```shell
-python benchmarks/cpp/prepare_dataset.py --stdout --tokenizer meta-llama/Llama-2-7b-hf token-norm-dist --input-mean 128 --output-mean 128 --input-stdev 0 --output-stdev 0 --num-requests 3000 > /tmp/synthetic_128_128.txt
-trtllm-bench --model meta-llama/Llama-2-7b-hf build --dataset /tmp/synthetic_128_128.txt --quantization FP8
-trtllm-bench --model meta-llama/Llama-2-7b-hf throughput --dataset /tmp/synthetic_128_128.txt --engine_dir /tmp/meta-llama/Llama-2-7b-hf/tp_1_pp_1
+python benchmarks/cpp/prepare_dataset.py --stdout --tokenizer meta-llama/Llama-3.1-8B token-norm-dist --input-mean 128 --output-mean 128 --input-stdev 0 --output-stdev 0 --num-requests 3000 > /tmp/synthetic_128_128.txt
+trtllm-bench --model meta-llama/Llama-3.1-8B build --dataset /tmp/synthetic_128_128.txt --quantization FP8
+trtllm-bench --model meta-llama/Llama-3.1-8B throughput --dataset /tmp/synthetic_128_128.txt --engine_dir /tmp/meta-llama/Llama-3.1-8B/tp_1_pp_1
 ```
 
-And that's it!
 After the benchmark completes, `trtllm-bench` prints a summary with summary metrics.
 
 ```shell
 ===========================================================
 = ENGINE DETAILS
 ===========================================================
-Model:                  meta-llama/Llama-2-7b-hf
-Engine Directory:       /tmp/meta-llama/Llama-2-7b-hf/tp_1_pp_1
-TensorRT-LLM Version:   0.12.0
-Dtype:                  float16
+Model:                  meta-llama/Llama-3.1-8B
+Engine Directory:       /tmp/meta-llama/Llama-3.1-8B/tp_1_pp_1
+TensorRT-LLM Version:   0.17.0
+Dtype:                  bfloat16
 KV Cache Dtype:         FP8
 Quantization:           FP8
-Max Input Length:       2048
-Max Sequence Length:    4098
+Max Input Length:       256
+Max Sequence Length:    256
 
 ===========================================================
 = WORLD + RUNTIME INFORMATION
@@ -89,17 +101,19 @@ PP Size:                1
 Max Runtime Batch Size: 4096
 Max Runtime Tokens:     8192
 Scheduling Policy:      Guaranteed No Evict
-KV Memory Percentage:   99.0%
-Issue Rate (req/sec):   3.680275266452667e+18
+KV Memory Percentage:   90.00%
+Issue Rate (req/sec):   5.0689E+14
+
 ===========================================================
-= STATISTICS
+= PERFORMANCE OVERVIEW
 ===========================================================
 Number of requests:             3000
-Average Input Length (tokens):  128.0
-Average Output Length (tokens): 128.0
-Token Throughput (tokens/sec):  23405.927228471104
-Request Throughput (req/sec):   182.8588064724305
-Total Latency (seconds):        16.406100739
+Average Input Length (tokens):  128.0000
+Average Output Length (tokens): 128.0000
+Token Throughput (tokens/sec):  28390.4265
+Request Throughput (req/sec):   221.8002
+Total Latency (ms):             13525.6862
+
 ===========================================================
 ```
 
@@ -108,26 +122,27 @@ Total Latency (seconds):        16.406100739
 The workflow for `trtllm-bench` is composed of the following steps:
 
 1. Prepare a dataset to drive the inflight batching benchmark.
-2. Build a benchmark engine using `trtllm-bench build` subcommand.
+2. Build a benchmark engine using `trtllm-bench build` subcommand (not required for [PyTorch flow](#running-with-the-pytorch-workflow)).
 3. Run the max throughput benchmark using the `trtllm-bench throughput` subcommand or low latency benchmark using the `trtllm-bench latency` subcommand.
 
 
-## Preparing a Dataset
+#### Preparing a Dataset
 
-The inflight benchmark utilizes a fixed JSON schema so that it is simple and
-straightforward to specify requests. The schema is defined as follows:
+The throughput benchmark utilizes a fixed JSON schema to specify requests. The schema is defined as follows:
 
 | Key             | Required |     Type      | Description                                     |
 | :-------------- | :------: | :-----------: | :---------------------------------------------- |
 | `task_id`       |    Y     |    String     | Unique identifier for the request.              |
 | `prompt`        |    N*    |    String     | Input text for a generation request.            |
-| `logits`        |    N*    | List[Integer] | List of logits that make up the request prompt. |
+| `input_ids`     |    Y*    | List[Integer] | List of logits that make up the request prompt. |
 | `output_tokens` |    Y     |    Integer    | Number of generated tokens for this request.    |
 
-Prompt and logits are mutually exclusive, but one of `prompt` or `logits` is required.
-If you specify `logits`, the `prompt` entry is ignored for request generation.
+```{tip}
+\* Specifying `prompt` or `input_ids` is required. However, you can not have both prompts and logits (`input_ids`)
+defined at the same time. If you specify `input_ids`, the `prompt` entry is ignored for request generation.
+```
 
-Refer to the following examples of valid entries for the inflight benchmark:
+Refer to the following examples of valid entries for the benchmark:
 
 - Entries with a human-readable prompt and no logits.
 
@@ -139,8 +154,8 @@ Refer to the following examples of valid entries for the inflight benchmark:
 - Entries which contain logits.
 
   ```json
-  {"task_id":0,"logits":[863,22056,25603,11943,8932,13195,3132,25032,21747,22213],"output_tokens":128}
-  {"task_id":1,"logits":[14480,13598,15585,6591,1252,8259,30990,26778,7063,30065,21764,11023,1418],"output_tokens":128}
+  {"task_id":0,"input_ids":[863,22056,25603,11943,8932,13195,3132,25032,21747,22213],"output_tokens":128}
+  {"task_id":1,"input_ids":[14480,13598,15585,6591,1252,8259,30990,26778,7063,30065,21764,11023,1418],"output_tokens":128}
   ```
 
 ```{tip}
@@ -150,34 +165,27 @@ can simply read a line and assume a complete entry. When creating a dataset, be 
 JSON entry is on every line.
 ```
 
-### Using prepare_dataset.py to Create Synthetic Datasets
-
 In order to prepare a synthetic dataset, you can use the provided script in the `benchmarks/cpp`
 directory. For example, to generate a synthetic dataset of 1000 requests with a uniform ISL/OSL of
-128/128 for [Llama-2-7b](https://huggingface.co/meta-llama/Llama-2-7b), simply run:
+128/128 for [meta-llama/Llama-3.1-8B](https://huggingface.co/meta-llama/Llama-3.1-8B), run:
 
 ```shell
-benchmarks/cpp/prepare_dataset.py --stdout --tokenizer meta-llama/Llama-2-7b-hf token-norm-dist --input-mean 128 --output-mean 128 --input-stdev 0 --output-stdev 0 --num-requests 1000 > /tmp/synthetic_128_128.txt
+benchmarks/cpp/prepare_dataset.py --stdout --tokenizer meta-llama/Llama-3.1-8B token-norm-dist --input-mean 128 --output-mean 128 --input-stdev 0 --output-stdev 0 --num-requests 1000 > /tmp/synthetic_128_128.txt
 ```
 
-You can pipe the above command to a file to reuse the same dataset, or simply pipe its output to the
-benchmark script (example below).
+### Building a Benchmark Engine
 
-
-## Building a Benchmark Engine
-
+#### Default Build Behavior
 The `trtllm-bench` CLI tool provides the `build` subcommand to build the TRT-LLM engines for max throughput benchmark.
-
-
-### How to Build the Engine
-
 To build an engine for benchmarking, you can specify the dataset generated with `prepare_dataset.py` through `--dataset` option.
-The `trtllm-bench`'s tuning heuristic uses the high-level statistics of the dataset (average ISL/OSL, max sequence length) to optimize engine build settings.
-The following command builds an FP8 quantized engine optimized using the dataset's ISL/OSL.
+By default, `trtllm-bench`'s tuning heuristic uses the high-level statistics of the dataset (average ISL/OSL, max sequence length)
+to optimize engine build settings. The following command builds an FP8 quantized engine optimized using the dataset's ISL/OSL.
 
 ```shell
-trtllm-bench --model meta-llama/Llama-2-7b-hf build --quantization FP8 --dataset /tmp/synthetic_128_128.txt
+trtllm-bench --model meta-llama/Llama-3.1-8B build --quantization FP8 --dataset /tmp/synthetic_128_128.txt
 ```
+
+#### Other Build Modes
 
 The build subcommand also provides other ways to build the engine where users have larger control over the tuning values.
 
@@ -188,7 +196,7 @@ If no value is specified, the default `max_batch_size` and `max_num_tokens` valu
 The following command builds an FP8 quantized engine by specifying the engine tuning values.
 
 ```shell
-trtllm-bench --model meta-llama/Llama-2-7b-hf build --quantization FP8 --max_seq_len 4096 --max_batch_size 1024 --max_num_tokens 2048
+trtllm-bench --model meta-llama/Llama-3.1-8B build --quantization FP8 --max_seq_len 4096 --max_batch_size 1024 --max_num_tokens 2048
 ```
 
 - [Experimental] Build engine with target ISL/OSL for optimization:
@@ -197,46 +205,56 @@ Generally, the target ISL and OSL aligns with the average ISL and OSL of the dat
 The following command builds an FP8 quantized engine and optmizes for ISL:OSL targets of 128:128.
 
 ```shell
-trtllm-bench --model meta-llama/Llama-2-7b-hf build --quantization FP8 --max_seq_len 4096 --target_isl 128 --target_osl 128
+trtllm-bench --model meta-llama/Llama-3.1-8B build --quantization FP8 --max_seq_len 4096 --target_isl 128 --target_osl 128
 ```
 
 
-### Parallelism Mapping Support
+#### Parallelism Mapping Support
 The `trtllm-bench build` subcommand supports combinations of tensor-parallel (TP) and pipeline-parallel (PP) mappings as long as the world size (`tp_size x pp_size`) `<=` `8`. The parallelism mapping in build subcommad is controlled by `--tp_size` and `--pp_size` options. The following command builds an engine with TP2-PP2 mapping.
 
 ```shell
-trtllm-bench --model meta-llama/Llama-2-7b-hf build --quantization FP8 --dataset /tmp/synthetic_128_128.txt --tp_size 2 --pp_size 2
+trtllm-bench --model meta-llama/Llama-3.1-8B build --quantization FP8 --dataset /tmp/synthetic_128_128.txt --tp_size 2 --pp_size 2
 ```
 
 
-### Example of Build Subcommand Output:
-The output of the `build` subcommand looks similar to the snippet below (for `meta-llama/Llama-2-7b-hf`):
+#### Example of Build Subcommand Output:
+The output of the `build` subcommand looks similar to the snippet below (for `meta-llama/Llama-3.1-8B`):
 
 ```shell
-trtllm-bench --model meta-llama/Llama-2-7b-hf build --dataset /tmp/synthetic_128_128.txt --quantization FP8
-[TensorRT-LLM] TensorRT-LLM version: 0.12.0
-[08/12/2024-19:13:06] [TRT-LLM] [I] Found dataset.
-[08/12/2024-19:13:07] [TRT-LLM] [I]
+user@387b12598a9e:/scratch/code/trt-llm/tekit_2025$ trtllm-bench --model meta-llama/Llama-3.1-8B build --dataset /tmp/synthetic_128_128.txt --quantization FP8
+[TensorRT-LLM] TensorRT-LLM version: 0.17.0
+[01/18/2025-00:55:14] [TRT-LLM] [I] Found dataset.
+[01/18/2025-00:55:14] [TRT-LLM] [I]
 ===========================================================
 = DATASET DETAILS
 ===========================================================
 Max Input Sequence Length:      128
 Max Output Sequence Length:     128
 Max Sequence Length:    256
+Target (Average) Input Sequence Length: 128
+Target (Average) Output Sequence Length:        128
 Number of Sequences:    3000
 ===========================================================
 
 
-[08/12/2024-19:13:07] [TRT-LLM] [I] Set multiple_profiles to True.
-[08/12/2024-19:13:07] [TRT-LLM] [I] Set use_paged_context_fmha to True.
-[08/12/2024-19:13:07] [TRT-LLM] [I] Set use_fp8_context_fmha to True.
-[08/12/2024-19:13:07] [TRT-LLM] [I]
+[01/18/2025-00:55:14] [TRT-LLM] [I] Max batch size and max num tokens are not provided, use tuning heuristics or pre-defined setting from trtllm-bench.
+[01/18/2025-00:55:14] [TRT-LLM] [I] Estimated total available memory for KV cache: 132.37 GB
+[01/18/2025-00:55:14] [TRT-LLM] [I] Estimated total KV cache memory: 125.75 GB
+[01/18/2025-00:55:14] [TRT-LLM] [I] Estimated max number of requests in KV cache memory: 8048.16
+[01/18/2025-00:55:14] [TRT-LLM] [I] Estimated max batch size (after fine-tune): 4096
+[01/18/2025-00:55:14] [TRT-LLM] [I] Estimated max num tokens (after fine-tune): 8192
+[01/18/2025-00:55:14] [TRT-LLM] [I] Set dtype to bfloat16.
+[01/18/2025-00:55:14] [TRT-LLM] [I] Set multiple_profiles to True.
+[01/18/2025-00:55:14] [TRT-LLM] [I] Set use_paged_context_fmha to True.
+[01/18/2025-00:55:14] [TRT-LLM] [I] Set use_fp8_context_fmha to True.
+[01/18/2025-00:55:14] [TRT-LLM] [I]
 ===========================================================
 = ENGINE BUILD INFO
 ===========================================================
-Model Name:             meta-llama/Llama-2-7b-hf
+Model Name:             meta-llama/Llama-3.1-8B
+Model Path:             None
 Workspace Directory:    /tmp
-Engine Directory:       /tmp/meta-llama/Llama-2-7b-hf/tp_1_pp_1
+Engine Directory:       /tmp/meta-llama/Llama-3.1-8B/tp_1_pp_1
 
 ===========================================================
 = ENGINE CONFIGURATION DETAILS
@@ -245,39 +263,47 @@ Max Sequence Length:            256
 Max Batch Size:                 4096
 Max Num Tokens:                 8192
 Quantization:                   FP8
+KV Cache Dtype:                 FP8
 ===========================================================
 
 Loading Model: [1/3]    Downloading HF model
-Downloaded model to /data/models--meta-llama--Llama-2-7b-hf/snapshots/01c7f73d771dfac7d292323805ebc428287df4f9
-Time: 0.115s
+Downloaded model to /data/models--meta-llama--Llama-3.1-8B/snapshots/d04e592bb4f6aa9cfee91e2e20afa771667e1d4b
+Time: 0.321s
 Loading Model: [2/3]    Loading HF model to memory
+Loading checkpoint shards: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████| 4/4 [00:59<00:00, 14.79s/it]
+Generating train split: 100%|████████████████████████████████████████████████████████████████████████████████████| 287113/287113 [00:06<00:00, 41375.57 examples/s]
+Generating validation split: 100%|█████████████████████████████████████████████████████████████████████████████████| 13368/13368 [00:00<00:00, 41020.63 examples/s]
+Generating test split: 100%|███████████████████████████████████████████████████████████████████████████████████████| 11490/11490 [00:00<00:00, 41607.11 examples/s]
+Inserted 675 quantizers
+/usr/local/lib/python3.12/dist-packages/modelopt/torch/quantization/model_quant.py:71: DeprecationWarning: forward_loop should take model as argument, but got forward_loop without any arguments. This usage will be deprecated in future versions.
+  warnings.warn(
+Disable lm_head quantization for TRT-LLM export due to deployment limitations.
 current rank: 0, tp rank: 0, pp rank: 0
-Time: 60.786s
+Time: 122.568s
 Loading Model: [3/3]    Building TRT-LLM engine
-Time: 163.331s
+/usr/local/lib/python3.12/dist-packages/tensorrt/__init__.py:85: DeprecationWarning: Context managers for TensorRT types are deprecated. Memory will be freed automatically when the reference count reaches 0.
+  warnings.warn(
+Time: 53.820s
 Loading model done.
-Total latency: 224.232s
-[TensorRT-LLM][INFO] Engine version 0.12.0 found in the config file, assuming engine(s) built by new builder API.
+Total latency: 176.709s
 
 <snip verbose logging>
 
-[08/12/2024-19:17:09] [TRT-LLM] [I]
-
 ===========================================================
-ENGINE SAVED: /tmp/meta-llama/Llama-2-7b-hf/tp_1_pp_1
+ENGINE SAVED: /tmp/meta-llama/Llama-3.1-8B/tp_1_pp_1
 ===========================================================
 ```
 
-The engine in this case will be written to `/tmp/meta-llama/Llama-2-7b-hf/tp_1_pp_1` (the end of the log).
+The engine in this case will be written to `/tmp/meta-llama/Llama-3.1-8B/tp_1_pp_1` (the end of the log).
 
 
-## Max Throughput Benchmark
+### Max Throughput Benchmark
 
 The `trtllm-bench` command line tool provides a max throughput benchmark that is accessible via the
-`throughput` subcommand. This benchmark tests a TensorRT-LLM engine under maximum load to provide an
+`throughput` subcommand. This benchmark tests a TensorRT-LLM engine or PyTorch backend under maximum load to provide an
 upper bound throughput number.
 
-### How the Benchmarker Works
+#### How the Benchmarker Works
 
 The benchmarker reads a data file where a single line contains
 a complete JSON request entry as specified in [](#preparing-a-dataset).
@@ -292,41 +318,41 @@ To run the benchmarker, run the following commands with the [engine](#building-a
 [dataset](#preparing-a-dataset) generated from previous steps:
 
 ```shell
-trtllm-bench --model meta-llama/Llama-2-7b-hf throughput --dataset /tmp/synthetic_128_128.txt --engine_dir /tmp/meta-llama/Llama-2-7b-hf/tp_1_pp_1
-[TensorRT-LLM] TensorRT-LLM version: 0.12.0
-[08/12/2024-19:36:48] [TRT-LLM] [I] Preparing to run throughput benchmark...
-[08/12/2024-19:36:49] [TRT-LLM] [I] Setting up benchmarker and infrastructure.
-[08/12/2024-19:36:49] [TRT-LLM] [I] Ready to start benchmark.
-[08/12/2024-19:36:49] [TRT-LLM] [I] Initializing Executor.
-[TensorRT-LLM][INFO] Engine version 0.12.0 found in the config file, assuming engine(s) built by new builder API.
+trtllm-bench --model meta-llama/Llama-3.1-8B throughput --dataset /tmp/synthetic_128_128.txt --engine_dir /tmp/meta-llama/Llama-3.1-8B/tp_1_pp_1
+[TensorRT-LLM] TensorRT-LLM version: 0.17.0
+[01/18/2025-01:01:13] [TRT-LLM] [I] Preparing to run throughput benchmark...
+[01/18/2025-01:01:13] [TRT-LLM] [I] Setting up throughput benchmark.
 
 <snip verbose logging>
 
-[TensorRT-LLM][INFO] Executor instance created by worker
-[08/12/2024-19:36:58] [TRT-LLM] [I] Starting response daemon...
-[08/12/2024-19:36:58] [TRT-LLM] [I] Executor started.
-[08/12/2024-19:36:58] [TRT-LLM] [I] Request serving started.
-[08/12/2024-19:36:58] [TRT-LLM] [I] Starting statistics collection.
-[08/12/2024-19:36:58] [TRT-LLM] [I] Benchmark started.
-[08/12/2024-19:36:58] [TRT-LLM] [I] Collecting live stats...
-[08/12/2024-19:36:59] [TRT-LLM] [I] Request serving stopped.
-[08/12/2024-19:37:19] [TRT-LLM] [I] Collecting last stats...
-[08/12/2024-19:37:19] [TRT-LLM] [I] Ending statistics collection.
-[08/12/2024-19:37:19] [TRT-LLM] [I] Stop received.
-[08/12/2024-19:37:19] [TRT-LLM] [I] Stopping response parsing.
-[08/12/2024-19:37:19] [TRT-LLM] [I] Collecting last responses before shutdown.
-[08/12/2024-19:37:19] [TRT-LLM] [I] Completed request parsing.
-[08/12/2024-19:37:19] [TRT-LLM] [I] Parsing stopped.
-[08/12/2024-19:37:19] [TRT-LLM] [I] Request generator successfully joined.
-[08/12/2024-19:37:19] [TRT-LLM] [I] Statistics process successfully joined.
-[08/12/2024-19:37:19] [TRT-LLM] [I]
+[01/18/2025-01:01:26] [TRT-LLM] [I] Setting up for warmup...
+[01/18/2025-01:01:26] [TRT-LLM] [I] Running warmup.
+[01/18/2025-01:01:26] [TRT-LLM] [I] Starting benchmarking async task.
+[01/18/2025-01:01:26] [TRT-LLM] [I] Starting benchmark...
+[01/18/2025-01:01:26] [TRT-LLM] [I] Request submission complete. [count=2, time=0.0000s, rate=121847.20 req/s]
+[01/18/2025-01:01:28] [TRT-LLM] [I] Benchmark complete.
+[01/18/2025-01:01:28] [TRT-LLM] [I] Stopping LLM backend.
+[01/18/2025-01:01:28] [TRT-LLM] [I] Cancelling all 0 tasks to complete.
+[01/18/2025-01:01:28] [TRT-LLM] [I] All tasks cancelled.
+[01/18/2025-01:01:28] [TRT-LLM] [I] LLM Backend stopped.
+[01/18/2025-01:01:28] [TRT-LLM] [I] Warmup done.
+[01/18/2025-01:01:28] [TRT-LLM] [I] Starting benchmarking async task.
+[01/18/2025-01:01:28] [TRT-LLM] [I] Starting benchmark...
+[01/18/2025-01:01:28] [TRT-LLM] [I] Request submission complete. [count=3000, time=0.0012s, rate=2590780.97 req/s]
+[01/18/2025-01:01:42] [TRT-LLM] [I] Benchmark complete.
+[01/18/2025-01:01:42] [TRT-LLM] [I] Stopping LLM backend.
+[01/18/2025-01:01:42] [TRT-LLM] [I] Cancelling all 0 tasks to complete.
+[01/18/2025-01:01:42] [TRT-LLM] [I] All tasks cancelled.
+[01/18/2025-01:01:42] [TRT-LLM] [I] LLM Backend stopped.
+[01/18/2025-01:01:42] [TRT-LLM] [I]
+
 ===========================================================
 = ENGINE DETAILS
 ===========================================================
-Model:                  meta-llama/Llama-2-7b-hf
-Engine Directory:       /tmp/meta-llama/Llama-2-7b-hf/tp_1_pp_1
-TensorRT-LLM Version:   0.12.0
-Dtype:                  float16
+Model:                  meta-llama/Llama-3.1-8B
+Engine Directory:       /tmp/meta-llama/Llama-3.1-8B/tp_1_pp_1
+TensorRT-LLM Version:   0.17.0
+Dtype:                  bfloat16
 KV Cache Dtype:         FP8
 Quantization:           FP8
 Max Input Length:       256
@@ -340,29 +366,133 @@ PP Size:                1
 Max Runtime Batch Size: 4096
 Max Runtime Tokens:     8192
 Scheduling Policy:      Guaranteed No Evict
-KV Memory Percentage:   90.0%
-Issue Rate (req/sec):   2.0827970096792666e+19
+KV Memory Percentage:   90.00%
+Issue Rate (req/sec):   5.0689E+14
+
 ===========================================================
-= STATISTICS
+= PERFORMANCE OVERVIEW
 ===========================================================
 Number of requests:             3000
-Average Input Length (tokens):  128.0
-Average Output Length (tokens): 128.0
-Token Throughput (tokens/sec):  18886.813971319196
-Request Throughput (req/sec):   147.55323415093122
-Total Latency (seconds):        20.331645167
+Average Input Length (tokens):  128.0000
+Average Output Length (tokens): 128.0000
+Token Throughput (tokens/sec):  28390.4265
+Request Throughput (req/sec):   221.8002
+Total Latency (ms):             13525.6862
+
 ===========================================================
 
-[TensorRT-LLM][INFO] Orchestrator sendReq thread exiting
-[TensorRT-LLM][INFO] Orchestrator recv thread exiting
-[TensorRT-LLM][INFO] Leader sendThread exiting
-[TensorRT-LLM][INFO] Leader recvReq thread exiting
+[01/18/2025-01:01:42] [TRT-LLM] [I] Thread proxy_dispatch_result_thread stopped.
 [TensorRT-LLM][INFO] Refreshed the MPI local session
+```
+
+### Running with the PyTorch Workflow
+
+To benchmark the PyTorch backend (`tensorrt_llm._torch`), use the following command with [dataset](#preparing-a-dataset) generated from previous steps. With the PyTorch flow, you will not need to
+run `trtllm-bench build`; the `throughput` benchmark initializes the backend by tuning against the
+dataset provided via `--dataset` (or the other build mode settings described [above](#other-build-modes)).
+Note that CUDA graph is enabled by default. You can add additional pytorch config with
+`--extra_llm_api_options` followed by the path to a YAML file. For more details, please refer to the
+help text by running the command with `--help`.
+
+```{tip}
+The command below specifies the `--model_path` option. The model path is optional and used only when you want to run a locally
+stored checkpoint. When using `--model_path`, the `--model` is still required for reporting reasons and in order to look up parameters
+for build heuristics.
+```
+
+```shell
+trtllm-bench --model meta-llama/Llama-3.1-8B --model_path /Ckpt/Path/To/Llama-3.1-8B throughput --dataset /tmp/synthetic_128_128.txt --backend pytorch
+
+# Example output
+<snip verbose logging>
+===========================================================
+= PyTorch backend
+===========================================================
+Model:                  meta-llama/Llama-3.1-8B
+Model Path:             /Ckpt/Path/To/Llama-3.1-8B
+TensorRT-LLM Version:   0.17.0
+Dtype:                  bfloat16
+KV Cache Dtype:         None
+Quantization:           FP8
+
+===========================================================
+= WORLD + RUNTIME INFORMATION
+===========================================================
+TP Size:                1
+PP Size:                1
+Max Runtime Batch Size: 2048
+Max Runtime Tokens:     4096
+Scheduling Policy:      Guaranteed No Evict
+KV Memory Percentage:   90.00%
+Issue Rate (req/sec):   7.6753E+14
+
+===========================================================
+= PERFORMANCE OVERVIEW
+===========================================================
+Number of requests:             3000
+Average Input Length (tokens):  128.0000
+Average Output Length (tokens): 128.0000
+Token Throughput (tokens/sec):  20685.5510
+Request Throughput (req/sec):   161.6059
+Total Latency (ms):             18563.6825
+
+```
+
+#### Quantization in the PyTorch Flow
+
+In order to run a quantized run with `trtllm-bench` utilizing the PyTorch flow, you will need to use a pre-quantized
+To run a quantized benchmark with `trtllm-bench` utilizing the PyTorch flow, you will need to use a pre-quantized
+checkpoint. For the Llama-3.1 models, TensorRT-LLM provides the following checkpoints via HuggingFace:
+
+- [`nvidia/Llama-3.1-8B-Instruct-FP8`](https://huggingface.co/nvidia/Llama-3.1-8B-Instruct-FP8)
+- [`nvidia/Llama-3.1-70B-Instruct-FP8`](https://huggingface.co/nvidia/Llama-3.1-70B-Instruct-FP8)
+- [`nvidia/Llama-3.1-405B-Instruct-FP8`](https://huggingface.co/nvidia/Llama-3.1-405B-Instruct-FP8)
+
+`trtllm-bench` utilizes the `hf_quant_config.json` file present in the pre-quantized checkpoints above. The configuration
+file is present in checkpoints quantized with [TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer)
+and describes the compute and KV cache quantization that checkpoint was compiled with. For example, from the checkpoints
+above:
+
+```json
+{
+    "producer": {
+        "name": "modelopt",
+        "version": "0.23.0rc1"
+    },
+    "quantization": {
+        "quant_algo": "FP8",
+        "kv_cache_quant_algo": null
+    }
+```
+
+The checkpoints above are quantized to run with a compute precision of `FP8` and default to no KV cache quantization (full
+`FP16` cache). When running `trtllm-bench throughput`. The benchmark will select a KV cache quantization that is best suited
+for the compute precision in the checkpoint automatically if `kv_cache_quant_algo` is specified as `null`, otherwise it will
+be forced to match the specified non-null KV cache quantization. The following are the mappings that `trtllm-bench` will
+follow when a checkpoint does not specify a KV cache quantization algorithm:
+
+| Checkpoint Compute Quant | Checkpoint KV Cache Quant | `trtllm-bench` | Note |
+| - | - | - | - |
+| `null` | `null` | `null` | In this case, a quantization config doesn't exist. |
+| `FP8` | `FP8` | `FP8` | Matches the checkpoint |
+| `FP8` | `null` | `FP8` | Set to `FP8` via benchmark |
+| `NVFP4` | `null` | `FP8` | Set to `FP8` via benchmark |
+
+If you would like to force the KV cache quantizaton, you can specify the following in the YAML file to force the precision
+when the checkpoint precision is `null`:
+
+```yaml
+pytorch_backend_config:
+  kv_cache_dtype: "fp8"
+```
+
+```{tip}
+The two valid values for `kv_cache_dtype` are `auto` and `fp8`.
 ```
 
 ## Low Latency Benchmark
 
-The low latency benchmark follows a similar workflow to the [throughput benchmark](#running-a-max-throughput-benchmark)
+The low latency benchmark follows a similar workflow to the [throughput benchmark](#max-throughput-benchmark)
 but requires building the engine separately from `trtllm-bench`. Low latency benchmarks has the following modes:
 
 - A single-request low-latency engine
@@ -423,7 +553,7 @@ env TRTLLM_ENABLE_MMHA_MULTI_BLOCK_DEBUG=1 \
   --engine_dir /tmp/meta-llama/Meta-Llama-3-70B/engine
 ```
 
-#### Building a Medusa Low-Latency Engine
+### Building a Medusa Low-Latency Engine
 
 To build a Medusa-enabled engine requires checkpoints that contain Medusa heads.
 NVIDIA provides TensorRT-LLM checkpoints on the [NVIDIA](https://huggingface.co/nvidia) page on Hugging Face.

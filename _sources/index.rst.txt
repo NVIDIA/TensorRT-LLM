@@ -14,6 +14,7 @@ Welcome to TensorRT-LLM's Documentation!
    overview.md
    quick-start-guide.md
    key-features.md
+   torch.md
    release-notes.md
 
 
@@ -115,7 +116,7 @@ Welcome to TensorRT-LLM's Documentation!
 
    performance/perf-overview.md
    Benchmarking <performance/perf-benchmarking.md>
-   Best Practices <performance/perf-best-practices.md>
+   Best Practices <performance/introduction.md>
    performance/perf-analysis.md
 
 

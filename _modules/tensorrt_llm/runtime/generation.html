@@ -47,6 +47,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../quick-start-guide.html">Quick Start Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../torch.html">PyTorch Backend</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../release-notes.html">Release Notes</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Installation</span></p>
@@ -116,7 +117,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-best-practices.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/introduction.html">Best Practices</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -1205,7 +1206,7 @@
             <span class="n">expected_tensor_names</span> <span class="o">+=</span> <span class="p">[</span>
                 <span class="s1">&#39;spec_decoding_generation_lengths&#39;</span><span class="p">,</span>
                 <span class="s1">&#39;spec_decoding_position_offsets&#39;</span><span class="p">,</span> <span class="s1">&#39;spec_decoding_packed_mask&#39;</span><span class="p">,</span>
-                <span class="s1">&#39;medusa_logits&#39;</span>
+                <span class="s1">&#39;spec_decoding_use&#39;</span><span class="p">,</span> <span class="s1">&#39;medusa_logits&#39;</span>
             <span class="p">]</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_redrafter_mode</span><span class="p">:</span>
@@ -1794,6 +1795,7 @@
         <span class="c1"># Note: spec_decoding_packed_mask has no paddings in the first dimension.</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">spec_decoding_packed_mask</span> <span class="o">=</span> <span class="n">medusa_info</span><span class="o">.</span><span class="n">medusa_packed_mask</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span>
             <span class="mi">0</span><span class="p">)</span><span class="o">.</span><span class="n">expand</span><span class="p">(</span><span class="n">target_shape</span><span class="p">)</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">target_shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span><span class="o">.</span><span class="n">cuda</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">spec_decoding_use</span> <span class="o">=</span> <span class="n">medusa_info</span><span class="o">.</span><span class="n">medusa_spec_decoding_use</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">medusa_paths</span> <span class="o">=</span> <span class="n">medusa_info</span><span class="o">.</span><span class="n">medusa_paths</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">medusa_tree_ids</span> <span class="o">=</span> <span class="n">medusa_info</span><span class="o">.</span><span class="n">medusa_tree_ids</span>
@@ -2149,6 +2151,7 @@
                 <span class="s1">&#39;spec_decoding_position_offsets&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">spec_decoding_position_offsets</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">buffer</span><span class="p">[</span>
                 <span class="s1">&#39;spec_decoding_generation_lengths&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">spec_decoding_generation_lengths</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">buffer</span><span class="p">[</span><span class="s1">&#39;spec_decoding_use&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">spec_decoding_use</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">buffer_allocated</span> <span class="o">=</span> <span class="kc">True</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_medusa_mode</span><span class="p">:</span>
             <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_draft_tokens</span></div>
@@ -2503,6 +2506,7 @@
                        <span class="s1">&#39;spec_decoding_position_offsets&#39;</span><span class="p">)</span>
             <span class="n">add_tensor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">buffer</span><span class="p">[</span><span class="s1">&#39;spec_decoding_generation_lengths&#39;</span><span class="p">],</span>
                        <span class="s1">&#39;spec_decoding_generation_lengths&#39;</span><span class="p">)</span>
+            <span class="n">add_tensor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">buffer</span><span class="p">[</span><span class="s1">&#39;spec_decoding_use&#39;</span><span class="p">],</span> <span class="s1">&#39;spec_decoding_use&#39;</span><span class="p">)</span>
 
         <span class="k">return</span> <span class="n">tensors</span>
 
@@ -2845,6 +2849,7 @@
                        <span class="s1">&#39;spec_decoding_position_offsets&#39;</span><span class="p">)</span>
             <span class="n">add_tensor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">buffer</span><span class="p">[</span><span class="s1">&#39;spec_decoding_generation_lengths&#39;</span><span class="p">],</span>
                        <span class="s1">&#39;spec_decoding_generation_lengths&#39;</span><span class="p">)</span>
+            <span class="n">add_tensor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">buffer</span><span class="p">[</span><span class="s1">&#39;spec_decoding_use&#39;</span><span class="p">],</span> <span class="s1">&#39;spec_decoding_use&#39;</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_redrafter_mode</span><span class="p">:</span>
             <span class="n">set_redrafter_gen_tensors</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">batch_size</span><span class="p">,</span> <span class="n">add_tensor</span><span class="p">,</span>
@@ -3316,11 +3321,11 @@
                 <span class="n">b</span><span class="p">,</span> <span class="p">:</span><span class="bp">self</span><span class="o">.</span><span class="n">accept_lengths</span><span class="p">[</span><span class="n">b</span><span class="p">]]</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">end_ids</span><span class="p">[</span><span class="n">b</span><span class="p">]</span>
             <span class="n">should_stop_with_end_id</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">any</span><span class="p">(</span><span class="n">end_id_mask</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">medusa_should_stop</span><span class="p">[</span><span class="n">b</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">medusa_should_stop</span><span class="p">[</span><span class="n">b</span><span class="p">]</span> <span class="ow">or</span> <span class="p">(</span>
-                <span class="n">prev_total_output_length</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">accept_lengths</span><span class="p">[</span><span class="n">b</span><span class="p">]</span> <span class="o">&gt;=</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">max_new_tokens</span><span class="p">)</span> <span class="ow">or</span> <span class="n">should_stop_with_end_id</span>
+                <span class="n">prev_total_output_length</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">accept_lengths</span><span class="p">[</span><span class="n">b</span><span class="p">]</span>
+                <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_new_tokens</span><span class="p">)</span> <span class="ow">or</span> <span class="n">should_stop_with_end_id</span>
             <span class="c1"># update accept lengths for the current step.</span>
-            <span class="k">if</span> <span class="p">(</span><span class="n">prev_total_output_length</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">accept_lengths</span><span class="p">[</span><span class="n">b</span><span class="p">]</span> <span class="o">&gt;=</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">max_new_tokens</span><span class="p">):</span>
+            <span class="k">if</span> <span class="p">(</span><span class="n">prev_total_output_length</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">accept_lengths</span><span class="p">[</span><span class="n">b</span><span class="p">]</span>
+                    <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_new_tokens</span><span class="p">):</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">accept_lengths</span><span class="p">[</span><span class="n">b</span><span class="p">]</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">max_new_tokens</span> <span class="o">-</span> <span class="n">prev_total_output_length</span><span class="p">,</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">accept_lengths</span><span class="p">[</span><span class="n">b</span><span class="p">])</span>
@@ -4800,7 +4805,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fed39fd3c40>
+<jinja2.runtime.BlockReference object at 0x7f657dea7aa0>
 
 <div class="footer">
     <p>

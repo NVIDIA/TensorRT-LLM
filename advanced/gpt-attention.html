@@ -50,6 +50,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../torch.html">PyTorch Backend</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Installation</span></p>
@@ -153,7 +154,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../performance/perf-best-practices.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/introduction.html">Best Practices</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -304,7 +305,7 @@ is one model that it supports.</p>
 <ul class="simple">
 <li><p>FP16 / BF16 compute data type.</p></li>
 <li><p>FP16 / BF16 / FP8 / INT8 KV cache data type.</p></li>
-<li><p>Paged KV cache (64 / 128 tokens per block).</p></li>
+<li><p>Paged KV cache (8 / 16 / 32 / 64 / 128 tokens per block).</p></li>
 </ul>
 <p>This is default enabled. To disable this, you need to use the
 flag <code class="docutils literal notranslate"><span class="pre">--disable_xqa</span></code> when building the engines. Note that a heuristic algorithm
@@ -345,7 +346,7 @@ which is expected to increase the total throughput. Chunking contexts also remov
 constraints on input length. To enable this feature, the FMHA paged kv-cache also
 needs to be enabled. Except for the last one, the size of the context chunk needs
 to be an integer multiple of the kv-cache block size. Refer to
-<a class="reference internal" href="../performance/perf-best-practices.html#chunked-context"><span class="std std-ref">the performance best practices</span></a> for usage.</p>
+<a class="reference internal" href="#../performance/perf-best-practices.md#chunked-context"><span class="xref myst">the performance best practices</span></a> for usage.</p>
 </section>
 <section id="kv-cache">
 <h2>KV Cache<a class="headerlink" href="#kv-cache" title="Link to this heading"></a></h2>
@@ -522,7 +523,7 @@ is computed as:</p>
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fed1539fbb0>
+<jinja2.runtime.BlockReference object at 0x7f658d0bd8e0>
 
 <div class="footer">
     <p>
