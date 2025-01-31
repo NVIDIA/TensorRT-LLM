@@ -47,6 +47,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../quick-start-guide.html">Quick Start Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../torch.html">PyTorch Backend</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../release-notes.html">Release Notes</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Installation</span></p>
@@ -116,7 +117,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-best-practices.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/introduction.html">Best Practices</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -176,6 +177,7 @@
 <span class="c1"># limitations under the License.</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">argparse</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">ctypes</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">platform</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections</span><span class="w"> </span><span class="kn">import</span> <span class="n">OrderedDict</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">asdict</span><span class="p">,</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span><span class="p">,</span> <span class="n">fields</span>
@@ -187,6 +189,7 @@
 <span class="kn">import</span><span class="w"> </span><span class="nn">tensorrt</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">trt</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">.._ipc_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">IpcMemory</span><span class="p">,</span> <span class="n">can_access_peer</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">get_sm_version</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..bindings.internal.runtime</span><span class="w"> </span><span class="kn">import</span> <span class="n">lamport_initialize_all</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..logger</span><span class="w"> </span><span class="kn">import</span> <span class="n">logger</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..mapping</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
@@ -243,7 +246,7 @@
 <span class="n">PLUGIN_DTYPE_OPTIONS_MAP</span> <span class="o">=</span> <span class="p">{</span>
     <span class="s2">&quot;gemm_swiglu_plugin&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;fp8&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">],</span>
     <span class="s2">&quot;gemm_plugin&quot;</span><span class="p">:</span>
-    <span class="p">[</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span> <span class="s2">&quot;float16&quot;</span><span class="p">,</span> <span class="s2">&quot;float32&quot;</span><span class="p">,</span> <span class="s2">&quot;bfloat16&quot;</span><span class="p">,</span> <span class="s2">&quot;int32&quot;</span><span class="p">,</span> <span class="s2">&quot;fp8&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">],</span>
+    <span class="p">[</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span> <span class="s2">&quot;float16&quot;</span><span class="p">,</span> <span class="s2">&quot;float32&quot;</span><span class="p">,</span> <span class="s2">&quot;bfloat16&quot;</span><span class="p">,</span> <span class="s2">&quot;int32&quot;</span><span class="p">,</span> <span class="s2">&quot;fp8&quot;</span><span class="p">,</span> <span class="s2">&quot;nvfp4&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">],</span>
     <span class="s2">&quot;low_latency_gemm_plugin&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;fp8&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">],</span>
     <span class="s2">&quot;low_latency_gemm_swiglu_plugin&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;fp8&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">],</span>
 <span class="p">}</span>
@@ -338,6 +341,7 @@
             <span class="s2">&quot;Note: it&#39;s only affective for non-quantized gemm operations (except FP8).&quot;</span>
             <span class="s2">&quot;Note: For FP8, it also requires same calibration in checkpoint.&quot;</span>
         <span class="p">})</span>
+    <span class="n">_explicitly_disable_gemm_plugin</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="n">_gemm_swiglu_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
@@ -599,7 +603,15 @@
 
     <span class="nd">@classmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">from_arguments</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">args</span><span class="p">:</span> <span class="n">argparse</span><span class="o">.</span><span class="n">Namespace</span><span class="p">):</span>
-        <span class="k">return</span> <span class="bp">cls</span><span class="o">.</span><span class="n">from_dict</span><span class="p">(</span><span class="nb">vars</span><span class="p">(</span><span class="n">args</span><span class="p">))</span>
+        <span class="n">args</span> <span class="o">=</span> <span class="nb">vars</span><span class="p">(</span><span class="n">args</span><span class="p">)</span>
+        <span class="n">obj</span> <span class="o">=</span> <span class="bp">cls</span><span class="o">.</span><span class="n">from_dict</span><span class="p">(</span><span class="n">args</span><span class="p">)</span>
+
+        <span class="c1"># We want to know if the user explicitly disabled the gemm_plugin</span>
+        <span class="c1"># because nvfp4 gemm uses plugin by default currently</span>
+        <span class="k">if</span> <span class="s1">&#39;gemm_plugin&#39;</span> <span class="ow">in</span> <span class="n">args</span> <span class="ow">and</span> <span class="n">args</span><span class="p">[</span><span class="s1">&#39;gemm_plugin&#39;</span><span class="p">]</span> <span class="o">==</span> <span class="s1">&#39;disable&#39;</span><span class="p">:</span>
+            <span class="n">obj</span><span class="o">.</span><span class="n">_explicitly_disable_gemm_plugin</span> <span class="o">=</span> <span class="kc">True</span>
+
+        <span class="k">return</span> <span class="n">obj</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">to_dict</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="n">config</span> <span class="o">=</span> <span class="n">asdict</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span>
@@ -626,6 +638,23 @@
             <span class="k">elif</span> <span class="n">field</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="nb">bool</span> <span class="ow">or</span> <span class="n">field_name</span> <span class="o">==</span> <span class="s1">&#39;paged_kv_cache&#39;</span><span class="p">:</span>
                 <span class="nb">setattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">field_name</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span></div>
 
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="n">unsupported_plugins</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="c1"># bert_attention_plugin is handled within BertAttention</span>
+            <span class="mi">100</span><span class="p">:</span> <span class="p">[</span>
+                <span class="s1">&#39;gemm_swiglu_plugin&#39;</span><span class="p">,</span> <span class="s1">&#39;fp8_rowwise_gemm_plugin&#39;</span><span class="p">,</span>
+                <span class="s1">&#39;low_latency_gemm_plugin&#39;</span><span class="p">,</span> <span class="s1">&#39;low_latency_gemm_swiglu_plugin&#39;</span><span class="p">,</span>
+                <span class="s1">&#39;bert_context_fmha_fp32_acc&#39;</span>
+            <span class="p">]</span>
+        <span class="p">}</span>
+        <span class="n">sm</span> <span class="o">=</span> <span class="n">get_sm_version</span><span class="p">()</span>
+        <span class="k">if</span> <span class="n">sm</span> <span class="ow">in</span> <span class="n">unsupported_plugins</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">plugin</span> <span class="ow">in</span> <span class="n">unsupported_plugins</span><span class="p">[</span><span class="n">sm</span><span class="p">]:</span>
+                <span class="n">val</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">plugin</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">val</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">val</span> <span class="o">!=</span> <span class="kc">False</span><span class="p">:</span>
+                    <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span>
+                        <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">plugin</span><span class="si">}</span><span class="s2">=</span><span class="si">{</span><span class="n">val</span><span class="si">}</span><span class="s2"> is not supported on SM </span><span class="si">{</span><span class="n">sm</span><span class="si">}</span><span class="s2">.&quot;</span><span class="p">)</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">context_fmha_type</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
@@ -686,6 +715,10 @@
     <span class="k">def</span><span class="w"> </span><span class="nf">set_nccl_plugin</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;auto&quot;</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">nccl_plugin</span> <span class="o">=</span> <span class="n">dtype</span>
         <span class="n">init_all_reduce_helper</span><span class="p">()</span>
+        <span class="k">return</span> <span class="bp">self</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">set_lora_plugin</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">lora_plugin</span> <span class="o">=</span> <span class="n">dtype</span>
         <span class="k">return</span> <span class="bp">self</span></div>
 
 
@@ -738,10 +771,14 @@
             <span class="n">plugin_dtype_options</span> <span class="o">=</span> <span class="n">DEFAULT_PLUGIN_DTYPE_OPTIONS</span>
             <span class="k">if</span> <span class="n">field_name</span> <span class="ow">in</span> <span class="n">PLUGIN_DTYPE_OPTIONS_MAP</span><span class="p">:</span>
                 <span class="n">plugin_dtype_options</span> <span class="o">=</span> <span class="n">PLUGIN_DTYPE_OPTIONS_MAP</span><span class="p">[</span><span class="n">field_name</span><span class="p">]</span>
+            <span class="k">if</span> <span class="n">field_name</span> <span class="o">==</span> <span class="s2">&quot;gemm_plugin&quot;</span><span class="p">:</span>
+                <span class="n">default</span> <span class="o">=</span> <span class="n">field</span><span class="o">.</span><span class="n">default</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">default</span> <span class="o">=</span> <span class="n">field</span><span class="o">.</span><span class="n">default</span> <span class="k">if</span> <span class="n">field</span><span class="o">.</span><span class="n">default</span> <span class="k">else</span> <span class="s2">&quot;disable&quot;</span>
             <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span>
                 <span class="s2">&quot;--&quot;</span> <span class="o">+</span> <span class="n">field_name</span><span class="p">,</span>
                 <span class="nb">type</span><span class="o">=</span><span class="nb">str</span><span class="p">,</span>
-                <span class="n">default</span><span class="o">=</span><span class="n">field</span><span class="o">.</span><span class="n">default</span> <span class="k">if</span> <span class="n">field</span><span class="o">.</span><span class="n">default</span> <span class="k">else</span> <span class="s2">&quot;disable&quot;</span><span class="p">,</span>
+                <span class="n">default</span><span class="o">=</span><span class="n">default</span><span class="p">,</span>
                 <span class="n">choices</span><span class="o">=</span><span class="p">[</span><span class="n">x</span> <span class="k">if</span> <span class="n">x</span> <span class="k">else</span> <span class="s2">&quot;disable&quot;</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">plugin_dtype_options</span><span class="p">],</span>
                 <span class="n">help</span><span class="o">=</span><span class="n">help_message</span><span class="p">)</span>
         <span class="k">elif</span> <span class="n">field</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="nb">bool</span><span class="p">:</span>
@@ -757,6 +794,11 @@
                                 <span class="n">default</span><span class="o">=</span><span class="n">field</span><span class="o">.</span><span class="n">default</span><span class="p">,</span>
                                 <span class="n">help</span><span class="o">=</span><span class="n">help_message</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">parser</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">force_all_reduce_deterministic</span><span class="p">():</span>
+    <span class="k">return</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">&quot;FORCE_DETERMINISTIC&quot;</span><span class="p">,</span> <span class="s2">&quot;0&quot;</span><span class="p">)</span> <span class="o">==</span> <span class="s2">&quot;1&quot;</span> <span class="ow">or</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span>
+        <span class="s2">&quot;FORCE_ALL_REDUCE_DETERMINISTIC&quot;</span><span class="p">,</span> <span class="s2">&quot;0&quot;</span><span class="p">)</span> <span class="o">==</span> <span class="s2">&quot;1&quot;</span>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">CustomAllReduceHelper</span><span class="p">:</span>
@@ -800,6 +842,10 @@
 
     <span class="nd">@staticmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">max_workspace_size_auto</span><span class="p">(</span><span class="n">tp_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">force_all_reduce_deterministic</span><span class="p">():</span>
+            <span class="n">workspace_size</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">&quot;FORCE_ALLREDUCE_KERNEL_WORKSPACE_SIZE&quot;</span><span class="p">,</span>
+                                       <span class="s2">&quot;1000000000&quot;</span><span class="p">)</span>
+            <span class="k">return</span> <span class="nb">int</span><span class="p">(</span><span class="n">workspace_size</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">tp_size</span> <span class="o">&lt;=</span> <span class="mi">2</span><span class="p">:</span>
             <span class="k">return</span> <span class="mi">16_000_000</span>
         <span class="k">return</span> <span class="mi">8_000_000</span>
@@ -808,10 +854,14 @@
     <span class="k">def</span><span class="w"> </span><span class="nf">allocate_workspace</span><span class="p">(</span><span class="n">mapping</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">,</span>
                            <span class="n">size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="n">IpcMemory</span><span class="p">],</span> <span class="s2">&quot;torch.tensor&quot;</span><span class="p">]:</span>
         <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+
+        <span class="c1"># Force pull mode and disable lamport when force deterministic is enabled, for reducing device memory usage.</span>
+        <span class="n">force_deterministic</span> <span class="o">=</span> <span class="n">force_all_reduce_deterministic</span><span class="p">()</span>
         <span class="n">is_p2p_supported</span> <span class="o">=</span> <span class="n">can_access_peer</span><span class="p">(</span><span class="n">mapping</span><span class="p">)</span>
-        <span class="n">ipc_buffers_ping</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">size</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
+        <span class="n">ipc_buffers_size</span> <span class="o">=</span> <span class="n">size</span> <span class="k">if</span> <span class="n">force_deterministic</span> <span class="k">else</span> <span class="n">size</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span>
+        <span class="n">ipc_buffers_ping</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">ipc_buffers_size</span><span class="p">,</span>
                                      <span class="n">is_p2p_supported</span><span class="p">)</span>
-        <span class="n">ipc_buffers_pong</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">size</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
+        <span class="n">ipc_buffers_pong</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">ipc_buffers_size</span><span class="p">,</span>
                                      <span class="n">is_p2p_supported</span><span class="p">)</span>
         <span class="n">ipc_barriers_in</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span>
             <span class="n">mapping</span><span class="p">,</span> <span class="n">IpcMemory</span><span class="o">.</span><span class="n">IPC_BARRIERS_SIZE_PER_GPU</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">*</span> <span class="mi">2</span><span class="p">,</span>
@@ -819,11 +869,12 @@
         <span class="n">ipc_barriers_out</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span>
             <span class="n">mapping</span><span class="p">,</span> <span class="n">IpcMemory</span><span class="o">.</span><span class="n">IPC_BARRIERS_SIZE_PER_GPU</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">*</span> <span class="mi">2</span><span class="p">,</span>
             <span class="n">is_p2p_supported</span><span class="p">)</span>
-        <span class="n">lamport_buffers_0</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">size</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
+        <span class="n">lamport_buffers_size</span> <span class="o">=</span> <span class="mi">1</span> <span class="k">if</span> <span class="n">force_deterministic</span> <span class="k">else</span> <span class="n">size</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span>
+        <span class="n">lamport_buffers_0</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">lamport_buffers_size</span><span class="p">,</span>
                                       <span class="n">is_p2p_supported</span><span class="p">)</span>
-        <span class="n">lamport_buffers_1</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">size</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
+        <span class="n">lamport_buffers_1</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">lamport_buffers_size</span><span class="p">,</span>
                                       <span class="n">is_p2p_supported</span><span class="p">)</span>
-        <span class="n">lamport_buffers_2</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">size</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
+        <span class="n">lamport_buffers_2</span> <span class="o">=</span> <span class="n">IpcMemory</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="n">lamport_buffers_size</span><span class="p">,</span>
                                       <span class="n">is_p2p_supported</span><span class="p">)</span>
         <span class="n">rank</span> <span class="o">=</span> <span class="n">mapping</span><span class="o">.</span><span class="n">rank</span>
         <span class="n">tp_rank</span> <span class="o">=</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_rank</span>
@@ -870,7 +921,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fed248fd870>
+<jinja2.runtime.BlockReference object at 0x7f657e08f320>
 
 <div class="footer">
     <p>

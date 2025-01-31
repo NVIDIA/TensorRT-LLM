@@ -50,6 +50,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../torch.html">PyTorch Backend</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Installation</span></p>
@@ -129,7 +130,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../performance/perf-best-practices.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/introduction.html">Best Practices</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -199,14 +200,15 @@ This API is under development and might have breaking changes in the future.</p>
 <li><p><strong>Local Hugging Face models</strong>: Uses a locally stored Hugging Face model.</p></li>
 <li><p><strong>Local TensorRT-LLM engine</strong>: Built by <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> tool or saved by the Python LLM API.</p></li>
 </ol>
-<p>You can use any of these formats interchangeably with the <code class="docutils literal notranslate"><span class="pre">LLM(model=&lt;any-model-path&gt;)</span></code> constructor.
-The following sections describe how to use these different formats for the LLM API.</p>
+<p>Any of these formats can be used interchangeably with the <code class="docutils literal notranslate"><span class="pre">LLM(model=&lt;any-model-path&gt;)</span></code> constructor.</p>
+<p>The following sections describe how to use these different formats for the LLM API.</p>
 <section id="hugging-face-hub">
 <h3>Hugging Face Hub<a class="headerlink" href="#hugging-face-hub" title="Link to this heading"></a></h3>
 <p>Using the Hugging Face Hub is as simple as specifying the repo name in the LLM constructor:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">)</span>
 </pre></div>
 </div>
+<p>You can also directly load TensorRT Model Optimizer’s <a class="reference external" href="https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4">quantized checkpoints</a> on Hugging Face Hub in the same way.</p>
 </section>
 <section id="local-hugging-face-models">
 <h3>Local Hugging Face Models<a class="headerlink" href="#local-hugging-face-models" title="Link to this heading"></a></h3>
@@ -224,17 +226,16 @@ To use the API with Llama 3.1 models, download the model from the <a class="refe
 </section>
 <section id="local-tensorrt-llm-engine">
 <h3>Local TensorRT-LLM Engine<a class="headerlink" href="#local-tensorrt-llm-engine" title="Link to this heading"></a></h3>
-<p>The LLM API can use a TensorRT-LLM engine.
-There are two ways to build a TensorRT-LLM engine:</p>
+<p>There are two ways to build a TensorRT-LLM engine:</p>
 <ol class="arabic">
 <li><p>You can build the TensorRT-LLM engine from the Hugging Face model directly with the <a class="reference internal" href="../commands/trtllm-build.html"><span class="std std-doc"><code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code></span></a> tool and then save the engine to disk for later use.
 Refer to the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama">README</a> in the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama"><code class="docutils literal notranslate"><span class="pre">examples/llama</span></code></a> repository on GitHub.</p>
-<p>After the engine building is finished, you can load the model:</p>
+<p>After the engine building is finished, we can load the model:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=&lt;</span><span class="n">path_to_trt_engine</span><span class="o">&gt;</span><span class="p">)</span>
 </pre></div>
 </div>
 </li>
-<li><p>Alternatively, you can use an <code class="docutils literal notranslate"><span class="pre">LLM</span></code> instance to create the engine and persist to local disk:</p>
+<li><p>Use an <code class="docutils literal notranslate"><span class="pre">LLM</span></code> instance to create the engine and persist to local disk:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="o">&lt;</span><span class="n">model</span><span class="o">-</span><span class="n">path</span><span class="o">&gt;</span><span class="p">)</span>
 
 <span class="c1"># Save engine to local disk</span>
@@ -284,7 +285,7 @@ Refer to the <a class="reference external" href="https://github.com/NVIDIA/Tenso
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fed14883fa0>
+<jinja2.runtime.BlockReference object at 0x7f658c9701d0>
 
 <div class="footer">
     <p>

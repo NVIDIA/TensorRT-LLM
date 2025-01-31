@@ -47,6 +47,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../quick-start-guide.html">Quick Start Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../torch.html">PyTorch Backend</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../release-notes.html">Release Notes</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Installation</span></p>
@@ -116,7 +117,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-best-practices.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/introduction.html">Best Practices</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -211,8 +212,7 @@
                                  <span class="n">ExtendedRuntimePerfKnobConfig</span><span class="p">,</span> <span class="n">KvCacheConfig</span><span class="p">,</span>
                                  <span class="n">LookaheadDecodingConfig</span><span class="p">,</span> <span class="n">PeftCacheConfig</span><span class="p">,</span>
                                  <span class="n">SchedulerConfig</span><span class="p">)</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..builder</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">BuildConfig</span><span class="p">,</span> <span class="n">Engine</span><span class="p">,</span> <span class="n">EngineConfig</span><span class="p">,</span> <span class="n">_init_max_seq_len</span><span class="p">,</span>
-                       <span class="n">build</span><span class="p">)</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..builder</span><span class="w"> </span><span class="kn">import</span> <span class="n">BuildConfig</span><span class="p">,</span> <span class="n">Engine</span><span class="p">,</span> <span class="n">EngineConfig</span><span class="p">,</span> <span class="n">build</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..logger</span><span class="w"> </span><span class="kn">import</span> <span class="n">logger</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..mapping</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..models.automodel</span><span class="w"> </span><span class="kn">import</span> <span class="n">MODEL_MAP</span><span class="p">,</span> <span class="n">AutoConfig</span><span class="p">,</span> <span class="n">AutoModelForCausalLM</span>
@@ -238,6 +238,7 @@
     <span class="n">cp_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
     <span class="n">moe_tp_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
     <span class="n">moe_ep_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
+    <span class="n">cp_config</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
     <span class="n">auto_parallel</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
     <span class="n">_world_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
@@ -259,6 +260,7 @@
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">world_size</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">auto_parallel</span><span class="p">:</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">pp_size</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">cp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
                 <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
@@ -278,14 +280,23 @@
         <span class="k">elif</span> <span class="p">(</span><span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">auto_parallel</span>
               <span class="p">)</span> <span class="ow">and</span> <span class="n">world_size</span> <span class="o">!=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">pp_size</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">cp_size</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">&quot;world_size </span><span class="si">{</span><span class="n">world_size</span><span class="si">}</span><span class="s2"> should be equal to tp_size * pp_size * cp_size </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="bp">self</span><span class="o">.</span><span class="n">pp_size</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="bp">self</span><span class="o">.</span><span class="n">cp_size</span><span class="si">}</span><span class="s2"> &quot;</span>
-                <span class="s2">&quot;in non-auto_parallel mode.</span><span class="se">\n</span><span class="s2">&quot;</span>
-                <span class="s2">&quot;For non-auto-parallel mode, the world_size is not needed to set&quot;</span>
+                <span class="sa">f</span><span class="s2">&quot;world_size </span><span class="si">{</span><span class="n">world_size</span><span class="si">}</span><span class="s2"> should be equal to tp_size * pp_size </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="bp">self</span><span class="o">.</span><span class="n">pp_size</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="bp">self</span><span class="o">.</span><span class="n">cp_size</span><span class="si">}</span><span class="s2"> &quot;</span>
             <span class="p">)</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">is_multi_gpu</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">world_size</span> <span class="o">&gt;</span> <span class="mi">1</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">to_mapping</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Mapping</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">Mapping</span><span class="p">(</span><span class="n">world_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">world_size</span><span class="p">,</span>
+                       <span class="n">rank</span><span class="o">=</span><span class="n">mpi_rank</span><span class="p">(),</span>
+                       <span class="n">tp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
+                       <span class="n">pp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">pp_size</span><span class="p">,</span>
+                       <span class="n">cp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">cp_size</span><span class="p">,</span>
+                       <span class="n">cp_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">cp_config</span><span class="p">,</span>
+                       <span class="n">moe_tp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_tp_size</span><span class="p">,</span>
+                       <span class="n">moe_ep_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_ep_size</span><span class="p">,</span>
+                       <span class="n">auto_parallel</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">auto_parallel</span><span class="p">)</span>
 
 
 <div class="viewcode-block" id="CalibConfig">
@@ -565,6 +576,8 @@
 
     <span class="n">moe_expert_parallel_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
 
+    <span class="n">cp_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
+
     <span class="n">auto_parallel</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
     <span class="n">auto_parallel_world_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
@@ -641,6 +654,8 @@
     <span class="n">max_batch_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">max_num_tokens</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
 
+    <span class="c1"># backend to use</span>
+    <span class="n">backend</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="c1"># TODO[chunweiy]: Enable this option in the future</span>
@@ -653,7 +668,7 @@
         <span class="k">else</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span> <span class="o">=</span> <span class="n">tokenizer_factory</span><span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">,</span>
-                <span class="n">rust_remote_code</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">trust_remote_code</span><span class="p">,</span>
+                <span class="n">trust_remote_code</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">trust_remote_code</span><span class="p">,</span>
                 <span class="n">use_fast</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tokenizer_mode</span> <span class="o">!=</span> <span class="s1">&#39;slow&#39;</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">get_device_properties</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span><span class="o">.</span><span class="n">major</span> <span class="o">&lt;</span> <span class="mi">8</span><span class="p">:</span>
@@ -674,6 +689,7 @@
             <span class="n">cp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">context_parallel_size</span><span class="p">,</span>
             <span class="n">moe_tp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_tensor_parallel_size</span><span class="p">,</span>
             <span class="n">moe_ep_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_expert_parallel_size</span><span class="p">,</span>
+            <span class="n">cp_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">cp_config</span><span class="p">,</span>
             <span class="n">auto_parallel</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">auto_parallel</span><span class="p">)</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">auto_parallel</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">world_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">auto_parallel_world_size</span>
@@ -743,7 +759,8 @@
         <span class="n">speculative_model_obj</span> <span class="o">=</span> <span class="n">_ModelWrapper</span><span class="p">(</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">speculative_model</span>
         <span class="p">)</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_model</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
-        <span class="k">if</span> <span class="n">model_obj</span><span class="o">.</span><span class="n">is_local_model</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">model_obj</span><span class="o">.</span><span class="n">is_local_model</span> <span class="ow">and</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s1">&#39;backend&#39;</span><span class="p">,</span>
+                                                <span class="kc">None</span><span class="p">)</span> <span class="o">!=</span> <span class="s1">&#39;pytorch&#39;</span><span class="p">:</span>
             <span class="c1"># Load parallel_config from the engine.</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">model_format</span> <span class="o">=</span> <span class="n">ModelLoader</span><span class="o">.</span><span class="n">get_model_format</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">)</span>
 
@@ -1177,19 +1194,8 @@
             <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">speculative_model</span>
         <span class="p">)</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">speculative_model</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">convert_checkpoint_options</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">_convert_checkpoint_options</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">rank</span> <span class="o">=</span> <span class="n">mpi_rank</span><span class="p">()</span> <span class="k">if</span> <span class="n">llm_args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">is_multi_gpu</span> <span class="k">else</span> <span class="mi">0</span>
-        <span class="k">if</span> <span class="n">llm_args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">is_multi_gpu</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">llm_args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">auto_parallel</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span> <span class="o">=</span> <span class="n">Mapping</span><span class="p">(</span>
-                <span class="n">tp_size</span><span class="o">=</span><span class="n">llm_args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
-                <span class="n">pp_size</span><span class="o">=</span><span class="n">llm_args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">pp_size</span><span class="p">,</span>
-                <span class="n">cp_size</span><span class="o">=</span><span class="n">llm_args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">cp_size</span><span class="p">,</span>
-                <span class="n">moe_tp_size</span><span class="o">=</span><span class="n">llm_args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">moe_tp_size</span><span class="p">,</span>
-                <span class="n">moe_ep_size</span><span class="o">=</span><span class="n">llm_args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">moe_ep_size</span><span class="p">,</span>
-                <span class="n">rank</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">rank</span><span class="p">,</span>
-                <span class="n">world_size</span><span class="o">=</span><span class="n">llm_args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">world_size</span><span class="p">,</span>
-            <span class="p">)</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span> <span class="o">=</span> <span class="n">Mapping</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">rank</span> <span class="o">=</span> <span class="n">mpi_rank</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span> <span class="o">=</span> <span class="n">llm_args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">to_mapping</span><span class="p">()</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_build_pipeline</span> <span class="o">=</span> <span class="p">[]</span>
 
@@ -1198,7 +1204,7 @@
             <span class="n">Path</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_obj</span><span class="o">.</span><span class="n">model_dir</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_obj</span><span class="o">.</span><span class="n">is_local_model</span> <span class="k">else</span> <span class="kc">None</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_speculative_model_dir</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span>
-            <span class="n">PATH</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_model_obj</span><span class="o">.</span><span class="n">model_dir</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_model_obj</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_obj</span><span class="o">.</span><span class="n">is_local_model</span> <span class="k">else</span> <span class="kc">None</span>
+            <span class="n">Path</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_model_obj</span><span class="o">.</span><span class="n">model_dir</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_model_obj</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_obj</span><span class="o">.</span><span class="n">is_local_model</span> <span class="k">else</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_model_info</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">_ModelInfo</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_model_format</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">model_format</span>
 
@@ -1448,7 +1454,8 @@
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_model_obj</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_speculative_model_dir</span> <span class="o">=</span> <span class="n">mpi_broadcast</span><span class="p">(</span><span class="n">speculative_model_dir</span><span class="p">,</span>
                                                         <span class="n">root</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">speculative_model_dir</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_speculative_model_dir</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">speculative_model_obj</span><span class="o">.</span><span class="n">model_dir</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_speculative_model_dir</span>
+
             <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_model_obj</span><span class="o">.</span><span class="n">is_local_model</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_load_model_from_hf</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
@@ -1458,6 +1465,52 @@
             <span class="bp">self</span><span class="o">.</span><span class="n">_model_dir</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">trust_remote_code</span><span class="p">,</span>
             <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="p">,</span> <span class="s2">&quot;speculative_model&quot;</span><span class="p">)</span>
             <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">speculative_model</span><span class="p">)</span>
+
+        <span class="c1"># Update quant_config if it&#39;s ModelOpt quantized ckpt</span>
+        <span class="n">user_quant_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">quant_config</span>
+        <span class="n">hf_quant_config_path</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_model_dir</span><span class="p">)</span> <span class="o">/</span> <span class="s2">&quot;hf_quant_config.json&quot;</span>
+        <span class="k">if</span> <span class="n">hf_quant_config_path</span><span class="o">.</span><span class="n">exists</span><span class="p">():</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;Found </span><span class="si">{</span><span class="n">hf_quant_config_path</span><span class="si">}</span><span class="s2">, pre-quantized checkpoints are used.&quot;</span>
+            <span class="p">)</span>
+            <span class="n">already_quantized</span> <span class="o">=</span> <span class="kc">True</span>
+            <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">hf_quant_config_path</span><span class="p">,</span> <span class="s2">&quot;r&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                <span class="n">hf_quant_config</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
+                <span class="n">hf_quant_algo</span> <span class="o">=</span> <span class="n">hf_quant_config</span><span class="p">[</span><span class="s2">&quot;quantization&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
+                    <span class="s2">&quot;quant_algo&quot;</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">hf_quant_algo</span> <span class="o">==</span> <span class="s2">&quot;FP8&quot;</span> <span class="ow">and</span> <span class="n">user_quant_config</span><span class="o">.</span><span class="n">quant_algo</span> \
+                        <span class="ow">and</span> <span class="n">user_quant_config</span><span class="o">.</span><span class="n">quant_algo</span> <span class="o">!=</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8</span><span class="p">:</span>
+                    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                        <span class="sa">f</span><span class="s2">&quot;Expecting quant_algo to be FP8, got </span><span class="si">{</span><span class="n">user_quant_config</span><span class="o">.</span><span class="n">quant_algo</span><span class="si">}</span><span class="s2">.&quot;</span>
+                    <span class="p">)</span>
+                <span class="n">user_quant_config</span><span class="o">.</span><span class="n">quant_algo</span> <span class="o">=</span> <span class="n">hf_quant_algo</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;quant_algo is set to </span><span class="si">{</span><span class="n">hf_quant_algo</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+                <span class="n">hf_kv_cache_quant_algo</span> <span class="o">=</span> <span class="n">hf_quant_config</span><span class="p">[</span><span class="s2">&quot;quantization&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
+                    <span class="s2">&quot;kv_cache_quant_algo&quot;</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">hf_kv_cache_quant_algo</span> <span class="o">!=</span> <span class="n">user_quant_config</span><span class="o">.</span><span class="n">kv_cache_quant_algo</span><span class="p">:</span>
+                    <span class="k">if</span> <span class="n">user_quant_config</span><span class="o">.</span><span class="n">kv_cache_quant_algo</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                        <span class="n">user_quant_config</span><span class="o">.</span><span class="n">kv_cache_quant_algo</span> <span class="o">=</span> <span class="n">hf_kv_cache_quant_algo</span>
+                        <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+                            <span class="sa">f</span><span class="s2">&quot;kv_cache_quant_algo is set to </span><span class="si">{</span><span class="n">hf_kv_cache_quant_algo</span><span class="si">}</span><span class="s2">&quot;</span>
+                        <span class="p">)</span>
+                    <span class="k">elif</span> <span class="n">user_quant_config</span><span class="o">.</span><span class="n">kv_cache_quant_algo</span> <span class="o">==</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8</span> <span class="ow">and</span> <span class="n">hf_kv_cache_quant_algo</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                        <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                            <span class="sa">f</span><span class="s2">&quot;User specified kv_cache_quant_algo </span><span class="si">{</span><span class="n">user_quant_config</span><span class="o">.</span><span class="n">kv_cache_quant_algo</span><span class="si">}</span><span class="s2"> &quot;</span>
+                            <span class="sa">f</span><span class="s2">&quot;will overwrite </span><span class="si">{</span><span class="n">hf_kv_cache_quant_algo</span><span class="si">}</span><span class="s2"> from </span><span class="si">{</span><span class="n">hf_quant_config_path</span><span class="si">}</span><span class="s2">.&quot;</span>
+                        <span class="p">)</span>
+                    <span class="k">else</span><span class="p">:</span>
+                        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                            <span class="sa">f</span><span class="s2">&quot;User specified kv_cache_quant_algo </span><span class="si">{</span><span class="n">user_quant_config</span><span class="o">.</span><span class="n">kv_cache_quant_algo</span><span class="si">}</span><span class="s2">, &quot;</span>
+                            <span class="sa">f</span><span class="s2">&quot;while it&#39;s </span><span class="si">{</span><span class="n">hf_kv_cache_quant_algo</span><span class="si">}</span><span class="s2"> in </span><span class="si">{</span><span class="n">hf_quant_config_path</span><span class="si">}</span><span class="s2">.&quot;</span>
+                        <span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">already_quantized</span> <span class="o">=</span> <span class="kc">False</span>
+
+        <span class="c1"># FP4 Gemm force to use plugin.</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">quant_config</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_nvfp4</span><span class="p">():</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gemm_plugin</span> <span class="o">=</span> <span class="s2">&quot;nvfp4&quot;</span>
+
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">load_format</span> <span class="o">==</span> <span class="s1">&#39;dummy&#39;</span><span class="p">:</span>
             <span class="n">config</span> <span class="o">=</span> <span class="n">model_cls</span><span class="o">.</span><span class="n">config_class</span><span class="o">.</span><span class="n">from_hugging_face</span><span class="p">(</span>
                 <span class="nb">str</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_model_dir</span><span class="p">),</span>
@@ -1467,7 +1520,7 @@
                 <span class="o">**</span><span class="bp">self</span><span class="o">.</span><span class="n">convert_checkpoint_options</span><span class="p">,</span>
             <span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">model</span> <span class="o">=</span> <span class="n">model_cls</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
-        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">quant_config</span><span class="o">.</span><span class="n">requires_calibration</span><span class="p">:</span>
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">quant_config</span><span class="o">.</span><span class="n">requires_calibration</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">already_quantized</span><span class="p">:</span>
             <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">workspace</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
             <span class="n">checkpoint_dir</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">workspace</span><span class="si">}</span><span class="s2">/quantized-checkpoint&quot;</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">rank</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
@@ -1663,7 +1716,23 @@
                 <span class="p">)</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">llm_build_stats</span><span class="o">.</span><span class="n">engine_dir</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_loader</span><span class="o">.</span><span class="n">model_obj</span><span class="o">.</span><span class="n">model_dir</span>
                 <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_build_stats</span><span class="o">.</span><span class="n">engine_dir</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.pyexecutor.backend_registries.backend_registry</span><span class="w"> </span><span class="kn">import</span> \
+            <span class="n">get_backend_info</span>
+        <span class="k">if</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">backend</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">and</span> <span class="n">get_backend_info</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">backend</span><span class="p">,</span> <span class="s1">&#39;need_hf_model&#39;</span><span class="p">):</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_loader</span><span class="o">.</span><span class="n">model_obj</span><span class="o">.</span><span class="n">is_hub_model</span><span class="p">:</span>
+                <span class="n">hf_folder</span> <span class="o">=</span> <span class="n">download_hf_model</span><span class="p">(</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">model_loader</span><span class="o">.</span><span class="n">model_obj</span><span class="o">.</span><span class="n">model_name</span><span class="p">,</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">revision</span><span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span> <span class="o">=</span> <span class="n">hf_folder</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_loader</span><span class="o">.</span><span class="n">model_obj</span><span class="o">.</span><span class="n">model_dir</span>
 
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">quant_config</span><span class="o">.</span><span class="n">quant_algo</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                    <span class="s2">&quot;QuantConfig for pytorch backend is ignored. You can load&quot;</span>
+                    <span class="s2">&quot;quantized model with hf_quant_config.json directly.&quot;</span><span class="p">)</span>
+            <span class="k">return</span> <span class="kc">None</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span>
 
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_build_model</span><span class="p">(),</span> <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span>
 
@@ -1722,10 +1791,7 @@
         <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
         <span class="k">return</span> <span class="n">AutoConfig</span><span class="o">.</span><span class="n">from_hugging_face</span><span class="p">(</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span><span class="p">,</span>
-            <span class="n">mapping</span><span class="o">=</span><span class="n">Mapping</span><span class="p">(</span><span class="n">world_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">world_size</span><span class="p">,</span>
-                            <span class="n">tp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
-                            <span class="n">pp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">pp_size</span><span class="p">,</span>
-                            <span class="n">cp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">cp_size</span><span class="p">),</span>
+            <span class="n">mapping</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">to_mapping</span><span class="p">(),</span>
             <span class="n">quant_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">quant_config</span><span class="p">,</span>
             <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
 
@@ -1848,7 +1914,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fed137ceb30>
+<jinja2.runtime.BlockReference object at 0x7f657e7eae40>
 
 <div class="footer">
     <p>

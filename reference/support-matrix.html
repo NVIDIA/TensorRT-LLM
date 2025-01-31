@@ -50,6 +50,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../torch.html">PyTorch Backend</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Installation</span></p>
@@ -119,7 +120,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../performance/perf-best-practices.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/introduction.html">Best Practices</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -197,13 +198,14 @@
 <li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gptj">GPT-J</a></p></li>
 <li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt">GPT-Nemo</a></p></li>
 <li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gptneox">GPT-NeoX</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/granite">Granite-3.0</a></p></li>
 <li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/grok">Grok-1</a></p></li>
 <li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/internlm">InternLM</a></p></li>
 <li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/internlm2">InternLM2</a></p></li>
 <li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama">LLaMA/LLaMA 2/LLaMA 3/LLaMA 3.1</a></p></li>
 <li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mamba">Mamba</a></p></li>
 <li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec">mBART</a></p></li>
-<li><p>[Minitron] (https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/nemotron)</p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/nemotron">Minitron</a></p></li>
 <li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama">Mistral</a></p></li>
 <li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama">Mistral NeMo</a></p></li>
 <li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mixtral">Mixtral</a></p></li>
@@ -215,7 +217,7 @@
 <li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/qwen">Qwen/Qwen1.5/Qwen2</a></p></li>
 <li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/qwenvl">Qwen-VL</a></p></li>
 <li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/recurrentgemma">RecurrentGemma</a></p></li>
-<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mpt">Replit Code</a><a href="#id9"><span class="problematic" id="id3">[^ReplitCode]</span></a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mpt">Replit Code</a> <a class="footnote-reference brackets" href="#replitcode" id="id3" role="doc-noteref"><span class="fn-bracket">[</span>2<span class="fn-bracket">]</span></a></p></li>
 <li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/bert">RoBERTa</a></p></li>
 <li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt">SantaCoder</a></p></li>
 <li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/skywork">Skywork</a></p></li>
@@ -226,11 +228,11 @@
 </ul>
 </section>
 <section id="multi-modal-models">
-<h3>Multi-Modal Models <a class="footnote-reference brackets" href="#multimod" id="id4" role="doc-noteref"><span class="fn-bracket">[</span>2<span class="fn-bracket">]</span></a><a class="headerlink" href="#multi-modal-models" title="Link to this heading"></a></h3>
+<h3>Multi-Modal Models <a class="footnote-reference brackets" href="#multimod" id="id4" role="doc-noteref"><span class="fn-bracket">[</span>3<span class="fn-bracket">]</span></a><a class="headerlink" href="#multi-modal-models" title="Link to this heading"></a></h3>
 <ul class="simple">
 <li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">BLIP2 w/ OPT</a></p></li>
 <li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">BLIP2 w/ T5</a></p></li>
-<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">CogVLM</a> <a class="footnote-reference brackets" href="#bf16only" id="id5" role="doc-noteref"><span class="fn-bracket">[</span>3<span class="fn-bracket">]</span></a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">CogVLM</a> <a class="footnote-reference brackets" href="#bf16only" id="id5" role="doc-noteref"><span class="fn-bracket">[</span>4<span class="fn-bracket">]</span></a></p></li>
 <li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">Deplot</a></p></li>
 <li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">Fuyu</a></p></li>
 <li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">Kosmos</a></p></li>
@@ -242,6 +244,8 @@
 <li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">Phi-3-vision</a></p></li>
 <li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">Video NeVA</a></p></li>
 <li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">VILA</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">MLLaMA</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal">LLama 3.2 VLM</a></p></li>
 </ul>
 </section>
 </section>
@@ -266,6 +270,7 @@ In addition, older architectures can have limitations for newer software release
 </tr>
 <tr class="row-odd"><td><p>GPU Model Architectures</p></td>
 <td><ul class="simple">
+<li><p><a class="reference external" href="https://www.nvidia.com/en-us/data-center/technologies/blackwell-architecture/">NVIDIA Blackwell Architecture</a></p></li>
 <li><p><a class="reference external" href="https://www.nvidia.com/en-us/data-center/grace-hopper-superchip/">NVIDIA Grace Hopper Superchip</a></p></li>
 <li><p><a class="reference external" href="https://www.nvidia.com/en-us/data-center/technologies/hopper-architecture/">NVIDIA Hopper Architecture</a></p></li>
 <li><p><a class="reference external" href="https://www.nvidia.com/en-us/technologies/ada-architecture/">NVIDIA Ada Lovelace Architecture</a></p></li>
@@ -291,22 +296,21 @@ In addition, older architectures can have limitations for newer software release
 </thead>
 <tbody>
 <tr class="row-even"><td><p>Container</p></td>
-<td><p><a class="reference external" href="https://docs.nvidia.com/deeplearning/frameworks/support-matrix/index.html">24.11</a></p></td>
+<td><p><a class="reference external" href="https://docs.nvidia.com/deeplearning/frameworks/support-matrix/index.html">25.01</a></p></td>
 </tr>
 <tr class="row-odd"><td><p>TensorRT</p></td>
-<td><p><a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/release-notes/index.html">10.7</a></p></td>
+<td><p><a class="reference external" href="https://docs.nvidia.com/deeplearning/tensorrt/release-notes/index.html">10.8</a></p></td>
 </tr>
 <tr class="row-even"><td><p>Precision</p></td>
 <td><ul class="simple">
 <li><p>Hopper (SM90) - FP32, FP16, BF16, FP8, INT8, INT4</p></li>
 <li><p>Ada Lovelace (SM89) - FP32, FP16, BF16, FP8, INT8, INT4</p></li>
-<li><p>Ampere (SM80, SM86) - FP32, FP16, BF16, INT8, INT4<a class="footnote-reference brackets" href="#smgte89" id="id6" role="doc-noteref"><span class="fn-bracket">[</span>4<span class="fn-bracket">]</span></a></p></li>
+<li><p>Ampere (SM80, SM86) - FP32, FP16, BF16, INT8, INT4<a class="footnote-reference brackets" href="#smgte89" id="id6" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></li>
 </ul>
 </td>
 </tr>
 </tbody>
 </table>
-<p><a href="#id10"><span class="problematic" id="id7">[^ReplitCode]</span></a>：Replit Code is not supported with the transformers 4.45+.</p>
 <div class="admonition note">
 <p class="admonition-title">Note</p>
 <p>Support for FP8 and quantized data types (INT8 or INT4) is not implemented for all the models. Refer to <a class="reference internal" href="precision.html#precision"><span class="std std-ref">Numerical Precision</span></a> and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples">examples</a> folder for additional information.</p>
@@ -319,16 +323,20 @@ In addition, older architectures can have limitations for newer software release
 <span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id2">1</a><span class="fn-bracket">]</span></span>
 <p>Encoder-Decoder provides general encoder-decoder functionality that supports many encoder-decoder models such as T5 family, BART family, Whisper family, NMT family, and so on.</p>
 </aside>
+<aside class="footnote brackets" id="replitcode" role="doc-footnote">
+<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id3">2</a><span class="fn-bracket">]</span></span>
+<p>Replit Code is not supported with the transformers 4.45+.</p>
+</aside>
 <aside class="footnote brackets" id="multimod" role="doc-footnote">
-<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id4">2</a><span class="fn-bracket">]</span></span>
+<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id4">3</a><span class="fn-bracket">]</span></span>
 <p>Multi-modal provides general multi-modal functionality that supports many multi-modal architectures such as BLIP2 family, LLaVA family, and so on.</p>
 </aside>
 <aside class="footnote brackets" id="bf16only" role="doc-footnote">
-<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id5">3</a><span class="fn-bracket">]</span></span>
+<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id5">4</a><span class="fn-bracket">]</span></span>
 <p>Only supports bfloat16 precision.</p>
 </aside>
 <aside class="footnote brackets" id="smgte89" role="doc-footnote">
-<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id6">4</a><span class="fn-bracket">]</span></span>
+<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id6">5</a><span class="fn-bracket">]</span></span>
 <p>INT4 AWQ and GPTQ with FP8 activations require SM &gt;= 89.</p>
 </aside>
 </aside>
@@ -344,7 +352,7 @@ In addition, older architectures can have limitations for newer software release
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fed12eff610>
+<jinja2.runtime.BlockReference object at 0x7f657edafb30>
 
 <div class="footer">
     <p>

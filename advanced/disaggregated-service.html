@@ -50,6 +50,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../torch.html">PyTorch Backend</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Installation</span></p>
@@ -115,6 +116,7 @@
 <li class="toctree-l1"><a class="reference internal" href="speculative-decoding.html">Speculative Sampling</a></li>
 <li class="toctree-l1 current"><a class="current reference internal" href="#">Disaggregated-Service (experimental)</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="#usage">Usage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#example">Example</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#benchmarks">Benchmarks</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#troubleshooting-and-faq">Troubleshooting and FAQ</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="#general-faqs">General FAQs</a></li>
@@ -128,7 +130,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../performance/perf-best-practices.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/introduction.html">Best Practices</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -190,8 +192,8 @@ This feature is currently experimental, and the related API is subjected to chan
 <span class="p">};</span>
 </pre></div>
 </div>
-<p>The TRT-LLM executor can execute three types of requests: <code class="docutils literal notranslate"><span class="pre">REQUEST_TYPE_CONTEXT_AND_GENERATION</span></code>, <code class="docutils literal notranslate"><span class="pre">REQUEST_TYPE_CONTEXT_ONLY</span></code>, and <code class="docutils literal notranslate"><span class="pre">REQUEST_TYPE_GENERATION_ONLY</span></code>. Executor executes the context phase of the context-only request and the generation phase of the generation-only request. When the executor completes the context phase of a context-only request, it will maintain the corresponding kvCache, which will be requested by the executor handling the subsequent generation-only request.</p>
-<p>Note that the environment variable <code class="docutils literal notranslate"><span class="pre">TRTLLM_USE_MPI_KVCACHE=1</span></code> should be set for executing context-only request or generation-only request.</p>
+<p>The TRT-LLM executor can execute three types of requests: <code class="docutils literal notranslate"><span class="pre">REQUEST_TYPE_CONTEXT_AND_GENERATION</span></code>, <code class="docutils literal notranslate"><span class="pre">REQUEST_TYPE_CONTEXT_ONLY</span></code>, and <code class="docutils literal notranslate"><span class="pre">REQUEST_TYPE_GENERATION_ONLY</span></code>. An executor instance could execute the context phase of the context-only request or the generation phase of the generation-only request. When the executor completes the context phase of a context-only request, it maintains the corresponding kvCache, which will be requested by the executor for the subsequent generation-only request.</p>
+<p>Note that the environment variable <code class="docutils literal notranslate"><span class="pre">TRTLLM_USE_MPI_KVCACHE=1</span></code> should be set for <code class="docutils literal notranslate"><span class="pre">disaggregated-service</span></code>.</p>
 <p>Here are some key APIs to use disaggregated service:</p>
 <div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="n">Request</span><span class="w"> </span><span class="n">request</span><span class="p">{...};</span>
 
@@ -199,23 +201,28 @@ This feature is currently experimental, and the related API is subjected to chan
 
 <span class="k">auto</span><span class="w"> </span><span class="n">contextRequestId</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">contextExecutor</span><span class="p">.</span><span class="n">enqueueRequest</span><span class="p">(</span><span class="n">request</span><span class="p">);</span>
 
-<span class="k">auto</span><span class="w"> </span><span class="n">contextResposnes</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">contextExecutor</span><span class="p">.</span><span class="n">awaitResponses</span><span class="p">(</span><span class="n">contextRequestId</span><span class="p">);</span>
+<span class="k">auto</span><span class="w"> </span><span class="n">contextResponses</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">contextExecutor</span><span class="p">.</span><span class="n">awaitResponses</span><span class="p">(</span><span class="n">contextRequestId</span><span class="p">);</span>
 
-<span class="k">auto</span><span class="w"> </span><span class="n">contextPhaseParams</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">contextResposnes</span><span class="p">.</span><span class="n">back</span><span class="p">().</span><span class="n">getResult</span><span class="p">().</span><span class="n">contextPhaseParams</span><span class="p">.</span><span class="n">value</span><span class="p">();</span>
+<span class="k">auto</span><span class="w"> </span><span class="n">contextPhaseParams</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">contextResponses</span><span class="p">.</span><span class="n">back</span><span class="p">().</span><span class="n">getResult</span><span class="p">().</span><span class="n">contextPhaseParams</span><span class="p">.</span><span class="n">value</span><span class="p">();</span>
 
 <span class="n">request</span><span class="p">.</span><span class="n">setContextPhaseParams</span><span class="p">(</span><span class="n">contextPhaseParams</span><span class="p">);</span>
+
 <span class="n">request</span><span class="p">.</span><span class="n">setRequestType</span><span class="p">(</span><span class="n">tensorrt_llm</span><span class="o">::</span><span class="n">executor</span><span class="o">::</span><span class="n">RequestType</span><span class="o">::</span><span class="n">REQUEST_TYPE_GENERATION_ONLY</span><span class="p">);</span>
 
 <span class="k">auto</span><span class="w"> </span><span class="n">generationRequestId</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">generationExecutor</span><span class="p">.</span><span class="n">enqueueRequest</span><span class="p">(</span><span class="n">request</span><span class="p">);</span>
 
-<span class="k">auto</span><span class="w"> </span><span class="n">genResposnes</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">generationExecutor</span><span class="p">.</span><span class="n">awaitResponses</span><span class="p">(</span><span class="n">generationRequestId</span><span class="p">);</span>
+<span class="k">auto</span><span class="w"> </span><span class="n">genResponses</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">generationExecutor</span><span class="p">.</span><span class="n">awaitResponses</span><span class="p">(</span><span class="n">generationRequestId</span><span class="p">);</span>
 </pre></div>
 </div>
 <p>The generationExecutor will require data such as kvCache from the corresponding contextExecutor based on the <code class="docutils literal notranslate"><span class="pre">contextPhaseParams</span></code> attached to the request, so please make sure that the corresponding contextExecutor is not shut down before getting the generationExecutor’s response.</p>
-<p>In the code above, the <code class="docutils literal notranslate"><span class="pre">requestId</span></code> assigned to a request by different executors may be different, it is the user’s responsibility to manage the mapping of the <code class="docutils literal notranslate"><span class="pre">requestId</span></code> for context-only requests to the <code class="docutils literal notranslate"><span class="pre">requestId</span></code> for generation-only requests.</p>
+<p>In the code example above, the <code class="docutils literal notranslate"><span class="pre">contextRequestId</span></code> assigned by the contextExecutor and the <code class="docutils literal notranslate"><span class="pre">generationRequestId</span></code> assigned by the generationExecutor are independent, it is the user’s responsibility to manage the mapping of the <code class="docutils literal notranslate"><span class="pre">requestId</span></code> for context-only requests to the <code class="docutils literal notranslate"><span class="pre">requestId</span></code> for generation-only requests. The <code class="docutils literal notranslate"><span class="pre">contextResponses</span></code> contains the first output token generated by the context phase, and the <code class="docutils literal notranslate"><span class="pre">genResponses</span></code> also contains the first output token generated by the contextExecutor,  so all output tokens can be obtained from generationExecutor’s responses.</p>
 <p><img alt="disaggregated-service usage" src="../_images/disaggregated-service_usage.png" /></p>
-<p>An <code class="docutils literal notranslate"><span class="pre">orchestrator</span></code> is required in <code class="docutils literal notranslate"><span class="pre">disaggregated-service</span></code> to manage multiple executor instance and route requests to different executors, TRT-LLM provides class <code class="docutils literal notranslate"><span class="pre">DisaggExecutorOrchestrator</span></code> in <code class="docutils literal notranslate"><span class="pre">cpp/include/tensorrt_llm/executor/disaggServerUtil.h</span></code> to help user to launch multiple executor instances, however, <code class="docutils literal notranslate"><span class="pre">DisaggExecutorOrchestrator</span></code> only routes requests to executors in a simple round-robin policy, users need to implement their own orchestrator for disaggregated-service based on their business.</p>
-<p>TRT-LLM currently implements kvCache transfer using <code class="docutils literal notranslate"><span class="pre">CUDA-aware</span> <span class="pre">MPI</span></code>, and all executor processes involved need to hold same MPI world communicator. Therefore, TRT-LLM only supports launching multiple executors using <code class="docutils literal notranslate"><span class="pre">MPI</span></code>, and the <code class="docutils literal notranslate"><span class="pre">CommunicationMode</span></code> of the executors must be set to <code class="docutils literal notranslate"><span class="pre">KLEADER</span></code> or <code class="docutils literal notranslate"><span class="pre">kORCHESTRATOR</span></code> with <code class="docutils literal notranslate"><span class="pre">SpawnProcesses=false</span></code> for <code class="docutils literal notranslate"><span class="pre">disaggregated-service</span></code>, TRT-LLM will relax this restriction in future version to manage executors with greater ease.</p>
+<p>An <code class="docutils literal notranslate"><span class="pre">orchestrator</span></code> is required in <code class="docutils literal notranslate"><span class="pre">disaggregated-service</span></code> to manage multiple executor instances and route requests to different executors, TRT-LLM provides class <code class="docutils literal notranslate"><span class="pre">DisaggExecutorOrchestrator</span></code> in <code class="docutils literal notranslate"><span class="pre">cpp/include/tensorrt_llm/executor/disaggServerUtil.h</span></code> to launch multiple executor instances, however, <code class="docutils literal notranslate"><span class="pre">DisaggExecutorOrchestrator</span></code> only routes requests to executors in a simple round-robin policy, users need to implement their own orchestrator for disaggregated-service based on their usage scenario.</p>
+<p>TRT-LLM currently implements kvCache transfer using <code class="docutils literal notranslate"><span class="pre">CUDA-aware</span> <span class="pre">MPI</span></code>, and all executor processes involved need to hold the same MPI world communicator. Therefore, TRT-LLM only supports launching multiple executors using <code class="docutils literal notranslate"><span class="pre">MPI</span></code>, and the <code class="docutils literal notranslate"><span class="pre">CommunicationMode</span></code> of the executors must be set to <code class="docutils literal notranslate"><span class="pre">kLEADER</span></code> or <code class="docutils literal notranslate"><span class="pre">kORCHESTRATOR</span></code> with <code class="docutils literal notranslate"><span class="pre">SpawnProcesses=false</span></code> for <code class="docutils literal notranslate"><span class="pre">disaggregated-service</span></code>, TRT-LLM will relax this restriction in future version to manage executors with greater ease.</p>
+</section>
+<section id="example">
+<h2>Example<a class="headerlink" href="#example" title="Link to this heading"></a></h2>
+<p>Please refer to <code class="docutils literal notranslate"><span class="pre">examples/cpp/executor/executorExampleDisaggregated.cpp</span></code></p>
 </section>
 <section id="benchmarks">
 <h2>Benchmarks<a class="headerlink" href="#benchmarks" title="Link to this heading"></a></h2>
@@ -225,20 +232,20 @@ This feature is currently experimental, and the related API is subjected to chan
 <h2>Troubleshooting and FAQ<a class="headerlink" href="#troubleshooting-and-faq" title="Link to this heading"></a></h2>
 <section id="general-faqs">
 <h3>General FAQs<a class="headerlink" href="#general-faqs" title="Link to this heading"></a></h3>
-<p><em>Q. What are the limitations of disaggregated service in TRT-LLM?</em></p>
+<p><em>Q. What are the limitations of disaggregated-service in TRT-LLM?</em></p>
 <p>A. Currently, only <code class="docutils literal notranslate"><span class="pre">decoder-only</span> <span class="pre">engine</span></code> and <code class="docutils literal notranslate"><span class="pre">beamWidth=1</span></code> are supported, and the kvCache at each layer of the model is required to be homogeneous, with the same data type and the same number of attention headers.</p>
-<p><em>Q. Is the engine used by disaggregated_service any different from other engines?</em></p>
-<p>A. No. There are no special requirements for the arguments of the engine build.</p>
-<p><em>Q. Do the engine used by the context executor and generation executor need to be the same?</em></p>
-<p>A. No. The engine used by context executor and generation executor can be different, and their parallelism can be heterogeneous, i.e., TP,PP can be different, and TRT-LLM will handle the heterogeneity of kvCache.</p>
+<p><em>Q. Is the engine used by disaggregated-service different from other engines?</em></p>
+<p>A. No. There are no special requirements for the arguments to build engine.</p>
+<p><em>Q. Do the engines used by the context executor and generation executor need to be the same?</em></p>
+<p>A. No. The engines used by context executor and generation executor can be different, and their parallelism can be heterogeneous, i.e., TP,PP can be different, and TRT-LLM will handle the heterogeneity of kvCache.</p>
 <p><em>Q. Does TRT-LLM support running multiple context executor instances and generation executor instances?</em></p>
 <p>A. Yes. TRT-LLM supports running multiple context executors and generation executors at the same time, and each executor can use different engine, but it is the user’s responsibility to route requests to different executors and  manage <code class="docutils literal notranslate"><span class="pre">requestId</span></code>.</p>
-<p><em>Q. Can an executor run both context-only requests and generation-only requests?</em></p>
-<p>A. Yes, but it’s not recommended, and it’s better to run context-only requests and generation-only requests on different executors.</p>
-<p><em>Q. Does disaggregated-Service in TRT-LLM support multi-gpu and multi-node?</em></p>
-<p>A. Yes, it’s recommended that different executor use different GPUs . We support context-only executor and genertion-only executor run on same node or different node. The <code class="docutils literal notranslate"><span class="pre">participantIds</span></code> and <code class="docutils literal notranslate"><span class="pre">deviceIds</span></code> used by each executor need to be explicitly set by the user, and the <code class="docutils literal notranslate"><span class="pre">participantIds</span></code> of each executor must not be intersecting.</p>
+<p><em>Q. Can an executor handle both context-only requests and generation-only requests?</em></p>
+<p>A. Yes, but it’s not recommended, TRT-LLM does not implement proper scheduling for the case where the executor handles mixed context-only requests and generation-only requests, it’s better to run context-only requests and generation-only requests on different executors.</p>
+<p><em>Q. Does disaggregated-service in TRT-LLM support multi-gpu and multi-node?</em></p>
+<p>A. Yes, it’s recommended that different executor use different GPUs . We support context-only executor and genertion-only executor run on same node or different nodes. The <code class="docutils literal notranslate"><span class="pre">participantIds</span></code> and <code class="docutils literal notranslate"><span class="pre">deviceIds</span></code> used by each executor need to be explicitly set by the user, and the <code class="docutils literal notranslate"><span class="pre">participantIds</span></code> of each executor must not be intersecting.</p>
 <p><em>Q. What’s the requirement for disaggregated-service in TRT-LLM?</em></p>
-<p>A. TRT-LLM requires <code class="docutils literal notranslate"><span class="pre">UCX</span></code>-backend <code class="docutils literal notranslate"><span class="pre">CUDA-aware-MPI</span></code> currently, TRT-LLM implement kvCache transfer with <a class="reference external" href="https://docs.open-mpi.org/en/v5.0.x/tuning-apps/networking/cuda.html#how-do-i-build-open-mpi-with-cuda-aware-support"><code class="docutils literal notranslate"><span class="pre">CUDA-aware</span> <span class="pre">MPI</span></code></a>, and will support more communication components for kvCache transfer in future version.</p>
+<p>A. TRT-LLM requires <code class="docutils literal notranslate"><span class="pre">UCX</span></code>-backend <code class="docutils literal notranslate"><span class="pre">CUDA-aware</span> <span class="pre">MPI</span></code> currently, TRT-LLM implements kvCache transfer with <a class="reference external" href="https://docs.open-mpi.org/en/v5.0.x/tuning-apps/networking/cuda.html#how-do-i-build-open-mpi-with-cuda-aware-support"><code class="docutils literal notranslate"><span class="pre">CUDA-aware</span> <span class="pre">MPI</span></code></a>, and will support more communication components for kvCache transfer in future version.</p>
 </section>
 <section id="debugging-faqs">
 <h3>Debugging FAQs<a class="headerlink" href="#debugging-faqs" title="Link to this heading"></a></h3>
@@ -248,13 +255,9 @@ This feature is currently experimental, and the related API is subjected to chan
 </pre></div>
 </div>
 <p><em>Q. Why do some profiling tools show that TRT-LLM’s kvCache transfer does not utilize NVLink even on devices equipped with NVLink?</em></p>
-<p>A. Ensure run TRT-LLM with <code class="docutils literal notranslate"><span class="pre">UCX</span></code>-backend <code class="docutils literal notranslate"><span class="pre">CUDA-aware-MPI</span></code> ,and check version of <code class="docutils literal notranslate"><span class="pre">UCX</span></code> with <code class="docutils literal notranslate"><span class="pre">ucx_info</span> <span class="pre">-v</span></code>.
-If version of UCX &lt;=1.17, set <code class="docutils literal notranslate"><span class="pre">UCX_RNDV_FRAG_MEM_TYPE=cuda</span></code> to enable NVLink.
-If version of UCX =1.18, set <code class="docutils literal notranslate"><span class="pre">UCX_CUDA_COPY_ASYNC_MEM_TYPE=cuda</span></code> and <code class="docutils literal notranslate"><span class="pre">UCX_CUDA_COPY_DMABUF=no</span></code></p>
-<p><em>Q. Why is the token-token latency for generation-only requests unstable?</em></p>
-<p>A. The current version of TRT-LLM does not implement the overlap between kvCache transfers and engine compute for generation-only requests, which will be fixed in a future release.</p>
-<p><em>Q. How to handle error <code class="docutils literal notranslate"><span class="pre">All</span> <span class="pre">available</span> <span class="pre">sequence</span> <span class="pre">slots</span> <span class="pre">are</span> <span class="pre">used</span></code>?</em></p>
-<p>A. If generation_engine’s pp_size &gt;1, the error “All available sequence slots are used” may occur, will be fixed in a future release.</p>
+<p>A. Ensure TRT-LLM is running with <code class="docutils literal notranslate"><span class="pre">UCX</span></code>-backend <code class="docutils literal notranslate"><span class="pre">CUDA-aware</span> <span class="pre">MPI</span></code> , and check version of <code class="docutils literal notranslate"><span class="pre">UCX</span></code> with <code class="docutils literal notranslate"><span class="pre">ucx_info</span> <span class="pre">-v</span></code>.
+If version of UCX &lt;=1.17, set env <code class="docutils literal notranslate"><span class="pre">UCX_RNDV_FRAG_MEM_TYPE=cuda</span></code> and <code class="docutils literal notranslate"><span class="pre">UCX_MEMTYPE_CACHE=n</span></code> to enable NVLink.
+If version of UCX =1.18, set env <code class="docutils literal notranslate"><span class="pre">UCX_CUDA_COPY_ASYNC_MEM_TYPE=cuda</span></code>, <code class="docutils literal notranslate"><span class="pre">UCX_CUDA_COPY_DMABUF=no</span></code> and <code class="docutils literal notranslate"><span class="pre">UCX_MEMTYPE_CACHE=n</span></code>.</p>
 </section>
 </section>
 </section>
@@ -270,7 +273,7 @@ If version of UCX =1.18, set <code class="docutils literal notranslate"><span cl
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fed154cd7e0>
+<jinja2.runtime.BlockReference object at 0x7f658d008c20>
 
 <div class="footer">
     <p>

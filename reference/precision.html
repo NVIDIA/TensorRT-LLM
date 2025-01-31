@@ -50,6 +50,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../torch.html">PyTorch Backend</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Installation</span></p>
@@ -119,7 +120,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../performance/perf-best-practices.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/introduction.html">Best Practices</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -133,6 +134,7 @@
 <li class="toctree-l2"><a class="reference internal" href="#int4-and-int8-weight-only-w4a16-and-w8a16">INT4 and INT8 Weight-Only (W4A16 and W8A16)</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#gptq-and-awq-w4a16">GPTQ and AWQ (W4A16)</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#fp8-hopper">FP8 (Hopper)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#nvfp4-blackwell">NVFP4 (Blackwell)</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#support-matrix">Support matrix</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#technical-detail-the-quantmode-flags">Technical Detail: The <code class="docutils literal notranslate"><span class="pre">QuantMode</span></code> Flags</a></li>
 </ul>
@@ -272,6 +274,10 @@ are likely to evolve in a future release.</p>
 GPT-J and LLaMA. Those examples can be found in
 <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/examples/quantization">examples/quantization</a>.</p>
 </section>
+<section id="nvfp4-blackwell">
+<h2>NVFP4 (Blackwell)<a class="headerlink" href="#nvfp4-blackwell" title="Link to this heading"></a></h2>
+<p>LLama and Mixtral can run in NVFP4 datatype. Those examples can be found in Llama examples.</p>
+</section>
 <section id="support-matrix">
 <h2>Support matrix<a class="headerlink" href="#support-matrix" title="Link to this heading"></a></h2>
 <p>This release of TensorRT-LLM contains the following examples:</p>
@@ -282,6 +288,7 @@ GPT-J and LLaMA. Those examples can be found in
 <th class="head text-center"><p>FP16</p></th>
 <th class="head text-center"><p>BF16</p></th>
 <th class="head text-center"><p>FP8</p></th>
+<th class="head text-center"><p>NVFP4</p></th>
 <th class="head text-center"><p>W8A8 SQ</p></th>
 <th class="head text-center"><p>W8A16</p></th>
 <th class="head text-center"><p>W4A16</p></th>
@@ -295,6 +302,7 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
@@ -305,6 +313,7 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
@@ -322,12 +331,14 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>BLOOM</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
@@ -338,6 +349,7 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
@@ -355,11 +367,13 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p>ChatGLM-v3</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
@@ -373,6 +387,7 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>.</p></td>
@@ -383,6 +398,7 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
@@ -399,12 +415,14 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p>Gemma</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
@@ -416,6 +434,7 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
@@ -427,6 +446,7 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
@@ -443,11 +463,13 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p>GPT-NeoX</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
@@ -459,6 +481,7 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
@@ -476,8 +499,10 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>LLaMA</p></td>
+<td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
@@ -498,11 +523,13 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>Y</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>Mamba</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
@@ -515,6 +542,7 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
@@ -522,6 +550,7 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>.</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>Mixtral</p></td>
+<td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
@@ -537,6 +566,7 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
@@ -547,6 +577,7 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
@@ -564,11 +595,13 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>Qwen</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
@@ -581,6 +614,7 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
@@ -597,11 +631,13 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p>SantaCoder</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
@@ -619,11 +655,13 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p>StarCoder1</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
@@ -636,6 +674,7 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
@@ -652,11 +691,13 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>Whisper</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
@@ -674,11 +715,13 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
+<td class="text-center"><p>.</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>BLIP2-T5</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
@@ -691,6 +734,7 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
@@ -702,6 +746,7 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
@@ -712,6 +757,7 @@ GPT-J and LLaMA. Those examples can be found in
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
 <td class="text-center"><p>Y</p></td>
+<td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
 <td class="text-center"><p>.</p></td>
@@ -757,7 +803,7 @@ are:</p>
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fed10af9ea0>
+<jinja2.runtime.BlockReference object at 0x7f657edaf200>
 
 <div class="footer">
     <p>

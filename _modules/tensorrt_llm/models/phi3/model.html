@@ -47,6 +47,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../../overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../quick-start-guide.html">Quick Start Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../torch.html">PyTorch Backend</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../release-notes.html">Release Notes</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Installation</span></p>
@@ -116,7 +117,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../../performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../performance/perf-best-practices.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../performance/introduction.html">Best Practices</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -205,8 +206,8 @@
             <span class="n">attention_head_size</span> <span class="o">=</span> <span class="n">hidden_size</span> <span class="o">/</span> <span class="n">num_attention_heads</span>
             <span class="n">q_scaling</span> <span class="o">=</span> <span class="n">attention_head_size</span><span class="o">**</span><span class="mf">.5</span>
 
-            <span class="n">block_sparse</span> <span class="o">=</span> <span class="p">(</span>
-                <span class="p">(</span><span class="n">layer_idx</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">%</span> <span class="n">config</span><span class="o">.</span><span class="n">dense_attention_every_n_layers</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">0</span>
+            <span class="n">block_sparse</span> <span class="o">=</span> <span class="p">((</span><span class="n">layer_idx</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">%</span>
+                            <span class="n">config</span><span class="o">.</span><span class="n">dense_attention_every_n_layers</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">0</span>
             <span class="n">attention_mask_type</span> <span class="o">=</span> <span class="n">AttentionMaskType</span><span class="o">.</span><span class="n">blocksparse</span> <span class="k">if</span> <span class="n">block_sparse</span> <span class="k">else</span> <span class="n">AttentionMaskType</span><span class="o">.</span><span class="n">causal</span>
 
             <span class="n">block_sparse_attn_params</span> <span class="o">=</span> <span class="n">BlockSparseAttnParams</span><span class="p">(</span>
@@ -487,7 +488,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fed248f5c90>
+<jinja2.runtime.BlockReference object at 0x7f657e071fa0>
 
 <div class="footer">
     <p>
