@@ -7,7 +7,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Installing on Windows &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
 
@@ -15,7 +15,7 @@
       <script src="../_static/jquery.js?v=5d32c60e"></script>
       <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../_static/doctools.js?v=9a2dae69"></script>
       <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../_static/copybutton.js?v=65e89d2a"></script>
@@ -50,6 +50,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../torch.html">PyTorch Backend</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Installation</span></p>
@@ -119,7 +120,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../performance/perf-best-practices.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -167,7 +168,7 @@
 <div class="admonition note">
 <p class="admonition-title">Note</p>
 <p>The Windows release of TensorRT-LLM is currently in beta.
-We recommend checking out the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases/tag/v0.16.0">v0.16.0 tag</a> for the most stable experience.</p>
+We recommend checking out the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases/tag/v0.17.0">v0.17.0 tag</a> for the most stable experience.</p>
 </div>
 <div class="admonition note">
 <p class="admonition-title">Note</p>
@@ -180,7 +181,7 @@ We recommend checking out the <a class="reference external" href="https://github
 <ol class="arabic">
 <li><p>Install all dependencies together.</p>
 <ol class="arabic simple">
-<li><p>Run the provided PowerShell script <code class="docutils literal notranslate"><span class="pre">setup_env.ps1</span></code> located under the <code class="docutils literal notranslate"><span class="pre">/windows/</span></code> folder which installs Python and CUDA 12.6.3 automatically with default settings. Run PowerShell as Administrator to use the script.</p></li>
+<li><p>Run the provided PowerShell script <code class="docutils literal notranslate"><span class="pre">setup_env.ps1</span></code> located under the <code class="docutils literal notranslate"><span class="pre">/windows/</span></code> folder which installs Python and CUDA 12.8.0 automatically with default settings. Run PowerShell as Administrator to use the script.</p></li>
 </ol>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>./setup_env.ps1<span class="w"> </span><span class="o">[</span>-skipCUDA<span class="o">]</span><span class="w"> </span><span class="o">[</span>-skipPython<span class="o">]</span>
 </pre></div>
@@ -197,7 +198,7 @@ We recommend checking out the <a class="reference external" href="https://github
 <li><p>Navigate to the installation path <code class="docutils literal notranslate"><span class="pre">%USERPROFILE%\AppData\Local\Programs\Python\Python310</span></code> (<code class="docutils literal notranslate"><span class="pre">AppData</span></code> is a hidden folder) and copy <code class="docutils literal notranslate"><span class="pre">python.exe</span></code> to <code class="docutils literal notranslate"><span class="pre">python3.exe</span></code>.</p></li>
 </ol>
 </li>
-<li><p>Install <a class="reference external" href="https://developer.nvidia.com/cuda-12-6-3-download-archive?target_os=Windows&amp;amp;target_arch=x86_64">CUDA 12.6.3 Toolkit</a>. Use the Express Installation option. Installation may require a restart.</p></li>
+<li><p>Install <a class="reference external" href="https://developer.nvidia.com/cuda-12-8-0-download-archive?target_os=Windows&amp;amp;target_arch=x86_64">CUDA 12.8.0 Toolkit</a>. Use the Express Installation option. Installation may require a restart.</p></li>
 </ol>
 </li>
 </ol>
@@ -218,7 +219,7 @@ pip<span class="w"> </span>uninstall<span class="w"> </span>-y<span class="w"> <
 </pre></div>
 </div>
 <p>before installing TensorRT-LLM with the following command.</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span><span class="nv">tensorrt_llm</span><span class="o">==</span><span class="m">0</span>.16.0<span class="w"> </span>--extra-index-url<span class="w"> </span>https://download.pytorch.org/whl/
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span><span class="nv">tensorrt_llm</span><span class="o">==</span><span class="m">0</span>.17.0.post1<span class="w"> </span>--extra-index-url<span class="w"> </span>https://download.pytorch.org/whl/<span class="w"> </span>--extra-index-url<span class="w"> </span>https://pypi.nvidia.com
 </pre></div>
 </div>
 <p>Run the following command to verify that your TensorRT-LLM installation is working properly.</p>
@@ -253,7 +254,7 @@ and retry. Check the system path to make sure the latest version installed in <c
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fed14ce7850>
+<jinja2.runtime.BlockReference object at 0x7fa25503a5d0>
 
 <div class="footer">
     <p>

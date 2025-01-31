@@ -7,7 +7,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Welcome to TensorRT-LLM’s Documentation! &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="_static/copybutton.css?v=76b2166b" />
 
@@ -15,7 +15,7 @@
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/doctools.js?v=9a2dae69"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="_static/copybutton.js?v=65e89d2a"></script>
@@ -49,6 +49,7 @@
 <li class="toctree-l1"><a class="reference internal" href="overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="quick-start-guide.html">Quick Start Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="torch.html">PyTorch Backend</a></li>
 <li class="toctree-l1"><a class="reference internal" href="release-notes.html">Release Notes</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Installation</span></p>
@@ -118,7 +119,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="performance/perf-best-practices.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="performance/performance-tuning-guide/index.html">Performance Tuning Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -182,7 +183,15 @@
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="torch.html">PyTorch Backend</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="torch.html#quick-start">Quick Start</a></li>
+<li class="toctree-l2"><a class="reference internal" href="torch.html#quantization">Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="torch.html#developer-guide">Developer Guide</a></li>
+<li class="toctree-l2"><a class="reference internal" href="torch.html#key-components">Key Components</a></li>
+</ul>
+</li>
 <li class="toctree-l1"><a class="reference internal" href="release-notes.html">Release Notes</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="release-notes.html#tensorrt-llm-release-0-17-0">TensorRT-LLM Release 0.17.0</a></li>
 <li class="toctree-l2"><a class="reference internal" href="release-notes.html#tensorrt-llm-release-0-16-0">TensorRT-LLM Release 0.16.0</a></li>
 <li class="toctree-l2"><a class="reference internal" href="release-notes.html#tensorrt-llm-release-0-15-0">TensorRT-LLM Release 0.15.0</a></li>
 <li class="toctree-l2"><a class="reference internal" href="release-notes.html#tensorrt-llm-release-0-14-0">TensorRT-LLM Release 0.14.0</a></li>
@@ -344,6 +353,7 @@
 </li>
 <li class="toctree-l1"><a class="reference internal" href="advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="advanced/disaggregated-service.html#usage">Usage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="advanced/disaggregated-service.html#example">Example</a></li>
 <li class="toctree-l2"><a class="reference internal" href="advanced/disaggregated-service.html#benchmarks">Benchmarks</a></li>
 <li class="toctree-l2"><a class="reference internal" href="advanced/disaggregated-service.html#troubleshooting-and-faq">Troubleshooting and FAQ</a></li>
 </ul>
@@ -361,20 +371,20 @@
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="performance/perf-benchmarking.html">Benchmarking</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="performance/perf-benchmarking.html#supported-networks-for-benchmarking">Supported Networks for Benchmarking</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance/perf-benchmarking.html#support-quantization-modes">Support Quantization Modes</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance/perf-benchmarking.html#inflight-benchmarking-with-a-dataset">Inflight Benchmarking with a Dataset</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance/perf-benchmarking.html#preparing-a-dataset">Preparing a Dataset</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance/perf-benchmarking.html#building-a-benchmark-engine">Building a Benchmark Engine</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance/perf-benchmarking.html#max-throughput-benchmark">Max Throughput Benchmark</a></li>
+<li class="toctree-l2"><a class="reference internal" href="performance/perf-benchmarking.html#throughput-benchmarking">Throughput Benchmarking</a></li>
 <li class="toctree-l2"><a class="reference internal" href="performance/perf-benchmarking.html#low-latency-benchmark">Low Latency Benchmark</a></li>
 <li class="toctree-l2"><a class="reference internal" href="performance/perf-benchmarking.html#summary">Summary</a></li>
 </ul>
 </li>
-<li class="toctree-l1"><a class="reference internal" href="performance/perf-best-practices.html">Best Practices</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="performance/perf-best-practices.html#how-to-measure-performance">How To Measure Performance?</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance/perf-best-practices.html#build-options-to-optimize-the-performance-of-tensorrt-llm-models">Build Options to Optimize the Performance of TensorRT-LLM Models</a></li>
-<li class="toctree-l2"><a class="reference internal" href="performance/perf-best-practices.html#runtime-options-to-optimize-the-performance-of-tensorrt-llm-models">Runtime Options to Optimize the Performance of TensorRT-LLM Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="performance/performance-tuning-guide/index.html">Performance Tuning Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="performance/performance-tuning-guide/index.html#prerequisite-knowledge">Prerequisite Knowledge</a></li>
+<li class="toctree-l2"><a class="reference internal" href="performance/performance-tuning-guide/index.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="performance/performance-tuning-guide/benchmarking-default-performance.html">Benchmarking Default Performance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="performance/performance-tuning-guide/useful-build-time-flags.html">Useful Build-Time Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.html">Tuning Max Batch Size and Max Num Tokens</a></li>
+<li class="toctree-l2"><a class="reference internal" href="performance/performance-tuning-guide/deciding-model-sharding-strategy.html">Deciding Model Sharding Strategy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="performance/performance-tuning-guide/fp8-quantization.html">FP8 Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="performance/performance-tuning-guide/useful-runtime-flags.html">Useful Runtime Options</a></li>
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="performance/perf-analysis.html">Performance Analysis</a><ul>
@@ -411,6 +421,7 @@
 <li class="toctree-l2"><a class="reference internal" href="reference/precision.html#int4-and-int8-weight-only-w4a16-and-w8a16">INT4 and INT8 Weight-Only (W4A16 and W8A16)</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/precision.html#gptq-and-awq-w4a16">GPTQ and AWQ (W4A16)</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/precision.html#fp8-hopper">FP8 (Hopper)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/precision.html#nvfp4-blackwell">NVFP4 (Blackwell)</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/precision.html#support-matrix">Support matrix</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/precision.html#technical-detail-the-quantmode-flags">Technical Detail: The <code class="docutils literal notranslate"><span class="pre">QuantMode</span></code> Flags</a></li>
 </ul>
@@ -446,7 +457,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fed14c06dd0>
+<jinja2.runtime.BlockReference object at 0x7fa24959cb30>
 
 <div class="footer">
     <p>

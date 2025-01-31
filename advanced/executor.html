@@ -7,7 +7,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Executor API &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
 
@@ -15,7 +15,7 @@
       <script src="../_static/jquery.js?v=5d32c60e"></script>
       <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../_static/doctools.js?v=9a2dae69"></script>
       <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../_static/copybutton.js?v=65e89d2a"></script>
@@ -50,6 +50,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../torch.html">PyTorch Backend</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Installation</span></p>
@@ -114,6 +115,12 @@
 <li class="toctree-l3"><a class="reference internal" href="#sending-requests-with-different-beam-widths">Sending Requests with Different Beam Widths</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#controlling-output-with-logits-post-processor">Controlling output with Logits Post-Processor</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#structured-output-with-guided-decoding">Structured output with guided decoding</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#obtaining-arbitrary-output-tensors">Obtaining Arbitrary Output Tensors</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#mark-tensors-as-output">Mark Tensors As Output</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#configure-the-executor">Configure The Executor</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#request-additional-output">Request Additional Output</a></li>
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="#c-executor-api-example">C++ Executor API Example</a></li>
@@ -134,7 +141,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../performance/perf-best-practices.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -260,6 +267,39 @@ For details about the API, refer to the <span class="xref std std-ref">_cpp_gen/
 </ul>
 <p>The latter three types should be used with the schema/regex/grammar provided to <code class="docutils literal notranslate"><span class="pre">GuidedDecodingParams</span></code>.</p>
 </section>
+<section id="obtaining-arbitrary-output-tensors">
+<h3>Obtaining Arbitrary Output Tensors<a class="headerlink" href="#obtaining-arbitrary-output-tensors" title="Link to this heading"></a></h3>
+<p>The executor API gives the user the possibility to read the arbitrary outputs from the model. For example, it is possible to obtain hidden states or logits.</p>
+<section id="mark-tensors-as-output">
+<h4>Mark Tensors As Output<a class="headerlink" href="#mark-tensors-as-output" title="Link to this heading"></a></h4>
+<p>For a tensor to be obtainable using this feature, it needs to be marked as an output in your TensorRT engine, as part of the engine building process.</p>
+</section>
+<section id="configure-the-executor">
+<h4>Configure The Executor<a class="headerlink" href="#configure-the-executor" title="Link to this heading"></a></h4>
+<p>Assuming the TensorRT engine you are planning to use has a tensor named <code class="docutils literal notranslate"><span class="pre">TopKLogits</span></code> marked as output, you should then configure the <code class="docutils literal notranslate"><span class="pre">Executor</span></code> to read from this output tensor by passing its name to the <code class="docutils literal notranslate"><span class="pre">ExecutorConfig</span></code> configuration object:</p>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="k">auto</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="n">executorConfig</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ExecutorConfig</span><span class="p">{};</span>
+
+<span class="c1">// ... set more configuration options if needed</span>
+
+<span class="n">executorConfig</span><span class="p">.</span><span class="n">setAdditionalOutputNames</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">vector</span><span class="o">&lt;</span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="o">&gt;</span><span class="p">{</span><span class="s">&quot;TopKLogits&quot;</span><span class="p">});</span>
+
+<span class="c1">// ... create the `Executor` instance</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="request-additional-output">
+<h3>Request Additional Output<a class="headerlink" href="#request-additional-output" title="Link to this heading"></a></h3>
+<p>Construct a request to enqueue in the executor to query this tensor output:</p>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="n">std</span><span class="o">::</span><span class="n">vector</span><span class="o">&lt;</span><span class="n">executor</span><span class="o">::</span><span class="n">OutputConfig</span><span class="o">::</span><span class="n">AdditionalModelOutput</span><span class="o">&gt;</span><span class="w"> </span><span class="n">additionalOutputs</span><span class="p">{</span>
+<span class="w">    </span><span class="n">executor</span><span class="o">::</span><span class="n">OutputConfig</span><span class="o">::</span><span class="n">AdditionalModelOutput</span><span class="p">{</span><span class="s">&quot;TopKLogits&quot;</span><span class="p">,</span><span class="w"> </span><span class="cm">/*whether or not to get the output for the context too */</span><span class="w"> </span><span class="nb">true</span><span class="p">}};</span>
+<span class="n">executor</span><span class="o">::</span><span class="n">Request</span><span class="w"> </span><span class="n">request</span><span class="p">{</span><span class="n">requestTokens</span><span class="p">,</span><span class="w"> </span><span class="n">parameters</span><span class="p">.</span><span class="n">maxOutputLength</span><span class="p">,</span><span class="w"> </span><span class="nb">true</span><span class="p">,</span><span class="w"> </span><span class="n">executor</span><span class="o">::</span><span class="n">SamplingConfig</span><span class="p">{},</span>
+<span class="w">    </span><span class="n">executor</span><span class="o">::</span><span class="n">OutputConfig</span><span class="p">{</span><span class="nb">false</span><span class="p">,</span><span class="w"> </span><span class="nb">false</span><span class="p">,</span><span class="w"> </span><span class="nb">false</span><span class="p">,</span><span class="w"> </span><span class="nb">true</span><span class="p">,</span><span class="w"> </span><span class="nb">false</span><span class="p">,</span><span class="w"> </span><span class="nb">false</span><span class="p">,</span><span class="w"> </span><span class="n">additionalOutputs</span><span class="p">}};</span>
+<span class="n">executor</span><span class="p">.</span><span class="n">enqueueRequest</span><span class="p">(</span><span class="n">request</span><span class="p">);</span>
+</pre></div>
+</div>
+<p>The output can be found at the <code class="docutils literal notranslate"><span class="pre">additionalOutputs</span></code> property of each response.</p>
+</section>
 </section>
 <section id="c-executor-api-example">
 <h2>C++ Executor API Example<a class="headerlink" href="#c-executor-api-example" title="Link to this heading"></a></h2>
@@ -290,7 +330,7 @@ the TensorRT-LLM C++ Executor API.</p>
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fed154cd0c0>
+<jinja2.runtime.BlockReference object at 0x7fa241121d90>
 
 <div class="footer">
     <p>

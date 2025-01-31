@@ -5,6 +5,56 @@
 All published functionality in the Release Notes has been fully tested and verified with known limitations documented. To share feedback about this release, access our [NVIDIA Developer Forum](https://forums.developer.nvidia.com/).
 
 
+## TensorRT-LLM Release 0.17.0
+
+### Key Features and Enhancements
+  - **Blackwell support**
+    - **NOTE: pip installation is not supported for TRT-LLM 0.17 on Blackwell platforms only. Instead, it is recommended that the user build from source using NVIDIA NGC 25.01 PyTorch container.**
+    - Added support for B200.
+    - Added support for GeForce RTX 50 series using Windows Subsystem for Linux (WSL) for limited models.
+    - Added NVFP4 Gemm support for Llama and Mixtral models.
+    - Added NVFP4 support for the `LLM` API and `trtllm-bench` command.
+    - GB200 NVL is not fully supported.
+    - Added benchmark script to measure perf benefits of KV cache host offload with expected runtime improvements from GH200.
+  - **PyTorch workflow**
+    - The PyTorch workflow is an **experimental** feature in `tensorrt_llm._torch`. The following is a list of supported infrastructure, models, and features that can be used with the PyTorch workflow.
+    - Added support for H100/H200/B200.
+    - Added support for Llama models, Mixtral, QWen, Vila.
+    - Added support for FP16/BF16/FP8/NVFP4 Gemm and fused Mixture-Of-Experts (MOE), FP16/BF16/FP8 KVCache.
+    - Added custom context and decoding attention kernels support via PyTorch custom op.
+    - Added support for chunked context (default off).
+    - Added CudaGraph support for decoding only.
+    - Added overlap scheduler support to overlap prepare inputs and model forward by decoding 1 extra token.
+  - Added FP8 context FMHA support for the W4A8 quantization workflow.
+  - Added ModelOpt quantized checkpoint support for the `LLM` API.
+  - Added FP8 support for the Llama-3.2 VLM model. Refer to the “MLLaMA” section in `examples/multimodal/README.md`.
+  - Added PDL support for `userbuffer` based AllReduce-Norm fusion kernel.
+  - Added runtime support for seamless lookahead decoding.
+  - Added token-aligned arbitrary output tensors support for the C++ `executor` API.
+
+### API Changes
+  - [BREAKING CHANGE] KV cache reuse is enabled automatically when `paged_context_fmha` is enabled.
+  - Added `--concurrency` support for the `throughput` subcommand of `trtllm-bench`.
+
+### Known Issues
+  - Need `--extra-index-url https://pypi.nvidia.com` when running `pip install tensorrt-llm` due to new third-party dependencies.
+  - The PYPI SBSA wheel is incompatible with PyTorch 2.5.1 due to a break in the PyTorch ABI/API, as detailed in the related [GitHub issue](https://github.com/pytorch/pytorch/issues/144966).
+
+### Fixed Issues
+  - Fixed incorrect LoRA output dimension. Thanks for the contribution from @akhoroshev in #2484.
+  - Added NVIDIA H200 GPU into the `cluster_key` for auto parallelism feature. (#2552)
+  - Fixed a typo in the `__post_init__` function of `LLmArgs` Class. Thanks for the contribution from @topenkoff in #2691.
+  - Fixed workspace size issue in the GPT attention plugin. Thanks for the contribution from @AIDC-AI.
+  - Fixed Deepseek-V2 model accuracy.
+
+### Infrastructure Changes
+  - The base Docker image for TensorRT-LLM is updated to `nvcr.io/nvidia/pytorch:25.01-py3`.
+  - The base Docker image for TensorRT-LLM Backend is updated to `nvcr.io/nvidia/tritonserver:25.01-py3`.
+  - The dependent TensorRT version is updated to 10.8.0.
+  - The dependent CUDA version is updated to 12.8.0.
+  - The dependent ModelOpt version is updated to 0.23 for Linux platform, while 0.17 is still used on Windows platform.
+
+
 ## TensorRT-LLM Release 0.16.0
 
 ### Key Features and Enhancements

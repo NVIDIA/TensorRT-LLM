@@ -6,7 +6,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>tensorrt_llm.llmapi.llm &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="../../../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
 
@@ -14,7 +14,7 @@
       <script src="../../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../../../_static/doctools.js?v=9a2dae69"></script>
       <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
@@ -47,6 +47,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../quick-start-guide.html">Quick Start Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../torch.html">PyTorch Backend</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../release-notes.html">Release Notes</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Installation</span></p>
@@ -116,7 +117,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-best-practices.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -160,37 +161,38 @@
            <div itemprop="articleBody">
              
   <h1>Source code for tensorrt_llm.llmapi.llm</h1><div class="highlight"><pre>
-<span></span><span class="kn">import</span><span class="w"> </span><span class="nn">atexit</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">shutil</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">tempfile</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">weakref</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span><span class="p">,</span> <span class="n">List</span><span class="p">,</span> <span class="n">Literal</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">,</span> <span class="n">Union</span>
+<span></span><span class="kn">import</span> <span class="nn">atexit</span>
+<span class="kn">import</span> <span class="nn">json</span>
+<span class="kn">import</span> <span class="nn">os</span>
+<span class="kn">import</span> <span class="nn">shutil</span>
+<span class="kn">import</span> <span class="nn">tempfile</span>
+<span class="kn">import</span> <span class="nn">weakref</span>
+<span class="kn">from</span> <span class="nn">pathlib</span> <span class="kn">import</span> <span class="n">Path</span>
+<span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="n">Any</span><span class="p">,</span> <span class="n">List</span><span class="p">,</span> <span class="n">Literal</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">,</span> <span class="n">Union</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">tqdm</span><span class="w"> </span><span class="kn">import</span> <span class="n">tqdm</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">PreTrainedTokenizerBase</span>
+<span class="kn">from</span> <span class="nn">tqdm</span> <span class="kn">import</span> <span class="n">tqdm</span>
+<span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">PreTrainedTokenizerBase</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">..</span><span class="w"> </span><span class="kn">import</span> <span class="n">bindings</span> <span class="k">as</span> <span class="n">tllm</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..bindings</span><span class="w"> </span><span class="kn">import</span> <span class="n">executor</span> <span class="k">as</span> <span class="n">tllm</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..builder</span><span class="w"> </span><span class="kn">import</span> <span class="n">EngineConfig</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..executor</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">GenerationExecutor</span><span class="p">,</span> <span class="n">GenerationResult</span><span class="p">,</span> <span class="n">LoRARequest</span><span class="p">,</span>
+<span class="kn">from</span> <span class="nn">..</span> <span class="kn">import</span> <span class="n">bindings</span> <span class="k">as</span> <span class="n">tllm</span>
+<span class="kn">from</span> <span class="nn">..bindings</span> <span class="kn">import</span> <span class="n">executor</span> <span class="k">as</span> <span class="n">tllm</span>
+<span class="kn">from</span> <span class="nn">..builder</span> <span class="kn">import</span> <span class="n">EngineConfig</span>
+<span class="kn">from</span> <span class="nn">..executor</span> <span class="kn">import</span> <span class="p">(</span><span class="n">GenerationExecutor</span><span class="p">,</span> <span class="n">GenerationResult</span><span class="p">,</span> <span class="n">LoRARequest</span><span class="p">,</span>
                         <span class="n">PromptAdapterRequest</span><span class="p">)</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..logger</span><span class="w"> </span><span class="kn">import</span> <span class="n">logger</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..sampling_params</span><span class="w"> </span><span class="kn">import</span> <span class="n">SamplingParams</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.llm_utils</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">LLMARGS_DOCSTRING</span><span class="p">,</span> <span class="n">CachedModelLoader</span><span class="p">,</span> <span class="n">LlmArgs</span><span class="p">,</span>
+<span class="kn">from</span> <span class="nn">..inputs</span> <span class="kn">import</span> <span class="n">PromptInputs</span><span class="p">,</span> <span class="n">create_input_processor</span><span class="p">,</span> <span class="n">prompt_inputs</span>
+<span class="kn">from</span> <span class="nn">..logger</span> <span class="kn">import</span> <span class="n">logger</span>
+<span class="kn">from</span> <span class="nn">..sampling_params</span> <span class="kn">import</span> <span class="n">SamplingParams</span>
+<span class="kn">from</span> <span class="nn">.llm_utils</span> <span class="kn">import</span> <span class="p">(</span><span class="n">LLMARGS_DOCSTRING</span><span class="p">,</span> <span class="n">CachedModelLoader</span><span class="p">,</span> <span class="n">LlmArgs</span><span class="p">,</span>
                         <span class="n">LlmBuildStats</span><span class="p">,</span> <span class="n">ModelLoader</span><span class="p">,</span> <span class="n">_ModelRuntimeContext</span><span class="p">)</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.mpi_session</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">MpiCommSession</span><span class="p">,</span> <span class="n">MpiPoolSession</span><span class="p">,</span> <span class="n">MpiSession</span><span class="p">,</span>
+<span class="kn">from</span> <span class="nn">.mpi_session</span> <span class="kn">import</span> <span class="p">(</span><span class="n">MpiCommSession</span><span class="p">,</span> <span class="n">MpiPoolSession</span><span class="p">,</span> <span class="n">MpiSession</span><span class="p">,</span>
                           <span class="n">external_mpi_comm_available</span><span class="p">)</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.tokenizer</span><span class="w"> </span><span class="kn">import</span> <span class="n">TokenizerBase</span><span class="p">,</span> <span class="n">_xgrammar_tokenizer_info</span>
+<span class="kn">from</span> <span class="nn">.tokenizer</span> <span class="kn">import</span> <span class="n">TokenizerBase</span><span class="p">,</span> <span class="n">_xgrammar_tokenizer_info</span>
 <span class="c1"># TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">append_docstring</span><span class="p">,</span> <span class="n">exception_handler</span><span class="p">,</span> <span class="n">get_device_count</span>
+<span class="kn">from</span> <span class="nn">.utils</span> <span class="kn">import</span> <span class="n">append_docstring</span><span class="p">,</span> <span class="n">exception_handler</span><span class="p">,</span> <span class="n">get_device_count</span>
 
 
 <div class="viewcode-block" id="RequestOutput">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.RequestOutput">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">RequestOutput</span><span class="p">(</span><span class="n">GenerationResult</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">RequestOutput</span><span class="p">(</span><span class="n">GenerationResult</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;The output data of a completion request to the LLM.</span>
 
 <span class="sd">    Parameters:</span>
@@ -204,7 +206,7 @@
 
 <div class="viewcode-block" id="RequestOutput.__init__">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.RequestOutput.__init__">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">generation_result</span><span class="p">:</span> <span class="n">GenerationResult</span><span class="p">,</span>
                  <span class="n">prompt</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">tokenizer</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">TokenizerBase</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
@@ -215,7 +217,7 @@
 
 <div class="viewcode-block" id="RequestOutput.handle_response">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.RequestOutput.handle_response">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">handle_response</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">response</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">handle_response</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">response</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">handle_response</span><span class="p">(</span><span class="n">response</span><span class="p">)</span>
 
         <span class="n">sampling_params</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_generation_request</span><span class="o">.</span><span class="n">sampling_params</span>
@@ -246,20 +248,17 @@
                         <span class="n">beam_output</span><span class="o">.</span><span class="n">token_ids</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span></div>
 
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_repr_fields</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">_repr_fields</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="p">[</span>
             <span class="s2">&quot;request_id&quot;</span><span class="p">,</span> <span class="s2">&quot;prompt&quot;</span><span class="p">,</span> <span class="s2">&quot;prompt_token_ids&quot;</span><span class="p">,</span> <span class="s2">&quot;outputs&quot;</span><span class="p">,</span> <span class="s2">&quot;finished&quot;</span>
         <span class="p">]</span></div>
 
 
 
-<span class="n">PromptInputs</span> <span class="o">=</span> <span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span>
-
-
 <div class="viewcode-block" id="LLM">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.LLM">[docs]</a>
 <span class="nd">@append_docstring</span><span class="p">(</span><span class="n">LLMARGS_DOCSTRING</span><span class="p">)</span>
-<span class="k">class</span><span class="w"> </span><span class="nc">LLM</span><span class="p">:</span>
+<span class="k">class</span> <span class="nc">LLM</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;LLM class is the main class for running a LLM model.</span>
 
 <span class="sd">    Args:</span>
@@ -267,7 +266,7 @@
 
 <div class="viewcode-block" id="LLM.__init__">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.LLM.__init__">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">model</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
                  <span class="n">tokenizer</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Path</span><span class="p">,</span> <span class="n">TokenizerBase</span><span class="p">,</span>
                                            <span class="n">PreTrainedTokenizerBase</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -285,6 +284,8 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">MpiSession</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
 
         <span class="k">try</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">pytorch_backend_config</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;pytorch_backend_config&#39;</span><span class="p">,</span>
+                                                     <span class="kc">None</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">args</span> <span class="o">=</span> <span class="n">LlmArgs</span><span class="o">.</span><span class="n">from_kwargs</span><span class="p">(</span>
                 <span class="n">model</span><span class="o">=</span><span class="n">model</span><span class="p">,</span>
                 <span class="n">tokenizer</span><span class="o">=</span><span class="n">tokenizer</span><span class="p">,</span>
@@ -297,6 +298,7 @@
                 <span class="n">tokenizer_revision</span><span class="o">=</span><span class="n">tokenizer_revision</span><span class="p">,</span>
                 <span class="n">speculative_model</span><span class="o">=</span><span class="n">speculative_model</span><span class="p">,</span>
                 <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+
         <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
             <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">&quot;Failed to parse the arguments for the LLM constructor: </span><span class="si">{</span><span class="n">e</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
@@ -332,23 +334,23 @@
             <span class="bp">self</span><span class="o">.</span><span class="n">llm_build_stats</span> <span class="o">=</span> <span class="n">LlmBuildStats</span><span class="p">()</span>
 
             <span class="bp">self</span><span class="o">.</span><span class="n">_build_model</span><span class="p">()</span>
-
+            <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span> <span class="o">=</span> <span class="n">create_input_processor</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">)</span>
         <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
             <span class="k">raise</span> <span class="n">e</span>
 
-        <span class="n">exception_handler</span><span class="o">.</span><span class="n">register</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s1">&#39;_shutdown&#39;</span><span class="p">)</span>
+        <span class="n">exception_handler</span><span class="o">.</span><span class="n">register</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s1">&#39;shutdown&#39;</span><span class="p">)</span>
         <span class="n">atexit</span><span class="o">.</span><span class="n">register</span><span class="p">(</span><span class="n">LLM</span><span class="o">.</span><span class="n">_shutdown_wrapper</span><span class="p">,</span> <span class="n">weakref</span><span class="o">.</span><span class="n">ref</span><span class="p">(</span><span class="bp">self</span><span class="p">))</span></div>
 
 
     <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">workspace</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Path</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">workspace</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Path</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">Path</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_workspace</span><span class="o">.</span><span class="n">name</span><span class="p">)</span>
 
 <div class="viewcode-block" id="LLM.generate">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.LLM.generate">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">generate</span><span class="p">(</span>
+    <span class="k">def</span> <span class="nf">generate</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">inputs</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="n">PromptInputs</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">PromptInputs</span><span class="p">]],</span>
         <span class="n">sampling_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="n">SamplingParams</span><span class="p">,</span>
@@ -358,6 +360,7 @@
                                      <span class="n">Sequence</span><span class="p">[</span><span class="n">LoRARequest</span><span class="p">]]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">prompt_adapter_request</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span>
             <span class="n">PromptAdapterRequest</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">PromptAdapterRequest</span><span class="p">]]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">queries</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="n">PromptInputs</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">PromptInputs</span><span class="p">]]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Union</span><span class="p">[</span><span class="n">RequestOutput</span><span class="p">,</span> <span class="n">List</span><span class="p">[</span><span class="n">RequestOutput</span><span class="p">]]:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;Generate output for the given prompts in the synchronous mode.</span>
 <span class="sd">        Synchronous generation accepts either single prompt or batched prompts.</span>
@@ -372,17 +375,24 @@
 <span class="sd">                if any. Defaults to None.</span>
 <span class="sd">            prompt_adapter_request (PromptAdapterRequest, Sequence[PromptAdapterRequest], optional):</span>
 <span class="sd">                Prompt Adapter request to use for generation, if any. Defaults to None.</span>
-
+<span class="sd">            queries (PromptInputs or Sequence[PromptInputs]): The query text or token ids.</span>
+<span class="sd">                it can be single prompt or batched prompts. it is used for star attention to run long context tasks.</span>
 <span class="sd">        Returns:</span>
 <span class="sd">            Union[RequestOutput, List[RequestOutput]]: The output data of the completion request to the LLM.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
-        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">inputs</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span> <span class="ow">or</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">inputs</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="nb">str</span><span class="p">):</span>
-            <span class="n">unbatched</span> <span class="o">=</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">inputs</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="n">unbatched</span> <span class="o">=</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">inputs</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="nb">int</span><span class="p">)</span>
+        <span class="n">unbatched</span> <span class="o">=</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">inputs</span><span class="p">,</span> <span class="nb">list</span><span class="p">)</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">unbatched</span><span class="p">:</span>
+            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">inputs</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="nb">int</span><span class="p">):</span>
+                <span class="n">unbatched</span> <span class="o">=</span> <span class="kc">True</span>
 
         <span class="k">if</span> <span class="n">unbatched</span><span class="p">:</span>
             <span class="n">inputs</span> <span class="o">=</span> <span class="p">[</span><span class="n">inputs</span><span class="p">]</span>
+            <span class="k">if</span> <span class="n">queries</span><span class="p">:</span>
+                <span class="n">queries</span> <span class="o">=</span> <span class="p">[</span><span class="n">queries</span><span class="p">]</span>
+
+        <span class="n">inputs</span> <span class="o">=</span> <span class="p">[</span><span class="n">prompt_inputs</span><span class="p">(</span><span class="n">i</span><span class="p">)</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">inputs</span><span class="p">]</span>
+        <span class="k">if</span> <span class="n">queries</span><span class="p">:</span>
+            <span class="n">queries</span> <span class="o">=</span> <span class="p">[</span><span class="n">prompt_inputs</span><span class="p">(</span><span class="n">i</span><span class="p">)</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">queries</span><span class="p">]</span>
 
         <span class="n">futures</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">request_inputs</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">inputs</span><span class="p">):</span>
@@ -398,7 +408,9 @@
                 <span class="n">pa_req</span> <span class="o">=</span> <span class="n">prompt_adapter_request</span><span class="p">[</span><span class="n">i</span><span class="p">]</span>
             <span class="k">else</span><span class="p">:</span>
                 <span class="n">pa_req</span> <span class="o">=</span> <span class="n">prompt_adapter_request</span>
+            <span class="n">request_queries</span> <span class="o">=</span> <span class="kc">None</span> <span class="k">if</span> <span class="n">queries</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">queries</span><span class="p">[</span><span class="n">i</span><span class="p">]</span>
             <span class="n">future</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">generate_async</span><span class="p">(</span><span class="n">request_inputs</span><span class="p">,</span>
+                                         <span class="n">queries</span><span class="o">=</span><span class="n">request_queries</span><span class="p">,</span>
                                          <span class="n">sampling_params</span><span class="o">=</span><span class="n">sp</span><span class="p">,</span>
                                          <span class="n">lora_request</span><span class="o">=</span><span class="n">lora_req</span><span class="p">,</span>
                                          <span class="n">prompt_adapter_request</span><span class="o">=</span><span class="n">pa_req</span><span class="p">,</span>
@@ -419,13 +431,14 @@
 
 <div class="viewcode-block" id="LLM.generate_async">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.LLM.generate_async">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">generate_async</span><span class="p">(</span>
+    <span class="k">def</span> <span class="nf">generate_async</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">inputs</span><span class="p">:</span> <span class="n">PromptInputs</span><span class="p">,</span>
         <span class="n">sampling_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">SamplingParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">lora_request</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">LoRARequest</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">prompt_adapter_request</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">PromptAdapterRequest</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">streaming</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+        <span class="n">queries</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">PromptInputs</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">RequestOutput</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;Generate output for the given prompt in the asynchronous mode.</span>
 <span class="sd">        Asynchronous generation accepts single prompt only.</span>
@@ -440,36 +453,57 @@
 <span class="sd">                use for generation, if any. Defaults to None.</span>
 <span class="sd">            streaming (bool): Whether to use the streaming mode for the generation. Defaults to</span>
 <span class="sd">                False.</span>
+<span class="sd">            queries (PromptInputs or Sequence[PromptInputs]): The query text or token ids.</span>
+<span class="sd">                it can be single prompt or batched prompts. it is used for star attention to run long context tasks.</span>
 
 <span class="sd">        Returns:</span>
 <span class="sd">            RequestOutput: The output data of the completion request to the LLM.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="n">sampling_params</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepare_sampling_params</span><span class="p">(</span><span class="n">sampling_params</span><span class="p">)</span>
 
-        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">inputs</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
-            <span class="n">prompt_token_ids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepare_prompt_token_ids</span><span class="p">(</span>
-                <span class="n">inputs</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
-            <span class="n">prompt</span> <span class="o">=</span> <span class="n">inputs</span>
-        <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">inputs</span><span class="p">,</span> <span class="nb">list</span><span class="p">)</span> <span class="ow">and</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">inputs</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="nb">int</span><span class="p">):</span>
-            <span class="n">prompt_token_ids</span> <span class="o">=</span> <span class="n">inputs</span>
+        <span class="n">inputs</span> <span class="o">=</span> <span class="n">prompt_inputs</span><span class="p">(</span><span class="n">inputs</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">queries</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">queries</span> <span class="o">=</span> <span class="n">prompt_inputs</span><span class="p">(</span><span class="n">queries</span><span class="p">)</span>
+
+        <span class="n">query_token_ids</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">prompt_tuning_config</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="s2">&quot;prompt_token_ids&quot;</span> <span class="ow">in</span> <span class="n">inputs</span><span class="p">:</span>
+            <span class="n">prompt_token_ids</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;prompt_token_ids&#39;</span><span class="p">]</span>
             <span class="n">prompt</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="k">if</span> <span class="n">queries</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">query_token_ids</span> <span class="o">=</span> <span class="n">queries</span><span class="p">[</span><span class="s1">&#39;prompt_token_ids&#39;</span><span class="p">]</span>
+        <span class="k">elif</span> <span class="s2">&quot;prompt&quot;</span> <span class="ow">in</span> <span class="n">inputs</span><span class="p">:</span>
+            <span class="n">prompt_token_ids</span><span class="p">,</span> <span class="n">extra_processed_inputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span><span class="p">(</span>
+                <span class="n">inputs</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
+            <span class="n">prompt</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;prompt&#39;</span><span class="p">]</span>
+            <span class="k">if</span> <span class="n">queries</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">query_token_ids</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span><span class="p">(</span>
+                    <span class="n">queries</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">extra_processed_inputs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">prompt_tuning_config</span> <span class="o">=</span> <span class="n">extra_processed_inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
+                    <span class="s1">&#39;prompt_tuning_config&#39;</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">TypeError</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">&quot;The inputs must be type str or list of int, but got </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">inputs</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span>
             <span class="p">)</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">_check_arguments</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_check_arguments</span><span class="p">(</span>
+            <span class="nb">len</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="p">),</span>
+            <span class="nb">len</span><span class="p">(</span><span class="n">query_token_ids</span><span class="p">)</span> <span class="k">if</span> <span class="n">query_token_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="mi">0</span><span class="p">,</span>
+            <span class="n">sampling_params</span><span class="p">)</span>
         <span class="n">result</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">generate_async</span><span class="p">(</span>
             <span class="n">prompt_token_ids</span><span class="p">,</span>
+            <span class="n">query_token_ids</span><span class="o">=</span><span class="n">query_token_ids</span><span class="p">,</span>
             <span class="n">sampling_params</span><span class="o">=</span><span class="n">sampling_params</span><span class="p">,</span>
             <span class="n">lora_request</span><span class="o">=</span><span class="n">lora_request</span><span class="p">,</span>
             <span class="n">prompt_adapter_request</span><span class="o">=</span><span class="n">prompt_adapter_request</span><span class="p">,</span>
             <span class="n">streaming</span><span class="o">=</span><span class="n">streaming</span><span class="p">,</span>
+            <span class="n">prompt_tuning_config</span><span class="o">=</span><span class="n">prompt_tuning_config</span><span class="p">,</span>
         <span class="p">)</span>
         <span class="k">return</span> <span class="n">RequestOutput</span><span class="p">(</span><span class="n">result</span><span class="p">,</span> <span class="n">prompt</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">)</span></div>
 
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_get_stats</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">_get_stats</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&#39;&#39;&#39; Get the stats from the runtime.</span>
 
 <span class="sd">        Exceptions:</span>
@@ -483,7 +517,7 @@
 <span class="sd">        &#39;&#39;&#39;</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">get_stats</span><span class="p">(</span><span class="n">timeout</span><span class="o">=</span><span class="n">timeout</span><span class="p">)</span>
 
-    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">_get_stats_async</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+    <span class="k">async</span> <span class="k">def</span> <span class="nf">_get_stats_async</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&#39;&#39;&#39; Get the stats from the runtime.</span>
 
 <span class="sd">        Exceptions:</span>
@@ -497,22 +531,7 @@
 <span class="sd">        &#39;&#39;&#39;</span>
         <span class="k">return</span> <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">aget_stats</span><span class="p">(</span><span class="n">timeout</span><span class="o">=</span><span class="n">timeout</span><span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_prepare_prompt_token_ids</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">prompt</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
-                                  <span class="n">sampling_params</span><span class="p">:</span> <span class="n">SamplingParams</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;tokenizer is required to tokenize string prompt&quot;</span><span class="p">)</span>
-
-        <span class="k">if</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">truncate_prompt_tokens</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span>
-                <span class="n">prompt</span><span class="p">,</span> <span class="n">add_special_tokens</span><span class="o">=</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">add_special_tokens</span><span class="p">)</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span>
-                <span class="n">prompt</span><span class="p">,</span>
-                <span class="n">add_special_tokens</span><span class="o">=</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">add_special_tokens</span><span class="p">,</span>
-                <span class="n">truncation</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-                <span class="n">max_length</span><span class="o">=</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">truncate_prompt_tokens</span><span class="p">)</span>
-
-    <span class="k">def</span><span class="w"> </span><span class="nf">_prepare_sampling_params</span><span class="p">(</span>
+    <span class="k">def</span> <span class="nf">_prepare_sampling_params</span><span class="p">(</span>
             <span class="bp">self</span><span class="p">,</span>
             <span class="n">sampling_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">SamplingParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SamplingParams</span><span class="p">:</span>
         <span class="k">if</span> <span class="n">sampling_params</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
@@ -535,8 +554,11 @@
                 <span class="sa">f</span><span class="s2">&quot;The sampling_params must be type SamplingParams or None, but got </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">sampling_params</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span>
             <span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_check_arguments</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">prompt_token_ids</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
+    <span class="k">def</span> <span class="nf">_check_arguments</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">prompt_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">query_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
                          <span class="n">sampling_params</span><span class="p">:</span> <span class="n">SamplingParams</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">,</span> <span class="s1">&#39;backend&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="o">==</span> <span class="s1">&#39;pytorch&#39;</span><span class="p">:</span>
+            <span class="k">return</span>
 
         <span class="n">build_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span>
 
@@ -545,14 +567,13 @@
             <span class="n">built_enging_cfg</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
         <span class="n">max_seq_len</span> <span class="o">=</span> <span class="n">built_enging_cfg</span><span class="p">[</span><span class="s1">&#39;build_config&#39;</span><span class="p">][</span>
             <span class="s1">&#39;max_seq_len&#39;</span><span class="p">]</span> <span class="k">if</span> <span class="s1">&#39;build_config&#39;</span> <span class="ow">in</span> <span class="n">built_enging_cfg</span> <span class="k">else</span> <span class="n">build_config</span><span class="o">.</span><span class="n">max_seq_len</span>
-
-        <span class="n">prompt_len</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="p">)</span>
-
         <span class="c1"># TODO: Remove this check and left the request verification to cpp runtime</span>
-        <span class="k">if</span> <span class="p">(</span><span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">enable_chunked_prefill</span>
-            <span class="p">)</span> <span class="ow">and</span> <span class="n">prompt_len</span> <span class="o">+</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">max_tokens</span> <span class="o">&gt;</span> <span class="n">max_seq_len</span><span class="p">:</span>
+
+        <span class="k">if</span> <span class="p">(</span><span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">enable_chunked_prefill</span><span class="p">)</span> <span class="ow">and</span> <span class="p">(</span>
+                <span class="n">prompt_len</span> <span class="o">/</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">cp_size</span> <span class="o">+</span> <span class="n">query_len</span> <span class="o">+</span>
+                <span class="n">sampling_params</span><span class="o">.</span><span class="n">max_tokens</span> <span class="o">&gt;</span> <span class="n">max_seq_len</span><span class="p">):</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">&quot;The sum of prompt length (</span><span class="si">{</span><span class="n">prompt_len</span><span class="si">}</span><span class="s2">) and max_tokens (</span><span class="si">{</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">max_tokens</span><span class="si">}</span><span class="s2">) should not exceed &quot;</span>
+                <span class="sa">f</span><span class="s2">&quot;The sum of prompt length (</span><span class="si">{</span><span class="n">prompt_len</span><span class="o">/</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">cp_size</span><span class="si">}</span><span class="s2">) and query length (</span><span class="si">{</span><span class="n">query_len</span><span class="si">}</span><span class="s2">) max_tokens (</span><span class="si">{</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">max_tokens</span><span class="si">}</span><span class="s2">) should not exceed &quot;</span>
                 <span class="sa">f</span><span class="s2">&quot;max_seq_len (</span><span class="si">{</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_seq_len</span><span class="si">}</span><span class="s2">)&quot;</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">beam_width</span> <span class="o">&gt;</span> <span class="n">build_config</span><span class="o">.</span><span class="n">max_beam_width</span><span class="p">:</span>
@@ -560,7 +581,7 @@
                 <span class="sa">f</span><span class="s2">&quot;sampling_params&#39;s beam_width (</span><span class="si">{</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">beam_width</span><span class="si">}</span><span class="s2">) should not exceed max_beam_width (</span><span class="si">{</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_beam_width</span><span class="si">}</span><span class="s2">)&quot;</span>
             <span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_build_model</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">_build_model</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="n">model_loader</span> <span class="o">=</span> <span class="n">CachedModelLoader</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">,</span>
                                          <span class="n">mpi_session</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span><span class="p">,</span>
                                          <span class="n">workspace</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">workspace</span><span class="p">,</span>
@@ -618,8 +639,19 @@
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">extended_runtime_perf_knob_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">executor_config</span><span class="o">.</span><span class="n">extended_runtime_perf_knob_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">extended_runtime_perf_knob_config</span>
 
-        <span class="n">trt_engine_dir</span> <span class="o">=</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span>
-                          <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="kn">from</span> <span class="nn">tensorrt_llm._torch.pyexecutor.config</span> <span class="kn">import</span> <span class="n">update_executor_config</span>
+        <span class="n">update_executor_config</span><span class="p">(</span>
+            <span class="n">executor_config</span><span class="p">,</span>
+            <span class="n">backend</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">backend</span><span class="p">,</span>
+            <span class="n">pytorch_backend_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">pytorch_backend_config</span><span class="p">,</span>
+            <span class="n">mapping</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">to_mapping</span><span class="p">(),</span>
+            <span class="n">build_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span><span class="p">,</span>
+            <span class="n">hf_model_dir</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span><span class="p">,</span>
+            <span class="n">trt_engine_dir</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span><span class="p">)</span>
+        <span class="n">executor_config</span><span class="o">.</span><span class="n">llm_parallel_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span>
+        <span class="n">return_logits</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span> <span class="ow">and</span> <span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">gather_context_logits</span>
+            <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">gather_generation_logits</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor_cls</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span><span class="p">,</span>
             <span class="n">executor_config</span><span class="o">=</span><span class="n">executor_config</span><span class="p">,</span>
@@ -628,9 +660,10 @@
             <span class="n">mpi_session</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span><span class="p">,</span>
             <span class="n">reuse_mpi_comm</span><span class="o">=</span><span class="n">external_mpi_comm_available</span><span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">world_size</span><span class="p">),</span>
+            <span class="n">return_logits</span><span class="o">=</span><span class="n">return_logits</span><span class="p">,</span>
         <span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_try_load_tokenizer</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="n">TokenizerBase</span><span class="p">]:</span>
+    <span class="k">def</span> <span class="nf">_try_load_tokenizer</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="n">TokenizerBase</span><span class="p">]:</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">skip_tokenizer_init</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">None</span>
 
@@ -647,12 +680,15 @@
             <span class="n">use_fast</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">tokenizer_mode</span> <span class="o">!=</span> <span class="s1">&#39;slow&#39;</span><span class="p">)</span>
 
     <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">tokenizer</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="n">TokenizerBase</span><span class="p">]:</span>
+    <span class="k">def</span> <span class="nf">tokenizer</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="n">TokenizerBase</span><span class="p">]:</span>
+        <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">&quot;input_processor&quot;</span><span class="p">):</span>
+            <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span><span class="p">,</span> <span class="s2">&quot;tokenizer&quot;</span><span class="p">):</span>
+                <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span><span class="o">.</span><span class="n">tokenizer</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_tokenizer</span>
 
 <div class="viewcode-block" id="LLM.save">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.LLM.save">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">save</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">engine_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">save</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">engine_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;Save the built engine to the given path.</span>
 
 <span class="sd">        Args:</span>
@@ -668,34 +704,38 @@
             <span class="n">shutil</span><span class="o">.</span><span class="n">copytree</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span><span class="p">,</span> <span class="n">engine_dir</span><span class="p">,</span> <span class="n">dirs_exist_ok</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span></div>
 
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_shutdown</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<div class="viewcode-block" id="LLM.shutdown">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.LLM.shutdown">[docs]</a>
+    <span class="k">def</span> <span class="nf">shutdown</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">&quot;_executor&quot;</span><span class="p">)</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span> <span class="o">=</span> <span class="kc">None</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span> <span class="o">=</span> <span class="kc">None</span></div>
+
 
     <span class="nd">@staticmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">_shutdown_wrapper</span><span class="p">(</span><span class="n">self_ref</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">_shutdown_wrapper</span><span class="p">(</span><span class="n">self_ref</span><span class="p">):</span>
         <span class="c1"># Retrieve the instance if it still exists</span>
         <span class="n">instance</span> <span class="o">=</span> <span class="n">self_ref</span><span class="p">()</span>
         <span class="k">if</span> <span class="n">instance</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">instance</span><span class="o">.</span><span class="n">_shutdown</span><span class="p">()</span>
+            <span class="n">instance</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__enter__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__enter__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__exit__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">exc_type</span><span class="p">,</span> <span class="n">exc_value</span><span class="p">,</span> <span class="n">traceback</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="k">def</span> <span class="fm">__exit__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">exc_type</span><span class="p">,</span> <span class="n">exc_value</span><span class="p">,</span> <span class="n">traceback</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
         <span class="k">del</span> <span class="n">exc_value</span><span class="p">,</span> <span class="n">traceback</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_shutdown</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
         <span class="k">return</span> <span class="kc">False</span>  <span class="c1"># propagate exceptions</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">__getstate__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">__getstate__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="s2">&quot;LLM object can not be pickled.&quot;</span><span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__del__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_shutdown</span><span class="p">()</span></div>
+    <span class="k">def</span> <span class="fm">__del__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span></div>
 
 </pre></div>
 
@@ -706,7 +746,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fed141b6500>
+<jinja2.runtime.BlockReference object at 0x7fa25c5ff770>
 
 <div class="footer">
     <p>

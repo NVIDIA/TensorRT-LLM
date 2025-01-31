@@ -7,7 +7,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Quick Start Guide &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="_static/copybutton.css?v=76b2166b" />
 
@@ -15,7 +15,7 @@
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/doctools.js?v=9a2dae69"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="_static/copybutton.js?v=65e89d2a"></script>
@@ -59,6 +59,7 @@
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="torch.html">PyTorch Backend</a></li>
 <li class="toctree-l1"><a class="reference internal" href="release-notes.html">Release Notes</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Installation</span></p>
@@ -128,7 +129,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="performance/perf-best-practices.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="performance/performance-tuning-guide/index.html">Performance Tuning Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -190,10 +191,10 @@
 <h2>LLM API<a class="headerlink" href="#llm-api" title="Link to this heading"></a></h2>
 <p>The LLM API is a Python API designed to facilitate setup and inference with TensorRT-LLM directly within Python. It enables model optimization by simply specifying a HuggingFace repository name or a model checkpoint. The LLM API streamlines the process by managing checkpoint conversion, engine building, engine loading, and model inference, all through a single Python object.</p>
 <p>Here is a simple example to show how to use the LLM API with TinyLlama.</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="kn">from</span> <span class="nn">tensorrt_llm</span> <span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
 <span class="linenos"> 2</span>
 <span class="linenos"> 3</span>
-<span class="linenos"> 4</span><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
+<span class="linenos"> 4</span><span class="k">def</span> <span class="nf">main</span><span class="p">():</span>
 <span class="linenos"> 5</span>
 <span class="linenos"> 6</span>    <span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span>
 <span class="linenos"> 7</span>        <span class="s2">&quot;Hello, my name is&quot;</span><span class="p">,</span>
@@ -219,7 +220,8 @@
 <span class="linenos">27</span>    <span class="n">main</span><span class="p">()</span>
 </pre></div>
 </div>
-<p>To learn more about the LLM API, check out the <a class="reference internal" href="llm-api/index.html"><span class="doc std std-doc">API Introduction</span></a> and <a class="reference internal" href="llm-api-examples/index.html"><span class="doc std std-doc">LLM Examples Introduction</span></a>.</p>
+<p>You can also directly load TensorRT Model Optimizer’s <a class="reference external" href="https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4">quantized checkpoints on Hugging Face</a> in the LLM constructor.
+To learn more about the LLM API, check out the <a class="reference internal" href="llm-api/index.html"><span class="doc std std-doc">API Introduction</span></a> and <a class="reference internal" href="llm-api-examples/index.html"><span class="doc std std-doc">LLM Examples Introduction</span></a>.</p>
 </section>
 <section id="compile-the-model-into-a-tensorrt-engine">
 <span id="quick-start-guide-compile"></span><h2>Compile the Model into a TensorRT Engine<a class="headerlink" href="#compile-the-model-into-a-tensorrt-engine" title="Link to this heading"></a></h2>
@@ -304,7 +306,7 @@ The model definition is a minimal example that shows some of the optimizations a
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fed10af8250>
+<jinja2.runtime.BlockReference object at 0x7fa25b32cc80>
 
 <div class="footer">
     <p>

@@ -26,13 +26,14 @@ TensorRT-LLM optimizes the performance of a range of well-known models on NVIDIA
 - [GPT-J](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gptj)
 - [GPT-Nemo](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt)
 - [GPT-NeoX](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gptneox)
+- [Granite-3.0](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/granite)
 - [Grok-1](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/grok)
 - [InternLM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/internlm)
 - [InternLM2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/internlm2)
 - [LLaMA/LLaMA 2/LLaMA 3/LLaMA 3.1](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama)
 - [Mamba](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mamba)
 - [mBART](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/enc_dec)
-- [Minitron] (https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/nemotron)
+- [Minitron](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/nemotron)
 - [Mistral](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama)
 - [Mistral NeMo](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama)
 - [Mixtral](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mixtral)
@@ -44,7 +45,7 @@ TensorRT-LLM optimizes the performance of a range of well-known models on NVIDIA
 - [Qwen/Qwen1.5/Qwen2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/qwen)
 - [Qwen-VL](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/qwenvl)
 - [RecurrentGemma](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/recurrentgemma)
-- [Replit Code](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mpt)[^ReplitCode]
+- [Replit Code](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/mpt) [^replitcode]
 - [RoBERTa](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/bert)
 - [SantaCoder](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt)
 - [Skywork](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/skywork)
@@ -70,6 +71,8 @@ TensorRT-LLM optimizes the performance of a range of well-known models on NVIDIA
 - [Phi-3-vision](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
 - [Video NeVA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
 - [VILA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
+- [MLLaMA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
+- [LLama 3.2 VLM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/multimodal)
 
 
 (support-matrix-hardware)=
@@ -90,6 +93,7 @@ In addition, older architectures can have limitations for newer software release
   - TensorRT-LLM requires Linux x86_64, Linux aarch64 or Windows.
 * - GPU Model Architectures
   -
+    - [NVIDIA Blackwell Architecture](https://www.nvidia.com/en-us/data-center/technologies/blackwell-architecture/)
     - [NVIDIA Grace Hopper Superchip](https://www.nvidia.com/en-us/data-center/grace-hopper-superchip/)
     - [NVIDIA Hopper Architecture](https://www.nvidia.com/en-us/data-center/technologies/hopper-architecture/)
     - [NVIDIA Ada Lovelace Architecture](https://www.nvidia.com/en-us/technologies/ada-architecture/)
@@ -108,16 +112,17 @@ The following table shows the supported software for TensorRT-LLM.
 * -
   - Software Compatibility
 * - Container
-  - [24.11](https://docs.nvidia.com/deeplearning/frameworks/support-matrix/index.html)
+  - [25.01](https://docs.nvidia.com/deeplearning/frameworks/support-matrix/index.html)
 * - TensorRT
-  - [10.7](https://docs.nvidia.com/deeplearning/tensorrt/release-notes/index.html)
+  - [10.8](https://docs.nvidia.com/deeplearning/tensorrt/release-notes/index.html)
 * - Precision
   -
     - Hopper (SM90) - FP32, FP16, BF16, FP8, INT8, INT4
     - Ada Lovelace (SM89) - FP32, FP16, BF16, FP8, INT8, INT4
     - Ampere (SM80, SM86) - FP32, FP16, BF16, INT8, INT4[^smgte89]
 ```
-[^ReplitCode]：Replit Code is not supported with the transformers 4.45+.
+
+[^replitcode]: Replit Code is not supported with the transformers 4.45+.
 
 [^smgte89]: INT4 AWQ and GPTQ with FP8 activations require SM >= 89.
 

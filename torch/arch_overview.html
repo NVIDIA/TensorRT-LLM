@@ -1,0 +1,287 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Architecture Ovewiew &mdash; tensorrt_llm  documentation</title>
+      <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=80d5e7a1" />
+      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=e59714d7" />
+      <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+
+  
+      <script src="../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="../_static/doctools.js?v=9a2dae69"></script>
+      <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+      <script src="../_static/copybutton.js?v=65e89d2a"></script>
+    <script src="../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../index.html" class="icon icon-home">
+            tensorrt_llm
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../torch.html">PyTorch Backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/windows.html">Installing on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API Examples</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/index.html">LLM Examples Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/customization.html">Common Customizations</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/llm_api_examples.html">Examples</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-serve.html">trtllm-serve</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html">Model Definition</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html#compilation">Compilation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html#runtime">Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html#multi-gpu-and-multi-node-support">Multi-GPU and Multi-Node Support</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/executor.html">Executor API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html">Inference Request</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html#responses">Responses</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../index.html">tensorrt_llm</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">Architecture Ovewiew</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="../_sources/torch/arch_overview.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="architecture-ovewiew">
+<h1>Architecture Ovewiew<a class="headerlink" href="#architecture-ovewiew" title="Link to this heading"></a></h1>
+<p>TensorRT-LLM is a toolkit designed to create optimized solutions for Large Language Model (LLM) inference.
+Besides TensorRT, PyTorch can also serve as the backend for TensorRT-LLM. This document provides an overview of the PyTorch Backend architecture.</p>
+<section id="top-level-api">
+<h2>Top Level API<a class="headerlink" href="#top-level-api" title="Link to this heading"></a></h2>
+<p>The interface for PyTorch backend is <code class="docutils literal notranslate"><span class="pre">tensorrt._torch.LLM</span></code>.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span> <span class="nn">tensorrt_llm._torch</span> <span class="kn">import</span> <span class="n">LLM</span>
+<span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=&lt;</span><span class="n">path_to_llama_from_hf</span><span class="o">&gt;</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>The <code class="docutils literal notranslate"><span class="pre">LLM</span></code> also manages the tokenization and detokenization processes of the input.</p>
+</section>
+<section id="pyexecutor">
+<h2>PyExecutor<a class="headerlink" href="#pyexecutor" title="Link to this heading"></a></h2>
+<p>Similar to the TensorRT backend, which uses <a class="reference internal" href="../advanced/executor.html"><span class="std std-doc">Executor API</span></a>, the PyTorch backend employs a <code class="docutils literal notranslate"><span class="pre">PyExecutor</span></code> class.
+This class has a similar interface to Executor, allowing it to be integrated into LLM as an alternative backend.
+Key components of the <code class="docutils literal notranslate"><span class="pre">PyExecutor</span></code> include:</p>
+<ul class="simple">
+<li><p>Model Engine: Holds the language model and efficiently supports single-step model forward.</p></li>
+<li><p>Decoder: Generates output tokens based on Model Engine outputs. Currently, only greedy search is supported.</p></li>
+<li><p>Scheduler: Decides whether to allocate resources (like KV Cache) for a request and whether to run forward for each request at the current step.</p></li>
+</ul>
+<p>The single-step flow of PyExecutor involves:</p>
+<ul class="simple">
+<li><p>Fetching new requests from the request queue, if any.</p></li>
+<li><p>Scheduling some requests.</p></li>
+<li><p>Running model forward for scheduled requests.</p></li>
+<li><p>Running the decoder using the model forward outputs for the scheduled requests.</p></li>
+<li><p>Adding output tokens for each request and handling finished requests.</p></li>
+</ul>
+</section>
+<section id="model-engine">
+<h2>Model Engine<a class="headerlink" href="#model-engine" title="Link to this heading"></a></h2>
+<p>The core component of <code class="docutils literal notranslate"><span class="pre">PyExecutor</span></code> is the <code class="docutils literal notranslate"><span class="pre">ModelEngine</span></code>, responsible for executing the model’s forward pass efficiently on the GPU.
+The key method of <code class="docutils literal notranslate"><span class="pre">ModelEngine</span></code> is <code class="docutils literal notranslate"><span class="pre">forward</span></code>, which handles the forward pass computation.
+For the PyTorch backend, the derived class is <code class="docutils literal notranslate"><span class="pre">PyTorchModelEngine</span></code>, declared in <a class="reference download internal" download="" href="../_downloads/65d5819e99528658d1ed948c865dec4b/pytorch_model_engine.py"><span class="xref download myst">pytorch_model_engine.py</span></a>.</p>
+</section>
+<section id="decoder">
+<h2>Decoder<a class="headerlink" href="#decoder" title="Link to this heading"></a></h2>
+<p>The Decoder generates output tokens based on Model Engine outputs and supports greedy search decoding.</p>
+</section>
+<section id="scheduler">
+<h2>Scheduler<a class="headerlink" href="#scheduler" title="Link to this heading"></a></h2>
+<p>The scheduler operates in two steps:</p>
+<ol class="arabic simple">
+<li><p>CapacityScheduler: Determines if there are enough resources to accommodate a request.</p></li>
+<li><p>MicroBatchScheduler: Selects some requests for the model to run forward.</p></li>
+</ol>
+<p>Both CapacityScheduler and MicroBatchScheduler currently use C++ bindings.
+However, since the interfaces are implemented in Python, customization is possible.
+The document <a class="reference internal" href="scheduler.html"><span class="std std-doc">scheduler.md</span></a> explains how to implement customized scheduling logic.</p>
+</section>
+<section id="resourcemanager">
+<h2>ResourceManager<a class="headerlink" href="#resourcemanager" title="Link to this heading"></a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">ResourceManager</span></code> helps allocate and manage these resources that may be needed to run inference for a single request.
+It is a container of objects inherited from <code class="docutils literal notranslate"><span class="pre">BaseResourceManager</span></code>, each managing a specific type of resource.
+There are three important interfaces for <code class="docutils literal notranslate"><span class="pre">BaseResourceManager</span></code>:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">prepare_resources</span></code>: Called at each step before model forward in PyExecutor for the current batch.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">update_resources</span></code>: Called at each step finish for the current batch.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">free_resources</span></code>: Called at each request finish.</p></li>
+</ul>
+<p>One crucial resource is the KV Cache for transformer models. The <code class="docutils literal notranslate"><span class="pre">BaseResourceManager</span></code> for KV Cache is <code class="docutils literal notranslate"><span class="pre">KVCacheManager</span></code>.</p>
+<section id="kvcachemanager">
+<h3>KVCacheManager<a class="headerlink" href="#kvcachemanager" title="Link to this heading"></a></h3>
+<p>Currently, the KVCacheManager uses C++ binding. However, customization in Python is possible, as its interface is implemented in Python.
+The document <a class="reference internal" href="kv_cache_manager.html"><span class="std std-doc">kv_cache_manager.md</span></a> details how to implement a customized KVCacheManager.</p>
+</section>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer>
+
+  <hr/>
+
+  <div role="contentinfo">
+<jinja2.runtime.BlockReference object at 0x7fa25bc9a0c0>
+
+<div class="footer">
+    <p>
+        Copyright © 2024 NVIDIA Corporation
+    </p>
+    <p>
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/" target="_blank" rel="noopener"
+            data-cms-ai="0">Privacy Policy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/" target="_blank" rel="noopener"
+            data-cms-ai="0">Manage My Privacy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/preferences/start/" target="_blank" rel="noopener"
+            data-cms-ai="0">Do Not Sell or Share My Data</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/" target="_blank"
+            rel="noopener" data-cms-ai="0">Terms of Service</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/" target="_blank" rel="noopener"
+            data-cms-ai="0">Accessibility</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/" target="_blank"
+            rel="noopener" data-cms-ai="0">Corporate Policies</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/product-security/" target="_blank" rel="noopener"
+            data-cms-ai="0">Product Security</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/contact/" target="_blank" rel="noopener"
+            data-cms-ai="0">Contact</a>
+    </p>
+</div>
+
+
+  </div>
+
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>
