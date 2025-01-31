@@ -706,11 +706,13 @@ int GPTAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc,
 }
 
 template <typename T, typename AttentionOutT>
-mlaParams<T> GPTAttentionPlugin::enqueueMLAPreprocess(int32_t localNbSeq, int32_t localNbTokens,
+mlaParams<T> GPTAttentionPlugin::enqueueMLAPreprocess(int32_t localNbSeq, int32_t tokenIdxBeg, int32_t localNbTokens,
     nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
     void const* const* inputs, void* const* outputs, void*& workspace, bool is_context, cudaStream_t stream)
 {
-    auto const* input = static_cast<T const*>(inputs[getIdx(IdxEntry::QKV_TENSOR)]);
+    auto const* input = static_cast<T const*>(inputs[getIdx(IdxEntry::QKV_TENSOR)]) 
+        + inputDesc[getIdx(IdxEntry::QKV_TENSOR)].dims.d[getPackedTensorHiddenDimIndex(mRemovePadding)]
+            * size_t(tokenIdxBeg);
 
     auto const* q_b_proj = static_cast<T const*>(inputs[getIdx(IdxEntry::MLA_Q_B_PROJ_TENSOR)]);
     auto const* kv_b_proj = static_cast<T const*>(inputs[getIdx(IdxEntry::MLA_KV_B_PROJ_TENSOR)]);
@@ -718,7 +720,8 @@ mlaParams<T> GPTAttentionPlugin::enqueueMLAPreprocess(int32_t localNbSeq, int32_
 
     float2 const* cos_sin_cache = static_cast<float2 const*>(inputs[getIdx(IdxEntry::ROTARY_COS_SIN)]);
 
-    AttentionOutT* context_buf_ = static_cast<AttentionOutT*>(outputs[0]);
+    AttentionOutT* context_buf_ = static_cast<AttentionOutT*>(outputs[0])
+        + outputDesc[0].dims.d[getPackedTensorHiddenDimIndex(mRemovePadding)] * tokenIdxBeg;
 
     mlaParams<T> mla_params;
     mla_params.fused_a_input = input;
@@ -794,7 +797,7 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         // In MLA, attention_input will be the ptr of workspace, and workspace value will be updated in
         // enqueueMLAPreprocess
         mla_params = enqueueMLAPreprocess<T, AttentionOutT>(
-            localNbSeq, localNbTokens, inputDesc, outputDesc, inputs, outputs, workspace, is_context, stream);
+            localNbSeq, tokenIdxBeg, localNbTokens, inputDesc, outputDesc, inputs, outputs, workspace, is_context, stream);
 
         size_t const size_per_head = is_context
             ? (2 * (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim) + mMLAParams.v_head_dim)
