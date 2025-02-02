@@ -567,11 +567,35 @@ print(os.path.dirname(torch.__file__),end='');"
     endif()
   endif()
 
-elseif(NOT WIN32)
-  if(NOT USE_CXX11_ABI)
-    add_compile_options("-D_GLIBCXX_USE_CXX11_ABI=0")
+else()
+  if(NOT "all" IN_LIST CMAKE_CUDA_ARCHITECTURES
+     AND NOT "all-major" IN_LIST CMAKE_CUDA_ARCHITECTURES
+     AND NOT "native" IN_LIST CMAKE_CUDA_ARCHITECTURES)
+    foreach(CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
+      if(CUDA_ARCH MATCHES "^([1-9][0-9][0-9]?a?)(-real)?$")
+        string(
+          APPEND
+          CMAKE_CUDA_FLAGS
+          " --generate-code=arch=compute_${CMAKE_MATCH_1},code=sm_${CMAKE_MATCH_1}"
+        )
+      endif()
+      if(CUDA_ARCH MATCHES "^([1-9][0-9][0-9]?a?)(-virtual)?$")
+        string(
+          APPEND
+          CMAKE_CUDA_FLAGS
+          " --generate-code=arch=compute_${CMAKE_MATCH_1},code=compute_${CMAKE_MATCH_1}"
+        )
+      endif()
+    endforeach()
+    set(CMAKE_CUDA_ARCHITECTURES OFF)
   endif()
-  message(STATUS "Build without PyTorch, USE_CXX11_ABI=${USE_CXX11_ABI}")
+
+  if(NOT WIN32)
+    if(NOT USE_CXX11_ABI)
+      add_compile_options("-D_GLIBCXX_USE_CXX11_ABI=0")
+    endif()
+    message(STATUS "Build without PyTorch, USE_CXX11_ABI=${USE_CXX11_ABI}")
+  endif()
 endif()
 
 # Defer UCX/UCXX setup until after USE_CXX11_ABI is well defined, as UCXX will
