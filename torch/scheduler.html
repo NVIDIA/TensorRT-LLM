@@ -1,0 +1,312 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Scheduler &mdash; tensorrt_llm  documentation</title>
+      <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=e59714d7" />
+      <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+
+  
+      <script src="../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+      <script src="../_static/copybutton.js?v=65e89d2a"></script>
+    <script src="../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../index.html" class="icon icon-home">
+            tensorrt_llm
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../torch.html">PyTorch Backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/windows.html">Installing on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API Examples</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/index.html">LLM Examples Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/customization.html">Common Customizations</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/llm_api_examples.html">Examples</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-serve.html">trtllm-serve</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html">Model Definition</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html#compilation">Compilation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html#runtime">Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html#multi-gpu-and-multi-node-support">Multi-GPU and Multi-Node Support</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/executor.html">Executor API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html">Inference Request</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html#responses">Responses</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/introduction.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../index.html">tensorrt_llm</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">Scheduler</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="../_sources/torch/scheduler.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="scheduler">
+<h1>Scheduler<a class="headerlink" href="#scheduler" title="Link to this heading"></a></h1>
+<p>TensorRT-LLM PyTorch backend employs inflight batching, a mechanism where batching and scheduling occur dynamically at each LLM step.
+The scheduler is invoked to determine which requests are scheduled at the current step.</p>
+<section id="scheduler-introduction">
+<h2>Scheduler Introduction<a class="headerlink" href="#scheduler-introduction" title="Link to this heading"></a></h2>
+<p>There are two kinds of schedulers:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">CapacityScheduler</span></code>: This scheduler decides if resources should be allocated for each active request.
+It considers the KV cache capacity and other resources, if applicable.
+The input to <code class="docutils literal notranslate"><span class="pre">CapacityScheduler</span></code> includes all active requests that need processing.
+The primary output is <code class="docutils literal notranslate"><span class="pre">fitting_requests</span></code>, representing the requests for which resources are reserved at the current step.
+Another output is <code class="docutils literal notranslate"><span class="pre">paused_requests</span></code>, which supports request pausing in the C++ runtime.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">MicroBatchScheduler</span></code>: This scheduler selects some requests from <code class="docutils literal notranslate"><span class="pre">fitting_requests</span></code> chosen by <code class="docutils literal notranslate"><span class="pre">CapacityScheduler</span></code>.
+Another input is <code class="docutils literal notranslate"><span class="pre">inflight_request_ids</span></code>, which supports pipeline parallelism or overlapped execution in the C++ runtime.
+Since PyTorch Flow does not support pipeline parallelism, <code class="docutils literal notranslate"><span class="pre">inflight_request_ids</span></code> is an empty set.
+The outputs are <code class="docutils literal notranslate"><span class="pre">context_requests</span></code> and <code class="docutils literal notranslate"><span class="pre">generation_requests</span></code>, which are the scheduled context and generation requests.
+Requests not in these lists are not selected for the model forward pass.</p></li>
+</ul>
+<p><code class="docutils literal notranslate"><span class="pre">SimpleScheduler</span></code> combines these two schedulers, first using <code class="docutils literal notranslate"><span class="pre">CapacityScheduler</span></code> and then <code class="docutils literal notranslate"><span class="pre">MicroBatchScheduler</span></code>, to get the final schedule result.
+The inputs to <code class="docutils literal notranslate"><span class="pre">SimpleScheduler</span></code> include <code class="docutils literal notranslate"><span class="pre">active_requests</span></code> and <code class="docutils literal notranslate"><span class="pre">inflight_request_ids</span></code>, and the outputs are <code class="docutils literal notranslate"><span class="pre">context_requests</span></code>, <code class="docutils literal notranslate"><span class="pre">generation_requests</span></code>, and <code class="docutils literal notranslate"><span class="pre">paused_requests</span></code>.</p>
+</section>
+<section id="customize-your-own-scheduler">
+<h2>Customize Your Own Scheduler<a class="headerlink" href="#customize-your-own-scheduler" title="Link to this heading"></a></h2>
+<p>To customize the scheduler or batching mechanism, implement your own <code class="docutils literal notranslate"><span class="pre">CapacityScheduler</span></code> and <code class="docutils literal notranslate"><span class="pre">MicroBatchScheduler</span></code> by inheriting their respective classes.
+If two-step scheduling is unnecessary, inherit <code class="docutils literal notranslate"><span class="pre">RequestScheduler</span></code> and implement <code class="docutils literal notranslate"><span class="pre">schedule_request</span></code> directly.</p>
+<p>An example of a <code class="docutils literal notranslate"><span class="pre">CapacityScheduler</span></code> implementation is the <code class="docutils literal notranslate"><span class="pre">GuaranteedNoEvictScheduler</span></code> class, found in <a class="reference download internal" download="" href="../_downloads/e72250138e2ac8e266877319f30924db/scheduler.py"><span class="xref download myst">scheduler.py</span></a>.
+This class was used before the C++ binding of <code class="docutils literal notranslate"><span class="pre">CapacityScheduler</span></code> and initially employed a Python-based scheduler.
+It inherits <code class="docutils literal notranslate"><span class="pre">CapacityScheduler</span></code> and implements its own <code class="docutils literal notranslate"><span class="pre">schedule_request</span></code> method.
+This method processes all <code class="docutils literal notranslate"><span class="pre">active_requests</span></code> and tries to schedule more requests that can fit in the KV cache.
+Resource estimation should align with resource allocation and deallocation in <code class="docutils literal notranslate"><span class="pre">kv_cache_manager</span></code>.</p>
+<p>Here is the code snippet:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">GuaranteedNoEvictScheduler</span><span class="p">(</span><span class="n">CapacityScheduler</span><span class="p">):</span>
+    <span class="c1"># only schedule requests has no_schedule_until_state &lt;= state &lt; no_schedule_after_state</span>
+    <span class="n">no_schedule_until_state</span> <span class="o">=</span> <span class="n">LlmRequestState</span><span class="o">.</span><span class="n">CONTEXT_INIT</span>
+    <span class="n">no_schedule_after_state</span> <span class="o">=</span> <span class="n">LlmRequestState</span><span class="o">.</span><span class="n">GENERATION_COMPLETE</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">max_num_requests</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">kv_cache_manager</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">(</span><span class="n">GuaranteedNoEvictScheduler</span><span class="p">,</span> <span class="bp">self</span><span class="p">)</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">max_num_requests</span> <span class="o">=</span> <span class="n">max_num_requests</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_manager</span> <span class="o">=</span> <span class="n">kv_cache_manager</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">schedule_request</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">active_requests</span><span class="p">:</span> <span class="n">RequestList</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="n">LlmRequest</span><span class="p">],</span> <span class="nb">list</span><span class="p">[</span><span class="n">LlmRequest</span><span class="p">]]:</span>
+        <span class="n">scheduled_requests</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="n">pending_requests</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="n">reserved_blocks</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="n">max_blocks</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_manager</span><span class="o">.</span><span class="n">get_max_resource_count</span><span class="p">()</span>
+        <span class="k">for</span> <span class="n">request</span> <span class="ow">in</span> <span class="n">active_requests</span><span class="p">:</span>
+            <span class="n">req_state</span> <span class="o">=</span> <span class="n">request</span><span class="o">.</span><span class="n">state</span>
+            <span class="c1"># if request cannot be scheduled yet or request should no longer be scheduled, skip</span>
+            <span class="k">if</span> <span class="n">req_state</span><span class="o">.</span><span class="n">value</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">no_schedule_until_state</span><span class="o">.</span><span class="n">value</span> <span class="ow">or</span> <span class="n">req_state</span><span class="o">.</span><span class="n">value</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">no_schedule_after_state</span><span class="o">.</span><span class="n">value</span><span class="p">:</span>
+                <span class="k">continue</span>
+
+            <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">scheduled_requests</span>
+                   <span class="p">)</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_num_requests</span> <span class="ow">or</span> <span class="n">reserved_blocks</span> <span class="o">&gt;=</span> <span class="n">max_blocks</span><span class="p">:</span>
+                <span class="k">break</span>
+            <span class="k">elif</span> <span class="n">req_state</span> <span class="o">==</span> <span class="n">LlmRequestState</span><span class="o">.</span><span class="n">GENERATION_IN_PROGRESS</span> <span class="ow">or</span> <span class="n">req_state</span> <span class="o">==</span> <span class="n">LlmRequestState</span><span class="o">.</span><span class="n">GENERATION_TO_COMPLETE</span><span class="p">:</span>
+                <span class="n">scheduled_requests</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">request</span><span class="p">)</span>
+                <span class="n">reserved_blocks</span> <span class="o">+=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_manager</span><span class="o">.</span><span class="n">get_needed_resource_to_completion</span><span class="p">(</span>
+                    <span class="n">request</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">pending_requests</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">request</span><span class="p">)</span>
+
+        <span class="n">avaiable_blocks</span> <span class="o">=</span> <span class="n">max_blocks</span> <span class="o">-</span> <span class="n">reserved_blocks</span>
+        <span class="k">for</span> <span class="n">request</span> <span class="ow">in</span> <span class="n">pending_requests</span><span class="p">:</span>
+            <span class="n">req_state</span> <span class="o">=</span> <span class="n">request</span><span class="o">.</span><span class="n">state</span>
+            <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">scheduled_requests</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_num_requests</span><span class="p">:</span>
+                <span class="k">break</span>
+            <span class="k">elif</span> <span class="n">req_state</span> <span class="o">==</span> <span class="n">LlmRequestState</span><span class="o">.</span><span class="n">CONTEXT_INIT</span><span class="p">:</span>
+                <span class="n">needed_blocks</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_manager</span><span class="o">.</span><span class="n">get_needed_resource_to_completion</span><span class="p">(</span>
+                    <span class="n">request</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">needed_blocks</span> <span class="o">&lt;=</span> <span class="n">avaiable_blocks</span><span class="p">:</span>
+                    <span class="n">scheduled_requests</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">request</span><span class="p">)</span>
+                    <span class="n">avaiable_blocks</span> <span class="o">-=</span> <span class="n">needed_blocks</span>
+                <span class="k">elif</span> <span class="n">needed_blocks</span> <span class="o">&gt;</span> <span class="n">avaiable_blocks</span><span class="p">:</span>
+                    <span class="c1"># If one requests fails to be scheduled, break</span>
+                    <span class="k">break</span>
+
+        <span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="n">scheduled_requests</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">,</span> <span class="p">(</span>
+            <span class="s2">&quot;no pending request can get enough resource to complete, &quot;</span>
+            <span class="s2">&quot;please increase KV cache pool size.&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">scheduled_requests</span><span class="p">,</span> <span class="p">[]</span>
+</pre></div>
+</div>
+<p>After implementing your own scheduler, integrate it into the PyExecutor.
+For the PyTorch backend, the code is in <a class="reference download internal" download="" href="../_downloads/7bf66a65dff8703efe2c82828509f35d/pytorch_model_registry.py"><span class="xref download myst">pytorch_model_registry.py</span></a>.
+In the <code class="docutils literal notranslate"><span class="pre">create_pytorch_model_based_executor</span></code> function, there are two lines creating <code class="docutils literal notranslate"><span class="pre">CapacityScheduler</span></code>:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span>    <span class="n">capacitor_scheduler</span> <span class="o">=</span> <span class="n">BindCapacityScheduler</span><span class="p">(</span><span class="n">max_num_requests</span><span class="p">,</span>
+                                                <span class="n">kv_cache_manager</span><span class="o">.</span><span class="n">impl</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>Similar adjustments can be made for <code class="docutils literal notranslate"><span class="pre">MicroBatchScheduler</span></code>. This allows the <code class="docutils literal notranslate"><span class="pre">PyExecutor</span></code> to execute with your customized scheduling logic.</p>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer>
+
+  <hr/>
+
+  <div role="contentinfo">
+<jinja2.runtime.BlockReference object at 0x7efa38516d50>
+
+<div class="footer">
+    <p>
+        Copyright © 2024 NVIDIA Corporation
+    </p>
+    <p>
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/" target="_blank" rel="noopener"
+            data-cms-ai="0">Privacy Policy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/" target="_blank" rel="noopener"
+            data-cms-ai="0">Manage My Privacy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/preferences/start/" target="_blank" rel="noopener"
+            data-cms-ai="0">Do Not Sell or Share My Data</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/" target="_blank"
+            rel="noopener" data-cms-ai="0">Terms of Service</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/" target="_blank" rel="noopener"
+            data-cms-ai="0">Accessibility</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/" target="_blank"
+            rel="noopener" data-cms-ai="0">Corporate Policies</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/product-security/" target="_blank" rel="noopener"
+            data-cms-ai="0">Product Security</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/contact/" target="_blank" rel="noopener"
+            data-cms-ai="0">Contact</a>
+    </p>
+</div>
+
+
+  </div>
+
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

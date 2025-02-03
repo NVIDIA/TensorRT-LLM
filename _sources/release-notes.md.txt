@@ -10,7 +10,7 @@ All published functionality in the Release Notes has been fully tested and verif
 ### Key Features and Enhancements
   - **Blackwell support**
     - Added support for B200.
-    - Added support for gb20x Windows Subsystem for Linux (WSL) for limited models.
+    - Added support for GeForce RTX 50 series using Windows Subsystem for Linux (WSL) for limited models.
     - Added NVFP4 Gemm support for Llama and Mixtral models.
     - Added NVFP4 support for the `LLM` API and `trtllm-bench` command.
     - GB200 NVL is not fully supported.
