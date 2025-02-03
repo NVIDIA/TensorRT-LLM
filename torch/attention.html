@@ -1,0 +1,411 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Attention &mdash; tensorrt_llm  documentation</title>
+      <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=e59714d7" />
+      <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+
+  
+      <script src="../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+      <script src="../_static/copybutton.js?v=65e89d2a"></script>
+    <script src="../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../index.html" class="icon icon-home">
+            tensorrt_llm
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../torch.html">PyTorch Backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../release-notes.html">Release Notes</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/windows.html">Installing on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API Examples</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/index.html">LLM Examples Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/customization.html">Common Customizations</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../llm-api-examples/llm_api_examples.html">Examples</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-serve.html">trtllm-serve</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html">Model Definition</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html#compilation">Compilation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html#runtime">Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/core-concepts.html#multi-gpu-and-multi-node-support">Multi-GPU and Multi-Node Support</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/executor.html">Executor API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html">Inference Request</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/inference-request.html#responses">Responses</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/introduction.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../index.html">tensorrt_llm</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">Attention</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="../_sources/torch/attention.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="attention">
+<span id="id1"></span><h1>Attention<a class="headerlink" href="#attention" title="Link to this heading"></a></h1>
+<p>This document details the implementation of multi-head attention (MHA),
+multi-query attention (MQA), and group-query attention (GQA) for autoregressive
+models in TensorRT-LLM’s PyTorch backend. As a quick reminder, multi-head attention
+involves a sequence of batched matrix multiplications, a softmax operation, and another batched matrix multiplication,
+as described in the <a class="reference external" href="https://arxiv.org/abs/1706.03762">Attention Is All You Need</a> paper.
+<a class="reference external" href="https://arxiv.org/abs/1911.02150">Multi-query Attention (MQA)</a> and <a class="reference external" href="https://arxiv.org/abs/2307.09288">Group-query Attention (GQA)</a> are
+variants of MHA that use fewer KV heads than the number of query heads.
+TensorRT-LLM provides several implementations using different backends in <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/attention_backend/</span></code>.
+The following sections explain how to use these implementations and provide a brief guide on implementing new backends.</p>
+<section id="attention-backends">
+<h2>Attention Backends<a class="headerlink" href="#attention-backends" title="Link to this heading"></a></h2>
+<p>There are currently three available attention backends: the vanilla backend, the TRT-LLM backend, and the Flashinfer backend.
+You can specify the desired attention backend using <code class="docutils literal notranslate"><span class="pre">PyTorchConfig.attn_backend</span></code>. For instance, to utilize the Flashinfer backend, you can create a <code class="docutils literal notranslate"><span class="pre">PyTorchConfig</span></code> with <code class="docutils literal notranslate"><span class="pre">attn_backend</span> <span class="pre">=</span> <span class="pre">&quot;flashinfer&quot;</span></code> and then pass it to the <code class="docutils literal notranslate"><span class="pre">LLM</span></code> constructor as follows: <code class="docutils literal notranslate"><span class="pre">LLM(pytorch_backend_config=pytorch_config)</span></code>. This will enable the use of the Flashinfer backend for your model.</p>
+<p>The vanilla backend, <code class="docutils literal notranslate"><span class="pre">VanillaAttention</span></code>, is a reference implementation designed primarily for inflight batching and linear KV cache support. While it serves as a useful baseline, it is not recommended for production use due to its limited optimizations.</p>
+<p>In contrast, the Flashinfer backend, <code class="docutils literal notranslate"><span class="pre">FlashInferAttention</span></code>, is performance-optimized and supports both inflight batching and paged KV cache. It also includes the following advanced features:</p>
+<ol class="arabic simple">
+<li><p><strong>FP8 Quantization</strong>: This feature enables the quantization of inputs and KV cache into FP8 format, significantly reducing memory usage and improving computational throughput.</p></li>
+<li><p><strong>RoPE Fusion</strong>: By integrating rotary position embedding (RoPE) directly into the attention computation, this feature enhances efficiency and reduces overhead.</p></li>
+</ol>
+<p>The TRT-LLM backend, <code class="docutils literal notranslate"><span class="pre">TrtllmAttention</span></code>, serves as the default backend and supports all the features available in the Flashinfer backend while being further optimized for enhanced performance. It is the recommended choice for production environments. Additionally, it offers the following advanced features:</p>
+<ol class="arabic simple">
+<li><p><strong>Fused QKV Input</strong>: It can accept a single QKV tensor as input, which is more efficient compared to using separate Q, K, and V tensors.</p></li>
+<li><p><strong>FP8 Output</strong>: It supports outputting the attention result in FP8 format, fusing quantization into the attention computation process.</p></li>
+</ol>
+</section>
+<section id="implement-a-new-attention-backend">
+<h2>Implement a New Attention Backend<a class="headerlink" href="#implement-a-new-attention-backend" title="Link to this heading"></a></h2>
+<p>You can implement a new attention backend to integrate other attention libraries.
+An attention backend consists of an <code class="docutils literal notranslate"><span class="pre">AttentionBackend</span></code> class and an <code class="docutils literal notranslate"><span class="pre">AttentionMetadata</span></code> class.
+There are three stages in the PyTorch that involve the attention backend:</p>
+<ol class="arabic simple">
+<li><p>Model construction: During the model’s <code class="docutils literal notranslate"><span class="pre">__init__</span></code>, call <code class="docutils literal notranslate"><span class="pre">AttentionBackend.__init__</span></code> to create an attention backend for each layer.</p></li>
+<li><p>Metadata preparation: Before each forward step of the model:</p>
+<ol class="arabic simple">
+<li><p>If the metadata is uninitialized, call <code class="docutils literal notranslate"><span class="pre">AttentionMetadata.__init__</span></code> to create the attention metadata.</p></li>
+<li><p>If using CUDA graphs, call <code class="docutils literal notranslate"><span class="pre">AttentionMetadata.create_cuda_graph_metadata</span></code> to convert the metadata to CUDA graph metadata, which pre-allocates all tensors and can be used to capture CUDA graphs. Do not re-allocate any tensors stored inside <code class="docutils literal notranslate"><span class="pre">AttentionMetadata</span></code> after the initial warmup run when using CUDA graphs.</p></li>
+<li><p>To prepare parameters of the input and KV cache, call <code class="docutils literal notranslate"><span class="pre">AttentionMetadata.prepare</span></code> to convert from existing metadata and KV cache manager.</p></li>
+</ol>
+</li>
+<li><p>Single step forward: During the forward pass of each attention layer, call <code class="docutils literal notranslate"><span class="pre">AttentionBackend.forward</span></code> to perform the attention operation. The <code class="docutils literal notranslate"><span class="pre">AttentionMetadata</span></code> will be provided as a forward argument.</p></li>
+</ol>
+<section id="implement-attentionmetadata">
+<h3>Implement <code class="docutils literal notranslate"><span class="pre">AttentionMetadata</span></code><a class="headerlink" href="#implement-attentionmetadata" title="Link to this heading"></a></h3>
+<p>The <code class="docutils literal notranslate"><span class="pre">AttentionMetadata</span></code> class stores metadata from the batched input and KV cache for the attention backend.
+It contains the following predefined fields:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Field</p></th>
+<th class="head"><p>Type</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>max_num_requests</p></td>
+<td><p>int</p></td>
+<td><p>The max number of requests in a single batch.</p></td>
+</tr>
+<tr class="row-odd"><td><p>num_contexts</p></td>
+<td><p>int</p></td>
+<td><p>The number of context-phase sequences in the batch.</p></td>
+</tr>
+<tr class="row-even"><td><p>num_generations</p></td>
+<td><p>int</p></td>
+<td><p>The number of generation-phase sequences in the batch.</p></td>
+</tr>
+<tr class="row-odd"><td><p>max_num_tokens</p></td>
+<td><p>int</p></td>
+<td><p>The max number of tokens in all requests in a single batch.</p></td>
+</tr>
+<tr class="row-even"><td><p>num_tokens</p></td>
+<td><p>int</p></td>
+<td><p>Number of tokens in the batch.</p></td>
+</tr>
+<tr class="row-odd"><td><p>num_ctx_tokens</p></td>
+<td><p>int</p></td>
+<td><p>Number of tokens in sequences in the context phase.</p></td>
+</tr>
+<tr class="row-even"><td><p>kv_cache_manager</p></td>
+<td><p>KVCacheManager</p></td>
+<td><p>The KV cache manager.</p></td>
+</tr>
+<tr class="row-odd"><td><p>is_cuda_graph</p></td>
+<td><p>bool</p></td>
+<td><p>Whether CUDA graph is enabled.</p></td>
+</tr>
+<tr class="row-even"><td><p>seq_lens</p></td>
+<td><p>Tensor</p></td>
+<td><p>The length of each sequence in the batch. The shape is (batch_size), and located on CPU memory.</p></td>
+</tr>
+<tr class="row-odd"><td><p>seq_lens_cuda</p></td>
+<td><p>Tensor</p></td>
+<td><p>A copy of <code class="docutils literal notranslate"><span class="pre">seq_lens</span></code> store on the GPU.</p></td>
+</tr>
+<tr class="row-even"><td><p>context_lens</p></td>
+<td><p>Tensor</p></td>
+<td><p>The length of each context-phase sequence in the batch. The shape is (<code class="docutils literal notranslate"><span class="pre">num_contexts</span></code>).</p></td>
+</tr>
+<tr class="row-odd"><td><p>position_ids</p></td>
+<td><p>Optional[Tensor]</p></td>
+<td><p>The position of each token in each sequence. May be None if positional embedding is applied outside of the backend.</p></td>
+</tr>
+<tr class="row-even"><td><p>request_ids</p></td>
+<td><p>List[int]</p></td>
+<td><p>The request ID of each sequence in the batch.</p></td>
+</tr>
+<tr class="row-odd"><td><p>prompt_lens</p></td>
+<td><p>List[int]</p></td>
+<td><p>The prompt length of each sequence in the batch.</p></td>
+</tr>
+<tr class="row-even"><td><p>kv_cache_params</p></td>
+<td><p>KVCacheParams</p></td>
+<td><p>The parameters for the KV cache.</p></td>
+</tr>
+</tbody>
+</table>
+<p>During <code class="docutils literal notranslate"><span class="pre">AttentionMetadata.__init__</span></code>, you can initialize additional fields for the new attention metadata.
+For example, the Flashinfer metadata initializes <code class="docutils literal notranslate"><span class="pre">decode_wrapper</span></code> here.
+During <code class="docutils literal notranslate"><span class="pre">AttentionMetadata.prepare</span></code>, the runtime will fill all predefined fields, and you can fill your customized fields according to these predefined fields.
+For example, the Flashinfer metadata fills <code class="docutils literal notranslate"><span class="pre">qo_indptr</span></code> by combining <code class="docutils literal notranslate"><span class="pre">context_lens</span></code> and <code class="docutils literal notranslate"><span class="pre">num_generations</span></code> here.</p>
+</section>
+<section id="implement-attentionbackend">
+<h3>Implement <code class="docutils literal notranslate"><span class="pre">AttentionBackend</span></code><a class="headerlink" href="#implement-attentionbackend" title="Link to this heading"></a></h3>
+<p>The <code class="docutils literal notranslate"><span class="pre">AttentionBackend</span></code> delegates the attention operation to the backend implementation.</p>
+<p>Its <code class="docutils literal notranslate"><span class="pre">__init__</span></code> accepts the following arguments:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Field</p></th>
+<th class="head"><p>Type</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>layer_idx</p></td>
+<td><p>int</p></td>
+<td><p>The index of the attention layer in the model.</p></td>
+</tr>
+<tr class="row-odd"><td><p>num_heads</p></td>
+<td><p>int</p></td>
+<td><p>The number of query heads.</p></td>
+</tr>
+<tr class="row-even"><td><p>head_dim</p></td>
+<td><p>int</p></td>
+<td><p>The size of each attention head <code class="docutils literal notranslate"><span class="pre">(hidden_size</span> <span class="pre">//</span> <span class="pre">num_heads)</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p>num_kv_heads</p></td>
+<td><p>Optional[int]</p></td>
+<td><p>The number of KV heads. Defaults to num_heads if None.</p></td>
+</tr>
+<tr class="row-even"><td><p>quant_config</p></td>
+<td><p>QuantConfig</p></td>
+<td><p>Optional quantization configuration. If None, no quantization is applied.</p></td>
+</tr>
+<tr class="row-odd"><td><p>pos_embd_params</p></td>
+<td><p>PositionalEmbeddingParams</p></td>
+<td><p>Optional parameters defining how positional embedding should be applied. If None, positional embedding should be applied by the model before calling the backend. Otherwise, the backend is in-charge of applying positional embedding and may cache K without embedding it first.</p></td>
+</tr>
+</tbody>
+</table>
+<p>Its <code class="docutils literal notranslate"><span class="pre">forward</span></code> accepts the following arguments:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Field</p></th>
+<th class="head"><p>Type</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>q</p></td>
+<td><p>Tensor</p></td>
+<td><p>Query tensor with shape <code class="docutils literal notranslate"><span class="pre">(num_tokens,</span> <span class="pre">num_heads</span> <span class="pre">*</span> <span class="pre">head_dim)</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p>k</p></td>
+<td><p>Tensor</p></td>
+<td><p>Key tensor with shape <code class="docutils literal notranslate"><span class="pre">(num_tokens,</span> <span class="pre">num_kv_heads</span> <span class="pre">*</span> <span class="pre">head_dim)</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p>v</p></td>
+<td><p>Tensor</p></td>
+<td><p>Value tensor with shape <code class="docutils literal notranslate"><span class="pre">(num_tokens,</span> <span class="pre">num_kv_heads</span> <span class="pre">*</span> <span class="pre">head_dim)</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p>metadata</p></td>
+<td><p>AttentionMetadata</p></td>
+<td><p>Metadata for the attention operation.</p></td>
+</tr>
+<tr class="row-even"><td><p>attention_mask</p></td>
+<td><p>AttentionMask</p></td>
+<td><p>Optional attention mask. If None, causal mask is applied.</p></td>
+</tr>
+</tbody>
+</table>
+<p>For example, the Flashinfer backend calls <code class="docutils literal notranslate"><span class="pre">append_paged_kv_cache</span></code> and then wrapper’s <code class="docutils literal notranslate"><span class="pre">run</span></code> to perform the attention operation here.</p>
+</section>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer>
+
+  <hr/>
+
+  <div role="contentinfo">
+<jinja2.runtime.BlockReference object at 0x7efa38541b20>
+
+<div class="footer">
+    <p>
+        Copyright © 2024 NVIDIA Corporation
+    </p>
+    <p>
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/" target="_blank" rel="noopener"
+            data-cms-ai="0">Privacy Policy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/" target="_blank" rel="noopener"
+            data-cms-ai="0">Manage My Privacy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/preferences/start/" target="_blank" rel="noopener"
+            data-cms-ai="0">Do Not Sell or Share My Data</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/" target="_blank"
+            rel="noopener" data-cms-ai="0">Terms of Service</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/" target="_blank" rel="noopener"
+            data-cms-ai="0">Accessibility</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/" target="_blank"
+            rel="noopener" data-cms-ai="0">Corporate Policies</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/product-security/" target="_blank" rel="noopener"
+            data-cms-ai="0">Product Security</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/contact/" target="_blank" rel="noopener"
+            data-cms-ai="0">Contact</a>
+    </p>
+</div>
+
+
+  </div>
+
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>
