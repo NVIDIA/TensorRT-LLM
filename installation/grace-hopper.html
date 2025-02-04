@@ -169,13 +169,12 @@
 <li><p>Install TensorRT-LLM (tested on Ubuntu 24.04).</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip3<span class="w"> </span>install<span class="w"> </span><span class="nv">torch</span><span class="o">==</span><span class="m">2</span>.5.1<span class="w"> </span>torchvision<span class="w"> </span>torchaudio<span class="w"> </span>--index-url<span class="w"> </span>https://download.pytorch.org/whl/cu124
 
-sudo<span class="w"> </span>apt-get<span class="w"> </span>-y<span class="w"> </span>install<span class="w"> </span>libopenmpi-dev<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>pip3<span class="w"> </span>install<span class="w"> </span>--upgrade<span class="w"> </span>setuptools<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>pip3<span class="w"> </span>install<span class="w"> </span>tensorrt_llm
+sudo<span class="w"> </span>apt-get<span class="w"> </span>-y<span class="w"> </span>install<span class="w"> </span>libopenmpi-dev<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>pip3<span class="w"> </span>install<span class="w"> </span>--upgrade<span class="w"> </span>pip<span class="w"> </span>setuptools<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>pip3<span class="w"> </span>install<span class="w"> </span>tensorrt_llm<span class="w"> </span>--extra-index-url<span class="w"> </span>https://pypi.nvidia.com
 </pre></div>
 </div>
 <p>If using the <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch">PyTorch NGC Container</a> image, the prerequisite step for installing CUDA-enabled PyTorch package is not required.</p>
 </li>
-<li><p>Sanity check the installation by running the following in Python (tested on Python 3.12):</p></li>
-</ol>
+<li><p>Sanity check the installation by running the following in Python (tested on Python 3.12):</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
 <span class="linenos"> 2</span>
 <span class="linenos"> 3</span>
@@ -205,6 +204,8 @@ sudo<span class="w"> </span>apt-get<span class="w"> </span>-y<span class="w"> </
 <span class="linenos">27</span>    <span class="n">main</span><span class="p">()</span>
 </pre></div>
 </div>
+</li>
+</ol>
 </section>
 
 
@@ -218,7 +219,7 @@ sudo<span class="w"> </span>apt-get<span class="w"> </span>-y<span class="w"> </
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7efa3a3c3aa0>
+<jinja2.runtime.BlockReference object at 0x7f6400dc5190>
 
 <div class="footer">
     <p>

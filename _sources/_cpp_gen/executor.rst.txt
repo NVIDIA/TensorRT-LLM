@@ -4,10 +4,10 @@ Executor
 .. Here are files in the cpp/include/executor
 .. We manually add subsection to enable detailed description in the future
 .. It is also doable to automatically generate this file and list all the modules in the conf.py
-serialization.h
-_______________
+disaggServerUtil.h
+__________________
 
-.. doxygenfile:: serialization.h
+.. doxygenfile:: disaggServerUtil.h
    :project: TensorRT-LLM
 
 executor.h
@@ -16,10 +16,10 @@ __________
 .. doxygenfile:: executor.h
    :project: TensorRT-LLM
 
-types.h
-_______
+serialization.h
+_______________
 
-.. doxygenfile:: types.h
+.. doxygenfile:: serialization.h
    :project: TensorRT-LLM
 
 tensor.h
@@ -28,9 +28,9 @@ ________
 .. doxygenfile:: tensor.h
    :project: TensorRT-LLM
 
-disaggServerUtil.h
-__________________
+types.h
+_______
 
-.. doxygenfile:: disaggServerUtil.h
+.. doxygenfile:: types.h
    :project: TensorRT-LLM
 
