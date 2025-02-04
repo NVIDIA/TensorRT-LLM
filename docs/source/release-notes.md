@@ -9,6 +9,7 @@ All published functionality in the Release Notes has been fully tested and verif
 
 ### Key Features and Enhancements
   - **Blackwell support**
+    - **NOTE: pip installation is not supported for TRT-LLM 0.17 on Blackwell platforms only. Instead, it is recommended that the user build from source using NVIDIA NGC 25.01 PyTorch container.**
     - Added support for B200.
     - Added support for GeForce RTX 50 series using Windows Subsystem for Linux (WSL) for limited models.
     - Added NVFP4 Gemm support for Llama and Mixtral models.
