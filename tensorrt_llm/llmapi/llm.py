@@ -368,15 +368,21 @@ class LLM:
             raise TypeError(
                 f"The sampling_params must be type SamplingParams or None, but got {type(sampling_params)}"
             )
+        
+    def _get_config_data(self):
+        ''' Get the config data from the built engine. '''
+        if not hasattr(self, '_built_enging_cfg') or self._built_enging_cfg is None:
+            built_enging_cfg_file = Path(self.args.model) / 'config.json'
+            with open(built_enging_cfg_file) as f:
+                self._built_enging_cfg = json.load(f)
+        return self._built_enging_cfg
 
     def _check_arguments(self, prompt_len: int, query_len: int,
                          sampling_params: SamplingParams) -> None:
 
         build_config = self.args.build_config
 
-        built_enging_cfg_file = Path(self.args.model) / 'config.json'
-        with open(built_enging_cfg_file) as f:
-            built_enging_cfg = json.load(f)
+        built_enging_cfg = self._get_config_data()
         max_seq_len = built_enging_cfg['build_config'][
             'max_seq_len'] if 'build_config' in built_enging_cfg else build_config.max_seq_len
         # TODO: Remove this check and left the request verification to cpp runtime
