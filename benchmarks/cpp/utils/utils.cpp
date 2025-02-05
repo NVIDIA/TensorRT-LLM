@@ -1,4 +1,3 @@
-
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
@@ -152,4 +151,12 @@ std::ostream& operator<<(std::ostream& os, RecordTimeMetric const& metric)
        << metric.mP50;
     return os;
 }
+
+std::ostream& operator<<(std::ostream& os, RecordBwMetric const& metric)
+{
+    os << metric.mAvg << "," << metric.mMax << "," << metric.mMin << "," << metric.mP99 << "," << metric.mP90 << ","
+       << metric.mP50;
+    return os;
+}
+
 } // namespace tensorrt_llm::benchmark

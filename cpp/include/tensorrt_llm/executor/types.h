@@ -364,6 +364,8 @@ struct DisServingRequestStats
 {
     /// @brief The total time spent on transferring KV cache from context phase to generation phase (ms)
     double kvCacheTransferMS;
+    /// @brief The total size of KV cache transferred from context phase to generation phase (bytes)
+    size_t kvCacheSize;
 };
 
 /// @brief Struct that holds the stats of a single request
@@ -426,6 +428,8 @@ struct RequestPerfMetrics
         TimePoint kvCacheTransferStart;
         /// @brief End time of the KV cache transfer for disaggregated serving
         TimePoint kvCacheTransferEnd;
+        /// @brief KV Cache size transfer for disaggregated serving
+        mutable size_t kvCacheSize = 0;
     };
 
     struct KvCacheMetrics

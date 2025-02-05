@@ -168,7 +168,8 @@ void initBindings(pybind11::module_& m)
 
     py::class_<tle::DisServingRequestStats>(m, "DisServingRequestStats")
         .def(py::init<>())
-        .def_readwrite("kv_cache_transfer_ms", &tle::DisServingRequestStats::kvCacheTransferMS);
+        .def_readwrite("kv_cache_transfer_ms", &tle::DisServingRequestStats::kvCacheTransferMS)
+        .def_readwrite("kv_cache_size", &tle::DisServingRequestStats::kvCacheSize);
 
     py::class_<tle::RequestStats>(m, "RequestStats")
         .def(py::init<>())

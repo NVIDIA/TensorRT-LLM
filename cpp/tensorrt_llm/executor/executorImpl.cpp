@@ -1805,7 +1805,7 @@ RequestStatsPerIteration Executor::Impl::getCurrentRequestStats(
         if (requestType == batch_manager::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_ONLY
             || requestType == batch_manager::LlmRequestType::LLMREQUEST_TYPE_GENERATION_ONLY)
         {
-            requestStats.disServingStats = executor::DisServingRequestStats{request->getKvCacheTransferTimeMS()};
+            requestStats.disServingStats = executor::DisServingRequestStats{request->getKvCacheTransferTimeMS(), request->getKvCacheSize()};
         }
     };
 
