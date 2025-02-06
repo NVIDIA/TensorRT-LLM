@@ -714,16 +714,31 @@ def load_weights_from_hf_model(hf_model,
             rank_experts = list(range(moe_config.num_experts))
             if mapping.has_moe_ep():
                 rank_experts = mapping.ep_experts(moe_config.num_experts)
-            for suffix in ["w1", "w2", "w3"]:
-                model_params[f'model.layers.{l}.block_sparse_moe.experts.{suffix}.weight'] = \
-                            torch.stack([model_params[f'model.layers.{l}.block_sparse_moe.experts.{expert}.{suffix}.weight'].detach()
-                                        for expert in rank_experts])
-            w3 = model_params[
-                f'model.layers.{l}.block_sparse_moe.experts.w3.weight']
-            w2 = model_params[
-                f'model.layers.{l}.block_sparse_moe.experts.w2.weight']
-            w1 = model_params[
-                f'model.layers.{l}.block_sparse_moe.experts.w1.weight']
+            architecture = config.architecture.lower()
+            if "granite" not in architecture:
+                for suffix in ["w1", "w2", "w3"]:
+                    model_params[f'model.layers.{l}.block_sparse_moe.experts.{suffix}.weight'] = \
+                                torch.stack([model_params[f'model.layers.{l}.block_sparse_moe.experts.{expert}.{suffix}.weight'].detach()
+                                            for expert in rank_experts])
+                w3 = model_params[
+                    f'model.layers.{l}.block_sparse_moe.experts.w3.weight']
+                w2 = model_params[
+                    f'model.layers.{l}.block_sparse_moe.experts.w2.weight']
+                w1 = model_params[
+                    f'model.layers.{l}.block_sparse_moe.experts.w1.weight']
+            else:
+                w2 = model_params[
+                    f'model.layers.{l}.block_sparse_moe.output_linear.weight']
+                half_size = model_params[
+                    f'model.layers.{l}.block_sparse_moe.input_linear.weight'].shape[
+                        -2] // 2
+                w1, w3 = model_params[
+                    f'model.layers.{l}.block_sparse_moe.input_linear.weight']\
+                        .split(half_size, dim=-2)
+                w1 = w1[rank_experts[0]:rank_experts[-1] + 1]
+                w2 = w2[rank_experts[0]:rank_experts[-1] + 1]
+                w3 = w3[rank_experts[0]:rank_experts[-1] + 1]
+
             if mapping.has_moe_tp():
                 w3 = split(w3, mapping.moe_tp_size, mapping.moe_tp_rank, dim=1)
                 w2 = split(w2, mapping.moe_tp_size, mapping.moe_tp_rank, dim=2)
@@ -863,8 +878,15 @@ def load_weights_from_hf_model(hf_model,
                                                plugin_weight_only_quant_type,
                                                dtype, use_gemm_woq_plugin))
 
-            moe_experts_gate_weights = get_weight(
-                model_params, prefix + 'block_sparse_moe.gate', torch.float32)
+            architecture = config.architecture.lower()
+            if "granite" not in architecture:
+                moe_experts_gate_weights = get_weight(
+                    model_params, prefix + 'block_sparse_moe.gate',
+                    torch.float32)
+            else:
+                moe_experts_gate_weights = get_weight(
+                    model_params, prefix + 'block_sparse_moe.router.layer',
+                    torch.float32)
             weights.update(
                 get_tllm_linear_weight(
                     moe_experts_gate_weights,
@@ -1583,7 +1605,8 @@ def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
                 f"Invalid TP dim {tp_dim} for weight {key}'s shape {tensor_shape}"
             )
         return res.to(torch_dtype).contiguous(
-        ) if "block_sparse_moe.gate" not in key else res.to(torch.float32)
+        ) if "block_sparse_moe.gate" not in key and "block_sparse_moe.router" not in key else res.to(
+            torch.float32)
 
     def load_and_set(target,
                      key,
@@ -1666,30 +1689,47 @@ def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
                          prefix + param_name_map["mlp.fc"], 0)  # mlp.fc
 
         else:
-            weights[f'{tllm_prex}.mlp.router.weight'] = load(
-                prefix + 'block_sparse_moe.gate.weight')
+            architecture = config.architecture.lower()
+            if "granite" not in architecture:
+                weights[f'{tllm_prex}.mlp.router.weight'] = load(
+                    prefix + 'block_sparse_moe.gate.weight')
+            else:
+                weights[f'{tllm_prex}.mlp.router.weight'] = load(
+                    prefix + 'block_sparse_moe.router.layer.weight')
             rank_experts = list(range(moe_config.num_experts))
             if mapping.has_moe_ep():
                 rank_experts = mapping.ep_experts(moe_config.num_experts)
 
-            expert_weight_list = []
-            for suffix in range(3):
-                tp_dim = -1
-                if mapping.has_moe_tp():
-                    tp_dim = 1 if suffix == 1 else 0
-                expert_weight_list.append(
-                    torch.stack(
-                        list(
-                            load(
-                                prefix +
-                                f'block_sparse_moe.experts.{expert}.w{suffix + 1}.weight',
-                                tp_dim=tp_dim,
-                                is_expert_weights=True)
-                            for expert in rank_experts)))
+            if "granite" not in architecture:
+                expert_weight_list = []
+                for suffix in range(3):
+                    tp_dim = -1
+                    if mapping.has_moe_tp():
+                        tp_dim = 1 if suffix == 1 else 0
+                    expert_weight_list.append(
+                        torch.stack(
+                            list(
+                                load(
+                                    prefix +
+                                    f'block_sparse_moe.experts.{expert}.w{suffix + 1}.weight',
+                                    tp_dim=tp_dim,
+                                    is_expert_weights=True)
+                                for expert in rank_experts)))
 
-            w1 = expert_weight_list[0]
-            w2 = expert_weight_list[1]
-            w3 = expert_weight_list[2]
+                w1 = expert_weight_list[0]
+                w2 = expert_weight_list[1]
+                w3 = expert_weight_list[2]
+            else:
+                w2 = load(prefix + f'block_sparse_moe.output_linear.weight',
+                          is_expert_weights=True)  #TODO: correct this
+                w13 = load(prefix + f'block_sparse_moe.input_linear.weight',
+                           is_expert_weights=True)
+
+                half_size = w13.shape[-2] // 2
+                w1, w3 = w13.split(half_size, dim=-2)
+                w1 = w1[rank_experts[0]:rank_experts[-1] + 1]
+                w2 = w2[rank_experts[0]:rank_experts[-1] + 1]
+                w3 = w3[rank_experts[0]:rank_experts[-1] + 1]
 
             weights[f'{tllm_prex}.mlp.fc.weight'] = \
                 torch.concat([w3, w1], dim=-2).contiguous()

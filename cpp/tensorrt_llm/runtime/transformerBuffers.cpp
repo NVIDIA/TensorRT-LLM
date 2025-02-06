@@ -95,6 +95,19 @@ TransformerBuffers::TransformerBuffers(
         presentKeysValsAlt = utils::createBufferVector(runtime, extraKeyValBufferNum, MemoryType::kGPU, kvDtype);
     }
 
+    if (modelConfig.useGemmAllReducePlugin() && worldConfig.isTensorParallel())
+    {
+        nvinfer1::DataType ARType = modelConfig.getGemmAllReduceDtype();
+
+        auto tpGroup = worldConfig.getTensorParallelGroup();
+        std::set tpGroupSet(tpGroup.begin(), tpGroup.end());
+
+        auto const outputDims
+            = ITensor::makeShape({modelConfig.getMaxNumTokens().value(), modelConfig.getHiddenSize()});
+
+        gemmAllReduceOutput = std::make_shared<IpcNvlsTensor>(outputDims, ARType, tpGroupSet);
+    }
+
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
@@ -814,6 +827,22 @@ void TransformerBuffers::getRuntimeBuffers(RuntimeBuffers const* runtimeBuffers,
                 inputBuffers.insert_or_assign("past_key_value_" + std::to_string(firstLayerId + idx), input);
             }
             outputBuffers.insert_or_assign("present_key_value_" + std::to_string(firstLayerId + idx), output);
+        }
+    }
+
+    if (modelConfig.useGemmAllReducePlugin())
+    {
+        for (int idx = 0; idx < modelConfig.getNbAttentionLayers() * 2; ++idx)
+        {
+            // XXX (xsimmons): this is a bit hacky as it assumes
+            // 2x RowLinear layers per attention block.
+            // This will be fixed soon when I remove coupling between model
+            // and runtime.
+            auto gemmARViewUC = gemmAllReduceOutput->getUnicastView();
+            auto gemmARViewMC = gemmAllReduceOutput->getMulticastView();
+
+            outputBuffers.insert_or_assign("gemm_allreduce_uc_out_" + std::to_string(idx), gemmARViewUC);
+            outputBuffers.insert_or_assign("gemm_allreduce_mc_out_" + std::to_string(idx), gemmARViewMC);
         }
     }
 

@@ -25,7 +25,7 @@ There are two options to create a TensorRT-LLM Docker image. The approximate dis
 
 ### Option 1: Build TensorRT-LLM in One Step
 
-TensorRT-LLM contains a simple command to create a Docker image.
+TensorRT-LLM contains a simple command to create a Docker image. Note that if you plan to develop on TensorRT-LLM, we recommend using [Option 2: Build TensorRT-LLM Step-By-Step](#option-2-build-tensorrt-llm-step-by-step).
 
 ```bash
 make -C docker release_build
@@ -46,7 +46,9 @@ make -C docker release_run
 
 The `make` command supports the `LOCAL_USER=1` argument to switch to the local user account instead of `root` inside the container.  The examples of TensorRT-LLM are installed in the `/app/tensorrt_llm/examples` directory.
 
-### Option 2: Build TensorRT-LLM Step-By-Step
+Since TensorRT-LLM has been built and installed, you can skip the remaining steps.
+
+### Option 2: Build TensorRT-LLM Step-by-Step
 
 If you are looking for more flexibility, TensorRT-LLM has commands to create and run a development container in which TensorRT-LLM can be built.
 
@@ -95,16 +97,29 @@ If you are looking for more flexibility, TensorRT-LLM has commands to create and
     ```
     Note: please make sure to set `--ipc=host` as a docker run argument to avoid `Bus error (core dumped)`.
 
-#### Build TensorRT-LLM
+Once inside the container, follow the next steps to build TensorRT-LLM from source.
 
-Once in the container, build TensorRT-LLM from the source.
+## Build TensorRT-LLM
+
+### Option 1: Full Build with C++ Compilation
+
+The following command compiles the C++ code and packages the compiled libraries along with the Python files into a wheel. When developing C++ code, you need this full build command to apply your code changes.
 
 ```bash
 # To build the TensorRT-LLM code.
 python3 ./scripts/build_wheel.py --trt_root /usr/local/tensorrt
+```
 
-# Deploy TensorRT-LLM in your environment.
+Once the wheel is built, install it by:
+
+```bash
 pip install ./build/tensorrt_llm*.whl
+```
+
+Alternatively, you can use editable installation, which is convenient if you also develop Python code.
+
+```bash
+pip install -e .
 ```
 
 By default, `build_wheel.py` enables incremental builds. To clean the build
@@ -132,7 +147,7 @@ python3 ./scripts/build_wheel.py --benchmarks --trt_root /usr/local/tensorrt
 
 Refer to the {ref}`support-matrix-hardware` section for a list of architectures.
 
-## Building the Python Bindings for the C++ Runtime
+#### Building the Python Bindings for the C++ Runtime
 
 The C++ Runtime, in particular, `GptSession` can be exposed to Python via bindings. This feature can be turned on through the default build options.
 
@@ -146,7 +161,7 @@ relevant classes. The associated unit tests should also be consulted for underst
 
 This feature will not be enabled when [`building only the C++ runtime`](#link-with-the-tensorrt-llm-c++-runtime).
 
-## Linking with the TensorRT-LLM C++ Runtime
+#### Linking with the TensorRT-LLM C++ Runtime
 
 The `build_wheel.py` script will also compile the library containing the C++ runtime of TensorRT-LLM. If Python support and `torch` modules are not required, the script provides the option `--cpp_only` which restricts the build to the C++ runtime only.
 
@@ -172,3 +187,36 @@ cpp/build/tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so
 #### Supported C++ Header Files
 
 When using TensorRT-LLM, you need to add the `cpp` and `cpp/include` directories to the project's include paths.  Only header files contained in `cpp/include` are part of the supported API and may be directly included. Other headers contained under `cpp` should not be included directly since they might change in future versions.
+
+
+### Option 2: Python-Only Build without C++ Compilation
+
+If you only need to modify Python code, it is possible to package and install TensorRT-LLM without compilation.
+
+```bash
+# Package TensorRT-LLM wheel.
+TRTLLM_USE_PRECOMPILED=1 pip wheel . --no-deps --wheel-dir ./build
+
+# Install TensorRT-LLM wheel.
+pip install ./build/tensorrt_llm*.whl
+```
+
+Alternatively, you can use editable installation for convenience during Python development.
+
+```bash
+TRTLLM_USE_PRECOMPILED=1 pip install -e .
+```
+
+Setting `TRTLLM_USE_PRECOMPILED=1` enables downloading a prebuilt wheel of the version specified in `tensorrt_llm/version.py`, extracting compiled libraries into your current directory, thus skipping C++ compilation.
+
+You can specify a custom URL or local path for downloading using `TRTLLM_PRECOMPILED_LOCATION`. For example, to use version 0.16.0 from PyPI:
+
+```bash
+TRTLLM_PRECOMPILED_LOCATION=https://pypi.nvidia.com/tensorrt-llm/tensorrt_llm-0.16.0-cp312-cp312-linux_x86_64.whl pip install -e .
+```
+
+#### Known Limitations
+
+Currently, our released TensorRT-LLM wheel packages are linked against public PyTorch hosted on PyPI, which disables C++11 ABI support. However, the Docker image built previously is based on an NGC container where PyTorch has C++11 ABI enabled; see [NGC PyTorch container page](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch). Therefore, we recommend performing a full build inside this container.
+
+When using `TRTLLM_PRECOMPILED_LOCATION`, ensure that your wheel is compiled based on the same version of C++ code as your current directory; any discrepancies may lead to compatibility issues.

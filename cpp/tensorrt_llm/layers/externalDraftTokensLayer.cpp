@@ -83,20 +83,25 @@ void ExternalDraftTokensLayer<T>::allocateBuffer(SizeType32 batchSize)
 
     // host buffers.
     mSkipTopKDecodeDevice = mBufferManager->gpu(batchSizeShape, TRTDataType<bool>::value);
-    mSkipTopKDecodeHost = mBufferManager->pinnedPool(batchSizeShape, TRTDataType<bool>::value);
+    mSkipTopKDecodeHost = BufferManager::pinnedPool(batchSizeShape, TRTDataType<bool>::value);
     mSkipTopPDecodeDevice = mBufferManager->gpu(batchSizeShape, TRTDataType<bool>::value);
-    mSkipTopPDecodeHost = mBufferManager->pinnedPool(batchSizeShape, TRTDataType<bool>::value);
+    mSkipTopPDecodeHost = BufferManager::pinnedPool(batchSizeShape, TRTDataType<bool>::value);
     auto skipTopPDecodeHostRange = BufferRange<bool>(*mSkipTopPDecodeHost);
     std::fill(skipTopPDecodeHostRange.begin(), skipTopPDecodeHostRange.end(), true);
 
     mOutputIdsAfterSampling = mBufferManager->gpu(
         ITensor::makeShape({batchSize, mDecoderDomain.getVocabSizePadded()}), TRTDataType<TokenIdType>::value);
-    mTargetOutputIds = mBufferManager->gpu(ITensor::makeShape({batchSize}), TRTDataType<TokenIdType>::value);
+    mOutputIdsAfterSamplingPtrsHost = BufferManager::pinned(batchSizeShape, TRTDataType<TokenIdType*>::value);
+    mOutputIdsAfterSamplingPtrsDevice = mBufferManager->gpu(batchSizeShape, TRTDataType<TokenIdType*>::value);
+    mTargetOutputIds = mBufferManager->gpu(batchSizeShape, TRTDataType<TokenIdType>::value);
 
     mRuntimeTopKDevice = mBufferManager->gpu(batchSizeShape, TRTDataType<SizeType32>::value);
-    mRuntimeTopKHost = mBufferManager->cpu(batchSizeShape, TRTDataType<SizeType32>::value);
+    mRuntimeTopKHost = BufferManager::cpu(batchSizeShape, TRTDataType<SizeType32>::value);
 
     mRuntimeTopPDevice = mBufferManager->gpu(batchSizeShape, TRTDataType<float>::value);
+
+    mReturnAllSelectedTokensPerSlotHost = BufferManager::pinned(batchSizeShape, TRTDataType<bool>::value);
+    mReturnAllSelectedTokensPerSlotDevice = mBufferManager->gpu(batchSizeShape, TRTDataType<bool>::value);
 
     mMaskBuffer = mBufferManager->gpu(
         ITensor::makeShape({batchSize, mDecoderDomain.getVocabSizePadded()}), TRTDataType<bool>::value);
@@ -195,6 +200,47 @@ void ExternalDraftTokensLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWid
 }
 
 template <typename T>
+void ExternalDraftTokensLayer<T>::prepareInputs(
+    std::shared_ptr<BaseDecodingOutputs> const& outputs, std::shared_ptr<BaseDecodingInputs> const& baseInputs)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    // Fill the buffer for selected ids from sampling with zero. -1 will be set as a boundary if topP kernel is required
+    auto& outputIdsAfterSamplingTensor = const_cast<ITensor&>(*mOutputIdsAfterSampling);
+    mBufferManager->setZero(outputIdsAfterSamplingTensor);
+
+    auto inputs = std::dynamic_pointer_cast<ExternalDraftTokensInputs>(baseInputs);
+
+    if (inputs->step == 0)
+    {
+        auto const batchSize = inputs->logits.value()->getDimension<0>();
+
+        // Prepare mReturnAllSelectedTokensPerSlot
+        auto numDraftTokensHost = BufferRange<SizeType32>(*inputs->numDraftTokensHost);
+        auto returnAllSelectedTokensPerSlot = BufferRange<bool>(*mReturnAllSelectedTokensPerSlotHost);
+        std::transform(numDraftTokensHost.begin(), numDraftTokensHost.end(), returnAllSelectedTokensPerSlot.begin(),
+            [](auto numDraftTokens) { return numDraftTokens > 0; });
+        mBufferManager->copy(*mReturnAllSelectedTokensPerSlotHost, *mReturnAllSelectedTokensPerSlotDevice);
+
+        // Prepare mOutputIdsAfterSamplingPtrs
+        auto outputIdsAfterSamplingPtrsHost = BufferRange<TokenIdType*>(*mOutputIdsAfterSamplingPtrsHost);
+        auto outputIdsPtrs = BufferRange<TokenIdType*>(*outputs->outputIdsPtrHost);
+
+        auto const maxBatchSize = mDecoderDomain.getBatchSize();
+        for (auto batchSlot = 0; batchSlot < maxBatchSize; ++batchSlot)
+        {
+            auto outputIdsAfterSamplingSlice = ITensor::slice(mOutputIdsAfterSampling, batchSlot);
+            auto* outputIdsAfterSamplingPtr = bufferCast<TokenIdType>(*outputIdsAfterSamplingSlice);
+
+            outputIdsAfterSamplingPtrsHost[batchSlot]
+                = returnAllSelectedTokensPerSlot[batchSlot] ? outputIdsAfterSamplingPtr : outputIdsPtrs[batchSlot];
+        }
+        mBufferManager->copy(*mOutputIdsAfterSamplingPtrsHost, *mOutputIdsAfterSamplingPtrsDevice);
+    }
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+};
+
+template <typename T>
 void ExternalDraftTokensLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& outputs,
     std::shared_ptr<BaseDecodingInputs> const& baseInputs,
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
@@ -202,58 +248,18 @@ void ExternalDraftTokensLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutpu
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(ExternalDraftTokensLayer_forwardAsync);
 
-    auto inputs = std::dynamic_pointer_cast<ExternalDraftTokensInputs>(baseInputs);
+    targetSoftmax(baseInputs, workspace);
 
-    auto const batchSize = inputs->logits.value()->getDimension<0>();
-
-    auto const* endIds = bufferCast<TokenIdType>(*inputs->endIds);
-
-    FinishedState const* finishedInput = (inputs->finished)
-        ? reinterpret_cast<FinishedState const*>(bufferCast<FinishedState::UnderlyingType>(*inputs->finished.value()))
-        : nullptr;
-
-    inputs->curandStates = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*mCurandStatesDevice));
-    inputs->probsComputed = true;
-
-    auto runtimeLogitsPtr = bufferCast<T>(*workspace->getDeviceRuntimeLogits());
-    auto logitsPtrsPtr = static_cast<T**>(nullptr);
-    auto biasPtr = static_cast<T*>(nullptr);
-    auto const* batchSlotsPtr = workspace->getDeviceBatchSlotsPtr();
-    mBufferManager->copy(runtimeLogitsPtr, *mTargetLogits);
-
-    {
-        BiasSoftmaxParams<T> biasSoftmaxParams;
-        biasSoftmaxParams.logits = runtimeLogitsPtr;
-        biasSoftmaxParams.logitsPtrs = logitsPtrsPtr;
-        biasSoftmaxParams.probs = runtimeLogitsPtr;
-        biasSoftmaxParams.bias = biasPtr;
-        biasSoftmaxParams.endIds = endIds;
-        biasSoftmaxParams.finished = finishedInput;
-        biasSoftmaxParams.batchSlots = batchSlotsPtr;
-        biasSoftmaxParams.batchSize = batchSize;
-        biasSoftmaxParams.maxBatchSize = mDecoderDomain.getBatchSize();
-        biasSoftmaxParams.maxBeamWidth = 1;
-        biasSoftmaxParams.vocabSize = mDecoderDomain.getVocabSize();
-        biasSoftmaxParams.vocabSizePadded = mDecoderDomain.getVocabSizePadded();
-        biasSoftmaxParams.skipSoftMax = false;
-        biasSoftmaxParams.batchSlotsLogits = false;
-        biasSoftmaxParams.checkParams();
-
-        invokeAddBiasSoftMax(biasSoftmaxParams, getStream());
-    }
-
-    // Fill the buffer for selected ids from sampling with zero. -1 will be set as a boundary if topP kernel is required
-    auto& outputIdsAfterSamplingTensor = const_cast<ITensor&>(*mOutputIdsAfterSampling);
-    mBufferManager->setZero(outputIdsAfterSamplingTensor);
+    prepareInputs(outputs, baseInputs);
 
     // The logits from target engine should go through samplings first.
     // gptDecoderBatched.cpp is calling dynamic decoder step by step, in this step, dynamic Decoder already forwarded
     // PenaltyLayer, BanWordsLayer. For (TopK > 0) && (TopK == 0 && TopP == 0), we invoke TopK sampling kernel. The same
     // logic is implemented in SamplingLayer.cpp
-    getAllTopKs(baseInputs, workspace);
+    getAllTopKs(outputs, baseInputs, workspace);
 
     // Only for (TopK == 0 && TopP > 0), we invoke TopP sampling
-    getAllTopPs(baseInputs, workspace);
+    getAllTopPs(outputs, baseInputs, workspace);
 
     // After all selected tokens are filled in mOutputIdsAfterSampling by topK, topP kernels, token acceptance logics
     // starts. First we mask the logits of unselected token id to -inf as HF's TopK, TopP implementation. We compute the
@@ -276,6 +282,51 @@ template <typename T>
 size_t ExternalDraftTokensLayer<T>::getWorkspaceSize() const noexcept
 {
     return std::max(mWorkspaceSize, mSetupWorkspaceSize);
+}
+
+template <typename T>
+void ExternalDraftTokensLayer<T>::targetSoftmax(std::shared_ptr<BaseDecodingInputs> const& baseInputs,
+    std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    auto inputs = std::dynamic_pointer_cast<ExternalDraftTokensInputs>(baseInputs);
+
+    auto const batchSize = inputs->logits.value()->getDimension<0>();
+
+    auto const* endIds = bufferCast<TokenIdType>(*inputs->endIds);
+
+    FinishedState const* finishedInput = (inputs->finished)
+        ? reinterpret_cast<FinishedState const*>(bufferCast<FinishedState::UnderlyingType>(*inputs->finished.value()))
+        : nullptr;
+
+    inputs->curandStates = reinterpret_cast<curandState_t*>(bufferCast<int8_t>(*mCurandStatesDevice));
+    inputs->probsComputed = true;
+
+    auto runtimeLogitsPtr = bufferCast<T>(*workspace->getDeviceRuntimeLogits());
+    auto logitsPtrsPtr = static_cast<T**>(nullptr);
+    auto biasPtr = static_cast<T*>(nullptr);
+    auto const* batchSlotsPtr = workspace->getDeviceBatchSlotsPtr();
+    mBufferManager->copy(runtimeLogitsPtr, *mTargetLogits);
+
+    BiasSoftmaxParams<T> biasSoftmaxParams;
+    biasSoftmaxParams.logits = runtimeLogitsPtr;
+    biasSoftmaxParams.logitsPtrs = logitsPtrsPtr;
+    biasSoftmaxParams.probs = runtimeLogitsPtr;
+    biasSoftmaxParams.bias = biasPtr;
+    biasSoftmaxParams.endIds = endIds;
+    biasSoftmaxParams.finished = finishedInput;
+    biasSoftmaxParams.batchSlots = batchSlotsPtr;
+    biasSoftmaxParams.batchSize = batchSize;
+    biasSoftmaxParams.maxBatchSize = mDecoderDomain.getBatchSize();
+    biasSoftmaxParams.maxBeamWidth = 1;
+    biasSoftmaxParams.vocabSize = mDecoderDomain.getVocabSize();
+    biasSoftmaxParams.vocabSizePadded = mDecoderDomain.getVocabSizePadded();
+    biasSoftmaxParams.skipSoftMax = false;
+    biasSoftmaxParams.batchSlotsLogits = false;
+    biasSoftmaxParams.checkParams();
+
+    invokeAddBiasSoftMax(biasSoftmaxParams, getStream());
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 template <typename T>
@@ -378,8 +429,8 @@ void ExternalDraftTokensLayer<T>::multinomialSampling(std::shared_ptr<BaseDecodi
     FinishedState* finishedOutput = (outputs->finished)
         ? reinterpret_cast<FinishedState*>(bufferCastOrNull<FinishedState::UnderlyingType>(outputs->finished))
         : nullptr;
-    TopPSamplingKernelParams<T> params{};
 
+    TopPSamplingKernelParams<T> params{};
     params.probs = probs;
     params.outputIdsPtrs = bufferCastOrNull<TokenIdType*>(outputs->outputIdsPtr);
     params.workspace = workspace->getRawWorkspaceDevicePtr();
@@ -412,7 +463,8 @@ void ExternalDraftTokensLayer<T>::multinomialSampling(std::shared_ptr<BaseDecodi
 }
 
 template <typename T>
-void ExternalDraftTokensLayer<T>::getAllTopKs(std::shared_ptr<BaseDecodingInputs> const& baseInputs,
+void ExternalDraftTokensLayer<T>::getAllTopKs(std::shared_ptr<BaseDecodingOutputs> const& outputs,
+    std::shared_ptr<BaseDecodingInputs> const& baseInputs,
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -432,22 +484,31 @@ void ExternalDraftTokensLayer<T>::getAllTopKs(std::shared_ptr<BaseDecodingInputs
         return;
     }
 
+    auto* sequenceLength = bufferCastOrNull<SizeType32>(outputs->sequenceLength);
+    auto const* endIds = bufferCastOrNull<TokenIdType>(inputs->endIds);
+
     FinishedState const* finishedInput = (inputs->finished)
         ? reinterpret_cast<FinishedState const*>(bufferCastOrNull<FinishedState::UnderlyingType>(inputs->finished))
+        : nullptr;
+    FinishedState* finishedOutput = (outputs->finished)
+        ? reinterpret_cast<FinishedState*>(bufferCastOrNull<FinishedState::UnderlyingType>(outputs->finished))
         : nullptr;
 
     auto const* runtimeTopKHostPtr = bufferCast<SizeType32>(*mRuntimeTopKHost);
 
     TopKSamplingKernelParams<T> params{};
     params.logProbs = logits;
-    params.outputIds = bufferCastOrNull<TokenIdType>(mOutputIdsAfterSampling);
+    params.outputIdsPtrs = bufferCastOrNull<TokenIdType*>(mOutputIdsAfterSamplingPtrsDevice);
     params.workspace = workspace->getRawWorkspaceDevicePtr();
+    params.endIds = endIds;
+    params.sequenceLengths = sequenceLength;
     params.maxTopP = 1.0F;
     params.topPs = bufferCastOrNull<float>(mRuntimeTopPDevice);
     params.maxTopK = maxOfBatchSlots(batchSlotsHost, runtimeTopKHostPtr, batchSize);
     params.topKs = bufferCastOrNull<SizeType32>(mRuntimeTopKDevice);
     params.batchSlots = workspace->getDeviceBatchSlotsPtr();
     params.finishedInput = finishedInput;
+    params.finishedOutput = finishedOutput;
     params.skipDecode = bufferCastOrNull<bool>(mSkipTopKDecodeDevice);
     params.curandState = inputs->curandStates;
     params.batchSize = batchSize;
@@ -455,7 +516,7 @@ void ExternalDraftTokensLayer<T>::getAllTopKs(std::shared_ptr<BaseDecodingInputs
     params.maxTokensPerStep = 1;
     params.vocabSizePadded = mDecoderDomain.getVocabSizePadded();
     params.returnAllSelectedTokens = true;
-    params.maxSeqLen = mDecoderDomain.getVocabSizePadded(); // workaround for returning all topKs with outputIds
+    params.returnAllSelectedTokensPerSlot = bufferCastOrNull<bool>(mReturnAllSelectedTokensPerSlotDevice);
     params.logitsHasProbs = inputs->probsComputed;
     params.outputIdCurrentStep = bufferCastOrNull<TokenIdType>(mTargetOutputIds);
     params.skipOutputIdCurrentStep = bufferCast<bool>(*inputs->useDraftLogits);
@@ -465,7 +526,8 @@ void ExternalDraftTokensLayer<T>::getAllTopKs(std::shared_ptr<BaseDecodingInputs
 }
 
 template <typename T>
-void ExternalDraftTokensLayer<T>::getAllTopPs(std::shared_ptr<BaseDecodingInputs> const& baseInputs,
+void ExternalDraftTokensLayer<T>::getAllTopPs(std::shared_ptr<BaseDecodingOutputs> const& outputs,
+    std::shared_ptr<BaseDecodingInputs> const& baseInputs,
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -485,24 +547,33 @@ void ExternalDraftTokensLayer<T>::getAllTopPs(std::shared_ptr<BaseDecodingInputs
         return;
     }
 
+    auto* sequenceLength = bufferCastOrNull<SizeType32>(outputs->sequenceLength);
+    auto const* endIds = bufferCastOrNull<TokenIdType>(inputs->endIds);
+
     FinishedState const* finishedInput = (inputs->finished)
         ? reinterpret_cast<FinishedState const*>(bufferCastOrNull<FinishedState::UnderlyingType>(inputs->finished))
+        : nullptr;
+    FinishedState* finishedOutput = (outputs->finished)
+        ? reinterpret_cast<FinishedState*>(bufferCastOrNull<FinishedState::UnderlyingType>(outputs->finished))
         : nullptr;
 
     TopPSamplingKernelParams<T> params{};
     params.probs = logits;
-    params.outputIds = bufferCastOrNull<TokenIdType>(mOutputIdsAfterSampling);
+    params.outputIdsPtrs = bufferCastOrNull<TokenIdType*>(mOutputIdsAfterSamplingPtrsDevice);
     params.workspace = workspace->getRawWorkspaceDevicePtr();
+    params.endIds = endIds;
+    params.sequenceLength = sequenceLength;
     params.topPs = bufferCastOrNull<float>(mRuntimeTopPDevice);
     params.batchSlots = workspace->getDeviceBatchSlotsPtr();
     params.finishedInput = finishedInput;
+    params.finishedOutput = finishedOutput;
     params.skipDecode = bufferCastOrNull<bool>(mSkipTopPDecodeDevice);
     params.curandState = inputs->curandStates;
     params.batchSize = batchSize;
     params.maxBatchSize = mDecoderDomain.getBatchSize();
     params.vocabSizePadded = mDecoderDomain.getVocabSizePadded();
     params.returnAllSelectedTokens = true;
-    params.maxSeqLen = mDecoderDomain.getVocabSizePadded();
+    params.returnAllSelectedTokensPerSlot = bufferCastOrNull<bool>(mReturnAllSelectedTokensPerSlotDevice);
     params.outputIdCurrentStep = bufferCastOrNull<TokenIdType>(mTargetOutputIds);
     params.skipOutputIdCurrentStep = bufferCast<bool>(*inputs->useDraftLogits);
 

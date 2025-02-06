@@ -40,15 +40,15 @@ std::vector<nvinfer1::PluginField> LoraPluginCreator::mPluginAttributes;
 LoraPlugin::LoraPlugin(int in_hidden_size, std::vector<int> out_hidden_sizes, int transA, int transB,
     int num_lora_modules, nvinfer1::DataType type, LoraPlugin::PluginProfilerPtr const& pluginProfiler,
     bool remove_input_padding, int max_low_rank, int weight_index)
-    : mInHiddenSize(in_hidden_size)
-    , mTransA(transA)
+    : mTransA(transA)
     , mTransB(transB)
-    , mNumLoraModules(num_lora_modules)
     , mType(type)
-    , mPluginProfiler(pluginProfiler)
     , mRemoveInputPadding(remove_input_padding)
+    , mNumLoraModules(num_lora_modules)
+    , mInHiddenSize(in_hidden_size)
     , mMaxLowRank(max_low_rank)
     , mWeightIndex(weight_index)
+    , mPluginProfiler(pluginProfiler)
 {
     TLLM_LOG_DEBUG("%s", __PRETTY_FUNCTION__);
     mOutHiddenSizes.resize(mNumLoraModules);
@@ -259,11 +259,13 @@ int LoraPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::P
         int idx = 0;
         for (int reqId = 0; reqId < numReqs; reqId++)
         {
+            // loraWeightModulePtrs has 3 pointers for each module: A,B, and an optional DoRA magnitude
+            // the current LoRA plugin does not apply DoRA scaling, so the magnitude is ignored
             RequestType const reqType = static_cast<RequestType const>(reqTypes[reqId]);
             if (reqType == RequestType::kGENERATION)
             {
-                mExpandLoraWeightPtrs.push_back(reinterpret_cast<void const*>(loraWeightModulePtrs[reqId * 2]));
-                mExpandLoraWeightPtrs.push_back(reinterpret_cast<void const*>(loraWeightModulePtrs[reqId * 2 + 1]));
+                mExpandLoraWeightPtrs.push_back(reinterpret_cast<void const*>(loraWeightModulePtrs[reqId * 3]));
+                mExpandLoraWeightPtrs.push_back(reinterpret_cast<void const*>(loraWeightModulePtrs[reqId * 3 + 1]));
                 mExpandLoraRanks.push_back(loraRankModule[reqId]);
                 idx += 1;
             }
@@ -273,15 +275,21 @@ int LoraPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::P
 
                 for (int contextId = 0; contextId < contextLen; contextId++)
                 {
-                    mExpandLoraWeightPtrs.push_back(reinterpret_cast<void const*>(loraWeightModulePtrs[reqId * 2]));
-                    mExpandLoraWeightPtrs.push_back(reinterpret_cast<void const*>(loraWeightModulePtrs[reqId * 2 + 1]));
+                    mExpandLoraWeightPtrs.push_back(reinterpret_cast<void const*>(loraWeightModulePtrs[reqId * 3]));
+                    mExpandLoraWeightPtrs.push_back(reinterpret_cast<void const*>(loraWeightModulePtrs[reqId * 3 + 1]));
                     mExpandLoraRanks.push_back(loraRankModule[reqId]);
                     idx += 1;
                 }
             }
         }
-        TLLM_CHECK_WITH_INFO(idx == numTokens,
-            fmtstr("LoraParams and input dims don't match, lora tokens %d input tokens %d", idx, numTokens));
+
+        // In 1st generation phase cross attention qkv lora, cross qkv is skipped by passing an empty encoder_output
+        // (passing 0 to dim) getNumTokens() will get in cross qkv_lora. Skipping the check for this case.
+        if (numTokens > 0)
+        {
+            TLLM_CHECK_WITH_INFO(idx == numTokens,
+                fmtstr("LoraParams and input dims don't match, lora tokens %d input tokens %d", idx, numTokens));
+        }
     }
 
     // only used for unified gemm
@@ -368,7 +376,7 @@ void LoraPlugin::serialize(void* buffer) const noexcept
         write(d, mOutHiddenSizes.at(i));
     }
     mPluginProfiler->serialize(d, mGemmId);
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 }
 
 void LoraPlugin::terminate() noexcept {}
@@ -412,12 +420,14 @@ IPluginV2* LoraPluginCreator::createPlugin(char const* name, PluginFieldCollecti
     TLLM_LOG_DEBUG("%s", __PRETTY_FUNCTION__);
 
     PluginField const* fields = fc->fields;
-    nvinfer1::DataType type;
-    int num_lora_modules;
-    int in_hidden_size, transA, transB;
-    bool remove_input_padding;
-    int max_low_rank;
-    int weight_index;
+    nvinfer1::DataType type{};
+    int num_lora_modules{};
+    int in_hidden_size{};
+    int transA{};
+    int transB{};
+    bool remove_input_padding{};
+    int max_low_rank{};
+    int weight_index{};
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {

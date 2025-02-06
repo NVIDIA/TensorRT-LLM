@@ -36,6 +36,7 @@ In addition, there are two shared files in the parent folder [`examples`](../) f
 | Phi-3-medium-128k-instruct |  Y   |   Y   | Y   | Y  |
 | Phi-3.5-mini-instruct     |   Y   |   Y   | Y   | Y  |
 | Phi-3.5-MoE-instruct      |   Y   |   Y   | Y   | Y  | Y |
+| Phi-4                     |   Y   |   Y   | Y   | Y  |
 
 * Model Name: the name of the model, the same as the name on HuggingFace
 * TP: Tensor Parallel

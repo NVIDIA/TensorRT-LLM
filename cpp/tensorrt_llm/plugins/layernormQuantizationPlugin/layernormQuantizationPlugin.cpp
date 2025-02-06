@@ -231,7 +231,7 @@ void LayernormQuantizationPlugin::serialize(void* buffer) const noexcept
     write(d, mUseDiffOfSquares);
     write(d, mDynActScaling);
     write(d, mType);
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 }
 
 void LayernormQuantizationPlugin::destroy() noexcept
@@ -246,7 +246,7 @@ LayernormQuantizationPluginCreator::LayernormQuantizationPluginCreator()
 {
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
-    mPluginAttributes.emplace_back(PluginField("eps", nullptr, PluginFieldType::kFLOAT32, 1e-5f));
+    mPluginAttributes.emplace_back(PluginField("eps", nullptr, PluginFieldType::kFLOAT32, 1));
     mPluginAttributes.emplace_back(PluginField("use_diff_of_squares", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("dyn_act_scaling", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
@@ -272,10 +272,10 @@ PluginFieldCollection const* LayernormQuantizationPluginCreator::getFieldNames()
 IPluginV2* LayernormQuantizationPluginCreator::createPlugin(char const* name, PluginFieldCollection const* fc) noexcept
 {
     PluginField const* fields = fc->fields;
-    float eps;
-    nvinfer1::DataType type;
-    bool useDiffOfSquares;
-    bool dynamicActivationScaling;
+    float eps{};
+    nvinfer1::DataType type{};
+    bool useDiffOfSquares{};
+    bool dynamicActivationScaling{};
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {

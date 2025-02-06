@@ -2,18 +2,27 @@ import asyncio
 import json
 import tempfile
 import threading
+import time
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import pytest
 import torch
+import zmq
 
 from tensorrt_llm._utils import mpi_world_size
 from tensorrt_llm.bindings import executor as tllm
-from tensorrt_llm.executor import (FusedIpcQueue, GenerationExecutor,
-                                   SamplingParams)
+from tensorrt_llm.executor import (DetokenizedGenerationResultBase,
+                                   GenerationExecutor, GenerationRequest,
+                                   GenerationResult, GenerationResultBase,
+                                   PostprocWorker)
+from tensorrt_llm.executor.ipc import FusedIpcQueue, ZeroMqQueue
+from tensorrt_llm.executor.utils import (ExecutorResponse,
+                                         ExecutorResponseTensors)
 from tensorrt_llm.llmapi import LLM, BuildConfig
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.llmapi.utils import AsyncQueue
+from tensorrt_llm.sampling_params import SamplingParams
 
 # isort: off
 from utils.llm_data import llm_models_root
@@ -217,9 +226,10 @@ def _test_sync_generation_tp_inner(llama_7b_tp2_path: Path):
 
 
 def test_FusedIpcQueue():
-    producer_queue = FusedIpcQueue(is_server=True)
+    producer_queue = FusedIpcQueue(is_server=True, fuse_message=False)
     consumer_queue = FusedIpcQueue(is_server=False,
-                                   address=producer_queue.address)
+                                   address=producer_queue.address,
+                                   fuse_message=False)
 
     def producer(queue: FusedIpcQueue, n: int):
         for i in range(n):
@@ -227,11 +237,16 @@ def test_FusedIpcQueue():
         queue.put(None)
 
     def consumer(queue: FusedIpcQueue):
-        while True:
+        to_continue = True
+        while to_continue:
             item = queue.get()
-            if item is None:
-                break
-            print(f"consumer got {item}")
+            item = [item] if not isinstance(item, list) else item
+
+            for i in item:
+                if i is None:
+                    to_continue = False
+                    break
+                print(f"consumer got {i}")
 
     producer_thread = threading.Thread(target=producer,
                                        args=(producer_queue, 10))
@@ -242,6 +257,171 @@ def test_FusedIpcQueue():
 
     producer_thread.join()
     consumer_thread.join()
+
+
+def create_rsp(id, finished: bool = False):
+    tensors = ExecutorResponseTensors(
+        output_token_ids=[[id]],
+        context_logits=None,
+        generation_logits=None,
+        log_probs=None,
+        cum_log_probs=None,
+    )
+    rsp = ExecutorResponse(
+        client_id=0,
+        tensors=tensors,
+        finish_reasons=[tllm.FinishReason.END_ID] if finished else None,
+        is_final=finished,
+        sequence_index=0,
+        error="",
+        timestamp=time.perf_counter_ns(),
+    )
+    return rsp
+
+
+def test_GenerationResultBase():
+    sampling_params = SamplingParams(max_tokens=4)
+    result = GenerationResultBase(
+        id=2,
+        sampling_params=sampling_params,
+    )
+    result.handle_response(create_rsp(2, finished=False))
+    result.handle_response(create_rsp(3, finished=False))
+    result.handle_response(create_rsp(4, finished=True))
+    print(result.outputs[0])
+    assert len(result.outputs[0].token_ids) == 3
+    assert result._done
+
+
+def test_GenerationResult():
+    request = GenerationRequest(prompt_token_ids=[12, 23, 34],
+                                sampling_params=SamplingParams(max_tokens=4))
+    result = GenerationResult(request)
+
+    for i in range(11):
+        result.handle_response(create_rsp(i + 33, finished=False))
+    result.handle_response(create_rsp(44, finished=True))
+    assert len(result.outputs[0].token_ids) == 12
+    assert result._done
+
+
+def test_DetokenizedGenerationResultBase():
+    sampling_params = SamplingParams(max_tokens=4)
+    model_path = llm_models_root() / "llama-models/llama-7b-hf"
+    tokenizer = TransformersTokenizer.from_pretrained(model_path)
+    result = DetokenizedGenerationResultBase(
+        id=2,
+        sampling_params=sampling_params,
+        tokenizer=tokenizer,
+    )
+    result.handle_response(create_rsp(20, finished=False))
+    result.handle_response(create_rsp(30, finished=False))
+    result.handle_response(create_rsp(40, finished=True))
+    print(result.outputs[0])
+    assert len(result.outputs[0].token_ids) == 3
+    assert result._done
+
+
+def _ZeroMqQueue_sync_sync_task(addr: str):
+    print(f"Setup receiver: {addr}")
+    pull_pipe = ZeroMqQueue(address=addr, is_server=False, is_async=True)
+    print(f"after setup receiver")
+
+    total = 0
+
+    async def task():
+        print(f"running task")
+        for i in range(10):
+            print(f"waiting for msg")
+            msg = await pull_pipe.get_async()
+            print(f"received: {msg}")
+            nonlocal total
+            total += msg
+
+    print(f"to run task")
+    asyncio.run(task())
+
+    return total
+
+
+def test_ZeroMqQueue_sync_async():
+    # sync send, async recv
+    push_pipe = ZeroMqQueue(is_async=False, is_server=True)
+
+    pool = ProcessPoolExecutor(max_workers=1)
+    res = pool.submit(_ZeroMqQueue_sync_sync_task, push_pipe.address)
+
+    for i in range(10):
+        print(f"put: {i}")
+        push_pipe.put(i)
+
+    assert res.result() == 45
+
+
+Input = PostprocWorker.Input
+Output = PostprocWorker.Output
+
+
+def ResponsePostprocessWorker_record_creator(input: Input, tokenizer):
+    assert input.sampling_params is not None
+    return DetokenizedGenerationResultBase(
+        id=input.rsp.client_id,
+        sampling_params=input.sampling_params,
+        tokenizer=tokenizer)
+
+
+def ResponsePostprocessWorker_worker_task(pull_pipe_addr, push_pipe_addr,
+                                          tokenizer_dir):
+    worker = PostprocWorker(
+        pull_pipe_addr=pull_pipe_addr,
+        push_pipe_addr=push_pipe_addr,
+        tokenizer_dir=tokenizer_dir,
+        record_creator=ResponsePostprocessWorker_record_creator)
+    worker.start()
+
+
+def test_ResponsePostprocessWorker():
+
+    input_pipe = ZeroMqQueue(is_server=True)
+    out_pipe = ZeroMqQueue(is_server=True, socket_type=zmq.PULL)
+
+    pool = ProcessPoolExecutor(max_workers=1)
+    print("submit task")
+    fut = pool.submit(ResponsePostprocessWorker_worker_task, input_pipe.address,
+                      out_pipe.address,
+                      str(llm_models_root() / "llama-models/llama-7b-hf"))
+
+    inputs = [
+        Input(rsp=create_rsp(123),
+              sampling_params=SamplingParams(max_tokens=4),
+              streaming=False) for i in range(11)
+    ]
+    inputs.append(
+        Input(rsp=create_rsp(123, finished=True),
+              sampling_params=SamplingParams(max_tokens=4),
+              streaming=True))
+
+    def unbatch():
+
+        for inp in inputs:
+            print("put rsp")
+            input_pipe.put(inp)
+
+        for i in range(len(inputs)):
+            out = out_pipe.get()
+            print("output", out)
+
+    def batch():
+
+        input_pipe.put(inputs)
+        outs = out_pipe.get()
+        print(f"outputs: {outs}")
+
+    unbatch()
+    batch()
+
+    input_pipe.put(None)  # tell worker to shutdown
+    fut.result()
 
 
 if __name__ == '__main__':

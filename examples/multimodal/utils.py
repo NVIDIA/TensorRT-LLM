@@ -2,18 +2,14 @@ def add_common_args(parser):
     parser.add_argument('--max_new_tokens', type=int, default=128)
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--log_level', type=str, default='info')
-    parser.add_argument('--visual_engine_dir',
+    parser.add_argument('--engine_dir',
                         type=str,
                         default=None,
-                        help='Directory containing visual TRT engines')
+                        help='Directory containing visual and LLM TRT engines')
     parser.add_argument('--visual_engine_name',
                         type=str,
                         default='model.engine',
                         help='Name of visual TRT engine')
-    parser.add_argument('--llm_engine_dir',
-                        type=str,
-                        default=None,
-                        help='Directory containing TRT-LLM engines')
     parser.add_argument('--hf_model_dir',
                         type=str,
                         default=None,
@@ -63,6 +59,10 @@ def add_common_args(parser):
                         type=str,
                         default=",",
                         help='Path separator symbol')
+    parser.add_argument("--prompt_sep",
+                        type=str,
+                        default=",",
+                        help="Prompt separator symbol")
     parser.add_argument('--enable_context_fmha_fp32_acc',
                         action='store_true',
                         default=None,
@@ -73,15 +73,16 @@ def add_common_args(parser):
         help='Enables chunked context (only available with cpp session).',
     )
     parser.add_argument(
-        '--use_py_session',
-        default=False,
-        action='store_true',
+        '--session',
+        default='cpp_llm_only',
+        type=str,
+        choices=['python', 'cpp_llm_only', 'cpp'],
         help=
-        "Whether or not to use Python runtime session. By default C++ runtime session is used for the LLM."
+        'Rumtime used to run the models. \n`cpp_llm_only`: vision engine run in python runtime, but LLM in pybind cpp runtime\n`python`: everything runs in python runtime\n`cpp`: everything runs in C++ runtime'
     )
     parser.add_argument(
         '--kv_cache_free_gpu_memory_fraction',
-        default=0.9,
+        default=0.7,
         type=float,
         help='Specify the free gpu memory fraction.',
     )
@@ -101,4 +102,37 @@ def add_common_args(parser):
         help=
         "Distribute the work across multiple CUDA thread-blocks on the GPU for masked MHA kernel."
     )
+    parser.add_argument(
+        '--lora_task_uids',
+        type=str,
+        default=None,
+        nargs="+",
+        help="The list of LoRA task uids; use -1 to disable the LoRA module")
     return parser
+
+
+def levenshtein_distance(s1, s2):
+    if len(s1) < len(s2):
+        return levenshtein_distance(s2, s1)
+
+    if len(s2) == 0:
+        return len(s1)
+
+    previous_row = range(len(s2) + 1)
+    for i, c1 in enumerate(s1):
+        current_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            insertions = previous_row[j + 1] + 1
+            deletions = current_row[j] + 1
+            substitutions = previous_row[j] + (c1 != c2)
+            current_row.append(min(insertions, deletions, substitutions))
+        previous_row = current_row
+
+    return previous_row[-1]
+
+
+def compute_str_match_rate(s1, s2):
+    distance = levenshtein_distance(s1, s2)
+    max_length = max(len(s1), len(s2))
+    match_rate = (1 - distance / max_length) * 100
+    return match_rate

@@ -68,18 +68,9 @@ struct FillBuffers
             hostBufferRange[batchSlot] = value;
         }
 
-        if (batchSlots)
-        {
-            auto const hostSlice = runtime::IBuffer::slice(hostBuffer, 0, maxBatchSize);
-            auto deviceSlice = runtime::IBuffer::slice(deviceBuffer, 0, maxBatchSize);
-            mBufferManager->copy(*hostSlice, *deviceSlice);
-        }
-        else
-        {
-            auto const hostSlice = runtime::IBuffer::slice(hostBuffer, 0, batchSize);
-            auto deviceSlice = runtime::IBuffer::slice(deviceBuffer, 0, batchSize);
-            mBufferManager->copy(*hostSlice, *deviceSlice);
-        }
+        auto const hostSlice = runtime::IBuffer::slice(hostBuffer, 0, maxBatchSize);
+        auto deviceSlice = runtime::IBuffer::slice(deviceBuffer, 0, maxBatchSize);
+        mBufferManager->copy(*hostSlice, *deviceSlice);
     }
 
     runtime::SizeType32 batchSize;

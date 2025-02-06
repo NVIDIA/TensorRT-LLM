@@ -4,6 +4,7 @@ __pycache__/
 *.engine.config
 *.cache
 *.nsys-rep
+*.npy
 .VSCodeCounter
 cpp/build*
 build
@@ -15,6 +16,7 @@ build
 tmp/
 venv/
 .venv/
+.python-version
 .local/
 .hypothesis/
 .idea/
@@ -58,3 +60,4 @@ cpp/include/tensorrt_llm/executor/version.h
 CMakeUserPresets.json
 compile_commands.json
 *.bin
+.dir-locals.el

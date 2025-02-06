@@ -60,7 +60,8 @@ void RuntimeBuffers::clearTensorMaps()
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void RuntimeBuffers::create(TllmRuntime const& runtime, ModelConfig const& modelConfig, WorldConfig const& worldConfig)
+void RuntimeBuffers::create(TllmRuntime const& runtime, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
+    bool gatherGenerationLogits)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto const& manager = runtime.getBufferManager();
@@ -73,7 +74,7 @@ void RuntimeBuffers::create(TllmRuntime const& runtime, ModelConfig const& model
         originalLogitsPtr = logits;
 
         allGenerationLogits = manager.emptyTensor(MemoryType::kGPU, logitsType);
-        if (modelConfig.computeGenerationLogits())
+        if (gatherGenerationLogits)
         {
             cacheGenerationFragmentPointerDevice = manager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT64);
             cacheGenerationFragmentPointerHost
@@ -129,7 +130,8 @@ void RuntimeBuffers::initFromInput(ITensor const& inputIds, TensorPtr const& inp
         maxAttentionWindowVec, maxAttentionWindow, sinkTokenLength, maxSequenceLength);
 }
 
-void RuntimeBuffers::reshape(ModelConfig const& modelConfig, WorldConfig const& worldConfig)
+void RuntimeBuffers::reshape(
+    ModelConfig const& modelConfig, WorldConfig const& worldConfig, bool gatherGenerationLogits)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -144,7 +146,7 @@ void RuntimeBuffers::reshape(ModelConfig const& modelConfig, WorldConfig const& 
     {
         if (modelConfig.computeContextLogits())
         {
-            if (!modelConfig.computeGenerationLogits())
+            if (!gatherGenerationLogits)
             {
                 // If only enable computeContextLogits, also need to have a generation buffer to store the last token of
                 // context
@@ -154,14 +156,14 @@ void RuntimeBuffers::reshape(ModelConfig const& modelConfig, WorldConfig const& 
         else
         {
             // If only gather generation logits
-            if (modelConfig.computeGenerationLogits())
+            if (gatherGenerationLogits)
             {
                 logits = originalLogitsPtr; // logits point to original buffer
             }
             logits->reshape(ITensor::makeShape({batchSize, 1, vocabSizePadded}));
         }
 
-        if (modelConfig.computeGenerationLogits())
+        if (gatherGenerationLogits)
         {
             allGenerationLogits->reshape(
                 ITensor::makeShape({(maxSeqLength - maxInputLength), batchSize, beamWidth, vocabSizePadded}));

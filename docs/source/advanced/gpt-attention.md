@@ -73,9 +73,7 @@ FP8 Paged Context FMHA is also supported with the fp8 quantization workflow.
 You need to specify `use_fp8_context_fmha = enable` and
 `use_paged_context_fmha = enable` at the same time.
 
-Please be aware that this is an experimental feature only supported on Hopper.
-If you notice a significant decrease in accuracy, it is recommended to disable
-it.
+Please be aware that this feature is only supported on Ada and Hopper.
 
 ### Generation Phase
 
@@ -120,7 +118,7 @@ is one model that it supports.
 Support matrix of the XQA optimization:
  - FP16 / BF16 compute data type.
  - FP16 / BF16 / FP8 / INT8 KV cache data type.
- - Paged KV cache (64 / 128 tokens per block).
+ - Paged KV cache (8 / 16 / 32 / 64 / 128 tokens per block).
 
 This is default enabled. To disable this, you need to use the
 flag `--disable_xqa` when building the engines. Note that a heuristic algorithm

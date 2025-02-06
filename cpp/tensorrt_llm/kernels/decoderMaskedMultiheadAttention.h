@@ -274,8 +274,6 @@ inline int estimate_min_multi_block_count(int max_timesteps, int max_dynamic_shm
 {
     auto const qk_elts = static_cast<int>((max_timesteps + 1 + 4 - 1) / 4);
     int size_per_elts = 16;
-    auto const qk_sz = qk_elts * 16;
-    size_t logits_sz = 0;
 #ifndef MMHA_USE_FP32_ACUM_FOR_LOGITS
     if (sizeof(T) != 4)
     {

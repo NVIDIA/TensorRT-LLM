@@ -30,12 +30,15 @@
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/pybind/batch_manager/algorithms.h"
 #include "tensorrt_llm/pybind/batch_manager/bindings.h"
+#include "tensorrt_llm/pybind/batch_manager/buffers.h"
 #include "tensorrt_llm/pybind/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/pybind/batch_manager/llmRequest.h"
 #include "tensorrt_llm/pybind/executor/bindings.h"
 #include "tensorrt_llm/pybind/runtime/bindings.h"
+#include "tensorrt_llm/pybind/userbuffers/bindings.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
+#include "tensorrt_llm/runtime/ipcNvlsMemory.h"
 #include "tensorrt_llm/runtime/ipcUtils.h"
 #include "tensorrt_llm/runtime/memoryCounters.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
@@ -122,12 +125,13 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
 
     py::class_<tb::PeftCacheManagerConfig>(m, "PeftCacheManagerConfig")
         .def(py::init<SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32,
-                 SizeType32, std::optional<float>, std::optional<size_t>>(),
+                 SizeType32, std::optional<float>, std::optional<size_t>, std::optional<std::string>>(),
             py::arg("num_host_module_layer") = 0, py::arg("num_device_module_layer") = 0,
             py::arg("optimal_adapter_size") = 8, py::arg("max_adapter_size") = 64, py::arg("num_put_workers") = 1,
             py::arg("num_ensure_workers") = 1, py::arg("num_copy_streams") = 1,
             py::arg("max_pages_per_block_host") = 24, py::arg("max_pages_per_block_device") = 8,
-            py::arg("device_cache_percent") = std::nullopt, py::arg("host_cache_size") = std::nullopt)
+            py::arg("device_cache_percent") = std::nullopt, py::arg("host_cache_size") = std::nullopt,
+            py::arg("lora_prefetch_dir") = std::nullopt)
         .def_readwrite("num_host_module_layer", &tb::PeftCacheManagerConfig::numHostModuleLayer)
         .def_readwrite("num_device_module_layer", &tb::PeftCacheManagerConfig::numDeviceModuleLayer)
         .def_readwrite("optimal_adapter_size", &tb::PeftCacheManagerConfig::optimalAdapterSize)
@@ -138,7 +142,8 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_readwrite("max_pages_per_block_host", &tb::PeftCacheManagerConfig::maxPagesPerBlockHost)
         .def_readwrite("max_pages_per_block_device", &tb::PeftCacheManagerConfig::maxPagesPerBlockDevice)
         .def_readwrite("device_cache_percent", &tb::PeftCacheManagerConfig::deviceCachePercent)
-        .def_readwrite("host_cache_size", &tb::PeftCacheManagerConfig::hostCacheSize);
+        .def_readwrite("host_cache_size", &tb::PeftCacheManagerConfig::hostCacheSize)
+        .def_readwrite("lora_prefetch_dir", &tb::PeftCacheManagerConfig::loraPrefetchDir);
 
     py::enum_<nvinfer1::DataType>(m, "DataType")
         .value("FLOAT", nvinfer1::DataType::kFLOAT)
@@ -192,12 +197,13 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property_readonly("has_int8_kv_cache", &tc::QuantMode::hasInt8KvCache)
         .def_property_readonly("has_fp8_kv_cache", &tc::QuantMode::hasFp8KvCache)
         .def_property_readonly("has_fp8_qdq", &tc::QuantMode::hasFp8Qdq)
+        .def_property_readonly("has_nvfp4", &tc::QuantMode::hasNvfp4)
         .def_property_readonly("has_kv_cache_quant", &tc::QuantMode::hasKvCacheQuant)
         .def_static("from_description", &tc::QuantMode::fromDescription, py::arg("quantize_weights") = false,
             py::arg("quantize_activations") = false, py::arg("per_token") = false, py::arg("per_channel") = false,
             py::arg("per_group") = false, py::arg("use_int4_weights") = false, py::arg("use_int8_kv_cache") = false,
             py::arg("use_fp8_kv_kache") = false, py::arg("use_fp8_qdq") = false, py::arg("use_fp8_rowwise") = false,
-            py::arg("use_w4a8_qserve") = false)
+            py::arg("use_w4a8_qserve") = false, py::arg("use_nvfp4") = false)
         .def_static("use_smooth_quant", &tc::QuantMode::useSmoothQuant, py::arg("per_token") = false,
             py::arg("per_channel") = false)
         .def_static("use_weight_only", &tc::QuantMode::useWeightOnly, py::arg("use_int4_weights") = false,
@@ -296,11 +302,11 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         return py::make_tuple(config.beamWidth, config.temperature, config.minLength, config.repetitionPenalty,
             config.presencePenalty, config.frequencyPenalty, config.topK, config.topP, config.randomSeed,
             config.topPDecay, config.topPMin, config.topPResetIds, config.beamSearchDiversityRate, config.lengthPenalty,
-            config.earlyStopping, config.noRepeatNgramSize);
+            config.earlyStopping, config.noRepeatNgramSize, config.minP);
     };
     auto SamplingConfigSetState = [](py::tuple t) -> tr::SamplingConfig
     {
-        assert(t.size() == 16);
+        assert(t.size() == 17);
 
         tr::SamplingConfig config;
         config.beamWidth = t[0].cast<SizeType32>();
@@ -319,8 +325,9 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         config.lengthPenalty = t[13].cast<OptVec<float>>();
         config.earlyStopping = t[14].cast<OptVec<SizeType32>>();
         config.noRepeatNgramSize = t[15].cast<OptVec<SizeType32>>();
+        config.minP = t[16].cast<OptVec<float>>();
 
-        return std::move(config);
+        return config;
     };
 
     py::classh<tr::SamplingConfig>(m, "SamplingConfig")
@@ -343,8 +350,11 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_readwrite("length_penalty", &tr::SamplingConfig::lengthPenalty)
         .def_readwrite("early_stopping", &tr::SamplingConfig::earlyStopping)
         .def_readwrite("no_repeat_ngram_size", &tr::SamplingConfig::noRepeatNgramSize)
+        .def_readwrite("min_p", &tr::SamplingConfig::minP)
         .def(py::pickle(SamplingConfigGetState, SamplingConfigSetState))
         .def("__eq__", &tr::SamplingConfig::operator==);
+
+    py::bind_vector<std::vector<tr::SamplingConfig>>(m, "VectorSamplingConfig");
 
     py::class_<tr::GptJsonConfig>(m, "GptJsonConfig")
         .def(py::init<std::string, std::string, std::string, SizeType32, SizeType32, SizeType32, SizeType32,
@@ -436,7 +446,22 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
     tpb::initBindings(mInternalBatchManager);
     tb::kv_cache_manager::KVCacheManagerBindings::initBindings(mInternalBatchManager);
     tb::BasePeftCacheManagerBindings::initBindings(mInternalBatchManager);
+    tpb::Buffers::initBindings(mInternalBatchManager);
 
     auto mInternalAlgorithms = mInternal.def_submodule("algorithms", "Algorithms internal bindings");
     tpb::algorithms::initBindings(mInternalAlgorithms);
+
+    auto mUserbuffers = mInternal.def_submodule("userbuffers", "User buffers internal bindings");
+    tensorrt_llm::kernels::userbuffers::UserBufferBindings::initBindings(mUserbuffers);
+
+    // NVLS allocators
+    py::class_<tr::IpcNvlsHandle>(m, "IpcNvlsHandle")
+        .def(py::init<>())
+        .def_readwrite("uc_ptr", &tr::IpcNvlsHandle::uc_ptr)
+        .def_readwrite("mc_ptr", &tr::IpcNvlsHandle::mc_ptr)
+        .def_readwrite("size", &tr::IpcNvlsHandle::size);
+
+    m.def("ipc_nvls_allocate", &tr::ipcNvlsAllocate);
+    m.def("ipc_nvls_free", &tr::ipcNvlsFree);
+    m.def("ipc_nvls_supported", &tr::ipcNvlsSupported);
 }

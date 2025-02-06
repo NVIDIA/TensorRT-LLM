@@ -1,14 +1,16 @@
 # Executor API examples
 
-This directory contains four examples that demonstrate how to use the `Executor` API:
-1. The example defined in `executorExampleBasic.cpp` shows how you can generate output tokens for a single prompt in only a few lines of code.
-2. The example defined in `executorExampleAdvanced.cpp` supports more options such as providing an arbitrary number of input requests with arbitrary tokens per request and running in streaming mode.
-3. The example defined in `executorExampleLogitsProcessor.cpp` shows how to use `LogitsPostProcessor` to control output tokens.
-4. The example defined in `executorExampleFastLogits` shows how to use `ExternalDraftTokensConfig` for speculative decoding and optionally use the fast logits feature.
+This directory contains several examples that demonstrate how to use the `Executor` API:
+- The example defined in `executorExampleBasic.cpp` shows how you can generate output tokens for a single prompt in only a few lines of code.
+- The example defined in `executorExampleAdvanced.cpp` supports more options such as providing an arbitrary number of input requests with arbitrary tokens per request and running in streaming mode.
+- The example defined in `executorExampleLogitsProcessor.cpp` shows how to use `LogitsPostProcessor` to control output tokens.
+- The example defined in `executorExampleFastLogits.cpp` shows how to use `ExternalDraftTokensConfig` for speculative decoding and optionally use the fast logits feature.
+- The example defined in `executorExampleKvEvents.cpp` shows how to use the KV cache event API.
+- The example defined in `executorExampleDisaggregated.cpp` shows how to use the disaggregated executor API.
 
 ## Building the examples
 
-To build the examples, you first need to build the TensorRT-LLM C++ shared libraries (`libtensorrt_llmm.so` and `libnvinfer_plugin_tensorrt_llm.so`) using the [`build_wheel.py`](source:scripts/build_wheel.py) script. Alternatively, if you have already build the TensorRT-LLM libraries, you can modify the provided `CMakeLists.txt` such that the `libtensorrt_llm.so` and `libnvinfer_plugin_tensorrt_llm.so` are imported properly.
+To build the examples, you first need to build the TensorRT-LLM C++ shared libraries (`libtensorrt_llm.so` and `libnvinfer_plugin_tensorrt_llm.so`) using the [`build_wheel.py`](source:scripts/build_wheel.py) script. Alternatively, if you have already build the TensorRT-LLM libraries, you can modify the provided `CMakeLists.txt` such that the `libtensorrt_llm.so` and `libnvinfer_plugin_tensorrt_llm.so` are imported properly.
 
 Once the TensorRT-LLM libraries are built, you can run
 
@@ -115,3 +117,19 @@ From the `examples/cpp/executor/build` folder, you can get run the `executorExam
 where `<path_to_engine_dir>` is the path to the directly containing the TensorRT engine files.
 
 This example shows how the KV Cache Event API can be used to reconstruct the state of TRT-LLM's internal radix tree. This can be used in applications such as smart routing to route requests between multiple executor instances to maximize KV Cache reuse. Events are emitted when blocks are stored, removed, or updated in the radix tree.
+
+### executorExampleDisaggregated
+
+From the `examples/cpp/executor/build` folder, you can also run the `executorExampleDisaggregated` example. To get the full list of supported input arguments, type
+```
+./executorExampleDisaggregated -h
+```
+Note setting `TRTLLM_USE_MPI_KVCACHE=1` is required to run disaggregated executor.
+For example, you can run :
+```
+export TRTLLM_USE_MPI_KVCACHE=1
+
+mpirun -n <num_ranks> --allow-run-as-root --oversubscribe ./executorExampleDisaggregated --context_engine_dir <path_to_context_engine_dir> --context_rank_size <num_ranks_for_context> --generation_engine_dir <path_to_generation_engine_dir> --generation_rank_size <num_ranks_for_generation> --input_tokens ../inputTokens.csv
+
+```
+where `<num_ranks_for_context>` must equal to `tp*pp` for the context engine, and `<num_ranks_for_generation>` must equal to `tp*pp` for the generation engine,the context engine and generation engine can be heterogeneous in parallelism. `<num_ranks>` must equal to `<num_ranks_for_context>+<num_ranks_for_generation>+1`, the additional rank is used as orchestrator process.

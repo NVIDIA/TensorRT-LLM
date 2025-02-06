@@ -13,8 +13,13 @@ import torch
 import tqdm
 
 from tensorrt_llm import logger
+from tensorrt_llm.serve.openai_protocol import (
+    ChatCompletionResponseStreamChoice, ChatCompletionStreamResponse,
+    DeltaMessage)
 
 from .._utils import release_gc
+from ..bindings.executor import SchedulerConfig
+from ..executor import GenerationResultBase
 from ..profiler import device_memory_info, host_memory_info
 from . import LLM, KvCacheConfig, SamplingParams
 from .llm import LLM, SamplingParams
@@ -265,6 +270,13 @@ class LLMPerfEvaluator:
         if "kv_cache_free_gpu_mem_fraction" in kwargs:
             kvcache_extra_params["free_gpu_memory_fraction"] = kwargs.pop(
                 "kv_cache_free_gpu_mem_fraction")
+        if "enable_kv_cache_reuse" in kwargs:
+            kvcache_extra_params["enable_block_reuse"] = kwargs.pop(
+                "enable_kv_cache_reuse")
+        if "kv_cache_max_tokens" in kwargs:
+            kv_cache_max_tokens = kwargs.pop("kv_cache_max_tokens")
+            if kv_cache_max_tokens is not None:
+                kvcache_extra_params["max_tokens"] = kv_cache_max_tokens
 
         enable_chunked_prefill = kwargs.pop("chunked_context", True)
 
@@ -274,11 +286,30 @@ class LLMPerfEvaluator:
         print_colored(f"kvcache_extra_params: {kvcache_extra_params}\n",
                       "green")
 
+        if "capacity_scheduler_policy" in kwargs:
+            kwargs["scheduler_config"] = SchedulerConfig(
+                capacity_scheduler_policy=kwargs.pop(
+                    "capacity_scheduler_policy"))
+
+        num_postprocess_workers = kwargs.pop("num_postprocess_workers", 0)
+        # Enable postprocess workers
+        enable_oai_postprocess = kwargs.pop("enable_oai_postprocess", False)
+        postprocess_result_handler = perform_faked_oai_postprocess if enable_oai_postprocess else None
+        postprocess_tokenizer_dir = kwargs.pop("postprocess_tokenizer_dir",
+                                               None)
+
+        if num_postprocess_workers > 0:
+            assert postprocess_tokenizer_dir is not None, "postprocess_tokenizer_dir is required"
+            kwargs["_postprocess_result_handler"] = postprocess_result_handler
+            kwargs["_postprocess_tokenizer_dir"] = postprocess_tokenizer_dir
+            kwargs["_num_postprocess_workers"] = num_postprocess_workers
+
         try:
             kv_cache_config = KvCacheConfig(
                 **kvcache_extra_params) if kvcache_extra_params else None
             if kv_cache_config is not None:
                 kwargs['kv_cache_config'] = kv_cache_config
+
             llm = LLM(model,
                       skip_tokenizer_init=True,
                       enable_chunked_prefill=enable_chunked_prefill,
@@ -303,7 +334,8 @@ class LLMPerfEvaluator:
                    warmup=warmup,
                    concurrency=concurrency,
                    memory_monitor_thread=memory_monitor_thread,
-                   sampling_extra_params=sampling_extra_params)
+                   sampling_extra_params=sampling_extra_params,
+                   enable_postprocess_parallel=num_postprocess_workers > 0)
 
     def __init__(self,
                  llm: LLM,
@@ -313,7 +345,8 @@ class LLMPerfEvaluator:
                  concurrency: Optional[int] = None,
                  memory_monitor_thread: Optional[
                      MemoryContinuousMonitorThread] = None,
-                 sampling_extra_params: Optional[dict] = None):
+                 sampling_extra_params: Optional[dict] = None,
+                 enable_postprocess_parallel=False):
         self.llm = llm
         self.samples = samples
         self.streaming = streaming
@@ -324,6 +357,7 @@ class LLMPerfEvaluator:
                       "green")
         self.memory_monitor_thread = memory_monitor_thread
         self.sampling_extra_params = sampling_extra_params
+        self.enable_postprocess_parallel = enable_postprocess_parallel
 
         self.perf_items: List[PerfItem] = []
         self.start = None
@@ -344,7 +378,9 @@ class LLMPerfEvaluator:
                        is_warmup: bool = False,
                        tqdm_bar: tqdm.tqdm = None):
             nonlocal sample_offset
-            num_samples = self.warmup if is_warmup else len(self.samples)
+            num_samples = min(self.warmup,
+                              self.concurrency) if is_warmup else len(
+                                  self.samples)
 
             while sample_offset < num_samples:
                 sample = self.samples[sample_offset]
@@ -363,7 +399,9 @@ class LLMPerfEvaluator:
                     sampling_params=sampling_params,
                     streaming=self.streaming)
                 if self.streaming:
+                    no = 0
                     async for stream_output in output:
+                        no += 1
                         if time_on_first_token is None:
                             time_on_first_token = time.perf_counter()
                     output = stream_output
@@ -371,12 +409,13 @@ class LLMPerfEvaluator:
                     output = await output.aresult()
                 end = time.perf_counter()
 
+                num_out_tokens = sum(
+                    beam_output.length for beam_output in output.outputs
+                ) if not self.enable_postprocess_parallel else no
                 perf_item = PerfItem(start=start,
                                      end=end,
                                      time_on_first_token=time_on_first_token,
-                                     num_out_tokens=sum(
-                                         beam_output.length
-                                         for beam_output in output.outputs))
+                                     num_out_tokens=num_out_tokens)
                 if not is_warmup:
                     self.perf_items.append(perf_item)
 
@@ -487,3 +526,53 @@ class LLMPerfEvaluator:
             self.memory_monitor_thread.stop()
             self.memory_monitor_thread.join()
             del self.memory_monitor_thread
+
+
+def perform_faked_oai_postprocess(rsp: GenerationResultBase):
+    first_iteration = len(rsp.outputs[0].token_ids) == 1
+    num_choices = 1
+    finish_reason_sent = [False] * num_choices
+    role = "assistant"
+    model = "LLaMA"
+
+    def yield_first_chat(idx: int, role: str = None, content: str = None):
+        choice_data = ChatCompletionResponseStreamChoice(index=idx,
+                                                         delta=DeltaMessage(
+                                                             role=role,
+                                                             content=content),
+                                                         finish_reason=None)
+        chunk = ChatCompletionStreamResponse(choices=[choice_data], model=model)
+
+        data = chunk.model_dump_json(exclude_unset=True)
+        return data
+
+    res = []
+    if first_iteration:
+        for i in range(num_choices):
+            res.append(f"data: {yield_first_chat(i, role=role)} \n\n")
+    first_iteration = False
+
+    for output in rsp.outputs:
+        i = output.index
+
+        if finish_reason_sent[i]:
+            continue
+
+        delta_text = output.text_diff
+        delta_message = DeltaMessage(content=delta_text)
+
+        choice = ChatCompletionResponseStreamChoice(index=i,
+                                                    delta=delta_message,
+                                                    finish_reason=None)
+        if output.finish_reason is not None:
+            choice.finish_reason = output.finish_reason
+            choice.stop_reason = output.stop_reason
+            finish_reason_sent[i] = True
+        chunk = ChatCompletionStreamResponse(choices=[choice], model=model)
+        data = chunk.model_dump_json(exclude_unset=True)
+        res.append(f"data: {data}\n\n")
+
+    if rsp._done:
+        res.append(f"data: [DONE]\n\n")
+
+    return res

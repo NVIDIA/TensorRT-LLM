@@ -52,7 +52,7 @@ auto listAllTactics()
 template <class BenchClass>
 int parseTacticToId(nlohmann::json tactic_config)
 {
-    bool is_sm90 = tactic_config.at("is_sm90").get<bool>();
+    bool is_tma_warp_specialized = tactic_config.at("is_tma_warp_specialized").get<bool>();
     int tile_shape_id = -1;
     std::array<int, 3> tile_shape;
     if (tactic_config.at("tile_shape").is_array())
@@ -67,10 +67,10 @@ int parseTacticToId(nlohmann::json tactic_config)
         for (int i = 0; i < confs.size(); i++)
         {
             auto const& c = confs[i];
-            if (c.is_sm90 != is_sm90)
+            if (c.is_tma_warp_specialized != is_tma_warp_specialized)
                 continue;
 
-            if (!is_sm90)
+            if (!is_tma_warp_specialized)
             {
                 int stages = tactic_config.at("stages").get<int>();
                 if (c.stages != stages)
@@ -79,10 +79,10 @@ int parseTacticToId(nlohmann::json tactic_config)
 
             if (tile_shape_id != -1)
             {
-                int comp = is_sm90 ? (int) c.tile_config_sm90 : (int) c.tile_config;
+                int comp = c.getTileConfigAsInt();
                 if (tile_shape_id != comp)
                     continue;
-                if (is_sm90 && (int) c.cluster_shape != tactic_config.at("cluster_shape").get<int>())
+                if (is_tma_warp_specialized && (int) c.cluster_shape != tactic_config.at("cluster_shape").get<int>())
                     continue;
 
                 // Found matching config
@@ -90,8 +90,9 @@ int parseTacticToId(nlohmann::json tactic_config)
             }
 
             // Handle if the user provided a shape instead of the enum value
-            if (is_sm90)
+            if (is_tma_warp_specialized)
             {
+                // TODO Add cases for blackwell shapes
                 using Kv = uint64_t;
                 constexpr static auto K = [](int m, int n) { return (uint64_t(m) << 32) | uint64_t(n); };
                 static std::unordered_map<Kv, CutlassTileConfigSM90> const tile_map{
@@ -109,7 +110,7 @@ int parseTacticToId(nlohmann::json tactic_config)
                     {K(256, 128), CutlassTileConfigSM90::CtaShape256x128x128B},
                 };
 
-                if (c.tile_config_sm90 != tile_map.at(K(tile_shape[0], tile_shape[1])))
+                if (c.getTileConfigAsInt() != (int) tile_map.at(K(tile_shape[0], tile_shape[1])))
                     continue;
 
                 static std::unordered_map<Kv, ClusterShape> const cluster_map{
@@ -165,7 +166,7 @@ int parseTacticToId(nlohmann::json tactic_config)
                     {K({16, 256, 64}, {16, 64, 64}), CutlassTileConfig::CtaShape16x256x64_WarpShape16x64x64}
 
                 };
-                if (c.tile_config != tile_map.at(K(tile_shape, warp_shape)))
+                if (c.tile_config_sm80 != tile_map.at(K(tile_shape, warp_shape)))
                     continue;
 
                 // Found matching config
@@ -368,6 +369,10 @@ void argGenLoadFile(benchmark::internal::Benchmark* benchmark)
             {
                 continue;
             }
+            else if (BenchClass::FP4 && !hasDtype("fp4"))
+            {
+                continue;
+            }
             else if (BenchClass::INT4 && !hasDtype("int4"))
             {
                 continue;
@@ -546,6 +551,9 @@ BENCHMARK_BASIC(nv_bfloat16, nv_bfloat16, nv_bfloat16)
 #ifdef ENABLE_FP8
 BENCHMARK_BASIC(SafeFP8, SafeFP8, half)
 #endif
+#ifdef ENABLE_FP4
+BENCHMARK_BASIC(SafeFP4, SafeFP4, half)
+#endif
 
 void delayedRegisterBenchmark()
 {
@@ -561,6 +569,9 @@ void delayedRegisterBenchmark()
         BENCHMARK_BASIC_DO_REGISTER(half, uint4b_t, half);
 #ifdef ENABLE_BF16
         BENCHMARK_BASIC_DO_REGISTER(nv_bfloat16, nv_bfloat16, nv_bfloat16);
+#endif
+#ifdef ENABLE_FP4
+        BENCHMARK_BASIC_DO_REGISTER(SafeFP4, SafeFP4, half);
 #endif
     }
 }
@@ -614,10 +625,10 @@ void help()
            "- \"num_tokens\" - The total number of tokens to benchmark\n"
            "- \"bias\" - If bias should be used, 0 = no bias, 1 = bias\n"
            "- \"act_fn\" - The enum value of the activation function. See\n"
-           "\"cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels.h\"\n"
+           "\"cpp/tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_gemm_kernels.h\"\n"
            "- \"norm_mode\" - The normalization mode. 0 = NONE, 1 = RENORM, 2 = SPARSE_MIXER, 3 = DEVICE_LIMITED, 4 = "
            "DEVICE_LIMITED_RENORM. See\n"
-           "\"cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels.h\"\n"
+           "\"cpp/tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_kernels.h\"\n"
            "- \"tactic_id, tactic_id1, tactic_id2\"\n"
            "The config for the CUTLASS GEMM. tactic_id sets the same tactic for both to the same tactic (except in "
            "auto mode)\n"
@@ -625,7 +636,7 @@ void help()
            "Valid tactics are:\n"
            " - An object:\n"
            "   {\n"
-           "      \"is_sm90\": bool,\n"
+           "      \"is_tma_warp_specialized\": bool,\n"
            "      \"tile_shape\": [int, int, int] or int,\n"
            "      \"cluster_shape\": [int, int, int] or int, (required for sm90, type must be an int if tile_shape "
            "is "

@@ -91,6 +91,7 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
             dtype=torch.int32,
             device="cuda")
         greedy_sampling = torch.tensor([1], dtype=torch.int32, device="cpu")
+        use_dynamic_tree = torch.tensor([0], dtype=torch.int32, device="cpu")
         ref_accepted_tokens = torch.tensor([[0, 1]],
                                            dtype=torch.int32,
                                            device="cuda")
@@ -102,8 +103,8 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
         test_cases += [[
             logits, draft_tokens, draft_lens, eagle_temperature,
             rand_data_validation, posterior_alpha, posterior_threshold, paths,
-            greedy_sampling, ref_accepted_tokens, ref_num_accepted_tokens,
-            ref_accepted_paths
+            greedy_sampling, use_dynamic_tree, ref_accepted_tokens,
+            ref_num_accepted_tokens, ref_accepted_paths
         ]]
 
         ################# CASE 1 ##########################
@@ -143,6 +144,7 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
             dtype=torch.int32,
             device="cuda")
         greedy_sampling = torch.tensor([1], dtype=torch.int32, device="cpu")
+        use_dynamic_tree = torch.tensor([0], dtype=torch.int32, device="cpu")
         ref_accepted_tokens = torch.tensor([[2, 5, 6, 7]],
                                            dtype=torch.int32,
                                            device="cuda")
@@ -154,8 +156,8 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
         test_cases += [[
             logits, draft_tokens, draft_lens, eagle_temperature,
             rand_data_validation, posterior_alpha, posterior_threshold, paths,
-            greedy_sampling, ref_accepted_tokens, ref_num_accepted_tokens,
-            ref_accepted_paths
+            greedy_sampling, use_dynamic_tree, ref_accepted_tokens,
+            ref_num_accepted_tokens, ref_accepted_paths
         ]]
 
         ################# CASE 2 ##########################
@@ -218,6 +220,7 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
             dtype=torch.int32,
             device="cuda")
         greedy_sampling = torch.tensor([1], dtype=torch.int32, device="cpu")
+        use_dynamic_tree = torch.tensor([0], dtype=torch.int32, device="cpu")
         ref_accepted_tokens = torch.tensor([[0, 1, -1, -1], [3, 2, -1, -1]],
                                            dtype=torch.int32,
                                            device="cuda")
@@ -231,8 +234,8 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
         test_cases += [[
             logits, draft_tokens, draft_lens, eagle_temperature,
             rand_data_validation, posterior_alpha, posterior_threshold, paths,
-            greedy_sampling, ref_accepted_tokens, ref_num_accepted_tokens,
-            ref_accepted_paths
+            greedy_sampling, use_dynamic_tree, ref_accepted_tokens,
+            ref_num_accepted_tokens, ref_accepted_paths
         ]]
 
         ################# CASE 3 ##########################
@@ -288,6 +291,7 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
             dtype=torch.int32,
             device="cuda")
         greedy_sampling = torch.tensor([1], dtype=torch.int32, device="cpu")
+        use_dynamic_tree = torch.tensor([0], dtype=torch.int32, device="cpu")
         ref_accepted_tokens = torch.tensor(
             [[0, -1, -1, -1], [1, -1, -1, -1], [2, 2, -1, -1]],
             dtype=torch.int32,
@@ -302,8 +306,8 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
         test_cases += [[
             logits, draft_tokens, draft_lens, eagle_temperature,
             rand_data_validation, posterior_alpha, posterior_threshold, paths,
-            greedy_sampling, ref_accepted_tokens, ref_num_accepted_tokens,
-            ref_accepted_paths
+            greedy_sampling, use_dynamic_tree, ref_accepted_tokens,
+            ref_num_accepted_tokens, ref_accepted_paths
         ]]
 
         ################# CASE 4 ##########################
@@ -337,6 +341,7 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
             dtype=torch.int32,
             device="cuda")
         greedy_sampling = torch.tensor([0], dtype=torch.int32, device="cpu")
+        use_dynamic_tree = torch.tensor([0], dtype=torch.int32, device="cpu")
         ref_accepted_tokens = torch.tensor([[0, 1]],
                                            dtype=torch.int32,
                                            device="cuda")
@@ -348,8 +353,8 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
         test_cases += [[
             logits, draft_tokens, draft_lens, eagle_temperature,
             rand_data_validation, posterior_alpha, posterior_threshold, paths,
-            greedy_sampling, ref_accepted_tokens, ref_num_accepted_tokens,
-            ref_accepted_paths
+            greedy_sampling, use_dynamic_tree, ref_accepted_tokens,
+            ref_num_accepted_tokens, ref_accepted_paths
         ]]
 
         ################# CASE 5 ##########################
@@ -409,6 +414,7 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
             dtype=torch.int32,
             device="cuda")
         greedy_sampling = torch.tensor([0], dtype=torch.int32, device="cpu")
+        use_dynamic_tree = torch.tensor([0], dtype=torch.int32, device="cpu")
         ref_accepted_tokens = torch.tensor([[0, 1]],
                                            dtype=torch.int32,
                                            device="cuda")
@@ -420,8 +426,8 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
         test_cases += [[
             logits, draft_tokens, draft_lens, eagle_temperature,
             rand_data_validation, posterior_alpha, posterior_threshold, paths,
-            greedy_sampling, ref_accepted_tokens, ref_num_accepted_tokens,
-            ref_accepted_paths
+            greedy_sampling, use_dynamic_tree, ref_accepted_tokens,
+            ref_num_accepted_tokens, ref_accepted_paths
         ]]
 
         ################# CASE 6 ##########################
@@ -458,6 +464,7 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
             dtype=torch.int32,
             device="cuda")
         greedy_sampling = torch.tensor([0], dtype=torch.int32, device="cpu")
+        use_dynamic_tree = torch.tensor([0], dtype=torch.int32, device="cpu")
         ref_accepted_tokens = torch.tensor([[0, 2]],
                                            dtype=torch.int32,
                                            device="cuda")
@@ -469,8 +476,8 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
         test_cases += [[
             logits, draft_tokens, draft_lens, eagle_temperature,
             rand_data_validation, posterior_alpha, posterior_threshold, paths,
-            greedy_sampling, ref_accepted_tokens, ref_num_accepted_tokens,
-            ref_accepted_paths
+            greedy_sampling, use_dynamic_tree, ref_accepted_tokens,
+            ref_num_accepted_tokens, ref_accepted_paths
         ]]
 
         ################# CASE 7 ##########################
@@ -507,6 +514,7 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
             dtype=torch.int32,
             device="cuda")
         greedy_sampling = torch.tensor([0], dtype=torch.int32, device="cpu")
+        use_dynamic_tree = torch.tensor([0], dtype=torch.int32, device="cpu")
         ref_accepted_tokens = torch.tensor([[2, 4, 2]],
                                            dtype=torch.int32,
                                            device="cuda")
@@ -518,8 +526,8 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
         test_cases += [[
             logits, draft_tokens, draft_lens, eagle_temperature,
             rand_data_validation, posterior_alpha, posterior_threshold, paths,
-            greedy_sampling, ref_accepted_tokens, ref_num_accepted_tokens,
-            ref_accepted_paths
+            greedy_sampling, use_dynamic_tree, ref_accepted_tokens,
+            ref_num_accepted_tokens, ref_accepted_paths
         ]]
 
         ################ CASE 8 ##########################
@@ -561,6 +569,7 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
             dtype=torch.int32,
             device="cuda")
         greedy_sampling = torch.tensor([0], dtype=torch.int32, device="cpu")
+        use_dynamic_tree = torch.tensor([0], dtype=torch.int32, device="cpu")
 
         ref_accepted_tokens = torch.tensor([[1, 4, -1, -1], [3, 2, -1, -1]],
                                            dtype=torch.int32,
@@ -575,8 +584,8 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
         test_cases += [[
             logits, draft_tokens, draft_lens, eagle_temperature,
             rand_data_validation, posterior_alpha, posterior_threshold, paths,
-            greedy_sampling, ref_accepted_tokens, ref_num_accepted_tokens,
-            ref_accepted_paths
+            greedy_sampling, use_dynamic_tree, ref_accepted_tokens,
+            ref_num_accepted_tokens, ref_accepted_paths
         ]]
 
         return test_cases
@@ -585,8 +594,8 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
     def test_sample_accept_draft_tokens_plugin(
             self, logits, draft_tokens, draft_lens, eagle_temperature,
             rand_data_validation, posterior_alpha, posterior_threshold, paths,
-            greedy_sampling, ref_accepted_tokens, ref_num_accepted_tokens,
-            ref_accepted_paths):
+            greedy_sampling, use_dynamic_tree, ref_accepted_tokens,
+            ref_num_accepted_tokens, ref_accepted_paths):
         # construct trt network
         builder = tensorrt_llm.Builder()
         network = builder.create_network()
@@ -617,6 +626,9 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
             greedy_sampling_t = Tensor(name='greedy_sampling',
                                        dtype=trt.int32,
                                        shape=greedy_sampling.shape)
+            use_dynamic_tree_t = Tensor(name='use_dynamic_tree',
+                                        dtype=trt.int32,
+                                        shape=use_dynamic_tree.shape)
 
             output = tensorrt_llm.models.eagle.model.eagle_sample_and_accept_draft_plugin(
                 logits_t,
@@ -627,7 +639,8 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
                 posterior_alpha_t,
                 posterior_threshold_t,
                 TreeParams(paths=paths_t),
-                greedy_sampling=greedy_sampling_t)
+                greedy_sampling=greedy_sampling_t,
+                use_dynamic_tree=use_dynamic_tree_t)
             accepted_tokens, num_accepted_tokens, accepted_paths, next_draft_tokens, next_draft_lens, next_draft_paths, hidden_size_batch_level_starts = output
 
             accepted_tokens.mark_output('accepted_tokens')
@@ -651,6 +664,7 @@ class TestEagleSampleAcceptDraftTokensPlugin(unittest.TestCase):
             "posterior_threshold": posterior_threshold,
             "paths": paths,
             "greedy_sampling": greedy_sampling,
+            "use_dynamic_tree": use_dynamic_tree
         }
         outputs = run_session(session, inputs)
 

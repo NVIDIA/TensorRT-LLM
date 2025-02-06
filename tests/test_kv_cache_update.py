@@ -2,7 +2,6 @@ import random
 
 import pytest
 import torch
-from utils.util import getSMVersion
 
 import tensorrt_llm  # noqa
 
@@ -37,10 +36,6 @@ def test_linear_kvcache_update(num_kv_heads: int, head_dim: int,
                                rewind_draft_token_count: int,
                                separate_draft_count: bool,
                                max_kv_cache_length: int):
-    if getSMVersion() <= 70:
-        pytest.skip(
-            "Volta has invalid-device-function issues when running this tests.")
-
     torch.cuda.set_device(0)
     torch.cuda.manual_seed(1234)
     cache_shape = (

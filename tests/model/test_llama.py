@@ -38,8 +38,7 @@ from tensorrt_llm.plugin.plugin import ContextFMHAType
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root
-from utils.util import (skip_bf16_pre_ampere, skip_fp32_accum_pre_ampere,
-                        unittest_name_func)
+from utils.util import unittest_name_func
 
 
 class TestLLaMA(unittest.TestCase):
@@ -220,10 +219,6 @@ class TestLLaMA(unittest.TestCase):
     def test_llama(self, use_refit, fast_building, context_fmha_flag,
                    enable_remove_input_padding, dtype, num_kv_heads, hidden_act,
                    opt_flags):
-
-        # Skip tests that are not supported in pre-ampere architecture
-        skip_bf16_pre_ampere(dtype)
-        skip_fp32_accum_pre_ampere(context_fmha_flag)
 
         PRECHECKED_GOOD_RANDOM_SEEDS = [1, 4, 5, 8]
         model = 'llama'

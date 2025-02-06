@@ -32,8 +32,7 @@ from tensorrt_llm.functional import constant
 from tensorrt_llm.quantization.functional import weight_only_quant_matmul
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import (create_session, run_session, skip_pre_ampere,
-                        unittest_name_func)
+from utils.util import create_session, run_session, unittest_name_func
 
 
 class TestWeightOnlyQuantMatmul(unittest.TestCase):
@@ -142,7 +141,6 @@ class TestWeightOnlyQuantMatmul(unittest.TestCase):
             (256, 6144, 12288, 2, True),  # BF16 * INT4
         ],
         name_func=unittest_name_func)
-    @skip_pre_ampere
     def test_matmul_bf16_act(self, m, n, k, wTypeId, use_plugin):
         self._woq_matmul(m, n, k, 'bfloat16', wTypeId, use_plugin)
 
@@ -162,7 +160,6 @@ class TestWeightOnlyQuantMatmul(unittest.TestCase):
     @parameterized.expand([(1024, 4096, 1), (4096, 512, 1), (1024, 4096, 2),
                            (4096, 512, 2)],
                           name_func=unittest_name_func)
-    @skip_pre_ampere
     def test_bf16_conversion(self, n, k, wTypeId):
         self._conversion_helper(n, k, 'bfloat16', wTypeId)
 

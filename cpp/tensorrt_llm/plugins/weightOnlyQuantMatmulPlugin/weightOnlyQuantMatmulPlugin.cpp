@@ -387,7 +387,7 @@ void WeightOnlyQuantMatmulPlugin::serialize(void* buffer) const noexcept
     write(d, mDims);
 
     mPluginProfiler->serialize(d, mGemmId);
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 }
 
 void WeightOnlyQuantMatmulPlugin::destroy() noexcept
@@ -426,8 +426,8 @@ PluginFieldCollection const* WeightOnlyQuantMatmulPluginCreator::getFieldNames()
 IPluginV2* WeightOnlyQuantMatmulPluginCreator::createPlugin(char const* name, PluginFieldCollection const* fc) noexcept
 {
     PluginField const* fields = fc->fields;
-    nvinfer1::DataType type;
-    WeightTypeId weightTypeId;
+    nvinfer1::DataType type{};
+    WeightTypeId weightTypeId{};
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {

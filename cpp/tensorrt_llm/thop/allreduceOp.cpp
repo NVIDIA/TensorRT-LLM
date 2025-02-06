@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
+#include "tensorrt_llm/kernels/userbuffers/ub_interface.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include <nvml.h>
@@ -125,7 +126,7 @@ class AllreduceOp
 {
 public:
     AllreduceOp(std::set<int> group, nvinfer1::DataType type, AllReduceStrategyType strategy,
-        AllReduceStrategyConfig config, AllReduceFusionOp op, float eps, bool affine, bool bias)
+        AllReduceStrategyConfig config, AllReduceFusionOp op, float eps, bool affine, bool bias, bool scale)
         : mGroup(std::move(group))
         , mType(type)
         , mStrategy(strategy)
@@ -134,6 +135,7 @@ public:
         , mEps(eps)
         , mAffine(affine)
         , mBias(bias)
+        , mScale(scale)
     {
     }
 
@@ -143,8 +145,8 @@ public:
         torch::Tensor input, torch::optional<torch::Tensor> workspace, torch::TensorList reduce_fusion_inputs) noexcept
     {
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
-        auto output = torch::empty_like(input);
-        auto finalOutput = torch::empty_like(input);
+        torch::Tensor output;
+        torch::Tensor finalOutput;
         size_t size = input.numel();
         auto const sizePerElem = tensorrt_llm::common::getDTypeSize(mType);
 
@@ -152,7 +154,13 @@ public:
 
         static char* forceNcclAllReduceStrategyChar = std::getenv("FORCE_NCCL_ALL_REDUCE_STRATEGY");
         bool forceNcclAllReduceStrategy = (forceNcclAllReduceStrategyChar != nullptr);
-        if (forceNcclAllReduceStrategy || mStrategy == AllReduceStrategyType::NCCL)
+        // If strategy is set to UB, UB must be used as UB impl output is special and cannot be used
+        // by others.
+        if (mStrategy == AllReduceStrategyType::UB)
+        {
+            runtimeStrategy = AllReduceStrategyType::UB;
+        }
+        else if (forceNcclAllReduceStrategy || mStrategy == AllReduceStrategyType::NCCL)
         {
             runtimeStrategy = AllReduceStrategyType::NCCL;
         }
@@ -180,13 +188,48 @@ public:
             TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: TWOSHOT", rank);
             break;
         }
+        case AllReduceStrategyType::UB:
+        {
+            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: UB", rank);
+            break;
+        }
         default: break;
         }
 
-        if (runtimeStrategy == AllReduceStrategyType::NCCL)
+        if (runtimeStrategy == AllReduceStrategyType::UB)
         {
+            output = torch::empty_like(input);
+            // Only support fp8 fusion
+            TLLM_CHECK(mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM);
+            TLLM_CHECK(mScale);
+            TLLM_CHECK(mAffine);
+            TLLM_CHECK(!mBias);
+
+            int hidden_size = input.size(-1);
+
+            TLLM_CHECK_WITH_INFO(
+                tensorrt_llm::runtime::ub::ub_is_initialized(), "UserBuffer has not been initialized!");
+            auto ub_buffer0 = tensorrt_llm::runtime::ub::ub_get(0);
+            auto ub_buffer1 = tensorrt_llm::runtime::ub::ub_get(1);
+            TLLM_CHECK(input.data_ptr() == ub_buffer0.addr);
+            auto ub_comm = tensorrt_llm::runtime::ub::ub_comm();
+
+            void* residual = reduce_fusion_inputs[0].data_ptr();
+            void* gamma = reduce_fusion_inputs[1].data_ptr();
+            float* scale = static_cast<float*>(reduce_fusion_inputs[2].data_ptr());
+            tensorrt_llm::kernels::ub::allreduce2_userbuff_inplace_rmsnorm_quant_launcher(ub_buffer0.handle, 0,
+                ub_buffer1.handle, 0, size, hidden_size, nullptr, gamma, mEps, scale, residual, output.data_ptr(),
+                mType, ub_comm, stream);
+            finalOutput = torch::from_blob(ub_buffer1.addr, input.sizes(), input.strides(),
+                torch::dtype(torch::kFloat8_e4m3fn).device(torch::kCUDA));
+        }
+        else if (runtimeStrategy == AllReduceStrategyType::NCCL)
+        {
+            output = torch::empty_like(input);
             if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
             {
+                finalOutput = torch::empty_like(input);
+
                 NCCLCHECK(ncclAllReduce(input.data_ptr(), output.mutable_data_ptr(), size, (*getDtypeMap())[mType],
                     ncclSum, *mNcclComm, stream));
                 tensorrt_llm::kernels::AllReduceParams params;
@@ -212,6 +255,7 @@ public:
         {
             auto const tpSize = mGroup.size();
             int tpRank = 0;
+            output = torch::empty_like(input);
             for (auto const& currentRank : mGroup)
             {
                 if (rank == currentRank)
@@ -229,6 +273,7 @@ public:
             params.elts_total = size;
             if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
             {
+                finalOutput = torch::empty_like(input);
                 int fusion_ptr_idx = 0;
                 params.local_output_buffer_ptr = finalOutput.mutable_data_ptr();
                 params.fusion_params.bias_buffer = mBias ? reduce_fusion_inputs[fusion_ptr_idx++].data_ptr() : nullptr;
@@ -495,6 +540,7 @@ private:
     std::shared_ptr<ncclComm_t> mNcclComm;
     bool mAffine;
     bool mBias;
+    bool mScale;
 };
 
 } // namespace
@@ -503,7 +549,7 @@ private:
 
 std::tuple<torch::Tensor, torch::Tensor> allreduce(torch::Tensor input, torch::optional<torch::Tensor> workspace,
     torch::TensorList reduce_fusion_inputs, torch::List<int64_t> group_, int64_t const strategy_, int64_t const config_,
-    int64_t const fusion_op_, double const eps_, bool const affine_, bool const bias_)
+    int64_t const fusion_op_, double const eps_, bool const affine_, bool const bias_, bool const scale_)
 {
 #if ENABLE_MULTI_DEVICE
     auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
@@ -516,7 +562,7 @@ std::tuple<torch::Tensor, torch::Tensor> allreduce(torch::Tensor input, torch::o
     {
         group.insert(static_cast<int>(rank));
     }
-    AllreduceOp op(group, dtype, strategy, config, fusion_op, eps, affine_, bias_);
+    AllreduceOp op(group, dtype, strategy, config, fusion_op, eps, affine_, bias_, scale_);
     op.initialize();
     auto output = op.run(input, workspace, reduce_fusion_inputs);
     return output;
@@ -531,7 +577,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "allreduce(Tensor input, Tensor? workspace, Tensor[] reduce_fusion_inputs, int[] group, int "
-        "strategy, int config, int op, float eps, bool affine, bool bias) -> (Tensor, Tensor)");
+        "strategy, int config, int op, float eps, bool affine, bool bias, bool scale) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

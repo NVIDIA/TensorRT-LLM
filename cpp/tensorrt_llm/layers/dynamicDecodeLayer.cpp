@@ -246,8 +246,8 @@ void DynamicDecodeLayer<T>::prepareIdsPtrs(std::shared_ptr<BaseDecodingOutputs> 
     BufferConstPtr batchSlots, SizeType32 batchSize, SizeType32 beamWidth, SizeType32 maxSeqLen)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    TensorPtr outputIdsPtrHostSlice = ITensor::slice(mOutputIdsPtrHost, mCyclicStep, 1);
-    TensorPtr parentIdsPtrHostSlice = ITensor::slice(mParentIdsPtrHost, mCyclicStep, 1);
+    TensorPtr outputIdsPtrHostSlice = ITensor::at(mOutputIdsPtrHost, {mCyclicStep});
+    TensorPtr parentIdsPtrHostSlice = ITensor::at(mParentIdsPtrHost, {mCyclicStep});
     auto outputIdsPtrHost = runtime::bufferCast<TokenIdType*>(*outputIdsPtrHostSlice);
     auto parentIdsPtrHost = runtime::bufferCast<TokenIdType*>(*parentIdsPtrHostSlice);
     auto const* batchSlotsPtr = bufferCast<SizeType32>(*batchSlots);
@@ -274,6 +274,7 @@ void DynamicDecodeLayer<T>::prepareIdsPtrs(std::shared_ptr<BaseDecodingOutputs> 
     mBufferManager->copy(*outputIdsPtrHostSlice, *mOutputIdsPtrDevice);
     mBufferManager->copy(*parentIdsPtrHostSlice, *mParentIdsPtrDevice);
     outputs->outputIdsPtr = ITensor::slice(mOutputIdsPtrDevice, 0, batchSize);
+    outputs->outputIdsPtrHost = ITensor::slice(outputIdsPtrHostSlice, 0, batchSize);
     outputs->parentIdsPtr = ITensor::slice(mParentIdsPtrDevice, 0, batchSize);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

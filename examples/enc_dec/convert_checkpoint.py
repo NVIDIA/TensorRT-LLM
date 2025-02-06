@@ -170,7 +170,7 @@ def convert_t5_weights_to_tllm_safetensors(config, component, params):
     attention_hidden_size = n_head * head_size  # head size * num_heads not necessarily equals hidden_dim, such as Flan-T5
 
     hf_param_prefix = f'{component}'
-    trtllm_layer_name = f'{component}_layers'
+    trtllm_layer_name = f'transformer.layers'
     trtllm_attn_layer_name = 'attention' if component == 'encoder' else 'self_attention'
     trtllm_attn_layernorm_name = 'self_attention_layernorm' if component == 'decoder' else 'attention_layernorm'
     hf_component_idx = 1 if component == 'encoder' else 2
@@ -178,8 +178,11 @@ def convert_t5_weights_to_tllm_safetensors(config, component, params):
     def get_attn_module_name(component, block, layer, attn_type):
         return f'{component}.block.{int(block)}.layer.{int(layer)}.{attn_type}'
 
-    weights['embedding.vocab_embedding.weight'] = reshape(
-        params['shared.weight'].clone(), None)
+    weights['transformer.vocab_embedding.weight'] = reshape(
+        params['shared.weight'].clone(),
+        None) if not config.use_parallel_embedding else reshape(
+            split(params['shared.weight'].clone(), mapping.tp_size,
+                  mapping.tp_rank, 0), None)
 
     layers_range = mapping.pp_layers(num_layers)
     for layer_idx in layers_range:
@@ -301,7 +304,7 @@ def convert_t5_weights_to_tllm_safetensors(config, component, params):
                 weights[weight_info["name"]] = reshape(
                     params[hf_weight_name].clone(), shape=weight_info["shape"])
 
-    weights['final_layernorm.weight'] = reshape(
+    weights['transformer.ln_f.weight'] = reshape(
         params[f'{component}.final_layer_norm.weight'].clone(), None)
 
     if component == 'decoder':
@@ -460,7 +463,7 @@ def convert_nmt_weights_to_tllm_safetensors(config, component, params,
     vocab_size = config.vocab_size
 
     hf_param_prefix = f'models.0.{component}'
-    trtllm_layer_name = f'{component}_layers'
+    trtllm_layer_name = f'transformer.layers'
     trtllm_attn_layer_name = 'attention' if component == 'encoder' else 'self_attention'
     trtllm_attn_layernorm_name = 'self_attention_layernorm' if component == 'decoder' else 'attention_layernorm'
 
@@ -540,10 +543,13 @@ def convert_nmt_weights_to_tllm_safetensors(config, component, params,
     def get_attn_module_name(component, layer, attn_type):
         return f'models.0.{component}.layers.{int(layer)}.{attn_type}'
 
-    weights["embedding.vocab_embedding.weight"] = reshape(
+    weights["transformer.vocab_embedding.weight"] = reshape(
         params[f'{hf_param_prefix}.embed_tokens.weight'].clone(),
-        (vocab_size, -1))
-    weights["embedding.position_embedding.weight"] = reshape(
+        (vocab_size, -1)) if not config.use_parallel_embedding else reshape(
+            split(params[f'{hf_param_prefix}.embed_tokens.weight'].clone(),
+                  mapping.tp_size, mapping.tp_rank, 0),
+            (vocab_size // mapping.tp_size, -1))
+    weights["transformer.position_embedding.weight"] = reshape(
         sin_pos_embedding, (config.max_position_embeddings, hidden_size))
 
     num_layers = config.num_hidden_layers
@@ -596,9 +602,9 @@ def convert_nmt_weights_to_tllm_safetensors(config, component, params,
                   dim=0), (config.vocab_size // mapping.tp_size, hidden_size))
 
     if config.has_model_final_layernorm:
-        weights['final_layernorm.weight'] = params[
+        weights['transformer.ln_f.weight'] = params[
             f'{hf_param_prefix}.layer_norm.weight'].clone()
-        weights['final_layernorm.bias'] = params[
+        weights['transformer.ln_f.bias'] = params[
             f'{hf_param_prefix}.layer_norm.bias'].clone()
 
     return weights
@@ -772,24 +778,24 @@ def convert_bart_weights_to_tllm_safetensors(config, component, params):
     vocab_size = config.vocab_size
 
     hf_param_prefix = f'model.{component}'
-    trtllm_layer_name = f'{component}_layers'
+    trtllm_layer_name = f'transformer.layers'
     trtllm_attn_layer_name = 'attention' if component == 'encoder' else 'self_attention'
     trtllm_attn_layernorm_name = 'self_attention_layernorm' if component == 'decoder' else 'attention_layernorm'
     embedding_layer_names = {
         'embed_tokens.weight': {
-            "name": 'embedding.vocab_embedding.weight',
+            "name": 'transformer.vocab_embedding.weight',
             "shape": (vocab_size, -1)
         },
         'embed_positions.weight': {
-            "name": 'embedding.position_embedding.weight',
+            "name": 'transformer.position_embedding.weight',
             "shape": (config.max_position_embeddings, hidden_size)
         },
         'layernorm_embedding.weight': {
-            "name": 'embedding.embedding_layernorm.weight',
+            "name": 'transformer.ln_embed.weight',
             "shape": None
         },
         'layernorm_embedding.bias': {
-            "name": 'embedding.embedding_layernorm.bias',
+            "name": 'transformer.ln_embed.bias',
             "shape": None
         },
     }
@@ -846,12 +852,12 @@ def convert_bart_weights_to_tllm_safetensors(config, component, params):
 
     if config.model_type == 'mbart':
         hidden_layer_name_split['layer_norm.weight'] = {
-            "name": 'final_layernorm.weight',
+            "name": 'transformer.ln_f.weight',
             "shape": None,
             "split_dim": 0
         }
         hidden_layer_name_no_split['layer_norm.bias'] = {
-            "name": 'final_layernorm.bias',
+            "name": 'transformer.ln_f.bias',
             "shape": None,
             "split_dim": 0
         }
@@ -891,6 +897,13 @@ def convert_bart_weights_to_tllm_safetensors(config, component, params):
                 f'{hf_param_prefix}.{hf_weight_name}'].clone()
         weights[weight_info["name"]] = reshape(weights[weight_info["name"]],
                                                weight_info["shape"])
+
+    weights["embedding.vocab_embedding.weight"] = reshape(
+        params[f'{hf_param_prefix}.embed_tokens.weight'].clone(),
+        (vocab_size, -1)) if not config.use_parallel_embedding else reshape(
+            split(params[f'{hf_param_prefix}.embed_tokens.weight'].clone(),
+                  mapping.tp_size, mapping.tp_rank, 0),
+            (vocab_size // mapping.tp_size, -1))
 
     num_layers = config.num_hidden_layers
 
@@ -942,9 +955,9 @@ def convert_bart_weights_to_tllm_safetensors(config, component, params):
                   dim=0), (config.vocab_size // mapping.tp_size, hidden_size))
 
     if config.has_model_final_layernorm:
-        weights['final_layernorm.weight'] = params[
+        weights['transformer.ln_f.weight'] = params[
             f'{hf_param_prefix}.layer_norm.weight'].clone()
-        weights['final_layernorm.bias'] = params[
+        weights['transformer.ln_f.bias'] = params[
             f'{hf_param_prefix}.layer_norm.bias'].clone()
 
     return weights
@@ -1070,15 +1083,18 @@ def convert_pix2struct_weights_to_tllm_safetensors(config, component, params):
     attention_hidden_size = n_head * head_size  # head size * num_heads not necessarily equals hidden_dim, such as Flan-T5
 
     hf_param_prefix = f'{component}'
-    trtllm_layer_name = f'{component}_layers'
+    trtllm_layer_name = f'transformer.layers'
     trtllm_attn_layer_name = 'self_attention'
     trtllm_attn_layernorm_name = 'self_attention_layernorm'
 
     def get_attn_module_name(component, layer, attn_type):
         return f'{component}.layer.{int(layer)}.{attn_type}.attention'
 
-    weights['embedding.vocab_embedding.weight'] = reshape(
-        params[f'{hf_param_prefix}.embed_tokens.weight'].clone(), None)
+    weights['transformer.vocab_embedding.weight'] = reshape(
+        params[f'{hf_param_prefix}.embed_tokens.weight'].clone(),
+        None) if not config.use_parallel_embedding else reshape(
+            split(params[f'{hf_param_prefix}.embed_tokens.weight'].clone(),
+                  mapping.tp_size, mapping.tp_rank, 0), None)
 
     layers_range = mapping.pp_layers(num_layers)
     for layer_idx in layers_range:
@@ -1185,7 +1201,7 @@ def convert_pix2struct_weights_to_tllm_safetensors(config, component, params):
                 weights[weight_info["name"]] = reshape(
                     params[hf_weight_name].clone(), shape=weight_info["shape"])
 
-    weights[f'final_layernorm.weight'] = reshape(
+    weights[f'transformer.ln_f.weight'] = reshape(
         params[f'{component}.final_layer_norm.weight'].clone(), None)
 
     weights['lm_head.weight'] = reshape(

@@ -41,7 +41,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 from examples.bloom.convert_checkpoint import convert_hf_bloom
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import skip_fp32_accum_pre_ampere, unittest_name_func
+from utils.util import unittest_name_func
 
 
 class TestBloom(unittest.TestCase):
@@ -393,9 +393,6 @@ class TestBloom(unittest.TestCase):
     @parameterized.expand(load_test_cases(), name_func=unittest_name_func)
     def test_greedy_search(self, use_gpt_attention_plugin, context_fmha_type,
                            enable_remove_input_padding, dtype):
-
-        # Skip tests that are not supported in pre-ampere architecture
-        skip_fp32_accum_pre_ampere(context_fmha_type)
 
         model = 'bloom'
         log_level = 'error'

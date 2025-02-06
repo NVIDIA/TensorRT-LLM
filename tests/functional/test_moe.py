@@ -19,6 +19,7 @@ from collections import OrderedDict
 from itertools import product
 
 import numpy as np
+import pytest
 
 # isort: off
 import torch
@@ -37,10 +38,11 @@ from tensorrt_llm.layers.lora import Lora, LoraParams
 from tensorrt_llm.layers.moe import MoeConfig, MoeOOTB
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo, QuantMode
+from tensorrt_llm.quantization.quantize import fp4_quantize
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.util import (create_session, getSMVersion, run_session,
-                        skip_bf16_pre_ampere, unittest_name_func)
+                        unittest_name_func)
 
 default_actfn = 'gelu'
 default_hidden_size = {
@@ -77,15 +79,11 @@ def make_tuple(num_experts=4,
 def config_is_allowed(config):
     # TODO: Support ootb path with getSMVersion() < 90:
     enable_ootb = getSMVersion() >= 90
-    enable_bf16 = getSMVersion() >= 80
     enable_fp8 = getSMVersion() >= 89
 
-    DATA_TYPE_INDEX = 5
     WEIGHT_TYPE_INDEX = 6
     USE_PLUGIN_INDEX = 8
     if not enable_fp8 and config[WEIGHT_TYPE_INDEX] == 'fp8':
-        return False
-    if not enable_bf16 and config[DATA_TYPE_INDEX] == 'bfloat16':
         return False
     if not enable_ootb and not config[USE_PLUGIN_INDEX]:
         return False
@@ -112,6 +110,42 @@ def quant_dequant_int(weights, quant_mode):
     result = torch.multiply(quant_weights,
                             torch_weight_scales.unsqueeze(0)).T.contiguous()
     return result.to(device=weights.device)
+
+
+def quant_fp4(weights):
+    num_experts = 1 if len(weights.shape) == 2 else weights.shape[0]
+    from modelopt.torch.quantization.qtensor import NVFP4QTensor
+    if num_experts == 1:
+        quant_weights, scale, _ = NVFP4QTensor.quantize(
+            weights,
+            block_size=16,
+            weights_scaling_factor_2=torch.tensor([1.0],
+                                                  dtype=torch.float32,
+                                                  device=weights.device))
+        quant_weights = quant_weights._quantized_data
+    else:
+        quant_weight_list = []
+        scale_list = []
+        for i in range(num_experts):
+            quant_weights, scale, _ = NVFP4QTensor.quantize(
+                weights[i],
+                block_size=16,
+                weights_scaling_factor_2=torch.tensor([1.0],
+                                                      dtype=torch.float32,
+                                                      device=weights.device))
+            quant_weights = quant_weights._quantized_data
+            quant_weight_list.append(quant_weights)
+            scale_list.append(scale)
+        quant_weights = torch.stack(quant_weight_list, dim=0)
+        scale = torch.stack(scale_list, dim=0)
+    # quant_weights, scale = torch.ops.tensorrt_llm.half_to_e2m1_and_ufp8sf_scale(
+    #     weights.cuda(),
+    #     torch.FloatTensor([1.0] * num_experts).cuda(), 16, 1)
+    shape_prefix = weights.shape[:-1]
+    quant_weights = quant_weights.view(torch.int64).view(*shape_prefix,
+                                                         -1).cpu()
+    scale = scale.view(torch.int32).view(*shape_prefix, -1).cpu()
+    return quant_weights, scale
 
 
 def quant_dequant(weights, quant_mode):
@@ -421,8 +455,11 @@ class TestMoE(unittest.TestCase):
         ) * fc1_weight_rescale_2)
 
         self.lora_fc1_weights_ptrs = torch.tensor(
-            (self.lora_fc1_weights_1.data_ptr(),
-             self.lora_fc1_weights_2.data_ptr()),
+            (
+                self.lora_fc1_weights_1.data_ptr(),
+                self.lora_fc1_weights_2.data_ptr(),
+                # null DoRA scales ptr
+                0),
             dtype=torch.int64,
         ).repeat(num_reqs, 1)
         self.lora_fc1_ranks = torch.tensor((lora_rank, ),
@@ -440,8 +477,11 @@ class TestMoE(unittest.TestCase):
         ) * fc1_weight_rescale_2)
 
         self.lora_gated_weights_ptrs = torch.tensor(
-            (self.lora_gated_weights_1.data_ptr(),
-             self.lora_gated_weights_2.data_ptr()),
+            (
+                self.lora_gated_weights_1.data_ptr(),
+                self.lora_gated_weights_2.data_ptr(),
+                # null DoRA scales ptr
+                0),
             dtype=torch.int64,
         ).repeat(num_reqs, 1)
         self.lora_gated_ranks = torch.tensor((lora_rank, ),
@@ -459,8 +499,11 @@ class TestMoE(unittest.TestCase):
         ) * fc2_weight_rescale_2)
 
         self.lora_fc2_weights_ptrs = torch.tensor(
-            (self.lora_fc2_weights_1.data_ptr(),
-             self.lora_fc2_weights_2.data_ptr()),
+            (
+                self.lora_fc2_weights_1.data_ptr(),
+                self.lora_fc2_weights_2.data_ptr(),
+                # null DoRA scales ptr
+                0),
             dtype=torch.int64,
         ).repeat(num_reqs, 1)
         self.lora_fc2_ranks = torch.tensor((lora_rank, ),
@@ -469,7 +512,7 @@ class TestMoE(unittest.TestCase):
     def create_lora_params(self, num_reqs):
 
         moe_h_to_4h_weights_pointers = Tensor(
-            shape=(num_reqs, 2),
+            shape=(num_reqs, 3),
             dtype=tensorrt_llm.str_dtype_to_trt("int64"),
             name="moe_h_to_4h_weights_pointers",
         )
@@ -479,7 +522,7 @@ class TestMoE(unittest.TestCase):
             name="moe_h_to_4h_lora_ranks",
         )
         moe_4h_to_h_weights_pointers = Tensor(
-            shape=(num_reqs, 2),
+            shape=(num_reqs, 3),
             dtype=tensorrt_llm.str_dtype_to_trt("int64"),
             name="moe_4h_to_h_weights_pointers",
         )
@@ -489,7 +532,7 @@ class TestMoE(unittest.TestCase):
             name="moe_4h_to_h_lora_ranks",
         )
         moe_gate_weights_pointers = Tensor(
-            shape=(num_reqs, 2),
+            shape=(num_reqs, 3),
             dtype=tensorrt_llm.str_dtype_to_trt("int64"),
             name="moe_gate_weights_pointers",
         )
@@ -537,19 +580,22 @@ class TestMoE(unittest.TestCase):
             weight_index=0,
         )
 
+    @staticmethod
+    def max_abs_tensor(tensor):
+        return torch.max(torch.abs(tensor.view(-1, np.prod(tensor.shape[-2:]))),
+                         dim=1,
+                         keepdim=True)[0].float()
+
     def create_fp8_scaling_factors(self, max_act1, max_act2):
         self.activation_scaling_factor_1 = torch.tensor([max_act1
                                                          ]).float() / 440.
         self.activation_scaling_factor_2 = torch.tensor([max_act2
                                                          ]).float() / 440.
 
-        def max_weights(weights):
-            return torch.max(torch.abs(weights.view(weights.shape[0], -1)),
-                             dim=1,
-                             keepdim=True)[0].float()
-
-        self.weight_scaling_factor_1 = max_weights(self.fc1_weights) / 440.
-        self.weight_scaling_factor_2 = max_weights(self.fc2_weights) / 440.
+        self.weight_scaling_factor_1 = TestMoE.max_abs_tensor(
+            self.fc1_weights) / 440.
+        self.weight_scaling_factor_2 = TestMoE.max_abs_tensor(
+            self.fc2_weights) / 440.
 
     @parameterized.expand(get_params(), name_func=unittest_name_func)
     def test_mixture_of_experts(self, num_experts, top_k, hidden_size, actfn,
@@ -630,13 +676,31 @@ class TestMoE(unittest.TestCase):
             inputs = {"input_hidden_states": input}
             outputs = run_session(session, inputs)
 
+            tight_tolerances = {
+                'float32': 1e-2,
+                'float16': 1e-2,
+                'bfloat16': 1e-2,
+                'fp4': 2e-2,
+                'fp8': 5e-2,
+                'int8': 5e-2,
+                'int4': 5e-2,
+            }
+
+            assert torch.sum(
+                torch.isclose(outputs['output'].float(),
+                              ref.float(),
+                              atol=tight_tolerances[weight_dtype_str],
+                              rtol=tight_tolerances[weight_dtype_str])).item(
+                              ) >= math.floor(torch.numel(input) * 0.95)
+
             tolerances = {
                 'float32': 1e-2,
                 'float16': 5e-2,
                 'bfloat16': 5e-2,
+                'fp4': 5e-2,
+                'fp8': 2e-1,
                 'int8': 2e-1,
                 'int4': 2e-1,
-                'fp8': 2e-1,
             }
             tolerance = tolerances[weight_dtype_str]
 
@@ -662,16 +726,21 @@ class TestMoE(unittest.TestCase):
             if getSMVersion() >= 90:
                 params += [('float32', actfn, False), ('float16', actfn, False),
                            ('bfloat16', actfn, False)]
+            if getSMVersion() >= 100:
+                params += [('fp4', actfn, True), ('fp4', actfn, False)]
         return params
 
     @parameterized.expand(get_mlp_params(), name_func=unittest_name_func)
     def test_mlp_comparison(self, dtype_str, actfn, use_plugin):
         """ This test uses one expert and compares the result to a plain MLP """
-        skip_bf16_pre_ampere(dtype_str)
-
         use_int4_weights = dtype_str == 'int4'
-        weight_dtype = trt.int8 if use_int4_weights else tensorrt_llm.str_dtype_to_trt(
-            dtype_str)
+        custom_map = {
+            "int4": trt.int8,
+            "fp4": trt.float16,
+        }
+        weight_dtype = custom_map[
+            dtype_str] if dtype_str in custom_map else tensorrt_llm.str_dtype_to_trt(
+                dtype_str)
 
         dtype = weight_dtype
         quant_mode = QuantMode(0)
@@ -681,12 +750,15 @@ class TestMoE(unittest.TestCase):
             hidden_size = 64
             quant_mode = QuantMode.use_weight_only(
                 use_int4_weights=use_int4_weights)
+        elif dtype_str == "fp4":
+            quant_mode = QuantMode.NVFP4
+            hidden_size = 256  # At least vector_size * 16 to make padding simple
 
         num_sequences = 5
         sequence_lengths = 4
-        num_experts = 1
-        top_k = 1
-        bias = True
+        num_experts = 1  # 4 # TODO Ampere fails to build the TRT network with multiple experts
+        top_k = num_experts  # All tokens to all experts to make the comparison trivial
+        bias = not quant_mode.has_nvfp4()
         ffn_hidden_size = 4 * hidden_size
         self.create_weights(num_experts,
                             hidden_size,
@@ -696,45 +768,75 @@ class TestMoE(unittest.TestCase):
                             weight_dtype,
                             is_gated=is_gated_activation(actfn))
 
+        # Override the router to ensure all values have the same scale
+        for i in range(num_experts):
+            self.router_weights[i] = torch.squeeze(
+                torch.eye(hidden_size, m=1, dtype=torch.float32, device="cuda"))
+
         input_data = gen_uniform_weights(
             (num_sequences, sequence_lengths, hidden_size),
             dtype=trt_dtype_to_torch(dtype))
 
         def MLP(network, trt_key):
-            mlp_type = tensorrt_llm.layers.GatedMLP if is_gated_activation(
-                actfn) else tensorrt_llm.layers.MLP
-            mlp = mlp_type(hidden_size=hidden_size,
-                           ffn_hidden_size=ffn_hidden_size,
-                           hidden_act=gated2act(actfn),
-                           bias=bias,
-                           quant_mode=quant_mode,
-                           dtype=dtype)
-            # Quantize the weights manually so the results are comparable
-            fc1_qd = quant_dequant(self.fc1_weights[0].cpu(), quant_mode)
-            if is_gated_activation(actfn):
-                # Note that the MLP uses the opposite convention to the GLU paper for naming,
-                #  the gate is the matrix the activations are NOT applied to
-                gate, fc1_qd = fc1_qd.chunk(2, dim=0)
-                mlp.gate.weight.value = np.ascontiguousarray(
-                    torch_to_numpy(gate))
+            output = trt_key * 0.0
+            for i in range(num_experts):
+                mlp_type = tensorrt_llm.layers.GatedMLP if is_gated_activation(
+                    actfn) else tensorrt_llm.layers.MLP
+                mlp = mlp_type(hidden_size=hidden_size,
+                               ffn_hidden_size=ffn_hidden_size,
+                               hidden_act=gated2act(actfn),
+                               bias=bias,
+                               quant_mode=quant_mode,
+                               dtype=dtype)
 
-            mlp.fc.weight.value = np.ascontiguousarray(torch_to_numpy(fc1_qd))
-            fc2_qd = quant_dequant(self.fc2_weights[0].cpu(), quant_mode)
-            mlp.proj.weight.value = np.ascontiguousarray(torch_to_numpy(fc2_qd))
-            if bias:
-                fc1_bias = self.fc1_bias[0].cpu()
+                if quant_mode.has_nvfp4():
+                    quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+                    mlp = fp4_quantize(mlp, quant_config)
+                    mlp.quant_mode = quant_mode
+
+                # Quantize the weights manually so the results are comparable
+                fc1_qd = quant_dequant(self.fc1_weights[i].cpu(), quant_mode)
 
                 if is_gated_activation(actfn):
-                    gate, fc1_bias = fc1_bias.chunk(2, dim=0)
-                    mlp.gate.bias.value = np.ascontiguousarray(
+                    # Note that the MLP uses the opposite convention to the GLU paper for naming,
+                    #  the gate is the matrix the activations are NOT applied to
+                    gate, fc1_qd = fc1_qd.chunk(2, dim=0)
+
+                    if quant_mode.has_nvfp4():
+                        gate, block_scale = quant_fp4(gate)
+                        self.set_fp4_scales(mlp.gate, block_scale, 1)
+
+                    mlp.gate.weight.value = np.ascontiguousarray(
                         torch_to_numpy(gate))
 
-                mlp.fc.bias.value = np.ascontiguousarray(
-                    torch_to_numpy(fc1_bias))
-                mlp.proj.bias.value = np.ascontiguousarray(
-                    torch_to_numpy(self.fc2_bias[0].cpu()))
+                if quant_mode.has_nvfp4():
+                    fc1_qd, block_scale = quant_fp4(fc1_qd)
+                    self.set_fp4_scales(mlp.fc, block_scale, 1)
 
-            output = mlp(trt_key)
+                mlp.fc.weight.value = np.ascontiguousarray(
+                    torch_to_numpy(fc1_qd))
+
+                fc2_qd = quant_dequant(self.fc2_weights[i].cpu(), quant_mode)
+                if quant_mode.has_nvfp4():
+                    fc2_qd, block_scale = quant_fp4(fc2_qd)
+                    self.set_fp4_scales(mlp.proj, block_scale, 1)
+
+                mlp.proj.weight.value = np.ascontiguousarray(
+                    torch_to_numpy(fc2_qd))
+                if bias:
+                    fc1_bias = self.fc1_bias[i].cpu()
+
+                    if is_gated_activation(actfn):
+                        gate, fc1_bias = fc1_bias.chunk(2, dim=0)
+                        mlp.gate.bias.value = np.ascontiguousarray(
+                            torch_to_numpy(gate))
+
+                    mlp.fc.bias.value = np.ascontiguousarray(
+                        torch_to_numpy(fc1_bias))
+                    mlp.proj.bias.value = np.ascontiguousarray(
+                        torch_to_numpy(self.fc2_bias[i].cpu()))
+
+                output += mlp(trt_key) / num_experts
             output.mark_output('mlp_output', dtype)
 
         session = self.create_trt_session(
@@ -748,24 +850,166 @@ class TestMoE(unittest.TestCase):
             dtype,
             weight_dtype,
             quant_mode,
-            norm_mode=MoeConfig.ExpertScaleNormalizationMode.NONE,
+            norm_mode=MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE,
             custom_network=MLP,
             use_plugin=use_plugin)
 
         inputs = {"input_hidden_states": input_data}
         outputs = run_session(session, inputs)
 
-        tolerances = {
+        tight_tolerances = {
             'float32': 1e-2,
-            'float16': 2e-2
-            if getSMVersion() >= 75 else 1e-1,  # Some issues for geglu on volta
+            'float16': 1e-2,
+            'bfloat16': 1e-2,
+            'fp4': 1.5e-2,
+            'int8': 5e-2,
+            'int4': 5e-2,
+        }
+
+        result = torch.sum(
+            torch.isclose(outputs["output"],
+                          outputs["mlp_output"],
+                          atol=tight_tolerances[dtype_str],
+                          rtol=tight_tolerances[dtype_str])).item()
+        assert result >= math.floor(torch.numel(input_data) * 0.95)
+
+        loose_tolerances = {
+            'float32': 1e-2,
+            'float16': 2e-2,
             'bfloat16': 1e-1,
             'int8': 2e-1,
             'int4': 2e-1,
+            'fp4': 6e-2,
         }
+
         torch.testing.assert_close(
             outputs["output"],
             outputs["mlp_output"],
+            rtol=loose_tolerances[dtype_str],
+            atol=loose_tolerances[dtype_str],
+        )
+
+    @staticmethod
+    def get_ootb_comp_params():
+        params = []
+        for actfn in ('gelu', 'geglu'):
+            for experts, k in [(8, 2), (10, 3)]:
+                dtypes = ['float16', 'bfloat16', 'fp8']
+                if getSMVersion() >= 100:
+                    dtypes += ['fp4']
+                for dtype in dtypes:
+                    params.append((dtype, experts, k, actfn))
+        return params
+
+    @parameterized.expand(get_ootb_comp_params(), name_func=unittest_name_func)
+    def test_ootb_comparison(self, dtype_str, num_experts, top_k, actfn):
+        """ This test uses one expert and compares the result to a plain MLP """
+        if getSMVersion() < 90:
+            pytest.skip("OOTB tests disabled on pre-Hopper architectures")
+
+        use_int4_weights = dtype_str == 'int4'
+        custom_map = {
+            "int4": trt.int8,
+            "fp4": trt.float16,
+        }
+        weight_dtype = custom_map[
+            dtype_str] if dtype_str in custom_map else tensorrt_llm.str_dtype_to_trt(
+                dtype_str)
+
+        dtype = weight_dtype
+        quant_mode = QuantMode(0)
+        hidden_size = 8
+        if dtype_str == "fp8":
+            dtype = tensorrt_llm.str_dtype_to_trt("bfloat16")
+            quant_mode = QuantMode.FP8_QDQ
+            hidden_size = 64
+        elif dtype_str == "fp4":
+            quant_mode = QuantMode.NVFP4
+            hidden_size = 256  # At least vector_size * 16 to make padding simple
+
+        num_sequences = 5
+        sequence_lengths = 4
+        bias = not quant_mode.has_nvfp4() and not quant_mode.has_fp8_qdq()
+        ffn_hidden_size = 4 * hidden_size
+        self.create_weights(num_experts,
+                            hidden_size,
+                            ffn_hidden_size,
+                            bias,
+                            dtype,
+                            weight_dtype,
+                            is_gated=is_gated_activation(actfn))
+
+        input_data = gen_uniform_weights(
+            (num_sequences, sequence_lengths, hidden_size),
+            dtype=trt_dtype_to_torch(dtype))
+
+        if quant_mode.has_fp8_qdq():
+            max_act = TestMoE.max_abs_tensor(input_data.view(-1, hidden_size))
+            max_weight = TestMoE.max_abs_tensor(
+                self.fc1_weights.view(-1, hidden_size))
+            self.create_fp8_scaling_factors(max_act, max_act * max_weight)
+
+        session_moe = self.create_trt_session(
+            tuple(input_data.shape),
+            num_experts,
+            top_k,
+            hidden_size,
+            ffn_hidden_size,
+            actfn,
+            bias,
+            dtype,
+            weight_dtype,
+            quant_mode,
+            norm_mode=MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE,
+            use_plugin=True)
+        session_ootb = self.create_trt_session(
+            tuple(input_data.shape),
+            num_experts,
+            top_k,
+            hidden_size,
+            ffn_hidden_size,
+            actfn,
+            bias,
+            dtype,
+            weight_dtype,
+            quant_mode,
+            norm_mode=MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE,
+            use_plugin=False)
+
+        inputs = {"input_hidden_states": input_data}
+        outputs_moe = run_session(session_moe, inputs)
+        outputs_ootb = run_session(session_ootb, inputs)
+
+        tight_tolerances = {
+            'float32': 5e-2,
+            'float16': 5e-2,
+            'bfloat16': 5e-2,
+            'fp4': 5e-2,
+            'fp8': 5e-2,
+            'int8': 5e-2,
+            'int4': 5e-2,
+        }
+
+        assert torch.sum(
+            torch.isclose(
+                outputs_moe["output"],
+                outputs_ootb["output"],
+                atol=tight_tolerances[dtype_str],
+                rtol=tight_tolerances[dtype_str])).item() >= math.floor(
+                    torch.numel(input_data) * 0.95)
+
+        tolerances = {
+            'float32': 1e-2,
+            'float16': 1e-2,
+            'bfloat16': 2e-2,
+            'fp4': 5e-2,
+            'fp8': 7e-2,
+            'int8': 1e-1,
+            'int4': 1e-1,
+        }
+        torch.testing.assert_close(
+            outputs_moe["output"],
+            outputs_ootb["output"],
             rtol=tolerances[dtype_str],
             atol=tolerances[dtype_str],
         )
@@ -776,8 +1020,6 @@ class TestMoE(unittest.TestCase):
                           name_func=unittest_name_func)
     def test_mlp_lora_comparison(self, dtype_str, actfn, use_plugin, lora_rank):
         """This test uses one expert and compares the result to a plain MLP"""
-        skip_bf16_pre_ampere(dtype_str)
-
         use_int4_weights = dtype_str == "int4"
         weight_dtype = (trt.int8 if use_int4_weights else
                         tensorrt_llm.str_dtype_to_trt(dtype_str))
@@ -921,8 +1163,7 @@ class TestMoE(unittest.TestCase):
 
         tolerances = {
             "float32": 1e-2,
-            "float16": (2e-2 if getSMVersion() >= 75 else
-                        1e-1),  # Some issues for geglu on volta
+            "float16": 2e-2,
             "bfloat16": 1e-1,
             "int8": 2e-1,
             "int4": 2e-1,
@@ -933,6 +1174,22 @@ class TestMoE(unittest.TestCase):
             rtol=tolerances[dtype_str],
             atol=tolerances[dtype_str],
         )
+
+    def set_fp4_scales(self, moe_weight_wrapper, scale_factor: Tensor,
+                       num_experts):
+        moe_weight_wrapper.weights_block_scaling_factor.value = np.ascontiguousarray(
+            torch_to_numpy(scale_factor.view(torch.float8_e4m3fn)))
+        moe_weight_wrapper.weights_block_scaling_factor_interleaved.value = (
+            np.ascontiguousarray(
+                torch_to_numpy(
+                    torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
+                        scale_factor.view(torch.uint8).cpu().contiguous()).view(
+                            scale_factor.dtype).reshape(
+                                scale_factor.shape).view(torch.uint8))))
+        moe_weight_wrapper.activation_global_scaling_factor.value = np.array(
+            [1.], dtype=np.float32)
+        moe_weight_wrapper.alpha.value = np.array([1.] * num_experts,
+                                                  dtype=np.float32)
 
     def set_weight_layer(self,
                          input_weights,
@@ -959,6 +1216,13 @@ class TestMoE(unittest.TestCase):
                 torch_to_numpy(processed_torch_weights))
             moe_weight_wrapper.weights_scaling_factor.value = np.ascontiguousarray(
                 torch_to_numpy(fp8_scalar))
+        elif quant_mode.has_nvfp4():
+            processed_torch_weights, torch_weight_scales = quant_fp4(
+                input_weights)
+            self.set_fp4_scales(moe_weight_wrapper, torch_weight_scales,
+                                input_weights.shape[0])
+            moe_weight_wrapper.weight.value = np.ascontiguousarray(
+                torch_to_numpy(processed_torch_weights))
         else:
             moe_weight_wrapper.weight.value = np.ascontiguousarray(
                 torch_to_numpy(input_weights))
@@ -1050,7 +1314,8 @@ class TestMoE(unittest.TestCase):
             if bias:
                 moe.fc.bias.value = torch_to_numpy(self.fc1_bias.cpu())
                 moe.proj.bias.value = torch_to_numpy(self.fc2_bias.cpu())
-
+            if quant_mode.has_nvfp4():
+                network.plugin_config.gemm_plugin = 'nvfp4' if use_plugin else None
             if custom_network:
                 if use_lora:
                     custom_network(network, trt_key, lora_params)
@@ -1063,10 +1328,16 @@ class TestMoE(unittest.TestCase):
                     quant_config = QuantConfig(
                         quant_algo=QuantAlgo.FP8,
                         kv_cache_quant_algo=QuantAlgo.FP8)
+                elif quant_mode.has_nvfp4():
+                    quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
                 moe = moe.to(MoeOOTB, quant_config=quant_config)
 
             output = moe(trt_key, lora_layer_params=lora_params)
             output.mark_output("output", dtype)
+
+            for k, v in moe.named_network_outputs():
+                v.mark_output(k, v.dtype)
+
         # trt run
         session = create_session(builder,
                                  network,

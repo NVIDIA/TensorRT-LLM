@@ -16,15 +16,17 @@
  */
 
 #include "bindings.h"
+
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
+#include "tensorrt_llm/batch_manager/runtimeBuffers.h"
 #include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
 #include "tensorrt_llm/pybind/common/bindTypes.h"
 #include "tensorrt_llm/runtime/torch.h"
-#include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/torchView.h"
+
 #include <ATen/ATen.h>
 #include <pybind11/chrono.h>
 #include <pybind11/functional.h>
@@ -62,9 +64,6 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("chunk_unit_size", &tb::batch_scheduler::ContextChunkingConfig::chunkUnitSize);
 
     py::classh<GenLlmReq>(m, "GenericLlmRequest")
-        .def("validate", &GenLlmReq::validate, py::arg("max_input_len"), py::arg("max_seq_len"),
-            py::arg("max_draft_len"), py::arg("max_endocer_input_len") = std::nullopt,
-            py::arg("enable_kv_cache_reuse") = false)
         .def("set_exclude_input_from_output", &GenLlmReq::setExcludeInputFromOutput, py::arg("exclude"))
         .def("get_num_tokens", &GenLlmReq::getNumTokens, py::arg("beam"))
         .def_property_readonly("max_beam_num_tokens", &GenLlmReq::getMaxBeamNumTokens)
@@ -170,16 +169,14 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("prompt_len", &GenLlmReq::mPromptLen)
         .def_readwrite("max_new_tokens", &GenLlmReq::mMaxNewTokens)
         .def_readwrite("sampling_config", &GenLlmReq::mSamplingConfig)
-        .def_property(
-            "state", [](GenLlmReq& self) { return self.mState; },
-            [](GenLlmReq& self, tb::LlmRequestState state) { self.mState = state; })
+        .def_property("state", &GenLlmReq::getState, &GenLlmReq::setState)
         .def_property("streaming", &GenLlmReq::isStreaming, &GenLlmReq::setStreaming)
         .def_readwrite("end_id", &GenLlmReq::mEndId)
         .def_readwrite("pad_id", &GenLlmReq::mPadId)
         .def_readwrite("seq_slot", &GenLlmReq::mSeqSlot)
         .def_property_readonly("return_log_probs", &GenLlmReq::returnLogProbs)
-        .def_property_readonly("return_context_logits", &GenLlmReq::setReturnContextLogits)
-        .def_property_readonly("return_generation_logits", &GenLlmReq::setReturnGenerationLogits)
+        .def_property_readonly("return_context_logits", &GenLlmReq::getReturnContextLogits)
+        .def_property_readonly("return_generation_logits", &GenLlmReq::getReturnGenerationLogits)
         .def_property_readonly("log_probs", py::overload_cast<>(&GenLlmReq::getLogProbs, py::const_))
         .def("get_log_probs", py::overload_cast<GenLlmReq::SizeType32>(&GenLlmReq::getLogProbs, py::const_))
         .def("set_log_probs", &GenLlmReq::setLogProbs, py::arg("log_probs"), py::arg("beam"))
@@ -196,7 +193,7 @@ void initBindings(pybind11::module_& m)
         .def("is_last_context_chunk", py::overload_cast<>(&GenLlmReq::isLastContextChunk, py::const_))
         .def("is_first_context_chunk", py::overload_cast<>(&GenLlmReq::isFirstContextChunk, py::const_))
         .def("get_context_remaining_length", py::overload_cast<>(&GenLlmReq::getContextRemainingLength, py::const_))
-        .def("create_response", &GenLlmReq::createResponse)
+        .def("set_finished_reason", &GenLlmReq::setFinishedReason, py::arg("finish_reason"), py::arg("beam"))
         .def_property_readonly("position_ids",
             [](GenLlmReq& self)
             {
@@ -315,6 +312,11 @@ void initBindings(pybind11::module_& m)
             py::arg("eagle_config") = std::nullopt, py::arg("skip_cross_attn_blocks") = std::nullopt,
             py::arg("return_perf_metrics") = false, py::arg("guided_decoding_params") = std::nullopt,
             py::arg("allotted_time_ms") = std::nullopt)
+        .def("validate", &tb::LlmRequest::validate, py::arg("max_input_len"), py::arg("max_seq_len"),
+            py::arg("max_draft_len"), py::arg("max_endocer_input_len") = std::nullopt,
+            py::arg("enable_kv_cache_reuse") = false)
+        .def("create_response", &tb::LlmRequest::createResponse, py::arg("use_fast_logits") = false,
+            py::arg("mpi_world_rank") = 0)
         .def("move_prompt_embedding_table_to_gpu", &tb::LlmRequest::movePromptEmbeddingTableToGpu, py::arg("manager"))
         .def("move_lora_weights_to_gpu", &tb::LlmRequest::moveLoraWeightsToGpu, py::arg("manager"));
 

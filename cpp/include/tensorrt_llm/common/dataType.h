@@ -18,16 +18,13 @@
 
 #include "tensorrt_llm/common/logger.h"
 #include <NvInferRuntime.h>
+#include <map>
 
 namespace tensorrt_llm::common
 {
 
 constexpr static size_t getDTypeSize(nvinfer1::DataType type)
 {
-#if defined(__GNUC__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wswitch"
-#endif
     switch (type)
     {
     case nvinfer1::DataType::kINT64: return 8;
@@ -40,12 +37,51 @@ constexpr static size_t getDTypeSize(nvinfer1::DataType type)
     case nvinfer1::DataType::kINT8: [[fallthrough]];
     case nvinfer1::DataType::kFP8: return 1;
     case nvinfer1::DataType::kINT4: TLLM_THROW("Cannot determine size of INT4 data type");
-    default: return 0;
+    case nvinfer1::DataType::kFP4: TLLM_THROW("Cannot determine size of FP4 data type");
+    default: TLLM_THROW("Unknown dtype %d", static_cast<int>(type));
     }
     return 0;
-#if defined(__GNUC__)
-#pragma GCC diagnostic pop
-#endif
+}
+
+constexpr static size_t getDTypeSizeInBits(nvinfer1::DataType type)
+{
+    switch (type)
+    {
+    case nvinfer1::DataType::kINT64: return 64;
+    case nvinfer1::DataType::kINT32: [[fallthrough]];
+    case nvinfer1::DataType::kFLOAT: return 32;
+    case nvinfer1::DataType::kBF16: [[fallthrough]];
+    case nvinfer1::DataType::kHALF: return 16;
+    case nvinfer1::DataType::kBOOL: [[fallthrough]];
+    case nvinfer1::DataType::kUINT8: [[fallthrough]];
+    case nvinfer1::DataType::kINT8: [[fallthrough]];
+    case nvinfer1::DataType::kFP8: return 8;
+    case nvinfer1::DataType::kINT4: [[fallthrough]];
+    case nvinfer1::DataType::kFP4: return 4;
+    default: TLLM_THROW("Unknown dtype %d", static_cast<int>(type));
+    }
+    return 0;
+}
+
+[[maybe_unused]] static std::string getDtypeString(nvinfer1::DataType type)
+{
+    switch (type)
+    {
+    case nvinfer1::DataType::kFLOAT: return "fp32"; break;
+    case nvinfer1::DataType::kHALF: return "fp16"; break;
+    case nvinfer1::DataType::kINT8: return "int8"; break;
+    case nvinfer1::DataType::kINT32: return "int32"; break;
+    case nvinfer1::DataType::kBOOL: return "bool"; break;
+    case nvinfer1::DataType::kUINT8: return "uint8"; break;
+    case nvinfer1::DataType::kFP8: return "fp8"; break;
+    case nvinfer1::DataType::kBF16: return "bf16"; break;
+    case nvinfer1::DataType::kINT64: return "int64"; break;
+    case nvinfer1::DataType::kINT4: return "int4"; break;
+    case nvinfer1::DataType::kFP4: return "fp4"; break;
+    default: throw std::runtime_error("Unsupported data type"); break;
+    }
+
+    return "";
 }
 
 } // namespace tensorrt_llm::common

@@ -15,20 +15,22 @@
  */
 
 #pragma once
+
 #include "cubin/fmha_cubin.h"
 #include "cuda_runtime_api.h"
 #include "fused_multihead_attention_common.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tmaDescriptor.h"
+
 #include <algorithm>
-#include <assert.h>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <set>
-#include <stdint.h>
 #include <unordered_map>
-#include <vector>
 
 namespace tensorrt_llm::kernels
 {
@@ -193,9 +195,9 @@ public:
         int device_id;
         cudaGetDevice(&device_id);
         static std::unique_ptr<TFusedMHAKernelFactory<TFusedMHAKernelList>> s_factory[32] = {nullptr};
+        TLLM_CHECK(device_id <= 32);
         if (s_factory[device_id] == nullptr)
         {
-            assert(device_id <= 32);
             s_factory[device_id] = std::make_unique<TFusedMHAKernelFactory<TFusedMHAKernelList>>(
                 TFusedMHAKernelFactory<TFusedMHAKernelList>());
         }
@@ -251,7 +253,8 @@ public:
     }
 
     // FMHA runner.
-    void run(Fused_multihead_attention_params_v2& params, Launch_params& launch_params, cudaStream_t stream) const
+    void run(
+        Fused_multihead_attention_params_v2& params, Launch_params& launch_params, cudaStream_t stream) const override
     {
         bool forceUnroll = useForceUnroll(params, launch_params);
         auto const findIter = mFunctions.find(hashFromParams(params, launch_params));
@@ -289,7 +292,8 @@ public:
 
                 block_size.y = std::min(static_cast<int>(params.num_tiles), launch_params.multi_processor_count);
                 // 2 * bytes_per_elt stands for kv cache and bytes_per_elt bytes per element.
-                size_t size_in_bytes = params.b * params.h * params.s * params.d * 2 * get_size_in_bytes(mDataType);
+                auto const size_in_bytes = 2 * static_cast<int64_t>(get_size_in_bytes(mDataType)) * params.b * params.h
+                    * params.s * params.d;
                 params.use_balanced_scheduling = launch_params.attention_mask_type == ContextAttentionMaskType::CAUSAL
                     && size_in_bytes <= launch_params.device_l2_cache_size;
 
@@ -309,7 +313,8 @@ public:
                     / kernelMeta.mUnrollStep * NUM_COMPUTE_GROUPS);
 
                 // 2 * size_per_element stands for kv cache.
-                size_t size_in_bytes = block_size.y * params.s * params.d * 2 * get_size_in_bytes(mDataType);
+                auto const size_in_bytes
+                    = 2 * static_cast<int64_t>(get_size_in_bytes(mDataType)) * block_size.y * params.s * params.d;
                 if (size_in_bytes <= launch_params.device_l2_cache_size)
                 {
                     // strategy 1: limit to only 1 wave
@@ -340,7 +345,7 @@ public:
             {
                 TLLM_CU_CHECK(mDriver->cuLaunchKernel(func, params.h, params.b, unroll, kernelMeta.mThreadsPerCTA, 1, 1,
                     kernelMeta.mSharedMemBytes, stream, kernelParams, nullptr));
-            } // on Ampere/Ada/Volta flash attention, we launch blocks (steps, h, b)
+            } // on Ampere/Ada flash attention, we launch blocks (steps, h, b)
             else
             {
                 if (kernelMeta.mTiled)

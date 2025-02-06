@@ -91,6 +91,7 @@ void LoraManager::fillInputTensors(TensorPtr weightsPtrs, TensorPtr adapterSizes
 
         auto const inWeightsPtr = peftValue.weightsInPointer;
         auto const outWeightsPtr = peftValue.weightsOutPointer;
+        auto const scalingVecPtr = peftValue.scalingVecPointer.value_or(0);
 
         auto weightsPointersPtrOffset = common::flat_index4(modOff, layerIdx - firstLayerId, batchIdx, SizeType32{0},
             weightsPtrs->getShape().d[1], weightsPtrs->getShape().d[2], weightsPtrs->getShape().d[3]);
@@ -111,6 +112,7 @@ void LoraManager::fillInputTensors(TensorPtr weightsPtrs, TensorPtr adapterSizes
         {
             writeWeightsPtr[weightsPtrsOff++] = inWeightsPtr;
             writeWeightsPtr[weightsPtrsOff++] = outWeightsPtr;
+            writeWeightsPtr[weightsPtrsOff++] = scalingVecPtr;
         }
         std::fill_n(writeAdapterSizesPtr, beamWidth, adapterSize);
     }

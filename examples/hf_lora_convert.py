@@ -45,24 +45,45 @@ def save_val(val, dir, key, tp_num=None, write_npy=False):
 def get_all_lora_weights(lora_weights):
     all_weights = defaultdict(lambda: defaultdict(dict))
     pattern = re.compile(
-        r'.*\.layers\.([0-9]+)\.(self_attn|mlp)\.([a-z_]+)\.lora_(A|B)\.weight.*'
+        r'(.*\.layers\.([0-9]+)\.(self_attn|mlp)\.([a-z_]+))\.(?:lora_(?:(A|B)\.weight|(magnitude)_vector)|weight_(m_wdecomp).weight).*'
     )
     moe_pattern = re.compile(
-        r'.*\.layers\.([0-9]+)\.(block_sparse_moe)\.((experts)\.([0-9]+)\.|)([a-zA-Z0-9_]+)\.lora_(A|B)\.weight.*'
+        r'(.*\.layers\.([0-9]+)\.(block_sparse_moe)\.((experts)\.([0-9]+)\.|)([a-zA-Z0-9_]+))\.(?:lora_(?:(A|B)\.weight|(magnitude)_vector)|weight_(m_wdecomp).weight).*'
     )
     for key, weights in lora_weights.items():
         m = pattern.match(key)
         m_moe = moe_pattern.match(key)
         if m:
-            layer_idx = int(m.group(1))
-            hf_module = m.group(3)
-            inout = "in" if m.group(4) == "A" else "out"
-            all_weights[layer_idx][hf_module][inout] = weights
+            layer_idx = int(m.group(2))
+            hf_module = m.group(4)
+            inout = m.group(5)
+            dora_magnitude = m.group(6) or m.group(7)
+
+            if inout:
+                inout = "in" if inout == "A" else "out"
+                all_weights[layer_idx][hf_module][inout] = weights
+            elif dora_magnitude:
+                LOGGER.warning(
+                    "Detected DoRA magnitude vector, make sure it was preprocessed and normalized using the proper base model weights"
+                )
+                all_weights[layer_idx][hf_module]["magnitude"] = weights.view(
+                    -1)
+
         elif m_moe:
-            layer_idx = int(m_moe.group(1))
-            hf_module = m_moe.group(6)
-            inout = "in" if m_moe.group(7) == "A" else "out"
-            all_weights[layer_idx][hf_module][inout] = weights
+            layer_idx = int(m_moe.group(2))
+            hf_module = m_moe.group(7)
+            inout = m_moe.group(8)
+            dora_magnitude = m_moe.group(9) or m.group(10)
+
+            if inout:
+                inout = "in" if inout == "A" else "out"
+                all_weights[layer_idx][hf_module][inout] = weights
+            elif dora_magnitude:
+                LOGGER.warning(
+                    "Detected DoRA magnitude vector, make sure it was preprocessed and normalized using the proper base model weights"
+                )
+                all_weights[layer_idx][hf_module]["magnitude"] = weights.view(
+                    -1)
         else:
             print(f"no match {key}")
             continue
@@ -122,38 +143,62 @@ def convert_hf_model(model_dir, dtype, out_dir):
     all_weights = get_all_lora_weights(lora_model)
     converted_weights = []
     converted_config = []
+
+    def derive_adapter_size(inout_weight: torch.Tensor) -> int:
+        assert len(inout_weight.shape) == 2
+        dim0, dim1 = inout_weight.shape
+        # assume the hidden dim is the larger of the 2
+        adapter_size = min(dim0, dim1)
+        return adapter_size
+
+    def derive_weights_scale(adapter_size: int, alpha: float,
+                             use_rslora: bool) -> float:
+        if use_rslora:
+            return alpha / np.sqrt(adapter_size)
+        return alpha / adapter_size
+
     for layer_idx, layer_weights in all_weights.items():
         for hf_module, module_weights in layer_weights.items():
             in_weights = module_weights['in']
             out_weights = module_weights['out']
-            in_out_weights = []
-            adapter_size = 0
+            magnitude = module_weights.get("magnitude", None)
+            is_dora = magnitude is not None
+
+            processed_weights = []
+
+            assert len(in_weights.shape) == 2
+            assert len(out_weights.shape) == 2
+            assert not is_dora or len(magnitude.shape) == 1
+
+            adapter_size = derive_adapter_size(in_weights)
+            assert adapter_size == derive_adapter_size(
+                out_weights), "adapter size of A mismatches adapter size of B"
+            scale = derive_weights_scale(adapter_size, alpha, use_rslora)
+
             for w, inout in ((in_weights, "in"), (out_weights, "out")):
-                assert len(w.shape) == 2
-                # assume that the hidden dim is the larger of the 2
                 dim0 = w.shape[0]
                 dim1 = w.shape[1]
-                adapter_size = min(dim0, dim1)
                 # in_weights should have shape [adaper_size, hidden]
                 if dim1 < dim0 and inout == "in":
-                    adapter_size = dim1
                     w = w.transpose(1, 0)
                 # out_weights should have shape [hidden, adapter_size]
                 elif dim0 < dim1 and inout == "out":
-                    adapter_size = dim0
                     w = w.transpose(1, 0)
                 if inout == "out":
-                    if use_rslora:
-                        scale = alpha / np.sqrt(adapter_size)
-                    else:
-                        scale = alpha / adapter_size
                     w = w * scale
                 w = w.contiguous().flatten().to(dtype=str_dtype_to_torch(dtype))
-                in_out_weights.append(w)
-            in_out_weights = torch.concatenate(in_out_weights).flatten()
-            converted_weights.append(in_out_weights)
-            converted_config.append(
-                [hf_modules_to_module_id[hf_module], layer_idx, adapter_size])
+                processed_weights.append(w)
+
+            if is_dora:
+                processed_weights.append(magnitude.contiguous().flatten().to(
+                    dtype=str_dtype_to_torch(dtype)))
+
+            processed_weights = torch.concatenate(processed_weights).flatten()
+            converted_weights.append(processed_weights)
+            converted_config.append([
+                hf_modules_to_module_id[hf_module], layer_idx, adapter_size,
+                1 if is_dora else 0
+            ])
     max_row_size = 0
     for t in converted_weights:
         max_row_size = max(max_row_size, t.shape[0])

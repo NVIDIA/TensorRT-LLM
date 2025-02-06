@@ -329,7 +329,7 @@ void dispatch_gemm_to_cutlass(ActivationType const* A, WeightType const* B, Scal
     constexpr bool all_types_are_the_same = std::is_same_v<ActivationType, ScaleZeroType>
         && std::is_same_v<ActivationType, BiasType> && std::is_same_v<ActivationType, OutputType>;
 
-    constexpr bool is_valid_pre_hopper = (all_types_are_the_same && !any_is_fp8) || (arch::kMinComputeCapability >= 89);
+    constexpr bool is_valid_pre_hopper = (all_types_are_the_same && !any_is_fp8) || (arch::kMinComputeCapability == 89);
 
     if constexpr (is_valid_pre_hopper)
     {
@@ -337,27 +337,19 @@ void dispatch_gemm_to_cutlass(ActivationType const* A, WeightType const* B, Scal
         // We also only instantiate configs here where threadblockShapeM == warpShapeM since those usually perform the
         // best for mixed type gemms.
         constexpr int tile_shape_k = 128 * 8 / cutlass::sizeof_bits<ActivationType>::value;
-        switch (gemm_config.tile_config)
+        switch (gemm_config.tile_config_sm80)
         {
         case tkc::CutlassTileConfig::CtaShape16x128x64_WarpShape16x32x64:
-            TLLM_CHECK_WITH_INFO(arch::kMinComputeCapability >= 75, "Invalid config on Volta");
-            if constexpr (arch::kMinComputeCapability >= 75)
-            {
-                dispatch_gemm_config<ActivationType, WeightType, ScaleZeroType, BiasType, OutputType, arch, QuantOp,
-                    EpilogueTag, cutlass::gemm::GemmShape<16, 128, tile_shape_k>,
-                    cutlass::gemm::GemmShape<16, 32, tile_shape_k>>(A, B, weight_scales, weight_zero_points, biases,
-                    alpha, C, m, n, k, group_size, gemm_config, workspace, workspace_bytes, stream, occupancy);
-            }
+            dispatch_gemm_config<ActivationType, WeightType, ScaleZeroType, BiasType, OutputType, arch, QuantOp,
+                EpilogueTag, cutlass::gemm::GemmShape<16, 128, tile_shape_k>,
+                cutlass::gemm::GemmShape<16, 32, tile_shape_k>>(A, B, weight_scales, weight_zero_points, biases, alpha,
+                C, m, n, k, group_size, gemm_config, workspace, workspace_bytes, stream, occupancy);
             break;
         case tkc::CutlassTileConfig::CtaShape16x256x64_WarpShape16x64x64:
-            TLLM_CHECK_WITH_INFO(arch::kMinComputeCapability >= 75, "Invalid config on Volta");
-            if constexpr (arch::kMinComputeCapability >= 75)
-            {
-                dispatch_gemm_config<ActivationType, WeightType, ScaleZeroType, BiasType, OutputType, arch, QuantOp,
-                    EpilogueTag, cutlass::gemm::GemmShape<16, 256, tile_shape_k>,
-                    cutlass::gemm::GemmShape<16, 64, tile_shape_k>>(A, B, weight_scales, weight_zero_points, biases,
-                    alpha, C, m, n, k, group_size, gemm_config, workspace, workspace_bytes, stream, occupancy);
-            }
+            dispatch_gemm_config<ActivationType, WeightType, ScaleZeroType, BiasType, OutputType, arch, QuantOp,
+                EpilogueTag, cutlass::gemm::GemmShape<16, 256, tile_shape_k>,
+                cutlass::gemm::GemmShape<16, 64, tile_shape_k>>(A, B, weight_scales, weight_zero_points, biases, alpha,
+                C, m, n, k, group_size, gemm_config, workspace, workspace_bytes, stream, occupancy);
             break;
         case tkc::CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64:
             dispatch_gemm_config<ActivationType, WeightType, ScaleZeroType, BiasType, OutputType, arch, QuantOp,
@@ -372,14 +364,10 @@ void dispatch_gemm_to_cutlass(ActivationType const* A, WeightType const* B, Scal
                 C, m, n, k, group_size, gemm_config, workspace, workspace_bytes, stream, occupancy);
             break;
         case tkc::CutlassTileConfig::CtaShape128x128x64_WarpShape128x32x64:
-            TLLM_CHECK_WITH_INFO(arch::kMinComputeCapability >= 75, "Invalid config on Volta");
-            if constexpr (arch::kMinComputeCapability >= 75)
-            {
-                dispatch_gemm_config<ActivationType, WeightType, ScaleZeroType, BiasType, OutputType, arch, QuantOp,
-                    EpilogueTag, cutlass::gemm::GemmShape<128, 128, tile_shape_k>,
-                    cutlass::gemm::GemmShape<128, 32, tile_shape_k>>(A, B, weight_scales, weight_zero_points, biases,
-                    alpha, C, m, n, k, group_size, gemm_config, workspace, workspace_bytes, stream, occupancy);
-            }
+            dispatch_gemm_config<ActivationType, WeightType, ScaleZeroType, BiasType, OutputType, arch, QuantOp,
+                EpilogueTag, cutlass::gemm::GemmShape<128, 128, tile_shape_k>,
+                cutlass::gemm::GemmShape<128, 32, tile_shape_k>>(A, B, weight_scales, weight_zero_points, biases, alpha,
+                C, m, n, k, group_size, gemm_config, workspace, workspace_bytes, stream, occupancy);
             break;
         case tkc::CutlassTileConfig::Undefined:
             throw std::runtime_error("[TensorRT-LLm Error][fpA_intB][dispatch_gemm_to_cutlass] gemm config undefined.");
@@ -439,7 +427,7 @@ void CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType
             QuantOp, EpilogueTag>(A, B, weight_scales, weight_zero_points, biases, alpha, C, m, n, k, group_size,
             workspace_ptr, workspace_bytes, gemm_config, stream, occupancy);
     }
-    else if (sm_ >= 80 && sm_ < 89)
+    else if ((sm_ >= 80 && sm_ < 89) || sm_ >= 100)
     {
         dispatch_gemm_to_cutlass<ActivationType, WeightType, ScaleZeroType, BiasType, OutputType, cutlass::arch::Sm80,
             QuantOp, EpilogueTag>(A, B, weight_scales, weight_zero_points, biases, alpha, C, m, n, k, group_size,

@@ -105,8 +105,8 @@ std::vector<LowLatencyGemmPluginProfiler::Config> LowLatencyGemmPluginProfiler::
 
 LowLatencyGemmPlugin::LowLatencyGemmPlugin(
     nvinfer1::DataType type, float alpha, PluginProfilerPtr const& pluginProfiler)
-    : mAplha(alpha)
-    , mPluginProfiler(pluginProfiler)
+    : mPluginProfiler(pluginProfiler)
+    , mAplha(alpha)
 {
     init(type);
 }
@@ -369,8 +369,8 @@ PluginFieldCollection const* LowLatencyGemmPluginCreator::getFieldNames() noexce
 IPluginV2* LowLatencyGemmPluginCreator::createPlugin(char const* name, PluginFieldCollection const* fc) noexcept
 {
     PluginField const* fields = fc->fields;
-    float alpha;
-    nvinfer1::DataType type;
+    float alpha{};
+    nvinfer1::DataType type{};
     for (int i = 0; i < fc->nbFields; i++)
     {
         char const* attrName = fields[i].name;

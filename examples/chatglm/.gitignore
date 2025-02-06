@@ -1,7 +1,5 @@
 __pycache__/
 .vscode/
-chatglm*/
-glm*/
 dataset/
 trt_ckpt/
 trt_engine/

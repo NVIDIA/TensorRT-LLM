@@ -20,6 +20,7 @@
 #include "tensorrt_llm/runtime/tllmLogger.h"
 
 #include "tensorrt_llm/plugins/bertAttentionPlugin/bertAttentionPlugin.h"
+#include "tensorrt_llm/plugins/doraPlugin/doraPlugin.h"
 #include "tensorrt_llm/plugins/fp8RowwiseGemmPlugin/fp8RowwiseGemmPlugin.h"
 #include "tensorrt_llm/plugins/gemmPlugin/gemmPlugin.h"
 #include "tensorrt_llm/plugins/gemmSwigluPlugin/gemmSwigluPlugin.h"
@@ -31,8 +32,10 @@
 #include "tensorrt_llm/plugins/lruPlugin/lruPlugin.h"
 #include "tensorrt_llm/plugins/mambaConv1dPlugin/mambaConv1dPlugin.h"
 #include "tensorrt_llm/plugins/mixtureOfExperts/mixtureOfExpertsPlugin.h"
+#include "tensorrt_llm/plugins/quantizeToFP4Plugin/quantizeToFP4Plugin.h"
 #if ENABLE_MULTI_DEVICE
 #include "tensorrt_llm/plugins/cpSplitPlugin/cpSplitPlugin.h"
+#include "tensorrt_llm/plugins/gemmAllReducePlugin/gemmAllReducePlugin.h"
 #include "tensorrt_llm/plugins/ncclPlugin/allgatherPlugin.h"
 #include "tensorrt_llm/plugins/ncclPlugin/allreducePlugin.h"
 #include "tensorrt_llm/plugins/ncclPlugin/recvPlugin.h"
@@ -44,6 +47,7 @@
 #include "tensorrt_llm/plugins/eaglePlugin/eagleDecodeDraftTokensPlugin.h"
 #include "tensorrt_llm/plugins/eaglePlugin/eaglePrepareDrafterInputsPlugin.h"
 #include "tensorrt_llm/plugins/eaglePlugin/eagleSampleAndAcceptDraftTokensPlugin.h"
+#include "tensorrt_llm/plugins/fp4GemmPlugin/fp4GemmPlugin.h"
 #include "tensorrt_llm/plugins/lowLatencyGemmPlugin/lowLatencyGemmPlugin.h"
 #include "tensorrt_llm/plugins/lowLatencyGemmSwigluPlugin/lowLatencyGemmSwigluPlugin.h"
 #include "tensorrt_llm/plugins/qserveGemmPlugin/qserveGemmPlugin.h"
@@ -214,10 +218,12 @@ extern "C"
         static tensorrt_llm::plugins::AllreducePluginCreator allreducePluginCreator;
         static tensorrt_llm::plugins::AllgatherPluginCreator allgatherPluginCreator;
         static tensorrt_llm::plugins::ReduceScatterPluginCreator reduceScatterPluginCreator;
+        static tensorrt_llm::plugins::GemmAllReducePluginCreator gemmAllReducePluginCreator;
 #endif // ENABLE_MULTI_DEVICE
         static tensorrt_llm::plugins::SmoothQuantGemmPluginCreator smoothQuantGemmPluginCreator;
         static tensorrt_llm::plugins::QServeGemmPluginCreator qserveGemmPluginCreator;
         static tensorrt_llm::plugins::LayernormQuantizationPluginCreator layernormQuantizationPluginCreator;
+        static tensorrt_llm::plugins::QuantizeToFP4PluginCreator quantizeToFP4PluginCreator;
         static tensorrt_llm::plugins::QuantizePerTokenPluginCreator quantizePerTokenPluginCreator;
         static tensorrt_llm::plugins::QuantizeTensorPluginCreator quantizeTensorPluginCreator;
         static tensorrt_llm::plugins::RmsnormQuantizationPluginCreator rmsnormQuantizationPluginCreator;
@@ -227,6 +233,7 @@ extern "C"
         static tensorrt_llm::plugins::LookupPluginCreator lookupPluginCreator;
         static tensorrt_llm::plugins::LoraPluginCreator loraPluginCreator;
         static tensorrt_llm::plugins::SelectiveScanPluginCreator selectiveScanPluginCreator;
+        static tensorrt_llm::plugins::Fp4GemmPluginCreator fp4GemmPluginCreator;
         static tensorrt_llm::plugins::MambaConv1dPluginCreator mambaConv1DPluginCreator;
         static tensorrt_llm::plugins::lruPluginCreator lruPluginCreator;
         static tensorrt_llm::plugins::CumsumLastDimPluginCreator cumsumLastDimPluginCreator;
@@ -252,10 +259,12 @@ extern "C"
                   creatorPtr(allreducePluginCreator),
                   creatorPtr(allgatherPluginCreator),
                   creatorPtr(reduceScatterPluginCreator),
+                  creatorPtr(gemmAllReducePluginCreator),
 #endif // ENABLE_MULTI_DEVICE
                   creatorPtr(smoothQuantGemmPluginCreator),
                   creatorPtr(qserveGemmPluginCreator),
                   creatorPtr(layernormQuantizationPluginCreator),
+                  creatorPtr(quantizeToFP4PluginCreator),
                   creatorPtr(quantizePerTokenPluginCreator),
                   creatorPtr(quantizeTensorPluginCreator),
                   creatorPtr(rmsnormQuantizationPluginCreator),
@@ -264,6 +273,7 @@ extern "C"
                   creatorPtr(lookupPluginCreator),
                   creatorPtr(loraPluginCreator),
                   creatorPtr(selectiveScanPluginCreator),
+                  creatorPtr(fp4GemmPluginCreator),
                   creatorPtr(mambaConv1DPluginCreator),
                   creatorPtr(lruPluginCreator),
                   creatorPtr(cumsumLastDimPluginCreator),
@@ -285,12 +295,15 @@ extern "C"
         static tensorrt_llm::plugins::CpSplitPluginCreator cpSplitPluginCreator;
 #endif // ENABLE_MULTI_DEVICE
 
+        static tensorrt_llm::plugins::DoraPluginCreator doraPluginCreator;
+
         static std::array creators
             = { creatorInterfacePtr(eaglePrepareDrafterInputsPluginCreator),
 #if ENABLE_MULTI_DEVICE
                   creatorInterfacePtr(cpSplitPluginCreator),
 #endif // ENABLE_MULTI_DEVICE
-              };
+                  creatorInterfacePtr(doraPluginCreator) };
+
         nbCreators = creators.size();
         return creators.data();
     }

@@ -28,7 +28,7 @@ namespace PYBIND11_NAMESPACE
 namespace detail
 {
 template <>
-struct type_caster<tensorrt_llm::executor::StreamPtr>
+class type_caster<tensorrt_llm::executor::StreamPtr>
 {
 public:
     PYBIND11_TYPE_CASTER(tensorrt_llm::executor::StreamPtr, _("int"));

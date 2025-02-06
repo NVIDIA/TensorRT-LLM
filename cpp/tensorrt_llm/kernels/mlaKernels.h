@@ -29,11 +29,11 @@ namespace kernels
 
 struct mlaMetaParams
 {
-    int32_t q_lora_rank;
-    int32_t kv_lora_rank;
-    int32_t qk_nope_head_dim;
-    int32_t qk_rope_head_dim;
-    int32_t v_head_dim;
+    int32_t q_lora_rank = 0;
+    int32_t kv_lora_rank = 0;
+    int32_t qk_nope_head_dim = 0;
+    int32_t qk_rope_head_dim = 0;
+    int32_t v_head_dim = 0;
 };
 
 template <typename T>

@@ -25,8 +25,7 @@ from tensorrt_llm._utils import torch_to_numpy
 from tensorrt_llm.quantization.functional import smooth_quant_layer_norm
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import (create_session, run_session, skip_bf16_pre_ampere,
-                        unittest_name_func)
+from utils.util import create_session, run_session, unittest_name_func
 
 
 class TestSmoothQuantLayerNorm(unittest.TestCase):
@@ -49,9 +48,6 @@ class TestSmoothQuantLayerNorm(unittest.TestCase):
     def test_smooth_quant_layer_norm(self, dtype, dynamic_act_scaling,
                                      elementwise_affine, remove_batch_dim,
                                      use_plugin):
-        # Skip tests that are not supported in pre-ampere architecture
-        skip_bf16_pre_ampere(dtype)
-
         # test data
         hidden_size = 1024
         x_data = torch.randn(

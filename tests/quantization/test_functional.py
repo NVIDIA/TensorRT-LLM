@@ -28,8 +28,7 @@ from tensorrt_llm.quantization.functional import (dequantize, quantize,
 from tensorrt_llm.quantization.layers import quantize_tensor
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import (create_session, run_session, skip_bf16_pre_ampere,
-                        unittest_name_func)
+from utils.util import create_session, run_session, unittest_name_func
 
 
 class TestQuantizationFunctional(unittest.TestCase):
@@ -43,9 +42,6 @@ class TestQuantizationFunctional(unittest.TestCase):
                            ('bfloat16', True), ('bfloat16', False)],
                           name_func=unittest_name_func)
     def test_quantize_tensor(self, dtype, use_plugin):
-        # Skip tests that are not supported in pre-ampere architecture
-        skip_bf16_pre_ampere(dtype)
-
         x_data = torch.randn(
             (1, 2, 2, 4),
             dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),
@@ -144,9 +140,6 @@ class TestQuantizationFunctional(unittest.TestCase):
     ],
                           name_func=unittest_name_func)
     def test_quantize_per_token(self, dtype, use_plugin, sum_per_token):
-        # Skip tests that are not supported in pre-ampere architecture
-        skip_bf16_pre_ampere(dtype)
-
         x_data = torch.randn(
             (4, 2, 4, 8),
             dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),

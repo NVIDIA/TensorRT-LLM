@@ -59,6 +59,11 @@ public:
         PYBIND11_OVERLOAD_PURE(void, tbk::BaseKVCacheManager, allocatePools, dtype, useUvm);
     }
 
+    void releasePools() override
+    {
+        PYBIND11_OVERLOAD_PURE(void, tbk::BaseKVCacheManager, releasePools);
+    }
+
     void startScheduling() override
     {
         PYBIND11_OVERLOAD_PURE(void, tbk::BaseKVCacheManager, startScheduling);
@@ -105,7 +110,7 @@ public:
     }
 
     void addSequence(tb::LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
-        tensorrt_llm::common::OptionalRef<tb::LlmRequest> llmRequest = std::nullopt)
+        tensorrt_llm::common::OptionalRef<tb::LlmRequest> llmRequest = std::nullopt) override
     {
         PYBIND11_OVERLOAD_PURE(
             void, tbk::BaseKVCacheManager, addSequence, requestId, inputLength, beamWidth, llmRequest);
@@ -117,7 +122,7 @@ public:
         PYBIND11_OVERLOAD_PURE(void, tbk::BaseKVCacheManager, removeSequence, requestId, llmRequest);
     }
 
-    tbk::GenerationRequest const& getSequence(tb::LlmRequest::RequestIdType requestId) const
+    tbk::GenerationRequest const& getSequence(tb::LlmRequest::RequestIdType requestId) const override
     {
         PYBIND11_OVERLOAD_PURE(tbk::GenerationRequest const&, tbk::BaseKVCacheManager, getSequence, requestId);
     }
@@ -185,12 +190,12 @@ public:
         PYBIND11_OVERLOAD_PURE(void, tbk::BaseKVCacheManager, storeContextBlocks, llmRequest);
     }
 
-    bool schedulingHasFreeBlocks(SizeType32 numRequired = 1) const
+    bool schedulingHasFreeBlocks(SizeType32 numRequired = 1) const override
     {
         PYBIND11_OVERLOAD_PURE(bool, tbk::BaseKVCacheManager, schedulingHasFreeBlocks, numRequired);
     }
 
-    std::vector<std::vector<SizeType32>> const& getCacheBlockIds(tb::LlmRequest::RequestIdType requestId) const
+    std::vector<std::vector<SizeType32>> const& getCacheBlockIds(tb::LlmRequest::RequestIdType requestId) const override
     {
         PYBIND11_OVERLOAD_PURE(
             std::vector<std::vector<SizeType32>> const&, tbk::BaseKVCacheManager, getCacheBlockIds, requestId);
@@ -213,35 +218,35 @@ public:
         PYBIND11_OVERLOAD_PURE(SizeType32, tbk::BaseKVCacheManager, getNumFreeBlocks);
     }
 
-    tbk::BlockManager const& getBlockManager() const
+    tbk::BlockManager const& getBlockManager() const override
     {
         PYBIND11_OVERLOAD_PURE(tbk::BlockManager const&, tbk::BaseKVCacheManager, getBlockManager);
     }
 
     std::deque<tensorrt_llm::executor::KVCacheEvent> getLatestEvents(
-        std::optional<std::chrono::milliseconds> timeout = std::nullopt) const
+        std::optional<std::chrono::milliseconds> timeout = std::nullopt) const override
     {
         PYBIND11_OVERLOAD_PURE(
             std::deque<tensorrt_llm::executor::KVCacheEvent>, tbk::BaseKVCacheManager, getLatestEvents, timeout);
     }
 
-    tensorrt_llm::runtime::ITensor::SharedPtr getPrimaryPool(SizeType32 layer_idx) const
+    tensorrt_llm::runtime::ITensor::SharedPtr getPrimaryPool(SizeType32 layer_idx) const override
     {
         PYBIND11_OVERLOAD_PURE(
             tensorrt_llm::runtime::ITensor::SharedPtr, tbk::BaseKVCacheManager, getPrimaryPool, layer_idx);
     }
 
-    SizeType32 getPoolLayerIdx(SizeType32 layer_idx) const
+    SizeType32 getPoolLayerIdx(SizeType32 layer_idx) const override
     {
         PYBIND11_OVERLOAD_PURE(SizeType32, tbk::BaseKVCacheManager, getPoolLayerIdx, layer_idx);
     }
 
-    void refreshBlocks()
+    void refreshBlocks() override
     {
         PYBIND11_OVERLOAD_PURE(void, tbk::BaseKVCacheManager, refreshBlocks);
     }
 
-    void flushIterationEvents()
+    void flushIterationEvents() override
     {
         PYBIND11_OVERLOAD_PURE(void, tbk::BaseKVCacheManager, flushIterationEvents);
     }
@@ -311,6 +316,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
         .def_static("calculate_max_num_blocks", &tbk::BaseKVCacheManager::calculateMaxNumBlocks, py::arg("config"),
             py::arg("dtype"), py::arg("model_config"), py::arg("world_config"), py::arg("buffer_manager"))
         .def("allocate_pools", &BaseKVCacheManager::allocatePools)
+        .def("release_pools", &BaseKVCacheManager::releasePools)
         .def("start_scheduling", &BaseKVCacheManager::startScheduling)
         .def_property_readonly("tokens_per_block", &BaseKVCacheManager::getTokensPerBlock)
         .def_property_readonly("max_num_blocks", &BaseKVCacheManager::getMaxNumBlocks)
@@ -370,6 +376,17 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
                 TLLM_CHECK_WITH_INFO(_output.has_value(), "Invalid output tensor.");
                 auto maxBlockCount = self.copyBlockOffsets(*(_output.value()), outputSlotOffset, requestId);
                 return maxBlockCount;
+            })
+        .def("copy_batch_block_offsets",
+            [](tbk::BaseKVCacheManager& self, at::Tensor output,
+                std::vector<tb::LlmRequest::RequestIdType> const& requestIds)
+            {
+                auto _output = from_torch(output);
+                TLLM_CHECK_WITH_INFO(_output.has_value(), "Invalid output tensor.");
+                for (size_t i = 0; i < requestIds.size(); ++i)
+                {
+                    self.copyBlockOffsets(*(_output.value()), i, requestIds[i]);
+                }
             })
         .def_property_readonly("enable_block_reuse", &BaseKVCacheManager::isEnableBlockReuse)
         .def_property_readonly("use_one_more_block", &BaseKVCacheManager::isUseOneMoreBlock)

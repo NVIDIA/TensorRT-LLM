@@ -39,6 +39,8 @@ set(SRCS
     iBuffer.cpp
     iTensor.cpp
     ipcUtils.cpp
+    ipcSocket.cpp
+    ipcNvlsMemory.cpp
     memoryCounters.cpp
     ncclCommunicator.cpp
     promptTuningParams.cpp

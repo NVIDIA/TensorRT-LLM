@@ -22,6 +22,10 @@ FP8_QUANT=0
 EXAMPLE_DIR="llama"
 OUTPUT_FILE=$WORKSPACE/"output.txt"
 
+# Number of postprocess workers, 0 means no postprocess workers
+NUM_POSTPROCESS_WORKERS=${NUM_POSTPROCESS_WORKERS:-0}
+ENABLE_OAI_POSTPROCESS=${ENABLE_OAI_POSTPROCESS:-0}
+
 function usage() {
   echo "Usage: $0 -m <hf_model_dir> -t <tp_size> -i <isl> -o <osl>"
   echo "  -m: Path to the model"
@@ -205,7 +209,7 @@ function build_engine_using_cli() {
   local log_file=$workspace/engine_build.log
   if [ ! -d $workspace ]; then
     mkdir -p $workspace
-    local cmd="trtllm-bench -m $HF_MODEL_DIR -w $workspace build -tp $TP_SIZE --dataset $(get_data_path $ISL $OSL $NUM_SAMPLES)"
+    local cmd="python $TRTLLM_ROOT/tensorrt_llm/commands/bench.py -m $TRTLLM_BENCH_MODEL_NAME --model_path $HF_MODEL_DIR -w $workspace build -tp $TP_SIZE --dataset $(get_data_path $ISL $OSL $NUM_SAMPLES)"
     if [ $FP8_QUANT -eq 1 ]; then
       cmd="$cmd -q FP8"
     fi
@@ -214,7 +218,7 @@ function build_engine_using_cli() {
     $cmd 2>&1 | tee $log_file
     set +x
   fi
-  ENGINE_DIR=$(grep 'ENGINE SAVED:' $log_file | sed 's/.*SAVED: //')
+  ENGINE_DIR=$(grep 'ENGINE SAVED:' $log_file | uniq | sed 's/.*SAVED: //')
   echo "Engine saved to $ENGINE_DIR"
 }
 
@@ -290,18 +294,21 @@ function run_perf() {
 
   set -x
   python $evaluator_py benchmark \
-  --model-path $ENGINE_DIR \
-  --tp-size $TP_SIZE \
-  --samples-path $data_path \
-  --num-samples $samples \
-  --report-path-prefix $report_path \
-  --warmup 100 \
-  --return-context-logits $RETURN_CONTEXT_LOGITS \
-  --return-generation-logits $RETURN_GENERATION_LOGITS \
-   ${streaming_suffix} \
-  --kv-cache-free-gpu-mem-fraction $KVCACHE_MEM_FRACTION \
-  --cpp-executable $cpp_benchmark \
-  2>&1 | tee -a $log_path
+      --model-path $ENGINE_DIR \
+      --tp-size $TP_SIZE \
+      --samples-path $data_path \
+      --num-samples $samples \
+      --report-path-prefix $report_path \
+      --warmup 100 \
+      --return-context-logits $RETURN_CONTEXT_LOGITS \
+      --return-generation-logits $RETURN_GENERATION_LOGITS \
+      ${streaming_suffix} \
+      --kv-cache-free-gpu-mem-fraction $KVCACHE_MEM_FRACTION \
+      --num-postprocess-workers $NUM_POSTPROCESS_WORKERS \
+      --postprocess-tokenizer-dir $HF_MODEL_DIR \
+      --enable-oai-postprocess $ENABLE_OAI_POSTPROCESS \
+      --cpp-executable $cpp_benchmark \
+      2>&1 | tee -a $log_path
   set +x
 
   if [ ${PIPESTATUS[0]} -ne 0 ]; then

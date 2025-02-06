@@ -7,7 +7,6 @@ import tempfile
 import pytest
 from parameterized import parameterized
 
-from tensorrt_llm._utils import release_gc
 from tensorrt_llm.executor import ExecutorBindingsProxy
 from tensorrt_llm.llmapi import LLM, KvCacheConfig, SamplingParams
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
@@ -24,7 +23,9 @@ from test_llm import (
     llama_v2_7b_prompt_adapter_test_harness, llama_v2_13b_lora_test_harness,
     llm_check_output, llm_get_stats_async_test_harness,
     llm_get_stats_test_harness, llm_test_harness, mixtral_model_name, prompts,
-    tinyllama_guided_decoding_test_harness)
+    tinyllama_guided_decoding_test_harness,
+    tinyllama_logits_processor_test_harness, run_llm_with_postprocess_parallel,
+    run_llm_with_postprocess_parallel_and_result_handler)
 from utils.util import (skip_gpu_memory_less_than, skip_num_gpus_less_than,
                         skip_single_gpu, unittest_name_func)
 # isort: on
@@ -58,6 +59,12 @@ def engine_from_checkpoint() -> tempfile.TemporaryDirectory:
 
 # shrink the kv_cache_config to avoid OOM in CI
 global_kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
+
+# python api does not seem to support extra tokens needed for prompt tuning + reuse.
+# disable block reuse for those tests.
+# TODO: Add extra tokens to prompt tuning unit tests.
+global_kv_cache_config_no_reuse = KvCacheConfig(free_gpu_memory_fraction=0.4,
+                                                enable_block_reuse=False)
 
 
 @skip_single_gpu
@@ -206,6 +213,12 @@ def test_llm_end2end_tp2(llm_additional_options):
 
 
 @skip_num_gpus_less_than(4)
+def test_tinyllama_logits_processor_tp2pp2():
+    tinyllama_logits_processor_test_harness(tensor_parallel_size=2,
+                                            pipeline_parallel_size=2)
+
+
+@skip_num_gpus_less_than(4)
 def test_tinyllama_guided_decoding_tp2pp2():
     tinyllama_guided_decoding_test_harness(
         tensor_parallel_size=2,
@@ -230,7 +243,7 @@ def test_llama_7b_multi_lora_tp2():
 @skip_single_gpu
 def test_llama_v2_7b_prompt_adapter_tp2():
     llama_v2_7b_prompt_adapter_test_harness(
-        tensor_parallel_size=2, kv_cache_config=global_kv_cache_config)
+        tensor_parallel_size=2, kv_cache_config=global_kv_cache_config_no_reuse)
 
 
 @skip_single_gpu
@@ -328,9 +341,6 @@ def _test_executor_handle_background_error_in_dispatch_result_thread():
 
     asyncio.run(task())
 
-    del llm
-    release_gc()
-
 
 class DummyExecutorProxy3(ExecutorBindingsProxy):
     ''' This is for testing the error occur in a Worker process in the Proxy. '''
@@ -368,6 +378,14 @@ def test_llm_get_stats_async_tp2():
 
 def test_llm_capture_request_error():
     _test_llm_capture_request_error(tp_size=2)
+
+
+def test_llm_with_postprocess_parallel_tp2():
+    run_llm_with_postprocess_parallel(tp_size=2)
+
+
+def test_llm_with_postprocess_parallel_and_result_handler_tp2():
+    run_llm_with_postprocess_parallel_and_result_handler(tp_size=2)
 
 
 if __name__ == '__main__':

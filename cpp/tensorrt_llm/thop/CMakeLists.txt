@@ -22,18 +22,25 @@ add_library(
   th_common SHARED
   allgatherOp.cpp
   allreduceOp.cpp
+  attentionOp.cpp
   convertSpecDecodingMaskToPackedMaskOp.cpp
   cutlassScaledMM.cpp
   cublasScaledMM.cpp
   dynamicDecodeOp.cpp
   fmhaPackMaskOp.cpp
   fp8Op.cpp
+  fp4Op.cpp
+  fp4Gemm.cpp
+  fp4Quantize.cpp
   gatherTreeOp.cpp
+  mambaConv1dOp.cpp
   moeOp.cpp
   ncclCommunicatorOp.cpp
   parallelDecodeKVCacheUpdateOp.cpp
   redrafterCurandOp.cpp
   relativeAttentionBiasOp.cpp
+  selectiveScanOp.cpp
+  userbuffersFinalizeOp.cpp
   weightOnlyQuantOp.cpp)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(th_common PRIVATE ${TORCH_LIBRARIES} th_utils
@@ -50,4 +57,6 @@ if(NOT WIN32)
     th_common
     PROPERTIES LINK_FLAGS
                "-Wl,-rpath='$ORIGIN' ${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
+else()
+  target_link_libraries(th_common PRIVATE context_attention_src)
 endif()

@@ -178,12 +178,6 @@ public:
 
     [[nodiscard]] virtual executor::DecodingMode getDecodingMode() const = 0;
 
-    //! @brief Initialize batched decoder at seqSlots with a new `requests`.
-    virtual void newRequests(std::vector<SizeType32> const& seqSlots,
-        std::vector<decoder_batch::Request> const& requests, std::vector<SamplingConfig> const& samplingConfigs,
-        ModelConfig const& modelConfig)
-        = 0;
-
     //! @returns [batchSize, maxTokensPerStep-1], predicted draft tokens for next step, on gpu
     virtual TensorPtr getNextDraftTokens() const = 0;
 

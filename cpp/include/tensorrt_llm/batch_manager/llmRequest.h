@@ -22,6 +22,7 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
 
 #include <algorithm>
@@ -127,12 +128,12 @@ public:
         , mPromptLen(inputTokens->size())
         , mMaxNewTokens(maxNewTokens)
         , mSamplingConfig(samplingConfig)
-        , mState(LlmRequestState::kCONTEXT_INIT)
         , mEndId(endId)
         , mPadId(padId)
         , mLogitsPostProcessor(std::move(logitsPostProcessor))
         , mApplyLogitsPostProcessorBatched(applyLogitsPostProcessorBatched)
         , mClientId(clientId)
+        , mState(LlmRequestState::kCONTEXT_INIT)
         , mIsStreaming(isStreaming)
         , mOrigPromptLen(mPromptLen)
         , mNumPreDecodedTokens(samplingConfig.beamWidth, 0)
@@ -206,12 +207,12 @@ public:
         , mPromptLen(inputTokens.size())
         , mMaxNewTokens(maxNewTokens)
         , mSamplingConfig(samplingConfig)
-        , mState(LlmRequestState::kCONTEXT_INIT)
         , mEndId(endId)
         , mPadId(padId)
         , mLogitsPostProcessor(logitsPostProcessor)
         , mApplyLogitsPostProcessorBatched(applyLogitsPostProcessorBatched)
         , mClientId(clientId)
+        , mState(LlmRequestState::kCONTEXT_INIT)
         , mIsStreaming(isStreaming)
         , mOrigPromptLen(mPromptLen)
         , mNumPreDecodedTokens(samplingConfig.beamWidth, 0)
@@ -271,10 +272,10 @@ public:
         , mPromptLen(req.getInputTokenIds().size())
         , mMaxNewTokens(req.getMaxTokens())
         , mSamplingConfig(req.getSamplingConfig(), req.getExternalDraftTokensConfig())
-        , mState(LlmRequestState::kCONTEXT_INIT)
         , mEndId(req.getEndId())
         , mPadId(req.getPadId())
         , mClientId(req.getClientId())
+        , mState(LlmRequestState::kCONTEXT_INIT)
         , mIsStreaming(req.getStreaming())
         , mOrigPromptLen(mPromptLen)
         , mNumPreDecodedTokens(mSamplingConfig.beamWidth, 0)
@@ -490,71 +491,6 @@ public:
         initialize(req.getInputTokenIds(), req.getOutputConfig().returnLogProbs);
     }
 
-    void validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen,
-        std::optional<SizeType32> maxEncoderInputLen = std::nullopt, bool enableKVCacheReuse = false)
-    {
-        TLLM_CHECK_WITH_INFO(!(maxEncoderInputLen.has_value() && getEncoderInputLen() > maxEncoderInputLen.value()),
-            "Encoder length (%d) exceeds maximum encoder input length (%d).", getEncoderInputLen(),
-            maxEncoderInputLen.value());
-
-        if (mPromptLen > maxInputLen)
-        {
-            TLLM_THROW(
-                "Prompt length (%d) exceeds maximum input length (%d). Set log level to info and check "
-                "TRTGptModel logs for how maximum input length is set",
-                mPromptLen, maxInputLen);
-        }
-
-        // Maximum number of draft tokens per request we pass to the engine for single runtime iteration.
-        // It depends on the speculative decoding mode.
-        auto draftLenPerEngineStep = maxDraftLen;
-        auto const& draftTokens = getDraftTokens();
-        if (draftTokens && !draftTokens->empty())
-        {
-            auto const inputDraftTokensLen = static_cast<SizeType32>(draftTokens->size());
-            if (inputDraftTokensLen > maxDraftLen)
-            {
-                TLLM_THROW("Draft tokens length (%d) exceeds maximum draft tokens length (%d).", inputDraftTokensLen,
-                    maxDraftLen);
-            }
-            draftLenPerEngineStep = inputDraftTokensLen;
-
-            if (mPromptLen + draftLenPerEngineStep > maxInputLen)
-            {
-                auto const newDraftLenPerEngineStep = maxInputLen - mPromptLen;
-                TLLM_LOG_WARNING(
-                    "Prompt length + number of draft tokens (%d + %d) exceeds maximum input length (%d)."
-                    "Number of draft tokens is changed to (%d)",
-                    mPromptLen, draftLenPerEngineStep, maxInputLen, newDraftLenPerEngineStep);
-                draftLenPerEngineStep = newDraftLenPerEngineStep;
-                mDraftTokens->resize(draftLenPerEngineStep);
-            }
-        }
-
-        if (mPromptLen + mMaxNewTokens + draftLenPerEngineStep > maxSequenceLen)
-        {
-            auto const maxNewTokens = maxSequenceLen - mPromptLen - draftLenPerEngineStep;
-            TLLM_LOG_WARNING(
-                "Prompt length + number of requested output tokens + draft tokens per step (%d + %d + %d) exceeds "
-                "maximum sequence length (%d). "
-                "Number of requested output tokens is changed to (%d).",
-                mPromptLen, mMaxNewTokens, draftLenPerEngineStep, maxSequenceLen, maxNewTokens);
-            mMaxNewTokens = maxNewTokens;
-        }
-
-        TLLM_CHECK_WITH_INFO(mSamplingConfig.validate(), "Incorrect sampling config");
-
-        // validate extra ids when enabling kv cache reuse with prompt table
-        if (enableKVCacheReuse && mPromptEmbeddingTable.has_value() && mPromptVocabSize.has_value())
-        {
-            TLLM_CHECK_WITH_INFO(mInputTokenExtraIds.has_value() && mInputTokenExtraIds.value(),
-                "Input token extra ids must be provided when enabling kv cache reuse with prompt table");
-            TLLM_CHECK_WITH_INFO(mInputTokenExtraIds.value()->size() == static_cast<size_t>(mOrigPromptLen),
-                "inputTokenExtraIds vector size (%lu) must be the same as input token vector size (%lu).",
-                mInputTokenExtraIds.value()->size(), static_cast<size_t>(mOrigPromptLen));
-        }
-    }
-
     void setExcludeInputFromOutput(bool exclude)
     {
         mExcludeInputFromOutput = exclude;
@@ -672,6 +608,13 @@ public:
     [[nodiscard]] BeamUniqueTokens const& getUniqueTokens() const
     {
         return mUniqueTokens;
+    }
+
+    /// @brief Get all extra input token ids
+    /// @return A optional shared pointer to a vector of extra ids.
+    [[nodiscard]] std::optional<std::shared_ptr<VecTokenExtraIds>> const& getInputTokensExtraIds() const
+    {
+        return mInputTokenExtraIds;
     }
 
     /// @brief Get input tokens to encoder
@@ -794,7 +737,7 @@ public:
     /// @brief Erases all previous generated tokens, only leaving the prompt.
     void clearGeneratedTokens()
     {
-        TLLM_LOG_DEBUG("emptying generated tokens for request %d with promptlen", mRequestId, mPromptLen);
+        TLLM_LOG_DEBUG("emptying generated tokens for request %ld with promptlen", mRequestId, mPromptLen);
         for (auto& beam : mTokens)
         {
             beam.resize(mPromptLen);
@@ -805,7 +748,7 @@ public:
     /// @param generatedBeamTokens The generated tokens for all beams (vector of vector of tokens)
     void setGeneratedTokens(BeamTokens const& generatedBeamTokens)
     {
-        TLLM_LOG_DEBUG("setting generated tokens for request %d", mRequestId);
+        TLLM_LOG_DEBUG("setting generated tokens for request %ld", mRequestId);
         assert(generatedBeamTokens.size() == static_cast<size_t>(mSamplingConfig.beamWidth));
 
         for (size_t beamId = 0; beamId < generatedBeamTokens.size(); ++beamId)
@@ -928,6 +871,11 @@ public:
         return mPromptEmbeddingTable;
     }
 
+    [[nodiscard]] std::optional<TensorPtr>& getPromptEmbeddingTableMutable()
+    {
+        return mPromptEmbeddingTable;
+    }
+
     [[nodiscard]] std::optional<SizeType32> getPromptVocabSize() const
     {
         return mPromptVocabSize;
@@ -961,6 +909,11 @@ public:
     void setLoraWeights(TensorPtr weights)
     {
         mLoraWeights = weights;
+    }
+
+    void setPromptVocabSize(SizeType32 size)
+    {
+        mPromptVocabSize = size;
     }
 
     void clearLoraWeights()
@@ -1148,11 +1101,26 @@ public:
         TLLM_CHECK_WITH_INFO(numTokensToDiscard <= getNumDraftTokens(),
             "Can't discard more draft tokens (%d) than exists (%d).", numTokensToDiscard, getNumDraftTokens());
         mDraftTokens->resize(getNumDraftTokens() - numTokensToDiscard);
+
+        if (mDraftLogits)
+        {
+            auto shape = mDraftLogits.value()->getShape();
+            shape.d[0] = getNumDraftTokens();
+            mDraftLogits.value()->reshape(shape);
+        }
     }
 
-    void setNumTokensPerIteration(SizeType32 numTokensPerIteration)
+    void updateNumTokensPerIteration(SizeType32 numTokensPerIteration, runtime::ModelConfig const& modelConfig)
     {
         mNumTokensPerIteration = std::max(1, numTokensPerIteration);
+
+        if (modelConfig.hasSpeculativeDecodingModule() && getReturnPerfMetrics() && hasDraftTokens())
+        {
+            auto& specDecMetrics = mPerfMetrics.speculativeDecoding;
+            specDecMetrics.totalAcceptedDraftTokens += mNumTokensPerIteration - 1;
+            auto const maxAcceptedDraftTokens = modelConfig.getSpeculativeDecodingModule().getMaxDraftPathLen();
+            specDecMetrics.totalDraftTokens += std::min(getNumDraftTokens(), maxAcceptedDraftTokens);
+        }
     }
 
     [[nodiscard]] SizeType32 getNumTokensPerIteration() const
@@ -1438,6 +1406,17 @@ public:
         }
     }
 
+    void setState(LlmRequestState state)
+    {
+        TLLM_LOG_DEBUG("Set request %ld from state %d to %d", mRequestId, mState, state);
+        mState = state;
+    }
+
+    [[nodiscard]] LlmRequestState getState() const noexcept
+    {
+        return mState;
+    }
+
     [[nodiscard]] bool hasReachedState(LlmRequestState state) const noexcept
     {
         return mState >= state;
@@ -1453,10 +1432,20 @@ public:
         return mState == LlmRequestState::kCONTEXT_INIT || mState == LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS;
     }
 
+    [[nodiscard]] bool isContextFinished() const noexcept
+    {
+        return isGenerationInProgressState() || mState == LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS;
+    }
+
     [[nodiscard]] bool isGenerationInProgressState() const noexcept
     {
         return mState == LlmRequestState::kGENERATION_IN_PROGRESS || mState == LlmRequestState::kGENERATION_TO_COMPLETE
             || mState == LlmRequestState::KDISAGG_GENERATION_TRANS_COMPLETE;
+    }
+
+    [[nodiscard]] bool isGenerationToCompleteState() const noexcept
+    {
+        return mState == LlmRequestState::kGENERATION_TO_COMPLETE;
     }
 
     [[nodiscard]] bool isGenerationCompleteState() const noexcept
@@ -1488,6 +1477,23 @@ public:
     [[nodiscard]] bool isDisaggContextCompleteState() const noexcept
     {
         return mState == LlmRequestState::kDISAGG_CONTEXT_COMPLETE;
+    }
+
+    [[nodiscard]] executor::RequestStage getRequestStage() const
+    {
+        switch (mState)
+        {
+        case batch_manager::LlmRequestState::kENCODER_INIT: return executor::RequestStage::kENCODER_IN_PROGRESS; break;
+        case batch_manager::LlmRequestState::kCONTEXT_INIT: return executor::RequestStage::kCONTEXT_IN_PROGRESS; break;
+        case batch_manager::LlmRequestState::kGENERATION_IN_PROGRESS:
+        case batch_manager::LlmRequestState::kGENERATION_TO_COMPLETE:
+        case batch_manager::LlmRequestState::KDISAGG_GENERATION_TRANS_COMPLETE:
+        case batch_manager::LlmRequestState::kDISAGG_GENERATION_INIT:
+        case batch_manager::LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS:
+            return executor::RequestStage::kGENERATION_IN_PROGRESS;
+            break;
+        default: TLLM_LOG_ERROR("Unexpected request state."); return executor::RequestStage::kGENERATION_COMPLETE;
+        }
     }
 
     /// To determine whether the context is unchunked. When a context is chunked into only a part, it
@@ -1606,156 +1612,10 @@ public:
         }
         auto const currentTime = std::chrono::steady_clock::now();
         auto const elapsed = (std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - mStartTime));
-        TLLM_LOG_DEBUG("Checked timeOut for request %d with allotted Time %d after time %d and got %d", mRequestId,
+        TLLM_LOG_DEBUG("Checked timeOut for request %ld with allotted Time %ld after time %ld and got %d", mRequestId,
             mAllottedTimeMs->count(), elapsed.count(), (elapsed >= mAllottedTimeMs));
 
         return elapsed >= *mAllottedTimeMs;
-    }
-
-    /// @brief  Create a Response from the current state of the request
-    /// @details Note that there is some dependency on the order of operations in this method. Modify with care!
-    /// @return An optional Response
-    std::optional<executor::Response> createResponse(bool useFastLogits = false, int32_t mpiWorldRank = 0)
-    {
-        TLLM_CHECK(!isDisaggContextCompleteState());
-        if (!(isFinished() || (mIsStreaming && mState == LlmRequestState::kGENERATION_IN_PROGRESS)))
-        {
-            return std::nullopt;
-        }
-
-        TLLM_LOG_DEBUG("Creating response for request %lu", mRequestId);
-
-        executor::Result result;
-        result.sequenceIndex = mSequenceIndex;
-
-        result.isSequenceFinal = isFinished();
-        mSequenceFinalVec->at(mSequenceIndex) = result.isSequenceFinal;
-
-        result.isFinal = std::all_of(
-            mSequenceFinalVec->begin(), mSequenceFinalVec->end(), [](bool isSequenceFinal) { return isSequenceFinal; });
-
-        auto const maxNbTokens = getMaxBeamNumTokens();
-
-        if (isDisaggContextTransmissionState() && isContextOnlyRequest())
-        {
-            auto const reqBeamWidth = mSamplingConfig.beamWidth;
-            std::vector<TokenIdType> firstGenTokens;
-            for (SizeType32 beam = 0; beam < reqBeamWidth; ++beam)
-            {
-                firstGenTokens.push_back(getTokens().at(beam).back());
-            }
-            // TODO: fill the rank ids
-            result.contextPhaseParams = executor::ContextPhaseParams{
-                std::move(firstGenTokens), mRequestId, mContextPhaseParams.value().releaseState()};
-        }
-
-        auto const calculateNbTokensOut = [this](SizeType32 maxNbTokens)
-        {
-            if (!mIsStreaming)
-            {
-                return maxNbTokens - (mExcludeInputFromOutput ? getOrigPromptLen() : 0);
-            }
-            return mReturnAllGeneratedTokens ? maxNbTokens - getOrigPromptLen() : maxNbTokens - getMaxSentTokenLen();
-        };
-
-        auto const maxNbTokensOut = calculateNbTokensOut(maxNbTokens);
-
-        auto const nbBeams = mSamplingConfig.getNumReturnBeams();
-
-        result.outputTokenIds.resize(nbBeams);
-
-        auto const startTokenPos = maxNbTokens - maxNbTokensOut;
-
-        auto const shouldSendResponse = isFinished() || (mIsStreaming && maxNbTokens > getMaxSentTokenLen());
-
-        if (!shouldSendResponse)
-        {
-            return std::nullopt;
-        }
-
-        for (SizeType32 beam = 0; beam < nbBeams; ++beam)
-        {
-            auto const& tokens = getTokens(beam);
-            auto const nbTokensOut = calculateNbTokensOut(tokens.size());
-
-            if (nbTokensOut > 0)
-            {
-                auto const first = tokens.data() + startTokenPos;
-                result.outputTokenIds.at(beam).assign(first, first + nbTokensOut);
-            }
-        }
-
-        auto sliceBeams = [&nbBeams](auto beams)
-        { return std::vector<typename decltype(beams)::value_type>(beams.begin(), beams.begin() + nbBeams); };
-
-        if (returnLogProbs())
-        {
-            result.cumLogProbs = sliceBeams(getCumLogProbs());
-            result.logProbs = sliceBeams(getLogProbs());
-        }
-
-        if (getReturnContextLogits())
-        {
-            result.contextLogits = executor::detail::ofITensor(getContextLogitsHost());
-        }
-
-        if (getReturnGenerationLogits())
-        {
-            bool hasDraftTokens = mDraftTokens && !mDraftTokens->empty();
-            if (isStreaming() && !hasDraftTokens)
-            {
-                auto startGenTokenPos = startTokenPos - getOrigPromptLen();
-                TensorPtr generationLogitsHostCurrentStep
-                    = runtime::ITensor::slice(getGenerationLogitsHost(), startGenTokenPos, maxNbTokensOut);
-                result.generationLogits = executor::detail::ofITensor(generationLogitsHostCurrentStep);
-            }
-            else if (useFastLogits)
-            {
-                result.specDecFastLogitsInfo = executor::SpeculativeDecodingFastLogitsInfo{mRequestId, mpiWorldRank};
-            }
-            else
-            {
-                result.generationLogits
-                    = executor::detail::ofITensor(runtime::ITensor::slice(getGenerationLogitsHost(), 0, nbBeams));
-            }
-        }
-
-        if (getReturnEncoderOutput())
-        {
-            result.encoderOutput = executor::detail::ofITensor(getEncoderOutputHost());
-        }
-
-        if (getReturnPerfMetrics())
-        {
-            result.requestPerfMetrics = mPerfMetrics;
-        }
-
-        result.finishReasons = sliceBeams(mFinishReasons);
-        result.decodingIter = mDecodingIter;
-
-        if (hasAdditionalOutputs())
-        {
-            std::string prefix = "context_";
-            for (auto const& outputTensorMap : {mAdditionalContextOutputTensors, mAdditionalGenerationOutputTensors})
-            {
-                for (auto const& outputTensor : outputTensorMap)
-                {
-                    TLLM_LOG_DEBUG("Adding tensor %s with shape %s to result.", outputTensor.first.c_str(),
-                        runtime::ITensor::toString(outputTensor.second->getShape()).c_str());
-                    result.additionalOutputs.emplace_back(
-                        prefix + outputTensor.first, executor::detail::ofITensor(outputTensor.second));
-                }
-                prefix = "generation_";
-            }
-        }
-
-        // Update position of last sent response
-        setMaxSentTokenLen(maxNbTokens);
-
-        auto requestId = isChild() ? mParentRequestId : mRequestId;
-        auto response = executor::Response(requestId, std::move(result), mClientId);
-
-        return response;
     }
 
     void setFinishedReason(executor::FinishReason reason, SizeType32 beam)
@@ -1822,12 +1682,12 @@ public:
     {
         if (finishReason == executor::FinishReason::kTIMED_OUT)
         {
-            TLLM_LOG_DEBUG("Request %d finished by timeout after %f sec", mRequestId,
+            TLLM_LOG_DEBUG("Request %ld finished by timeout after %f sec", mRequestId,
                 std::chrono::duration<float>(std::chrono::steady_clock::now() - mStartTime).count());
         }
         if (finishReason == executor::FinishReason::kCANCELLED)
         {
-            TLLM_LOG_DEBUG("Request %d finished by cancel", mRequestId);
+            TLLM_LOG_DEBUG("Request %ld finished by cancel", mRequestId);
         }
 
         for (int beam = 0; beam < mSamplingConfig.beamWidth; ++beam)
@@ -1881,7 +1741,6 @@ public:
     SizeType32 mMaxNewTokens;
     // Tokens [beam_size, mPromptLen + getMaxNumGeneratedTokens()]
     runtime::SamplingConfig mSamplingConfig;
-    LlmRequestState mState;
     std::optional<TokenIdType> mEndId;
     std::optional<TokenIdType> mPadId;
     std::optional<SizeType32> mSeqSlot;
@@ -1892,6 +1751,8 @@ public:
     SizeType32 mMaskPosition{0};
 
 protected:
+    LlmRequestState mState;
+
     bool mIsStreaming;
 
     // A list of tokens generated at the current step.
@@ -2273,59 +2134,19 @@ public:
         mKvCacheRetentionConfig = request.getKvCacheRetentionConfig();
     }
 
-    std::shared_ptr<LlmRequest> createChildRequest(RequestIdType requestId)
-    {
-        TLLM_CHECK_WITH_INFO(!isChild(), "A child request cannot create its own child.");
-        TLLM_CHECK_WITH_INFO(mChildRequests.size() + 1 < static_cast<size_t>(getNumSubRequests()),
-            "Cannot create child requests more than the number of return sequences (%d)", getNumSubRequests());
-        auto childReq = std::make_shared<LlmRequest>(*this);
-        childReq->mRequestId = requestId;
-        childReq->mSequenceIndex = mChildRequests.size() + 1;
-        childReq->mParentRequestId = this->mRequestId;
-        childReq->mSequenceFinalVec = this->mSequenceFinalVec;
-        childReq->mSeqSlot.reset();
+    /// @brief  Create a Response from the current state of the request
+    /// @details Note that there is some dependency on the order of operations in this method. Modify with care!
+    /// @return An optional Response
+    std::optional<executor::Response> createResponse(bool useFastLogits = false, int32_t mpiWorldRank = 0);
 
-        // To ensure different randomness across children, assign a unique random seed to each child
-        // by adding its sequence index to the base seed. If no seed is provided, the parent's seed defaults to 0.
-        using RandomSeedType = tensorrt_llm::executor::RandomSeedType;
-        if (childReq->mSamplingConfig.randomSeed.has_value())
-        {
-            childReq->mSamplingConfig.randomSeed->at(0) += static_cast<RandomSeedType>(childReq->mSequenceIndex);
-        }
-        else
-        {
-            RandomSeedType defaultSeed{0};
-            mSamplingConfig.randomSeed = std::vector<RandomSeedType>(1, defaultSeed);
-            childReq->mSamplingConfig.randomSeed
-                = std::vector<RandomSeedType>(1, defaultSeed + static_cast<RandomSeedType>(childReq->mSequenceIndex));
-        }
+    void validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen,
+        std::optional<SizeType32> maxEncoderInputLen = std::nullopt, bool enableKVCacheReuse = false);
 
-        mChildRequests.push_back(childReq);
-        return childReq;
-    }
+    std::shared_ptr<LlmRequest> createChildRequest(RequestIdType requestId);
 
-    void movePromptEmbeddingTableToGpu(runtime::BufferManager const& manager)
-    {
-        if (!mPromptEmbeddingTable.has_value()
-            || mPromptEmbeddingTable.value()->getMemoryType() == runtime::MemoryType::kGPU)
-        {
-            return;
-        }
+    void movePromptEmbeddingTableToGpu(runtime::BufferManager const& manager);
 
-        TensorPtr gpuPromptEmbeddingTable = manager.copyFrom(*mPromptEmbeddingTable.value(), runtime::MemoryType::kGPU);
-        mPromptEmbeddingTable = gpuPromptEmbeddingTable;
-    }
-
-    void moveLoraWeightsToGpu(runtime::BufferManager const& manager)
-    {
-        if (!mLoraWeights.has_value() || mLoraWeights.value()->getMemoryType() == runtime::MemoryType::kGPU)
-        {
-            return;
-        }
-        // TODO for tp / pp models we only need to move the bit that belong on the local device
-        TensorPtr gpuLoraWeights = manager.copyFrom(*mLoraWeights.value(), runtime::MemoryType::kGPU);
-        mLoraWeights = gpuLoraWeights;
-    }
+    void moveLoraWeightsToGpu(runtime::BufferManager const& manager);
 };
 
 } // namespace tensorrt_llm::batch_manager

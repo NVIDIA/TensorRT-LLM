@@ -39,7 +39,7 @@ import sys
 from examples.gptneox.convert_checkpoint import convert_hf_gptneox
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import skip_fp32_accum_pre_ampere, unittest_name_func
+from utils.util import unittest_name_func
 
 
 def compare_max_abs_error(ref, res, str):
@@ -192,9 +192,6 @@ class TestGPTNeoX(unittest.TestCase):
     @parameterized.expand(load_test_cases, name_func=unittest_name_func)
     def test_gptneox_plugin(self, context_fmha_flag,
                             enable_remove_input_padding):
-
-        # Skip tests that are not supported in pre-ampere architecture
-        skip_fp32_accum_pre_ampere(context_fmha_flag)
 
         torch.random.manual_seed(0)
         use_refit = False

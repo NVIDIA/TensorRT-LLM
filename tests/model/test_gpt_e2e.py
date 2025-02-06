@@ -33,7 +33,6 @@ work_dir = Path(__file__).parent.resolve() / 'check_gpt'
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root
-from utils.util import getSMVersion
 
 gpt_example_root = os.path.join(os.path.dirname(__file__), '../../examples/gpt')
 
@@ -114,23 +113,18 @@ def build_engines():
     build_engine(str(fp16_ckpt_dir), str(engine_dir / 'fp16-plugin/1-gpu'),
                  '--gpt_attention_plugin=float16')
 
-    # Skip tests that are not supported in pre-ampere architecture
-    if getSMVersion() >= 80:
-        build_engine(str(fp16_ckpt_dir),
-                     str(engine_dir / 'fp16-plugin-fmha/1-gpu'),
-                     '--gpt_attention_plugin=float16', '--context_fmha=enable')
+    build_engine(str(fp16_ckpt_dir), str(engine_dir / 'fp16-plugin-fmha/1-gpu'),
+                 '--gpt_attention_plugin=float16', '--context_fmha=enable')
 
     build_engine(str(fp16_ckpt_dir),
                  str(engine_dir / 'fp16-plugin-packed/1-gpu'),
                  '--gpt_attention_plugin=float16',
                  '--remove_input_padding=enable')
 
-    # Skip tests that are not supported in pre-ampere architecture
-    if getSMVersion() >= 80:
-        build_engine(fp16_ckpt_dir,
-                     str(engine_dir / 'fp16-plugin-packed-fmha/1-gpu'),
-                     '--gpt_attention_plugin=float16',
-                     '--remove_input_padding=enable', '--context_fmha=enable')
+    build_engine(fp16_ckpt_dir,
+                 str(engine_dir / 'fp16-plugin-packed-fmha/1-gpu'),
+                 '--gpt_attention_plugin=float16',
+                 '--remove_input_padding=enable', '--context_fmha=enable')
 
     print("Done.")
 
@@ -227,16 +221,9 @@ def check_outputs():
     check_output(engine='fp32-plugin')
     check_output(engine='fp16-default')
     check_output(engine='fp16-plugin')
-
-    # Skip tests that are not supported in pre-ampere architecture
-    if getSMVersion() >= 80:
-        check_output(engine='fp16-plugin-fmha')
-
+    check_output(engine='fp16-plugin-fmha')
     check_output(engine='fp16-plugin-packed')
-
-    # Skip tests that are not supported in pre-ampere architecture
-    if getSMVersion() >= 80:
-        check_output(engine='fp16-plugin-packed-fmha')
+    check_output(engine='fp16-plugin-packed-fmha')
 
 
 class TestGPTE2E(unittest.TestCase):

@@ -10,6 +10,7 @@ import click
 import torch.cuda
 
 from tensorrt_llm import logger
+from tensorrt_llm.bindings.executor import CapacitySchedulerPolicy
 from tensorrt_llm.llmapi import BuildConfig
 from tensorrt_llm.llmapi._perf_evaluator import LLMPerfEvaluator
 from tensorrt_llm.llmapi.llm import ModelLoader
@@ -45,11 +46,36 @@ def cli():
     default=None,
     help=
     "Path to the cpp executable, set it if you want to run the cpp benchmark")
+@click.option("--backend", type=str, default=None)
+@click.option("--torch-compile/--no-torch-compile", type=bool, default=False)
+@click.option("--torch-compile-fullgraph/--no-torch-compile-fullgraph",
+              type=bool,
+              default=False)
+@click.option("--torch-compile-inductor/--no-torch-compile-inductor",
+              type=bool,
+              default=False)
+@click.option("--cuda-graph/--no-cuda-graph", type=bool, default=False)
+@click.option("--cuda-graph-padding/--no-cuda-graph-padding",
+              type=bool,
+              default=False)
+@click.option("--cuda-graph-batch-sizes", type=str, default=None)
 @click.option("--return-context-logits", type=bool, default=False)
 @click.option("--return-generation-logits", type=bool, default=False)
 @click.option("--kv-cache-free-gpu-mem-fraction", type=float, default=None)
 @click.option("--log-level", type=str, default="warning", show_default=True)
 @click.option("--chunked-context/--no-chunked-context", type=bool, default=True)
+@click.option("--kv-cache-reuse/--no-kv-cache-reuse", type=bool, default=True)
+@click.option("--kv-cache-max-tokens", type=int, default=None)
+@click.option("--overlap-scheduler/--no-overlap-scheduler",
+              type=bool,
+              default=False)
+@click.option("--capacity_scheduler_policy",
+              type=str,
+              default="guaranteed_no_evict")
+@click.option("--fp8-kv-cache/--no-fp8-kv-cache", type=bool, default=False)
+@click.option("--num-postprocess-workers", type=int, default=0)
+@click.option("--postprocess-tokenizer-dir", type=str, default=None)
+@click.option("--enable-oai-postprocess", type=bool, default=False)
 def benchmark_main(
     model_path: str,
     samples_path: str,
@@ -68,8 +94,23 @@ def benchmark_main(
     return_context_logits=False,
     return_generation_logits=False,
     kv_cache_free_gpu_mem_fraction: Optional[float] = None,
+    backend: str = None,
+    torch_compile: bool = False,
+    torch_compile_fullgraph: bool = False,
+    torch_compile_inductor: bool = False,
+    cuda_graph: bool = False,
+    cuda_graph_padding: bool = False,
+    cuda_graph_batch_sizes: Optional[str] = None,
     log_level: str = "warning",
     chunked_context: bool = True,
+    kv_cache_reuse: bool = True,
+    kv_cache_max_tokens: int = None,
+    overlap_scheduler: bool = False,
+    capacity_scheduler_policy: str = "guaranteed_no_evict",
+    fp8_kv_cache: bool = False,
+    num_postprocess_workers: int = 0,
+    postprocess_tokenizer_dir: Optional[str] = None,
+    enable_oai_postprocess: bool = False,
 ):
     ''' Run the benchmark on LLM API.
     If `cpp_executable_path` is provided, it will run the cpp benchmark as well.
@@ -102,6 +143,14 @@ def benchmark_main(
                                    max_seq_len=max_seq_length,
                                    max_batch_size=max_batch_size)
 
+        nonlocal capacity_scheduler_policy
+        if capacity_scheduler_policy == "static_batch":
+            capacity_scheduler_policy = CapacitySchedulerPolicy.STATIC_BATCH
+        elif capacity_scheduler_policy == "max_utilization":
+            capacity_scheduler_policy = CapacitySchedulerPolicy.MAX_UTILIZATION
+        else:
+            capacity_scheduler_policy = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
+
         evaluator = LLMPerfEvaluator.create(
             model=model_path,
             samples_path=samples_path,
@@ -117,6 +166,14 @@ def benchmark_main(
             return_generation_logits=return_generation_logits,
             kv_cache_free_gpu_mem_fraction=kv_cache_free_gpu_mem_fraction,
             chunked_context=chunked_context,
+            enable_kv_cache_reuse=kv_cache_reuse,
+            kv_cache_max_tokens=kv_cache_max_tokens,
+            capacity_scheduler_policy=capacity_scheduler_policy,
+
+            # postprocess parallel related
+            num_postprocess_workers=num_postprocess_workers,
+            postprocess_tokenizer_dir=postprocess_tokenizer_dir,
+            enable_oai_postprocess=enable_oai_postprocess,
         )
         assert evaluator
         report = evaluator.run()
@@ -153,6 +210,8 @@ def benchmark_main(
             command = f"mpirun -n {tp_size} {command}"
         if chunked_context:
             command = f"{command} --enable_chunked_context"
+        if not kv_cache_reuse:
+            command = f"{command} --enable_kv_cache_reuse=false"
         print_colored(f'cpp benchmark command: {command}\n', "grey")
         output = subprocess.run(command,
                                 check=True,

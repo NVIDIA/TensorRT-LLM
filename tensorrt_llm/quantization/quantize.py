@@ -9,13 +9,13 @@ from ..layers import (MLP, Attention, ColumnLinear, Embedding, GatedMLP,
 from ..layers.moe import MixtureOfExperts
 from ..models.modeling_utils import LayerQuantConfig, QuantConfig
 from ..parameter import Parameter
-from .layers import (FP8Linear, FP8RowLinear, Fp8RowwiseAttention,
-                     Fp8RowwiseGatedMLP, Fp8RowwiseMLP, Fp8RowwiseRmsNorm,
-                     Int8SmoothQuantLinear, Int8SmoothQuantRowLinear,
-                     QServeAttention, QServeGatedMLP, QServeMLP, QServeRmsNorm,
-                     SmoothQuantAttention, SmoothQuantGatedMLP,
-                     SmoothQuantLayerNorm, SmoothQuantMLP, SmoothQuantRmsNorm,
-                     WeightOnlyGroupwiseQuantColumnLinear,
+from .layers import (FP4Linear, FP4RowLinear, FP8Linear, FP8RowLinear,
+                     Fp8RowwiseAttention, Fp8RowwiseGatedMLP, Fp8RowwiseMLP,
+                     Fp8RowwiseRmsNorm, Int8SmoothQuantLinear,
+                     Int8SmoothQuantRowLinear, QServeAttention, QServeGatedMLP,
+                     QServeMLP, QServeRmsNorm, SmoothQuantAttention,
+                     SmoothQuantGatedMLP, SmoothQuantLayerNorm, SmoothQuantMLP,
+                     SmoothQuantRmsNorm, WeightOnlyGroupwiseQuantColumnLinear,
                      WeightOnlyGroupwiseQuantRowLinear,
                      WeightOnlyQuantColumnLinear, WeightOnlyQuantEmbedding,
                      WeightOnlyQuantRowLinear)
@@ -65,7 +65,8 @@ def quantize_layers(
                 continue
 
             init_params = get_init_params(module, quant_cls)
-            if "bias" in init_params:
+            if "bias" in init_params and not isinstance(module,
+                                                        MixtureOfExperts):
                 init_params["bias"] = init_params["bias"] is not None
             if isinstance(module, ColumnLinear):
                 init_params[
@@ -216,6 +217,7 @@ def fp8_quantize(model, quant_config: QuantConfig):
     quant_map = {
         ColumnLinear: FP8Linear,
         RowLinear: FP8RowLinear,
+        MixtureOfExperts: MixtureOfExperts,
     }
 
     model = quantize_layers(
@@ -513,13 +515,33 @@ def qserve_quantize(model, quant_config: QuantConfig):
     return model
 
 
+def fp4_quantize(model, quant_config: QuantConfig):
+    assert quant_config.quant_mode.has_nvfp4()
+    quant_map = {
+        ColumnLinear: FP4Linear,
+        RowLinear: FP4RowLinear,
+        MixtureOfExperts: MixtureOfExperts,
+    }
+
+    model = quantize_layers(
+        model,
+        quant_config,
+        quant_map,
+    )
+    return model
+
+
 # Now consider the kv cache is enabled for all layers
 def kv_cache_quantize(model):
     for name, module in model.named_modules():
         if isinstance(module,
                       (Attention, SmoothQuantAttention, Fp8RowwiseAttention)):
+            # for dequant
             module.kv_cache_scaling_factor = Parameter(shape=(1, ),
                                                        dtype='float32')
+            # for quant
+            module.kv_cache_rcp_scaling_factor = Parameter(shape=(1, ),
+                                                           dtype='float32')
     return model
 
 
@@ -545,6 +567,8 @@ def quantize(model, quant_config: Union[QuantConfig, LayerQuantConfig]):
             module = fp8_rowwise_quantize(module, layer_quant_cfg)
         elif layer_quant_mode.is_qserve_w4a8():
             model = qserve_quantize(model, quant_config)
+        elif layer_quant_mode.has_nvfp4():
+            model = fp4_quantize(model, layer_quant_cfg)
         elif layer_quant_mode.has_act_and_weight_quant():
             module = smooth_quantize(module, layer_quant_cfg)
         elif layer_quant_mode.is_weight_only():

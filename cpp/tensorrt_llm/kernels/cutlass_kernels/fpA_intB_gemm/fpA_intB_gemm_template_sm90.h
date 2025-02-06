@@ -129,8 +129,7 @@ void sm90_dispatch_mainloop_schedules(ActivationType const* A, WeightType const*
         {
         case tkc::MainloopScheduleType::AUTO:
             using KernelScheduleType = cute::conditional_t<size<0>(CTAShape{}) == Int<64>{},
-                cutlass::gemm::KernelTmaWarpSpecializedPingpongMixedInput,
-                cutlass::gemm::KernelTmaWarpSpecializedCooperativeMixedInput>;
+                cutlass::gemm::KernelTmaWarpSpecializedPingpong, cutlass::gemm::KernelTmaWarpSpecializedCooperative>;
             sm90_dispatch_epilogue_schedules<ActivationType, WeightType, ScaleZeroType, BiasType, OutputType, QuantOp,
                 EpilogueTag, CTAShape, ClusterShape, KernelScheduleType>(A, B, weight_scales, weight_zero_points,
                 biases, alpha, C, m, n, k, group_size, gemm_config, workspace, workspace_bytes, stream, occupancy);

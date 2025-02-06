@@ -66,6 +66,10 @@ private:
     bool mOutputLogProbs{false};
     bool mCumLogProbs{false};
 
+    TensorPtr mRuntimeMinPHost;
+    TensorPtr mRuntimeMinPDevice;
+    bool mUseMinP{false};
+
     std::vector<std::unique_ptr<BaseLayer>> mSamplingLayers;
 
 private:

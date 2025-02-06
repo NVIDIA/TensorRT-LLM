@@ -9,7 +9,7 @@ from tensorrt_llm.llmapi import CalibConfig, QuantAlgo, QuantConfig
 # isort: off
 from test_llm import cnn_dailymail_path, get_model_path, llm_test_harness
 from utils.util import (force_ampere, skip_gpu_memory_less_than_40gb,
-                        skip_pre_ampere, skip_pre_hopper)
+                        skip_pre_hopper)
 # isort: on
 
 gptj_model_path = get_model_path('gpt-j-6b')
@@ -288,7 +288,6 @@ def test_llm_baichuan2_7b_int4weight_only():
                      trust_remote_code=True)
 
 
-@skip_pre_ampere
 def test_llm_qwen():
     qwen_requirement_path = os.path.join(os.getenv("LLM_ROOT"),
                                          "examples/qwen/requirements.txt")
@@ -301,7 +300,6 @@ def test_llm_qwen():
                      trust_remote_code=True)
 
 
-@skip_pre_ampere
 def test_llm_qwen1_5():
     qwen1_5_sampling_params = SamplingParams(max_tokens=10)
     llm_test_harness(qwen1_5_model_path,
@@ -311,7 +309,6 @@ def test_llm_qwen1_5():
                      trust_remote_code=True)
 
 
-@skip_pre_ampere
 def test_llm_qwen2():
     build_config = BuildConfig()
     build_config.max_batch_size = 512
@@ -323,7 +320,6 @@ def test_llm_qwen2():
                      trust_remote_code=True)
 
 
-@skip_pre_ampere
 def test_llm_qwen2_5():
     build_config = BuildConfig()
     build_config.max_batch_size = 512
@@ -335,7 +331,6 @@ def test_llm_qwen2_5():
                      trust_remote_code=True)
 
 
-@skip_pre_ampere
 def test_llm_qwen2_int4_weight_only():
     quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16)
     calib_config = CalibConfig(calib_dataset=cnn_dailymail_path)
@@ -361,7 +356,6 @@ def test_llm_qwen2_fp8():
                      trust_remote_code=True)
 
 
-@skip_pre_ampere
 def test_llm_mamba2_370m():
     build_config = BuildConfig()
     build_config.plugin_config._paged_kv_cache = False

@@ -203,10 +203,11 @@ def parse_arguments():
                         help="Enable debug output.")
     parser.add_argument(
         '--visualize_network',
-        default=BuildConfig.visualize_network,
-        action='store_true',
+        type=str,
+        default=None,
         help=
-        "Export TensorRT Networks to ONNX prior to Engine build for debugging.")
+        "The directory path to export TensorRT Network as ONNX prior to Engine build for debugging."
+    )
     parser.add_argument(
         '--dry_run',
         default=BuildConfig.dry_run,
@@ -335,15 +336,15 @@ def build_model(
         "StreamingLLM is only supported in the llama model."
     assert not build_config.plugin_config.pp_reduce_scatter or architecture == "MixtralForCausalLM", \
         "PP reduce scatter is only supported in the mixtral model."
-    real_rank = rank
 
     model_config.mapping.gpus_per_node = build_config.auto_parallel_config.gpus_per_node
     if build_config.auto_parallel_config.enabled:
         assert rank < build_config.auto_parallel_config.world_size
         assert model_config.mapping.pp_size == 1 and model_config.mapping.tp_size == 1, \
             "You must convert to full model with TP=1&&PP=1 to use auto parallel planner"
-        #TODO: TRTLLM-193 remove this after the new build API for autopp is done
-        rank = 0  # This is a WAR to construct a whole model and load all the weights before auto parallel
+        model_config.mapping.auto_parallel = True
+        model_config.mapping.world_size = build_config.auto_parallel_config.world_size
+        model_config.mapping.rank = rank
     else:
         assert rank < model_config.mapping.world_size
 
@@ -369,16 +370,9 @@ def build_model(
             lora_config.lora_target_modules = kwargs['lora_target_modules']
         build_config.lora_config = lora_config
 
-    # tells the low level build api to only build rank-th shard of the model
-    if build_config.auto_parallel_config.enabled:
-        model.config.mapping.rank = real_rank
-
     if is_checkpoint_pruned or kwargs.pop('strip_plan', False):
         build_config.use_strip_plan = True
     build_config.use_refit = kwargs.get('refit', False)
-
-    if dry_run:
-        return build_config
 
     return build(model, build_config)
 
@@ -467,6 +461,12 @@ def parallel_build(model_config: PretrainedConfig,
 def main():
     parser = parse_arguments()
     args = parser.parse_args()
+
+    if hasattr(args, 'gather_generation_logits'):
+        logger.warning(
+            'Option --gather_generation_logits is deprecated, a build flag is not required anymore. Use --output_generation_logits at runtime instead.'
+        )
+
     if args.gather_all_token_logits:
         args.gather_context_logits = True
         args.gather_generation_logits = True
@@ -497,7 +497,7 @@ def main():
         )
 
     plugin_config = PluginConfig.from_arguments(args)
-
+    plugin_config.validate()
     if args.fast_build:
         plugin_config.manage_weights = True
 

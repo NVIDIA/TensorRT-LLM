@@ -115,6 +115,7 @@ public:
         std::optional<SizeType32> genMicroBatchSize = std::nullopt;
         std::optional<executor::DecodingMode> decodingMode = std::nullopt;
         bool normalizeLogProbs = true;
+        bool gatherGenerationLogits = false;
     };
 
     //! @brief Optional profiler class to profile the generation phase of an inference request
@@ -203,6 +204,11 @@ public:
     [[nodiscard]] bool getNormalizeLogProbs() const noexcept
     {
         return mNormalizeLogProbs;
+    }
+
+    [[nodiscard]] bool getGatherGenerationLogits() const
+    {
+        return getModelConfig().computeGenerationLogits() || mGatherGenerationLogits;
     }
 
     [[nodiscard]] nvinfer1::IEngineInspector& getEngineInspector() const;
@@ -390,7 +396,8 @@ private:
     // ping-pong instances
     std::vector<CudaGraphExecutor> mCudaGraphInstances;
 
-    bool mNormalizeLogProbs = true;
+    bool mNormalizeLogProbs{true};
+    bool mGatherGenerationLogits{false};
 };
 
 } // namespace tensorrt_llm::runtime

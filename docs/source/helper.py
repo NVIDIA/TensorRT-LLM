@@ -51,9 +51,16 @@ def generate_examples():
     # Generate the toctree for the example scripts
     with open(doc_dir / "llm_examples_index.template.rst_") as f:
         examples_index = f.read()
+
     with open(doc_dir / "llm_api_examples.rst", "w+") as f:
         example_docs = "\n   ".join(path.stem for path in script_paths)
+        f.write(examples_index.replace(r"%EXAMPLE_DOCS%", example_docs))
 
+    with open(doc_dir / "index.rst") as f:
+        examples_index = f.read()
+
+    with open(doc_dir / "index.rst", "w+") as f:
+        example_docs = "\n    ".join(path.stem for path in script_paths)
         f.write(examples_index.replace(r"%EXAMPLE_DOCS%", example_docs))
 
 

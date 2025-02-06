@@ -14,6 +14,9 @@ from tensorrt_llm.models.unet.weights import load_from_hf_unet
 from tensorrt_llm.network import net_guard
 
 parser = argparse.ArgumentParser(description='build the UNet TensorRT engine.')
+parser.add_argument('--model_dir',
+                    type=str,
+                    default='stabilityai/stable-diffusion-xl-base-1.0')
 parser.add_argument('--size', type=int, default=1024, help='image size')
 parser.add_argument('--output_dir',
                     type=str,
@@ -22,6 +25,7 @@ parser.add_argument('--output_dir',
 
 args = parser.parse_args()
 
+model_dir = args.model_dir
 size = args.size
 sample_size = size // 8
 
@@ -55,8 +59,8 @@ builder_config = builder.create_builder_config(
     None,  # do not use obey or the precision error will be too large
 )
 
-pipeline = DiffusionPipeline.from_pretrained(
-    "stabilityai/stable-diffusion-xl-base-1.0", torch_dtype=torch.float16)
+pipeline = DiffusionPipeline.from_pretrained(model_dir,
+                                             torch_dtype=torch.float16)
 model = UNet2DConditionModel(
     sample_size=sample_size,
     in_channels=4,

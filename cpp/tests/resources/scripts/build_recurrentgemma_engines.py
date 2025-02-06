@@ -124,14 +124,6 @@ def build_engines(model_cache: _tp.Optional[str] = None):
                  engine_dir / model_spec_obj.get_model_path() / tp_pp_cp_dir,
                  '--remove_input_padding=enable', '--paged_state=enable')
 
-    # Restore transformers version
-    run_command([python_exe, "-m", "pip", "uninstall", "transformers", "-y"],
-                env=_os.environ,
-                timeout=300)
-    run_command([python_exe, "-m", "pip", "install", "transformers==4.38.2"],
-                env=_os.environ,
-                timeout=300)
-
     print("Done.")
 
 

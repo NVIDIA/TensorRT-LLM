@@ -30,8 +30,7 @@ from tensorrt_llm._utils import torch_to_numpy
 from tensorrt_llm.quantization import QuantMode
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import (create_session, run_session, skip_bf16_pre_ampere,
-                        skip_pre_ampere, unittest_name_func)
+from utils.util import create_session, run_session, unittest_name_func
 
 
 class GPT2AttentionSmoothQuant(torch.nn.Module):
@@ -225,7 +224,6 @@ class TestSmoothQuant(unittest.TestCase):
          ('float32', False, False, True,
           tensorrt_llm.quantization.layers.SmoothQuantRowLinear)],
         name_func=unittest_name_func)
-    @skip_pre_ampere  # INT8 TC does not support pre-Ampere
     def test_linear_smooth_quant(self, dtype, per_token_scaling,
                                  per_channel_scaling, bias, linear_cls):
         # test data
@@ -383,7 +381,6 @@ class TestSmoothQuant(unittest.TestCase):
                            ('float32', True, True, 'gelu'),
                            ('float32', True, True, 'elu')],
                           name_func=unittest_name_func)
-    @skip_pre_ampere  # INT8 TC is not supported in pre-Ampere
     def test_mlp_smooth_quant(self, dtype, per_token_scaling,
                               per_channel_scaling, hidden_act):
         # test data
@@ -538,9 +535,6 @@ class TestSmoothQuant(unittest.TestCase):
                           name_func=unittest_name_func)
     def test_smooth_quant_layer_norm_layer(self, dtype, per_token_scaling,
                                            elementwise_affine):
-        # Skip tests that are not supported in pre-ampere architecture
-        skip_bf16_pre_ampere(dtype)
-
         torch.manual_seed(1997)
         # test data
         hidden_size = 1024
@@ -646,7 +640,6 @@ class TestSmoothQuant(unittest.TestCase):
          ('float16', 1, True,
           tensorrt_llm.quantization.layers.WeightOnlyQuantRowLinear)],
         name_func=unittest_name_func)
-    @skip_pre_ampere  # WOQ contains bug in pre-Ampere
     def test_linear_weight_only_linear(self, dtype, wTypeId, bias, linear_cls):
         # test data
         m = 1
@@ -1102,9 +1095,6 @@ class TestSmoothQuant(unittest.TestCase):
     @parameterized.expand([('float16'), ('bfloat16'), ('float32')],
                           name_func=unittest_name_func)
     def test_quantize_per_token(self, dtype):
-        # Skip tests that are not supported in pre-ampere architecture
-        skip_bf16_pre_ampere(dtype)
-
         x_data = torch.randn(
             (2, 4, 4, 8),
             dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),

@@ -719,6 +719,7 @@ class MLLaMAModel(Module):
 
 # TODO try to inherit the DecoderModelForCausalLM
 class MLLaMAForCausalLM(PretrainedModel):
+    config_class = MLLaMAConfig
 
     def __init__(self, config: MLLaMAConfig):
         super().__init__(config)
@@ -1168,9 +1169,10 @@ class MLLaMAForCausalLM(PretrainedModel):
                     lora_weight_pointer = Tensor(
                         name=f'{lora_module}_lora_weights_pointers_{i}',
                         dtype=trt.int64,
-                        shape=[-1, 2],
+                        shape=[-1, 3],
                         dim_range=OrderedDict([('batch_size_beam_width',
-                                                [bb_range]), ('in_out', [2])]))
+                                                [bb_range]),
+                                               ('in_out_scales', [3])]))
                     lora_weight_pointer_dict.update({
                         f'{lora_module}_lora_weights_pointers':
                         lora_weight_pointer

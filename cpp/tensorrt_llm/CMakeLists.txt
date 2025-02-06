@@ -30,7 +30,8 @@ if(ENABLE_MULTI_DEVICE)
 endif()
 
 if(NOT WIN32)
-  set(DECODER_SHARED_TARGET decoder_attention)
+  set(DECODER_SHARED_TARGET_0 decoder_attention_0)
+  set(DECODER_SHARED_TARGET_1 decoder_attention_1)
 endif()
 
 add_subdirectory(common)
@@ -366,16 +367,19 @@ set(TRTLLM_LINK_LIBS
     kernels_src
     context_attention_src
     decoder_attention_src
+    trtllm_gen_fmha
     selective_scan_src
     fpA_intB_gemm_src
-    moe_gemm_src
+    # moe_gemm_src
     fb_gemm_src
+    ar_gemm_src
     gemm_swiglu_sm90_src
     cutlass_src
     layers_src
     runtime_src
     userbuffers_src
-    ${DECODER_SHARED_TARGET})
+    ${DECODER_SHARED_TARGET_0}
+    ${DECODER_SHARED_TARGET_1})
 
 if(ENABLE_MULTI_DEVICE)
   set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} ${MPI_C_LIBRARIES} ${NCCL_LIB})
@@ -418,6 +422,9 @@ target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
 link_whole_archive(${SHARED_TARGET} ${BATCH_MANAGER_TARGET})
 link_whole_archive(${SHARED_TARGET} ${EXECUTOR_TARGET})
 link_whole_archive(${SHARED_TARGET} ${INTERNAL_CUTLASS_KERNELS_TARGET})
+
+# Link kernel_src and cutlass_src. static internal cutlass lib overridden.
+target_link_libraries(${SHARED_TARGET} PUBLIC kernels_src cutlass_src)
 
 # Cyclic dependency of batch manager on TRT-LLM
 target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE ${SHARED_TARGET})

@@ -1,5 +1,6 @@
-tensorrt_llm==0.17.0.dev2024121700
+-c ../constraints.txt
+tensorrt_llm>=0.0.dev0
 datasets~=2.14.5
-rouge_score~=0.1.2
+rouge_score
 SentencePiece~=0.1.99
-evaluate~=0.4.1
+evaluate

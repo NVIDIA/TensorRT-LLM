@@ -276,7 +276,7 @@ void QuantizePerTokenPlugin::serialize(void* buffer) const noexcept
     write(d, mQuantMode);
     write(d, mClampValEnabled);
     write(d, mSumPerToken);
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 }
 
 void QuantizePerTokenPlugin::destroy() noexcept

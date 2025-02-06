@@ -31,6 +31,7 @@ class IdxEntry(Enum):
     KV_CACHE_QUANTIZATION_SCALE = auto()
     KV_CACHE_DEQUANTIZATION_SCALE = auto()
     ATTENTION_OUTPUT_QUANTIZATION_SCALE = auto()
+    ATTENTION_OUTPUT_SF_SCALE = auto()
     ROTARY_INV_FREQ = auto()
     ROTARY_COS_SIN = auto()
     ALIBI_SLOPES = auto()
@@ -61,6 +62,7 @@ class IdxEntryParser:
             plugin_info.pfc_as_list['unfuse_qkv_gemm'][0])
         self.use_fp8_context_fmha = bool(
             plugin_info.pfc_as_list['use_fp8_context_fmha'][0])
+        self.fuse_fp4_quant = bool(plugin_info.pfc_as_list['fuse_fp4_quant'][0])
         self.mask_type = AttentionMaskType(
             plugin_info.pfc_as_list['mask_type'][0])
         self.use_cache = bool(plugin_info.pfc_as_list['use_cache'][0])
@@ -125,6 +127,8 @@ class IdxEntryParser:
         elif entry == IdxEntry.ATTENTION_OUTPUT_QUANTIZATION_SCALE:
             return self.use_fp8_context_fmha and self.kv_cache_quant_mode.has_fp8_qdp(
             )
+        elif entry == IdxEntry.ATTENTION_OUTPUT_SF_SCALE:
+            return self.fuse_fp4_quant
         elif entry == IdxEntry.ROTARY_INV_FREQ:
             return self.position_embedding_type.is_rope()
         elif entry == IdxEntry.ROTARY_COS_SIN:
