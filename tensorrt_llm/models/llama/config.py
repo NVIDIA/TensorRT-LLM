@@ -151,7 +151,7 @@ class LLaMAConfig(PretrainedConfig):
             # HF LLaMA-type models are implicitly using gated activation.
             # With our MoE implementation, we must make it explicit
             hidden_act = "swiglu"
-            moe_normalization_mode = MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE
+            moe_normalization_mode = MoeConfig.ExpertScaleNormalizationMode.NONE
         else:
             moe_normalization_mode = None
         moe_num_experts = getattr(hf_config, "num_local_experts", 0)
