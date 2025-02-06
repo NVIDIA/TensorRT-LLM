@@ -18,6 +18,7 @@ from typing import Optional, Union
 
 from transformers import AutoModelForCausalLM
 
+from tensorrt_llm._utils import numpy_to_torch
 from tensorrt_llm.models.llama.model import LLaMAForCausalLM
 from tensorrt_llm.models.medusa.weight import load_medusa_hf
 from tensorrt_llm.models.qwen.model import QWenForCausalLM
@@ -190,7 +191,7 @@ class MedusaForCausalLm(PretrainedModel):
         import transformers
 
         assert hf_model_or_dir is not None
-        speculative_model_dir = kwargs.pop('speculative_model', None)
+        speculative_model_dir = kwargs.get('speculative_model', None)
 
         use_preloading = isinstance(hf_model_or_dir,
                                     transformers.PreTrainedModel)
@@ -201,41 +202,66 @@ class MedusaForCausalLm(PretrainedModel):
             hf_model_dir = hf_model_or_dir
             hf_config_or_dir = hf_model_or_dir
 
-        config = MedusaConfig.from_hugging_face(
-            hf_config_or_dir,
-            dtype=dtype,
-            mapping=mapping,
-            quant_config=quant_config,
-            speculative_model=speculative_model_dir,
-            **kwargs)
+        config = MedusaConfig.from_hugging_face(hf_config_or_dir,
+                                                dtype=dtype,
+                                                mapping=mapping,
+                                                quant_config=quant_config,
+                                                **kwargs)
+
+        # ModelOpt ckpt has combined base model and Medusa-head
+        is_modelopt_ckpt = True if not speculative_model_dir else False
 
         if not use_preloading:
             trust_remote_code = kwargs.pop('trust_remote_code', True)
 
-            hf_model = AutoModelForCausalLM.from_pretrained(
-                hf_model_dir,
-                torch_dtype="auto",
-                trust_remote_code=trust_remote_code)
+            if is_modelopt_ckpt:
+                hf_model = LLaMAForCausalLM.from_hugging_face(
+                    hf_model_dir,
+                    dtype,
+                    mapping=mapping,
+                    quant_config=quant_config,
+                    **kwargs)
+            else:
+                hf_model = AutoModelForCausalLM.from_pretrained(
+                    hf_model_dir,
+                    torch_dtype="auto",
+                    trust_remote_code=trust_remote_code)
 
-        assert isinstance(hf_model, transformers.PreTrainedModel)
+                assert isinstance(hf_model, transformers.PreTrainedModel)
 
-        weights = convert_hf_llama(hf_model, config.mapping, dtype='float16')
+        if is_modelopt_ckpt:
+            weights = {
+                name: numpy_to_torch(param.raw_value)
+                for name, param in hf_model.named_parameters()
+            }
+        else:
+            weights = convert_hf_llama(
+                hf_model,
+                config.mapping,
+                dtype='float16',
+                use_parallel_embedding=config.use_parallel_embedding)
 
         model = cls(config)
 
-        config_file = speculative_model_dir / "config.json"
-        with open(config_file) as fp:
-            model_config = json.load(fp)
+        if is_modelopt_ckpt:
+            num_medusa_heads = config.config.num_medusa_heads
+            num_medusa_layers = config.config.num_medusa_layers
+            speculative_model_dir = hf_model_or_dir
+        else:
+            config_file = speculative_model_dir / "config.json"
+            with open(config_file) as fp:
+                model_config = json.load(fp)
 
-        num_medusa_heads = kwargs[
-            'medusa_num_heads'] if 'medusa_num_heads' in kwargs else model_config.get(
-                'medusa_num_heads', None)
-        num_medusa_layers = model_config.get('medusa_num_layers', None)
+            num_medusa_heads = kwargs[
+                'medusa_num_heads'] if 'medusa_num_heads' in kwargs else model_config.get(
+                    'medusa_num_heads', None)
+            num_medusa_layers = model_config.get('medusa_num_layers', None)
         medusa_weights = load_medusa_hf(medusa_path=speculative_model_dir,
                                         num_medusa_heads=num_medusa_heads,
                                         num_medusa_layers=num_medusa_layers,
                                         mapping=mapping,
-                                        dtype="float16")
+                                        dtype="float16",
+                                        is_modelopt_ckpt=is_modelopt_ckpt)
         weights.update(medusa_weights)
         model.load(weights)
         return model

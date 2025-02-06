@@ -74,6 +74,12 @@ skip_pre_ada = pytest.mark.skipif(
 skip_pre_hopper = pytest.mark.skipif(
     getSMVersion() < 90,
     reason="This test is not supported in pre-Hopper architecture")
+skip_pre_blackwell = pytest.mark.skipif(
+    getSMVersion() < 100,
+    reason="This test is not supported in pre-Blackwell architecture")
+skip_blackwell = pytest.mark.skipif(
+    getSMVersion() == 100,
+    reason="This test is not supported in Blackwell architecture")
 
 # If used together with @parameterized, we have to use unittest.skipIf instead of pytest.mark.skipif
 skip_pre_ampere_unittest = unittest.skipIf(
@@ -87,6 +93,15 @@ skip_pre_ada_unittest = unittest.skipIf(
 skip_pre_hopper_unittest = unittest.skipIf(
     getSMVersion() < 90,
     reason="This test is not supported in pre-Hopper architecture")
+skip_pre_blackwell_unittest = unittest.skipIf(
+    getSMVersion() < 100,
+    reason="This test is not supported in pre-Blackwell architecture")
+skip_non_hopper_unittest = unittest.skipIf(
+    getSMVersion() != 90,
+    reason="This test is only supported in Hopper architecture")
+skip_neither_ada_nor_hopper_unittest = unittest.skipIf(
+    getSMVersion() != 90 and getSMVersion() != 89,
+    reason="This test is only supported in Ada or Hopper architecture")
 
 IGNORE_ARCH = os.environ.get('TLLM_TEST_IGNORE_ARCH', False)
 force_ampere = pytest.mark.skipif(
@@ -114,6 +129,20 @@ def skip_bf16_pre_ampere(dtype):
 def skip_fp8_pre_ada(use_fp8):
     if use_fp8 and getSMVersion() < 89:
         pytest.skip("FP8 is not supported on pre-Ada architectures")
+
+
+def skip_blackwell_for_fmha_tests(context_fmha_type, head_size):
+    if getSMVersion() == 100 and (head_size not in [32, 64, 128]
+                                  and context_fmha_type
+                                  != ContextFMHAType.disabled):
+        pytest.skip(
+            "Context FMHA only supports head sizes [32, 64, 128] currently on blackwell."
+        )
+
+
+def skip_fp4_pre_blackwell(use_fp4):
+    if use_fp4 and getSMVersion() < 100:
+        pytest.skip("FP4 is not supported on pre-Blackwell architectures")
 
 
 def skip_bf16_fp32_accum(dtype, context_fmha_type):
@@ -267,11 +296,18 @@ def run_session(session: Session,
         for name, tensor in inputs.items()
     ])
 
+    def create_torch(t):
+        if t.dtype == trt.fp4:
+            shape = list(t.shape)
+            shape[-1] = shape[-1] // 2
+            return torch.empty(tuple(shape), dtype=torch.uint8, device='cuda')
+        else:
+            return torch.empty(tuple(t.shape),
+                               dtype=trt_dtype_to_torch(t.dtype),
+                               device='cuda')
+
     outputs = {
-        t.name:
-        torch.empty(tuple(t.shape),
-                    dtype=trt_dtype_to_torch(t.dtype),
-                    device='cuda') if t.name not in outputs else outputs[t.name]
+        t.name: create_torch(t) if t.name not in outputs else outputs[t.name]
         for t in output_info
     }
 

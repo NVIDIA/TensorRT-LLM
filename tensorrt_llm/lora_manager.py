@@ -43,7 +43,7 @@ def get_all_nemo_lora_weights(lora_weights):
 
 # The pattern is {layer_prefix:1}.{layer_idx:2}.{module_prefix:3}.{module_name or {expert_name:5}.{expert_idx:6}.{module_name:7} :4}.lora_{A|B:8}.weight
 HF_LORA_PATTERN = re.compile(
-    r'(.*)\.(\d+)\.(\w+)\.(\w+|\w+\.\w+|(\w+)\.(\d+)\.(\w+))\.lora_(A|B)\.weight'
+    r'(.*)\.(\d+)\.(\w+)\.(\w+|\w+\.\w+|(\w+)\.(\d+)\.(\w+))\.(?:lora_(?:(A|B)\.weight|(magnitude)_vector)|weight_(m_wdecomp).weight)'
 )
 
 
@@ -60,6 +60,8 @@ def iterate_hf_lora(iter_fn, lora_weights, hf_modules, component=None):
             continue
         layer_idx = int(m.group(2))
         expert_idx = m.group(6)
+        if expert_idx is not None:
+            expert_idx = int(expert_idx)
         is_moe = expert_idx is not None
         if is_moe:
             expert_name = m.group(5)
@@ -70,14 +72,21 @@ def iterate_hf_lora(iter_fn, lora_weights, hf_modules, component=None):
             hf_module = m.group(3) + "." + module_name
         if hf_module not in hf_modules:
             hf_module = module_name
-            assert hf_module in hf_modules
-        inout = "in" if m.group(8) == "A" else "out"
-        iter_fn(layer_idx, hf_module, expert_idx, inout, weights)
+            assert hf_module in hf_modules, f"hf_module {hf_module} is not in supported llist {hf_modules}"
+
+        is_lora_a_or_b = m.group(8) is not None
+        if is_lora_a_or_b:
+            inout_or_mag = "in" if m.group(8) == "A" else "out"
+        else:
+            inout_or_mag = "magnitude"
+
+        iter_fn(layer_idx, hf_module, expert_idx, inout_or_mag, weights)
         if not is_moe:
-            all_weights[layer_idx][hf_module][inout] = weights
+            all_weights[layer_idx][hf_module][inout_or_mag] = weights
         else:
             all_weights[layer_idx][hf_module].setdefault(expert_idx, {})
-            all_weights[layer_idx][hf_module][expert_idx][inout] = weights
+            all_weights[layer_idx][hf_module][expert_idx][
+                inout_or_mag] = weights
     return all_weights
 
 
@@ -114,6 +123,16 @@ def invert_module_mapping(trtllm_modules_to_hf_modules):
         else:
             hf_modules_to_trtllm_modules[hf_modules] = k
     return hf_modules_to_trtllm_modules
+
+
+def norm_dora_magnitude(W0: torch.Tensor,
+                        A: torch.Tensor,
+                        B: torch.Tensor,
+                        m: torch.Tensor,
+                        scaling: float = 1.0):
+    new_weight_v = W0 + (B @ A) * scaling
+    norm_m = m.view(-1) / (torch.linalg.norm(new_weight_v, dim=1)).detach()
+    return norm_m
 
 
 @dataclass
@@ -227,6 +246,7 @@ def get_default_trtllm_modules_to_hf_modules():
         "moe_4h_to_h": "w2",
         "moe_gate": "w3",
         "moe_router": "gate",
+        "mlp_gate_up": "gate_up_proj",
     }
 
 
@@ -366,6 +386,7 @@ class LoraManager(object):
         "moe_gate": 15,
         "moe_router": 16,
         "mlp_router": 17,
+        "mlp_gate_up": 18,
     }
 
     def __init__(self):
@@ -518,8 +539,10 @@ class LoraManager(object):
                         self._lora_uid_to_low_ranks[uid][layer_idx][
                             lora_module] = int(rank)
                         self._lora_weights_pointers_list[uid][layer_idx][
-                            lora_module] = [t_in.data_ptr(),
-                                            t_out.data_ptr()]
+                            lora_module] = [
+                                t_in.data_ptr(),
+                                t_out.data_ptr(), 0
+                            ]
 
                         # prevent torch free this buffer
                         self._lora_weights.append(t_in)
@@ -691,10 +714,20 @@ class LoraManager(object):
                             module_weights[expert_idx]["out"]
                             for expert_idx in sorted(module_weights.keys())
                         ])
+                        for weights in module_weights.values():
+                            if "mag" in weights:
+                                # TODO(oargov): this might work, but I had no MoE DoRA models to test
+                                raise ValueError(
+                                    "DoRA with MoE is not supported")
+                        t_mag = None
                     else:
                         is_moe = False
                         t_in = module_weights["in"]
                         t_out = module_weights["out"]
+                        t_mag = module_weights.get("magnitude", None)
+
+                    is_dora = t_mag is not None
+
                     if lora_module in ["moe_router", "mlp_router"]:
                         pass
                     elif "moe" in lora_module and runtime_mapping.has_moe_ep():
@@ -718,12 +751,19 @@ class LoraManager(object):
                         t_out = torch.split(t_out,
                                             t_out.shape[dim] // tp_size,
                                             dim=dim)[tp_rank].contiguous()
+                        if dim == 0 and is_dora:
+                            t_mag = torch.split(t_mag,
+                                                t_mag.shape[0] // tp_size,
+                                                dim=0)[tp_rank].contiguous()
 
                     rank_dim = 1 if is_moe else 0
                     effective_rank = t_in.shape[rank_dim]
 
                     t_in = t_in.cuda().contiguous()
                     t_out = t_out.cuda().contiguous()
+                    if is_dora:
+                        t_mag = t_mag.cuda().contiguous()
+
                     if rs_lora:
                         scale = float(
                             hf_config["lora_alpha"]) / np.sqrt(effective_rank)
@@ -732,24 +772,33 @@ class LoraManager(object):
                     t_out = t_out * scale
                     t_in = t_in.to(str_dtype_to_torch(model_config.dtype))
                     t_out = t_out.to(str_dtype_to_torch(model_config.dtype))
+                    if is_dora:
+                        t_mag = t_mag.to(str_dtype_to_torch(model_config.dtype))
 
                     self._lora_uid_to_low_ranks[uid][layer_idx][
                         lora_module] = effective_rank
                     self._lora_weights_pointers_list[uid][layer_idx][
-                        lora_module] = [t_in.data_ptr(),
-                                        t_out.data_ptr()]
+                        lora_module] = [
+                            t_in.data_ptr(),
+                            t_out.data_ptr(),
+                            t_mag.data_ptr() if is_dora else 0
+                        ]
 
                     # prevent torch free this buffer
                     self._lora_weights.append(t_in)
                     self._lora_weights.append(t_out)
+                    if is_dora:
+                        self._lora_weights.append(t_mag)
+
                     self._cpp_lora_weights[uid].append(
                         torch.concatenate(
                             [t_in.flatten().cpu(),
-                             t_out.flatten().cpu()]))
+                             t_out.flatten().cpu()] +
+                            ([t_mag.flatten().cpu()] if is_dora else [])))
                     self._cpp_lora_config[uid].append(
                         torch.tensor([
                             self.LORA_MODULE_IDS[lora_module], layer_idx,
-                            effective_rank
+                            effective_rank, is_dora
                         ],
                                      dtype=torch.int32))
 
@@ -845,7 +894,7 @@ class LoraManager(object):
                 lora_ptrs_ = []
                 for lora_uid in lora_uids:
                     lora_rank = 0
-                    lora_ptrs = [0, 0]
+                    lora_ptrs = [0, 0, 0]
 
                     if lora_uid != "-1":
                         low_ranks = self.uid_to_low_ranks(lora_uid)

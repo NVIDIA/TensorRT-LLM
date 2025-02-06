@@ -167,8 +167,8 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 
     if (pipeR_ == 2)
     {
-        r_mxL = array<array<array<unsigned, wmmaM_ * wmmaK_ / 64>, tileM_ / wmmaM_ / warpM_>, pipeR_>();
-        r_mxR = array<array<array<unsigned, wmmaK_ * wmmaN_ / 64>, tileN_ / wmmaN_ / warpN_>, pipeR_>();
+        r_mxL[1] = array<array<unsigned, wmmaM_ * wmmaK_ / 64>, tileM_ / wmmaM_ / warpM_>();
+        r_mxR[1] = array<array<unsigned, wmmaK_ * wmmaN_ / 64>, tileN_ / wmmaN_ / warpN_>();
     }
 
     constexpr int step = std::max(
@@ -241,6 +241,12 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 #pragma unroll
                 for (int x = 0; x < tileN_ / wmmaN_ / warpN_; x++)
                 {
+                    if (pipeR_ == 2)
+                    {
+                        if (wmmaK_ == 16)
+                            mma<Tp_>(r_mxAcc[y][x], r_mxL[1][y], r_mxR[1][x]);
+                    }
+
                     float2 tmp2 = float2{expf(s_mxdA[get(mStart * cn<tileM_> + Rn<UNROLL>{y} * cn<warpM_ * wmmaM_>
                                              + threadIdx_z * cn<wmmaM_> + threadIdx_x / cn<4>)]),
                         expf(s_mxdA[get(mStart * cn<tileM_> + Rn<UNROLL>{y} * cn<warpM_ * wmmaM_> + cn<8>
@@ -251,6 +257,12 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
                     r_mxAcc[y][x][2] *= tmp2.y;
                     r_mxAcc[y][x][3] *= tmp2.y;
                 }
+
+            if (pipeR_ == 2)
+            {
+                r_mxL[1] = array<array<unsigned, wmmaM_ * wmmaK_ / 64>, tileM_ / wmmaM_ / warpM_>();
+                r_mxR[1] = array<array<unsigned, wmmaK_ * wmmaN_ / 64>, tileN_ / wmmaN_ / warpN_>();
+            }
         }
 
         if ((iK - pipeS_) * cn<tileK_> >= N_)
@@ -424,6 +436,18 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 
     cp_wait_group<0>();
 
+#pragma unroll
+    for (int y = 0; y < tileM_ / wmmaM_ / warpM_; y++)
+#pragma unroll
+        for (int x = 0; x < tileN_ / wmmaN_ / warpN_; x++)
+        {
+            if (pipeR_ == 2)
+            {
+                if (wmmaK_ == 16)
+                    mma<Tp_>(r_mxAcc[y][x], r_mxL[1][y], r_mxR[1][x]);
+            }
+        }
+
     if (g_mxD)
     {
         float r_D = g_mxD[hStart.var];
@@ -543,12 +567,6 @@ __global__ std::enable_if_t<std::is_same_v<Tp_, half> || std::is_same_v<Tp_, __n
 #pragma unroll
         for (int x = 0; x < tileN_ / wmmaN_ / warpN_; x++)
         {
-            if (pipeR_ == 2)
-            {
-                if (wmmaK_ == 16)
-                    mma<Tp_>(r_mxAcc[y][x], r_mxL[1][y], r_mxR[1][x]);
-            }
-
             if (std::is_same_v<Tp_, half>)
             {
                 *(half2*) &r_mxAcc[y][x][0] = __floats2half2_rn(r_mxAcc[y][x][0], r_mxAcc[y][x][1]);
@@ -1140,7 +1158,7 @@ ChunkScanKernelFunc getChunkScanKernel(int B_, int L_, int H_, int P_, int G_, i
     int B = B_;
     int L = L_;
     int H = H_;
-    int P = round_up(P_, 32);
+    int P = P_;
     int G = G_;
     int N = N_;
     int Q = Q_;
@@ -1154,7 +1172,7 @@ ChunkScanKernelFunc getChunkScanKernel(int B_, int L_, int H_, int P_, int G_, i
         auto sharedMem
             = useTma * 1024 + std::max((tileM * tileK + tileK * tileN) * pipeS * 2 + Q * 8, (tileM * tileN) * 2);
 
-        *blockDims_ = dim3(H * div_up(P, tileN) * Q / tileM, C, B);
+        *blockDims_ = dim3(H * div_up(P_, tileN) * Q / tileM, C, B);
         *threadDims_ = dim3(32, useTma ? warpM : warpN, useTma ? warpN : warpM);
         *sharedMem_ = sharedMem;
         *useTma_ = useTma;
@@ -1211,261 +1229,1030 @@ ChunkScanKernelFunc getChunkScanKernel(int B_, int L_, int H_, int P_, int G_, i
         return func;
     };
 
-    if (isHopper_) // Hopper kernel
+    if (Q == 256 && isHopper_ == false)
     {
 #ifndef FAST_BUILD
-        if (Q_ == 256 && P_ % 256 == 0 && N_ >= 256)
+        if (P == 32 && N >= 256)
+        {
+            if (compute >= (1LL << 32))
+                return set(64, 32, 32, 2, 1, 2, 0, chunk_scan_kernel<256, 64, 32, 32, 2, 1, 2, 1, 1, 0, Tp_, Wt_>);
+            else
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 32, 64, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+        }
+        if (P == 32 && N >= 128)
+        {
+            if (compute >= (1LL << 32))
+                return set(64, 32, 32, 2, 1, 2, 0, chunk_scan_kernel<256, 64, 32, 32, 2, 1, 2, 1, 1, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 28))
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 32, 64, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+            else
+                return set(64, 32, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 32, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P == 32 && N >= 64)
+        {
+            if (compute >= (1LL << 31))
+                return set(64, 32, 32, 2, 1, 2, 0, chunk_scan_kernel<256, 64, 32, 32, 2, 1, 2, 1, 1, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 32, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 32, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 28))
+                return set(64, 32, 32, 2, 1, 2, 0, chunk_scan_kernel<256, 64, 32, 32, 2, 1, 2, 1, 1, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 27))
+                return set(64, 32, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 32, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 26))
+                return set(64, 32, 32, 2, 1, 2, 0, chunk_scan_kernel<256, 64, 32, 32, 2, 1, 2, 1, 1, 0, Tp_, Wt_>);
+            else
+                return set(64, 32, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 32, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P % 256 == 0 && N >= 256)
+        {
+            if (compute >= (1LL << 36))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 34))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 4, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 30))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
+            else
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P % 256 == 0 && N >= 128)
+        {
+            if (compute >= (1LL << 35))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 34))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 4, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 30))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 128, 64, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 2, 1, 2, 1, Tp_, Wt_>);
+            else
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
+        }
+        if (P % 256 == 0 && N >= 64)
+        {
+            if (compute >= (1LL << 30))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 0, Tp_, Wt_>);
+            else
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
+        }
+        if (P % 128 == 0 && N >= 256)
+        {
+            if (compute >= (1LL << 36))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 35))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 4, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 31))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 30))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 4, 1, Tp_, Wt_>);
+            else
+                return set(64, 128, 64, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 2, 1, 2, 1, Tp_, Wt_>);
+        }
+        if (P % 128 == 0 && N >= 128)
+        {
+            if (compute >= (1LL << 31))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 30))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 4, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 128, 64, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 2, 1, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 28))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 4, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 27))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
+            else
+                return set(64, 32, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 32, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P % 128 == 0 && N >= 64)
+        {
+            if (compute >= (1LL << 38))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 37))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 4, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 31))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 4, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 27))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
+            else
+                return set(64, 32, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 32, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P % 64 == 0 && N >= 256)
+        {
+            if (compute >= (1LL << 34))
+                return set(64, 64, 32, 2, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 2, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 28))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 0, Tp_, Wt_>);
+            else
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P % 64 == 0 && N >= 128)
+        {
+            if (compute >= (1LL << 38))
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 34))
+                return set(64, 64, 32, 2, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 2, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 28))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 27))
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 26))
+                return set(64, 32, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 32, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+#endif
+        if (P % 64 == 0 && N >= 64)
+        {
+            if (compute >= (1LL << 38))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 34))
+                return set(64, 64, 32, 2, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 2, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 27))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 26))
+                return set(64, 32, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 32, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 0, Tp_, Wt_>);
+        }
+        if (round_up(P, 32) == 32)
+            P = 32;
+        else
+            P = round_up(P, 64);
+#ifndef FAST_BUILD
+        if (P == 32 && N >= 256)
+        {
+            return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 32, 64, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+        }
+        if (P == 32 && N >= 128)
+        {
+            if (compute >= (1LL << 28))
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 32, 64, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+            else
+                return set(64, 32, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 32, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P == 32 && N >= 64)
+        {
+            return set(64, 32, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 32, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P % 256 == 0 && N >= 256)
         {
             if (compute >= (1LL << 37))
-                return set(64, 128, 32, 4, 2, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 3, 0, 1, 0, Tp_, Wt_>);
-            else if (compute >= (1LL << 35))
-                return set(64, 128, 32, 4, 2, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 3, 0, 4, 0, Tp_, Wt_>);
-            else if (compute >= (1LL << 33))
-                return set(64, 256, 32, 2, 2, 4, 0, chunk_scan_kernel<256, 64, 256, 32, 2, 2, 4, 1, 4, 0, Tp_, Wt_>);
-            else if (compute >= (1LL << 31))
-                return set(64, 128, 64, 1, 4, 3, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 3, 1, 1, 0, Tp_, Wt_>);
+                return set(64, 128, 64, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 2, 1, 2, 1, Tp_, Wt_>);
             else if (compute >= (1LL << 30))
-                return set(64, 256, 32, 1, 4, 3, 0, chunk_scan_kernel<256, 64, 256, 32, 1, 4, 3, 1, 4, 0, Tp_, Wt_>);
-            else if (compute >= (1LL << 0))
-                return set(64, 128, 64, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 2, 1, 1, 0, Tp_, Wt_>);
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 4, 1, Tp_, Wt_>);
+            else
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
         }
-
-        if (Q_ == 256 && P_ % 256 == 0 && N_ >= 128)
+        if (P % 256 == 0 && N >= 128)
         {
-            if (compute >= (1LL << 35))
-                return set(64, 128, 32, 4, 2, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 3, 0, 4, 0, Tp_, Wt_>);
-            else if (compute >= (1LL << 33))
-                return set(64, 256, 32, 2, 2, 4, 0, chunk_scan_kernel<256, 64, 256, 32, 2, 2, 4, 1, 1, 0, Tp_, Wt_>);
-            else if (compute >= (1LL << 29))
-                return set(64, 128, 64, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 2, 1, 1, 0, Tp_, Wt_>);
-            else if (compute >= (1LL << 0))
-                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 1, 0, Tp_, Wt_>);
-        }
-
-        if (Q_ == 256 && P_ % 256 == 0 && N_ >= 64)
-        {
-            if (compute >= (1LL << 35))
-                return set(64, 128, 32, 4, 2, 2, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 2, 0, 4, 0, Tp_, Wt_>);
-            else if (compute >= (1LL << 32))
-                return set(64, 256, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 256, 32, 2, 2, 2, 1, 4, 0, Tp_, Wt_>);
-            else if (compute >= (1LL << 0))
-                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
-        }
-
-        if (Q_ == 256 && P_ % 128 == 0 && N_ >= 256)
-        {
-            if (compute >= (1LL << 35))
-                return set(64, 128, 32, 4, 2, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 3, 0, 4, 0, Tp_, Wt_>);
+            if (compute >= (1LL << 38))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 4, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 37))
+                return set(64, 128, 64, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 2, 1, 2, 1, Tp_, Wt_>);
             else if (compute >= (1LL << 30))
-                return set(64, 128, 64, 1, 4, 3, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 3, 1, 1, 0, Tp_, Wt_>);
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 4, 1, Tp_, Wt_>);
             else if (compute >= (1LL << 29))
-                return set(64, 128, 64, 1, 4, 4, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 4, 1, 1, 0, Tp_, Wt_>);
+                return set(64, 128, 64, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 2, 1, 2, 1, Tp_, Wt_>);
+            else
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P % 256 == 0 && N >= 64)
+        {
+            return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 4, 1, Tp_, Wt_>);
+        }
+        if (P % 128 == 0 && N >= 256)
+        {
+            if (compute >= (1LL << 37))
+                return set(64, 128, 64, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 2, 1, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 30))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 4, 1, Tp_, Wt_>);
             else if (compute >= (1LL << 28))
-                return set(64, 128, 64, 4, 4, 3, 0, chunk_scan_kernel<256, 64, 128, 64, 4, 4, 3, 2, 2, 0, Tp_, Wt_>);
-            else if (compute >= (1LL << 0))
-                return set(64, 128, 64, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 2, 1, 8, 0, Tp_, Wt_>);
+                return set(64, 128, 64, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 2, 1, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 27))
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 26))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 4, 1, Tp_, Wt_>);
+            else
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 32, 64, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
         }
-
-        if (Q_ == 256 && P_ % 128 == 0 && N_ >= 128)
+        if (P % 128 == 0 && N >= 128)
         {
-            if (compute >= (1LL << 34))
-                return set(64, 128, 32, 4, 2, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 3, 0, 4, 0, Tp_, Wt_>);
+            if (compute >= (1LL << 30))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 4, 1, Tp_, Wt_>);
             else if (compute >= (1LL << 28))
-                return set(64, 128, 64, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 2, 1, 1, 0, Tp_, Wt_>);
-            else if (compute >= (1LL << 0))
-                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
+                return set(64, 128, 64, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 2, 1, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 26))
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 32, 64, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
         }
-
-        if (Q_ == 256 && P_ % 128 == 0 && N_ >= 64)
+        if (P % 128 == 0 && N >= 64)
         {
-            if (compute >= (1LL << 34))
-                return set(64, 128, 32, 4, 2, 2, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 2, 0, 4, 0, Tp_, Wt_>);
-            else if (compute >= (1LL << 29))
-                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
-            else if (compute >= (1LL << 0))
-                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 0, Tp_, Wt_>);
+            if (compute >= (1LL << 28))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 4, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 27))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 26))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 4, 1, Tp_, Wt_>);
+            else
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
         }
-
-        if (Q_ == 256 && P_ % 64 == 0 && N_ >= 256)
-        {
-            if (compute >= (1LL << 35))
-                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 64, 32, 4, 1, 2, 0, 8, 0, Tp_, Wt_>);
-            else if (compute >= (1LL << 33))
-                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 64, 32, 4, 1, 2, 0, 1, 0, Tp_, Wt_>);
-            else if (compute >= (1LL << 32))
-                return set(64, 64, 32, 2, 1, 4, 0, chunk_scan_kernel<256, 64, 64, 32, 2, 1, 4, 1, 1, 0, Tp_, Wt_>);
-            else if (compute >= (1LL << 0))
-                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 1, 0, Tp_, Wt_>);
-        }
-
-        if (Q_ == 256 && P_ % 64 == 0 && N_ >= 128)
-        {
-            if (compute >= (1LL << 33))
-                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 64, 32, 4, 1, 2, 0, 2, 0, Tp_, Wt_>);
-            else if (compute >= (1LL << 30))
-                return set(64, 64, 32, 4, 1, 4, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 4, 1, 2, 0, Tp_, Wt_>);
-            else if (compute >= (1LL << 0))
-                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 1, 0, Tp_, Wt_>);
-        }
-
-        if (Q_ == 256 && P_ % 64 == 0 && N_ >= 64)
-        {
-            if (compute >= (1LL << 33))
-                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 64, 32, 4, 1, 2, 0, 2, 0, Tp_, Wt_>);
-            else if (compute >= (1LL << 0))
-                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 0, Tp_, Wt_>);
-        }
-
-        if (Q_ == 256 && P % 128 == 0 && N_ >= 64)
+        if (P % 64 == 0 && N >= 256)
         {
             if (compute >= (1LL << 32))
-                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 1, 2, 0, 2, 1, Tp_, Wt_>);
-            else if (compute >= (1LL << 30))
-                return set(64, 128, 32, 4, 2, 2, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 2, 0, 2, 1, Tp_, Wt_>);
-            else if (compute >= (1LL << 0))
-                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 2, 1, Tp_, Wt_>);
-        }
-
-        if (Q_ == 256 && P % 64 == 0 && N_ >= 64)
-        {
-            if (compute >= (1LL << 36))
-                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 1, 2, 0, 2, 1, Tp_, Wt_>);
+                return set(64, 64, 32, 2, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 2, 1, 2, 1, 1, 1, Tp_, Wt_>);
             else if (compute >= (1LL << 31))
-                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 64, 32, 4, 1, 2, 0, 2, 1, Tp_, Wt_>);
-            else if (compute >= (1LL << 0))
-                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 2, 1, Tp_, Wt_>);
-        }
-
-#endif
-        if (Q_ == 256 && P % 32 == 0 && N_ >= 64)
-        {
-            if (compute >= (1LL << 30))
-                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 64, 32, 4, 1, 2, 0, 2, 1, Tp_, Wt_>);
-            else if (compute >= (1LL << 0))
-                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 2, 1, Tp_, Wt_>);
-        }
-
-#ifndef FAST_BUILD
-        if (Q_ == 128 && P % 128 == 0 && N_ >= 64)
-        {
-            if (compute >= (1LL << 34))
-                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 128, 32, 4, 1, 2, 0, 2, 1, Tp_, Wt_>);
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
             else if (compute >= (1LL << 30))
-                return set(64, 128, 32, 4, 2, 2, 1, chunk_scan_hopper<128, 64, 128, 32, 4, 2, 2, 0, 2, 1, Tp_, Wt_>);
-            else if (compute >= (1LL << 0))
-                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 2, 1, Tp_, Wt_>);
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 25))
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 32, 64, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
         }
-
-        if (Q_ == 128 && P % 64 == 0 && N_ >= 64)
+        if (P % 64 == 0 && N >= 128)
         {
-            if (compute >= (1LL << 30))
-                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 64, 32, 4, 1, 2, 0, 2, 1, Tp_, Wt_>);
-            else if (compute >= (1LL << 0))
-                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 2, 1, Tp_, Wt_>);
+            if (compute >= (1LL << 38))
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 32))
+                return set(64, 64, 32, 2, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 2, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 25))
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 32, 64, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
         }
-
-        if (Q_ == 128 && P % 32 == 0 && N_ >= 64)
-        {
-            if (compute >= (1LL << 30))
-                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 64, 32, 4, 1, 2, 0, 2, 1, Tp_, Wt_>);
-            else if (compute >= (1LL << 0))
-                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 2, 1, Tp_, Wt_>);
-        }
-
 #endif
+        if (P % 64 == 0 && N >= 64)
+        {
+            if (compute >= (1LL << 38))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 32))
+                return set(64, 64, 32, 2, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 2, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 24))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 23))
+                return set(64, 32, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 32, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+        }
     }
-    else // non Hopper kernel
+    else if (Q == 256 && isHopper_)
     {
 #ifndef FAST_BUILD
-        if (Q_ == 256 && P_ % 128 == 0 && N_ >= 128)
-        {
-            if (compute >= (1LL << 33))
-                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
-            else if (compute >= (1LL << 31))
-                return set(64, 128, 32, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 1, 4, 2, 1, 2, 0, Tp_, Wt_>);
-            else if (compute >= (1LL << 29))
-                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
-            else if (compute >= (1LL << 0))
-                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
-        }
-
-        if (Q_ == 256 && P_ % 128 == 0 && N_ >= 64)
-        {
-            if (compute >= (1LL << 34))
-                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
-            else if (compute >= (1LL << 0))
-                return set(64, 128, 32, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 1, 4, 2, 1, 2, 0, Tp_, Wt_>);
-        }
-
-        if (Q_ == 256 && P_ % 64 == 0 && N_ >= 128)
-        {
-            if (compute >= (1LL << 36))
-                return set(128, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 128, 64, 32, 4, 1, 2, 1, 2, 0, Tp_, Wt_>);
-            else if (compute >= (1LL << 33))
-                return set(128, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 128, 64, 32, 4, 1, 2, 1, 2, 0, Tp_, Wt_>);
-            else if (compute >= (1LL << 30))
-                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 2, 0, Tp_, Wt_>);
-            else if (compute >= (1LL << 0))
-                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
-        }
-
-        if (Q_ == 256 && P_ % 64 == 0 && N_ >= 64)
-        {
-            if (compute >= (1LL << 34))
-                return set(128, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 128, 64, 32, 4, 1, 2, 1, 2, 0, Tp_, Wt_>);
-            else if (compute >= (1LL << 0))
-                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 2, 0, Tp_, Wt_>);
-        }
-
-        if (Q_ == 256 && P % 128 == 0 && N_ >= 64)
-        {
-            if (compute >= (1LL << 0))
-                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 2, 1, Tp_, Wt_>);
-        }
-
-        if (Q_ == 256 && P % 64 == 0 && N_ >= 64)
-        {
-            if (compute >= (1LL << 36))
-                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 2, 1, Tp_, Wt_>);
-            else if (compute >= (1LL << 32))
-                return set(64, 64, 32, 2, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 2, 1, 2, 1, 2, 1, Tp_, Wt_>);
-            else if (compute >= (1LL << 0))
-                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 2, 1, Tp_, Wt_>);
-        }
-
-#endif
-        if (Q_ == 256 && P % 32 == 0 && N_ >= 64)
+        if (P == 32 && N >= 256)
         {
             if (compute >= (1LL << 31))
-                return set(64, 64, 32, 2, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 2, 1, 2, 1, 2, 1, Tp_, Wt_>);
-            else if (compute >= (1LL << 0))
-                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 2, 1, Tp_, Wt_>);
+                return set(64, 32, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 32, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 32, 64, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
         }
-
-#ifndef FAST_BUILD
-        if (Q_ == 128 && P % 128 == 0 && N_ >= 64)
+        if (P == 32 && N >= 128)
         {
-            if (compute >= (1LL << 0))
-                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 128, 32, 2, 2, 2, 1, 2, 1, Tp_, Wt_>);
+            if (compute >= (1LL << 31))
+                return set(64, 32, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 32, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 28))
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 32, 64, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 27))
+                return set(64, 32, 32, 2, 1, 2, 0, chunk_scan_kernel<256, 64, 32, 32, 2, 1, 2, 1, 1, 0, Tp_, Wt_>);
+            else
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 32, 64, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
         }
-
-        if (Q_ == 128 && P % 64 == 0 && N_ >= 64)
+        if (P == 32 && N >= 64)
+        {
+            if (compute >= (1LL << 31))
+                return set(64, 32, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 32, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 27))
+                return set(64, 32, 32, 2, 1, 2, 0, chunk_scan_kernel<256, 64, 32, 32, 2, 1, 2, 1, 1, 0, Tp_, Wt_>);
+            else
+                return set(64, 32, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 32, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P % 256 == 0 && N >= 256)
+        {
+            if (compute >= (1LL << 36))
+                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 34))
+                return set(64, 128, 32, 4, 2, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 3, 0, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 33))
+                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 31))
+                return set(64, 128, 32, 4, 2, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 3, 0, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 128, 64, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 2, 1, 2, 1, Tp_, Wt_>);
+        }
+        if (P % 256 == 0 && N >= 128)
+        {
+            if (compute >= (1LL << 38))
+                return set(64, 128, 32, 4, 2, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 3, 0, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 36))
+                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 31))
+                return set(64, 128, 32, 4, 2, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 3, 0, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 128, 64, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 2, 1, 2, 1, Tp_, Wt_>);
+            else
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
+        }
+        if (P % 256 == 0 && N >= 64)
         {
             if (compute >= (1LL << 32))
-                return set(64, 64, 32, 2, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 2, 1, 2, 1, 2, 1, Tp_, Wt_>);
-            else if (compute >= (1LL << 0))
-                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 2, 1, Tp_, Wt_>);
+                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 30))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 28))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 0, Tp_, Wt_>);
+            else
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
         }
-
-        if (Q_ == 128 && P % 32 == 0 && N_ >= 64)
+        if (P % 128 == 0 && N >= 256)
+        {
+            if (compute >= (1LL << 36))
+                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 34))
+                return set(64, 128, 32, 4, 2, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 3, 0, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 33))
+                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 31))
+                return set(64, 128, 32, 4, 2, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 3, 0, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 30))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 128, 64, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 2, 1, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 28))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 128, 64, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 2, 1, 2, 1, Tp_, Wt_>);
+        }
+        if (P % 128 == 0 && N >= 128)
+        {
+            if (compute >= (1LL << 38))
+                return set(64, 128, 32, 4, 2, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 3, 0, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 36))
+                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 32))
+                return set(64, 128, 32, 4, 2, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 3, 0, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 30))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 28))
+                return set(64, 128, 64, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 2, 1, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 27))
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 26))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 0, Tp_, Wt_>);
+            else
+                return set(64, 128, 64, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 2, 1, 2, 1, Tp_, Wt_>);
+        }
+        if (P % 128 == 0 && N >= 64)
+        {
+            if (compute >= (1LL << 32))
+                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 26))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 0, Tp_, Wt_>);
+            else
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 2, 0, Tp_, Wt_>);
+        }
+        if (P % 64 == 0 && N >= 256)
+        {
+            if (compute >= (1LL << 32))
+                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 64, 32, 4, 1, 2, 0, 4, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 30))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 28))
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 27))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 0, Tp_, Wt_>);
+            else
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P % 64 == 0 && N >= 128)
+        {
+            if (compute >= (1LL << 32))
+                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 64, 32, 4, 1, 2, 0, 4, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 30))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 27))
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 26))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 25))
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 32, 32, 2, 1, 2, 0, chunk_scan_kernel<256, 64, 32, 32, 2, 1, 2, 1, 1, 0, Tp_, Wt_>);
+        }
+#endif
+        if (P % 64 == 0 && N >= 64)
+        {
+            if (compute >= (1LL << 32))
+                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 64, 32, 4, 1, 2, 0, 4, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 25))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 0, Tp_, Wt_>);
+            else
+                return set(64, 32, 32, 2, 1, 2, 0, chunk_scan_kernel<256, 64, 32, 32, 2, 1, 2, 1, 1, 0, Tp_, Wt_>);
+        }
+        if (round_up(P, 32) == 32)
+            P = 32;
+        else
+            P = round_up(P, 64);
+#ifndef FAST_BUILD
+        if (P == 32 && N >= 256)
         {
             if (compute >= (1LL << 31))
-                return set(64, 64, 32, 2, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 2, 1, 2, 1, 2, 1, Tp_, Wt_>);
-            else if (compute >= (1LL << 0))
-                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 2, 1, Tp_, Wt_>);
+                return set(64, 32, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 32, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 32, 64, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
         }
-
+        if (P == 32 && N >= 128)
+        {
+            if (compute >= (1LL << 31))
+                return set(64, 32, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 32, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 28))
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 32, 64, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 27))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 32, 64, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+        }
+        if (P == 32 && N >= 64)
+        {
+            if (compute >= (1LL << 31))
+                return set(64, 32, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 32, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else
+                return set(64, 32, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 32, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P % 256 == 0 && N >= 256)
+        {
+            if (compute >= (1LL << 36))
+                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 34))
+                return set(64, 128, 32, 4, 2, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 3, 0, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 33))
+                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 31))
+                return set(64, 128, 32, 4, 2, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 3, 0, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 128, 64, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 2, 1, 2, 1, Tp_, Wt_>);
+        }
+        if (P % 256 == 0 && N >= 128)
+        {
+            if (compute >= (1LL << 38))
+                return set(64, 128, 32, 4, 2, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 3, 0, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 36))
+                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 31))
+                return set(64, 128, 32, 4, 2, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 3, 0, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 128, 64, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 2, 1, 2, 1, Tp_, Wt_>);
+        }
+        if (P % 256 == 0 && N >= 64)
+        {
+            if (compute >= (1LL << 31))
+                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 27))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 4, 1, Tp_, Wt_>);
+        }
+        if (P % 128 == 0 && N >= 256)
+        {
+            if (compute >= (1LL << 33))
+                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 31))
+                return set(64, 128, 32, 4, 2, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 3, 0, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 28))
+                return set(64, 128, 64, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 2, 1, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 27))
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 25))
+                return set(64, 128, 64, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 2, 1, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 23))
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 32, 64, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+            else
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P % 128 == 0 && N >= 128)
+        {
+            if (compute >= (1LL << 38))
+                return set(64, 128, 32, 4, 2, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 3, 0, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 33))
+                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 31))
+                return set(64, 128, 32, 4, 2, 3, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 2, 3, 0, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 28))
+                return set(64, 128, 64, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 2, 1, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 27))
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 25))
+                return set(64, 128, 64, 1, 4, 2, 0, chunk_scan_kernel<256, 64, 128, 64, 1, 4, 2, 1, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 23))
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 32, 64, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+            else
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P % 128 == 0 && N >= 64)
+        {
+            if (compute >= (1LL << 30))
+                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 128, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 26))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 25))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 128, 32, 2, 2, 2, 1, 4, 1, Tp_, Wt_>);
+            else
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P % 64 == 0 && N >= 256)
+        {
+            if (compute >= (1LL << 31))
+                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 64, 32, 4, 1, 2, 0, 4, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 30))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 25))
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 24))
+                return set(64, 32, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 32, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 23))
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 32, 64, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+            else
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P % 64 == 0 && N >= 128)
+        {
+            if (compute >= (1LL << 31))
+                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 64, 32, 4, 1, 2, 0, 4, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 30))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 25))
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 24))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 64, 64, 2, 2, 2, 0, chunk_scan_kernel<256, 64, 64, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+        }
 #endif
+        if (P % 64 == 0 && N >= 64)
+        {
+            if (compute >= (1LL << 31))
+                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<256, 64, 64, 32, 4, 1, 2, 0, 4, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 26))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 25))
+                return set(64, 32, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 32, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 23))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 22))
+                return set(64, 32, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 32, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<256, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+    }
+    if (Q == 128 && isHopper_ == false)
+    {
+#ifndef FAST_BUILD
+        if (P == 32 && N >= 256)
+        {
+            return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 32, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P == 32 && N >= 128)
+        {
+            if (compute >= (1LL << 33))
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 32, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 32))
+                return set(64, 32, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 32, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 30))
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 32, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 32, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 32, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 32, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P == 32 && N >= 64)
+        {
+            return set(64, 32, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 32, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P % 256 == 0 && N >= 256)
+        {
+            if (compute >= (1LL << 38))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 37))
+                return set(64, 64, 32, 2, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 2, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+        }
+        if (P % 256 == 0 && N >= 128)
+        {
+            if (compute >= (1LL << 30))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 4, 0, Tp_, Wt_>);
+            else
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+        }
+        if (P % 256 == 0 && N >= 64)
+        {
+            if (compute >= (1LL << 30))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 4, 0, Tp_, Wt_>);
+            else
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+        }
+        if (P % 128 == 0 && N >= 256)
+        {
+            return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+        }
+        if (P % 128 == 0 && N >= 128)
+        {
+            if (compute >= (1LL << 30))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 4, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 27))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+            else
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 32, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P % 128 == 0 && N >= 64)
+        {
+            if (compute >= (1LL << 31))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 30))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 4, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+            else
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 4, 0, Tp_, Wt_>);
+        }
+        if (P % 64 == 0 && N >= 256)
+        {
+            if (compute >= (1LL << 35))
+                return set(64, 64, 32, 2, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 2, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 4, 0, Tp_, Wt_>);
+        }
+        if (P % 64 == 0 && N >= 128)
+        {
+            if (compute >= (1LL << 35))
+                return set(64, 64, 32, 2, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 2, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 4, 0, Tp_, Wt_>);
+        }
+#endif
+        if (P % 64 == 0 && N >= 64)
+        {
+            if (compute >= (1LL << 36))
+                return set(64, 64, 32, 2, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 2, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 4, 0, Tp_, Wt_>);
+        }
+        if (round_up(P, 32) == 32)
+            P = 32;
+        else
+            P = round_up(P, 64);
+#ifndef FAST_BUILD
+        if (P == 32 && N >= 256)
+        {
+            return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 32, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P == 32 && N >= 128)
+        {
+            if (compute >= (1LL << 33))
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 32, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 32))
+                return set(64, 32, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 32, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 30))
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 32, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 32, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 32, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 32, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P == 32 && N >= 64)
+        {
+            return set(64, 32, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 32, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P % 256 == 0 && N >= 256)
+        {
+            if (compute >= (1LL << 38))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 37))
+                return set(64, 64, 32, 2, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 2, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+        }
+        if (P % 256 == 0 && N >= 128)
+        {
+            if (compute >= (1LL << 30))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 64, 32, 2, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 2, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+        }
+        if (P % 256 == 0 && N >= 64)
+        {
+            if (compute >= (1LL << 30))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 64, 32, 2, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 2, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+        }
+        if (P % 128 == 0 && N >= 256)
+        {
+            if (compute >= (1LL << 29))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 26))
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 32, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+        }
+        if (P % 128 == 0 && N >= 128)
+        {
+            if (compute >= (1LL << 27))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 26))
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 32, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+        }
+        if (P % 128 == 0 && N >= 64)
+        {
+            return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+        }
+        if (P % 64 == 0 && N >= 256)
+        {
+            if (compute >= (1LL << 32))
+                return set(64, 64, 32, 2, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 2, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 26))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 25))
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 32, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P % 64 == 0 && N >= 128)
+        {
+            if (compute >= (1LL << 32))
+                return set(64, 64, 32, 2, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 2, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 26))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 25))
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 32, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+#endif
+        if (P % 64 == 0 && N >= 64)
+        {
+            if (compute >= (1LL << 32))
+                return set(64, 64, 32, 2, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 2, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+    }
+    else if (Q == 128 && isHopper_)
+    {
+#ifndef FAST_BUILD
+        if (P == 32 && N >= 256)
+        {
+            if (compute >= (1LL << 31))
+                return set(64, 32, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 32, 32, 4, 1, 2, 0, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 32, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P == 32 && N >= 128)
+        {
+            if (compute >= (1LL << 31))
+                return set(64, 32, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 32, 32, 4, 1, 2, 0, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 32, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P == 32 && N >= 64)
+        {
+            if (compute >= (1LL << 30))
+                return set(64, 32, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 32, 32, 4, 1, 2, 0, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 32, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 32, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P % 256 == 0 && N >= 256)
+        {
+            if (compute >= (1LL << 32))
+                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 128, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 4, 0, Tp_, Wt_>);
+        }
+        if (P % 256 == 0 && N >= 128)
+        {
+            if (compute >= (1LL << 31))
+                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 128, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 4, 0, Tp_, Wt_>);
+        }
+        if (P % 256 == 0 && N >= 64)
+        {
+            if (compute >= (1LL << 31))
+                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 128, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 4, 0, Tp_, Wt_>);
+        }
+        if (P % 128 == 0 && N >= 256)
+        {
+            if (compute >= (1LL << 31))
+                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 128, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 28))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 4, 0, Tp_, Wt_>);
+            else
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+        }
+        if (P % 128 == 0 && N >= 128)
+        {
+            if (compute >= (1LL << 32))
+                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 128, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 26))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 4, 0, Tp_, Wt_>);
+            else
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+        }
+        if (P % 128 == 0 && N >= 64)
+        {
+            if (compute >= (1LL << 32))
+                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 128, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 4, 0, Tp_, Wt_>);
+        }
+        if (P % 64 == 0 && N >= 256)
+        {
+            if (compute >= (1LL << 32))
+                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 64, 32, 4, 1, 2, 0, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 27))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 4, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 26))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 25))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 4, 0, Tp_, Wt_>);
+            else
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 32, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P % 64 == 0 && N >= 128)
+        {
+            if (compute >= (1LL << 32))
+                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 64, 32, 4, 1, 2, 0, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 25))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 4, 0, Tp_, Wt_>);
+            else if (compute >= (1LL << 24))
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 32, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+#endif
+        if (P % 64 == 0 && N >= 64)
+        {
+            if (compute >= (1LL << 32))
+                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 64, 32, 4, 1, 2, 0, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 24))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 4, 0, Tp_, Wt_>);
+            else
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (round_up(P, 32) == 32)
+            P = 32;
+        else
+            P = round_up(P, 64);
+#ifndef FAST_BUILD
+        if (P == 32 && N >= 256)
+        {
+            if (compute >= (1LL << 31))
+                return set(64, 32, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 32, 32, 4, 1, 2, 0, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 32, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P == 32 && N >= 128)
+        {
+            if (compute >= (1LL << 31))
+                return set(64, 32, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 32, 32, 4, 1, 2, 0, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 32, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P == 32 && N >= 64)
+        {
+            if (compute >= (1LL << 30))
+                return set(64, 32, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 32, 32, 4, 1, 2, 0, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 32, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 32, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P % 256 == 0 && N >= 256)
+        {
+            if (compute >= (1LL << 32))
+                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 128, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 31))
+                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 64, 32, 4, 1, 2, 0, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 30))
+                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 128, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P % 256 == 0 && N >= 128)
+        {
+            if (compute >= (1LL << 30))
+                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 128, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P % 256 == 0 && N >= 64)
+        {
+            if (compute >= (1LL << 30))
+                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 128, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P % 128 == 0 && N >= 256)
+        {
+            if (compute >= (1LL << 30))
+                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 128, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 29))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 28))
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 32, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 27))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 26))
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 32, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 25))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 23))
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 32, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 32, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 32, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P % 128 == 0 && N >= 128)
+        {
+            if (compute >= (1LL << 31))
+                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 128, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 27))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 26))
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 32, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 25))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 23))
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 32, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 32, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 32, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P % 128 == 0 && N >= 64)
+        {
+            if (compute >= (1LL << 30))
+                return set(64, 128, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 128, 32, 4, 1, 2, 0, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 26))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 25))
+                return set(64, 128, 32, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 128, 32, 2, 2, 2, 1, 8, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 23))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 32, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 32, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P % 64 == 0 && N >= 256)
+        {
+            if (compute >= (1LL << 31))
+                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 64, 32, 4, 1, 2, 0, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 25))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 23))
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 32, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 32, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 32, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+        if (P % 64 == 0 && N >= 128)
+        {
+            if (compute >= (1LL << 31))
+                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 64, 32, 4, 1, 2, 0, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 25))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 23))
+                return set(64, 32, 64, 2, 2, 2, 0, chunk_scan_kernel<128, 64, 32, 64, 2, 2, 2, 1, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 32, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 32, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+        }
+#endif
+        if (P % 64 == 0 && N >= 64)
+        {
+            if (compute >= (1LL << 31))
+                return set(64, 64, 32, 4, 1, 2, 1, chunk_scan_hopper<128, 64, 64, 32, 4, 1, 2, 0, 2, 1, Tp_, Wt_>);
+            else if (compute >= (1LL << 22))
+                return set(64, 64, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 64, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+            else
+                return set(64, 32, 32, 4, 1, 2, 0, chunk_scan_kernel<128, 64, 32, 32, 4, 1, 2, 1, 1, 1, Tp_, Wt_>);
+        }
     }
 
     return nullptr;

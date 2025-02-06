@@ -36,7 +36,7 @@ struct PeftCacheManagerConfig
         SizeType32 optimalAdapterSize = 8, SizeType32 maxAdapterSize = 64, SizeType32 numPutWorkers = 1,
         SizeType32 numEnsureWorkers = 1, SizeType32 numCopyStreams = 1, SizeType32 maxPagesPerBlockHost = 24,
         SizeType32 maxPagesPerBlockDevice = 8, std::optional<float> deviceCachePercent = std::nullopt,
-        std::optional<size_t> hostCacheSize = std::nullopt)
+        std::optional<size_t> hostCacheSize = std::nullopt, std::optional<std::string> loraPrefetchDir = std::nullopt)
         : numHostModuleLayer(numHostModuleLayer)
         , numDeviceModuleLayer(numDeviceModuleLayer)
         , optimalAdapterSize(optimalAdapterSize)
@@ -48,6 +48,7 @@ struct PeftCacheManagerConfig
         , maxPagesPerBlockDevice(maxPagesPerBlockDevice)
         , deviceCachePercent(deviceCachePercent)
         , hostCacheSize(hostCacheSize)
+        , loraPrefetchDir(loraPrefetchDir)
     {
     }
 
@@ -63,6 +64,7 @@ struct PeftCacheManagerConfig
         , maxPagesPerBlockDevice(cfg.getMaxPagesPerBlockDevice())
         , deviceCachePercent(cfg.getDeviceCachePercent())
         , hostCacheSize(cfg.getHostCacheSize())
+        , loraPrefetchDir(cfg.getLoraPrefetchDir())
     {
     }
 
@@ -88,5 +90,7 @@ struct PeftCacheManagerConfig
     std::optional<float> deviceCachePercent;
     // size in bytes to use for host cache
     std::optional<size_t> hostCacheSize;
+    // folder to store the LoRA weights we hope to load during engine initialization
+    std::optional<std::string> loraPrefetchDir;
 };
 } // namespace tensorrt_llm::batch_manager

@@ -188,6 +188,9 @@ def convert_from_hf(hf_model,
     num_kv_heads = hf_config.num_key_value_heads
     num_hidden_layers = hf_config.num_hidden_layers
     layers_range = mapping.pp_layers(num_hidden_layers)
+    is_xcomposer2 = (
+        hf_config.architectures[0] == 'InternLMXComposer2ForCausalLM')
+    lora_weights = {}
     for l in layers_range:
         prefix = f'model.layers.{l}'
         tllm_prex = f'transformer.layers.{l - layers_range[0]}'
@@ -201,6 +204,84 @@ def convert_from_hf(hf_model,
                                mapping.tp_rank,
                                is_bias=False,
                                num_kv_heads=num_kv_heads)
+
+        if is_xcomposer2:
+            lora_prefix = f'base_model.model.model.layers.{l}'
+            assert num_attention_heads % num_kv_heads == 0
+            num_key_value_groups = num_attention_heads // num_kv_heads
+
+            qkv_loraA = convert.get_weight(model_params,
+                                           prefix + '.attention.wqkv.Plora_A',
+                                           dtype)
+            qkv_loraB = convert.get_weight(model_params,
+                                           prefix + '.attention.wqkv.Plora_B',
+                                           dtype)
+            q_lora_name = f"{lora_prefix}.self_attn.q_proj"
+            k_lora_name = f"{lora_prefix}.self_attn.k_proj"
+            v_lora_name = f"{lora_prefix}.self_attn.v_proj"
+
+            #save qkv_loraA to be (q/k/v)_loraA
+            lora_weights[f"{q_lora_name}.lora_A.weight"] = qkv_loraA
+            lora_weights[f"{k_lora_name}.lora_A.weight"] = qkv_loraA
+            lora_weights[f"{v_lora_name}.lora_A.weight"] = qkv_loraA
+
+            qkv_lora_rank = qkv_loraB.shape[-1]
+            head_size = hidden_size // num_attention_heads
+
+            qkv_loraB = qkv_loraB.reshape(-1, num_key_value_groups + 2,
+                                          head_size, qkv_lora_rank)
+            q_loraB = qkv_loraB[:, :num_key_value_groups, :, :].reshape(
+                -1, qkv_lora_rank).contiguous()
+            k_loraB = qkv_loraB[:,
+                                -2, :, :].reshape(-1,
+                                                  qkv_lora_rank).contiguous()
+            v_loraB = qkv_loraB[:,
+                                -1, :, :].reshape(-1,
+                                                  qkv_lora_rank).contiguous()
+
+            #save (q/k/v)_loraB
+            lora_weights[f"{q_lora_name}.lora_B.weight"] = q_loraB
+            lora_weights[f"{k_lora_name}.lora_B.weight"] = k_loraB
+            lora_weights[f"{v_lora_name}.lora_B.weight"] = v_loraB
+
+            wo_loraA = convert.get_weight(model_params,
+                                          prefix + '.attention.wo.Plora_A',
+                                          dtype)
+            wo_loraB = convert.get_weight(model_params,
+                                          prefix + '.attention.wo.Plora_B',
+                                          dtype)
+
+            lora_weights[
+                f"{lora_prefix}.self_attn.o_proj.lora_A.weight"] = wo_loraA
+            lora_weights[
+                f"{lora_prefix}.self_attn.o_proj.lora_B.weight"] = wo_loraB
+
+            mlp_gate_loraA = convert.get_weight(
+                model_params, prefix + '.feed_forward.w3.Plora_A', dtype)
+            mlp_gate_loraB = convert.get_weight(
+                model_params, prefix + '.feed_forward.w3.Plora_B', dtype)
+            lora_weights[
+                f"{lora_prefix}.mlp.up_proj.lora_A.weight"] = mlp_gate_loraA
+            lora_weights[
+                f"{lora_prefix}.mlp.up_proj.lora_B.weight"] = mlp_gate_loraB
+
+            mlp_fc_loraA = convert.get_weight(
+                model_params, prefix + '.feed_forward.w1.Plora_A', dtype)
+            mlp_fc_loraB = convert.get_weight(
+                model_params, prefix + '.feed_forward.w1.Plora_B', dtype)
+            lora_weights[
+                f"{lora_prefix}.mlp.gate_proj.lora_A.weight"] = mlp_fc_loraA
+            lora_weights[
+                f"{lora_prefix}.mlp.gate_proj.lora_B.weight"] = mlp_fc_loraB
+
+            mlp_proj_loraA = convert.get_weight(
+                model_params, prefix + '.feed_forward.w2.Plora_A', dtype)
+            mlp_proj_loraB = convert.get_weight(
+                model_params, prefix + '.feed_forward.w2.Plora_B', dtype)
+            lora_weights[
+                f"{lora_prefix}.mlp.down_proj.lora_A.weight"] = mlp_proj_loraA
+            lora_weights[
+                f"{lora_prefix}.mlp.down_proj.lora_B.weight"] = mlp_proj_loraB
 
         qkv_bias = None
         if f'{prefix}.attention.wqkv.bias' in model_params:
@@ -292,6 +373,41 @@ def convert_from_hf(hf_model,
 
         release_gc()
 
+    if is_xcomposer2:
+        torch.save(lora_weights, 'adapter_model.bin')
+        adapter_config = {
+            "base_model_name_or_path":
+            "Internlm-xcomposer-2-7b-vl-hf",
+            "bias":
+            "none",
+            "enable_lora":
+            None,
+            "fan_in_fan_out":
+            False,
+            "inference_mode":
+            True,
+            "lora_alpha":
+            256.0,
+            "lora_dropout":
+            0.05,
+            "merge_weights":
+            False,
+            "modules_to_save":
+            None,
+            "peft_type":
+            "LORA",
+            "r":
+            256,
+            "target_modules": [
+                "q_proj", "v_proj", "k_proj", "o_proj", "gate_proj",
+                "down_proj", "up_proj"
+            ],
+            "task_type":
+            "CAUSAL_LM"
+        }
+        with open(os.path.join('adapter_config.json'), 'w') as f:
+            json.dump(adapter_config, f, indent=4)
+
     embed_w = convert.get_weight(model_params, 'model.tok_embeddings', dtype)
     if use_parallel_embedding:
         embed_w = convert.split_matrix_tp(embed_w,
@@ -375,6 +491,8 @@ if __name__ == '__main__':
             'tp_size': args.tp_size,
             'pp_size': args.pp_size,
         },
+        'has_partial_lora_mask':
+        hf_config.architectures[0] == 'InternLMXComposer2ForCausalLM',
         'attn_bias': getattr(hf_config, 'bias', False),
         'rotary_scaling': getattr(hf_config, "rope_scaling", None)
     }

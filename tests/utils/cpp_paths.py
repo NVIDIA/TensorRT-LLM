@@ -65,6 +65,11 @@ def model_path_lora(engine_path: _pl.Path) -> _pl.Path:
 
 
 @pytest.fixture
+def model_path_draft_tokens_external(engine_path: _pl.Path) -> _pl.Path:
+    return engine_path / f"gpt2/{get_base_model_spec().use_draft_tokens_external_decoding().get_model_path()}/tp1-pp1-cp1-gpu"
+
+
+@pytest.fixture
 def lora_config_path(data_path: _pl.Path) -> _pl.Path:
     return data_path / "lora-test-weights-gpt2-tp1"
 

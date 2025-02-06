@@ -2,21 +2,20 @@
 
 set -ex
 
-TRT_VER="10.7.0.23"
+TRT_VER="10.8.0.43"
 # Align with the pre-installed cuDNN / cuBLAS / NCCL versions from
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-11.html#rel-24-11
-CUDA_VER="12.6" # 12.6.3
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-01.html#rel-25-01
+CUDA_VER="12.8" # 12.8.0
 # Keep the installation for cuDNN if users want to install PyTorch with source codes.
 # PyTorch 2.x can compile with cuDNN v9.
-CUDA_DRIVER_VERSION="560.35.05-1.el8"
-CUDNN_VER="9.5.1.17-1"
-NCCL_VER="2.23.4-1+cuda12.6"
-# Use cuBLAS 12.6.1.4 instead of 12.6.4.1 to avoid accuracy issues
-CUBLAS_VER="12.6.1.4-1"
+CUDNN_VER="9.7.0.66-1"
+NCCL_VER="2.25.1-1+cuda12.8"
+CUBLAS_VER="12.8.3.14-1"
 # Align with the pre-installed CUDA / NVCC / NVRTC versions from
 # https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html
-NVRTC_VER="12.6.85-1"
-CUDA_RUNTIME="12.6.77-1"
+NVRTC_VER="12.8.61-1"
+CUDA_RUNTIME="12.8.57-1"
+CUDA_DRIVER_VERSION="570.86.10-1.el8"
 
 for i in "$@"; do
     case $i in
@@ -33,7 +32,6 @@ done
 NVCC_VERSION_OUTPUT=$(nvcc --version)
 if [[ $(echo $NVCC_VERSION_OUTPUT | grep -oP "\d+\.\d+" | head -n 1) != ${CUDA_VER} ]]; then
   echo "The version of pre-installed CUDA is not equal to ${CUDA_VER}."
-  exit 1
 fi
 
 install_ubuntu_requirements() {
@@ -41,6 +39,7 @@ install_ubuntu_requirements() {
     ARCH=$(uname -m)
     if [ "$ARCH" = "amd64" ];then ARCH="x86_64";fi
     if [ "$ARCH" = "aarch64" ];then ARCH="sbsa";fi
+    # TODO: Replace with ubuntu2404 rather than using ubuntu2204.
     curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/${ARCH}/cuda-keyring_1.0-1_all.deb
     dpkg -i cuda-keyring_1.0-1_all.deb
 
@@ -68,38 +67,56 @@ install_ubuntu_requirements() {
     rm -rf /var/lib/apt/lists/*
 }
 
-install_centos_requirements() {
+install_rockylinux_requirements() {
     CUBLAS_CUDA_VERSION=$(echo $CUDA_VER | sed 's/\./-/g')
-    yum -y update
-    yum -y install epel-release
-    wget -q https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/x86_64/libnccl-${NCCL_VER}.x86_64.rpm
-    wget -q https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/x86_64/libnccl-devel-${NCCL_VER}.x86_64.rpm
-    yum remove -y "libnccl*" && yum -y localinstall libnccl-${NCCL_VER}.x86_64.rpm libnccl-devel-${NCCL_VER}.x86_64.rpm
-    wget -q https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/x86_64/cuda-toolkit-${CUBLAS_CUDA_VERSION}-config-common-${CUDA_RUNTIME}.noarch.rpm
-    wget -q https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/x86_64/cuda-toolkit-12-config-common-${CUDA_RUNTIME}.noarch.rpm
-    wget -q https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/x86_64/cuda-toolkit-config-common-${CUDA_RUNTIME}.noarch.rpm
-    wget -q https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/x86_64/cuda-compat-${CUBLAS_CUDA_VERSION}-${CUDA_DRIVER_VERSION}.x86_64.rpm
-    yum remove -y "cuda-toolkit*" && yum -y localinstall cuda-toolkit-${CUBLAS_CUDA_VERSION}-config-common-${CUDA_RUNTIME}.noarch.rpm cuda-toolkit-12-config-common-${CUDA_RUNTIME}.noarch.rpm cuda-toolkit-config-common-${CUDA_RUNTIME}.noarch.rpm
-    yum remove -y "cuda-compat*" && yum -y localinstall cuda-compat-${CUBLAS_CUDA_VERSION}-${CUDA_DRIVER_VERSION}.x86_64.rpm
-    wget -q https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/x86_64/libcublas-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.x86_64.rpm
-    wget -q https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/x86_64/libcublas-devel-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.x86_64.rpm
-    yum remove -y "libcublas*" && yum -y localinstall libcublas-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.x86_64.rpm libcublas-devel-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.x86_64.rpm
-    yum clean all
+
+    ARCH=$(uname -m)
+    if [ "$ARCH" = "x86_64" ];then ARCH1="x86_64" && ARCH2="x64" && ARCH3=$ARCH1;fi
+    if [ "$ARCH" = "aarch64" ];then ARCH1="aarch64" && ARCH2="aarch64sbsa" && ARCH3="sbsa";fi
+
+    wget -q "https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/${ARCH3}/libnccl-${NCCL_VER}.${ARCH1}.rpm"
+    dnf remove -y "libnccl*"
+    dnf -y install libnccl-${NCCL_VER}.${ARCH1}.rpm
+    wget -q "https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/${ARCH3}/libnccl-devel-${NCCL_VER}.${ARCH1}.rpm"
+    dnf -y install libnccl-devel-${NCCL_VER}.${ARCH1}.rpm
+    wget -q "https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/${ARCH3}/cuda-compat-${CUBLAS_CUDA_VERSION}-${CUDA_DRIVER_VERSION}.${ARCH1}.rpm"
+    dnf remove -y "cuda-compat*"
+    dnf -y install cuda-compat-${CUBLAS_CUDA_VERSION}-${CUDA_DRIVER_VERSION}.${ARCH1}.rpm
+    wget -q "https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/${ARCH3}/cuda-toolkit-12-8-config-common-${CUDA_RUNTIME}.noarch.rpm"
+    wget -q "https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/${ARCH3}/cuda-toolkit-12-config-common-${CUDA_RUNTIME}.noarch.rpm"
+    wget -q "https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/${ARCH3}/cuda-toolkit-config-common-${CUDA_RUNTIME}.noarch.rpm"
+    dnf remove -y "cuda-toolkit*"
+    dnf -y install cuda-toolkit-12-8-config-common-${CUDA_RUNTIME}.noarch.rpm
+    dnf -y install cuda-toolkit-12-config-common-${CUDA_RUNTIME}.noarch.rpm
+    dnf -y install cuda-toolkit-config-common-${CUDA_RUNTIME}.noarch.rpm
+    wget -q "https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/${ARCH3}/libcublas-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}.rpm"
+    dnf remove -y "libcublas*"
+    dnf -y install libcublas-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}.rpm
+    wget -q "https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/${ARCH3}/libcublas-devel-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}.rpm"
+    dnf -y install libcublas-devel-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}.rpm
+    dnf makecache --refresh
+    dnf -y install \
+      epel-release \
+      # libnccl-${NCCL_VER} \
+      # libnccl-devel-${NCCL_VER} \
+      # libcublas-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER} \
+      # libcublas-devel-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER} \
+      # cuda-compat-${CUBLAS_CUDA_VERSION}-${CUDA_DRIVER_VERSION}
+    dnf clean all
     nvcc --version
 }
 
 install_tensorrt() {
     PY_VERSION=$(python3 -c 'import sys; print(".".join(map(str, sys.version_info[0:2])))')
     PARSED_PY_VERSION=$(echo "${PY_VERSION//./}")
-    TRT_CUDA_VERSION="12.6"
+    TRT_CUDA_VERSION="12.8"
 
     if [ -z "$RELEASE_URL_TRT" ];then
         ARCH=${TRT_TARGETARCH}
         if [ -z "$ARCH" ];then ARCH=$(uname -m);fi
         if [ "$ARCH" = "arm64" ];then ARCH="aarch64";fi
         if [ "$ARCH" = "amd64" ];then ARCH="x86_64";fi
-        if [ "$ARCH" = "x86_64" ];then DIR_NAME="x64-agnostic"; else DIR_NAME=${ARCH};fi
-        RELEASE_URL_TRT=https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.7.0/tars/TensorRT-${TRT_VER}.Linux.${ARCH}-gnu.cuda-${TRT_CUDA_VERSION}.tar.gz
+        RELEASE_URL_TRT="https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.8.0/tars/TensorRT-${TRT_VER}.Linux.${ARCH}-gnu.cuda-${TRT_CUDA_VERSION}.tar.gz"
     fi
     wget --no-verbose ${RELEASE_URL_TRT} -O /tmp/TensorRT.tar
     tar -xf /tmp/TensorRT.tar -C /usr/local/
@@ -116,8 +133,8 @@ case "$ID" in
     install_ubuntu_requirements
     install_tensorrt
     ;;
-  centos)
-    install_centos_requirements
+  rocky)
+    install_rockylinux_requirements
     install_tensorrt
     ;;
   *)

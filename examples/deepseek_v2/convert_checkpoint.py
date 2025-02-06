@@ -104,6 +104,14 @@ def parse_arguments():
         help=
         'Controls renormalization after gate logits. Check layers/moe.py for accepted values'
     )
+    parser.add_argument('--use_preloading',
+                        action="store_true",
+                        default=False,
+                        help='Loading weights from HF model')
+    parser.add_argument('--use_safetensors_loading',
+                        action="store_true",
+                        default=False,
+                        help='Loading weights from HF safetensors')
     parser.add_argument(
         '--save_config_only',
         action="store_true",
@@ -155,27 +163,34 @@ def execute(workers, func, args):
 
 
 def convert_and_save_hf(args):
-    model_dir = args.model_dir
     world_size = args.tp_size * args.pp_size
     # Need to convert the cli args to the kay-value pairs and override them in the generate config dict.
     # Ideally these fields will be moved out of the config and pass them into build API, keep them here for compatibility purpose for now,
     # before the refactor is done.
     override_fields = {}
     override_fields.update(args_to_build_options(args))
+    use_preloading = args.use_preloading
+    use_safetensors_loading = args.use_safetensors_loading
 
-    load_model_on_cpu = args.load_model_on_cpu
-    hf_model = load_hf_deepseek(model_dir, load_model_on_cpu)
+    args.load_model_on_cpu
+
+    if os.environ.get("TRTLLM_DISABLE_UNIFIED_CONVERTER"
+                      ) is not None and not use_safetensors_loading:
+        hf_model = load_hf_deepseek(args.model_dir, args.load_model_on_cpu)
+    else:
+        hf_model = None
 
     def convert_and_save_rank(args, rank):
+
         mapping = Mapping(world_size=world_size,
                           rank=rank,
                           tp_size=args.tp_size,
                           pp_size=args.pp_size,
                           moe_tp_size=args.moe_tp_size,
                           moe_ep_size=args.moe_ep_size)
-
         deepseekv2 = DeepseekV2ForCausalLM.from_hugging_face(
-            hf_model, args.model_dir, args.dtype, mapping, **override_fields)
+            args.model_dir, args.dtype, hf_model, use_preloading,
+            use_safetensors_loading, mapping, **override_fields)
         deepseekv2.save_checkpoint(args.output_dir, save_config=(rank == 0))
         del deepseekv2
 

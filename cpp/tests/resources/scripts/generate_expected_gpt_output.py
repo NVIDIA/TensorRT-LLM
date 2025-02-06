@@ -17,7 +17,9 @@
 import argparse
 from pathlib import Path
 
+# isort: off
 import run
+# isort: on
 from build_engines_utils import init_model_spec_module
 
 init_model_spec_module()
@@ -67,10 +69,14 @@ def generate_output(engine: str,
 
     base_output_name = os.path.splitext(model_spec_obj.get_results_file())[0]
 
-    output_logits_npy = None
+    output_logits_args = []
     if output_logits:
         logits_file = base_output_name + '_logits.npy'
-        output_logits_npy = str(output_dir / logits_file)
+        output_logits_args = [
+            '--output_logits_npy',
+            str(output_dir / logits_file),
+            '--output_generation_logits',
+        ]
 
     results_file = str(output_dir / (base_output_name + '.npy'))
     results_csv = str(output_dir / (base_output_name + '.csv'))
@@ -82,9 +88,8 @@ def generate_output(engine: str,
         str(models_dir / model), '--output_npy', results_file, '--output_csv',
         results_csv, '--max_output_len',
         str(max_output_len), '--num_beams',
-        str(num_beams), '--output_logits_npy',
-        str(output_logits_npy), '--use_py_session'
-    ]
+        str(num_beams), '--use_py_session'
+    ] + output_logits_args
 
     # Generate context_fmha_fp32_acc enabled results for GptExecutorTest.GenerationLogitsEarlyStop
     if model_spec_obj.get_enable_context_fmha_fp32_acc():

@@ -148,14 +148,15 @@ value for a given parameter, the vector can be limited to a single element
 
 ***Sampling***
 
-| Name in TRT-LLM |               Description               |   Data type   |  Range of value   |  Default value   | Name in HF |
-| :-------------: | :-------------------------------------: | :-----------: | :---------------: | :--------------: | :--------: |
-|  `randomSeed`   | random seed for random number generator |     Int64     |   \[0, 2^64-1\]   |       `0`        |     no     |
-|     `topK`      |   the number of logits to sample from   |  List\[Int\]  |    \[0, 1024\]    |       `0`        |  `top_k`   |
-|     `topP`      |  the top-P probability to sample from   | List\[Float\] |  \[0.0f, 1.0f\]   |      `0.0f`      |  `top_p`   |
-|   `topPDecay`   |    the decay in the `topP` algorithm    | List\[Float\] |  \(0.0f, 1.0f\]   |      `1.0f`      |     no     |
-|    `topPMin`    |    the decay in the `topP` algorithm    | List\[Float\] |  \(0.0f, 1.0f\]   |    `1.0e-6,f`    |     no     |
-| `topPResetIds`  |    the decay in the `topP` algorithm    |  List\[Int\]  | \[-1, $+\infty$\) | `-1` (no effect) |     no     |
+| Name in TRT-LLM |               Description                                               |   Data type   |  Range of value   |  Default value   | Name in HF |
+| :-------------: | :---------------------------------------------------------------------: | :-----------: | :---------------: | :--------------: | :--------: |
+|  `randomSeed`   | random seed for random number generator                                 |     Int64     |   \[0, 2^64-1\]   |       `0`        |     no     |
+|     `topK`      |   the number of logits to sample from                                   |  List\[Int\]  |    \[0, 1024\]    |       `0`        |  `top_k`   |
+|     `topP`      |  the top-P probability to sample from                                   | List\[Float\] |  \[0.0f, 1.0f\]   |      `0.0f`      |  `top_p`   |
+|   `topPDecay`   |    the decay in the `topP` algorithm                                    | List\[Float\] |  \(0.0f, 1.0f\]   |      `1.0f`      |     no     |
+|    `topPMin`    |    the decay in the `topP` algorithm                                    | List\[Float\] |  \(0.0f, 1.0f\]   |    `1.0e-6,f`    |     no     |
+| `topPResetIds`  |    the decay in the `topP` algorithm                                    |  List\[Int\]  | \[-1, $+\infty$\) | `-1` (no effect) |     no     |
+|     `minP`      | scale the most likely token to determine the minimum token probability. |  List\[Float\]  | \[0.0f, 1.0f\] | `0.0` (no effect) |     `min_p`     |
 
  * If setting `topK = 0` and `topP = 0.0f`, greedy search is performed.
  * If setting `topK > 0` and `topP = 0.0f`, `topK` tokens of highest probabilities will become the candidates of sampling (named `TopK sampling` in TRT-LLM).
@@ -167,6 +168,8 @@ value for a given parameter, the vector can be limited to a single element
  * `topPDecay`, `topPMin` and `topPResetIds` are explained in
    [_Factuality Enhanced Language Models for Open-Ended Text Generation_](https://arxiv.org/abs/2206.04624).
    `topPDecay` is the decay, `topPMin` is the lower-bound and `topPResetIds` indicates where to reset the decay.
+
+ * `minP` is explained in [_Turning Up the Heat: Min-p Sampling for Creative and Coherent LLM Outputs_](https://arxiv.org/abs/2407.01082).
 
 ***Beam-search***
 

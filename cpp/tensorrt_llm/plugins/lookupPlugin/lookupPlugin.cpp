@@ -257,7 +257,7 @@ void LookupPlugin::serialize(void* buffer) const noexcept
     write(d, mType);
     write(d, mRank);
 
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 }
 
 void LookupPlugin::terminate() noexcept {}
@@ -292,8 +292,8 @@ PluginFieldCollection const* LookupPluginCreator::getFieldNames() noexcept
 IPluginV2* LookupPluginCreator::createPlugin(char const* name, PluginFieldCollection const* fc) noexcept
 {
     PluginField const* fields = fc->fields;
-    nvinfer1::DataType type;
-    int rank;
+    nvinfer1::DataType type{};
+    int rank{};
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {

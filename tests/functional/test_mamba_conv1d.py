@@ -28,7 +28,7 @@ from tensorrt_llm._utils import str_dtype_to_torch
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from torch_ref import mamba_conv1d_ref
-from utils.util import skip_bf16_pre_ampere, unittest_name_func
+from utils.util import unittest_name_func
 
 
 class TestFunctional(unittest.TestCase):
@@ -48,8 +48,6 @@ class TestFunctional(unittest.TestCase):
         name_func=unittest_name_func)
     def test_mamba_conv1d(self, dim, dconv, req_type, dtype, batch_size,
                           max_seq_len, stride_size, remove_padding, apply_silu):
-        # Skip tests that are not supported in pre-ampere architecture
-        skip_bf16_pre_ampere(dtype)
         if max_seq_len == 131072:
             total_gpu_mem = torch.cuda.get_device_properties(0).total_memory
             if total_gpu_mem <= 33 * 1024**3:
@@ -120,7 +118,11 @@ class TestFunctional(unittest.TestCase):
         past_conv_state_trt = past_conv_state.permute(0, 2, 1).contiguous()
         conv_weight_trt = conv_weight.permute(1, 2, 0).contiguous()
 
-        output_trt = torch.zeros_like(x_trt)
+        if remove_padding and req_type == "generation":
+            output_trt = torch.zeros_like(x_trt.squeeze(1))
+        else:
+            output_trt = torch.zeros_like(x_trt)
+
         present_conv_state_trt = torch.zeros_like(past_conv_state_trt)
         if with_stride:
             base_shape = [x_trt.shape[i] for i in range(len(x_trt.shape) - 1)]
@@ -133,6 +135,9 @@ class TestFunctional(unittest.TestCase):
                                    device=device,
                                    dtype=str_dtype_to_torch(dtype))
             x_trt = torch.cat([pad_pre, x_trt, pad_post], dim=-1).contiguous()
+
+        if remove_padding and req_type == "generation":
+            x_trt = x_trt.squeeze(1)
 
         # construct trt network
         builder = tensorrt_llm.Builder()
@@ -232,6 +237,9 @@ class TestFunctional(unittest.TestCase):
             for b in range(batch_size):
                 out_ref_batches.append(out_ref[b, :host_context_length[b], :])
             out_ref = torch.cat(out_ref_batches, dim=0)
+
+        if remove_padding and req_type == "generation":
+            out_ref = out_ref.squeeze(1)
 
         dtype_atol = {"float16": 1e-2, "float32": 2e-3, "bfloat16": 1e-1}
 

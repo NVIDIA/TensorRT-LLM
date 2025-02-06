@@ -55,25 +55,6 @@ namespace threadblock
 {
 
 ////////////////////////////////////////////////////////////////////////////////
-// SFINAE trick so I can keep the same loop code for Volta and dispatch to the
-// correct warp level mma. On volta, all data is stored to shared memory as FP16.
-template <typename WarpMma, int kExpansionFactor = 1>
-CUTLASS_DEVICE void run_warp_mma(WarpMma& warp_mma, typename WarpMma::FragmentC& D,
-    typename WarpMma::FragmentA const& A, typename WarpMma::FragmentB const& B, typename WarpMma::FragmentC const& C,
-    int const warp_tileB_k_offset)
-{
-    warp_mma(D, A, B, C);
-}
-
-template <typename WarpMma, int kExpansionFactor = WarpMma::kExpansionFactor>
-CUTLASS_DEVICE void run_warp_mma(WarpMma& warp_mma, typename WarpMma::FragmentC& D,
-    typename WarpMma::TransformedFragmentA const& A, typename WarpMma::TransformedFragmentB const& B,
-    typename WarpMma::FragmentC const& C, int const warp_tileB_k_offset)
-{
-    warp_mma(D, A, B, C, warp_tileB_k_offset);
-}
-
-////////////////////////////////////////////////////////////////////////////////
 
 /// Structure to compute the matrix product targeting CUDA cores and SIMT math
 /// instructions.

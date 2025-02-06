@@ -25,6 +25,7 @@ from ..functional import (Tensor, _add_plugin_info, _create_tensor, cast, clip,
                           constant, flatten, layer_norm, matmul,
                           repeat_interleave, rms_norm, round, sum, view)
 from ..layers.linear import ColumnLinear
+from ..parameter import Parameter
 from ..plugin import TRT_LLM_PLUGIN_NAMESPACE
 from .mode import QuantMode
 
@@ -261,7 +262,7 @@ def weight_only_groupwise_quant_matmul(input: Tensor,
                                        scales: Tensor,
                                        zeros: Tensor,
                                        biases: Tensor,
-                                       alpha: Tensor,
+                                       alpha: Parameter,
                                        quant_algo: int,
                                        group_size: int,
                                        dtype: str = 'float16') -> Tensor:
@@ -273,7 +274,7 @@ def weight_only_groupwise_quant_matmul(input: Tensor,
 
         if quant_algo & 8:
             # fp8_alpha
-            input = input * alpha
+            input = input * alpha.value
         if quant_algo & 4:
             # pre quant
             input = input * pre_quant_scale
@@ -299,13 +300,24 @@ def weight_only_groupwise_quant_matmul(input: Tensor,
                                       np.array(group_size, dtype=np.int32),
                                       trt.PluginFieldType.INT32)
 
+        if alpha:
+            alpha.is_buffer = True
+            alpha_value = alpha.raw_value[0]
+        else:
+            alpha_value = 1.0
+
+        alpha_ = trt.PluginField("alpha", np.array(alpha_value,
+                                                   dtype=np.float32),
+                                 trt.PluginFieldType.FLOAT32)
+
         p_dtype = default_net(
         ).plugin_config.weight_only_groupwise_quant_matmul_plugin
         pf_type_ = trt.PluginField(
             "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
             trt.PluginFieldType.INT32)
 
-        pfc = trt.PluginFieldCollection([pf_type_, quant_algo_, group_size_])
+        pfc = trt.PluginFieldCollection(
+            [pf_type_, quant_algo_, group_size_, alpha_])
 
         matmul_plug = plg_creator.create_plugin("woq_groupwise_matmul", pfc)
 
@@ -318,7 +330,6 @@ def weight_only_groupwise_quant_matmul(input: Tensor,
         BIAS = 1
         ZERO = 2
         PRE_QUANT_SCALE = 4
-        FP8_ALPHA = 8
 
         if quant_algo & PRE_QUANT_SCALE:
             plug_inputs += [pre_quant_scale.trt_tensor]
@@ -329,8 +340,6 @@ def weight_only_groupwise_quant_matmul(input: Tensor,
             plug_inputs += [zeros.trt_tensor]
         if quant_algo & BIAS:
             plug_inputs += [biases.trt_tensor]
-        if quant_algo & FP8_ALPHA:
-            plug_inputs += [alpha.trt_tensor]
 
         layer = default_trtnet().add_plugin_v2(plug_inputs, matmul_plug)
         _add_plugin_info(layer, plg_creator, "woq_groupwise_matmul", pfc)
@@ -1061,3 +1070,143 @@ def postprocess_fp8_rowwise(tllm_key, weights, **kwargs):
             tllm_key: processed_torch_weights,
             tllm_key.replace("weight", "per_channel_scale"): torch_weight_scales
         }
+
+
+def fp4_gemm(input: Tensor,
+             input_sf: Tensor,
+             weight: Tensor,
+             weight_sf: Tensor,
+             global_sf: Tensor,
+             output_dtype: str | trt.DataType,
+             scaling_vector_size: int = 16):
+    '''
+    Parameters:
+        input : Tensor (On GPU)
+            The input tensor. Its shape is [batch_size, seq_len, input_dim] or [num_tokens, input_dim] for remove_input_padding, should be fp4
+        input_sf : Tensor (On GPU)
+            The input scaling factor tensor. Its shape is [batch_size, seq_len, input_dim / scaling_vector_size] or [num_tokens, input_dim / scaling_vector_size] for remove_input_padding, should be int32 (4 packed)
+        weight : Tensor (On GPU)
+            The weight tensor. Its shape is [output_dim, input_dim], should be fp4
+        weight_sf : Tensor (On GPU)
+            The weight scaling factor tensor. Its shape is [output_dim, input_dim / scaling_vector_size], should be fp8
+        global_sf : Tensor (On GPU)
+            The global scaling factor tensor. Its shape is [1,], should be float32, used as alpha of Gemm.
+        output_dtype: str
+            output data type
+        scaling_vector_size: int
+            scaling vector block size
+    '''
+    if isinstance(output_dtype, str):
+        output_dtype = str_dtype_to_trt(output_dtype)
+
+    fp4_gemm_plg_creator = trt.get_plugin_registry().get_plugin_creator(
+        'Fp4Gemm', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert fp4_gemm_plg_creator is not None
+    sv_vec_size = trt.PluginField("sv_vec_size",
+                                  np.array(scaling_vector_size, dtype=np.int32),
+                                  trt.PluginFieldType.INT32)
+    output_dtype = trt.PluginField("output_type_id",
+                                   np.array([int(output_dtype)], np.int32),
+                                   trt.PluginFieldType.INT32)
+    pfc = trt.PluginFieldCollection([sv_vec_size, output_dtype])
+    fp4_gemm_plug = fp4_gemm_plg_creator.create_plugin("fp4_gemm", pfc)
+    plug_inputs = [input, input_sf, weight, weight_sf, global_sf]
+    plug_inputs = [i.trt_tensor for i in plug_inputs]
+    layer = default_trtnet().add_plugin_v2(plug_inputs, fp4_gemm_plug)
+    _add_plugin_info(layer, fp4_gemm_plg_creator, "fp4_gemm", pfc)
+    output = _create_tensor(layer.get_output(0), layer)
+    return output
+
+
+def quantize_to_fp4_tensor(input: Tensor, sf_scale: Tensor):
+    '''
+    Parameters:
+        input : Tensor (On GPU)
+            The input tensor. Its shape is [batch_size, seq_len, input_dim] or [num_tokens, input_dim] for remove_input_padding, should be fp16
+        sf_scale : Tensor (On GPU)
+            The global per-tensor scaling factor. Its shape is [1,], should be float32.
+            used to scale SF from input range to fp8 range (448.f / (MaxVal of input / 6.f)).
+        output : Tensor (On GPU)
+            The output tensor. Its shape is [batch_size, seq_len, input_dim] or [num_tokens, input_dim] for remove_input_padding, should be FP4
+        output_sf : Tensor (On GPU)
+            The input scaling factor tensor. Its shape is [batch_size, seq_len, input_dim / scaling_vector_size] or [num_tokens, input_dim / scaling_vector_size] for remove_input_padding, should be FP8
+    '''
+    plg_creator = trt.get_plugin_registry().get_plugin_creator(
+        'QuantizeToFP4', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert plg_creator is not None
+
+    pfc = trt.PluginFieldCollection([])
+    quantize_plug = plg_creator.create_plugin("quantize_to_fp4_plugin", pfc)
+
+    plug_inputs = [input.trt_tensor, sf_scale.trt_tensor]
+    layer = default_trtnet().add_plugin_v2(plug_inputs, quantize_plug)
+    _add_plugin_info(layer, plg_creator, "quantize_to_fp4_plugin", pfc)
+
+    quantized = _create_tensor(layer.get_output(0), layer)
+    scales = _create_tensor(layer.get_output(1), layer)
+    return quantized, scales
+
+
+def dynamic_quantize(
+        x: Tensor,
+        double_scale: Tensor,
+        axis: int = -1,
+        block_size: int = 16,
+        data_qtype: trt.DataType = trt.fp4,
+        scale_qtype: trt.DataType = trt.fp8) -> Tuple[Tensor, Tensor]:
+    '''
+    Parameters:
+        x : Tensor (On GPU)
+            The input tensor.
+        double_scale : Tensor (On GPU)
+            The global per-tensor scaling factor. It should contain only 1 element.
+        axis : int
+            The axis to quantize. Default is -1 (the last axis).
+        block_size : int
+            The block size for quantization. Default is 16.
+        data_qtype : trt.DataType
+            The data type for quantized data. Default is FP4.
+        scale_qtype : trt.DataType
+            The data type for block scale. Default is FP8.
+    Returns:
+        A tuple of two tensors: quantized tensor and block scale tensor.
+    '''
+    if axis < 0:
+        axis = len(x.shape) + axis
+    dynq = default_trtnet().add_dynamic_quantize(x.trt_tensor, axis, block_size,
+                                                 data_qtype, scale_qtype)
+    dynq.set_input(1, double_scale.trt_tensor)
+    quantized = _create_tensor(dynq.get_output(0), dynq)
+    scale = _create_tensor(dynq.get_output(1), dynq)
+    return quantized, scale
+
+
+def block_double_dequantize(x: Tensor,
+                            scale: Tensor,
+                            double_scale: Tensor,
+                            dtype: trt.DataType | str = 'float16') -> Tensor:
+    '''
+    Parameters:
+        x : Tensor (On GPU)
+            The input tensor.
+        scale : Tensor (On GPU)
+            The block scale tensor.
+        double_scale : Tensor (On GPU)
+            The global per-tensor scaling factor. It should contain only 1 element.
+        dtype : trt.DataType | str
+            The data type for dequantized data. Default is float32.
+    Returns:
+        The dequantized tensor.
+    '''
+    if isinstance(dtype, str):
+        dtype = str_dtype_to_trt(dtype)
+    dequantize_scale_layer = default_trtnet().add_dequantize(
+        scale.trt_tensor, double_scale.trt_tensor, dtype)
+    scale = _create_tensor(dequantize_scale_layer.get_output(0),
+                           dequantize_scale_layer)
+
+    dequantize_data_layer = default_trtnet().add_dequantize(
+        x.trt_tensor, scale.trt_tensor, dtype)
+    dequantize_data = _create_tensor(dequantize_data_layer.get_output(0),
+                                     dequantize_data_layer)
+    return dequantize_data

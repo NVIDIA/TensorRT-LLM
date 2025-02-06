@@ -6,11 +6,14 @@ set(TRTLLM_PYBIND_MODULE
 set(SRCS
     batch_manager/algorithms.cpp
     batch_manager/bindings.cpp
+    batch_manager/buffers.cpp
     batch_manager/kvCacheManager.cpp
     batch_manager/llmRequest.cpp
     executor/bindings.cpp
     executor/executor.cpp
     runtime/bindings.cpp
+    userbuffers/bindings.cpp
+    ../runtime/ipcNvlsMemory.cpp
     bindings.cpp)
 
 include_directories(${PROJECT_SOURCE_DIR}/include)

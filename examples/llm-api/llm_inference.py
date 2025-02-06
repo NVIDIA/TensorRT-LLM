@@ -6,7 +6,8 @@ from tensorrt_llm import LLM, SamplingParams
 
 def main():
 
-    # Model could accept HF model name or a path to local HF model.
+    # Model could accept HF model name, a path to local HF model,
+    # or TensorRT Model Optimizer's quantized checkpoints like nvidia/Llama-3.1-8B-Instruct-FP8 on HF.
     llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
     # You can save the engine to disk and load it back later, the LLM class can accept either a HF model or a TRT-LLM engine.

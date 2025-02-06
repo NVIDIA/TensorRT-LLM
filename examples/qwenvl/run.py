@@ -97,6 +97,9 @@ class QWenInfer(object):
 
         use_gpt_attention_plugin = config["build_config"]["plugin_config"][
             "gpt_attention_plugin"]
+        gemm_allreduce_plugin = config["build_config"]["plugin_config"][
+            "gemm_allreduce_plugin"]
+
         remove_input_padding = config["build_config"]["plugin_config"][
             "remove_input_padding"]
         dtype = config["pretrained_config"]["dtype"]
@@ -148,6 +151,7 @@ class QWenInfer(object):
             vocab_size=vocab_size,
             num_layers=num_layers,
             gpt_attention_plugin=use_gpt_attention_plugin,
+            gemm_allreduce_plugin=gemm_allreduce_plugin,
             kv_cache_type=kv_cache_type,
             tokens_per_block=tokens_per_block,
             remove_input_padding=remove_input_padding,

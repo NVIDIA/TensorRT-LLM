@@ -29,7 +29,7 @@ namespace kv_cache
 {
 class CommState;
 class CacheState;
-class SocketState;
+struct SocketState;
 } // namespace kv_cache
 
 class Serialization

@@ -38,6 +38,7 @@ option(WARNING_IS_ERROR "Treat all warnings as errors" OFF)
 option(FAST_BUILD "Skip compiling some kernels to accelerate compiling" OFF)
 option(FAST_MATH "Compiling in fast math mode" OFF)
 option(INDEX_RANGE_CHECK "Compiling with index range checks" OFF)
+option(COMPRESS_FATBIN "Compress everything in fatbin" ON)
 
 # Always use static NVRTC for IP protection reasons.
 set(USE_SHARED_NVRTC OFF)
@@ -213,7 +214,10 @@ endif()
 
 # Initialize CMAKE_CUDA_ARCHITECTURES before enabling CUDA
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "11.8")
+  if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.7")
+    set(CMAKE_CUDA_ARCHITECTURES 80-real 86-real 89-real 90-real 100-real
+                                 120-real)
+  elseif(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "11.8")
     set(CMAKE_CUDA_ARCHITECTURES 80-real 86-real 89-real 90-real)
   else()
     set(CMAKE_CUDA_ARCHITECTURES 80-real 86-real)
@@ -245,6 +249,17 @@ else()
   set(CMAKE_CUDA_ARCHITECTURES_ORIG "${CMAKE_CUDA_ARCHITECTURES}")
 endif()
 message(STATUS "GPU architectures: ${CMAKE_CUDA_ARCHITECTURES_ORIG}")
+
+set(ARCHES "80" "86" "89" "90" "100" "120")
+foreach(ARCH IN LISTS ARCHES)
+  if(NOT "${ARCH}" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
+     AND NOT "${ARCH}-real" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
+     AND NOT "all" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
+     AND NOT "all-major" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
+    add_definitions("-DEXCLUDE_SM_${ARCH}")
+    message(STATUS "Excluding SM ${ARCH}")
+  endif()
+endforeach()
 
 enable_language(C CXX CUDA)
 
@@ -358,6 +373,14 @@ if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "11.8")
   )
 endif()
 
+if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "12.8")
+  add_definitions("-DENABLE_FP4")
+  message(
+    STATUS
+      "CUDAToolkit_VERSION ${CUDAToolkit_VERSION_MAJOR}.${CUDAToolkit_VERSION_MINOR} is greater or equal than 12.8, enable -DENABLE_FP4 flag"
+  )
+endif()
+
 if(ENABLE_MULTI_DEVICE)
   # MPI MPI isn't used until tensorrt_llm/CMakeLists.txt is invoked. However, if
   # it's not called before "CMAKE_CXX_FLAGS" is set, it breaks on Windows for
@@ -379,8 +402,11 @@ endif()
 # Note: The following are desirable settings that should be enabled if we
 # decrease shared library size. See e.g.
 # https://github.com/rapidsai/cudf/pull/6134 for a similar issue in another
-# project. set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO
-# "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO} --generate-line-info")
+# project.
+
+# set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO}
+# --generate-line-info")
+
 # set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -G")
 
 set(CMAKE_CXX_FLAGS
@@ -391,7 +417,9 @@ set(CMAKE_CXX_FLAGS
 # be found in
 # https://gcc.gnu.org/onlinedocs/gcc/x86-Options.html#index-mcmodel_003dmedium-1
 if(CMAKE_SYSTEM_PROCESSOR STREQUAL x86_64)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mcmodel=medium  -Wl,--no-relax")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mcmodel=medium")
+  set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--no-relax")
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--no-relax")
 endif()
 
 # Disable deprecated declarations warnings
@@ -441,8 +469,11 @@ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-extended-lambda")
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr")
 if(FAST_MATH)
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --use_fast_math")
-  message("CMAKE_CUDA_FLAGS: ${CMAKE_CUDA_FLAGS}")
 endif()
+if(COMPRESS_FATBIN)
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --fatbin-options -compress-all")
+endif()
+message("CMAKE_CUDA_FLAGS: ${CMAKE_CUDA_FLAGS}")
 
 set(COMMON_HEADER_DIRS ${PROJECT_SOURCE_DIR} ${CUDAToolkit_INCLUDE_DIR})
 message(STATUS "COMMON_HEADER_DIRS: ${COMMON_HEADER_DIRS}")
@@ -469,6 +500,8 @@ if(BUILD_PYT)
   foreach(CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
     if(CUDA_ARCH MATCHES "^([0-9])([0-9])(-real)*$")
       set(TORCH_ARCH "${CMAKE_MATCH_1}.${CMAKE_MATCH_2}")
+    elseif(CUDA_ARCH MATCHES "^1([0-9])([0-9])(-real)*$")
+      set(TORCH_ARCH "1${CMAKE_MATCH_1}.${CMAKE_MATCH_2}")
     elseif(CUDA_ARCH STREQUAL "native")
       set(TORCH_ARCH "Auto")
     else()
@@ -534,11 +567,35 @@ print(os.path.dirname(torch.__file__),end='');"
     endif()
   endif()
 
-elseif(NOT WIN32)
-  if(NOT USE_CXX11_ABI)
-    add_compile_options("-D_GLIBCXX_USE_CXX11_ABI=0")
+else()
+  if(NOT "all" IN_LIST CMAKE_CUDA_ARCHITECTURES
+     AND NOT "all-major" IN_LIST CMAKE_CUDA_ARCHITECTURES
+     AND NOT "native" IN_LIST CMAKE_CUDA_ARCHITECTURES)
+    foreach(CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
+      if(CUDA_ARCH MATCHES "^([1-9][0-9][0-9]?a?)(-real)?$")
+        string(
+          APPEND
+          CMAKE_CUDA_FLAGS
+          " --generate-code=arch=compute_${CMAKE_MATCH_1},code=sm_${CMAKE_MATCH_1}"
+        )
+      endif()
+      if(CUDA_ARCH MATCHES "^([1-9][0-9][0-9]?a?)(-virtual)?$")
+        string(
+          APPEND
+          CMAKE_CUDA_FLAGS
+          " --generate-code=arch=compute_${CMAKE_MATCH_1},code=compute_${CMAKE_MATCH_1}"
+        )
+      endif()
+    endforeach()
+    set(CMAKE_CUDA_ARCHITECTURES OFF)
   endif()
-  message(STATUS "Build without PyTorch, USE_CXX11_ABI=${USE_CXX11_ABI}")
+
+  if(NOT WIN32)
+    if(NOT USE_CXX11_ABI)
+      add_compile_options("-D_GLIBCXX_USE_CXX11_ABI=0")
+    endif()
+    message(STATUS "Build without PyTorch, USE_CXX11_ABI=${USE_CXX11_ABI}")
+  endif()
 endif()
 
 # Defer UCX/UCXX setup until after USE_CXX11_ABI is well defined, as UCXX will
@@ -559,12 +616,18 @@ if(ENABLE_UCX)
         ${3RDPARTY_DIR}/ucxx/build.sh libucxx -n
         --cmake-args=\"-DBUILD_SHARED_LIBS=OFF
         -DCMAKE_CXX_FLAGS=-D_GLIBCXX_USE_CXX11_ABI=${USE_CXX11_ABI}\"
-        COMMAND_ECHO STDOUT)
+        OUTPUT_QUIET)
     find_package(ucxx REQUIRED PATHS ${3RDPARTY_DIR}/ucxx/cpp/build
                  NO_DEFAULT_PATH)
   endif()
 endif()
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DENABLE_UCX=${ENABLE_UCX}")
+
+string(REPLACE "arch=compute_100,code=sm_100" "arch=compute_100a,code=sm_100a"
+               CMAKE_CUDA_FLAGS ${CMAKE_CUDA_FLAGS})
+
+string(REPLACE "arch=compute_120,code=sm_120" "arch=compute_120a,code=sm_120a"
+               CMAKE_CUDA_FLAGS ${CMAKE_CUDA_FLAGS})
 
 file(STRINGS "${TRT_INCLUDE_DIR}/NvInferVersion.h" VERSION_STRINGS
      REGEX "#define NV_TENSORRT_.*")

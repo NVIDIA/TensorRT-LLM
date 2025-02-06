@@ -12,8 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
-import sys
 import unittest
 
 import _utils
@@ -32,9 +30,6 @@ import tensorrt_llm
 from tensorrt_llm import Tensor
 from tensorrt_llm.quantization.functional import (qserve_gemm_per_channel,
                                                   qserve_gemm_per_group)
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import skip_pre_ampere
 
 
 class TestQServeGemm(unittest.TestCase):
@@ -245,7 +240,6 @@ class TestQServeGemm(unittest.TestCase):
         # Allow some difference.
         self.assertTrue(np.allclose(output, ref, rtol=1e-2, atol=0.25))
 
-    @skip_pre_ampere
     def test_qserve_gemm_per_group(self, dtype='float16'):
         bs = 2
         inseq = 16
@@ -263,7 +257,6 @@ class TestQServeGemm(unittest.TestCase):
                                          hidden_size,
                                          dtype=dtype)
 
-    @skip_pre_ampere
     def test_qserve_gemm_per_channel(self, dtype='float16'):
         bs = 2
         inseq = 16

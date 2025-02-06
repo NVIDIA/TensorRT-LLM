@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Optional, Union
@@ -35,6 +36,10 @@ class LLaMAConfig(PretrainedConfig):
                  disable_weight_only_quant_plugin: bool = False,
                  moe: Optional[Union[MoeConfig, dict]] = None,
                  remove_duplicated_kv_heads: bool = False,
+                 embedding_multiplier: float = 1.0,
+                 attention_multiplier: float = 1.0,
+                 residual_multiplier: float = 1.0,
+                 output_multiplier_scale: float = 1.0,
                  **kwargs):
         self.mlp_bias = mlp_bias
         self.attn_bias = attn_bias
@@ -59,6 +64,11 @@ class LLaMAConfig(PretrainedConfig):
         self.use_input_layernorm_in_first_layer = True
         self.use_last_layernorm = True
         self.layer_idx_offset = 0
+        self.embedding_multiplier = embedding_multiplier
+        self.attention_multiplier = attention_multiplier
+        self.residual_multiplier = residual_multiplier
+        self.output_multiplier_scale = output_multiplier_scale
+        self.has_partial_lora_mask = False
 
         super().__init__(**kwargs)
 
@@ -91,12 +101,13 @@ class LLaMAConfig(PretrainedConfig):
         import transformers
 
         trust_remote_code = kwargs.pop('trust_remote_code', True)
+        has_partial_lora_mask = False
 
         if isinstance(hf_config_or_dir, transformers.PretrainedConfig):
             hf_config = hf_config_or_dir
         else:
             hf_config_dir = str(hf_config_or_dir)
-            if "vila" in hf_config_dir:
+            if "vila" in hf_config_dir.lower():
                 sys.path.append(hf_config_dir + "/../VILA")
                 from llava.model import LlavaLlamaConfig  # noqa
                 from llava.model import LlavaLlamaModel
@@ -122,6 +133,10 @@ class LLaMAConfig(PretrainedConfig):
                     "architectures"][0]
                 hf_config.llm_cfg["dtype"] = hf_config.llm_cfg["torch_dtype"]
                 hf_config = PretrainedConfig.from_dict(hf_config.llm_cfg)
+            if hf_config.model_type == 'internlmxcomposer2':
+                # InternLM-XComposer2 has a mask for partial lora
+                # Therefore we need an additional flag for this mask
+                has_partial_lora_mask = True
 
         num_key_value_heads = getattr(hf_config, "num_key_value_heads",
                                       hf_config.num_attention_heads)
@@ -146,8 +161,14 @@ class LLaMAConfig(PretrainedConfig):
             'disable_weight_only_quant_plugin', False)
         remove_duplicated_kv_heads = kwargs.pop('remove_duplicated_kv_heads',
                                                 False)
-
-        if hf_config.model_type == "mixtral" or hf_config.model_type == "arctic":
+        embedding_multiplier = getattr(hf_config, "embedding_multiplier", 1.0)
+        attention_multiplier = getattr(hf_config, "attention_multiplier", 1.0)
+        if attention_multiplier != 1.0:
+            attention_multiplier *= math.sqrt(head_size)
+        residual_multiplier = getattr(hf_config, "residual_multiplier", 1.0)
+        output_multiplier_scale = 1.0 / getattr(hf_config, "logits_scaling",
+                                                1.0)
+        if hf_config.model_type in ["mixtral", "arctic", "granitemoe"]:
             # HF LLaMA-type models are implicitly using gated activation.
             # With our MoE implementation, we must make it explicit
             hidden_act = "swiglu"
@@ -186,8 +207,13 @@ class LLaMAConfig(PretrainedConfig):
             moe=moe_config,
             mapping=mapping,
             quantization=quant_config,
+            has_partial_lora_mask=has_partial_lora_mask,
             remove_duplicated_kv_heads=remove_duplicated_kv_heads,
             tie_word_embeddings=tie_word_embeddings,
+            embedding_multiplier=embedding_multiplier,
+            attention_multiplier=attention_multiplier,
+            residual_multiplier=residual_multiplier,
+            output_multiplier_scale=output_multiplier_scale,
             **kwargs)
 
     @classmethod

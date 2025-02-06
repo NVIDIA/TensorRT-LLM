@@ -204,14 +204,22 @@ template <typename KVCacheBuffer>
 struct XQALaunchParam
 {
     uint32_t num_k_heads;
+    uint32_t slidingWindowSize;
+    float qScale;
     void* output;
+    float const* rcpOutScale;
     void const* qkv;
+    float2 const* ropeCosSin;
     KVCache<KVCacheBuffer> kvCacheParams;
     std::optional<BeamSearchParams> beamSearchParams;
     uint32_t batch_size;
     float const* kv_scale_quant_orig = nullptr;
     int* cu_seq_lens = nullptr;
+    int* cu_kv_seq_lens = nullptr;
     float* rotary_inv_freq_buf = nullptr;
+    int2* tokens_info = nullptr;
+    float* bmm1_scale_ptr = nullptr;
+    float* bmm2_scale_ptr = nullptr;
     int32_t* semaphores = nullptr;
     void* scratch = nullptr;
 };
@@ -225,34 +233,59 @@ void buildXQALaunchParams(XQALaunchParam<KVCacheBuffer>& launchParams, void*& in
         params.data_type == DATA_TYPE_FP16 || params.data_type == DATA_TYPE_BF16, "Only fp16 or bf16 supported now.");
     memset(&launchParams, 0, sizeof(XQALaunchParam<KVCacheBuffer>));
     launchParams.num_k_heads = params.num_kv_heads;
+    launchParams.slidingWindowSize = params.cyclic_attention_window_size;
+    launchParams.qScale = params.q_scaling;
     launchParams.output = static_cast<uint8_t*>(params.output);
+    launchParams.rcpOutScale = params.fp8_out_scale;
     launchParams.qkv = static_cast<uint8_t const*>(params.qkv);
+    launchParams.ropeCosSin = params.rotary_cos_sin;
     launchParams.batch_size = params.batch_size;
     launchParams.kv_scale_quant_orig = params.kv_scale_quant_orig;
     launchParams.semaphores = params.semaphores;
 
-    // Workspace.
-    size_t offset = 0;
-    int8_t* workspace = reinterpret_cast<int8_t*>(params.workspaces);
-    inputScratch = workspace;
-    workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(
-        workspace, 2 * params.head_size * params.num_q_heads * params.total_num_input_tokens);
-    if (hasOutputScratch)
-    {
-        launchParams.output = workspace;
-        workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(
-            workspace, 2 * params.head_size * params.num_q_heads * params.total_num_input_tokens);
-    }
-    unsigned int batch_beam_size = params.batch_size * params.beam_width;
-    const size_t cu_seqlens_size = sizeof(int) * (batch_beam_size + 1);
-    const size_t rotary_inv_freq_size = sizeof(float) * batch_beam_size * params.rotary_embedding_dim / 2;
-    launchParams.cu_seq_lens = reinterpret_cast<int*>(workspace);
-    workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(workspace, cu_seqlens_size);
-    launchParams.rotary_inv_freq_buf = reinterpret_cast<float*>(workspace);
+    // The workspace alignment.
     auto const multi_block_workspace_alignment = tensorrt_llm::common::roundUp(
         sizeof(half) * params.head_size * (params.num_q_heads / params.num_kv_heads) * params.beam_width, 128);
-    workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(
-        workspace, rotary_inv_freq_size, multi_block_workspace_alignment);
+
+    // Workspace.
+    int8_t* workspace = reinterpret_cast<int8_t*>(params.workspaces);
+    unsigned int batch_beam_size = params.batch_size * params.beam_width;
+    const size_t cu_seqlens_size = sizeof(int) * (batch_beam_size + 1);
+    const size_t cu_kv_seqlens_size = sizeof(int) * (batch_beam_size + 1);
+    const size_t rotary_inv_freq_size = sizeof(float) * batch_beam_size * params.rotary_embedding_dim / 2;
+    const size_t tokens_info_size = sizeof(int2) * params.total_num_input_tokens;
+    launchParams.cu_seq_lens = reinterpret_cast<int*>(workspace);
+    workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(workspace, cu_seqlens_size);
+    launchParams.cu_kv_seq_lens = reinterpret_cast<int*>(workspace);
+    workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(workspace, cu_kv_seqlens_size);
+    launchParams.rotary_inv_freq_buf = reinterpret_cast<float*>(workspace);
+    workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(workspace, rotary_inv_freq_size);
+    launchParams.tokens_info = reinterpret_cast<int2*>(workspace);
+    workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(workspace, tokens_info_size);
+    // Only used for trtllm-gen kernels.
+    size_t const bmm1_scale_size = sizeof(float) * 2;
+    size_t const bmm2_scale_size = sizeof(float);
+    launchParams.bmm1_scale_ptr = reinterpret_cast<float*>(workspace);
+    workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(workspace, bmm1_scale_size);
+    launchParams.bmm2_scale_ptr = reinterpret_cast<float*>(workspace);
+    workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(workspace, bmm2_scale_size);
+    inputScratch = workspace;
+    if (hasOutputScratch)
+    {
+        workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(
+            workspace, 2 * params.head_size * params.num_q_heads * params.total_num_input_tokens);
+        // Only used for output conversion.
+        launchParams.output = workspace;
+        workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(workspace,
+            2 * params.head_size * params.num_q_heads * params.total_num_input_tokens, multi_block_workspace_alignment);
+    }
+    else
+    {
+        workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(workspace,
+            2 * params.head_size * params.num_q_heads * params.total_num_input_tokens, multi_block_workspace_alignment);
+    }
+    workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(workspace,
+        2 * params.head_size * params.num_q_heads * params.total_num_input_tokens, multi_block_workspace_alignment);
     launchParams.scratch = reinterpret_cast<void*>(workspace);
 
     launchParams.kvCacheParams = KVCache<KVCacheBuffer>(kv_cache_buffer);
@@ -298,9 +331,14 @@ std::optional<T> getGlobalVar(std::shared_ptr<tensorrt_llm::common::CUDADriverWr
 
 inline int computeMultiBlockCount(XQAParams const& xqaParams, int batch_size, int multiprocessor_count)
 {
+    auto const userSpecified = tensorrt_llm::common::getEnvXqaBlocksPerSequence();
+    if (userSpecified.has_value())
+    {
+        return userSpecified.value();
+    }
     int multi_block_count = 1;
     int num_kv_heads = xqaParams.num_kv_heads;
-    int history_length = xqaParams.timestep;
+    int history_length = xqaParams.max_past_kv_length;
 
     int32_t const maxNbSubSeq = kXQA_MAX_NUM_SUB_SEQ;
 

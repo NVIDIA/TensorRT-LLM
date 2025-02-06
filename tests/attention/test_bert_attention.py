@@ -29,7 +29,7 @@ from tensorrt_llm import Tensor
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import skip_fp32_accum_pre_ampere, unittest_name_func
+from utils.util import unittest_name_func
 
 
 class TestFunctional(unittest.TestCase):
@@ -49,7 +49,6 @@ class TestFunctional(unittest.TestCase):
     @parameterized.expand(load_test_cases, name_func=unittest_name_func)
     def test_bert_attention(self, batch_size, in_len, num_heads, head_size,
                             context_fmha_type, dtype):
-        skip_fp32_accum_pre_ampere(context_fmha_type)
 
         def _construct_execution(input_tensor, weight, bias, input_lengths,
                                  num_heads, hidden_size, output, dtype,

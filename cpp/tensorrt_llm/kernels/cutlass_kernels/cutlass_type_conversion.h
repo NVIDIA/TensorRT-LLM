@@ -16,8 +16,10 @@
 
 #pragma once
 
+#include <NvInferRuntime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+
 #include <cuda_fp8.h>
 
 #include "cutlass/bfloat16.h"
@@ -30,6 +32,32 @@ namespace kernels
 {
 namespace cutlass_kernels
 {
+///////////////////////////////////////////////////////////////////////////////////////////////////
+// nvinfer1::DataType to Cutlass
+///////////////////////////////////////////////////////////////////////////////////////////////////
+template <nvinfer1::DataType>
+struct CutlassType
+{
+    using type = void;
+};
+
+template <>
+struct CutlassType<nvinfer1::DataType::kHALF>
+{
+    using type = cutlass::half_t;
+};
+
+template <>
+struct CutlassType<nvinfer1::DataType::kBF16>
+{
+    using type = cutlass::bfloat16_t;
+};
+
+template <>
+struct CutlassType<nvinfer1::DataType::kFP8>
+{
+    using type = cutlass::float_e4m3_t;
+};
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 // Tllm to Cutlass

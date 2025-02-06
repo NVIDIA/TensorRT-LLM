@@ -37,7 +37,7 @@
 #include <string>
 #include <unordered_map>
 
-namespace tensorrt_llm::common
+namespace tensorrt_llm::common::op
 {
 
 // Write values into buffer
@@ -52,8 +52,22 @@ void write(char*& buffer, T const& val)
 template <typename T>
 void read(char const*& buffer, T& val)
 {
-    std::memcpy(&val, buffer, sizeof(T));
+    auto* valPtr = reinterpret_cast<char*>(&val);
+    std::memcpy(valPtr, buffer, sizeof(T));
     buffer += sizeof(T);
+}
+
+inline cudaDataType_t trtToCublasDtype(nvinfer1::DataType type)
+{
+    switch (type)
+    {
+    case nvinfer1::DataType::kFLOAT: return CUDA_R_32F;
+    case nvinfer1::DataType::kHALF: return CUDA_R_16F;
+#if defined(NV_TENSORRT_MAJOR) && NV_TENSORRT_MAJOR >= 9
+    case nvinfer1::DataType::kBF16: return CUDA_R_16BF;
+#endif
+    default: TLLM_THROW("Not supported data type for cuBLAS");
+    }
 }
 
 // Like std::unique_ptr, but does not prevent generation of default copy constructor when used as class members.
@@ -79,9 +93,36 @@ public:
     }
 };
 
+template <typename T>
+std::size_t hash_combine(std::size_t seed, T const& value)
+{
+    std::hash<T> hasher;
+    seed ^= hasher(value) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+    return seed;
+}
+
+template <typename T>
+struct TupleHash;
+
+template <typename... Args>
+struct TupleHash<std::tuple<Args...>>
+{
+    std::size_t operator()(std::tuple<Args...> const& tuple) const noexcept
+    {
+        std::size_t seed = static_cast<std::size_t>(672807365);
+        return std::apply(
+            [&seed](auto const&... args)
+            {
+                ((seed = hash_combine(seed, args)), ...);
+                return seed;
+            },
+            tuple);
+    }
+};
+
 // for testing only
 void const* getCommSessionHandle();
-} // namespace tensorrt_llm::common
+} // namespace tensorrt_llm::common::op
 
 inline bool isBuilding()
 {
@@ -112,8 +153,6 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group);
 //! Get cublas and cublasLt handle for current cuda context
 std::shared_ptr<cublasHandle_t> getCublasHandle();
 std::shared_ptr<cublasLtHandle_t> getCublasLtHandle();
-std::shared_ptr<tensorrt_llm::common::CublasMMWrapper> getCublasMMWrapper(std::shared_ptr<cublasHandle_t> cublasHandle,
-    std::shared_ptr<cublasLtHandle_t> cublasltHandle, cudaStream_t stream, void* workspace);
 
 #ifndef DEBUG
 

@@ -293,9 +293,9 @@ class TestNetworkForGraphRewrite(unittest.TestCase):
         self.assertTrue('digraph' in dot_code)
 
     def test_to_onnx(self):
-        file_path = Path('./rank0.onnx')
-        self.network.to_onnx(file_path)
-        self.assertTrue(file_path.exists())
+        file_path = Path('.')
+        self.network.to_onnx(str(file_path))
+        self.assertTrue((file_path / "network.onnx").exists())
 
 
 class TestLayer(unittest.TestCase):

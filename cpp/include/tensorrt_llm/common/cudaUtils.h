@@ -29,9 +29,10 @@
 #include <cuda_runtime.h>
 #include <driver_types.h>
 #include <fstream>
-#include <iostream>
+#include <iomanip>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <string>
 #ifndef _WIN32 // Linux
 #include <sys/sysinfo.h>
@@ -119,23 +120,23 @@ static char const* _cudaGetErrorEnum(cublasStatus_t error)
 }
 
 template <typename T>
-void check(T result, char const* const func, char const* const file, int const line)
+void check(T ptr, char const* const func, char const* const file, int const line)
 {
-    if (result)
+    if (ptr)
     {
         throw TllmException(
-            file, line, fmtstr("[TensorRT-LLM][ERROR] CUDA runtime error in %s: %s", func, _cudaGetErrorEnum(result)));
+            file, line, fmtstr("[TensorRT-LLM][ERROR] CUDA runtime error in %s: %s", func, _cudaGetErrorEnum(ptr)));
     }
 }
 
 template <typename T>
-void checkEx(T result, std::initializer_list<T> const& validReturns, char const* const func, char const* const file,
-    int const line)
+void checkEx(
+    T ptr, std::initializer_list<T> const& validReturns, char const* const func, char const* const file, int const line)
 {
-    if (std::all_of(std::begin(validReturns), std::end(validReturns), [&result](T const& t) { return t != result; }))
+    if (std::all_of(std::begin(validReturns), std::end(validReturns), [&ptr](T const& t) { return t != ptr; }))
     {
         throw TllmException(
-            file, line, fmtstr("[TensorRT-LLM][ERROR] CUDA runtime error in %s: %s", func, _cudaGetErrorEnum(result)));
+            file, line, fmtstr("[TensorRT-LLM][ERROR] CUDA runtime error in %s: %s", func, _cudaGetErrorEnum(ptr)));
     }
 }
 
@@ -145,23 +146,23 @@ void checkEx(T result, std::initializer_list<T> const& validReturns, char const*
 inline std::optional<bool> isCudaLaunchBlocking()
 {
     static bool firstCall = true;
-    static std::optional<bool> result = std::nullopt;
+    static std::optional<bool> ptr = std::nullopt;
 
     if (firstCall)
     {
         char const* env = std::getenv("CUDA_LAUNCH_BLOCKING");
         if (env != nullptr && std::string(env) == "1")
         {
-            result = true;
+            ptr = true;
         }
         else if (env != nullptr && std::string(env) == "0")
         {
-            result = false;
+            ptr = false;
         }
         firstCall = false;
     }
 
-    return result;
+    return ptr;
 }
 
 inline bool doCheckError()
@@ -294,14 +295,14 @@ inline int getSMVersion()
 
 inline int getDevice()
 {
-    int current_dev_id = 0;
-    check_cuda_error(cudaGetDevice(&current_dev_id));
-    return current_dev_id;
+    int deviceID{0};
+    check_cuda_error(cudaGetDevice(&deviceID));
+    return deviceID;
 }
 
 inline int getDeviceCount()
 {
-    int count = 0;
+    int count{0};
     check_cuda_error(cudaGetDeviceCount(&count));
     return count;
 }
@@ -373,34 +374,44 @@ inline size_t getAllocationGranularity()
 
 inline int getMultiProcessorCount()
 {
-    int device_id = 0;
-    int multi_processor_count = 0;
-    check_cuda_error(cudaGetDevice(&device_id));
-    check_cuda_error(cudaDeviceGetAttribute(&multi_processor_count, cudaDevAttrMultiProcessorCount, device_id));
-    return multi_processor_count;
+    int nSM{0};
+    int deviceID{0};
+    check_cuda_error(cudaGetDevice(&deviceID));
+    check_cuda_error(cudaDeviceGetAttribute(&nSM, cudaDevAttrMultiProcessorCount, deviceID));
+    return nSM;
+}
+
+inline int getMaxSharedMemoryPerSM()
+{
+    int nByteMaxSharedMemoryPerSM{0};
+    int deviceID{0};
+    check_cuda_error(cudaGetDevice(&deviceID));
+    check_cuda_error(
+        cudaDeviceGetAttribute(&nByteMaxSharedMemoryPerSM, cudaDevAttrMaxSharedMemoryPerMultiprocessor, deviceID));
+    return nByteMaxSharedMemoryPerSM;
 }
 
 inline int getMaxSharedMemoryPerBlockOptin()
 {
-    int device_id = 0;
-    int max_shared_memory_per_block = 0;
-    check_cuda_error(cudaGetDevice(&device_id));
+    int nByteMaxSharedMemoryPerBlockOptin{0};
+    int deviceID{0};
+    check_cuda_error(cudaGetDevice(&deviceID));
     check_cuda_error(
-        cudaDeviceGetAttribute(&max_shared_memory_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device_id));
-    return max_shared_memory_per_block;
+        cudaDeviceGetAttribute(&nByteMaxSharedMemoryPerBlockOptin, cudaDevAttrMaxSharedMemoryPerBlockOptin, deviceID));
+    return nByteMaxSharedMemoryPerBlockOptin;
 }
 
 template <typename T1, typename T2>
-inline size_t divUp(const T1& a, const T2& n)
+inline size_t divUp(T1 const& a, T2 const& b)
 {
     auto const tmp_a = static_cast<size_t>(a);
-    auto const tmp_n = static_cast<size_t>(n);
-    return (tmp_a + tmp_n - 1) / tmp_n;
+    auto const tmp_b = static_cast<size_t>(b);
+    return (tmp_a + tmp_b - 1) / tmp_b;
 }
 
-inline int roundUp(int a, int n)
+inline int roundUp(int a, int b)
 {
-    return divUp(a, n) * n;
+    return divUp(a, b) * b;
 }
 
 template <typename T, typename U, typename = std::enable_if_t<std::is_integral<T>::value>,
@@ -411,213 +422,326 @@ auto constexpr ceilDiv(T numerator, U denominator)
 }
 
 template <typename T>
-void printAbsMean(T const* buf, uint64_t size, cudaStream_t stream, std::string name = "")
+void printArrayInfo(T const* ptr, uint64_t nElement = 1, std::string name = "", bool const bPrintElement = false)
 {
-    if (buf == nullptr)
+    if (ptr == nullptr)
     {
         TLLM_LOG_WARNING("%s is an nullptr, skip!", name.c_str());
         return;
     }
     cudaDeviceSynchronize();
     check_cuda_error(cudaGetLastError());
-    T* h_tmp = new T[size];
-    cudaMemcpyAsync(h_tmp, buf, sizeof(T) * size, cudaMemcpyDeviceToHost, stream);
-    cudaDeviceSynchronize();
-    check_cuda_error(cudaGetLastError());
-    double sum = 0.0f;
-    uint64_t zero_count = 0;
-    float max_val = -1e10;
-    bool find_inf = false;
-    for (uint64_t i = 0; i < size; i++)
+
+    bool const isDevicePtr = (getPtrCudaMemoryType(ptr) == cudaMemoryTypeDevice);
+    size_t sizeInByte = sizeof(T) * nElement;
+    TLLM_LOG_TRACE("addr=%p, location=%s, sizeof(T)=%lu, nElement=%d, sizeInByte=%lu\n", ptr,
+        (isDevicePtr ? "Device" : "Host"), sizeof(T), nElement, sizeInByte);
+    T* tmp = const_cast<T*>(ptr);
+    std::vector<T> tmpVec; // For device pointer
+    if (isDevicePtr)
     {
-        if (std::isinf((float) (h_tmp[i])))
+        tmpVec.resize(nElement);
+        tmp = tmpVec.data();
+        check_cuda_error(cudaMemcpy(tmp, ptr, sizeInByte, cudaMemcpyDeviceToHost));
+        cudaDeviceSynchronize();
+    }
+
+    size_t nInf = 0;
+    size_t nNaN = 0;
+    size_t nZero = 0;
+    double sum = 0.0;
+    double sqrSum = 0.0;
+    double absSum = 0.0;
+    float allMax = -1.0e6f;
+    float allMin = 1.0e6f;
+    float allSad = 0.0f; // Sum Abs of Difference, to distinguish A and its transpose
+    float old = 0.0f;
+    for (uint64_t i = 0; i < nElement; i++)
+    {
+        float val = (float) tmp[i];
+
+        if (std::isinf(val))
         {
-            find_inf = true;
+            nInf++;
             continue;
         }
-        sum += abs((double) h_tmp[i]);
-        if ((float) h_tmp[i] == 0.0f)
+        if (std::isnan(val))
         {
-            zero_count++;
+            nNaN++;
+            continue;
         }
-        max_val = max_val > abs(float(h_tmp[i])) ? max_val : abs(float(h_tmp[i]));
+        nZero += (val == 0.0f);
+        sum += val;
+        sqrSum += val * val;
+        absSum += expf(val);
+        allMax = std::max(allMax, val);
+        allMin = std::min(allMin, val);
+        allSad += abs(val - old);
+        old = val;
     }
-    TLLM_LOG_INFO("%20s size: %u, abs mean: %f, abs sum: %f, abs max: %f, find inf: %s", name.c_str(), size, sum / size,
-        sum, max_val, find_inf ? "true" : "false");
-    delete[] h_tmp;
+    float avg = sum / nElement;
+    float std = sqrtf(sqrSum / nElement - avg * avg);
+
+    TLLM_LOG_INFO("%s", name.c_str());
+    TLLM_LOG_INFO("size=%u, nInf=%zu, nNaN=%zu, nZero=%zu", nElement, nInf, nNaN, nZero);
+    TLLM_LOG_INFO("avg=%f, absSum: %f, std=%f, max=%f, min=%f, sad=%f", avg, absSum, std, allMax, allMin, allSad);
+
+    if (bPrintElement)
+    {
+        uint64_t constexpr nHead = 5;
+        std::stringstream ss;
+        ss << std::setw(10) << std::fixed << std::setprecision(3);
+        for (uint64_t i = 0; i < std::min(nElement, nHead); ++i)
+        {
+            ss << (float) tmp[i] << ", ";
+        }
+        if (nElement > nHead)
+        {
+            ss << " ... ";
+            for (uint64_t i = nElement - nHead; i < nElement; ++i)
+            {
+                ss << (float) tmp[i] << ", ";
+            }
+        }
+        TLLM_LOG_INFO("%s", ss.str().c_str());
+    }
     cudaDeviceSynchronize();
     check_cuda_error(cudaGetLastError());
 }
 
+template void printArrayInfo(float const* ptr, uint64_t nElement, std::string name, bool const bPrintElement);
+template void printArrayInfo(half const* ptr, uint64_t nElement, std::string name, bool const bPrintElement);
+#ifdef ENABLE_BF16
+template void printArrayInfo(__nv_bfloat16 const* ptr, uint64_t nElement, std::string name, bool const bPrintElement);
+#endif
+#ifdef ENABLE_FP8
+template void printArrayInfo(__nv_fp8_e4m3 const* ptr, uint64_t nElement, std::string name, bool const bPrintElement);
+#endif
+template void printArrayInfo(uint32_t const* ptr, uint64_t nElement, std::string name, bool const bPrintElement);
+template void printArrayInfo(uint64_t const* ptr, uint64_t nElement, std::string name, bool const bPrintElement);
+template void printArrayInfo(int const* ptr, uint64_t nElement, std::string name, bool const bPrintElement);
+template void printArrayInfo(uint8_t const* ptr, uint64_t nElement, std::string name, bool const bPrintElement);
+
 template <typename T>
-void printToStream(T const* result, int const size, FILE* strm)
+void printToStream(T const* ptr, int const nElement, FILE* strm)
 {
     bool const split_rows = (strm == stdout);
-    if (result == nullptr)
+    if (ptr == nullptr)
     {
-        TLLM_LOG_WARNING("It is an nullptr, skip! \n");
+        TLLM_LOG_WARNING("Nullptr, skip!\n");
         return;
     }
-    T* tmp = reinterpret_cast<T*>(malloc(sizeof(T) * size));
-    check_cuda_error(cudaMemcpy(tmp, result, sizeof(T) * size, cudaMemcpyDeviceToHost));
-    for (int i = 0; i < size; ++i)
+    std::vector<T> tmp(nElement, 0);
+    check_cuda_error(cudaMemcpy(tmp.data(), ptr, sizeof(T) * nElement, cudaMemcpyDeviceToHost));
+    for (int i = 0; i < nElement; ++i)
     {
         fprintf(strm, "%f, ", static_cast<float>(tmp[i]));
         if (split_rows && ((i + 1) % 10) == 0)
             fprintf(strm, "\n");
     }
-    if (!split_rows || (size % 10) != 0)
+    if (!split_rows || (nElement % 10) != 0)
     {
         fprintf(strm, "\n");
     }
-    free(tmp);
 }
 
 template <typename T>
-void printToScreen(T const* result, int const size)
+void printToScreen(T const* ptr, int const nElement)
 {
-    printToStream(result, size, stdout);
+    printToStream(ptr, nElement, stdout);
 }
 
 template <typename T>
-void print2dToStream(T const* result, int const r, int const c, int const stride, FILE* strm)
+void print2dToStream(T const* ptr, int const nRow, int const nCol, int const nStride, FILE* strm)
 {
-    if (result == nullptr)
+    if (ptr == nullptr)
     {
-        TLLM_LOG_WARNING("It is an nullptr, skip! \n");
+        TLLM_LOG_WARNING("Nullptr, skip!\n");
         return;
     }
-    for (int ri = 0; ri < r; ++ri)
+    for (int ri = 0; ri < nRow; ++ri)
     {
-        T const* ptr = result + ri * stride;
-        printToStream(ptr, c, strm);
+        T const* tmp = ptr + ri * nStride;
+        printToStream(tmp, nCol, strm);
     }
     fprintf(strm, "\n");
 }
 
 template <typename T>
-void print2dToScreen(T const* result, int const r, int const c, int const stride)
+void print2dToScreen(T const* ptr, int const nRow, int const nCol, int const nStride)
 {
-    print2dToStream(result, r, c, stride, stdout);
+    print2dToStream(ptr, nRow, nCol, nStride, stdout);
 }
 
 template <typename T>
-void print2dToFile(std::string fname, T const* result, int const r, int const c, int const stride)
+void print2dToFile(std::string fname, T const* ptr, int const nRow, int const nCol, int const nStride)
 {
     FILE* fp = fopen(fname.c_str(), "wt");
     if (fp != nullptr)
     {
-        print2dToStream(result, r, c, stride, fp);
+        print2dToStream(ptr, nRow, nCol, nStride, fp);
         fclose(fp);
     }
 }
 
-inline void print_float_(float x)
+__host__ __device__ inline void print_float_(float x)
 {
     printf("%7.3f ", x);
 }
 
-inline void print_element_(float x)
+__host__ __device__ inline void print_element_(float x)
 {
     print_float_(x);
 }
 
-inline void print_element_(half x)
+__host__ __device__ inline void print_element_(half x)
 {
     print_float_((float) x);
 }
 
 #ifdef ENABLE_BF16
-inline void print_element_(__nv_bfloat16 x)
+__host__ __device__ inline void print_element_(__nv_bfloat16 x)
 {
     print_float_((float) x);
 }
 #endif
 
 #ifdef ENABLE_FP8
-inline void print_element_(__nv_fp8_e4m3 x)
+__host__ __device__ inline void print_element_(__nv_fp8_e4m3 x)
 {
     print_float_((float) x);
 }
 #endif
 
-inline void print_element_(uint32_t ul)
+__host__ __device__ inline void print_element_(uint8_t ui)
 {
-    printf("%7" PRIu32, ul);
+    printf("%7" PRIu32 " ", (unsigned int) ui);
 }
 
-inline void print_element_(uint64_t ull)
+__host__ __device__ inline void print_element_(uint32_t ul)
 {
-    printf("%7" PRIu64, ull);
+    printf("%7" PRIu32 " ", ul);
 }
 
-inline void print_element_(int32_t il)
+__host__ __device__ inline void print_element_(uint64_t ull)
 {
-    printf("%7" PRId32, il);
+    printf("%7" PRIu64 " ", ull);
 }
 
-inline void print_element_(int64_t ill)
+__host__ __device__ inline void print_element_(int32_t il)
 {
-    printf("%7" PRId64, ill);
+    printf("%7" PRId32 " ", il);
+}
+
+__host__ __device__ inline void print_element_(int64_t ill)
+{
+    printf("%7" PRId64 " ", ill);
 }
 
 template <typename T>
-inline void printMatrix(T const* ptr, int m, int k, int stride, bool is_device_ptr)
+__host__ __device__ inline void print_elements(T const* ptr, int nRow, int nCol, int nStride)
 {
-    T* tmp;
-    if (is_device_ptr)
+    for (int iRow = -1; iRow < nRow; ++iRow)
     {
-        // k < stride ; stride = col-dimension.
-        tmp = reinterpret_cast<T*>(malloc(m * stride * sizeof(T)));
-        check_cuda_error(cudaMemcpy(tmp, ptr, sizeof(T) * m * stride, cudaMemcpyDeviceToHost));
-        cudaDeviceSynchronize();
-    }
-    else
-    {
-        tmp = const_cast<T*>(ptr);
-    }
-
-    for (int ii = -1; ii < m; ++ii)
-    {
-        if (ii >= 0)
+        if (iRow >= 0)
         {
-            printf("%07d ", ii);
+            printf("%07d|", iRow);
         }
         else
         {
-            printf("   ");
+            printf("       |"); // heading row
         }
-
-        for (int jj = 0; jj < k; jj += 1)
+        for (int iCol = 0; iCol < nCol; iCol += 1)
         {
-            if (ii >= 0)
+            if (iRow >= 0)
             {
-                print_element_(tmp[ii * stride + jj]);
+                print_element_(ptr[iRow * nStride + iCol]);
             }
             else
             {
-                printf("%7d ", jj);
+                printf("%7d|", iCol); // heading colume
             }
         }
         printf("\n");
     }
-    if (is_device_ptr)
+}
+
+template <typename T>
+inline void printMatrix(T const* ptr, int nRow, int nCol, int nStride)
+{
+    // `nRow` is length of row dimension
+    // `nStride` is length of column dimension
+    // `nCol` (<= nStride) is length for print per row
+    if (ptr == nullptr)
     {
-        free(tmp);
+        TLLM_LOG_WARNING("Nullptr, skip!\n");
+        return;
+    }
+    cudaDeviceSynchronize();
+    check_cuda_error(cudaGetLastError());
+
+    bool const isDevicePtr = (getPtrCudaMemoryType(ptr) == cudaMemoryTypeDevice);
+    size_t sizeInByte = sizeof(T) * nRow * nStride;
+    TLLM_LOG_TRACE("addr=%p, location=%s, sizeof(T)=%lu, nRow=%d, nStride=%d, sizeInByte=%lu\n", ptr,
+        (isDevicePtr ? "Device" : "Host"), sizeof(T), nRow, nStride, sizeInByte);
+    if (isDevicePtr)
+    {
+        std::vector<T> tmpVec;
+        tmpVec.resize(nRow * nStride);
+        T* tmp = tmpVec.data();
+        check_cuda_error(cudaMemcpy(tmp, ptr, sizeInByte, cudaMemcpyDeviceToHost));
+        cudaDeviceSynchronize();
+        check_cuda_error(cudaGetLastError());
+        print_elements(tmp, nRow, nCol, nStride);
+    }
+    else
+    {
+        print_elements(ptr, nRow, nCol, nStride);
     }
 }
 
-template void printMatrix(float const* ptr, int m, int k, int stride, bool is_device_ptr);
-template void printMatrix(half const* ptr, int m, int k, int stride, bool is_device_ptr);
+template void printMatrix(float const* ptr, int nRow, int nCol, int nStride);
+template void printMatrix(half const* ptr, int nRow, int nCol, int nStride);
 #ifdef ENABLE_BF16
-template void printMatrix(__nv_bfloat16 const* ptr, int m, int k, int stride, bool is_device_ptr);
+template void printMatrix(__nv_bfloat16 const* ptr, int nRow, int nCol, int nStride);
 #endif
 #ifdef ENABLE_FP8
-template void printMatrix(__nv_fp8_e4m3 const* ptr, int m, int k, int stride, bool is_device_ptr);
+template void printMatrix(__nv_fp8_e4m3 const* ptr, int nRow, int nCol, int nStride);
 #endif
-template void printMatrix(uint32_t const* ptr, int m, int k, int stride, bool is_device_ptr);
-template void printMatrix(uint64_t const* ptr, int m, int k, int stride, bool is_device_ptr);
-template void printMatrix(int const* ptr, int m, int k, int stride, bool is_device_ptr);
+template void printMatrix(uint32_t const* ptr, int nRow, int nCol, int nStride);
+template void printMatrix(uint64_t const* ptr, int nRow, int nCol, int nStride);
+template void printMatrix(int const* ptr, int nRow, int nCol, int nStride);
+template void printMatrix(uint8_t const* ptr, int nRow, int nCol, int nStride);
+
+template <typename T>
+__device__ inline void printMatrixDevice(T const* ptr, int nRow, int nCol, int nStride)
+{
+    // `nRow` is length of row dimension
+    // `nStride` is length of column dimension
+    // `nCol` (<= nStride) is length for print per row
+    // Can be called inside kernels by one single thread
+    if (ptr == nullptr)
+    {
+        printf("Nullptr, skip!\n");
+        return;
+    }
+    size_t sizeInByte = sizeof(T) * nRow * nStride;
+    printf("addr=%p, sizeof(T)=%lu, nRow=%d, nStride=%d, sizeInByte=%lu\n", ptr, sizeof(T), nRow, nStride, sizeInByte);
+    print_elements(ptr, nRow, nCol, nStride);
+}
+
+template __device__ void printMatrixDevice(float const* ptr, int nRow, int nCol, int nStride);
+template __device__ void printMatrixDevice(half const* ptr, int nRow, int nCol, int nStride);
+#ifdef ENABLE_BF16
+template __device__ void printMatrixDevice(__nv_bfloat16 const* ptr, int nRow, int nCol, int nStride);
+#endif
+#ifdef ENABLE_FP8
+template __device__ void printMatrixDevice(__nv_fp8_e4m3 const* ptr, int nRow, int nCol, int nStride);
+#endif
+template __device__ void printMatrixDevice(uint32_t const* ptr, int nRow, int nCol, int nStride);
+template __device__ void printMatrixDevice(uint64_t const* ptr, int nRow, int nCol, int nStride);
+template __device__ void printMatrixDevice(int const* ptr, int nRow, int nCol, int nStride);
+template __device__ void printMatrixDevice(uint8_t const* ptr, int nRow, int nCol, int nStride);
 
 } // namespace tensorrt_llm::common
 

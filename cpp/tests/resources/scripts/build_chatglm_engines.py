@@ -136,10 +136,20 @@ def build_engines(model_cache: typing.Optional[str] = None,
             if ckpt_dir.is_dir():
                 shutil.rmtree(ckpt_dir, ignore_errors=True)
 
-        # Fix HF error in ChatGLM-6B, hope to remove this in the future
+        # Fix HF error for ChatGLM-6B / GLM-4-9B / ChatGLM2-6B, hope to remove this in the future
         if model_name == "chatglm-6b":
             shutil.copy(
-                chatglm_example_dir / "tokenization_chatglm.py",
+                chatglm_example_dir / "chatglm-6b/tokenization_chatglm.py",
+                hf_dir,
+            )
+        if model_name == "glm-4-9b":
+            shutil.copy(
+                chatglm_example_dir / "glm-4-9b/tokenization_chatglm.py",
+                hf_dir,
+            )
+        if model_name == "chatglm2-6b":
+            shutil.copy(
+                chatglm_example_dir / "chatglm2-6b/tokenization_chatglm.py",
                 hf_dir,
             )
 

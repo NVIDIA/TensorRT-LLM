@@ -124,7 +124,8 @@ void FtDynamicDecode<T>::setup(size_t const batch_size, size_t const beam_width,
     th::optional<th::Tensor> early_stopping_opt, th::optional<th::Tensor> beam_search_diversity_rate_opt,
     th::optional<th::Tensor> random_seed_opt, th::optional<th::Tensor> top_p_decay_opt,
     th::optional<th::Tensor> top_p_min_opt, th::optional<th::Tensor> top_p_reset_ids_opt,
-    th::optional<th::Tensor> no_repeat_ngram_size_opt, bool output_log_probs, bool cum_log_probs)
+    th::optional<th::Tensor> no_repeat_ngram_size_opt, th::optional<th::Tensor> min_p_opt, bool output_log_probs,
+    bool cum_log_probs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     mBeamWidth = beam_width;
@@ -148,6 +149,7 @@ void FtDynamicDecode<T>::setup(size_t const batch_size, size_t const beam_width,
         safeInsert(top_p_decay_opt, decodingParams->topPDecay);
         safeInsert(top_p_min_opt, decodingParams->topPMin);
         safeInsert(top_p_reset_ids_opt, decodingParams->topPResetIds);
+        safeInsert(min_p_opt, decodingParams->runtimeMinP);
         decodingParams->outputLogProbs = std::vector<bool>({output_log_probs});
         decodingParams->cumLogProbs = std::vector<bool>({cum_log_probs});
         safeInsert(random_seed_opt, decodingParams->randomSeed);
@@ -332,8 +334,8 @@ void DynamicDecodeOp::setup(int64_t const batchSize, int64_t const beamWidth, th
     th::optional<th::Tensor> lengthPenaltyOpt, th::optional<th::Tensor> earlyStoppingOpt,
     th::optional<th::Tensor> beamSearchDiversityRateOpt, th::optional<th::Tensor> randomSeedOpt,
     th::optional<th::Tensor> topPDecayOpt, th::optional<th::Tensor> topPMinOpt,
-    th::optional<th::Tensor> topPResetIdsOpt, th::optional<th::Tensor> noRepeatNgramSizeOpt, bool outputLogProbs,
-    bool cumLogProbs)
+    th::optional<th::Tensor> topPResetIdsOpt, th::optional<th::Tensor> noRepeatNgramSizeOpt,
+    th::optional<th::Tensor> minPOpt, bool outputLogProbs, bool cumLogProbs)
 {
     // TODO: Revise DynamicDecodeLayer and make the decode arguments consistent.
     // TODO: add parameters "normalizeLogProbs" and "topKMedusaHeads"
@@ -352,11 +354,12 @@ void DynamicDecodeOp::setup(int64_t const batchSize, int64_t const beamWidth, th
     CHECK_OPTIONAL_INPUT(topPDecayOpt, torch::kFloat);
     CHECK_OPTIONAL_INPUT(topPMinOpt, torch::kFloat);
     CHECK_OPTIONAL_INPUT(topPResetIdsOpt, torch::kInt32);
+    CHECK_OPTIONAL_CPU_INPUT(minPOpt, torch::kFloat);
 
     dynamicDecode_->setup(static_cast<tr::SizeType32>(batchSize), static_cast<tr::SizeType32>(beamWidth),
         runtimeTopKOpt, runtimeTopPOpt, temperatureOpt, repetitionPenaltyOpt, presencePenaltyOpt, frequencyPenaltyOpt,
         minLengthOpt, lengthPenaltyOpt, earlyStoppingOpt, beamSearchDiversityRateOpt, randomSeedOpt, topPDecayOpt,
-        topPMinOpt, topPResetIdsOpt, noRepeatNgramSizeOpt, outputLogProbs, cumLogProbs);
+        topPMinOpt, topPResetIdsOpt, noRepeatNgramSizeOpt, minPOpt, outputLogProbs, cumLogProbs);
 }
 
 th::Tensor DynamicDecodeOp::forward(

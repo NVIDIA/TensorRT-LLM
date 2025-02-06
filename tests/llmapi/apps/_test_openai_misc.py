@@ -17,10 +17,18 @@ def model_name():
     return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 
 
+@pytest.fixture(scope="module", params=[None, 'pytorch'])
+def backend(request):
+    return request.param
+
+
 @pytest.fixture(scope="module")
-def server(model_name: str):
+def server(model_name: str, backend: str):
     model_path = get_model_path(model_name)
     args = ["--max_beam_width", "4"]
+    if backend is not None:
+        args.append("--backend")
+        args.append(backend)
     with RemoteOpenAIServer(model_path, args) as remote_server:
         yield remote_server
 

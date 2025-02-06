@@ -5,6 +5,107 @@
 All published functionality in the Release Notes has been fully tested and verified with known limitations documented. To share feedback about this release, access our [NVIDIA Developer Forum](https://forums.developer.nvidia.com/).
 
 
+## TensorRT-LLM Release 0.17.0
+
+### Key Features and Enhancements
+  - **Blackwell support**
+    - **NOTE: pip installation is not supported for TRT-LLM 0.17 on Blackwell platforms only. Instead, it is recommended that the user build from source using NVIDIA NGC 25.01 PyTorch container.**
+    - Added support for B200.
+    - Added support for GeForce RTX 50 series using Windows Subsystem for Linux (WSL) for limited models.
+    - Added NVFP4 Gemm support for Llama and Mixtral models.
+    - Added NVFP4 support for the `LLM` API and `trtllm-bench` command.
+    - GB200 NVL is not fully supported.
+    - Added benchmark script to measure perf benefits of KV cache host offload with expected runtime improvements from GH200.
+  - **PyTorch workflow**
+    - The PyTorch workflow is an **experimental** feature in `tensorrt_llm._torch`. The following is a list of supported infrastructure, models, and features that can be used with the PyTorch workflow.
+    - Added support for H100/H200/B200.
+    - Added support for Llama models, Mixtral, QWen, Vila.
+    - Added support for FP16/BF16/FP8/NVFP4 Gemm and fused Mixture-Of-Experts (MOE), FP16/BF16/FP8 KVCache.
+    - Added custom context and decoding attention kernels support via PyTorch custom op.
+    - Added support for chunked context (default off).
+    - Added CudaGraph support for decoding only.
+    - Added overlap scheduler support to overlap prepare inputs and model forward by decoding 1 extra token.
+  - Added FP8 context FMHA support for the W4A8 quantization workflow.
+  - Added ModelOpt quantized checkpoint support for the `LLM` API.
+  - Added FP8 support for the Llama-3.2 VLM model. Refer to the “MLLaMA” section in `examples/multimodal/README.md`.
+  - Added PDL support for `userbuffer` based AllReduce-Norm fusion kernel.
+  - Added runtime support for seamless lookahead decoding.
+  - Added token-aligned arbitrary output tensors support for the C++ `executor` API.
+
+### API Changes
+  - [BREAKING CHANGE] KV cache reuse is enabled automatically when `paged_context_fmha` is enabled.
+  - Added `--concurrency` support for the `throughput` subcommand of `trtllm-bench`.
+
+### Fixed Issues
+  - Fixed incorrect LoRA output dimension. Thanks for the contribution from @akhoroshev in #2484.
+  - Added NVIDIA H200 GPU into the `cluster_key` for auto parallelism feature. (#2552)
+  - Fixed a typo in the `__post_init__` function of `LLmArgs` Class. Thanks for the contribution from @topenkoff in #2691.
+  - Fixed workspace size issue in the GPT attention plugin. Thanks for the contribution from @AIDC-AI.
+  - Fixed Deepseek-V2 model accuracy.
+
+### Infrastructure Changes
+  - The base Docker image for TensorRT-LLM is updated to `nvcr.io/nvidia/pytorch:25.01-py3`.
+  - The base Docker image for TensorRT-LLM Backend is updated to `nvcr.io/nvidia/tritonserver:25.01-py3`.
+  - The dependent TensorRT version is updated to 10.8.0.
+  - The dependent CUDA version is updated to 12.8.0.
+  - The dependent ModelOpt version is updated to 0.23 for Linux platform, while 0.17 is still used on Windows platform.
+
+
+## TensorRT-LLM Release 0.16.0
+
+### Key Features and Enhancements
+  - Added guided decoding support with XGrammar backend.
+  - Added quantization support for RecurrentGemma. Refer to `examples/recurrentgemma/README.md`.
+  - Added ulysses context parallel support. Refer to an example on building LLaMA 7B using 2-way tensor parallelism and 2-way context parallelism at `examples/llama/README.md`.
+  - Added W4A8 quantization support to BF16 models on Ada (SM89).
+  - Added PDL support for the FP8 GEMM plugins.
+  - Added a runtime `max_num_tokens` dynamic tuning feature, which can be enabled by setting `--enable_max_num_tokens_tuning` to `gptManagerBenchmark`.
+  - Added typical acceptance support for EAGLE.
+  - Supported chunked context and sliding window attention to be enabled together.
+  - Added head size 64 support for the XQA kernel.
+  - Added the following features to the LLM API:
+    - Lookahead decoding.
+    - DeepSeek V1 support.
+    - Medusa support.
+    - `max_num_tokens` and `max_batch_size` arguments to control the runtime parameters.
+    - `extended_runtime_perf_knob_config` to enable various performance configurations.
+  - Added LogN scaling support for Qwen models.
+  - Added `AutoAWQ` checkpoints support for Qwen. Refer to the “INT4-AWQ” section in `examples/qwen/README.md`.
+  - Added `AutoAWQ` and `AutoGPTQ` Hugging Face checkpoints support for LLaMA. (#2458)
+  - Added `allottedTimeMs` to the C++ `Request` class to support per-request timeout.
+  - [BREAKING CHANGE] Removed NVIDIA V100 GPU support.
+
+### API Changes
+  - [BREAKING CHANGE] Removed `enable_xqa` argument from `trtllm-build`.
+  - [BREAKING CHANGE] Chunked context is enabled by default when KV cache and paged context FMHA is enabled on non-RNN based models.
+  - [BREAKING CHANGE] Enabled embedding sharing automatically when possible and remove the flag `--use_embedding_sharing` from convert checkpoints scripts.
+  - [BREAKING CHANGE] The `if __name__ == "__main__"` entry point is required for both single-GPU and multi-GPU cases when using the `LLM` API.
+  - [BREAKING CHANGE] Cancelled requests now return empty results.
+  - Added the `enable_chunked_prefill` flag to the `LlmArgs` of the `LLM` API.
+  - Integrated BERT and RoBERTa models to the `trtllm-build` command.
+
+### Model Updates
+  - Added Qwen2-VL support. Refer to the “Qwen2-VL” section of `examples/multimodal/README.md`.
+  - Added multimodal evaluation examples. Refer to `examples/multimodal`.
+  - Added Stable Diffusion XL support. Refer to `examples/sdxl/README.md`. Thanks for the contribution from @Zars19 in #1514.
+
+### Fixed Issues
+  - Fixed unnecessary batch logits post processor calls. (#2439)
+  - Fixed a typo in the error message. (#2473)
+  - Fixed the in-place clamp operation usage in smooth quant. Thanks for the contribution from @StarrickLiu in #2485.
+  - Fixed `sampling_params` to only be setup if `end_id` is None and `tokenizer` is not None in the `LLM` API. Thanks to the contribution from @mfuntowicz in #2573.
+
+### Infrastructure Changes
+  - Updated the base Docker image for TensorRT-LLM to `nvcr.io/nvidia/pytorch:24.11-py3`.
+  - Updated the base Docker image for TensorRT-LLM Backend to `nvcr.io/nvidia/tritonserver:24.11-py3`.
+  - Updated to TensorRT v10.7.
+  - Updated to CUDA v12.6.3.
+  - Added support for Python 3.10 and 3.12 to TensorRT-LLM Python wheels on PyPI.
+  - Updated to ModelOpt v0.21 for Linux platform, while v0.17 is still used on Windows platform.
+
+### Known Issues
+  - There is a known AllReduce performance issue on AMD-based CPU platforms on NCCL 2.23.4, which can be workarounded by `export NCCL_P2P_LEVEL=SYS`.
+
 ## TensorRT-LLM Release 0.15.0
 
 ### Key Features and Enhancements

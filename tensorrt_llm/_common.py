@@ -62,7 +62,7 @@ def _init(log_level: object = None) -> None:
     # load plugin lib
     _load_plugin_lib()
 
-    # load FT decoder layer
+    # load FT decoder layer and torch custom ops
     project_dir = str(Path(__file__).parent.absolute())
     if platform.system() == "Windows":
         ft_decoder_lib = project_dir + '/libs/th_common.dll'
@@ -70,7 +70,8 @@ def _init(log_level: object = None) -> None:
         ft_decoder_lib = project_dir + '/libs/libth_common.so'
     try:
         torch.classes.load_library(ft_decoder_lib)
-        register_fake()
+        from ._torch.custom_op import _register_fake
+        _register_fake()
     except Exception as e:
         msg = '\nFATAL: Decoding operators failed to load. This may be caused by the incompatibility between PyTorch and TensorRT-LLM. Please rebuild and install TensorRT-LLM.'
         raise ImportError(str(e) + msg)
@@ -78,21 +79,6 @@ def _init(log_level: object = None) -> None:
     MpiComm.local_init()
 
     logger.info('TensorRT-LLM inited.')
-
-
-def register_fake():
-
-    @torch.library.register_fake("trtllm::allreduce")
-    def _(input, workspace, reduce_fusion_inputs, group, strategy, config, op,
-          eps, affine, bias):
-        final_output = torch.empty_like(input)
-        inter_output = torch.empty_like(input)
-        return final_output, inter_output
-
-    @torch.library.register_fake("trtllm::allgather")
-    def _(input, group):
-        output_shape = (len(group), *input.shape)
-        return input.new_empty(output_shape)
 
 
 def default_net() -> Network:
@@ -257,12 +243,12 @@ def check_max_num_tokens(max_num_tokens, opt_num_tokens, max_batch_size,
                 "tensor volume, causing runtime errors. "
                 f"Got `max_num_tokens` = {max_num_tokens}")
     if max_num_tokens > max_seq_len * max_batch_size:
-        max_num_tokens = max_seq_len * max_batch_size
         logger.warning(
             f"max_num_tokens ({max_num_tokens}) shouldn't be greater than "
             f"max_seq_len * max_batch_size ({max_seq_len * max_batch_size}), "
             f"specifying to max_seq_len * max_batch_size ({max_seq_len * max_batch_size})."
         )
+        max_num_tokens = max_seq_len * max_batch_size
     if max_num_tokens < max_input_len and not enable_context_fmha:
         logger.warning(
             f"When enable_context_fmha is not turned on, max_num_tokens ({max_num_tokens}) "

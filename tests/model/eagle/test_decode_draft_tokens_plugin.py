@@ -23,7 +23,6 @@ from parameterized import parameterized
 import tensorrt_llm
 import tensorrt_llm.models.eagle
 from tensorrt_llm import Tensor
-from tensorrt_llm.models.eagle.model import TreeParams
 
 sys.path.append(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir))
 from utils.util import create_session, run_session, unittest_name_func
@@ -172,9 +171,6 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
                                               dtype=torch.int32,
                                               device="cuda")  # shape: [1]
 
-        rand_sample = torch.tensor([0], dtype=torch.float32,
-                                   device="cuda")  # shape: [num_tokens]
-
         paths = torch.tensor(
             [[[0, 1, 4, 6], [0, 1, 4, 7], [0, 2, -1, -1], [0, 3, 5, -1],
               [-1, -1, -1, -1], [-1, -1, -1, -1], [-1, -1, -1, -1],
@@ -199,7 +195,7 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             [3], dtype=torch.int32, device="cuda")  # shape: [batch_size]
 
         # Eagle-2 related inputs/outputs, useless for Eagle-1
-        use_dynamic_tree = torch.tensor(False, dtype=torch.bool,
+        use_dynamic_tree = torch.tensor([0], dtype=torch.int32,
                                         device="cpu")  # shape: [1]
         dynamic_tree_max_topK = torch.tensor(dynamic_tree_max_topK_t,
                                              dtype=torch.int32,
@@ -233,7 +229,7 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             dtype=torch.int32,
             device="cuda")  # shape: [batch_size, max_decoding_draft_tokens]
 
-        ref_return_output_path = None
+        ref_return_output_path = paths  # Same as the input
         ref_return_current_scores = None
         ref_return_next_expand_indices = None
         ref_return_output_all_layers_scores = None
@@ -241,9 +237,9 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
         ref_return_output_all_layers_draft_token_ids_predecessor = None
 
         test_cases += [[
-            logits, num_last_token_indices, rand_sample, paths,
-            use_dynamic_tree, dynamic_tree_max_topK, input_draft_token_ids,
-            input_draft_lens, input_prev_scores, input_current_expand_indices,
+            logits, num_last_token_indices, paths, use_dynamic_tree,
+            dynamic_tree_max_topK, input_draft_token_ids, input_draft_lens,
+            input_prev_scores, input_current_expand_indices,
             input_all_layers_scores, input_all_layers_draft_token_ids,
             input_all_layers_draft_token_ids_predecessor, top_k_sampling,
             num_eagle_layers, layerId, ref_return_draft_token_ids,
@@ -278,9 +274,6 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
                                               dtype=torch.int32,
                                               device="cuda")  # shape: [1]
 
-        rand_sample = torch.tensor([0, 0], dtype=torch.float32,
-                                   device="cuda")  # shape: [num_tokens]
-
         paths = torch.tensor(
             [[[0, 1, -1, -1], [0, 2, -1, -1], [-1, -1, -1, -1],
               [-1, -1, -1, -1], [-1, -1, -1, -1]],
@@ -308,7 +301,7 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             [2, 3], dtype=torch.int32, device="cuda")  # shape: [batch_size]
 
         # Eagle-2 related inputs/outputs, useless for Eagle-1
-        use_dynamic_tree = torch.tensor(False, dtype=torch.bool,
+        use_dynamic_tree = torch.tensor([0], dtype=torch.int32,
                                         device="cpu")  # shape: [1]
         dynamic_tree_max_topK = torch.tensor(dynamic_tree_max_topK_t,
                                              dtype=torch.int32,
@@ -342,7 +335,7 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             dtype=torch.int32,
             device="cuda")  # shape: [batch_size, max_decoding_draft_tokens]
 
-        ref_return_output_path = None
+        ref_return_output_path = paths  # Same as the input
         ref_return_current_scores = None
         ref_return_next_expand_indices = None
         ref_return_output_all_layers_scores = None
@@ -350,9 +343,9 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
         ref_return_output_all_layers_draft_token_ids_predecessor = None
 
         test_cases += [[
-            logits, num_last_token_indices, rand_sample, paths,
-            use_dynamic_tree, dynamic_tree_max_topK, input_draft_token_ids,
-            input_draft_lens, input_prev_scores, input_current_expand_indices,
+            logits, num_last_token_indices, paths, use_dynamic_tree,
+            dynamic_tree_max_topK, input_draft_token_ids, input_draft_lens,
+            input_prev_scores, input_current_expand_indices,
             input_all_layers_scores, input_all_layers_draft_token_ids,
             input_all_layers_draft_token_ids_predecessor, top_k_sampling,
             num_eagle_layers, layerId, ref_return_draft_token_ids,
@@ -388,9 +381,6 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
                                               dtype=torch.int32,
                                               device="cuda")  # shape: [1]
 
-        rand_sample = torch.tensor([0, 0], dtype=torch.float32,
-                                   device="cuda")  # shape: [num_tokens]
-
         paths = torch.tensor(
             [[[0, 1, 4, 6], [0, 1, 4, 7], [0, 2, -1, -1], [0, 3, 5, -1],
               [-1, -1, -1, -1], [-1, -1, -1, -1], [-1, -1, -1, -1],
@@ -415,7 +405,7 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             [5], dtype=torch.int32, device="cuda")  # shape: [batch_size]
 
         # Eagle-2 related inputs/outputs, useless for Eagle-1
-        use_dynamic_tree = torch.tensor(False, dtype=torch.bool,
+        use_dynamic_tree = torch.tensor([0], dtype=torch.int32,
                                         device="cpu")  # shape: [1]
         dynamic_tree_max_topK = torch.tensor(dynamic_tree_max_topK_t,
                                              dtype=torch.int32,
@@ -449,7 +439,7 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             dtype=torch.int32,
             device="cuda")  # shape: [batch_size, max_decoding_draft_tokens]
 
-        ref_return_output_path = None
+        ref_return_output_path = paths  # Same as the input
         ref_return_current_scores = None
         ref_return_next_expand_indices = None
         ref_return_output_all_layers_scores = None
@@ -457,9 +447,9 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
         ref_return_output_all_layers_draft_token_ids_predecessor = None
 
         test_cases += [[
-            logits, num_last_token_indices, rand_sample, paths,
-            use_dynamic_tree, dynamic_tree_max_topK, input_draft_token_ids,
-            input_draft_lens, input_prev_scores, input_current_expand_indices,
+            logits, num_last_token_indices, paths, use_dynamic_tree,
+            dynamic_tree_max_topK, input_draft_token_ids, input_draft_lens,
+            input_prev_scores, input_current_expand_indices,
             input_all_layers_scores, input_all_layers_draft_token_ids,
             input_all_layers_draft_token_ids_predecessor, top_k_sampling,
             num_eagle_layers, layerId, ref_return_draft_token_ids,
@@ -494,9 +484,6 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
                                               dtype=torch.int32,
                                               device="cuda")  # shape: [1]
 
-        rand_sample = torch.tensor([0], dtype=torch.float32,
-                                   device="cuda")  # shape: [num_tokens]
-
         paths = torch.tensor(
             [[[0, 1, -1, -1], [0, 2, -1, -1], [-1, -1, -1, -1],
               [-1, -1, -1, -1], [-1, -1, -1, -1]],
@@ -523,7 +510,7 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             [2, 4], dtype=torch.int32, device="cuda")  # shape: [batch_size]
 
         # Eagle-2 related inputs/outputs, useless for Eagle-1
-        use_dynamic_tree = torch.tensor(False, dtype=torch.bool,
+        use_dynamic_tree = torch.tensor([0], dtype=torch.int32,
                                         device="cpu")  # shape: [1]
         dynamic_tree_max_topK = torch.tensor(dynamic_tree_max_topK_t,
                                              dtype=torch.int32,
@@ -557,7 +544,7 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             dtype=torch.int32,
             device="cuda")  # shape: [batch_size, max_decoding_draft_tokens]
 
-        ref_return_output_path = None
+        ref_return_output_path = paths  # Same as the input
         ref_return_current_scores = None
         ref_return_next_expand_indices = None
         ref_return_output_all_layers_scores = None
@@ -565,9 +552,9 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
         ref_return_output_all_layers_draft_token_ids_predecessor = None
 
         test_cases += [[
-            logits, num_last_token_indices, rand_sample, paths,
-            use_dynamic_tree, dynamic_tree_max_topK, input_draft_token_ids,
-            input_draft_lens, input_prev_scores, input_current_expand_indices,
+            logits, num_last_token_indices, paths, use_dynamic_tree,
+            dynamic_tree_max_topK, input_draft_token_ids, input_draft_lens,
+            input_prev_scores, input_current_expand_indices,
             input_all_layers_scores, input_all_layers_draft_token_ids,
             input_all_layers_draft_token_ids_predecessor, top_k_sampling,
             num_eagle_layers, layerId, ref_return_draft_token_ids,
@@ -603,9 +590,6 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
                                               dtype=torch.int32,
                                               device="cuda")  # shape: [1]
 
-        rand_sample = torch.tensor([0, 0], dtype=torch.float32,
-                                   device="cuda")  # shape: [num_tokens]
-
         paths = torch.tensor(
             [[[0, 1, 4, 6], [0, 1, 4, 7], [0, 2, -1, -1], [0, 3, 5, -1],
               [-1, -1, -1, -1], [-1, -1, -1, -1], [-1, -1, -1, -1],
@@ -636,7 +620,7 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             [7, 7], dtype=torch.int32, device="cuda")  # shape: [batch_size]
 
         # Eagle-2 related inputs/outputs, useless for Eagle-1
-        use_dynamic_tree = torch.tensor(False, dtype=torch.bool,
+        use_dynamic_tree = torch.tensor([0], dtype=torch.int32,
                                         device="cpu")  # shape: [1]
         dynamic_tree_max_topK = torch.tensor(dynamic_tree_max_topK_t,
                                              dtype=torch.int32,
@@ -670,7 +654,7 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             dtype=torch.int32,
             device="cuda")  # shape: [batch_size, max_decoding_draft_tokens]
 
-        ref_return_output_path = None
+        ref_return_output_path = paths  # Same as the input
         ref_return_current_scores = None
         ref_return_next_expand_indices = None
         ref_return_output_all_layers_scores = None
@@ -678,9 +662,9 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
         ref_return_output_all_layers_draft_token_ids_predecessor = None
 
         test_cases += [[
-            logits, num_last_token_indices, rand_sample, paths,
-            use_dynamic_tree, dynamic_tree_max_topK, input_draft_token_ids,
-            input_draft_lens, input_prev_scores, input_current_expand_indices,
+            logits, num_last_token_indices, paths, use_dynamic_tree,
+            dynamic_tree_max_topK, input_draft_token_ids, input_draft_lens,
+            input_prev_scores, input_current_expand_indices,
             input_all_layers_scores, input_all_layers_draft_token_ids,
             input_all_layers_draft_token_ids_predecessor, top_k_sampling,
             num_eagle_layers, layerId, ref_return_draft_token_ids,
@@ -715,9 +699,6 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
                                               dtype=torch.int32,
                                               device="cuda")  # shape: [1]
 
-        rand_sample = torch.tensor([0], dtype=torch.float32,
-                                   device="cuda")  # shape: [num_tokens]
-
         paths = torch.tensor(
             [[[0, 1, 4, 6], [0, 1, 4, 7], [0, 2, -1, -1], [0, 3, 5, -1],
               [-1, -1, -1, -1], [-1, -1, -1, -1], [-1, -1, -1, -1],
@@ -742,7 +723,7 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             [3], dtype=torch.int32, device="cuda")  # shape: [batch_size]
 
         # Eagle-2 related inputs/outputs, useless for Eagle-1
-        use_dynamic_tree = torch.tensor(False, dtype=torch.bool,
+        use_dynamic_tree = torch.tensor([0], dtype=torch.int32,
                                         device="cpu")  # shape: [1]
         dynamic_tree_max_topK = torch.tensor(dynamic_tree_max_topK_t,
                                              dtype=torch.int32,
@@ -776,7 +757,7 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             dtype=torch.int32,
             device="cuda")  # shape: [batch_size, max_decoding_draft_tokens]
 
-        ref_return_output_path = None
+        ref_return_output_path = paths  # Same as the input
         ref_return_current_scores = None
         ref_return_next_expand_indices = None
         ref_return_output_all_layers_scores = None
@@ -784,9 +765,9 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
         ref_return_output_all_layers_draft_token_ids_predecessor = None
 
         test_cases += [[
-            logits, num_last_token_indices, rand_sample, paths,
-            use_dynamic_tree, dynamic_tree_max_topK, input_draft_token_ids,
-            input_draft_lens, input_prev_scores, input_current_expand_indices,
+            logits, num_last_token_indices, paths, use_dynamic_tree,
+            dynamic_tree_max_topK, input_draft_token_ids, input_draft_lens,
+            input_prev_scores, input_current_expand_indices,
             input_all_layers_scores, input_all_layers_draft_token_ids,
             input_all_layers_draft_token_ids_predecessor, top_k_sampling,
             num_eagle_layers, layerId, ref_return_draft_token_ids,
@@ -825,9 +806,6 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
                                               dtype=torch.int32,
                                               device="cuda")  # shape: [1]
 
-        rand_sample = torch.tensor([0], dtype=torch.float32,
-                                   device="cuda")  # shape: [num_tokens]
-
         paths = torch.tensor(
             [[[0, 1, 4, 6], [0, 1, 4, 7], [0, 2, -1, -1], [0, 3, 5, -1],
               [-1, -1, -1, -1], [-1, -1, -1, -1], [-1, -1, -1, -1],
@@ -852,7 +830,7 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             [3], dtype=torch.int32, device="cuda")  # shape: [batch_size]
 
         # Eagle-2 related inputs/outputs, useless for Eagle-1
-        use_dynamic_tree = torch.tensor(False, dtype=torch.bool,
+        use_dynamic_tree = torch.tensor([0], dtype=torch.int32,
                                         device="cpu")  # shape: [1]
         dynamic_tree_max_topK = torch.tensor(dynamic_tree_max_topK_t,
                                              dtype=torch.int32,
@@ -886,7 +864,7 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             dtype=torch.int32,
             device="cuda")  # shape: [batch_size, max_decoding_draft_tokens]
 
-        ref_return_output_path = None
+        ref_return_output_path = paths  # Same as the input
         ref_return_current_scores = None
         ref_return_next_expand_indices = None
         ref_return_output_all_layers_scores = None
@@ -894,9 +872,9 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
         ref_return_output_all_layers_draft_token_ids_predecessor = None
 
         test_cases += [[
-            logits, num_last_token_indices, rand_sample, paths,
-            use_dynamic_tree, dynamic_tree_max_topK, input_draft_token_ids,
-            input_draft_lens, input_prev_scores, input_current_expand_indices,
+            logits, num_last_token_indices, paths, use_dynamic_tree,
+            dynamic_tree_max_topK, input_draft_token_ids, input_draft_lens,
+            input_prev_scores, input_current_expand_indices,
             input_all_layers_scores, input_all_layers_draft_token_ids,
             input_all_layers_draft_token_ids_predecessor, top_k_sampling,
             num_eagle_layers, layerId, ref_return_draft_token_ids,
@@ -935,8 +913,6 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
                                               dtype=torch.int32,
                                               device="cuda")  # shape: [1]
 
-        rand_sample = torch.tensor([0], dtype=torch.float32,
-                                   device="cuda")  # shape: [num_tokens]
         paths = torch.full(
             (batch_size, max_decoding_tokens, max_path_len),
             -1,
@@ -944,7 +920,7 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             device="cuda"
         )  # shape: [batch_size, max_decoding_tokens, max_path_len]
 
-        use_dynamic_tree = torch.tensor(True, dtype=torch.bool,
+        use_dynamic_tree = torch.tensor([1], dtype=torch.int32,
                                         device="cpu")  # shape: [1]
         dynamic_tree_max_topK = torch.tensor(dynamic_tree_max_topK_t,
                                              dtype=torch.int32,
@@ -1021,9 +997,9 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
         # Since we will save this value continuously
 
         test_cases += [[
-            logits, num_last_token_indices, rand_sample, paths,
-            use_dynamic_tree, dynamic_tree_max_topK, input_draft_token_ids,
-            input_draft_lens, input_prev_scores, input_current_expand_indices,
+            logits, num_last_token_indices, paths, use_dynamic_tree,
+            dynamic_tree_max_topK, input_draft_token_ids, input_draft_lens,
+            input_prev_scores, input_current_expand_indices,
             input_all_layers_scores, input_all_layers_draft_token_ids,
             input_all_layers_draft_token_ids_predecessor, top_k_sampling,
             num_eagle_layers, layerId, ref_return_draft_token_ids,
@@ -1081,8 +1057,6 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
                                               dtype=torch.int32,
                                               device="cuda")  # shape: [1]
 
-        rand_sample = torch.tensor([0, 0], dtype=torch.float32,
-                                   device="cuda")  # shape: [num_tokens]
         paths = torch.full(
             (batch_size, max_decoding_tokens, max_path_len),
             -1,
@@ -1090,7 +1064,7 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             device="cuda"
         )  # shape: [batch_size, max_decoding_tokens, max_path_len]
 
-        use_dynamic_tree = torch.tensor(True, dtype=torch.bool,
+        use_dynamic_tree = torch.tensor([1], dtype=torch.int32,
                                         device="cpu")  # shape: [1]
         dynamic_tree_max_topK = torch.tensor(dynamic_tree_max_topK_t,
                                              dtype=torch.int32,
@@ -1175,9 +1149,9 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
         # Since we will save this value continuously
 
         test_cases += [[
-            logits, num_last_token_indices, rand_sample, paths,
-            use_dynamic_tree, dynamic_tree_max_topK, input_draft_token_ids,
-            input_draft_lens, input_prev_scores, input_current_expand_indices,
+            logits, num_last_token_indices, paths, use_dynamic_tree,
+            dynamic_tree_max_topK, input_draft_token_ids, input_draft_lens,
+            input_prev_scores, input_current_expand_indices,
             input_all_layers_scores, input_all_layers_draft_token_ids,
             input_all_layers_draft_token_ids_predecessor, top_k_sampling,
             num_eagle_layers, layerId, ref_return_draft_token_ids,
@@ -1222,8 +1196,6 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
                                               dtype=torch.int32,
                                               device="cuda")  # shape: [1]
 
-        rand_sample = torch.tensor([0], dtype=torch.float32,
-                                   device="cuda")  # shape: [num_tokens]
         paths = torch.tensor(
             [[[0, 1, -1, -1], [0, 2, -1, -1], [0, 3, -1, -1], [-1, -1, -1, -1],
               [-1, -1, -1, -1], [-1, -1, -1, -1], [-1, -1, -1, -1],
@@ -1232,7 +1204,7 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             device="cuda"
         )  # shape: [batch_size, max_decoding_tokens, max_path_len]
 
-        use_dynamic_tree = torch.tensor(True, dtype=torch.bool,
+        use_dynamic_tree = torch.tensor([1], dtype=torch.int32,
                                         device="cpu")  # shape: [1]
         dynamic_tree_max_topK = torch.tensor(dynamic_tree_max_topK_t,
                                              dtype=torch.int32,
@@ -1328,9 +1300,9 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             [6], dtype=torch.int32, device="cuda")  # shape: [batch_size]
 
         test_cases += [[
-            logits, num_last_token_indices, rand_sample, paths,
-            use_dynamic_tree, dynamic_tree_max_topK, input_draft_token_ids,
-            input_draft_lens, input_prev_scores, input_current_expand_indices,
+            logits, num_last_token_indices, paths, use_dynamic_tree,
+            dynamic_tree_max_topK, input_draft_token_ids, input_draft_lens,
+            input_prev_scores, input_current_expand_indices,
             input_all_layers_scores, input_all_layers_draft_token_ids,
             input_all_layers_draft_token_ids_predecessor, top_k_sampling,
             num_eagle_layers, layerId, ref_return_draft_token_ids,
@@ -1382,8 +1354,6 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
                                               dtype=torch.int32,
                                               device="cuda")  # shape: [1]
 
-        rand_sample = torch.tensor([0, 0], dtype=torch.float32,
-                                   device="cuda")  # shape: [num_tokens]
         paths = torch.tensor(
             [[[0, 1, -1, -1], [0, 2, -1, -1], [0, 3, -1, -1], [-1, -1, -1, -1],
               [-1, -1, -1, -1], [-1, -1, -1, -1], [-1, -1, -1, -1],
@@ -1395,7 +1365,7 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             device="cuda"
         )  # shape: [batch_size, max_decoding_tokens, max_path_len]
 
-        use_dynamic_tree = torch.tensor(True, dtype=torch.bool,
+        use_dynamic_tree = torch.tensor([1], dtype=torch.int32,
                                         device="cpu")  # shape: [1]
         dynamic_tree_max_topK = torch.tensor(dynamic_tree_max_topK_t,
                                              dtype=torch.int32,
@@ -1536,9 +1506,9 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             [6, 6], dtype=torch.int32, device="cuda")  # shape: [batch_size]
 
         test_cases += [[
-            logits, num_last_token_indices, rand_sample, paths,
-            use_dynamic_tree, dynamic_tree_max_topK, input_draft_token_ids,
-            input_draft_lens, input_prev_scores, input_current_expand_indices,
+            logits, num_last_token_indices, paths, use_dynamic_tree,
+            dynamic_tree_max_topK, input_draft_token_ids, input_draft_lens,
+            input_prev_scores, input_current_expand_indices,
             input_all_layers_scores, input_all_layers_draft_token_ids,
             input_all_layers_draft_token_ids_predecessor, top_k_sampling,
             num_eagle_layers, layerId, ref_return_draft_token_ids,
@@ -1601,8 +1571,6 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
                                               dtype=torch.int32,
                                               device="cuda")  # shape: [1]
 
-        rand_sample = torch.tensor([0], dtype=torch.float32,
-                                   device="cuda")  # shape: [num_tokens]
         paths = torch.tensor(
             [[[0, 1, -1, -1], [0, 2, -1, -1], [0, 3, -1, -1], [-1, -1, -1, -1],
               [-1, -1, -1, -1], [-1, -1, -1, -1], [-1, -1, -1, -1],
@@ -1611,7 +1579,7 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             device="cuda"
         )  # shape: [batch_size, max_decoding_tokens, max_path_len]
 
-        use_dynamic_tree = torch.tensor(True, dtype=torch.bool,
+        use_dynamic_tree = torch.tensor([1], dtype=torch.int32,
                                         device="cpu")  # shape: [1]
         dynamic_tree_max_topK = torch.tensor(dynamic_tree_max_topK_t,
                                              dtype=torch.int32,
@@ -1707,9 +1675,9 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             [6], dtype=torch.int32, device="cuda")  # shape: [batch_size]
 
         test_cases += [[
-            logits, num_last_token_indices, rand_sample, paths,
-            use_dynamic_tree, dynamic_tree_max_topK, input_draft_token_ids,
-            input_draft_lens, input_prev_scores, input_current_expand_indices,
+            logits, num_last_token_indices, paths, use_dynamic_tree,
+            dynamic_tree_max_topK, input_draft_token_ids, input_draft_lens,
+            input_prev_scores, input_current_expand_indices,
             input_all_layers_scores, input_all_layers_draft_token_ids,
             input_all_layers_draft_token_ids_predecessor, top_k_sampling,
             num_eagle_layers, layerId, ref_return_draft_token_ids,
@@ -1764,8 +1732,6 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
                                               dtype=torch.int32,
                                               device="cuda")  # shape: [1]
 
-        rand_sample = torch.tensor([0], dtype=torch.float32,
-                                   device="cuda")  # shape: [num_tokens]
         paths = torch.tensor(
             [[
                 [0, 1, 4, -1],
@@ -1781,7 +1747,7 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             device="cuda"
         )  # shape: [batch_size, max_decoding_tokens, max_path_len]
 
-        use_dynamic_tree = torch.tensor(True, dtype=torch.bool,
+        use_dynamic_tree = torch.tensor([1], dtype=torch.int32,
                                         device="cpu")  # shape: [1]
         dynamic_tree_max_topK = torch.tensor(dynamic_tree_max_topK_t,
                                              dtype=torch.int32,
@@ -1861,9 +1827,9 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
         ref_return_output_all_layers_draft_token_ids_predecessor = None
 
         test_cases += [[
-            logits, num_last_token_indices, rand_sample, paths,
-            use_dynamic_tree, dynamic_tree_max_topK, input_draft_token_ids,
-            input_draft_lens, input_prev_scores, input_current_expand_indices,
+            logits, num_last_token_indices, paths, use_dynamic_tree,
+            dynamic_tree_max_topK, input_draft_token_ids, input_draft_lens,
+            input_prev_scores, input_current_expand_indices,
             input_all_layers_scores, input_all_layers_draft_token_ids,
             input_all_layers_draft_token_ids_predecessor, top_k_sampling,
             num_eagle_layers, layerId, ref_return_draft_token_ids,
@@ -1908,8 +1874,6 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
                                               dtype=torch.int32,
                                               device="cuda")  # shape: [1]
 
-        rand_sample = torch.tensor([0, 0], dtype=torch.float32,
-                                   device="cuda")  # shape: [num_tokens]
         paths = torch.tensor(
             [[
                 [0, 1, 4, -1],
@@ -1935,7 +1899,7 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             device="cuda"
         )  # shape: [batch_size, max_decoding_tokens, max_path_len]
 
-        use_dynamic_tree = torch.tensor(True, dtype=torch.bool,
+        use_dynamic_tree = torch.tensor([1], dtype=torch.int32,
                                         device="cpu")  # shape: [1]
         dynamic_tree_max_topK = torch.tensor(dynamic_tree_max_topK_t,
                                              dtype=torch.int32,
@@ -2052,9 +2016,9 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
         ref_return_output_all_layers_draft_token_ids_predecessor = None
 
         test_cases += [[
-            logits, num_last_token_indices, rand_sample, paths,
-            use_dynamic_tree, dynamic_tree_max_topK, input_draft_token_ids,
-            input_draft_lens, input_prev_scores, input_current_expand_indices,
+            logits, num_last_token_indices, paths, use_dynamic_tree,
+            dynamic_tree_max_topK, input_draft_token_ids, input_draft_lens,
+            input_prev_scores, input_current_expand_indices,
             input_all_layers_scores, input_all_layers_draft_token_ids,
             input_all_layers_draft_token_ids_predecessor, top_k_sampling,
             num_eagle_layers, layerId, ref_return_draft_token_ids,
@@ -2093,8 +2057,6 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
                                               dtype=torch.int32,
                                               device="cuda")  # shape: [1]
 
-        rand_sample = torch.tensor([0], dtype=torch.float32,
-                                   device="cuda")  # shape: [num_tokens]
         paths = torch.tensor(
             [[
                 [-1, -1, -1, -1],
@@ -2107,7 +2069,7 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             device="cuda"
         )  # shape: [batch_size, max_decoding_tokens, max_path_len]
 
-        use_dynamic_tree = torch.tensor(True, dtype=torch.bool,
+        use_dynamic_tree = torch.tensor([1], dtype=torch.int32,
                                         device="cpu")  # shape: [1]
         dynamic_tree_max_topK = torch.tensor(dynamic_tree_max_topK_t,
                                              dtype=torch.int32,
@@ -2173,9 +2135,9 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
         ref_return_output_all_layers_draft_token_ids_predecessor = None
 
         test_cases += [[
-            logits, num_last_token_indices, rand_sample, paths,
-            use_dynamic_tree, dynamic_tree_max_topK, input_draft_token_ids,
-            input_draft_lens, input_prev_scores, input_current_expand_indices,
+            logits, num_last_token_indices, paths, use_dynamic_tree,
+            dynamic_tree_max_topK, input_draft_token_ids, input_draft_lens,
+            input_prev_scores, input_current_expand_indices,
             input_all_layers_scores, input_all_layers_draft_token_ids,
             input_all_layers_draft_token_ids_predecessor, top_k_sampling,
             num_eagle_layers, layerId, ref_return_draft_token_ids,
@@ -2189,9 +2151,9 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
 
     @parameterized.expand(load_test_cases, name_func=unittest_name_func)
     def test_sample_draft_tokens_plugin(
-            self, logits, num_last_token_indices, rand_sample, paths,
-            use_dynamic_tree, dynamic_tree_max_topK, input_draft_token_ids,
-            input_draft_lens, input_prev_scores, input_current_expand_indices,
+            self, logits, num_last_token_indices, paths, use_dynamic_tree,
+            dynamic_tree_max_topK, input_draft_token_ids, input_draft_lens,
+            input_prev_scores, input_current_expand_indices,
             input_all_layers_scores, input_all_layers_draft_token_ids,
             input_all_layers_draft_token_ids_predecessor, top_k_sampling,
             num_eagle_layers, layerId, ref_return_draft_token_ids,
@@ -2218,12 +2180,9 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
                 dtype=tensorrt_llm.torch_dtype_to_trt(
                     num_last_token_indices.dtype),
                 shape=num_last_token_indices.shape)
-            rand_sample_t = Tensor(name='rand_sample',
-                                   dtype=trt.float32,
-                                   shape=rand_sample.shape)
             paths_t = Tensor(name='paths', dtype=trt.int32, shape=paths.shape)
             use_dynamic_tree_t = Tensor(name='use_dynamic_tree',
-                                        dtype=trt.bool,
+                                        dtype=trt.int32,
                                         shape=use_dynamic_tree.shape)
             dynamic_tree_max_topK_t = Tensor(name='dynamic_tree_max_topK',
                                              dtype=trt.int32,
@@ -2261,11 +2220,9 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
                 top_k_sampling=top_k_sampling,
                 logits=logits_t,
                 num_last_token_indices=num_last_token_indices_t,
-                rand_sample=rand_sample_t,
-                tree_params=TreeParams(
-                    paths=paths_t,
-                    use_dynamic_tree=use_dynamic_tree_t,
-                    dynamic_tree_max_topK=dynamic_tree_max_topK_t),
+                input_paths=paths_t,
+                use_dynamic_tree=use_dynamic_tree_t,
+                dynamic_tree_max_topK=dynamic_tree_max_topK_t,
                 input_draft_token_ids=input_draft_token_ids_t,
                 input_draft_lens=input_draft_lens_t,
                 input_prev_scores=input_prev_scores_t,
@@ -2297,8 +2254,6 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
             logits,
             "num_last_token_indices":
             num_last_token_indices,
-            "rand_sample":
-            rand_sample,
             "paths":
             paths,
             "use_dynamic_tree":
@@ -2344,23 +2299,19 @@ class TestEagleDecodeDraftTokensPlugin(unittest.TestCase):
                 self.assertEqual(ref_return_draft_token_ids[bix][jj],
                                  output_draft_token_ids[bix][jj])
 
+            # 3) Check output paths
+            max_decoding_tokens = output_paths.shape[1]
+            output_paths.shape[2]
+            for jj in range(max_decoding_tokens):
+                for kk in range(layerId + 1):  # '+1' is because the root node
+                    self.assertEqual(ref_return_output_path[bix][jj][kk],
+                                     output_paths[bix][jj][kk])
+
             # For eagle-2
             if use_dynamic_tree:
-                # 3) Check output path
-                # max_decoding_tokens = ref_return_output_path.shape[1]
-                max_decoding_tokens = output_paths.shape[1]
-                max_decoding_tokens - 1
-                # max_path_len = ref_return_output_path.shape[2]
-                max_path_len = output_paths.shape[2]
-
                 num_all_layers_draft_tokens = (
                     layerId - 1
                 ) * dynamic_tree_max_topK * dynamic_tree_max_topK + dynamic_tree_max_topK
-
-                for jj in range(max_decoding_tokens):
-                    for kk in range(max_path_len):
-                        self.assertEqual(ref_return_output_path[bix][jj][kk],
-                                         output_paths[bix][jj][kk])
 
                 if layerId != num_eagle_layers - 1:
                     # Only check these output for internal layers

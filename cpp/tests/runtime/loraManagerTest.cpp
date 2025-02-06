@@ -14,8 +14,11 @@
  * limitations under the License.
  */
 
-#include <gtest/gtest.h>
+#ifndef TOP_LEVEL_DIR
+#error "Define TOP_LEVEL_DIR"
+#endif
 
+#include "tensorrt_llm/runtime/loraManager.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -24,13 +27,14 @@
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/loraCache.h"
-#include "tensorrt_llm/runtime/loraManager.h"
 #include "tensorrt_llm/runtime/loraModule.h"
 #include "tensorrt_llm/runtime/loraUtils.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include "tensorrt_llm/runtime/utils/numpyUtils.h"
+
+#include <gtest/gtest.h>
 
 #include <memory>
 #include <string>
@@ -54,8 +58,11 @@ namespace tensorrt_llm::runtime
 {
 using TensorPtr = ITensor::SharedPtr;
 using PeftTable = LoraManager::PeftTable;
+using ParamType = bool;
 
-class LoraManagerTest : public ::testing::Test // NOLINT(cppcoreguidelines-pro-type-member-init)
+class LoraManagerTest
+    : public ::testing::Test,
+      public ::testing::WithParamInterface<ParamType> // NOLINT(cppcoreguidelines-pro-type-member-init)
 {
 protected:
     LoraManagerTest()
@@ -176,13 +183,16 @@ static void checkLoraTensors(LoraManager const& loraManager, std::vector<int64_t
             {
                 SizeType32 adapterSizeOff = common::flat_index3(m, l, i, numLayers, numSeqs);
                 EXPECT_EQ(targetAdapterSizes[adapterSizeOff], adapterSizesPtr[adapterSizeOff]);
-                SizeType32 inPtrIdx = common::flat_index4(m, l, i, 0, numLayers, numSeqs, 2);
-                SizeType32 outPtrIdx = common::flat_index4(m, l, i, 1, numLayers, numSeqs, 2);
-                std::cout << weightsPtrsPtr[inPtrIdx] << " " << weightsPtrsPtr[outPtrIdx] << std::endl;
+                SizeType32 inPtrIdx = common::flat_index4(m, l, i, 0, numLayers, numSeqs, 3);
+                SizeType32 outPtrIdx = common::flat_index4(m, l, i, 1, numLayers, numSeqs, 3);
+                SizeType32 magnitudePtrIdx = common::flat_index4(m, l, i, 2, numLayers, numSeqs, 3);
+                std::cout << weightsPtrsPtr[inPtrIdx] << " " << weightsPtrsPtr[outPtrIdx] << " "
+                          << weightsPtrsPtr[magnitudePtrIdx] << std::endl;
                 if (checkPointers || targetPtrs[inPtrIdx] == 0)
                 {
                     EXPECT_EQ(targetPtrs[inPtrIdx], weightsPtrsPtr[inPtrIdx]);
                     EXPECT_EQ(targetPtrs[outPtrIdx], weightsPtrsPtr[outPtrIdx]);
+                    EXPECT_EQ(targetPtrs[magnitudePtrIdx], weightsPtrsPtr[magnitudePtrIdx]);
                 }
                 else
                 {
@@ -227,7 +237,7 @@ static void checkLoraTensors(LoraManager const& loraManager, std::vector<int64_t
 static std::tuple<std::vector<int32_t>, std::vector<int64_t>, PeftTable> createFillInputTensorsTestsData(
     std::vector<TensorPtr> const& configs, std::vector<uint64_t> const& reqIds,
     std::vector<SizeType32> const& reqBeamWidth, std::vector<LoraModule> const& modules, SizeType32 numLayers,
-    SizeType32 numSeq, std::vector<LoraCache::TaskLayerModuleConfigListPtr>& valuesWorkspace)
+    SizeType32 numSeq, std::vector<LoraCache::TaskLayerModuleConfigListPtr>& valuesWorkspace, bool isDora)
 {
     std::map<SizeType32, SizeType32> moduleOffset;
     SizeType32 modOff = 0;
@@ -240,7 +250,7 @@ static std::tuple<std::vector<int32_t>, std::vector<int64_t>, PeftTable> createF
     SizeType32 numModules = modules.size();
 
     std::vector<int32_t> targetAdapterSizes(numModules * numLayers * numSeq, 0);
-    std::vector<int64_t> targetPointers(numModules * numLayers * numSeq * 2, 0);
+    std::vector<int64_t> targetPointers(numModules * numLayers * numSeq * 3, 0);
 
     PeftTable peftTable{};
 
@@ -270,17 +280,21 @@ static std::tuple<std::vector<int32_t>, std::vector<int64_t>, PeftTable> createF
 
             auto inPointer = pointerAddr++;
             auto outPointer = pointerAddr++;
-            valuesWorkspace[bid]->push_back(
-                LoraCache::TaskLayerModuleConfig{0, 0, 0, 0, moduleId, layerId, adapterSize, 0, inPointer, outPointer});
+            auto magnitudePointer = isDora ? pointerAddr++ : 0;
+
+            valuesWorkspace[bid]->push_back(LoraCache::TaskLayerModuleConfig{0, 0, 0, 0, moduleId, layerId, adapterSize,
+                0, inPointer, outPointer, isDora ? std::optional<int64_t>(magnitudePointer) : std::nullopt});
 
             for (SizeType32 beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
             {
                 targetAdapterSizes[common::flat_index3<size_t>(modOff, layerId, bid + beamIdx, numLayers, numSeq)]
                     = adapterSize;
-                targetPointers[common::flat_index4<size_t>(modOff, layerId, bid + beamIdx, 0, numLayers, numSeq, 2)]
+                targetPointers[common::flat_index4<size_t>(modOff, layerId, bid + beamIdx, 0, numLayers, numSeq, 3)]
                     = inPointer;
-                targetPointers[common::flat_index4<size_t>(modOff, layerId, bid + beamIdx, 1, numLayers, numSeq, 2)]
+                targetPointers[common::flat_index4<size_t>(modOff, layerId, bid + beamIdx, 1, numLayers, numSeq, 3)]
                     = outPointer;
+                targetPointers[common::flat_index4<size_t>(modOff, layerId, bid + beamIdx, 2, numLayers, numSeq, 3)]
+                    = magnitudePointer;
             }
         }
         peftTable.try_emplace(reqIds[bid], *valuesWorkspace[bid]);
@@ -289,8 +303,10 @@ static std::tuple<std::vector<int32_t>, std::vector<int64_t>, PeftTable> createF
     return std::make_tuple(std::move(targetAdapterSizes), std::move(targetPointers), std::move(peftTable));
 }
 
-TEST_F(LoraManagerTest, fillInputTensors)
+TEST_P(LoraManagerTest, fillInputTensors)
 {
+    bool const isDora = GetParam();
+
     LoraManager loraManager;
     auto modelConfig = ModelConfig(0, 2, 2, 0, 1, 16, nvinfer1::DataType::kFLOAT);
     modelConfig.setMlpHiddenSize(32);
@@ -316,7 +332,7 @@ TEST_F(LoraManagerTest, fillInputTensors)
     auto numLayers = static_cast<SizeType32>(modelConfig.getNbAttentionLayers());
     SizeType32 numSeqs = 4;
     TensorPtr weightsPtrs
-        = mManager->cpu(ITensor::makeShape({numModules, numLayers, numSeqs, 2}), nvinfer1::DataType::kINT64);
+        = mManager->cpu(ITensor::makeShape({numModules, numLayers, numSeqs, 3}), nvinfer1::DataType::kINT64);
     TensorPtr adapterSizes
         = mManager->cpu(ITensor::makeShape({numModules, numLayers, numSeqs}), nvinfer1::DataType::kINT32);
 
@@ -332,7 +348,7 @@ TEST_F(LoraManagerTest, fillInputTensors)
 
     std::vector<LoraCache::TaskLayerModuleConfigListPtr> valuesWorkspace;
     auto [targetadapterSizes, targetPointers, peftTable] = createFillInputTensorsTestsData(
-        loraConfigs, reqIds, reqBeamWidth, modules, numLayers, numSeqs, valuesWorkspace);
+        loraConfigs, reqIds, reqBeamWidth, modules, numLayers, numSeqs, valuesWorkspace, isDora);
 
     loraManager.fillInputTensors(weightsPtrs, adapterSizes, peftTable, reqIds, reqBeamWidth, modelConfig, worldConfig);
 
@@ -342,4 +358,7 @@ TEST_F(LoraManagerTest, fillInputTensors)
     checkLoraTensors(loraManager, targetPointers, weightsPtrs, targetadapterSizes, adapterSizes, modelConfig,
         worldConfig, modules, numModules, numLayers, numSeqs);
 }
+
+INSTANTIATE_TEST_SUITE_P(LoraManagerTest, LoraManagerTest, testing::Values(false, true));
+
 } // namespace tensorrt_llm::runtime

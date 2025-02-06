@@ -31,8 +31,7 @@ from polygraphy.backend.trt import (CreateConfig, EngineFromNetwork, Profile,
 from transformers.models.bloom.modeling_bloom import build_alibi_tensor
 from transformers.models.llama.modeling_llama import (LlamaConfig, LlamaMLP,
                                                       LlamaRMSNorm)
-from utils.util import (getSMVersion, skip_bf16_pre_ampere, skip_fp8_pre_ada,
-                        skip_pre_ampere, unittest_name_func)
+from utils.util import skip_fp8_pre_ada, unittest_name_func
 
 import tensorrt_llm
 from tensorrt_llm import Tensor
@@ -332,9 +331,6 @@ class TestLayer(unittest.TestCase):
                     output_dtype=None,
                     pad_lda=0,
                     pad_ldc=0):
-        # Skip tests that are not supported on pre-Ampere
-        skip_bf16_pre_ampere(dtype)
-
         if output_dtype is None:
             output_dtype = dtype
 
@@ -412,9 +408,6 @@ class TestLayer(unittest.TestCase):
     ],
                           name_func=unittest_name_func)
     def test_grouped_linear(self, dtype, use_plugin, output_dtype=None):
-        # Skip tests that are not supported on pre-Ampere
-        skip_bf16_pre_ampere(dtype)
-
         if output_dtype is None:
             output_dtype = dtype
 
@@ -485,7 +478,6 @@ class TestLayer(unittest.TestCase):
 
     @parameterized.expand(list(product([True, False])),
                           name_func=unittest_name_func)
-    @skip_pre_ampere  # Skip tests that are not supported in pre-ampere architecture
     def test_prompt_tuning_embedding(self, remove_padding):
         torch.random.manual_seed(0)
         dtype = "bfloat16"
@@ -717,7 +709,6 @@ class TestLayer(unittest.TestCase):
 
     @parameterized.expand([("bfloat16", "float32"), ("float32", "bfloat16")],
                           name_func=unittest_name_func)
-    @skip_pre_ampere
     def test_cast_bf16(self, from_dtype, to_dtype):
 
         torch_from_dtype = str_dtype_to_torch(from_dtype)
@@ -1042,8 +1033,7 @@ class TestLayer(unittest.TestCase):
             engine_buffer)
         act_mem = session.engine.device_memory_size_v2
 
-        # TRT doesn't support context fmha in pre-turing architecture.
-        if act_mem_baseline != None and getSMVersion() >= 75:
+        if act_mem_baseline != None:
             if isinstance(act_mem_baseline, tuple):
                 act_mem_baseline = act_mem_baseline[
                     1] if trt.__version__.startswith(
@@ -1126,9 +1116,6 @@ class TestLayer(unittest.TestCase):
                           name_func=unittest_name_func)
     def test_mamba(self, batch_size, in_seq_len, out_seq_len, d_model, d_state,
                    req_type, dtype, remove_padding, use_plugin):
-
-        # Skip tests that are not supported in pre-ampere architecture
-        skip_bf16_pre_ampere(dtype)
 
         if not use_plugin and remove_padding:
             pytest.skip(
@@ -1447,20 +1434,22 @@ class TestLayer(unittest.TestCase):
                                    ssm_state_trt_llm,
                                    atol=dtype_atol[dtype])
 
-    @parameterized.expand(list(
-        product([3], [16], [1], [1024], [128], [64], [256], [1, 4],
-                ['context', 'generation'], ["float32", "float16", "bfloat16"],
-                [True, False], [True, False])) + list(
-                    product([16], [16], [1], [160, 320, 640], [128], [80],
-                            [256], [1], ['context', 'generation'],
-                            ["float16", "bfloat16"], [True], [True])),
-                          name_func=unittest_name_func)
+    @parameterized.expand(
+        # simple tests
+        list(
+            product([3], [16], [1], [1024], [128], [64], [256], [1, 4],
+                    ['context', 'generation'],
+                    ["float32", "float16", "bfloat16"], [True, False],
+                    [True, False])) +
+        # P=8x and H=2x
+        list(
+            product([2, 4, 8, 16], [16], [1], [160, 320, 640], [128], [80],
+                    [256], [1], ['context', 'generation'], ["float16"], [True],
+                    [True])),
+        name_func=unittest_name_func)
     def test_mamba2(self, batch_size, in_seq_len, out_seq_len, d_model, d_state,
                     headdim, chunk_size, ngroups, req_type, dtype,
                     remove_padding, use_plugin):
-
-        # Skip tests that are not supported in pre-ampere architecture
-        skip_bf16_pre_ampere(dtype)
 
         if not use_plugin and remove_padding:
             pytest.skip(
@@ -1469,9 +1458,6 @@ class TestLayer(unittest.TestCase):
             pytest.skip(
                 "Mamba2 layer only support float16 and bfloat16 in context phase"
             )
-        if getSMVersion() < 80:
-            pytest.skip(
-                "Mamba2 layer is not supported in pre-Ampere architecture")
 
         # configs
         device = "cuda"
@@ -1796,9 +1782,6 @@ class TestLayer(unittest.TestCase):
                        lru_width, num_heads, req_type, dtype, remove_padding,
                        use_plugin, use_fused_rg_lru):
 
-        # Skip tests that are not supported in pre-ampere architecture
-        skip_bf16_pre_ampere(dtype)
-
         if not use_plugin and remove_padding:
             pytest.skip(
                 "Skipping remove input padding without mamba conv1d plugin")
@@ -2116,11 +2099,8 @@ class TestLayer(unittest.TestCase):
             conv_state_trt_llm = conv_state_trt_llm.permute(0, 2, 1)
         conv_state_trt_llm = conv_state_trt_llm.to(torch.float32).cpu().numpy()
 
-        # https://nvbugs/4619116
-        # test_layer.py::TestLayer::test_recurrent_3_16_1_1280_1280_10_generation_float16_False_False
-        # only failed on V100 due the strict default tolerance setting.
-        atol = 1e-2 if getSMVersion() == 70 else dtype_atol[dtype]
-        rtol = 10 if getSMVersion() == 70 else 1e-7
+        atol = dtype_atol[dtype]
+        rtol = 1e-7
 
         np.testing.assert_allclose(output_torch.numpy(),
                                    output_trt_llm.numpy(),

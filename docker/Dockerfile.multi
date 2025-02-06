@@ -1,6 +1,6 @@
 # Multi-stage Dockerfile
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
-ARG BASE_TAG=24.11-py3
+ARG BASE_TAG=25.01-py3
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE}:${BASE_TAG} as base
@@ -27,11 +27,11 @@ RUN bash ./install_cmake.sh && rm install_cmake.sh
 COPY docker/common/install_ccache.sh install_ccache.sh
 RUN bash ./install_ccache.sh && rm install_ccache.sh
 
-# Only take effect when the base image is 12.4.0-devel-centos7.
+# Only take effect when the base image is Rocky Linux 8 with old CUDA version.
 COPY docker/common/install_cuda_toolkit.sh install_cuda_toolkit.sh
 RUN bash ./install_cuda_toolkit.sh && rm install_cuda_toolkit.sh
 
-# Download & install internal TRT release
+# Download & install latest TRT release
 ARG TRT_VER
 ARG CUDA_VER
 ARG CUDNN_VER
@@ -106,6 +106,7 @@ COPY --from=wheel \
      ${CPP_BUILD_DIR}/benchmarks/bertBenchmark \
      ${CPP_BUILD_DIR}/benchmarks/gptManagerBenchmark \
      ${CPP_BUILD_DIR}/benchmarks/gptSessionBenchmark \
+     ${CPP_BUILD_DIR}/benchmarks/disaggServerBenchmark \
      benchmarks/cpp/
 COPY examples examples
 RUN chmod -R a+w examples && \
@@ -113,6 +114,7 @@ RUN chmod -R a+w examples && \
       benchmarks/cpp/bertBenchmark.cpp \
       benchmarks/cpp/gptManagerBenchmark.cpp \
       benchmarks/cpp/gptSessionBenchmark.cpp \
+      benchmarks/cpp/disaggServerBenchmark.cpp \
       benchmarks/cpp/CMakeLists.txt
 ARG GIT_COMMIT
 ARG TRT_LLM_VER

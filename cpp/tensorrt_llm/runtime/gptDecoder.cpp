@@ -106,6 +106,7 @@ void GptDecoder<T>::disableLookahead(
     samplingParams->topPResetIds = mSamplingConfig.topPResetIds;
     samplingParams->outputLogProbs = mSamplingConfig.outputLogProbs;
     samplingParams->cumLogProbs = mSamplingConfig.cumLogProbs;
+    samplingParams->runtimeMinP = mSamplingConfig.minP;
 
     // get setup parameters
     setupParams->penaltyParams = std::move(penaltyParams);
@@ -162,6 +163,7 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
         samplingParams->topPResetIds = mSamplingConfig.topPResetIds;
         samplingParams->outputLogProbs = mSamplingConfig.outputLogProbs;
         samplingParams->cumLogProbs = mSamplingConfig.cumLogProbs;
+        samplingParams->runtimeMinP = mSamplingConfig.minP;
 
         setupParams->decodingParams = std::move(samplingParams);
     }
@@ -329,8 +331,7 @@ void prepareMedusaInputs(
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void prepareExternalDraftTokensInputs(
-    DecodingInput const& inputs, size_t maxBatchSize, std::shared_ptr<tl::DecodingInputs>& baseInputs)
+void prepareExternalDraftTokensInputs(DecodingInput const& inputs, std::shared_ptr<tl::DecodingInputs>& baseInputs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -342,6 +343,7 @@ void prepareExternalDraftTokensInputs(
     inputParams->draftProbs = externalDraftTokensInputs.draftProbs;
     inputParams->targetProbs = externalDraftTokensInputs.targetProbs;
     inputParams->numDraftTokens = externalDraftTokensInputs.numDraftTokens;
+    inputParams->numDraftTokensHost = externalDraftTokensInputs.numDraftTokensHost;
     inputParams->draftTokenIds = externalDraftTokensInputs.draftTokenIds;
     inputParams->constantThreshold = externalDraftTokensInputs.constantThreshold;
     inputParams->useRandomAcceptanceThreshold = externalDraftTokensInputs.useRandomAcceptanceThreshold;
@@ -531,7 +533,7 @@ std::shared_ptr<tl::BaseDecodingInputs> prepareInputs(
 
     if (decodingMode.isExternalDraftTokens())
     {
-        prepareExternalDraftTokensInputs(input, maxBatchSize, forwardParams);
+        prepareExternalDraftTokensInputs(input, forwardParams);
     }
 
     if (decodingMode.isEagle())

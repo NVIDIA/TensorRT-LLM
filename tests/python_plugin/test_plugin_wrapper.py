@@ -7,12 +7,13 @@ import torch
 
 import tensorrt_llm
 from tensorrt_llm import PluginBase, Tensor
-from tensorrt_llm._utils import torch_dtype_to_str, torch_dtype_to_trt
-from tensorrt_llm.python_plugin import SymTensor, TensorWrapper, trtllm_plugin
+from tensorrt_llm._utils import (TensorWrapper, torch_dtype_to_str,
+                                 torch_dtype_to_trt)
+from tensorrt_llm.python_plugin import SymTensor, trtllm_plugin
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "../"))
 from plugin_wrapper_utils import DummyPlugin
-from utils.util import create_session, run_session, skip_bf16_pre_ampere
+from utils.util import create_session, run_session
 
 sys.path.append(
     os.path.join(os.path.dirname(__file__), "..", "..", "examples",
@@ -40,9 +41,6 @@ def use_cuda_as_default_device():
 @pytest.mark.parametrize("to_torch", [False, True])
 @pytest.mark.parametrize("fp32_output", [False, True])
 def test_triton_plugin(dtype, to_torch, fp32_output):
-    # Skip tests that are not supported on pre-Ampere
-    skip_bf16_pre_ampere(dtype)
-
     # meta data
     batch_size = 10
     vocab_size = 1000

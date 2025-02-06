@@ -97,6 +97,21 @@ be equal to `num_eagle_layers`.
 To run non-greedy sampling and use typical acceptance, set `--eagle_posterior_threshold` to `run.py`. `eagle_posterior_threshold` corresponds to epsilon in typical acceptance criteria from [Medusa paper](https://arxiv.org/pdf/2401.10774).
 `--temperature` can be specified as well. When no `--eagle_posterior_threshold` is specified or `--temperature=0.0` is set, greedy sampling is used.
 
+#### Run EAGLE-2
+**EAGLE-2 is still under the experimental stage.**
+
+EAGLE-2 can be enabled with 2 runtime flags (`--eagle_use_dynamic_tree` and `--eagle_dynamic_tree_max_top_k=N`). The same engine can be used for EAGLE-1 and EAGLE-2. Eagle choices must not be set in case of EAGLE-2. EAGLE-2 will generate the tree corresponding to choices dynamically in the runtime. For more details, please refer to [EAGLE-2 paper](https://arxiv.org/pdf/2406.16858).
+
+When using EAGLE-2, please enable `--eagle_use_dynamic_tree`, which indicates whether to use a dynamic tree (default is `False`, i.e., use EAGLE-1 by default). Then set `--eagle_dynamic_tree_max_top_k=N`, which indicates how many new child nodes are expanded for the nodes in the dynamic tree.
+- In EagleNet0, `N` draft tokens are generated.
+- In EagleNet1, each draft token expands `N` new draft tokens. Therefore, this layer has `N * N` draft tokens. We select the top `N` as the output of this layer.
+- In EagleNet2, the `N` output nodes of EagleNet1 are expanded, and each node expands `N` new draft tokens. Therefore, this layer also has a total of `N * N` draft tokens. And select the top `N` as the output of this layer.
+- Etc.
+
+Finally, after `num_eagle_layer` EagleNets, `N + N * N * (num_eagle_layer - 1)` draft tokens are generated. We will rebuild the final tree based on all draft tokens and their scores. The final generated tree will have `min(N + N * N * (num_eagle_layer - 1), max_draft_tokens)` nodes.
+
+
+
 ```bash
 # Eagle greedy decoding using vicuna-7b-v1.3 model with 1 GPU
 python ../run.py --engine_dir ./tmp/eagle/7B/trt_engines/fp16/1-gpu/ \
@@ -120,6 +135,15 @@ mpirun -np 4 --allow-run-as-root --oversubscribe \
                  --tokenizer_dir ./vicuna-7b-v1.3/ \
                  --max_output_len=100 \
                  --eagle_choices="[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], [0, 0, 0, 0], [0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [0, 0, 0, 1], [1, 6], [0, 7, 0]]" \
+                 --input_text "Once upon"
+
+# Run EAGLE-2
+mpirun -np 1 --allow-run-as-root --oversubscribe \
+  python ../run.py --engine_dir ./tmp/eagle/7B/trt_engines/fp16/1-gpu/ \
+                 --tokenizer_dir ./vicuna-7b-v1.3/ \
+                 --max_output_len=100 \
+                 --eagle_use_dynamic_tree \
+                 --eagle_dynamic_tree_max_top_k 10 \
                  --input_text "Once upon"
 ```
 
@@ -151,4 +175,16 @@ mpirun -np 4 --allow-run-as-root --oversubscribe \
                            --data_type fp16 \
                            --eagle_choices="[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], [0, 0, 0, 0], [0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [0, 0, 0, 1], [1, 6], [0, 7, 0]]" \
                            --batch_size 1
+
+# Run EAGLE-2
+mpirun -np 1 --allow-run-as-root --oversubscribe \
+    python ../summarize.py --engine_dir ./tmp/eagle/7B/trt_engines/fp16/1-gpu/ \
+                           --hf_model_dir ./vicuna-7b-v1.3/ \
+                           --tokenizer_dir ./vicuna-7b-v1.3/ \
+                           --test_trt_llm \
+                           --data_type fp16 \
+                           --eagle_use_dynamic_tree \
+                           --eagle_dynamic_tree_max_top_k 10 \
+                           --batch_size 1
+
 ```

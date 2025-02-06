@@ -1,4 +1,5 @@
-from typing import Optional
+from pathlib import Path
+from typing import Optional, Union
 
 from ..mapping import Mapping
 from . import MODEL_MAP
@@ -49,10 +50,16 @@ class AutoConfig:
 class AutoModelForCausalLM:
 
     @staticmethod
-    def get_trtllm_model_class(hf_model_or_dir,
-                               trust_remote_code=False,
-                               has_speculative_model=False):
+    def get_trtllm_model_class(hf_model_or_dir: Union[str, Path],
+                               trust_remote_code: bool = False,
+                               has_speculative_model: bool = False):
         import transformers
+
+        hf_model_or_dir = Path(hf_model_or_dir) if not isinstance(
+            hf_model_or_dir, Path) else hf_model_or_dir
+
+        assert (hf_model_or_dir / "config.json").exists(
+        ), "Please provide a Hugging Face model as the input to the LLM API."
 
         hf_config = transformers.AutoConfig.from_pretrained(
             hf_model_or_dir, trust_remote_code=trust_remote_code)

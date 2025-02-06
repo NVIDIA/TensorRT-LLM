@@ -1,20 +1,7 @@
 ### Generate Text Using Lookahead Decoding
-import argparse
-
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import (LLM, BuildConfig, KvCacheConfig,
                                  LookaheadDecodingConfig, SamplingParams)
-
-parser = argparse.ArgumentParser()
-# model can accept HF model name or a path to local HF model or path to TRT-LLM engine
-parser.add_argument(
-    '--model',
-    type=str,
-    default="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    help=
-    "Path to a TensorRT-LLM engine, a Huggingface model or the name of a Huggingface model to download (for example \"TinyLlama/TinyLlama-1.1B-Chat-v1.0\""
-)
-args = parser.parse_args()
 
 
 def main():
@@ -29,7 +16,7 @@ def main():
                                                max_verification_set_size=4)
 
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
-    llm = LLM(model=args.model,
+    llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
               kv_cache_config=kv_cache_config,
               build_config=build_config,
               speculative_config=lookahead_config)

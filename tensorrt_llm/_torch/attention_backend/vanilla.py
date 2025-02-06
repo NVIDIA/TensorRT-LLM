@@ -1,0 +1,207 @@
+from typing import Optional
+
+import torch
+
+from tensorrt_llm.models.modeling_utils import QuantConfig
+
+try:
+    from transformers.modeling_attn_mask_utils import AttentionMaskConverter
+except ImportError:
+    AttentionMaskConverter = None
+
+from .interface import (AttentionBackend, AttentionMask, AttentionMetadata,
+                        PredefinedAttentionMask)
+
+
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    """
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :,
+                                  None, :, :].expand(batch, num_key_value_heads,
+                                                     n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen,
+                                 head_dim)
+
+
+def generate_causal_mask(batch_size: int, target_length: int,
+                         cache_position: torch.Tensor, device: torch.device):
+    causal_mask = torch.arange(
+        target_length,
+        device=device).unsqueeze(0) <= cache_position.unsqueeze(-1)
+    causal_mask = causal_mask.expand(batch_size, 1, -1, -1)
+
+    return causal_mask
+
+
+class VanillaAttentionMetadata(AttentionMetadata):
+
+    def prepare(self) -> None:
+        # indices of used cache blocks for each sequence
+        assert self.request_ids is not None
+        self.block_ids_per_seq = self.kv_cache_manager.get_batch_cache_indices(
+            self.request_ids)
+
+
+class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
+
+    Metadata = VanillaAttentionMetadata
+
+    _access_type = {
+        1: torch.int8,
+        2: torch.int16,
+        4: torch.int32,
+        8: torch.int64
+    }
+
+    def __init__(
+        self,
+        layer_idx: int,
+        num_heads: int,
+        head_dim: int,
+        num_kv_heads: Optional[int] = None,
+        quant_config: Optional[QuantConfig] = None,
+    ):
+        super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
+                         quant_config)
+        self.num_key_value_groups = self.num_heads // self.num_kv_heads
+
+    def _single_request_update_kv_cache(self, k, v, kv_cache_tensor, seq_len,
+                                        cache_idx, cache_position):
+        k_out = kv_cache_tensor[cache_idx, 0, :, :, :].unsqueeze(0)
+        v_out = kv_cache_tensor[cache_idx, 1, :, :, :].unsqueeze(0)
+
+        if k is not None and v is not None:
+            access_type = self._access_type[k.dtype.itemsize]
+            k_out.view(dtype=access_type).index_copy_(1, cache_position,
+                                                      k.view(dtype=access_type))
+            v_out.view(dtype=access_type).index_copy_(1, cache_position,
+                                                      v.view(dtype=access_type))
+
+        return k_out[:, :seq_len, :, :], v_out[:, :seq_len, :, :]
+
+    def _single_request_forward(self, q, k, v, attention_mask: AttentionMask,
+                                kv_cache_tensor, past_seen_token, cache_idx):
+
+        bsz = 1
+        q_len = q.size(0)
+
+        # Query
+        q = q.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # Key and Value
+        target_seq_len = past_seen_token
+        if k is not None and v is not None:
+            kv_len = k.size(0)
+            k = k.view(bsz, kv_len, self.num_kv_heads, self.head_dim)
+            v = v.view(bsz, kv_len, self.num_kv_heads, self.head_dim)
+            target_seq_len += kv_len
+
+            if self.quant_config and self.quant_config.layer_quant_mode.has_any_quant(
+            ):
+                qc = self.quant_config
+                if qc.layer_quant_mode.has_fp8_kv_cache():
+                    assert kv_cache_tensor.dtype == torch.float8_e4m3fn, f"KV cache should have fp8 dtype, but get {kv_cache_tensor.dtype}"
+                    k = k.to(torch.float8_e4m3fn)
+                    v = v.to(torch.float8_e4m3fn)
+            assert k.dtype == v.dtype == kv_cache_tensor.dtype, f"KV cache dtype {kv_cache_tensor.dtype} does not match k/v dtype {k.dtype}/{v.dtype}"
+
+        cache_position = torch.arange(past_seen_token,
+                                      target_seq_len,
+                                      device=q.device)
+
+        key_states, value_states = self._single_request_update_kv_cache(
+            k, v, kv_cache_tensor, target_seq_len, cache_idx, cache_position)
+
+        key_states = key_states.transpose(1, 2).to(q.dtype)
+        value_states = value_states.transpose(1, 2).to(q.dtype)
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        # Attention Mask
+        is_causal = False
+        attn_mask = None
+        if attention_mask == PredefinedAttentionMask.CAUSAL:
+            if past_seen_token == 0:
+                is_causal = True
+            elif q_len != 1:
+                # attn_mask: 4-D tensor (batch_size, 1, query_seq_len, seq_len)
+                attn_mask = generate_causal_mask(bsz, target_seq_len,
+                                                 cache_position, q.device)
+        elif attention_mask == PredefinedAttentionMask.FULL:
+            pass
+        else:
+            raise ValueError("Unexpected attention mask type")
+
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            q,
+            key_states,
+            value_states,
+            is_causal=is_causal,
+            attn_mask=attn_mask,
+        )
+
+        attn_output = attn_output.squeeze(0)
+        return attn_output
+
+    def forward(self,
+                q: torch.Tensor,
+                k: Optional[torch.Tensor],
+                v: Optional[torch.Tensor],
+                metadata: VanillaAttentionMetadata,
+                *,
+                attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
+                **kwargs) -> torch.Tensor:
+        # This is only for memory estimation for now.
+        # NOTE: this method is not accurate while it works for most scenario.
+        if metadata is None or metadata.kv_cache_manager is None:
+            return AttentionBackend.dummy_forward(q.unsqueeze(0),
+                                                  k.unsqueeze(0),
+                                                  v.unsqueeze(0))
+
+        past_seen_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
+        cache_indices = [
+            block_ids[0] for block_ids in metadata.block_ids_per_seq
+        ]
+        kv_cache_tensor = metadata.kv_cache_manager.get_buffers(self.layer_idx)
+
+        q_len = q.size(0)
+
+        assert len(cache_indices) == len(past_seen_tokens)
+        assert len(cache_indices) == metadata.seq_lens.nelement()
+
+        offset = 0
+        offset_kv = 0
+        attn_outputs = []
+        for i, (seq_len, seq_len_kv) in enumerate(
+                zip(metadata.seq_lens, metadata.seq_lens_kv)):
+            single_q = q[offset:offset + seq_len]
+            single_k = k[
+                offset_kv:offset_kv +
+                seq_len_kv] if k is not None and seq_len_kv != 0 else None
+            single_v = v[
+                offset_kv:offset_kv +
+                seq_len_kv] if k is not None and seq_len_kv != 0 else None
+            past_seen_token = past_seen_tokens[i]
+            cache_idx = cache_indices[i]
+
+            attn_output = self._single_request_forward(single_q, single_k,
+                                                       single_v, attention_mask,
+                                                       kv_cache_tensor,
+                                                       past_seen_token,
+                                                       cache_idx)
+            attn_outputs.append(attn_output)
+
+            offset += seq_len
+            offset_kv += seq_len_kv
+
+        attn_output = torch.cat(attn_outputs, dim=1)
+        attn_output = attn_output.transpose(0, 1).contiguous()
+        attn_output = attn_output.view(q_len, -1)
+
+        return attn_output

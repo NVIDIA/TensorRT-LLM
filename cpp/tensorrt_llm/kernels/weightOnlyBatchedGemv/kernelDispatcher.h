@@ -48,6 +48,17 @@ void dispatcher(Params& params, cudaStream_t s)
         DISPATCHER_FOR_M(2, 2, 4, 128);
         DISPATCHER_FOR_M(3, 3, 4, 128);
         DISPATCHER_FOR_M(4, 4, 4, 128);
+        DISPATCHER_FOR_M(5, 5, 4, 128);
+        DISPATCHER_FOR_M(6, 6, 4, 128);
+        DISPATCHER_FOR_M(7, 7, 4, 128);
+        DISPATCHER_FOR_M(8, 8, 4, 128);
+        DISPATCHER_FOR_M(9, 9, 4, 128);
+        DISPATCHER_FOR_M(10, 10, 4, 128);
+        DISPATCHER_FOR_M(11, 11, 4, 128);
+        DISPATCHER_FOR_M(12, 12, 4, 128);
+        DISPATCHER_FOR_M(13, 13, 4, 128);
+        DISPATCHER_FOR_M(14, 14, 4, 128);
+        DISPATCHER_FOR_M(15, 15, 4, 128);
         // clang-format on
     }
     else
@@ -57,6 +68,17 @@ void dispatcher(Params& params, cudaStream_t s)
         DISPATCHER_FOR_M(2, 2, 8, 128);
         DISPATCHER_FOR_M(3, 3, 8, 128);
         DISPATCHER_FOR_M(4, 4, 8, 128);
+        DISPATCHER_FOR_M(5, 5, 8, 128);
+        DISPATCHER_FOR_M(6, 6, 8, 128);
+        DISPATCHER_FOR_M(7, 7, 8, 128);
+        DISPATCHER_FOR_M(8, 8, 8, 128);
+        DISPATCHER_FOR_M(9, 9, 8, 128);
+        DISPATCHER_FOR_M(10, 10, 8, 128);
+        DISPATCHER_FOR_M(11, 11, 8, 128);
+        DISPATCHER_FOR_M(12, 12, 8, 128);
+        DISPATCHER_FOR_M(13, 13, 8, 128);
+        DISPATCHER_FOR_M(14, 14, 8, 128);
+        DISPATCHER_FOR_M(15, 15, 8, 128);
         // clang-format on
     }
     throw std::runtime_error("unsupported m");

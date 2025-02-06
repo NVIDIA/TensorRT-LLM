@@ -33,11 +33,11 @@ RmsnormQuantizationPlugin::RmsnormQuantizationPlugin(float eps, bool dynamicActi
     bool clampValEnabled, QuantMode quantMode, nvinfer1::DataType type, nvinfer1::DataType outputType)
     : mEps(eps)
     , mDynActScaling(dynamicActivationScaling)
-    , mSumPerToken(sumPerToken)
-    , mClampValEnabled{clampValEnabled}
-    , mQuantMode{quantMode}
     , mType(type)
     , mOutputType{outputType}
+    , mClampValEnabled{clampValEnabled}
+    , mQuantMode{quantMode}
+    , mSumPerToken(sumPerToken)
 {
     TLLM_CHECK_WITH_INFO(mOutputType == nvinfer1::DataType::kINT8 || mOutputType == nvinfer1::DataType::kFP8,
         "Only int8 or fp8 output type is allowed.");
@@ -328,7 +328,7 @@ void RmsnormQuantizationPlugin::serialize(void* buffer) const noexcept
     write(d, mQuantMode);
     write(d, mType);
     write(d, mOutputType);
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 }
 
 void RmsnormQuantizationPlugin::destroy() noexcept
@@ -343,7 +343,7 @@ RmsnormQuantizationPluginCreator::RmsnormQuantizationPluginCreator()
 {
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
-    mPluginAttributes.emplace_back(PluginField("eps", nullptr, PluginFieldType::kFLOAT32, 1e-5f));
+    mPluginAttributes.emplace_back(PluginField("eps", nullptr, PluginFieldType::kFLOAT32, 1));
     mPluginAttributes.emplace_back(PluginField("dyn_act_scaling", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("sum_per_token", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("clamp_enabled", nullptr, PluginFieldType::kINT32, 1));
@@ -372,13 +372,13 @@ PluginFieldCollection const* RmsnormQuantizationPluginCreator::getFieldNames() n
 IPluginV2* RmsnormQuantizationPluginCreator::createPlugin(char const* name, PluginFieldCollection const* fc) noexcept
 {
     PluginField const* fields = fc->fields;
-    nvinfer1::DataType outputType;
+    nvinfer1::DataType outputType{};
     QuantMode quantMode;
     bool clampValEnabled = false;
-    float eps;
-    nvinfer1::DataType type;
-    bool dynamicActivationScaling;
-    bool sumPerToken;
+    float eps{};
+    nvinfer1::DataType type{};
+    bool dynamicActivationScaling{};
+    bool sumPerToken{};
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {

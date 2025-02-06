@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplCommon.h"
 #include <cuda_runtime_api.h>
 
 namespace tensorrt_llm::kernels::jit
@@ -76,6 +77,7 @@ CubinObj::CubinObj(CubinObj&& other)
         this->mModule = other.mModule;
         this->mFunction = other.mFunction;
         this->mSharedMemBytes = other.mSharedMemBytes;
+        this->mKernelType = other.mKernelType;
 
         other.mInitialized = false;
     }
@@ -100,6 +102,7 @@ CubinObj& CubinObj::operator=(CubinObj&& other)
         this->mModule = other.mModule;
         this->mFunction = other.mFunction;
         this->mSharedMemBytes = other.mSharedMemBytes;
+        this->mKernelType = other.mKernelType;
 
         other.mInitialized = false;
     }
@@ -128,11 +131,16 @@ void CubinObj::serialize(void* buffer_, size_t buffer_size) const noexcept
     memcpy(buffer, mContent.c_str(), len);
 }
 
-void CubinObj::launch(dim3 gridDim, dim3 blockDim, CUstream hStream, void** kernelParams)
+void CubinObj::launch(dim3 gridDim, dim3 blockDim, CUstream hStream, void** kernelParams) const
 {
     TLLM_CHECK(mInitialized);
-    TLLM_CU_CHECK(mDriver->cuLaunchKernel(mFunction, gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y,
-        blockDim.z, mSharedMemBytes, hStream, kernelParams, /*extra=*/nullptr));
+    CUlaunchAttribute fdlAttr;
+    fdlAttr.id = CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
+    fdlAttr.value.programmaticStreamSerializationAllowed = (tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0);
+    CUlaunchConfig const cfg{
+        gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z, mSharedMemBytes, hStream, &fdlAttr, 1};
+
+    TLLM_CU_CHECK(mDriver->cuLaunchKernelEx(&cfg, mFunction, kernelParams, /*extra=*/nullptr));
 }
 
 void CubinObj::initialize()
@@ -147,11 +155,9 @@ void CubinObj::initialize()
         TLLM_CU_CHECK(mDriver->cuModuleGetFunction(&mFunction, mModule, kFuncName));
         TLLM_CHECK(mFunction != nullptr);
 
-        // Populate mSharedMemBytes.
-        CUdeviceptr shmem_dev_ptr = 0;
-        TLLM_CU_CHECK(mDriver->cuModuleGetGlobal(&shmem_dev_ptr, nullptr, mModule, kSmemName));
-        TLLM_CHECK(shmem_dev_ptr != 0);
-        TLLM_CU_CHECK(mDriver->cuMemcpyDtoH(&mSharedMemBytes, shmem_dev_ptr, sizeof(unsigned int)));
+        // Populate mSharedMemBytes and mKernelType.
+        mSharedMemBytes = getGlobalVar<uint32_t>(mDriver, mModule, kSmemName, true).value();
+        mKernelType = getGlobalVar<XQAKernelType>(mDriver, mModule, kKernelTypeName, true).value();
 
         TLLM_CHECK(mSharedMemBytes > 0);
 

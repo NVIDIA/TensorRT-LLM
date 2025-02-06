@@ -119,7 +119,7 @@ int CudaStreamPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinf
         auto const resource_name = nvinfer1::pluginInternal::SideStream::getResourceKey(mSideStreamId);
         nvinfer1::pluginInternal::SideStream side_stream{};
         mSideStreamPtr = reinterpret_cast<nvinfer1::pluginInternal::SideStream*>(
-            getPluginRegistry()->acquirePluginResource(resource_name, &side_stream));
+            getPluginRegistry()->acquirePluginResource(resource_name.c_str(), &side_stream));
     }
     mSideStreamPtr->waitSideStreamOnMainStream(stream);
     size_t count = 1;
@@ -168,7 +168,7 @@ void CudaStreamPlugin::terminate() noexcept
     if (mSideStreamPtr)
     {
         auto const resource_name = nvinfer1::pluginInternal::SideStream::getResourceKey(mSideStreamId);
-        getPluginRegistry()->releasePluginResource(resource_name);
+        getPluginRegistry()->releasePluginResource(resource_name.c_str());
         mSideStreamPtr = nullptr;
     }
 }
@@ -184,7 +184,7 @@ void CudaStreamPlugin::serialize(void* buffer) const noexcept
     write(d, mSideStreamId);
     write(d, mNbInputs);
     write(d, mType);
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 }
 
 void CudaStreamPlugin::destroy() noexcept
@@ -241,7 +241,6 @@ IPluginV2* CudaStreamPluginCreator::createPlugin(char const* name, PluginFieldCo
         MapPair{"num_inputs", std::ref(nbInputs)},
         MapPair{"type_id", std::ref(type)},
     };
-    bool typeSet = false;
     for (int i = 0; i < fc->nbFields; ++i)
     {
         char const* attrName = fields[i].name;

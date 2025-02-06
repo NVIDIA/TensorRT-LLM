@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Optional
 
 from ..._utils import pad_vocab_size
@@ -22,6 +23,7 @@ from ...layers import (Attention, AttentionMaskType, ColumnLinear, Embedding,
 from ...mapping import Mapping
 from ...module import Module
 from ...plugin import init_all_reduce_helper
+from ..model_weights_loader import ModelWeightsLoader
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
                               PretrainedConfig)
 from .config import DeepSeekV1Config
@@ -225,14 +227,53 @@ class DeepseekForCausalLM(DecoderModelForCausalLM):
                                                                mapping=mapping,
                                                                **kwargs)
         deepseek = cls.from_config(pretrained_config)
-        hf_model = load_hf_deepseek(model_dir)
-        weights = convert_deepseek(
-            hf_model,
-            pretrained_config,
-            mapping=pretrained_config.mapping,
-            dtype=pretrained_config.dtype,
-            use_parallel_embedding=pretrained_config.use_parallel_embedding,
-            sharding_dim=pretrained_config.embedding_sharding_dim)
-        deepseek.load(weights)
+        if os.environ.get("TRTLLM_DISABLE_UNIFIED_CONVERTER") is None:
 
-        return deepseek
+            custom_dict = {}
+
+            rank_experts = mapping.ep_experts(pretrained_config.moe.num_experts)
+            for index, module in enumerate(deepseek.transformer.layers):
+                if index > 0:
+
+                    module.mlp.shared_expert.fc.tllm_to_externel_key_dict = {
+                        "fc": ["up_proj", "gate_proj"],
+                        "shared_expert": "shared_experts"
+                    }
+                    module.mlp.shared_expert.proj.tllm_to_externel_key_dict = {
+                        "shared_expert": "shared_experts"
+                    }
+                    module.mlp.fc.tllm_to_externel_key_dict = {
+                        "fc": [
+                            f"experts.{expert}.up_proj"
+                            for expert in rank_experts
+                        ] + [
+                            f"experts.{expert}.gate_proj"
+                            for expert in rank_experts
+                        ]
+                    }
+                    module.mlp.proj.tllm_to_externel_key_dict = {
+                        "proj": [
+                            f"experts.{expert}.down_proj"
+                            for expert in rank_experts
+                        ]
+                    }
+                    module.mlp.router.tllm_to_externel_key_dict = {
+                        "mlp": "mlp",
+                        "router": "gate"
+                    }
+
+            loader = ModelWeightsLoader(model_dir, custom_dict)
+            loader.generate_tllm_weights(deepseek)
+            return deepseek
+        else:
+
+            hf_model = load_hf_deepseek(model_dir)
+            weights = convert_deepseek(
+                hf_model,
+                pretrained_config,
+                mapping=pretrained_config.mapping,
+                dtype=pretrained_config.dtype,
+                use_parallel_embedding=pretrained_config.use_parallel_embedding,
+                sharding_dim=pretrained_config.embedding_sharding_dim)
+            deepseek.load(weights)
+            return deepseek

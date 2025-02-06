@@ -115,9 +115,11 @@ public:
         TensorPtr draftProbs;
         TensorPtr targetProbs;
         TensorPtr numDraftTokens;
+        TensorPtr numDraftTokensHost;
         TensorPtr draftTokenIds;
         TensorPtr useDraftLogits;
         TensorPtr useDraftLogitsHost;
+
         SizeType32 step;
         float constantThreshold;
         bool useRandomAcceptanceThreshold;

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass
+from math import prod
 from typing import Any, Dict, List, Optional
 
 # isort: off
@@ -46,7 +47,37 @@ class TensorInfo:
     name: str
     dtype: trt.DataType
     shape: tuple
+
     # add more info like strides, formats if needed
+
+    def numel(self):
+        return prod(self.shape)
+
+    def view(self, *shape):
+        assert set(map(type, shape)) == {int}
+        n_unknown = len(tuple(filter(lambda l: l < 0, shape)))
+        new_shape = list(shape)
+        if n_unknown == 0:
+            assert prod(shape) == self.numel()
+        elif n_unknown == 1:
+            n_known_elements = prod(filter(lambda l: l >= 0, shape))
+            for i, l in enumerate(new_shape):
+                if l == -1:
+                    assert self.numel() % n_known_elements == 0
+                    new_shape[i] = self.numel() // n_known_elements
+                    break
+        else:
+            raise ValueError('More than one dimensions need to be inferred!')
+        return TensorInfo(self.name, self.dtype, tuple(new_shape))
+
+    def __len__(self):
+        return self.shape[0]
+
+    def squeeze(self, dim=0):
+        if self.shape[dim] != 1:
+            raise ValueError(f"dim {dim} is {self.shape[dim]} instead of 1!")
+        return TensorInfo(self.name, self.dtype,
+                          self.shape[:dim] + self.shape[dim + 1:])
 
 
 class Session(object):

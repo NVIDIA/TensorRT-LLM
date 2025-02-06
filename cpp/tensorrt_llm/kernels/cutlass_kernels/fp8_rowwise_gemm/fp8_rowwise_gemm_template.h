@@ -223,7 +223,7 @@ size_t dispatchGemmToCutlassSm89(void* D, void const* A, void const* B, void con
     char* workspace, size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr)
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-    switch (gemmConfig.tile_config)
+    switch (gemmConfig.tile_config_sm80)
     {
 
     case tkc::CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64:

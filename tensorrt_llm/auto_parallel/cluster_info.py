@@ -144,41 +144,34 @@ cluster_infos = {
             float32=74,
         ),
     ),
-    # from https://images.nvidia.cn/content/technologies/volta/pdf/volta-v100-datasheet-update-us-1165301-r5.pdf
-    "V100-PCIe-16GB":
+    # from https://nvdam.widen.net/s/nb5zzzsjdf/hpc-datasheet-sc23-h200-datasheet-3002446
+    "H200-SXM":
     ClusterInfo(
-        intra_node_bw_per_device=_bandwidths["PCIe-3"],
-        memory_bw=900,
-        memory_budget_per_device=16,
-        math_throughput=MathThroughput(float32=112),
+        inter_node_bw_per_device=50,
+        intra_node_bw_per_device=450,
+        memory_bw=4800,
+        memory_budget_per_device=141,
+        math_throughput=MathThroughput(
+            int8=3958,
+            fp8=3958,
+            float16=1979,
+            bfloat16=1979,
+            float32=67,
+        ),
     ),
-    "V100-PCIe-32GB":
+    "H200-NVL":
     ClusterInfo(
-        intra_node_bw_per_device=_bandwidths["PCIe-3"],
-        memory_bw=900,
-        memory_budget_per_device=32,
-        math_throughput=MathThroughput(float32=112),
-    ),
-    "V100-SXM-16GB":
-    ClusterInfo(
-        intra_node_bw_per_device=150,
-        memory_bw=900,
-        memory_budget_per_device=16,
-        math_throughput=MathThroughput(float32=125),
-    ),
-    "V100-SXM-32GB":
-    ClusterInfo(
-        intra_node_bw_per_device=150,
-        memory_bw=900,
-        memory_budget_per_device=32,
-        math_throughput=MathThroughput(float32=125),
-    ),
-    "V100S-PCIe":
-    ClusterInfo(
-        intra_node_bw_per_device=_bandwidths["PCIe-3"],
-        memory_bw=1134,
-        memory_budget_per_device=32,
-        math_throughput=MathThroughput(float32=130),
+        inter_node_bw_per_device=50,
+        intra_node_bw_per_device=450,
+        memory_bw=4800,
+        memory_budget_per_device=141,
+        math_throughput=MathThroughput(
+            int8=3341,
+            fp8=3341,
+            float16=1671,
+            bfloat16=1671,
+            float32=60,
+        ),
     ),
     # from https://images.nvidia.cn/content/Solutions/data-center/a40/nvidia-a40-datasheet.pdf
     "A40":
@@ -353,25 +346,17 @@ def infer_cluster_key() -> str:
             return "H100-SXM"
         else:
             return "H100-PCIe"
+    elif match("H200", device_name):
+        if is_sxm():
+            return "H200-SXM"
+        else:
+            return "H200-NVL"
     elif match("L40S", device_name):
         return "L40S"
     elif match("L40", device_name):
         return "L40"
     elif match("L4", device_name):
         return "L4"
-    elif match("V100S", device_name):
-        return "V100S-PCIe"
-    elif match("V100", device_name):
-        if is_sxm():
-            if is_32gb():
-                return "V100-SXM-32GB"
-            else:
-                return "V100-SXM-16GB"
-        else:
-            if is_32gb():
-                return "V100-PCIe-32GB"
-            else:
-                return "V100-PCIe-16GB"
     return None
 
 

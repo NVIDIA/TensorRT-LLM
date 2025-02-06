@@ -74,7 +74,8 @@ public:
         std::optional<FloatType> const& lengthPenalty = std::nullopt,
         std::optional<SizeType32> const& earlyStopping = std::nullopt,
         std::optional<SizeType32> const& noRepeatNgramSize = std::nullopt,
-        std::optional<SizeType32> const& numReturnSequences = std::nullopt);
+        std::optional<SizeType32> const& numReturnSequences = std::nullopt,
+        std::optional<FloatType> const& minP = std::nullopt);
 
     bool operator==(SamplingConfig const& other) const;
 
@@ -98,6 +99,7 @@ public:
     [[nodiscard]] std::optional<SizeType32> getEarlyStopping() const;
     [[nodiscard]] std::optional<SizeType32> getNoRepeatNgramSize() const;
     [[nodiscard]] std::optional<SizeType32> getNumReturnSequences() const;
+    [[nodiscard]] std::optional<FloatType> getMinP() const;
 
     void setBeamWidth(SizeType32 beamWidth);
     void setTopK(std::optional<SizeType32> const& topK);
@@ -118,6 +120,7 @@ public:
     void setEarlyStopping(std::optional<SizeType32> const& earlyStopping);
     void setNoRepeatNgramSize(std::optional<SizeType32> const& noRepeatNgramSize);
     void setNumReturnSequences(std::optional<SizeType32> const& numReturnSequences);
+    void setMinP(std::optional<FloatType> const& minP);
 
 private:
     static SizeType32 checkBeamWidth(SizeType32 beamWidth);
@@ -134,6 +137,7 @@ private:
         std::optional<FloatType> const& beamSearchDiversityRate);
     static std::optional<SizeType32> const& checkNumReturnSequences(
         std::optional<SizeType32> const& numReturnSequences, SizeType32 beamWidth);
+    static std::optional<FloatType> const& checkMinP(std::optional<FloatType> const& minP);
 
     void updateNumReturnBeams();
 
@@ -181,6 +185,9 @@ private:
     /// @brief The number of beams to return. It is equal to beamWidth unless numReturnSequences is set.
     /// If beamWidth > 1 and numReturnSequences is set, then numReturnBeams is equal to numReturnSequences.
     SizeType32 mNumReturnBeams;
+    /// @brief Controls the min_p scaling for sampling.
+    /// It masks x which P_x < min_p * P_max, where P_x is probability of candidate x. Default is 0.f
+    std::optional<FloatType> mMinP;
 };
 
 /// @brief Configuration that controls the outputs of a Result
@@ -352,12 +359,15 @@ private:
 struct EagleConfig
 {
     explicit EagleConfig(std::optional<EagleChoices> eagleChoices = std::nullopt, bool greedySampling = true,
-        std::optional<float> posteriorThreshold = std::nullopt);
+        std::optional<float> posteriorThreshold = std::nullopt, bool useDynamicTree = false,
+        std::optional<SizeType32> dynamicTreeMaxTopK = std::nullopt);
 
     bool operator==(EagleConfig const& other) const;
     [[nodiscard]] std::optional<EagleChoices> getEagleChoices() const;
     [[nodiscard]] std::optional<float> getPosteriorThreshold() const;
     [[nodiscard]] bool isGreedySampling() const;
+    [[nodiscard]] bool useDynamicTree() const;
+    [[nodiscard]] std::optional<SizeType32> getDynamicTreeMaxTopK() const;
 
 private:
     std::optional<float> const& checkPosteriorValue(std::optional<float> const& value);
@@ -374,6 +384,12 @@ private:
     /// Corresponds to epsilon in https://arxiv.org/pdf/2401.10774.
     /// Default is 0.09f.
     std::optional<float> mPosteriorThreshold;
+
+    /// @brief Flag to use Eagle-2
+    bool mUseDynamicTree;
+
+    /// @brief Number of draft tokens expand for each node in Eagle-2
+    std::optional<SizeType32> mDynamicTreeMaxTopK;
 };
 
 class ContextPhaseParams
@@ -425,6 +441,9 @@ public:
 
     /// @brief Send logits tensor directly from draft to target model.
     bool fastLogits;
+
+private:
+    friend class Serialization;
 };
 
 /// @brief Guided decoding parameters for a request.
@@ -574,7 +593,7 @@ public:
     /// @param positionIds The input position ids
     /// @param badWords A list of bad words tokens. Each "word" can be composed of multiple tokens
     /// @param stopWords A list of stop words tokens. Each "word" can be composed of multiple tokens
-    /// @param embeddingBias The embedding bias tensor. Expected type is kFP32 and shape is [vocab_size]
+    /// @param embeddingBias The embedding bias tensor. Expected shape is [vocab_size]
     /// @param externalDraftTokensConfig The speculative decoding with external draft tokens configuration
     /// @param pTuningConfig The prompt tuning configuration
     /// @param loraConfig The LoRA configuration
@@ -903,7 +922,7 @@ private:
 class KvCacheConfig
 {
 public:
-    explicit KvCacheConfig(bool enableBlockReuse = false, std::optional<SizeType32> const& maxTokens = std::nullopt,
+    explicit KvCacheConfig(bool enableBlockReuse = true, std::optional<SizeType32> const& maxTokens = std::nullopt,
         std::optional<std::vector<SizeType32>> const& maxAttentionWindowVec = std::nullopt,
         std::optional<SizeType32> const& sinkTokenLength = std::nullopt,
         std::optional<FloatType> const& freeGpuMemoryFraction = std::nullopt,
@@ -1141,7 +1160,8 @@ public:
         SizeType32 maxPagesPerBlockHost = kDefaultMaxPagesPerBlockHost,
         SizeType32 maxPagesPerBlockDevice = kDefaultMaxPagesPerBlockDevice,
         std::optional<float> const& deviceCachePercent = std::nullopt,
-        std::optional<size_t> const& hostCacheSize = std::nullopt);
+        std::optional<size_t> const& hostCacheSize = std::nullopt,
+        std::optional<std::string> const& loraPrefetchDir = std::nullopt);
 
     bool operator==(PeftCacheConfig const& other) const;
 
@@ -1156,6 +1176,7 @@ public:
     [[nodiscard]] SizeType32 getMaxPagesPerBlockDevice() const;
     [[nodiscard]] std::optional<float> getDeviceCachePercent() const;
     [[nodiscard]] std::optional<size_t> getHostCacheSize() const;
+    [[nodiscard]] std::optional<std::string> getLoraPrefetchDir() const;
 
 private:
     friend class Serialization;
@@ -1182,6 +1203,8 @@ private:
     std::optional<FloatType> mDeviceCachePercent;
     // size in bytes to use for host cache
     std::optional<size_t> mHostCacheSize;
+    // folder to store the LoRA weights we hope to load during engine initialization
+    std::optional<std::string> mLoraPrefetchDir;
 };
 
 /// @brief Configuration class for the decoding.
@@ -1333,7 +1356,8 @@ public:
         uint64_t maxSeqIdleMicroseconds = kDefaultMaxSeqIdleMicroseconds,
         std::optional<SpeculativeDecodingConfig> specDecConfig = std::nullopt,
         std::optional<GuidedDecodingConfig> guidedDecodingConfig = std::nullopt,
-        std::optional<std::vector<std::string>> additionalOutputNames = std::nullopt);
+        std::optional<std::vector<std::string>> additionalOutputNames = std::nullopt,
+        bool gatherGenerationLogits = false);
 
     [[nodiscard]] SizeType32 getMaxBeamWidth() const;
     [[nodiscard]] SchedulerConfig getSchedulerConfig() const;
@@ -1363,6 +1387,7 @@ public:
     [[nodiscard]] std::optional<SpeculativeDecodingConfig> getSpecDecConfig() const;
     [[nodiscard]] std::optional<GuidedDecodingConfig> getGuidedDecodingConfig() const;
     [[nodiscard]] std::optional<std::vector<std::string>> getAdditionalOutputNames() const;
+    [[nodiscard]] bool getGatherGenerationLogits() const;
 
     void setMaxBeamWidth(SizeType32 maxBeamWidth);
     void setMaxBatchSize(SizeType32 maxBatchSize);
@@ -1383,10 +1408,11 @@ public:
     void setExtendedRuntimePerfKnobConfig(ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig);
     void setDebugConfig(DebugConfig const& debugConfig);
     void setRecvPollPeriodMs(SizeType32 const& recvPollPeriodMs);
-    void setMaxSeqIdleMicroseconds(uint64_t maxNumTokens);
+    void setMaxSeqIdleMicroseconds(uint64_t maxSeqIdleMicroseconds);
     void setSpecDecConfig(SpeculativeDecodingConfig const& specDecConfig);
     void setGuidedDecodingConfig(GuidedDecodingConfig const& guidedDecodingConfig);
     void setAdditionalOutputNames(std::vector<std::string> const& additionalOutputNames);
+    void setGatherGenerationLogits(bool gatherGenerationLogits);
 
 private:
     friend class Serialization;
@@ -1458,6 +1484,10 @@ private:
 
     /// @brief The additional output tensor names
     std::optional<std::vector<std::string>> mAdditionalOutputNames;
+
+    /// @brief Controls if generation logits should be gathered, so that returnGenerationLogits can be requested.
+    /// Default is false.
+    bool mGatherGenerationLogits;
 };
 
 struct KVCacheCreatedData
@@ -1577,7 +1607,6 @@ public:
     /// @param modelPath Path to the folder that defines the model to run
     /// @param modelType The type of model
     /// @param executorConfig The configuration for the executor
-    /// @param comm An optional inter-process communicator configuration
     Executor(std::filesystem::path const& modelPath, ModelType modelType, ExecutorConfig const& executorConfig);
 
     Executor(std::filesystem::path const& encoderModelPath, std::filesystem::path const& decoderModelPath,

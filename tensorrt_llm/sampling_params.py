@@ -96,6 +96,7 @@ class SamplingParams:
         length_penalty (float): Controls how to penalize longer sequences in beam search. Default is 0.f
         early_stopping (int): Controls whether the generation process finishes once beamWidth sentences are generated (ends with end_token)
         no_repeat_ngram_size (int): Controls how many repeat ngram size are acceptable. Default is 1 << 30.
+        min_p (float): scale the most likely token to determine the minimum token probability. Default is 0.0.
 
         return_log_probs (bool): Controls if Result should contain log probabilities. Default is false.
         return_context_logits (bool): Controls if Result should contain the context logits. Default is false.
@@ -170,6 +171,7 @@ class SamplingParams:
     length_penalty: Optional[float] = None
     early_stopping: Optional[int] = None
     no_repeat_ngram_size: Optional[int] = None
+    min_p: Optional[float] = None
 
     # Keep the below fields in sync with tllme.OutputConfig
     return_log_probs: bool = False
@@ -352,7 +354,8 @@ class SamplingParams:
             "top_p_decay", "seed", "random_seed", "temperature", "min_tokens",
             "min_length", "beam_search_diversity_rate", "repetition_penalty",
             "presence_penalty", "frequency_penalty", "length_penalty",
-            "early_stopping", "no_repeat_ngram_size", "num_return_sequences"
+            "early_stopping", "no_repeat_ngram_size", "num_return_sequences",
+            "min_p"
         }
         found_fields = {
             f

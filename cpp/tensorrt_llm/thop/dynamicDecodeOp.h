@@ -35,7 +35,7 @@ public:
         th::optional<th::Tensor> beam_search_diversity_rate_opt, th::optional<th::Tensor> random_seed_opt,
         th::optional<th::Tensor> top_p_decay_opt, th::optional<th::Tensor> top_p_min_opt,
         th::optional<th::Tensor> top_p_reset_ids_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,
-        bool output_log_probs, bool cum_log_probs)
+        th::optional<th::Tensor> min_p_opt, bool output_log_probs, bool cum_log_probs)
         = 0;
 
     virtual void forward(th::Tensor const& logits, int const step, int const max_input_length,
@@ -73,7 +73,7 @@ public:
         th::optional<th::Tensor> beam_search_diversity_rate_opt, th::optional<th::Tensor> random_seed_opt,
         th::optional<th::Tensor> top_p_decay_opt, th::optional<th::Tensor> top_p_min_opt,
         th::optional<th::Tensor> top_p_reset_ids_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,
-        bool output_log_probs, bool cum_log_probs) override;
+        th::optional<th::Tensor> min_p_opt, bool output_log_probs, bool cum_log_probs) override;
 
     void forward(th::Tensor const& logits, int const step, int const max_input_length, int const max_attention_window,
         int const sink_token_length, uint64_t const ite, int const local_batch_size, th::Tensor end_id,
@@ -116,7 +116,7 @@ public:
         th::optional<th::Tensor> beam_search_diversity_rate_opt, th::optional<th::Tensor> random_seed_opt,
         th::optional<th::Tensor> top_p_decay_opt, th::optional<th::Tensor> top_p_min_opt,
         th::optional<th::Tensor> top_p_reset_ids_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,
-        bool output_log_probs, bool cum_log_probs);
+        th::optional<th::Tensor> min_p_opt, bool output_log_probs, bool cum_log_probs);
 
     th::Tensor forward(th::Tensor const& logits, int64_t const step, int64_t const max_input_length,
         int64_t const max_attention_window, int64_t const sink_token_length, int64_t const ite,

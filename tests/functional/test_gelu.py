@@ -24,8 +24,7 @@ import tensorrt_llm
 from tensorrt_llm import Tensor
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import (create_session, run_session, skip_bf16_pre_ampere,
-                        unittest_name_func)
+from utils.util import create_session, run_session, unittest_name_func
 
 
 class TestGelu(unittest.TestCase):
@@ -45,9 +44,6 @@ class TestGelu(unittest.TestCase):
     @parameterized.expand(('float32', 'float16', 'bfloat16'),
                           name_func=unittest_name_func)
     def test_gelu(self, dtype):
-        # Skip tests that are not supported in pre-ampere architecture
-        skip_bf16_pre_ampere(dtype)
-
         torch_dtype = tensorrt_llm._utils.str_dtype_to_torch(dtype)
         x_shape = (12, 12, 96, 96)
         x_data = torch.rand(x_shape, dtype=torch_dtype, device="cuda")

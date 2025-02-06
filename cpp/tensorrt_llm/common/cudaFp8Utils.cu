@@ -426,8 +426,10 @@ DEFINE_INVOKE_QUANTIZE_MATRIX(half, half, __nv_fp8_e4m3);
 DEFINE_INVOKE_QUANTIZE_MATRIX(float, float, __nv_fp8_e4m3);
 DEFINE_INVOKE_QUANTIZE_MATRIX(half, float, __nv_fp8_e4m3);
 #ifdef ENABLE_BF16
+DEFINE_INVOKE_QUANTIZE_MATRIX(__nv_fp8_e4m3, float, __nv_bfloat16);
 DEFINE_INVOKE_QUANTIZE_MATRIX(__nv_fp8_e4m3, __nv_bfloat16, __nv_bfloat16);
 DEFINE_INVOKE_QUANTIZE_MATRIX(__nv_bfloat16, __nv_bfloat16, __nv_fp8_e4m3);
+DEFINE_INVOKE_QUANTIZE_MATRIX(__nv_bfloat16, float, __nv_fp8_e4m3);
 #endif
 #endif
 

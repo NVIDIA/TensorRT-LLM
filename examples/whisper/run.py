@@ -502,7 +502,7 @@ def decode_dataset(
         padding_strategy="longest"):
     data_loader = DataLoader(dataset,
                              batch_size=batch_size,
-                             num_workers=4,
+                             num_workers=0,
                              pin_memory=True,
                              collate_fn=collate_wrapper)
     results = []

@@ -112,6 +112,8 @@ struct BuildDecoderInfoParams
     // The number of padded tokens in the corresponding padded tensor before the current token, for Decoder. Shape:
     // [numTokens].
     int* paddingOffsets;
+    // The batch_idx and token_idx_in_seq for each token. Shape: [numTokens].
+    int2* tokensInfo;
     // The number of padded tokens in the corresponding padded tensor before the current token, for Encoder. Shape:
     // [numTokens].
     int* encoderPaddingOffsets;
@@ -136,8 +138,9 @@ struct BuildDecoderInfoParams
     uint32_t* fmhaTileCounter;
 
     // Scales for fmha only.
-    // The scale to dequant Qkv input.
-    float const* dequantScaleQkv;
+    // The scale to dequant Q/Kv input.
+    float const* dequantScaleQ;
+    float const* dequantScaleKv;
     // The scale to quant O output.
     float const* quantScaleO;
     // The fmha bmm1 host scale (1.0f / sqrt(headSize) by default).
@@ -160,6 +163,8 @@ struct BuildDecoderInfoParams
     int sinkTokenLength;
     // The number of tokens in total. It's \sum_{ii=0}^{batchSize} seqLengths[ii].
     int numTokens;
+    // Remove padding or not.
+    bool removePadding;
     // The type of attention.
     AttentionMaskType attentionMaskType;
     // Params for block sparse pattern
@@ -177,6 +182,32 @@ struct BuildDecoderInfoParams
     // Dynamic scaling;
     int rotaryEmbeddingMaxPositions;
 
+    bool isBuildDecoderInfoKernelNeeded()
+    {
+        if (!removePadding)
+        {
+            return true;
+        }
+        if (maxQSeqLength > 1)
+        {
+            return true;
+        }
+        if (rotaryScalingType == RotaryScalingType::kDYNAMIC)
+        {
+            return true;
+        }
+        if (rotaryScalingType != RotaryScalingType::kNONE && rotaryEmbeddingInvFreqCache == nullptr)
+        {
+            return true;
+        }
+        if (attentionMask != nullptr)
+        {
+            return true;
+        }
+        // Other cases don't need to call buildDecoderInfo kernel.
+        return false;
+    }
+
     std::string toString() const
     {
         std::stringstream ss;
@@ -192,6 +223,10 @@ struct BuildDecoderInfoParams
         ss << "paddingOffsets: "
            << *(runtime::ITensor::wrap(
                   (void*) paddingOffsets, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batchSize})))
+           << std::endl;
+        ss << "tokensInfo: "
+           << *(runtime::ITensor::wrap(
+                  (void*) tokensInfo, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({numTokens * 2})))
            << std::endl;
         if (encoderPaddingOffsets != nullptr)
         {
@@ -210,6 +245,7 @@ struct BuildDecoderInfoParams
         ss << "attentionWindowSize: " << attentionWindowSize << std::endl;
         ss << "sinkTokenLength: " << sinkTokenLength << std::endl;
         ss << "numTokens: " << numTokens << std::endl;
+        ss << "removePadding: " << removePadding << std::endl;
         ss << "attentionMaskType: " << static_cast<int>(attentionMaskType) << std::endl;
         ss << "rotaryEmbeddingScale: " << rotaryEmbeddingScale << std::endl;
         ss << "rotaryEmbeddingBase: " << rotaryEmbeddingBase << std::endl;

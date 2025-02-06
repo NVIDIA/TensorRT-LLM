@@ -86,7 +86,7 @@ TritonFlashAttentionPlugin::TritonFlashAttentionPlugin(void const* data, size_t 
     readArg(d, mHeadSize);
     readArg(d, mSoftmaxScale);
     readArg(d, mType);
-    assert(d == a + length);
+    TLLM_CHECK(d == a + length);
 }
 
 // IPluginV2DynamicExt Methods
@@ -262,7 +262,7 @@ void TritonFlashAttentionPlugin::serialize(void* buffer) const noexcept
     writeArg(d, mHeadSize);
     writeArg(d, mSoftmaxScale);
     writeArg(d, mType);
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 }
 
 void TritonFlashAttentionPlugin::destroy() noexcept

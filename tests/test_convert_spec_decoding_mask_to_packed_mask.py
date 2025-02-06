@@ -1,6 +1,5 @@
 import pytest
 import torch
-from utils.util import getSMVersion
 
 import tensorrt_llm  # noqa
 
@@ -8,8 +7,6 @@ import tensorrt_llm  # noqa
 @pytest.mark.parametrize("batch_size", [1, 2, 5])
 @pytest.mark.parametrize("max_draft_tokens", [20, 41, 101])
 def test_convert_mask_to_packed_mask(batch_size: int, max_draft_tokens: int):
-    if getSMVersion() <= 70:
-        pytest.skip("This tests can't be run on pre-Volta GPU.")
     torch.cuda.set_device(0)
     torch.cuda.manual_seed(1234)
     device = 'cuda'

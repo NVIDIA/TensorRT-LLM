@@ -441,7 +441,7 @@ class Network(object):
             assert layer, "Invalid layer name"
             yield layer
 
-    def to_dot(self, path=None) -> Optional[str]:
+    def to_dot(self, path: Union[str, Path] = None) -> Optional[str]:
         '''
         Get a graphviz representation of the network.
 
@@ -538,18 +538,26 @@ class Network(object):
             return dot.source
         dot.save(path)
 
-    def to_onnx(self, path: Path = None) -> None:
+    def to_onnx(self, path: str = None) -> None:
         '''
         Export the network into a "ONNX-like" file for visualization.
 
         Parameters:
             path: the path to the output file
         '''
-        trt_network = self.trt_network
+        if path is None:
+            return
+
+        network = self.trt_network
+        b_onnx_type = True  # Use ONNX style operator names
 
         def layer_type_to_class(layer: trt.ILayer = None) -> trt.ILayer:
+            '''
+            Convert trt.ILayer into a exect TensorRT layer
+            '''
             layer_type_name = str(layer.type)[10:]
-            if layer_type_name == "ELEMENTWISE":  # Some special cases
+            # Some special cases
+            if layer_type_name == "ELEMENTWISE":
                 return trt.IElementWiseLayer
             if layer_type_name == "LRN":
                 return trt.ILRNLayer
@@ -566,13 +574,16 @@ class Network(object):
             if layer_type_name == "TOPK":
                 return trt.ITopKLayer
 
-            # e.g. MATRIX_MULTIPLY -> MatrixMultiply
+            # general cases, e.g. MATRIX_MULTIPLY -> MatrixMultiply
             name = "".join(name[0] + name[1:].lower()
                            for name in layer_type_name.split("_"))
             return trt.__builtins__["getattr"](trt, f"I{name}Layer")
 
         def convert_type_to_onnx(node_type: str = "",
                                  attribution: OrderedDict = OrderedDict()):
+            '''
+            Convert layer names of TensorRT style into ONNX style
+            '''
             if node_type == "ACTIVATION":
                 convert_list = {
                     "RELU": "Relu",
@@ -679,10 +690,9 @@ class Network(object):
             number: int = 0,
             b_onnx_type: bool = False,
         ) -> Tuple[gs.Variable, int]:
-            """
+            '''
             Simplify version of function `add_node`, and we do some beautify to it.
-            """
-
+            '''
             if isinstance(name_list, list) or isinstance(
                     datatype_list, list) or isinstance(
                         shape_list, list):  # Case of multi-output
@@ -714,114 +724,98 @@ class Network(object):
                 output_list = output_list[0]
             return output_list, number + 1
 
-        def export_network_as_onnx(
-            network,
-            export_onnx_file: Path = None,
-            b_onnx_type: bool = False,
-        ):
-            graph = gs.Graph(nodes=[], inputs=[], outputs=[])
-            graph.name = "" if network.name == "Unnamed Network 0" else network.name
-            n = 0
+        graph = gs.Graph(nodes=[], inputs=[], outputs=[])
+        graph.name = "" if network.name == "Unnamed Network 0" else network.name
+        n = 0
 
-            global_tensor_map = {
-            }  # mapping from TRT tensor (trt.ITensor) to GS tensor (gs.Variable)
-            for i in range(network.num_inputs):
-                trt_tensor = network.get_input(i)
-                gs_tensor = gs.Variable(trt_tensor.name,
-                                        trt.nptype(trt_tensor.dtype),
-                                        trt_tensor.shape)
-                global_tensor_map[trt_tensor] = gs_tensor
-                if gs_tensor not in graph.inputs:
-                    graph.inputs.append(gs_tensor)
+        # mapping from TRT tensor (trt.ITensor) to GS tensor (gs.Variable)
+        global_tensor_map = {}
 
-            for i in range(network.num_layers):
-                layer = network.get_layer(i)
+        for i in range(network.num_inputs):
+            trt_tensor = network.get_input(i)
+            gs_tensor = gs.Variable(trt_tensor.name,
+                                    trt.nptype(trt_tensor.dtype),
+                                    trt_tensor.shape)
+            global_tensor_map[trt_tensor] = gs_tensor
+            if gs_tensor not in graph.inputs:
+                graph.inputs.append(gs_tensor)
 
-                input_tensor_list = []
-                for j in range(layer.num_inputs):
-                    trt_tensor = layer.get_input(j)
-                    if trt_tensor is None:  # Useful for constant layer
-                        gs_tensor = None
-                    elif trt_tensor in global_tensor_map.keys(
-                    ):  # already in the map
-                        gs_tensor = global_tensor_map[trt_tensor]
-                    else:
-                        logger.debug(
-                            f"[ExportONNX]Layer input tensor not in global_tensor_map: {trt_tensor.name}"
-                        )  # ■
-                        gs_tensor = gs.Variable(trt_tensor.name,
-                                                trt.nptype(trt_tensor.dtype),
-                                                trt_tensor.shape)
-                        global_tensor_map[trt_tensor] = gs_tensor
-                    input_tensor_list.append(gs_tensor)
+        for i in range(network.num_layers):
+            layer = network.get_layer(i)
 
-                output_name_list = []
-                output_datatype_list = []
-                output_shape_list = []
-                for i in range(layer.num_outputs):
-                    trt_tensor = layer.get_output(i)
-                    # Don't do this check because we need this trt_tensor to overwrite the placeholder tensor in ■
-                    # if trt_tensor in global_tensor_map.keys():
-                    #     gs_tensor = global_tensor_map[trt_tensor]
-                    output_name_list.append(trt_tensor.name)
-                    output_datatype_list.append(trt.nptype(trt_tensor.dtype))
-                    output_shape_list.append(trt_tensor.shape)
-
-                attr = OrderedDict()
-                # Set attribution of ILayer
-                for key in dir(layer):
-                    if not (key.startswith("_")
-                            or callable(layer.__getattribute__(key))):
-                        attr[key] = str(layer.__getattribute__(key))
-                # Set attribution of exact layer type
-                layer.__class__ = layer_type_to_class(layer)
-                for key in dir(layer):
-                    if key in dir(trt.ILayer) and key != "type":
-                        continue
-                    if key == "type" and not isinstance(layer.type,
-                                                        trt.LayerType):
-                        attr["algo-type"] = str(layer.type)
-                        continue
-                    value = layer.__getattribute__(key)
-                    if isinstance(
-                            value, np.ndarray
-                    ):  # Convert all attributions into string besides weights
-                        value = value.astype(np.float32)  # In case of overflow
-                        ss = f"shape={value.shape}, SumAbs={np.sum(abs(value)):.5e}, Var={np.var(value):.5f}, "
-                        ss += f"Max={np.max(value):.5f}, Min={np.min(value):.5f}, SAD={np.sum(np.abs(np.diff(value.reshape(-1)))):.5f}, "
-                        ss += f"[:5]={value.reshape(-1)[:5]}, [-5:]={value.reshape(-1)[-5:]}"
-                        attr[key] = ss
-                    else:
-                        attr[key] = str(value)
-
-                output_tensor_list, n = add_node_for_trt_network(graph, layer.name, attr["type"][10:], input_tensor_list, attr, \
-                    output_name_list, output_datatype_list, output_shape_list, n, b_onnx_type)
-
-                if layer.num_outputs == 1:
-                    global_tensor_map[layer.get_output(0)] = output_tensor_list
+            input_tensor_list = []
+            for j in range(layer.num_inputs):
+                trt_tensor = layer.get_input(j)
+                if trt_tensor is None:  # Useful for constant layer
+                    gs_tensor = None
+                elif trt_tensor in global_tensor_map.keys(
+                ):  # already in the map
+                    gs_tensor = global_tensor_map[trt_tensor]
                 else:
-                    for i in range(layer.num_outputs):
-                        global_tensor_map[layer.get_output(
-                            i)] = output_tensor_list[i]
+                    logger.debug(
+                        f"[ExportONNX]Layer input tensor not in global_tensor_map: {trt_tensor.name}"
+                    )  # ■
+                    gs_tensor = gs.Variable(trt_tensor.name,
+                                            trt.nptype(trt_tensor.dtype),
+                                            trt_tensor.shape)
+                    global_tensor_map[trt_tensor] = gs_tensor
+                input_tensor_list.append(gs_tensor)
 
-            for i in range(network.num_outputs):
-                gs_tensor = global_tensor_map[network.get_output(i)]
-                if gs_tensor not in graph.outputs:
-                    graph.outputs.append(gs_tensor)
+            output_name_list = []
+            output_datatype_list = []
+            output_shape_list = []
+            for i in range(layer.num_outputs):
+                trt_tensor = layer.get_output(i)
+                # Don't do this check because we need this trt_tensor to overwrite the placeholder tensor in ■
+                # if trt_tensor in global_tensor_map.keys():
+                #     gs_tensor = global_tensor_map[trt_tensor]
+                output_name_list.append(trt_tensor.name)
+                output_datatype_list.append(trt.nptype(trt_tensor.dtype))
+                output_shape_list.append(trt_tensor.shape)
 
-            onnx_model = gs.export_onnx(graph)
-            onnx.save(
-                onnx_model,
-                export_onnx_file,
-                save_as_external_data=True,
-                all_tensors_to_one_file=True,
-                location=export_onnx_file.name + ".weight",
-            )
-            logger.debug(
-                f"Export {export_onnx_file.name}: {len(graph.nodes):5d} Nodes, {len(graph.tensors().keys()):5d} tensors"
-            )
+            attr = OrderedDict()
+            # Set attribution of ILayer
+            for key in dir(layer):
+                if not (key.startswith("_")
+                        or callable(layer.__getattribute__(key))):
+                    attr[key] = str(layer.__getattribute__(key))
+            # Set attribution of exact layer type
+            layer.__class__ = layer_type_to_class(layer)
+            for key in dir(layer):
+                if key in dir(trt.ILayer) and key != "type":
+                    continue
+                if key == "type" and not isinstance(layer.type, trt.LayerType):
+                    attr["algo-type"] = str(layer.type)
+                    continue
+                value = layer.__getattribute__(key)
+                if isinstance(value, np.ndarray):
+                    # Convert all attributions into string besides weights
+                    value = value.astype(np.float32)  # In case of overflow
+                    ss = f"shape={value.shape}, SumAbs={np.sum(abs(value)):.5e}, Var={np.var(value):.5f}, "
+                    ss += f"Max={np.max(value):.5f}, Min={np.min(value):.5f}, SAD={np.sum(np.abs(np.diff(value.reshape(-1)))):.5f}, "
+                    ss += f"[:5]={value.reshape(-1)[:5]}, [-5:]={value.reshape(-1)[-5:]}"
+                    attr[key] = ss
+                else:
+                    attr[key] = str(value)
 
-        export_network_as_onnx(trt_network, path, True)
+            output_tensor_list, n = add_node_for_trt_network(graph, layer.name, attr["type"][10:], input_tensor_list, attr, \
+                output_name_list, output_datatype_list, output_shape_list, n, b_onnx_type)
+
+            if layer.num_outputs == 1:
+                global_tensor_map[layer.get_output(0)] = output_tensor_list
+            else:
+                for i in range(layer.num_outputs):
+                    global_tensor_map[layer.get_output(
+                        i)] = output_tensor_list[i]
+
+        for i in range(network.num_outputs):
+            gs_tensor = global_tensor_map[network.get_output(i)]
+            if gs_tensor not in graph.outputs:
+                graph.outputs.append(gs_tensor)
+
+        onnx.save(gs.export_onnx(graph),
+                  path + "/network.onnx",
+                  save_as_external_data=False)
         return
 
     def _get_graph(self) -> "Network._GraphState":

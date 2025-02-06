@@ -21,9 +21,13 @@
 #include "tensorrt_llm/kernels/cutlass_kernels/fpA_intB_gemm/fpA_intB_gemm.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fused_gated_gemm/fused_gated_gemm.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/int8_gemm/int8_gemm.h"
+#include "tensorrt_llm/kernels/internal_cutlass_kernels/include/fp4_gemm.h"
+#include "tensorrt_llm/plugins/gemmAllReducePlugin/gemmAllReducePlugin.h"
 #include "tensorrt_llm/plugins/lowLatencyGemmPlugin/lowLatencyGemmPlugin.h"
 #include "tensorrt_llm/plugins/lowLatencyGemmSwigluPlugin/lowLatencyGemmSwigluPlugin.h"
 #include "tensorrt_llm/plugins/mixtureOfExperts/mixtureOfExpertsPlugin.h"
+
+#include <cstddef>
 
 namespace tensorrt_llm::plugins
 {
@@ -111,8 +115,8 @@ void GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::initTmpD
 }
 
 template <typename Config, typename RunnerPtr, typename GemmIdType, typename GemmIdHashType>
-void GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::profileTactics(
-    RunnerPtr const& runner, nvinfer1::DataType const& type, GemmDims const& dims, GemmIdType const& gemmId)
+void GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::profileTactics(RunnerPtr const& runner,
+    nvinfer1::DataType const& type, GemmDims const& dims, GemmIdType const& gemmId, bool hasCudaKernel)
 {
     writer_lock lock(mMNKProfileMap->mutex);
 
@@ -152,7 +156,25 @@ void GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::profileT
                 isAllocated = true;
             }
             initTmpData(m, n, k, mWorkspaceTmp, mTmpWorkspaceSizeInBytes, mStream);
-            auto const tactics = this->getTactics(m, n, k);
+            auto tactics = this->getTactics(m, n, k);
+
+            // stop to profile Cuda kernel if m > 16 or CUTLASS kernel performs better for m - 1
+            if constexpr (std::is_same_v<Config, tensorrt_llm::cutlass_extensions::CutlassGemmConfig>)
+            {
+                // check if the best tactic for m-1 is CUTLASS kernel
+                bool lastTacticEnableCudaKernel = true;
+                if (mProfileMap->count(m - 1) > 0)
+                {
+                    lastTacticEnableCudaKernel = mProfileMap->at(m - 1).value().enableCudaKernel;
+                }
+                if (m > 16 || !lastTacticEnableCudaKernel)
+                {
+                    if (!tactics.empty())
+                    {
+                        tactics.pop_back();
+                    }
+                }
+            }
             // Profile different tactics for particular m and insert best config to the map
             mProfileMap->insert({m, this->profileTacticsForProblem(m, n, k, tactics)});
         }
@@ -161,9 +183,28 @@ void GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHashType>::profileT
     common::check_cuda_error(cudaStreamCreate(&mStream));
 
     int const startMinMRounded = nextPowerOfTwo(dims.minM);
-    for (int m = std::max(1, startMinMRounded); m < maxM; m *= 2)
+
+    if (hasCudaKernel)
     {
-        profileTactics(m, dims.n, dims.k);
+        // Profile tactics for finer granularity of M if CUDA kernel is enabled
+        int minM = dims.minM;
+        for (int m = std::max(1, minM); m < std::min(16, maxM); m += 1)
+        {
+            profileTactics(m, dims.n, dims.k);
+        }
+
+        for (int m = 16; m < maxM; m *= 2)
+        {
+            profileTactics(m, dims.n, dims.k);
+        }
+    }
+    else
+    {
+        // Profile tactics for CUTLASS kernel only
+        for (int m = std::max(1, startMinMRounded); m < maxM; m *= 2)
+        {
+            profileTactics(m, dims.n, dims.k);
+        }
     }
 
     profileTactics(maxM, dims.n, dims.k);
@@ -190,7 +231,22 @@ std::optional<Config> GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHa
 
     int const mRounded = std::min(std::max(1, nextPowerOfTwo(m)), getMaxProfileM());
     fflush(stdout);
-    return mMNKProfileMap->getMProfileMap(gemmId)->at(mRounded);
+
+    if (mMNKProfileMap->getMProfileMap(gemmId)->count(m) > 0)
+    {
+        return mMNKProfileMap->getMProfileMap(gemmId)->at(m);
+    }
+    else if (mMNKProfileMap->getMProfileMap(gemmId)->count(mRounded) > 0)
+    {
+        return mMNKProfileMap->getMProfileMap(gemmId)->at(mRounded);
+    }
+    else
+    {
+        std::ostringstream msg;
+        msg << "Cannot find best tactic for m=" << m << " and GEMM ID " << gemmId;
+        TLLM_LOG_WARNING(msg.str());
+        return std::nullopt;
+    }
 }
 
 template <typename Config, typename RunnerPtr, typename GemmIdType, typename GemmIdHashType>
@@ -219,7 +275,7 @@ std::optional<Config> GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHa
     bool foundOne = false;
 
     // Iterate over all tactics for given M, N and K
-    for (int ii = 0; ii < tactics.size(); ++ii)
+    for (size_t ii = 0; ii < tactics.size(); ++ii)
     {
         Config const& candidateConfig = tactics[ii];
         float time = std::numeric_limits<float>::max();
@@ -229,7 +285,7 @@ std::optional<Config> GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHa
             {
                 continue;
             }
-            // Profile particualar tactic for given M, N and K
+            // Profile particular tactic for given M, N and K
             time = profileTacticForProblem(m, n, k, candidateConfig);
             foundOne = true;
         }
@@ -265,6 +321,7 @@ std::optional<Config> GemmPluginProfiler<Config, RunnerPtr, GemmIdType, GemmIdHa
         TLLM_LOG_WARNING(msg.str());
         return std::nullopt;
     }
+
     return {bestConfig};
 }
 
@@ -332,9 +389,17 @@ template class GemmPluginProfiler<tensorrt_llm::cutlass_extensions::CutlassGemmC
     std::shared_ptr<tensorrt_llm::kernels::cutlass_kernels::CutlassFp8RowwiseGemmRunnerInterface>, GemmIdCore,
     GemmIdCoreHash>;
 
+template class GemmPluginProfiler<tensorrt_llm::cutlass_extensions::CutlassGemmConfig,
+    std::shared_ptr<tensorrt_llm::kernels::internal_cutlass_kernels::CutlassFp4GemmRunnerInterface>, GemmIdCore,
+    GemmIdCoreHash>;
+
 template class GemmPluginProfiler<LowLatencyGemmPluginProfiler::Config, LowLatencyGemmRunnerPtr, GemmIdCore,
     GemmIdCoreHash>;
 
 template class GemmPluginProfiler<LowLatencyGemmSwigluPluginProfiler::Config, LowLatencyGemmSwigluRunnerPtr, GemmIdCore,
     GemmIdCoreHash>;
+
+template class GemmPluginProfiler<tensorrt_llm::kernels::cutlass_kernels::GemmAllReduceImplInterface::LaunchConfig,
+    std::shared_ptr<tensorrt_llm::kernels::cutlass_kernels::GemmAllReduceImplInterface>, GemmIdCore, GemmIdCoreHash>;
+
 } // namespace tensorrt_llm::plugins

@@ -1,4 +1,5 @@
-tensorrt_llm==0.17.0.dev2024121700
+-c ../constraints.txt
+tensorrt_llm>=0.0.dev0
 tiktoken
 datasets
 kaldialign

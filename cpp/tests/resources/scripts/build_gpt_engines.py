@@ -255,7 +255,7 @@ def build_engines(model_cache: Optional[str] = None,
                  max_input_len=max_input_len)
 
     # Build the target model with return accepted token logits
-    # Build with '--max_draft_len', '--speculative_decoding_mode' and '--gather_generation_logits'
+    # Build with '--max_draft_len', '--speculative_decoding_mode'
     model_spec_current = model_spec_obj.__copy__()
     max_draft_len = 5
     model_spec_current.use_draft_tokens_external_decoding()
@@ -268,19 +268,19 @@ def build_engines(model_cache: Optional[str] = None,
         str(engine_dir / model_spec_current.get_model_path() / tp_pp_cp_dir),
         f'--max_draft_len={max_draft_len}',
         '--speculative_decoding_mode=draft_tokens_external',
-        '--gather_generation_logits', *get_ifb_args(_tb.KVCacheType.PAGED))
+        *get_ifb_args(_tb.KVCacheType.PAGED))
 
-    # We build almost the same engine twice. But this engine has gather_all_token_logits
+    # We build almost the same engine twice. But this engine has gather_context_logits
     # to extract logits from python runtime and uses context FMHA for generation to match draft model executions,
     # which uses context FMHA for draft tokens prediction.
-    # Currently the gather_all_token_logits is not supported with target model of speculative decoding
+    # Currently the gather_context_logits is not supported with target model of speculative decoding
     model_spec_current = model_spec_obj.__copy__()
     model_spec_current.gather_logits()
 
     build_engine(
         str(fp16_ckpt_dir),
         str(engine_dir / model_spec_current.get_model_path() / tp_pp_cp_dir),
-        '--gather_all_token_logits', *get_ifb_args(_tb.KVCacheType.PAGED))
+        '--gather_context_logits', *get_ifb_args(_tb.KVCacheType.PAGED))
 
     # build engine with lora enabled
     model_spec_current = model_spec_obj.__copy__()

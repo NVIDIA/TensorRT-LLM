@@ -39,7 +39,7 @@ In addition, there are three shared files in the parent folder [`examples`](../)
 
 - [x] FP16
 - [x] TENSOR PARALLEL
-- [ ] FP8
+- [x] FP8
 
 ## Usage
 
@@ -72,6 +72,26 @@ python ../run.py --engine_dir ./trtllm_engines/deepseek_v1/bf16/tp1 \
                 --max_output_len 32 \
                 --top_p 0 \
                 --input_text "The president of the United States is person who"
+```
+
+### FP8 Quantization
+
+The [`../quantization/quantize.py`](../quantization/quantize.py) script can be used to quantize the models and export TensorRT-LLM checkpoints.
+
+```bash
+# Deepseek-v1: single gpu, fp8 quantization
+python ../quantization/quantize.py --model_dir deepseek_moe_16b \
+        --dtype float16 \
+        --qformat fp8 \
+        --kv_cache_dtype fp8 \
+        --output_dir trt_ckpt/deepseek_moe_16b/fp8/1-gpu \
+        --calib_size 512
+
+# Deepseek-v1: single-gpu engine with fp8 quantization, GPT Attention plugin, Gemm plugin
+trtllm-build --checkpoint_dir ./trt_ckpt/deepseek_moe_16b/fp8/1-gpu \
+             --gemm_plugin float16 \
+             --gpt_attention_plugin bfloat16 \
+             --output_dir ./trt_engines/fp8/1-gpu/
 ```
 ## Credits
 This Deepseek-v1 model example exists thanks to @akhoroshev(https://github.com/akhoroshev) community contribution!

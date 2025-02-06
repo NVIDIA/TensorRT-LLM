@@ -255,7 +255,7 @@ void splitkGroupedGemm(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std:
         }
         else if (minKN >= 1)
         {
-            splitkGroupedGemmType_<16, 32, 64, 16, 32, 64, 8, 1, 1>(problem_sizes, ptrA, ptrB, ptrC, ptrD,
+            splitkGroupedGemmType_<16, 32, 64, 16, 32, 64, 8, 1, 2>(problem_sizes, ptrA, ptrB, ptrC, ptrD,
                 gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkSpaceSize, dataType, splitKSlices,
                 stream);
         }

@@ -14,6 +14,9 @@ rank = tensorrt_llm.mpi_rank()
 def parseArgs():
     parser = argparse.ArgumentParser(
         description='run SDXL with the UNet TensorRT engine.')
+    parser.add_argument('--model_dir',
+                        type=str,
+                        default='stabilityai/stable-diffusion-xl-base-1.0')
     parser.add_argument('--size', type=int, default=1024)
     parser.add_argument('--seed', type=int, default=233)
     parser.add_argument('--num_inference_steps', type=int, default=50)
@@ -23,10 +26,10 @@ def parseArgs():
         default=
         "masterpiece, gouache painting, 1girl, distant view, lone boat, willow trees"
     )
-    parser.add_argument('--model_dir',
+    parser.add_argument('--engine_dir',
                         type=str,
                         default=None,
-                        help='model directory')
+                        help='engine directory')
     parser.add_argument('--num-warmup-runs', type=int, default=3)
     parser.add_argument('--avg-runs', type=int, default=10)
     parser.add_argument("--ignore_ratio",
@@ -42,22 +45,23 @@ def parseArgs():
 
 if __name__ == "__main__":
     args = parseArgs()
+    model_dir = args.model_dir
     size = args.size
     seed = args.seed
     prompt = args.prompt
     num_inference_steps = args.num_inference_steps
-    model_dir = f'sdxl_s{size}_w{world_size}' if args.model_dir is None else args.model_dir
+    engine_dir = f'sdxl_s{size}_w{world_size}' if args.engine_dir is None else args.engine_dir
     num_warmup_runs = args.num_warmup_runs
     avg_runs = args.avg_runs
     output_file = args.output
 
     pipeline = StableDiffusionXLPipeline.from_pretrained(
-        "stabilityai/stable-diffusion-xl-base-1.0",
+        model_dir,
         torch_dtype=torch.float16,
         use_safetensors=True,
     )
     pipeline.set_progress_bar_config(disable=rank != 0)
-    pipeline.prepare(model_dir, size)
+    pipeline.prepare(engine_dir, size)
     pipeline.to('cuda')
 
     # warm up

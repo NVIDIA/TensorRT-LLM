@@ -69,6 +69,7 @@ class EncDecBenchmark(BaseBenchmark):
                 lora_config = builder_config['lora_config']
                 auto_parallel_config = builder_config['auto_parallel_config']
                 use_gpt_attention_plugin = plugin_config["gpt_attention_plugin"]
+                gemm_allreduce_plugin = plugin_config["gemm_allreduce_plugin"]
                 remove_input_padding = plugin_config["remove_input_padding"]
                 use_lora_plugin = plugin_config["lora_plugin"]
                 tp_size = pretrained_config['mapping']['tp_size']
@@ -123,6 +124,7 @@ class EncDecBenchmark(BaseBenchmark):
                     vocab_size=vocab_size,
                     num_layers=num_layers,
                     gpt_attention_plugin=use_gpt_attention_plugin,
+                    gemm_allreduce_plugin=gemm_allreduce_plugin,
                     remove_input_padding=remove_input_padding,
                     kv_cache_type=kv_cache_type,
                     tokens_per_block=tokens_per_block,

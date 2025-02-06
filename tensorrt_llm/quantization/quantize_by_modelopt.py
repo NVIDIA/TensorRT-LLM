@@ -22,6 +22,7 @@ import os
 import random
 import sys
 import time
+from importlib.metadata import version
 
 import numpy as np
 import torch
@@ -90,6 +91,16 @@ KV_CACHE_CFG = {
         "axis": None,
         "enable": True
     },
+    "*.k.output_quantizer": {
+        "num_bits": 8,
+        "axis": None,
+        "enable": True
+    },
+    "*.v.output_quantizer": {
+        "num_bits": 8,
+        "axis": None,
+        "enable": True
+    },
 }
 
 
@@ -104,7 +115,13 @@ def quant_cfg_choices():
         "int4_wo": EMPTY_CFG,
         "full_prec": EMPTY_CFG,
     }
+    if hasattr(mtq, "NVFP4_DEFAULT_CFG"):
+        QUANT_CFG_CHOICES["nvfp4"] = mtq.NVFP4_DEFAULT_CFG
     return QUANT_CFG_CHOICES
+
+
+def model_type_is_enc_dec(model_type):
+    return model_type in ["t5", "bart"]
 
 
 MODEL_NAME_PATTERN_MAP = {
@@ -129,17 +146,23 @@ MODEL_NAME_PATTERN_MAP = {
     "NemotronForCausalLM": "nemotron",
     "GPTBigCodeForCausalLM": "gpt_bigcode",
     "ArcticForCausalLM": "llama",
+    "PhiMoEForCausalLM": "phi3",
     "Phi3SmallForCausalLM": "phi3small",
     "Phi3ForCausalLM": "phi3",
+    "Phi3VForCausalLM": "phi3",
     "Starcoder2ForCausalLM": "gptnext",
     "GPTBigCodeForCausalLM": "gptnext",
     "GLM": "glm",
     "Exaone": "exaone",
     "DeciLMForCausalLM": "deci",
     "DeepseekForCausalLM": "deepseek",
+    "GraniteForCausalLM": "granite",
+    "GraniteMoeForCausalLM": "granitemoe",
+    "T5": "t5",
+    "Bart": "bart"
 }
 
-MULTIMODAL_DATASETS = ['scienceqa']
+MULTIMODAL_DATASETS = ['scienceqa', 'science_qa']
 
 
 class _CustomDataset(torch.utils.data.Dataset):
@@ -156,6 +179,23 @@ class _CustomDataset(torch.utils.data.Dataset):
 
     def __len__(self):
         return len(self.encodings["input_ids"])
+
+
+class EncDecModelWrapper(torch.nn.Module):
+
+    def __init__(self, hf_model=None):
+        super().__init__()
+        self.hf_model = hf_model
+        self.model_type = get_model_type(hf_model)
+
+    def forward(self, **kwargs):
+        self.hf_model.generate(**kwargs)
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.hf_model, name)
 
 
 def get_tokenizer(ckpt_path, max_seq_length=2048, model_type=None):
@@ -241,7 +281,10 @@ def _get_llava_qwen_model(model_dir, dtype, device):
     return model
 
 
-def get_model(ckpt_path: str, dtype: str = 'bfloat16', device: str = 'cuda'):
+def get_model(ckpt_path: str,
+              dtype: str = 'bfloat16',
+              device: str = 'cuda',
+              device_map: str = "auto"):
     logger.info(f"Initializing model from {ckpt_path}")
     # Note: VILA model is not in public HF model zoo yet. We need to explicitly import from the git repo
     hf_config = get_hf_config(ckpt_path)
@@ -268,10 +311,17 @@ def get_model(ckpt_path: str, dtype: str = 'bfloat16', device: str = 'cuda'):
                                                       device_map="cuda",
                                                       torch_dtype=torch_dtype,
                                                       trust_remote_code=True)
+    elif model_type_is_enc_dec(hf_config.model_type):
+        from transformers import AutoModelForSeq2SeqLM
+        model = AutoModelForSeq2SeqLM.from_pretrained(ckpt_path,
+                                                      device_map=device,
+                                                      torch_dtype=torch_dtype,
+                                                      trust_remote_code=True)
+        model = EncDecModelWrapper(hf_model=model)
     else:
         model = model_cls.from_pretrained(
             ckpt_path,
-            device_map="auto" if device != "cpu" else "cpu",
+            device_map=device_map if device != "cpu" else "cpu",
             torch_dtype="auto",
             trust_remote_code=True)
         if hf_config.model_type in ["llava", "internvl_chat"]:
@@ -289,6 +339,8 @@ def get_model(ckpt_path: str, dtype: str = 'bfloat16', device: str = 'cuda'):
 
 
 def get_model_type(model):
+    if type(model).__name__ == "EncDecModelWrapper":
+        return model.model_type
     if type(model).__name__ in MODEL_NAME_PATTERN_MAP:
         return MODEL_NAME_PATTERN_MAP[type(model).__name__]
     for k, v in MODEL_NAME_PATTERN_MAP.items():
@@ -311,8 +363,12 @@ def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
             data_files="https://the-eye.eu/public/AI/pile/val.jsonl.zst",
             split="train")
         dataset = dataset["text"][:calib_size]
-    elif dataset_name_or_dir == "scienceqa":
-        dataset = load_dataset("derek-thomas/ScienceQA", split="train")
+    elif "scienceqa" in dataset_name_or_dir.lower(
+    ) or "science_qa" in dataset_name_or_dir.lower():
+        if os.path.isdir(dataset_name_or_dir):
+            dataset = load_dataset(dataset_name_or_dir, split="train")
+        else:
+            dataset = load_dataset("derek-thomas/ScienceQA", split="train")
         dataset = dataset.select(range(calib_size))
     elif "cnn_dailymail" in dataset_name_or_dir:
         dataset = load_dataset(
@@ -333,7 +389,11 @@ def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
             f"Unsupported dataset name or local repo directory: {dataset_name_or_dir}."
         )
 
-    if dataset_name_or_dir in MULTIMODAL_DATASETS:
+    is_multimodal = False
+    for dataset_name in MULTIMODAL_DATASETS:
+        if dataset_name in dataset_name_or_dir:
+            is_multimodal = True
+    if is_multimodal:
         # Apply the preprocessing function to the dataset
         processed_dataset = dataset.map(tokenizer.preprocess_function,
                                         batched=False,
@@ -429,6 +489,13 @@ def quantize_model(model, quant_cfg, calib_dataloader, batch_size, qformat,
     start_time = time.time()
     if auto_quantize_bits:
         logger.info("Starting mixed precision quantization...")
+
+        from packaging import version as v
+        opt_kwargs = {}
+        modelopt_version = version('nvidia-modelopt')
+        if v.parse(modelopt_version) > v.parse("0.21"):
+            opt_kwargs['disabled_layers'] = ["*lm_head*"]
+
         model, search_history = mtq.auto_quantize(
             model,
             data_loader=calib_dataloader,
@@ -443,7 +510,7 @@ def quantize_model(model, quant_cfg, calib_dataloader, batch_size, qformat,
                 len(calib_dataloader), 128 // batch_size
             ),  # Limit the number of score steps to avoid long calibration time
             verbose=True,
-        )
+            **opt_kwargs)
         mtq.print_quant_summary(model)
 
         # We need to explicitly calibrate for kv cache quantization
@@ -570,7 +637,8 @@ def quantize_and_export(*,
                         medusa_hidden_act=None,
                         medusa_model_dir=None,
                         quant_medusa_head=None,
-                        auto_quantize_bits=None):
+                        auto_quantize_bits=None,
+                        device_map="auto"):
     '''
         Load model from the model_dir, call Modelopt to quantize the model, and then export
         the quantized model as TRT-LLM checkpoint
@@ -601,8 +669,9 @@ def quantize_and_export(*,
     hf_config = get_hf_config(model_dir)
     dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
 
-    model = get_model(model_dir, dtype, device=device)
+    model = get_model(model_dir, dtype, device=device, device_map=device_map)
     model_type = get_model_type(model)
+    is_enc_dec = model_type_is_enc_dec(model_type)
     if "vila" in model_dir:
         tokenizer = get_tokenizer(model_dir + "/llm",
                                   max_seq_length=tokenizer_max_seq_length,
@@ -685,6 +754,8 @@ def quantize_and_export(*,
             )
             model_type = f"unknown:{type(model).__name__}"
 
+        architecture = type(model).__name__
+
         export_path = output_dir
         start_time = time.time()
 
@@ -702,7 +773,7 @@ def quantize_and_export(*,
         if model_type == 'mllama':
             model = model.language_model
         export_tensorrt_llm_checkpoint(
-            model,
+            model.hf_model if is_enc_dec else model,
             model_type,
             getattr(torch, dtype),
             export_dir=export_path,
@@ -710,124 +781,141 @@ def quantize_and_export(*,
             inference_pipeline_parallel=pp_size,
         )
 
-        with open(f"{export_path}/config.json", "r") as f:
-            tensorrt_llm_config = json.load(f)
+        export_paths = []
+        tensorrt_llm_configs = []
+        if not is_enc_dec:
+            with open(f"{export_path}/config.json", "r") as f:
+                tensorrt_llm_config = json.load(f)
+            tensorrt_llm_configs.append(tensorrt_llm_config)
+            export_paths.append(export_path)
+        else:
+            for component in ["encoder", "decoder"]:
+                with open(f"{export_path}/{component}/config.json", "r") as f:
+                    tensorrt_llm_config = json.load(f)
+                tensorrt_llm_configs.append(tensorrt_llm_config)
+                export_paths.append(f"{export_path}/{component}")
 
-        tensorrt_llm_config["model_type"] = model_type
+        for export_path, tensorrt_llm_config in zip(export_paths,
+                                                    tensorrt_llm_configs):
 
-        # Workaround for wo quantization
-        if qformat in ["int8_wo", "int4_wo", "full_prec"]:
-            if qformat == "int8_wo":
+            tensorrt_llm_config["model_type"] = model_type
+            if not is_enc_dec:
+                tensorrt_llm_config["architecture"] = architecture
+
+            # Workaround for wo quantization
+            if qformat in ["int8_wo", "int4_wo", "full_prec"]:
+                if qformat == "int8_wo":
+                    tensorrt_llm_config["quantization"][
+                        "quant_algo"] = QuantAlgo.W8A16
+                elif qformat == "int4_wo":
+                    tensorrt_llm_config["quantization"][
+                        "quant_algo"] = QuantAlgo.W4A16
+                else:
+                    tensorrt_llm_config["quantization"]["quant_algo"] = None
+
+            # HF uses rope_scaling while tensorrt_llm uses rotary_scaling
+            if hasattr(model.config, "rope_scaling"
+                       ) and "rotary_scaling" not in tensorrt_llm_config:
+                tensorrt_llm_config["rotary_scaling"] = getattr(
+                    model.config, "rope_scaling")
+            with open(f"{export_path}/config.json", "w") as f:
+                json.dump(tensorrt_llm_config, f, indent=4)
+
+            # Workaround for Modelopt 0.9.x fp8_kv_cache knob issue
+            if qformat in ['fp8', 'nvfp4'] and kv_cache_dtype is None:
+                with open(f"{export_path}/config.json", "r") as f:
+                    tensorrt_llm_config = json.load(f)
                 tensorrt_llm_config["quantization"][
-                    "quant_algo"] = QuantAlgo.W8A16
-            elif qformat == "int4_wo":
-                tensorrt_llm_config["quantization"][
-                    "quant_algo"] = QuantAlgo.W4A16
-            else:
-                tensorrt_llm_config["quantization"]["quant_algo"] = None
+                    "kv_cache_quant_algo"] = None
+                with open(f"{export_path}/config.json", "w") as f:
+                    json.dump(tensorrt_llm_config, f, indent=4)
 
-        # HF uses rope_scaling while tensorrt_llm uses rotary_scaling
-        if hasattr(
-                model.config,
-                "rope_scaling") and "rotary_scaling" not in tensorrt_llm_config:
-            tensorrt_llm_config["rotary_scaling"] = getattr(
-                model.config, "rope_scaling")
-        with open(f"{export_path}/config.json", "w") as f:
-            json.dump(tensorrt_llm_config, f, indent=4)
+            # Workaround for qwen version
+            if model_type == 'qwen':
+                with open(f"{export_path}/config.json", "r") as f:
+                    tensorrt_llm_config = json.load(f)
+                qwen_config = AutoConfig.from_pretrained(model_dir,
+                                                         trust_remote_code=True)
+                try:
+                    from transformers import LlavaOnevisionConfig
+                    if isinstance(qwen_config, LlavaOnevisionConfig):
+                        qwen_config = qwen_config.text_config
+                except:
+                    pass
+                tensorrt_llm_config["qwen_type"] = qwen_config.model_type
+                if qwen_config.model_type == "qwen2":
+                    tensorrt_llm_config[
+                        "norm_epsilon"] = qwen_config.rms_norm_eps
+                    tensorrt_llm_config["rotary_base"] = qwen_config.rope_theta
+                tensorrt_llm_config[
+                    "intermediate_size"] = qwen_config.intermediate_size
+                with open(f"{export_path}/config.json", "w") as f:
+                    json.dump(tensorrt_llm_config, f, indent=4)
 
-        # Workaround for Modelopt 0.9.x fp8_kv_cache knob issue
-        if qformat == 'fp8' and kv_cache_dtype is None:
-            with open(f"{export_path}/config.json", "r") as f:
-                tensorrt_llm_config = json.load(f)
-            tensorrt_llm_config["quantization"]["kv_cache_quant_algo"] = None
-            with open(f"{export_path}/config.json", "w") as f:
-                json.dump(tensorrt_llm_config, f, indent=4)
+            # Set rotary parameters correctly for chatglm.
+            if model_type == 'chatglm':
+                rotary_base = 10000.0
+                rotary_embedding_scaling = None
+                chatglm_config = AutoConfig.from_pretrained(
+                    model_dir, trust_remote_code=True)
+                chatglm_version = tensorrt_llm_config['chatglm_version']
+                rope_ratio = tensorrt_llm_config.get('rope_ratio', 1.0)
+                if chatglm_version == 'chatglm2':
+                    if rope_ratio > 1:
+                        rotary_embedding_scaling = {
+                            'type': 'linear',
+                            'factor': rope_ratio
+                        }
+                elif chatglm_version == 'chatglm3':
+                    rotary_base *= rope_ratio
 
-        # Workaround for qwen version
-        if model_type == 'qwen':
-            with open(f"{export_path}/config.json", "r") as f:
-                tensorrt_llm_config = json.load(f)
-            qwen_config = AutoConfig.from_pretrained(model_dir,
-                                                     trust_remote_code=True)
-            try:
-                from transformers import LlavaOnevisionConfig
-                if isinstance(qwen_config, LlavaOnevisionConfig):
-                    qwen_config = qwen_config.text_config
-            except:
-                pass
-            tensorrt_llm_config["qwen_type"] = qwen_config.model_type
-            if qwen_config.model_type == "qwen2":
-                tensorrt_llm_config["norm_epsilon"] = qwen_config.rms_norm_eps
-                tensorrt_llm_config["rotary_base"] = qwen_config.rope_theta
-            tensorrt_llm_config[
-                "intermediate_size"] = qwen_config.intermediate_size
-            with open(f"{export_path}/config.json", "w") as f:
-                json.dump(tensorrt_llm_config, f, indent=4)
+                with open(f"{export_path}/config.json", "r") as f:
+                    tensorrt_llm_config = json.load(f)
+                tensorrt_llm_config['rotary_base'] = rotary_base
+                tensorrt_llm_config['rotary_scaling'] = rotary_embedding_scaling
+                tensorrt_llm_config['rotary_pct'] = 0.5
+                with open(f"{export_path}/config.json", "w") as f:
+                    json.dump(tensorrt_llm_config, f, indent=4)
 
-        # Set rotary parameters correctly for chatglm.
-        if model_type == 'chatglm':
-            rotary_base = 10000.0
-            rotary_embedding_scaling = None
-            chatglm_config = AutoConfig.from_pretrained(model_dir,
-                                                        trust_remote_code=True)
-            chatglm_version = tensorrt_llm_config['chatglm_version']
-            rope_ratio = tensorrt_llm_config.get('rope_ratio', 1.0)
-            if chatglm_version == 'chatglm2':
-                if rope_ratio > 1:
-                    rotary_embedding_scaling = {
-                        'type': 'linear',
-                        'factor': rope_ratio
-                    }
-            elif chatglm_version == 'chatglm3':
-                rotary_base *= rope_ratio
+            # context parallel
+            if cp_size > 1:
+                with open(f"{export_path}/config.json", "r") as f:
+                    tensorrt_llm_config = json.load(f)
+                tensorrt_llm_config["mapping"]["cp_size"] = cp_size
+                tensorrt_llm_config["mapping"]["world_size"] *= cp_size
+                with open(f"{export_path}/config.json", "w") as f:
+                    json.dump(tensorrt_llm_config, f, indent=4)
 
-            with open(f"{export_path}/config.json", "r") as f:
-                tensorrt_llm_config = json.load(f)
-            tensorrt_llm_config['rotary_base'] = rotary_base
-            tensorrt_llm_config['rotary_scaling'] = rotary_embedding_scaling
-            tensorrt_llm_config['rotary_pct'] = 0.5
-            with open(f"{export_path}/config.json", "w") as f:
-                json.dump(tensorrt_llm_config, f, indent=4)
+            if model_type == 'gptnext':
+                with open(f"{export_path}/config.json", "r") as f:
+                    tensorrt_llm_config = json.load(f)
+                if tensorrt_llm_config['max_position_embeddings'] is None:
+                    tensorrt_llm_config['max_position_embeddings'] = getattr(
+                        model.config, "n_positions", None)
+                with open(f"{export_path}/config.json", "w") as f:
+                    json.dump(tensorrt_llm_config, f, indent=4)
 
-        # context parallel
-        if cp_size > 1:
-            with open(f"{export_path}/config.json", "r") as f:
-                tensorrt_llm_config = json.load(f)
-            tensorrt_llm_config["mapping"]["cp_size"] = cp_size
-            tensorrt_llm_config["mapping"]["world_size"] *= cp_size
-            with open(f"{export_path}/config.json", "w") as f:
-                json.dump(tensorrt_llm_config, f, indent=4)
+            # Workaround for combining medusa head
+            # TODO: move these integration into modelopt to avoid redundant reading and writing
+            if medusa_model_dir is not None:
+                combine_medusa_weight(tp_size, pp_size, export_path,
+                                      num_medusa_heads, num_medusa_layers,
+                                      max_draft_len, medusa_hidden_act,
+                                      medusa_model_dir, quant_medusa_head)
 
-        if model_type == 'gptnext':
-            with open(f"{export_path}/config.json", "r") as f:
-                tensorrt_llm_config = json.load(f)
-            if tensorrt_llm_config['max_position_embeddings'] is None:
-                tensorrt_llm_config['max_position_embeddings'] = getattr(
-                    model.config, "n_positions", None)
-            with open(f"{export_path}/config.json", "w") as f:
-                json.dump(tensorrt_llm_config, f, indent=4)
+            # Workaround for mllama
+            if model_type == 'mllama':
+                from tensorrt_llm.models.mllama.config import MLLaMAConfig
+                config = MLLaMAConfig.from_hugging_face(
+                    model_dir,
+                    dtype=dtype,
+                )
+                for key, value in config.to_dict().items():
+                    if key not in tensorrt_llm_config:
+                        tensorrt_llm_config[key] = value
 
-        # Workaround for combining medusa head
-        # TODO: move these integration into modelopt to avoid redundant reading and writing
-        if medusa_model_dir is not None:
-            combine_medusa_weight(tp_size, pp_size, export_path,
-                                  num_medusa_heads, num_medusa_layers,
-                                  max_draft_len, medusa_hidden_act,
-                                  medusa_model_dir, quant_medusa_head)
-
-        # Workaround for mllama
-        if model_type == 'mllama':
-            from tensorrt_llm.models.mllama.config import MLLaMAConfig
-            config = MLLaMAConfig.from_hugging_face(
-                model_dir,
-                dtype=dtype,
-            )
-            for key, value in config.to_dict().items():
-                if key not in tensorrt_llm_config:
-                    tensorrt_llm_config[key] = value
-
-            with open(f"{export_path}/config.json", "w") as f:
-                json.dump(tensorrt_llm_config, f, indent=4)
+                with open(f"{export_path}/config.json", "w") as f:
+                    json.dump(tensorrt_llm_config, f, indent=4)
 
         end_time = time.time()
         logger.info(

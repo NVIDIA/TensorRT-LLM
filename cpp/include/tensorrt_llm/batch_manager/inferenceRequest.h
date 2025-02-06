@@ -65,6 +65,7 @@ auto constexpr kPromptVocabSizeName = "prompt_vocab_size";
 auto constexpr kLoraTaskId = "lora_task_id";
 auto constexpr kNoRepeatNgramSizeTensorName = "noRepeatNgramSize";
 auto constexpr kSkipCrossAttnBlocksTensorName = "skipCrossAttnBlocks";
+auto constexpr kRuntimeMinPTensorName = "runtime_min_p";
 // weights for a lora adapter shape [ num_lora_modules_layers, D x Hi + Ho x D ]
 // where the last dimension holds the in / out adapter weights for the associated module (e.g. attn_qkv) and model layer
 // each of the in / out tensors are first flattened and then concatenated together in the format above.
@@ -218,6 +219,7 @@ public:
         inference_request::kPromptEmbeddingTableName,
         inference_request::kPromptVocabSizeName,
         inference_request::kNoRepeatNgramSizeTensorName,
+        inference_request::kRuntimeMinPTensorName,
         // obsolete names for backward compatibility
         inference_request::kInputLengthsTensorName,
         inference_request::kLoraTaskId,
@@ -291,6 +293,7 @@ public:
     TENSOR_GETTER_SETTER(LoraWeights, inference_request::kLoraWeights)
     TENSOR_GETTER_SETTER(LoraConfig, inference_request::kLoraConfig)
     TENSOR_GETTER_SETTER(NoRepeatNgramSize, inference_request::kNoRepeatNgramSizeTensorName)
+    TENSOR_GETTER_SETTER(RuntimeMinP, inference_request::kRuntimeMinPTensorName)
 
 #undef TENSOR_GETTER_SETTER
 

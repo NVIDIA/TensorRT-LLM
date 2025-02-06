@@ -252,7 +252,6 @@ class MambaForCausalLM(PretrainedModel):
             prompt_embedding_table_size: int = 0,
             max_draft_len: int = 0,
             gather_context_logits: bool = False,
-            gather_generation_logits: bool = False,
             lora_target_modules: List[str] = None,
             speculative_decoding_draft_tokens_external: bool = False):
         '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the

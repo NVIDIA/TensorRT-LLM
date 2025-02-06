@@ -38,12 +38,12 @@ BertAttentionPlugin::BertAttentionPlugin(int num_heads, int head_size, float q_s
     : mNumHeads(num_heads)
     , mHeadSize(head_size)
     , mQScaling(q_scaling)
-    , mEnableContextFMHA(context_fmha_type != ContextFMHAType::DISABLED)
-    , mFMHAForceFP32Acc(context_fmha_type == ContextFMHAType::ENABLED_WITH_FP32_ACC)
     , mType(type)
     , mRelativeAttention(do_relative_attention)
     , mMaxDistance(max_distance)
     , mRemovePadding(remove_padding)
+    , mEnableContextFMHA(context_fmha_type != ContextFMHAType::DISABLED)
+    , mFMHAForceFP32Acc(context_fmha_type == ContextFMHAType::ENABLED_WITH_FP32_ACC)
 {
     // pre-check whether FMHA is supported in order to save memory allocation
     if (mEnableContextFMHA)
@@ -555,7 +555,7 @@ void BertAttentionPlugin::serialize(void* buffer) const noexcept
     write(d, mRelativeAttention);
     write(d, mMaxDistance);
     write(d, mRemovePadding);
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 }
 
 void BertAttentionPlugin::terminate() noexcept {}
@@ -596,13 +596,14 @@ PluginFieldCollection const* BertAttentionPluginCreator::getFieldNames() noexcep
 IPluginV2* BertAttentionPluginCreator::createPlugin(char const* name, PluginFieldCollection const* fc) noexcept
 {
     PluginField const* fields = fc->fields;
-    int num_heads, head_size;
-    ContextFMHAType context_fmha_type;
-    float q_scaling;
-    nvinfer1::DataType type;
-    bool do_relative_attention;
-    int max_distance;
-    bool remove_padding;
+    int num_heads{};
+    int head_size{};
+    ContextFMHAType context_fmha_type{};
+    float q_scaling{};
+    nvinfer1::DataType type{};
+    bool do_relative_attention{};
+    int max_distance{};
+    bool remove_padding{};
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {
