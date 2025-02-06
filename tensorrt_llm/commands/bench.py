@@ -40,7 +40,7 @@ def main(
     workspace: Path,
 ) -> None:
     ctx.obj = BenchmarkEnvironment(model=model,
-                                   model_path=model_path,
+                                   checkpoint_path=model_path,
                                    workspace=workspace)
 
     # Create the workspace where we plan to store intermediate files.

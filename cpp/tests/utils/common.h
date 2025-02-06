@@ -12,6 +12,11 @@
 
 #pragma once
 
+#ifndef TOP_LEVEL_DIR
+#error "Define TOP_LEVEL_DIR"
+#endif
+
+#include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -21,6 +26,8 @@
 #include <cmath>
 #include <filesystem>
 #include <random>
+#include <set>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -33,6 +40,72 @@ using tr::SizeType32;
 using tr::TokenIdType;
 using tr::ITensor;
 using tr::MemoryType;
+
+auto const TEST_RESOURCE_PATH = fs::path{TOP_LEVEL_DIR} / "cpp/tests/resources";
+
+auto const ENGINE_PATH = TEST_RESOURCE_PATH / "models/rt_engine";
+auto const GPT_MODEL_PATH = ENGINE_PATH / "gpt2";
+auto const LLAMA_MODEL_PATH = ENGINE_PATH / "llama-7b-hf";
+auto const MEDUSA_MODEL_PATH = ENGINE_PATH / "vicuna-7b-medusa";
+auto const CHATGLM_MODEL_PATH = ENGINE_PATH / "chatglm-6b";
+auto const CHATGLM2_MODEL_PATH = ENGINE_PATH / "chatglm2-6b";
+auto const CHATGLM3_MODEL_PATH = ENGINE_PATH / "chatglm3-6b";
+auto const GLM_MODEL_PATH = ENGINE_PATH / "glm-10b";
+auto const ENC_DEC_ENGINE_BASE = TEST_RESOURCE_PATH / "models/enc_dec/trt_engines";
+
+auto const DATA_PATH = TEST_RESOURCE_PATH / "data";
+auto const GPT_DATA_PATH = DATA_PATH / "gpt2";
+auto const GPT_XGRAMMAR_TOKENIZER_INFO_PATH = GPT_DATA_PATH / "xgrammar_tokenizer_info.json";
+auto const LLAMA_DATA_PATH = DATA_PATH / "llama-7b-hf";
+auto const LLAMA_XGRAMMAR_TOKENIZER_INFO_PATH = LLAMA_DATA_PATH / "xgrammar_tokenizer_info.json";
+auto const MEDUSA_DATA_PATH = DATA_PATH / "vicuna-7b-medusa";
+auto const CHATGLM_DATA_PATH = DATA_PATH / "chatglm-6b";
+auto const CHATGLM2_DATA_PATH = DATA_PATH / "chatglm2-6b";
+auto const CHATGLM3_DATA_PATH = DATA_PATH / "chatglm3-6b";
+auto const GLM_DATA_PATH = DATA_PATH / "glm-10b";
+auto const ENC_DEC_DATA_BASE = DATA_PATH / "enc_dec";
+
+auto constexpr T5_NAME = "t5-small";
+auto constexpr BART_NAME = "bart-large-cnn";
+
+class PathUtil
+{
+public:
+    static std::string EXECUTOR_WORKER_PATH()
+    {
+        return (std::filesystem::path{TOP_LEVEL_DIR} / "cpp/build/tensorrt_llm/executor_worker/executorWorker")
+            .string();
+    }
+
+    // model paths
+    static std::string FP16_GPT_ATTENTION_PACKED_DIR();
+    static std::string FP16_GPT_ATTENTION_PACKED_PAGED_DIR();
+    static std::string FP16_GPT_LORA_DIR();
+    static std::string FP16_GPT_ATTENTION_PACKED_PAGED_RETURN_ACCEPTED_TOKENS_LOGITS_DIR();
+    static std::string FP16_GPT_ATTENTION_PACKED_PAGED_GATHER_DIR();
+    static std::string FP16_PLUGIN_PACKED_PAGED_RESULT_FILE();
+    static std::string FP16_PLUGIN_PACKED_PAGED_LONG_RESULT_FILE();
+    static std::string FP16_PLUGIN_PACKED_PAGED_GATHER_RESULT_FILE();
+    // logits
+    static std::string FP16_PLUGIN_PACKED_PAGED_GENERATION_LOGITS_FILE();
+    static std::string FP16_PLUGIN_PACKED_PAGED_CONTEXT_LOGITS_FILE();
+    static std::string FP16_PLUGIN_PACKED_PAGED_CUM_LOG_PROBS_FILE();
+    static std::string FP16_PLUGIN_PACKED_PAGED_GATHER_CUM_LOG_PROBS_FILE();
+    static std::string FP16_PLUGIN_PACKED_PAGED_LOG_PROBS_FILE();
+    static std::string FP16_PLUGIN_PACKED_PAGED_GATHER_LOG_PROBS_FILE();
+    // results
+    static std::string FP16_PLUGIN_PACKED_PAGED_RESULT_TP1_PP1_FILE();
+    static std::string FP16_PLUGIN_PACKED_PAGED_RESULT_TP4_PP1_FILE();
+    static std::string FP16_PLUGIN_PACKED_PAGED_RESULT_TP2_PP2_FILE();
+    static std::string FP16_PLUGIN_PACKED_PAGED_RESULT_TP1_PP4_FILE();
+    static std::string FP16_PLUGIN_PACKED_PAGED_RESULT_TP1_PP2_FILE();
+    static std::string FP16_PLUGIN_PACKED_PAGED_RESULT_TP2_PP1_FILE();
+    // GptExecutorTest.GenerationLogitsEarlyStop requires to use context_fmha_fp32_acc flag in runtime for better
+    // accuracy
+    static std::string FP16_PLUGIN_PACKED_PAGED_GATHER_CONTEXTFMHAFP32ACC_RESULT_FILE();
+    static std::string FP16_PLUGIN_PACKED_PAGED_CONTEXTFMHAFP32ACC_GENERATION_LOGITS_FILE();
+    static std::string FP16_PLUGIN_PACKED_PAGED_CONTEXTFMHAFP32ACC_CONTEXT_LOGITS_FILE();
+};
 
 class ModelIds
 {
@@ -76,6 +149,12 @@ public:
 
 using BeamResults = std::vector<BeamResult>;
 
+struct FlakyTestInfo
+{
+    // Pair of batch ID + beam which are flaky
+    std::set<std::pair<SizeType32, SizeType32>> batchIdBeams;
+};
+
 class TestData
 {
 public:
@@ -102,6 +181,30 @@ public:
 
     void makeDraft(SizeType32 maxDraftTokens, bool acceptDraftByLogits, fs::path const& genLogitsFile,
         std::vector<SizeType32> const& givenInputLengths, tr::BufferManager const& manager);
+
+    static TestData loadTestData(BeamResult const& beamResults, ITensor const& givenInput, SizeType32 maxBeamWidth,
+        tr::BufferManager& manager, executor::OutputConfig const& outConfig, ModelIds const& modelIds);
+
+    void verifyOutput(std::unordered_map<SizeType32, std::vector<executor::BeamTokens>> const& resultTokens,
+        std::vector<SizeType32> const& givenInputLengths, SizeType32 nbGivenInputs, bool streaming,
+        bool excludeInputFromOutput, FlakyTestInfo flakyTestInfo, bool isSpeculativeDecoding,
+        bool returnAllGeneratedTokens, SizeType32 reqBeamWidth, SizeType32 numReturnSequences,
+        bool isNonGreedySampling);
+
+    void verifyLogProbs(bool computeLogProbs, bool streaming, bool excludeInputFromOutput, SizeType32 inputLength,
+        SizeType32 beamWidth, executor::BeamTokens const& beamTokens,
+        std::optional<executor::VecLogProbs> const& cumLogProbs,
+        std::optional<std::vector<executor::VecLogProbs>> const& logProbs, SizeType32 batchId,
+        FlakyTestInfo flakyTestInfo);
+
+    void validateContextLogits(bool getContextLogits, SizeType32 inputLength, SizeType32 beamWidth,
+        std::optional<executor::Tensor> const& contextLogits, SizeType32 vocabSizePadded, SizeType32 batchId,
+        executor::BatchingType batchingType);
+
+    void validateGenerationLogits(bool getGenLogits, bool isFinal, bool streaming, bool excludeInputFromOutput,
+        SizeType32 inputLength, SizeType32 maxOutputLen, SizeType32 beamWidth, executor::BeamTokens const& beamTokens,
+        std::optional<executor::Tensor> const& genLogits, SizeType32 vocabSizePadded, SizeType32 batchId,
+        executor::BatchingType batchingType, bool returnAllGeneratedTokens);
 
     SizeType32 nbGivenInputs{};
     SizeType32 beamWidth{};
@@ -189,5 +292,52 @@ std::vector<TLogits> randomLogits(runtime::SizeType32 vocabSize, TEngine* engine
 
 std::vector<tensorrt_llm::executor::TokenIdType> createConsecutiveTokenSequence(
     tensorrt_llm::runtime::SizeType32 length, tensorrt_llm::runtime::TokenIdType vocabLength);
+
+/**
+ * GPU timer for recording the elapsed time across kernel(s) launched in GPU stream
+ */
+struct GpuTimer
+{
+    cudaStream_t _stream_id;
+    cudaEvent_t _start;
+    cudaEvent_t _stop;
+
+    /// Construct`or
+    GpuTimer()
+        : _stream_id(0)
+    {
+        TLLM_CUDA_CHECK(cudaEventCreate(&_start));
+        TLLM_CUDA_CHECK(cudaEventCreate(&_stop));
+    }
+
+    /// Destructor
+    ~GpuTimer()
+    {
+        TLLM_CUDA_CHECK(cudaEventDestroy(_start));
+        TLLM_CUDA_CHECK(cudaEventDestroy(_stop));
+    }
+
+    /// Start the timer for a given stream (defaults to the default stream)
+    void start(cudaStream_t stream_id = 0)
+    {
+        _stream_id = stream_id;
+        TLLM_CUDA_CHECK(cudaEventRecord(_start, _stream_id));
+    }
+
+    /// Stop the timer
+    void stop()
+    {
+        TLLM_CUDA_CHECK(cudaEventRecord(_stop, _stream_id));
+    }
+
+    /// Return the elapsed time (in milliseconds)
+    float elapsed_millis()
+    {
+        float elapsed = 0.0;
+        TLLM_CUDA_CHECK(cudaEventSynchronize(_stop));
+        TLLM_CUDA_CHECK(cudaEventElapsedTime(&elapsed, _start, _stop));
+        return elapsed;
+    }
+};
 
 } // namespace tensorrt_llm::testing

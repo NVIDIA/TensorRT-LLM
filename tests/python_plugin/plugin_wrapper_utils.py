@@ -6,7 +6,8 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm import PluginBase
-from tensorrt_llm.python_plugin import SymTensor, TensorWrapper, trtllm_plugin
+from tensorrt_llm._utils import TensorWrapper
+from tensorrt_llm.python_plugin import SymTensor, trtllm_plugin
 
 sys.path.append(os.path.join(os.path.dirname(__file__), os.pardir))
 

@@ -133,7 +133,8 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
     float const* topPs, curandState_t* curandState, TokenIdType const* endIds, SizeType32 vocabSize,
     bool const* skipDecode, SizeType32 const* batchSlots, SizeType32 maxBatchSize, bool normalizeLogProbs,
     bool logitHasProbs, SizeType32 const* tokensPerStep, SizeType32 maxTokensPerStep, SizeType32 maxSeqLen,
-    bool returnAllSelectedTokens, TokenIdType* outputIdCurrentStep, bool const* skipOutputIdCurrentStep)
+    bool returnAllSelectedTokensFlag, bool strictTopPBoundary, bool const* returnAllSelectedTokensPerSlot,
+    TokenIdType* outputIdCurrentStep, bool const* skipOutputIdCurrentStep)
 {
     bool const IS_FP16 = std::is_same<T, half>::value;
     T const MAX_T_VAL = (IS_FP16) ? HALF_FLT_MAX : FLT_MAX;
@@ -156,6 +157,9 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
     auto const probThreshold = (topPs != nullptr) ? topPs[batchSlot] : topP;
     auto const size = k * BLOCKS_PER_BEAM_;
     auto const stride = maxTopK * BLOCKS_PER_BEAM_;
+    auto const returnAllSelectedTokens = returnAllSelectedTokensPerSlot != nullptr
+        ? returnAllSelectedTokensPerSlot[batchSlot]
+        : returnAllSelectedTokensFlag;
     bool const sampleTokenInSelected = returnAllSelectedTokens && outputIdCurrentStep && curandState
         && skipOutputIdCurrentStep && !skipOutputIdCurrentStep[batchSlot];
 
@@ -287,7 +291,7 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
                     outputIdCurrentStep[batchSlot] = outputId;
                 }
 
-                if (returnAllSelectedTokens && randNum <= 0.0f)
+                if (returnAllSelectedTokens && randNum <= 0.0f && strictTopPBoundary)
                 {
                     if (ki < k - 1)
                     { // not the last k, write a -1 to to log top p tokens boundary for external draft token masking
@@ -337,7 +341,8 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
                     params.maxTopK, params.topKs, params.maxTopP, params.topPs, params.curandState, params.endIds,     \
                     params.vocabSizePadded, params.skipDecode, params.batchSlots, params.maxBatchSize,                 \
                     params.normalizeLogProbs, params.logitsHasProbs, params.tokensPerStep, params.maxTokensPerStep,    \
-                    params.maxSeqLen, params.returnAllSelectedTokens, params.outputIdCurrentStep,                      \
+                    params.maxSeqLen, params.returnAllSelectedTokens, params.strictTopPBoundary,                       \
+                    params.returnAllSelectedTokensPerSlot, params.outputIdCurrentStep,                                 \
                     params.skipOutputIdCurrentStep);                                                                   \
         }                                                                                                              \
     } while (0)

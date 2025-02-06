@@ -169,6 +169,8 @@ public:
         std::int64_t weightsInPointer;
         // pointer to out weights cast to an int64_t
         std::int64_t weightsOutPointer;
+        // optional pointer to DoRA magnitude vector. size is outDim.
+        std::optional<std::int64_t> scalingVecPointer;
 
         std::string toString() const;
 

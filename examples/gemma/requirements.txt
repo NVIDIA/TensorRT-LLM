@@ -1,8 +1,9 @@
 -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+-c ../constraints.txt
 # WAR the new posting of "nvidia-cudnn-cu12~=9.0".
 # "jax[cuda12_pip]~=0.4.19" specifies "nvidia-cudnn-cu12>=8.9" but actually requires "nvidia-cudnn-cu12~=8.9".
 nvidia-cudnn-cu12~=8.9; platform_machine == "x86_64"
-tensorrt_llm==0.17.0.dev2024121700
+tensorrt_llm>=0.0.dev0
 flax~=0.8.0
 # jax[cuda12_pip]~=0.4.19; platform_system != "Windows"
 jax~=0.4.19; platform_system == "Windows"

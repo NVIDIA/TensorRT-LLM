@@ -35,7 +35,7 @@
 #include "cutlass_extensions/gemm/kernel/gemm_moe_problem_visitor.h"
 #include "cutlass_extensions/tile_interleaved_layout.h"
 
-#include "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_sm90_traits.h"
+#include "tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/moe_tma_warp_specialized_traits.h"
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -517,9 +517,7 @@ public:
     void operator()(Params const& params, SharedStorage& shared_storage)
     {
 #if defined(__CUDA_ARCH__)
-#if (__CUDA_ARCH__ >= 750) && (__CUDA_ARCH__ < 800)
-        run_kernel<arch::Sm75>(params, shared_storage);
-#elif (__CUDA_ARCH__ >= 800) && (__CUDA_ARCH__ < 890)
+#if (__CUDA_ARCH__ >= 800) && (__CUDA_ARCH__ < 890)
         run_kernel<arch::Sm80>(params, shared_storage);
 #elif (__CUDA_ARCH__ >= 890) && (__CUDA_ARCH__ < 900)
         constexpr bool isFp8 = platform::is_same<ElementA, cutlass::float_e4m3_t>::value
@@ -536,7 +534,7 @@ public:
         run_kernel<arch::Sm80>(params, shared_storage);
 #else
         static_assert(
-            false, "Invalid architecture being compiled. Only Volta+ supported in weight-only quantization kernels.");
+            false, "Invalid architecture being compiled. Only Ampere+ supported in weight-only quantization kernels.");
 #endif
 #else
         CUTLASS_NOT_IMPLEMENTED();

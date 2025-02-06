@@ -11,12 +11,18 @@ def generate_source_weights(mod_id,
                             adapter_dim,
                             in_dim,
                             out_dim,
-                            dtype=torch.float32):
-    weights = torch.rand((num_layers, adapter_dim * (in_dim + out_dim)),
+                            dtype=torch.float32,
+                            is_dora: bool | None = None):
+    weights = torch.rand((num_layers, adapter_dim * (in_dim + out_dim) +
+                          (out_dim if is_dora else 0)),
                          dtype=dtype)
     config = []
     for layer_idx in range(num_layers):
-        config.append((mod_id, layer_idx, adapter_dim))
+        if is_dora is not None:
+            config.append((mod_id, layer_idx, adapter_dim, is_dora))
+        else:
+            # test old config format for backwards compatibility
+            config.append((mod_id, layer_idx, adapter_dim))
     config = torch.tensor(config, dtype=torch.int32)
     return weights, config
 
@@ -63,7 +69,8 @@ def copy_to_cache_pages(weights,
                         page_blocks,
                         configs,
                         tp_rank=0,
-                        tp_size=1):
+                        tp_size=1,
+                        is_dora: bool | None = None):
     page_slots = page_blocks.shape[1]
     page_width = page_blocks.shape[2]
 
@@ -82,35 +89,52 @@ def copy_to_cache_pages(weights,
 
         local_size = 0
         if split_in:
-            local_size = adapter_size * (local_in_dim + out_dim)
+            local_size = adapter_size * (local_in_dim + out_dim) + (
+                out_dim if is_dora else 0)
         else:
-            local_size = adapter_size * (in_dim + local_out_dim)
+            local_size = adapter_size * (in_dim + local_out_dim) + (
+                local_out_dim if is_dora else 0)
 
         num_slots = (local_size + page_width - 1) // page_width
         if num_slots + curr_slot > page_slots:
             curr_slot = 0
             curr_page += 1
 
-        flattend_size = adapter_size * (in_dim + out_dim)
+        flattend_size = adapter_size * (in_dim + out_dim) + (out_dim
+                                                             if is_dora else 0)
 
+        dora_mag = None
         if split_in:
             in_weights = weights[i, :adapter_size * in_dim].reshape(
                 (adapter_size, tp_size,
                  local_in_dim))[:, tp_rank, :].contiguous().flatten()
             out_weights = weights[i, adapter_size *
                                   in_dim:flattend_size].contiguous().flatten()
+            if is_dora:
+                dora_mag = out_weights[-out_dim:]
+                out_weights = out_weights[:-out_dim]
+
         else:
             in_weights = weights[i, :adapter_size *
                                  in_dim].contiguous().flatten()
-            out_weights = weights[i,
-                                  adapter_size * in_dim:flattend_size].reshape(
-                                      (tp_size, local_out_dim, adapter_size
-                                       ))[tp_rank, :, :].contiguous().flatten()
+            out_weights = weights[i, adapter_size * in_dim:flattend_size]
+
+            if is_dora:
+                dora_mag = out_weights[-out_dim:]
+                out_weights = out_weights[:-out_dim]
+                dora_mag = dora_mag.reshape(
+                    (tp_size, local_out_dim))[tp_rank].contiguous().flatten()
+
+            out_weights = out_weights.reshape(
+                (tp_size, local_out_dim,
+                 adapter_size))[tp_rank, :, :].contiguous().flatten()
 
         page_blocks[curr_page, curr_slot:curr_slot + num_slots, :].view(
-            -1)[0:in_weights.shape[0] +
-                out_weights.shape[0]] = torch.concatenate(
-                    (in_weights, out_weights)).contiguous().flatten()
+            -1)[0:in_weights.shape[0] + out_weights.shape[0] +
+                (dora_mag.shape[0] if is_dora else 0)] = torch.concatenate(
+                    (in_weights, out_weights) +
+                    ((dora_mag, ) if is_dora else ())).contiguous().flatten()
+
         curr_slot += num_slots
 
 
@@ -134,6 +158,8 @@ def main():
         help=
         "Comma separated list of ids to include. For example, use --config-ids-filter=0 for attn_qkv only."
     )
+    parser.add_argument('--target-file-name', type=str, default="target.npy")
+    parser.add_argument('--config-file-name', type=str, default="config.npy")
 
     args = parser.parse_args()
 
@@ -168,55 +194,64 @@ def main():
         configs = [c for c in configs if c[0] in config_ids_filter]
 
     for lora_idx in range(args.num_loras):
-        all_source = []
-        all_config = []
+        for is_dora in [None, False, True]:
+            all_source = []
+            all_config = []
 
-        all_target = []
-        for c in configs:
-            source_weights, config = generate_source_weights(*c)
-            all_source.append(source_weights)
-            all_config.append(config)
+            all_target = []
+            for c in configs:
+                source_weights, config = generate_source_weights(
+                    *c, is_dora=is_dora)
+                all_source.append(source_weights)
+                all_config.append(config)
 
-            mod_id, _, adapter_size, in_dim, out_dim = c
-            split_in = mod_id in (4, 6, 12)
+                mod_id, _, adapter_size, in_dim, out_dim = c
+                split_in = mod_id in (4, 6, 12)
 
-            target_weights = format_tensors(source_weights, adapter_size,
-                                            in_dim, out_dim, args.tp_size,
-                                            split_in)
-            all_target.append(target_weights)
+                target_weights = format_tensors(source_weights, adapter_size,
+                                                in_dim, out_dim, args.tp_size,
+                                                split_in)
+                all_target.append(target_weights)
 
-        all_source = pad_tensors(all_source)
-        all_config = pad_tensors(all_config)
-        all_target = pad_tensors(all_target)
+            all_source = pad_tensors(all_source)
+            all_config = pad_tensors(all_config)
+            all_target = pad_tensors(all_target)
 
-        output_dir = Path(args.out_dir)
-        if args.num_loras > 1:
-            output_dir = output_dir / str(lora_idx)
+            output_dir = Path(args.out_dir)
+            if args.num_loras > 1:
+                output_dir = output_dir / str(lora_idx)
 
-        os.makedirs(output_dir, exist_ok=True)
-        # copy weights into cache pages
-        if not args.no_generate_cache_pages:
-            for rank in range(args.tp_size):
-                page_block = torch.zeros((8, 18, 128),
-                                         dtype=torch.float32,
-                                         device='cpu')
-                copy_to_cache_pages(all_source,
-                                    all_config,
-                                    page_block,
-                                    configs,
-                                    tp_rank=rank,
-                                    tp_size=args.tp_size)
+            os.makedirs(output_dir, exist_ok=True)
+            suffix = "" if is_dora is None else (
+                "_dora" if is_dora else "_no_dora")
+            # copy weights into cache pages
+            if not args.no_generate_cache_pages:
+                for rank in range(args.tp_size):
+                    page_block = torch.zeros((8, 18, 128),
+                                             dtype=torch.float32,
+                                             device='cpu')
+                    copy_to_cache_pages(all_source,
+                                        all_config,
+                                        page_block,
+                                        configs,
+                                        tp_rank=rank,
+                                        tp_size=args.tp_size,
+                                        is_dora=is_dora)
 
-                out_path = output_dir / f'cache_pages_rank{rank}.npy'
-                np.save(out_path, page_block)
+                    out_path = output_dir / f'cache_pages_rank{rank}{suffix}.npy'
+                    print(f"{page_block.shape=}")
+                    np.save(out_path, page_block)
 
-        source_out_path = output_dir / 'source.npy'
-        config_out_path = output_dir / 'config.npy'
-        target_out_path = output_dir / 'target.npy'
+            config_file_name = Path(args.config_file_name).stem
+            target_file_name = Path(args.target_file_name).stem
 
-        np.save(source_out_path, all_source)
-        np.save(config_out_path, all_config)
-        np.save(target_out_path, all_target)
+            source_out_path = output_dir / f'source{suffix}.npy'
+            config_out_path = output_dir / f'{config_file_name}{suffix}.npy'
+            target_out_path = output_dir / f'{target_file_name}{suffix}.npy'
+
+            np.save(source_out_path, all_source)
+            np.save(config_out_path, all_config)
+            np.save(target_out_path, all_target)
 
 
 if __name__ == "__main__":

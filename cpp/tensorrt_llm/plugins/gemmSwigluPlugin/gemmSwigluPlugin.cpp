@@ -108,11 +108,11 @@ std::vector<GemmSwigluPluginProfiler::Config> GemmSwigluPluginProfiler::getTacti
 GemmSwigluPlugin::GemmSwigluPlugin(QuantMode quantMode, nvinfer1::DataType type, bool hasBias, float scale_d0,
     float scale_d1, float scale_output, GemmSwigluPlugin::PluginProfilerPtr const& pluginProfiler)
     : mQuantMode(quantMode)
+    , mPluginProfiler(pluginProfiler)
     , mHasBias(hasBias)
     , mScaleD0(scale_d0)
     , mScaleD1(scale_d1)
     , mScaleOutput(scale_output)
-    , mPluginProfiler(pluginProfiler)
 {
     init(type);
 }
@@ -373,11 +373,11 @@ IPluginV2* GemmSwigluPluginCreator::createPlugin(char const* name, PluginFieldCo
 {
     PluginField const* fields = fc->fields;
     TLLM_CHECK(fc->nbFields == 5);
-    nvinfer1::DataType type;
-    bool hasBias;
-    float scale_d0;
-    float scale_d1;
-    float scale_output;
+    nvinfer1::DataType type{};
+    bool hasBias{};
+    float scale_d0{};
+    float scale_d1{};
+    float scale_output{};
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {

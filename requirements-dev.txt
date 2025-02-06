@@ -9,6 +9,7 @@ pybind11
 pybind11-stubgen
 pytest-asyncio
 pytest-cov
+pytest-csv
 pytest-forked
 pytest-xdist
 pytest-timeout
@@ -21,4 +22,3 @@ jsonlines==4.0.0
 jieba==0.42.1
 rouge==1.0.1
 pytest-rerunfailures
-setuptools==70.3.0

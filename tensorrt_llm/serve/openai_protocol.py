@@ -133,6 +133,7 @@ class CompletionRequest(OpenAIBaseModel):
     # doc: begin-completion-sampling-params
     use_beam_search: bool = False
     top_k: int = 0
+    top_p_min: float = 0.0
     min_p: float = 0.0
     repetition_penalty: float = 1.0
     length_penalty: float = 1.0
@@ -181,9 +182,11 @@ class CompletionRequest(OpenAIBaseModel):
             beam_width=self.best_of if self.best_of else self.n,
             min_tokens=self.min_tokens,
             include_stop_str_in_output=self.include_stop_str_in_output,
+            add_special_tokens=self.add_special_tokens,
+            min_p=self.min_p,
         )
-        if self.min_p > 0:
-            sampling_params.top_p_min = self.min_p
+        if self.top_p_min > 0:
+            sampling_params.top_p_min = self.top_p_min
         return sampling_params
 
     def model_post_init(self, __context: Any) -> None:
@@ -200,7 +203,8 @@ class CompletionRequest(OpenAIBaseModel):
     @model_validator(mode="before")
     @classmethod
     def check_logprobs(cls, data):
-        if "top_logprobs" in data or "logprobs" in data:
+        if ("top_logprobs" in data and data.get("top_logprobs")) or \
+            ("logprobs" in data and data.get("logprobs")):
             raise ValueError("returning log probs is not supported")
         return data
 
@@ -216,7 +220,8 @@ class CompletionRequest(OpenAIBaseModel):
     @classmethod
     def verify_multi_responses(cls, data):
         best_of = data.get("best_of")
-        if best_of and best_of < data.get("n"):
+        n = data.get("n")
+        if best_of and n and best_of < n:
             raise ValueError("best_of should not be smaller than n")
         return data
 
@@ -402,6 +407,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     best_of: Optional[int] = None
     use_beam_search: bool = False
     top_k: int = 0
+    top_p_min: float = 0.0
     min_p: float = 0.0
     repetition_penalty: float = 1.0
     length_penalty: float = 1.0
@@ -480,9 +486,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
             stop=self.stop,
             include_stop_str_in_output=self.include_stop_str_in_output,
             return_log_probs=self.logprobs,
+            add_special_tokens=self.add_special_tokens,
+            min_p=self.min_p,
         )
-        if self.min_p > 0:
-            sampling_params.top_p_min = self.min_p
+        if self.top_p_min > 0:
+            sampling_params.top_p_min = self.top_p_min
         return sampling_params
 
     def model_post_init(self, __context: Any) -> None:

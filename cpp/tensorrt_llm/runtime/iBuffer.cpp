@@ -87,13 +87,9 @@ std::ostream& tensorrt_llm::runtime::operator<<(std::ostream& output, IBuffer co
     return output << *tensor;
 }
 
-char const* IBuffer::getDataTypeName() const
+char const* IBuffer::getDataTypeName(DataType dataType)
 {
-#if defined(__GNUC__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wswitch"
-#endif
-    switch (getDataType())
+    switch (dataType)
     {
     case nvinfer1::DataType::kINT64: return DataTypeTraits<nvinfer1::DataType::kINT64>::name;
     case nvinfer1::DataType::kINT32: return DataTypeTraits<nvinfer1::DataType::kINT32>::name;
@@ -104,12 +100,15 @@ char const* IBuffer::getDataTypeName() const
     case nvinfer1::DataType::kUINT8: return DataTypeTraits<nvinfer1::DataType::kUINT8>::name;
     case nvinfer1::DataType::kINT8: return DataTypeTraits<nvinfer1::DataType::kINT8>::name;
     case nvinfer1::DataType::kFP8: return DataTypeTraits<nvinfer1::DataType::kFP8>::name;
-    case nvinfer1::DataType::kINT4: /* do nothing */;
+    case nvinfer1::DataType::kINT4: [[fallthrough]] /* do nothing */;
+    case nvinfer1::DataType::kFP4: /* do nothing */;
     }
-#if defined(__GNUC__)
-#pragma GCC diagnostic pop
-#endif
     TLLM_THROW("Unknown data type");
+}
+
+char const* IBuffer::getDataTypeName() const
+{
+    return getDataTypeName(getDataType());
 }
 
 char const* IBuffer::getMemoryTypeName() const

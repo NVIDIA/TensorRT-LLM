@@ -20,6 +20,10 @@ from tensorrt_llm.serve import OpenAIServer
               default="localhost",
               help="Hostname of the server.")
 @click.option("--port", type=int, default=8000, help="Port of the server.")
+@click.option("--backend",
+              type=click.Choice(["pytorch"]),
+              default=None,
+              help="Set to 'pytorch' for pytorch path. Default is cpp path.")
 @click.option("--max_beam_width",
               type=int,
               default=BuildConfig.max_beam_width,
@@ -55,10 +59,10 @@ from tensorrt_llm.serve import OpenAIServer
               is_flag=True,
               default=False,
               help="Flag for HF transformers.")
-def main(model: str, tokenizer: str, host: str, port: int, max_beam_width: int,
-         max_batch_size: int, max_num_tokens: int, max_seq_len: int,
-         tp_size: int, pp_size: int, kv_cache_free_gpu_memory_fraction: float,
-         trust_remote_code: bool):
+def main(model: str, tokenizer: str, host: str, port: int, backend: str,
+         max_beam_width: int, max_batch_size: int, max_num_tokens: int,
+         max_seq_len: int, tp_size: int, pp_size: int,
+         kv_cache_free_gpu_memory_fraction: float, trust_remote_code: bool):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -79,7 +83,7 @@ def main(model: str, tokenizer: str, host: str, port: int, max_beam_width: int,
         trust_remote_code=trust_remote_code,
         build_config=build_config,
         kv_cache_config=kv_cache_config,
-    )
+        backend=backend if backend == "pytorch" else None)
 
     llm = LLM(**llm_args.to_dict())
 

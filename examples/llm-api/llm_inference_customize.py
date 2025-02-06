@@ -1,7 +1,7 @@
-### Generate text
+### Generate text with customization
 import tempfile
 
-from tensorrt_llm.hlapi import LLM, BuildConfig, KvCacheConfig, SamplingParams
+from tensorrt_llm.llmapi import LLM, BuildConfig, KvCacheConfig, SamplingParams
 
 
 def main():

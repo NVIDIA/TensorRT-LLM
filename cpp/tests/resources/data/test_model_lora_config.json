@@ -129,6 +129,7 @@
             "dtype": "float16",
             "bert_attention_plugin": "auto",
             "gpt_attention_plugin": "auto",
+            "gemm_allreduce_plugin": null,
             "gemm_plugin": null,
             "gemm_swiglu_plugin": null,
             "smooth_quant_gemm_plugin": null,
@@ -150,8 +151,8 @@
             "reduce_fusion": false,
             "enable_xqa": true,
             "tokens_per_block": 64,
-            "use_paged_context_fmha": false,
-            "use_fp8_context_fmha": false,
+            "use_paged_context_fmha": true,
+            "use_fp8_context_fmha": true,
             "multiple_profiles": false,
             "paged_state": true,
             "streamingllm": false

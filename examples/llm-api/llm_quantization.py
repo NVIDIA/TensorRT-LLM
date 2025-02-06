@@ -7,16 +7,18 @@ from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import CalibConfig, QuantAlgo, QuantConfig
 
 major, minor = torch.cuda.get_device_capability()
-post_ada = major > 8 or (major == 8 and minor >= 9)
+enable_fp8 = major > 8 or (major == 8 and minor >= 9)
+enable_nvfp4 = major >= 10
 
 quant_and_calib_configs = []
 
-# Example 1: Specify int4 AWQ quantization to QuantConfig.
-# We can skip specifying CalibConfig or leave a None as the default value.
-quant_and_calib_configs.append(
-    (QuantConfig(quant_algo=QuantAlgo.W4A16_AWQ), None))
+if not enable_nvfp4:
+    # Example 1: Specify int4 AWQ quantization to QuantConfig.
+    # We can skip specifying CalibConfig or leave a None as the default value.
+    quant_and_calib_configs.append(
+        (QuantConfig(quant_algo=QuantAlgo.W4A16_AWQ), None))
 
-if post_ada:
+if enable_fp8:
     # Example 2: Specify FP8 quantization to QuantConfig.
     # We can create a CalibConfig to specify the calibration dataset and other details.
     # Note that the calibration dataset could be either HF dataset name or a path to local HF dataset.
@@ -28,7 +30,19 @@ if post_ada:
                      calib_max_seq_length=256)))
 else:
     logging.error(
-        "FP8 quantization only works on post-ada GPUs, skipped in the example.")
+        "FP8 quantization only works on post-ada GPUs. Skipped in the example.")
+
+if enable_nvfp4:
+    # Example 3: Specify NVFP4 quantization to QuantConfig.
+    quant_and_calib_configs.append(
+        (QuantConfig(quant_algo=QuantAlgo.NVFP4,
+                     kv_cache_quant_algo=QuantAlgo.FP8),
+         CalibConfig(calib_dataset='cnn_dailymail',
+                     calib_batches=256,
+                     calib_max_seq_length=256)))
+else:
+    logging.error(
+        "NVFP4 quantization only works on Blackwell. Skipped in the example.")
 
 
 def main():

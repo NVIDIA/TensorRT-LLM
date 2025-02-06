@@ -111,6 +111,13 @@ struct TopKSamplingKernelParams
     bool logitsHasProbs{false};
     //! flag to return all selected TopK results
     bool returnAllSelectedTokens{false};
+    //! flag to set strict TopP boundary.
+    //! If true, when randNum <=0.0f, the selection is completed, even if K draft tokens are not reached.
+    //! If false, when randNum <=0.0f, the selection will continue until it reaches K tokens.
+    bool strictTopPBoundary{true};
+
+    //! flag to return all selected TopK results per request.
+    bool const* returnAllSelectedTokensPerSlot{nullptr};
 
     //! output buffer [maxBatchSize], optional.
     //! Store the multinomial sampled target token id in TopK/TopP sampled tokens when returnAllSelectedTokens==True.

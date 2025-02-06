@@ -30,7 +30,7 @@
 namespace tensorrt_llm::batch_manager
 {
 class LlmRequest;
-}
+} // namespace tensorrt_llm::batch_manager
 
 namespace tensorrt_llm::runtime
 {
@@ -69,9 +69,6 @@ public:
 
     void newBatch(GenerationInput const& inputs, GenerationOutput const& outputs, SamplingConfig const& samplingConfig,
         ModelConfig const& modelConfig) override;
-
-    void newRequests(std::vector<SizeType32> const& seqSlots, std::vector<decoder_batch::Request> const& requests,
-        std::vector<SamplingConfig> const& samplingConfigs, ModelConfig const& modelConfig) override;
 
     DecoderFinishedEventPtr forwardAsync(decoder_batch::Output& output, decoder_batch::Input const& input) override;
 
@@ -247,14 +244,75 @@ public:
         return mDecodingMode;
     }
 
+    DecodingInput& getJointDecodingInput() const
+    {
+        return *mJointDecodingInput.get();
+    }
+
+    DecodingOutput& getJointDecodingOutput() const
+    {
+        return *mJointDecodingOutput.get();
+    }
+
+    CudaStreamPtr getDecoderStream() const
+    {
+        return mDecoderStream;
+    }
+
+    SpeculativeDecodingMode getSpeculativeDecodingMode() const
+    {
+        return mSpeculativeDecodingMode;
+    }
+
+    SizeType32 getMaxDecodingEngineTokens() const
+    {
+        return mMaxDecodingEngineTokens;
+    }
+
+    TensorPtr getFinishedSteps() const
+    {
+        return mFinishedSteps;
+    }
+
+    void setBeamWidths(SizeType32 batchSlot, SizeType32 beamWidth)
+    {
+        mBeamWidths[batchSlot] = beamWidth;
+    }
+
+    void setNbSteps(SizeType32 batchSlot, SizeType32 nbSteps)
+    {
+        mNbSteps[batchSlot] = nbSteps;
+    }
+
+    void setFinished(SizeType32 batchSlot, bool finished)
+    {
+        mFinished[batchSlot] = finished;
+    }
+
+    void setMaxNewTokens(SizeType32 batchSlot, SizeType32 maxNewTokens)
+    {
+        mMaxNewTokens[batchSlot] = maxNewTokens;
+    }
+
+    void setNumDecodingEngineTokens(SizeType32 batchSlot, SizeType32 numDecodingEngineTokens)
+    {
+        mNumDecodingEngineTokens[batchSlot] = numDecodingEngineTokens;
+    }
+
+    TensorPtr getBatchSlotsSetup() const
+    {
+        return mBatchSlotsSetup;
+    }
+
+    IGptDecoder& getUnderlyingDecoder() const
+    {
+        return *mDecoder.get();
+    }
+
 private:
     //! @brief Gather final beam search results for request `batchIdx`.
     [[nodiscard]] CudaEvent postProcessRequest(
         SizeType32 batchIdx, SamplingConfig const& samplingConfig, bool streaming) const;
-
-    //! @brief Initialize the decoder at `batchSlot` with a new `request`.
-    void newRequest(SizeType32 batchSlot, decoder_batch::Request const& request, SamplingConfig const& samplingConfig,
-        ModelConfig const& modelConfig);
 
     //! @brief Allocate buffers for speculative decoding.
     void allocateSpeculativeDecodingBuffers(nvinfer1::DataType dtype);
@@ -264,26 +322,6 @@ private:
 
     //! @brief Setup buffers for lookahead decoding.
     void setupLookahead(ModelConfig const& modelConfig);
-
-    //! @brief Setups decoder internal tensors for new speculative decoding request
-    void newRequestSpeculativeDecoding(SizeType32 batchIdx, decoder_batch::Request const& request,
-        SamplingConfig const& samplingConfig, ModelConfig const& modelConfig);
-
-    //! @brief Setups decoder internal tensors for new request in Draft model Sps mode
-    void newRequestDraftTokensExternal(
-        SizeType32 batchIdx, decoder_batch::Request const& request, SamplingConfig const& samplingConfig);
-
-    //! @brief Setups decoder internal tensors for new Medusa request
-    void newRequestMedusa(SizeType32 batchIdx, decoder_batch::Request const& request);
-
-    //! @brief Setups decoder internal tensors for new Lookahead request
-    void newRequestLookahead(SizeType32 batchIdx, decoder_batch::Request const& request);
-
-    //! @brief Setups decoder internal tensors for new Explicit draft tokens request
-    void newRequestExplicitDraftTokens(SizeType32 batchIdx, decoder_batch::Request const& request);
-
-    //! @brief Setups decoder internal tensors for new Eagle request
-    void newRequestEagle(SizeType32 batchIdx, decoder_batch::Request const& request, ModelConfig const& modelConfig);
 
     //! @brief Updates finished state on host for all active requests
     void updateFinished(decoder_batch::DecoderFinishedEvent const& decoderFinishEvent);

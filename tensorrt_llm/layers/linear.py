@@ -23,7 +23,8 @@ from .._common import default_net, default_trtnet
 from .._utils import set_obj_attrs, str_dtype_to_torch, str_dtype_to_trt
 from ..functional import (AllReduceFusionOp, AllReduceParams, Tensor,
                           _add_plugin_info, _create_tensor, allgather,
-                          allreduce, cast, low_latency_gemm, matmul)
+                          allreduce, cast, gemm_allreduce, low_latency_gemm,
+                          matmul)
 from ..mapping import Mapping
 from ..module import Module
 from ..parameter import Parameter
@@ -180,7 +181,8 @@ class LinearBase(Module, metaclass=ABCMeta):
 
         self.tp_size = tp_size
         self.tp_group = tp_group
-        self.strict_dtype = self.dtype if strict_dtype else None
+        self.strict_dtype = str_dtype_to_trt(
+            self.dtype) if strict_dtype else None
 
         if bias:
             self.bias = Parameter(shape=(self.out_features, ), dtype=dtype)
@@ -190,6 +192,7 @@ class LinearBase(Module, metaclass=ABCMeta):
 
         # see optimize_model's add_lora for LoRA initialization
         self.lora = None
+        self.dora = None
 
     def weight_loader(self, mapping: Mapping, param: Parameter,
                       loaded_weight: torch.Tensor) -> None:
@@ -214,14 +217,18 @@ class LinearBase(Module, metaclass=ABCMeta):
     def get_weight(self) -> Tensor:
         if default_net(
         ).plugin_config.manage_weights and self.prefer_managed_weight:
-            use_gemm_plugin = default_net(
-            ).plugin_config.gemm_plugin is not None
+            gemm_plugin = default_net().plugin_config.gemm_plugin
+            # nvfp4 plugin does not use this code path
+            use_gemm_plugin = gemm_plugin is not None and gemm_plugin != 'nvfp4'
             use_low_latency_gemm_plugin = default_net(
             ).plugin_config.low_latency_gemm_plugin == 'fp8'
+            use_gemm_allreduce_plugin = default_net(
+            ).plugin_config.gemm_allreduce_plugin is not None
             return self.weight.get_managed_tensor(
                 network=default_net(),
                 need_transpose=self.weight_is_kn() and not use_gemm_plugin
-                and not use_low_latency_gemm_plugin)
+                and not use_low_latency_gemm_plugin
+                and not use_gemm_allreduce_plugin)
         else:
             return self.weight.get_constant_tensor(network=default_net())
 
@@ -241,7 +248,7 @@ class LinearBase(Module, metaclass=ABCMeta):
             strict_dtype = str_dtype_to_trt(self.dtype) if isinstance(
                 self.dtype, str) else self.dtype
             x = low_latency_gemm(x, weight, alpha, strict_dtype)
-        elif gemm_plugin:
+        elif gemm_plugin and gemm_plugin != 'nvfp4':  # nvfp4 gemm plugin has its own implementation
             if gemm_plugin == 'fp8':
                 strict_dtype = str_dtype_to_trt(self.dtype) if isinstance(
                     self.dtype, str) else self.dtype
@@ -265,6 +272,9 @@ class LinearBase(Module, metaclass=ABCMeta):
                 if lora_hidden_state is None else lora_hidden_state,
                 lora_runtime_params=lora_runtime_params,
             )
+            if self.dora is not None:
+                x = self.dora(x, lora_runtime_params=lora_runtime_params)
+
         return x
 
     @abstractmethod
@@ -414,6 +424,7 @@ class Linear(LinearBase):
                                               -1)
                         weights[qkv_idx] = v.chunk(
                             tp_size, self.tp_dim)[config.mapping.tp_rank]
+
                 weights = torch.cat(weights)
             if using_head_as_leading_dim:
                 # Reorder [n_head, 3, head_dim, ...] into [3, n_head, head_dim, ...]
@@ -426,6 +437,10 @@ class Linear(LinearBase):
                     weights = w.reshape(-1, self.in_features)  # Weight
                 else:
                     weights = w.reshape(-1)  # Bias
+
+        if isinstance(weights, list):
+            weights = torch.cat(weights)
+
         weights = weights.to(str_dtype_to_torch(self.dtype))
         return {tllm_key: weights}
 
@@ -467,6 +482,52 @@ class RowLinear(LinearBase):
     @classmethod
     def tp_split_dim(cls) -> int:
         return 1
+
+    def multiply_collect(
+            self,
+            x,
+            weight,
+            gemm_plugin: Optional[str] = None,
+            low_latency_gemm_plugin: Optional[str] = None,
+            use_fp8: bool = False,
+            alpha: Optional[np.ndarray] = None,
+            lora_runtime_params: Optional[LoraRuntimeParams] = None,
+            lora_hidden_state: Optional[Tensor] = None,
+            **kwargs):
+
+        gemm_allreduce_plugin = default_net(
+        ).plugin_config.gemm_allreduce_plugin
+        if gemm_allreduce_plugin:
+            if lora_runtime_params != None or lora_hidden_state != None:
+                raise RuntimeError(
+                    "gemm_allreduce_plugin not supported with lora.")
+
+            output_dtype = self.dtype
+            if isinstance(output_dtype, str):
+                output_dtype = str_dtype_to_trt(output_dtype)
+
+            x = gemm_allreduce(
+                a=x,
+                b=weight,
+                transa=False,  # row-major
+                transb=True,  # col-major
+                alpha=alpha,
+                group=self.tp_group,  # ranks participating
+                output_dtype=output_dtype,
+                fp8_inputs_override=use_fp8)
+
+            if self.bias is not None:
+                bias = cast(self.bias.value, x.dtype)
+                if self.is_expert:
+                    x = x + bias / self.tp_size
+                else:
+                    x = x + bias
+            return x
+        else:
+            return super().multiply_collect(x, weight, gemm_plugin,
+                                            low_latency_gemm_plugin, use_fp8,
+                                            alpha, lora_runtime_params,
+                                            lora_hidden_state, **kwargs)
 
     def collect_and_bias(self, x, **kwargs):
         all_reduce_params: Optional[AllReduceParams] = kwargs.get(

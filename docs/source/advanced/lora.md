@@ -113,6 +113,7 @@ The following tensors are for a LoRA which has a `q` and `k` adapter.
 | moe_gate | 15 | for mixtral adapter for expert mlp layer: gate |
 | moe_router | 16 | for mixtral adapter for expert router layer |
 | mlp_router | 17 | for qwen2-moe adapter for shared expert gate layer |
+| mlp_gate_up | 18 | adapter for gated mlp layer after attention / RMSNorm: gate + up projection |
 
 #### LoraCache configuration
 
@@ -129,3 +130,13 @@ The partition of tensor parallel for LoRA is special. There are two cases: `RowL
 First, consider this linear layer is a `ColumnLinear` layer. When we partition the weight, we split the weight by column with `tp_size`. Then, there are `tp_size` split weights and the shapes of these weights are `[K, N // tp_size]`. When we apply LoRA adapter on such `ColumnLinear` layer, the shapes of original two weights are `[K, lora_rank]` and `[lora_rank, N]`. So, we only partition the second weight and get `tp_size` split weights with shapes `[lora_rank, N // tp_size]`. For the first weight, each GPU maintains the same entire weight (with shape `[K, lora_rank]`).
 
 Next, consider this linear layer is a `RowLinear` layer. When we partition the weight, we split the weight by row with `tp_size`. Then, there are `tp_size` split weights and the shapes of these weights are `[K // tp_size, N]`. When we apply LoRA adapter on such `RowLinear` layer, the shapes of original two weights are `[K, lora_rank]` and `[lora_rank, N]`. So, we only partition the first weight and get `tp_size` split weights with shapes `[K // tp_size, lora_rank]`. For the second weight, each GPU maintains the same entire weight (with shape `[lora_rank, N]`).
+
+#### DoRA
+
+TRTLLM supports DoRA as described in https://arxiv.org/abs/2402.09353 . To enable DoRA, you must add the additional `--dora_plugin enable` flag to the `trtllm-build` command.
+
+The DoRA scales must be normalized before they are submitted to TRTLLM in an inference request. The normalization requires the base model weights. To normalize your adapter you may use the script provided in `tensorrt_llm/examples/dora/normalize_weights.py`.
+
+When using DoRA, the format of `LoraWeights` and `LoraConfig` changes slightly.
+The shape of `LoraConfig` becomes `[module_id, layer_idx, adapter_size D (i.e. R value), is_dora]`, with `is_dora` a boolean flag that determines whether the supplied adapter contains DoRA scales or not. If the old config shape is used, it is assumed the adapter does not have DoRA scales.
+The shape of `LoraWeights` becomes `[num_lora_modules_layers, D x Hi + Ho x D + Ho]`, and the last `Ho` values are the DoRA scale vector.

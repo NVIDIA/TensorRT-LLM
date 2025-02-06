@@ -91,8 +91,6 @@ private:
     int mMaxBeamWidth = 0;
 
     bool mUseMambaConv1dPlugin = true;
-
-    bool mIsRecurrentGemma = false;
 };
 
 } // namespace tensorrt_llm::runtime

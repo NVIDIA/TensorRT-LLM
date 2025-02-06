@@ -76,13 +76,6 @@ void QServeGemmPlugin::init(nvinfer1::DataType dtype, int groupSize)
     mGroupSize = groupSize;
     mType = dtype;
     mRunner = std::make_shared<QServeGemmRunner>();
-
-    int arch = tensorrt_llm::common::getSMVersion();
-
-    if (arch < 80)
-    {
-        TLLM_THROW("QServe W4A8 is unsupported on pre-Ampere (sm<80) architectures!");
-    }
 }
 
 // IPluginV2DynamicExt Methods
@@ -318,7 +311,7 @@ void QServeGemmPlugin::serialize(void* buffer) const noexcept
     write(d, mGroupSize);
     write(d, mDims);
 
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 }
 
 void QServeGemmPlugin::destroy() noexcept
@@ -363,7 +356,7 @@ IPluginV2* QServeGemmPluginCreator::createPlugin(char const* name, PluginFieldCo
     PluginField const* fields = fc->fields;
 
     // bool perTokenScaling, perChannelScaling;
-    DataType dtype;
+    DataType dtype{};
     int group_size = -1;
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)

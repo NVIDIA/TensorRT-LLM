@@ -414,7 +414,7 @@ python examples/chatglm/convert_checkpoint.py --model_dir chatglm3-6b-128k \
 python -m tensorrt_llm.commands.build --checkpoint_dir /tmp/chatglm3-6b-128k/trt_ckpts \
             --output_dir /tmp/chatglm3-6b-128k/trt_engines \
             --gemm_plugin float16 \
-            --gather_all_token_logits \
+            --gather_context_logits \
             --max_batch_size 8 \
             --max_input_len 25600 \
             --max_num_tokens 25600
@@ -451,7 +451,7 @@ python examples/chatglm/convert_checkpoint.py --model_dir chatglm3-6b-128k \
 python -m tensorrt_llm.commands.build --checkpoint_dir /tmp/chatglm3-6b-128k/trt_ckpts \
             --output_dir /tmp/chatglm3-6b-128k/trt_engines \
             --gemm_plugin float16 \
-            --gather_all_token_logits \
+            --gather_context_logits \
             --max_batch_size 1 \
             --max_input_len 12800 \
             --max_num_tokens 12800

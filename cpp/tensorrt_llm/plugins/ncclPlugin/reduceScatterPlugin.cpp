@@ -158,7 +158,7 @@ void ReduceScatterPlugin::serialize(void* buffer) const noexcept
     {
         write(d, *it);
     }
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 }
 
 void ReduceScatterPlugin::destroy() noexcept
@@ -198,7 +198,7 @@ IPluginV2* ReduceScatterPluginCreator::createPlugin(char const* name, PluginFiel
 {
     PluginField const* fields = fc->fields;
     std::set<int> group;
-    nvinfer1::DataType type;
+    nvinfer1::DataType type{};
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {

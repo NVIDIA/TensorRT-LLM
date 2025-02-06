@@ -8,6 +8,7 @@ from typing import (Any, Callable, ClassVar, Dict, List, Optional, Set, Tuple,
 
 import tensorrt as trt
 
+from ._utils import trt_gte
 from .logger import logger
 from .network import Network
 
@@ -150,6 +151,10 @@ class Layer:
         trt.LayerType.NORMALIZATION: trt.INormalizationLayer,
         trt.LayerType.CAST: trt.ICastLayer,
     }
+
+    if trt_gte(10, 8):
+        TRT_LAYER_TYPE_TO_LAYER[
+            trt.LayerType.DYNAMIC_QUANTIZE] = trt.IQuantizeLayer
 
     def as_layer(self) -> Any:
         '''

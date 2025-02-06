@@ -26,6 +26,7 @@ TensorRT-LLM optimizes the performance of a range of well-known models on NVIDIA
 - [GPT-J](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gptj)
 - [GPT-Nemo](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gpt)
 - [GPT-NeoX](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/gptneox)
+- [Granite-3.0](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/granite)
 - [Grok-1](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/grok)
 - [InternLM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/internlm)
 - [InternLM2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/internlm2)
@@ -92,6 +93,7 @@ In addition, older architectures can have limitations for newer software release
   - TensorRT-LLM requires Linux x86_64, Linux aarch64 or Windows.
 * - GPU Model Architectures
   -
+    - [NVIDIA Blackwell Architecture](https://www.nvidia.com/en-us/data-center/technologies/blackwell-architecture/)
     - [NVIDIA Grace Hopper Superchip](https://www.nvidia.com/en-us/data-center/grace-hopper-superchip/)
     - [NVIDIA Hopper Architecture](https://www.nvidia.com/en-us/data-center/technologies/hopper-architecture/)
     - [NVIDIA Ada Lovelace Architecture](https://www.nvidia.com/en-us/technologies/ada-architecture/)
@@ -110,9 +112,9 @@ The following table shows the supported software for TensorRT-LLM.
 * -
   - Software Compatibility
 * - Container
-  - [24.11](https://docs.nvidia.com/deeplearning/frameworks/support-matrix/index.html)
+  - [25.01](https://docs.nvidia.com/deeplearning/frameworks/support-matrix/index.html)
 * - TensorRT
-  - [10.7](https://docs.nvidia.com/deeplearning/tensorrt/release-notes/index.html)
+  - [10.8](https://docs.nvidia.com/deeplearning/tensorrt/release-notes/index.html)
 * - Precision
   -
     - Hopper (SM90) - FP32, FP16, BF16, FP8, INT8, INT4

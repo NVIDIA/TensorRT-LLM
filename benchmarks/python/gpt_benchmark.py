@@ -101,7 +101,7 @@ class GPTBenchmark(BaseBenchmark):
             remove_input_padding=self.remove_input_padding,
             quant_mode=self.quant_mode,
             tokens_per_block=self.tokens_per_block if hasattr(
-                self, 'tokens_per_block') else 64,
+                self, 'tokens_per_block') else 32,
             mamba_conv1d_plugin=self.use_mamba_conv1d_plugin,
             gpu_weights_percent=list(sorted(gpu_weights_percents))[0],
             **rnn_configs_kwargs,

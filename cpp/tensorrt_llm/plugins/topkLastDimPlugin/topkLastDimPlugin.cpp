@@ -34,8 +34,6 @@ TopkLastDimPlugin::TopkLastDimPlugin(nvinfer1::DataType type, int32_t k, bool is
     , mK(k) // To avoid data-dependent shape, enforce K to be non-dynamic
     , mIsLargest(is_largest)
 {
-    TLLM_CHECK_WITH_INFO((getSMVersion() >= 80) || (mType != DataType::kBF16),
-        "Unsupported data type, pre SM 80 GPUs do not support bfloat16");
     TLLM_CHECK_WITH_INFO((mType == DataType::kBF16) || (mType == DataType::kFLOAT) || (mType == DataType::kHALF)
             || (mType == DataType::kINT32),
         "Only support int, float, half, and bfloat16.");
@@ -49,7 +47,6 @@ TopkLastDimPlugin::TopkLastDimPlugin(void const* data, size_t length)
     read(d, mK);
     read(d, mIsLargest);
     TLLM_CHECK(d == a + length);
-    TLLM_CHECK_WITH_INFO((getSMVersion() >= 80) || (mType != DataType::kBF16), "Unsupported data type");
     TLLM_CHECK_WITH_INFO((mType == DataType::kBF16) || (mType == DataType::kFLOAT) || (mType == DataType::kHALF)
             || (mType == DataType::kINT32),
         "Only support int, float, half, and bfloat16.");
@@ -101,7 +98,7 @@ size_t TopkLastDimPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* inp
     // extract shape info and then call helper
     auto const batchSize = inputs[getInputTensorIdx()].dims.d[0];
     auto const inputLength = inputs[getInputTensorIdx()].dims.d[1];
-    size_t tempStorageBytes;
+    size_t tempStorageBytes{};
     if (mType == DataType::kINT32)
     {
         tempStorageBytes = invokeComputeTopkLastDimWorkspaceSize<int>(batchSize, inputLength, mK, mIsLargest);
@@ -225,7 +222,7 @@ void TopkLastDimPlugin::serialize(void* buffer) const noexcept
     write(d, mType);
     write(d, mK);
     write(d, mIsLargest);
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 }
 
 void TopkLastDimPlugin::destroy() noexcept
@@ -264,9 +261,9 @@ PluginFieldCollection const* TopkLastDimPluginCreator::getFieldNames() noexcept
 IPluginV2* TopkLastDimPluginCreator::createPlugin(char const* name, PluginFieldCollection const* fc) noexcept
 {
     PluginField const* fields = fc->fields;
-    nvinfer1::DataType type;
-    int32_t k;
-    bool is_largest;
+    nvinfer1::DataType type{};
+    int32_t k{};
+    bool is_largest{};
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {

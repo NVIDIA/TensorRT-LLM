@@ -38,7 +38,6 @@ Each request can specify a Lookahead configuration, noted as `(w, n, g)`. If non
   * Inflight-fused-batching
   * C++ runtime
   * Tensor Parallel
-  * Pipeline Parallel
 
 ## Usage
 ### Convert Checkpoint

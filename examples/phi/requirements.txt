@@ -1,6 +1,7 @@
-tensorrt_llm==0.17.0.dev2024121700
+-c ../constraints.txt
+tensorrt_llm>=0.0.dev0
 datasets~=2.14.5
-evaluate~=0.4.1
-rouge_score~=0.1.2
+evaluate
+rouge_score
 einops~=0.7.0
 tiktoken==0.6.0

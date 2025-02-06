@@ -19,6 +19,8 @@
 #include "compileEngine.h"
 #include "cubinObjRegistry.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplCommon.h"
+#include "tensorrt_llm/kernels/trtllmGenKernels/fmha/fmhaRunner.h"
+#include "tensorrt_llm/plugins/common/plugin.h"
 #include <unordered_set>
 
 namespace tensorrt_llm

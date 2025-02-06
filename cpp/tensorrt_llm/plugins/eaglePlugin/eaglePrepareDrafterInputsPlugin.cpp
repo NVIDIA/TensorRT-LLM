@@ -152,7 +152,6 @@ int32_t EaglePrepareDrafterInputsPlugin::getOutputShapes(nvinfer1::DimsExprs con
     auto const maxDecodingLenExpr = inputs[getIdx(InputIdxEntry::PREV_DRAFT_PATHS)].d[1];
     auto const maxPathLenExpr = inputs[getIdx(InputIdxEntry::PREV_DRAFT_PATHS)].d[2];
 
-    nvinfer1::DimsExprs ret;
     for (SizeType32 outputIndex = 0; outputIndex < nbOutputs; ++outputIndex)
     {
         if (outputIndex == getIdx(OutputIdxEntry::SEQUENCE_LENGTHS)

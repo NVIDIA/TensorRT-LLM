@@ -66,10 +66,14 @@ private:
     TensorPtr mRuntimeMultinomialDevice;
 
     TensorPtr mOutputIdsAfterSampling;
+    TensorPtr mOutputIdsAfterSamplingPtrsHost;
+    TensorPtr mOutputIdsAfterSamplingPtrsDevice;
     TensorPtr mTargetOutputIds;
     TensorPtr mRuntimeTopKDevice;
     TensorPtr mRuntimeTopKHost;
     TensorPtr mRuntimeTopPDevice;
+    TensorPtr mReturnAllSelectedTokensPerSlotHost;
+    TensorPtr mReturnAllSelectedTokensPerSlotDevice;
     TensorPtr mMaskBuffer;
 
     TensorPtr mTargetLogits;
@@ -82,15 +86,21 @@ private:
 
 private:
     void allocateBuffer(runtime::SizeType32 batchSize);
+    void prepareInputs(
+        std::shared_ptr<BaseDecodingOutputs> const& outputs, std::shared_ptr<BaseDecodingInputs> const& baseInputs);
+    void targetSoftmax(std::shared_ptr<BaseDecodingInputs> const& baseInputs,
+        std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace);
     void acceptDraftTokens(std::shared_ptr<BaseDecodingOutputs> const& outputs,
         std::shared_ptr<BaseDecodingInputs> const& baseInputs,
         std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace);
     void multinomialSampling(std::shared_ptr<BaseDecodingOutputs> const& outputs,
         std::shared_ptr<BaseDecodingInputs> const& baseInputs,
         std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace);
-    void getAllTopKs(std::shared_ptr<BaseDecodingInputs> const& baseInputs,
+    void getAllTopKs(std::shared_ptr<BaseDecodingOutputs> const& outputs,
+        std::shared_ptr<BaseDecodingInputs> const& baseInputs,
         std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace);
-    void getAllTopPs(std::shared_ptr<BaseDecodingInputs> const& baseInputs,
+    void getAllTopPs(std::shared_ptr<BaseDecodingOutputs> const& outputs,
+        std::shared_ptr<BaseDecodingInputs> const& baseInputs,
         std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace);
     void forwardAcceptedTokens(std::shared_ptr<BaseDecodingOutputs> const& outputs,
         std::shared_ptr<BaseDecodingInputs> const& baseInputs,

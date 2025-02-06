@@ -23,6 +23,7 @@
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/ipcNvlsMemory.h"
 #include "tensorrt_llm/runtime/memoryCounters.h"
 
 #include <NvInferRuntime.h>
@@ -671,6 +672,147 @@ private:
     void* mBuffer;
 };
 
+class IpcNvlsBuffer : virtual public IBuffer
+{
+public:
+    explicit IpcNvlsBuffer(nvinfer1::DataType type, std::set<int> ranks)
+        : mSize(0)
+        , mCapacity(0)
+        , mType(type)
+        , mRanks(ranks)
+    {
+        TLLM_CHECK(ranks.size() > 1);
+    }
+
+    explicit IpcNvlsBuffer(size_t size, nvinfer1::DataType type, std::set<int> ranks)
+        : mSize(0)
+        , mCapacity(0)
+        , mType(type)
+        , mRanks(ranks)
+    {
+        TLLM_CHECK(size > 0);
+        TLLM_CHECK(ranks.size() > 1);
+        resize(size);
+    }
+
+    IpcNvlsBuffer(IpcNvlsBuffer&& other) noexcept
+        : mSize(other.mSize)
+        , mCapacity(other.mCapacity)
+        , mType(other.mType)
+        , mRanks(other.mRanks)
+        , mHandle(other.mHandle)
+    {
+        other.mSize = 0;
+        other.mCapacity = 0;
+        other.mHandle = IpcNvlsHandle{};
+    }
+
+    ~IpcNvlsBuffer() override
+    {
+        IpcNvlsBuffer::release();
+    }
+
+    IpcNvlsBuffer& operator=(IpcNvlsBuffer&& other) noexcept
+    {
+        if (this != &other)
+        {
+            // free old memory as we are assigning new memory to it
+            release();
+
+            mSize = other.mSize;
+            mCapacity = other.mCapacity;
+            mType = other.mType;
+            mRanks = other.mRanks;
+            mHandle = other.mHandle;
+
+            // reset other
+            other.mSize = 0;
+            other.mCapacity = 0;
+            other.mHandle = IpcNvlsHandle{};
+        }
+        return *this;
+    }
+
+    void* dataMC()
+    {
+        return reinterpret_cast<void*>(mHandle.mc_ptr);
+    }
+
+    void const* dataMC() const
+    {
+        return reinterpret_cast<void*>(mHandle.mc_ptr);
+    }
+
+    //////////////////////////
+    // Methods from IBuffer
+    //////////////////////////
+
+    using IBuffer::data;
+
+    // Return unicast pointer
+    void* data() override
+    {
+        return reinterpret_cast<void*>(mHandle.uc_ptr);
+    }
+
+    // Return unicast pointer
+    void const* data() const override
+    {
+        return reinterpret_cast<void*>(mHandle.uc_ptr);
+    }
+
+    std::size_t getSize() const override
+    {
+        return mSize;
+    }
+
+    std::size_t getCapacity() const override
+    {
+        return mCapacity;
+    }
+
+    nvinfer1::DataType getDataType() const override
+    {
+        return mType;
+    }
+
+    MemoryType getMemoryType() const override
+    {
+        return MemoryType::kGPU;
+    }
+
+    void resize(std::size_t newSize) override
+    {
+        TLLM_CHECK(newSize > 0);
+        if (mCapacity < newSize)
+        {
+            release();
+            printf("IpcNvlsBuffer resize: %d B\n", int(toBytes(newSize)));
+            mHandle = ipcNvlsAllocate(toBytes(newSize), mRanks);
+
+            TLLM_CHECK(mHandle.size % BufferDataType(mType).getSize() == 0);
+            mCapacity = mHandle.size / BufferDataType(mType).getSize();
+        }
+        mSize = newSize;
+    }
+
+    void release() override
+    {
+        if (mCapacity > 0)
+        {
+            TLLM_CHECK(mHandle.size > 0);
+            ipcNvlsFree(mHandle);
+        }
+    }
+
+private:
+    std::size_t mSize = 0;
+    std::size_t mCapacity = 0;
+    nvinfer1::DataType mType;
+    std::set<int> mRanks;
+    IpcNvlsHandle mHandle;
+};
+
 using DeviceBuffer = GenericBuffer<CudaAllocatorAsync>;
 using StaticDeviceBuffer = GenericBuffer<CudaAllocator>;
 using HostBuffer = GenericBuffer<HostAllocator>;
@@ -679,10 +821,10 @@ using PinnedPoolBuffer = GenericBuffer<PinnedPoolAllocator>;
 using UVMBuffer = GenericBuffer<UVMAllocator>;
 
 template <typename T>
-typename std::make_unsigned<T>::type nonNegative(T value)
+std::make_unsigned_t<T> nonNegative(T value)
 {
     TLLM_CHECK_WITH_INFO(value >= 0, "Value must be non-negative");
-    return static_cast<typename std::make_unsigned<T>::type>(value);
+    return static_cast<std::make_unsigned_t<T>>(value);
 }
 
 template <typename TAllocator>
@@ -735,6 +877,144 @@ public:
         return *this;
     }
 
+    [[nodiscard]] nvinfer1::Dims const& getShape() const override
+    {
+        return mDims;
+    }
+
+    void reshape(nvinfer1::Dims const& dims) override
+    {
+        Base::resize(nonNegative(volume(dims)));
+        mDims = dims;
+    }
+
+    void resize(std::size_t newSize) override
+    {
+        ITensor::resize(newSize);
+    }
+
+    void release() override
+    {
+        Base::release();
+        mDims.nbDims = 0;
+    }
+
+private:
+    nvinfer1::Dims mDims{};
+};
+
+// Forward declaration
+class IpcNvlsTensor;
+
+class IpcNvlsTensorView : virtual public ITensor
+{
+public:
+    explicit IpcNvlsTensorView(std::weak_ptr<IpcNvlsTensor> const& tensor, bool unicastView);
+
+    IpcNvlsTensorView(IpcNvlsTensorView&& other) noexcept;
+
+    IpcNvlsTensorView& operator=(IpcNvlsTensorView&& other) noexcept;
+
+    /////////////////////
+    // ITensor methods
+    /////////////////////
+    [[nodiscard]] nvinfer1::Dims const& getShape() const override;
+
+    void reshape(nvinfer1::Dims const& dims) override;
+
+    /////////////////////
+    // IBuffer methods
+    /////////////////////
+
+    std::size_t getSize() const override;
+
+    std::size_t getCapacity() const override;
+
+    nvinfer1::DataType getDataType() const override;
+
+    MemoryType getMemoryType() const override;
+
+    using ITensor::data;
+
+    void* data() override
+    {
+        return _data();
+    }
+
+    void const* data() const override
+    {
+        return _data();
+    }
+
+    void resize(std::size_t newSize) override
+    {
+        TLLM_THROW("Cannot resize() IpcNvlsTensorView");
+    }
+
+    void release() override
+    {
+        TLLM_THROW("Cannot release() IpcNvlsTensorView");
+    }
+
+private:
+    std::shared_ptr<IpcNvlsBuffer> lock() const;
+
+    void* _data() const;
+
+    std::weak_ptr<IpcNvlsTensor> mTensor;
+    bool mUnicastView;
+    nvinfer1::Dims mDims{};
+};
+
+class IpcNvlsTensor : virtual public ITensor, public IpcNvlsBuffer, public std::enable_shared_from_this<IpcNvlsTensor>
+{
+public:
+    using Base = IpcNvlsBuffer;
+
+    explicit IpcNvlsTensor(nvinfer1::DataType type, std::set<int> ranks)
+        : Base(type, ranks)
+    {
+        mDims.nbDims = 0;
+    }
+
+    explicit IpcNvlsTensor(nvinfer1::Dims const& dims, nvinfer1::DataType type, std::set<int> ranks)
+        : Base(nonNegative(volume(dims)), type, ranks)
+        , mDims(dims)
+    {
+    }
+
+    IpcNvlsTensor(IpcNvlsTensor&& tensor) noexcept
+        : Base(std::move(tensor))
+        , mDims(tensor.mDims)
+    {
+        tensor.mDims.nbDims = 0;
+    }
+
+    IpcNvlsTensor& operator=(IpcNvlsTensor&& tensor) noexcept
+    {
+        if (this != &tensor)
+        {
+            Base::operator=(std::move(tensor));
+            mDims = tensor.mDims;
+            // Reset tensor.
+            tensor.mDims.nbDims = 0;
+        }
+        return *this;
+    }
+
+    std::shared_ptr<ITensor> getUnicastView()
+    {
+        return std::make_shared<IpcNvlsTensorView>(weak_from_this(), true /* UC view */);
+    }
+
+    std::shared_ptr<ITensor> getMulticastView()
+    {
+        return std::make_shared<IpcNvlsTensorView>(weak_from_this(), false /* MC view */);
+    }
+
+    /////////////////////
+    // ITensor methods
+    /////////////////////
     [[nodiscard]] nvinfer1::Dims const& getShape() const override
     {
         return mDims;

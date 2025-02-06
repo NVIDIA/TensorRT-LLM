@@ -8,7 +8,7 @@ mpi4py
 numpy<2
 onnx>=1.12.0
 onnx_graphsurgeon>=0.5.2
-openai==1.54.3
+openai
 polygraphy
 psutil
 pynvml>=11.5.0
@@ -17,13 +17,15 @@ pandas
 h5py==3.12.1
 StrEnum
 sentencepiece>=0.1.99
-tensorrt~=10.7.0
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-24-11.html#rel-24-11 uses 2.6.0a0.
+tensorrt~=10.8.0
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-01.html#rel-25-01 uses 2.6.0a0.
 torch>=2.5.1,<=2.6.0a0
 torchvision
-nvidia-modelopt[torch]~=0.19.0
+nvidia-modelopt[torch]~=0.23.0
 nvidia-nccl-cu12
-transformers>=4.38.2,<=4.45.1
+nvidia-cuda-nvrtc-cu12
+# TODO: Remove the <4.48.0 constraint once https://github.com/huggingface/transformers/issues/35625 is resolved.
+transformers>=4.47.0,<4.48.0
 pydantic>=2.9.1
 pillow==10.3.0
 wheel
@@ -37,5 +39,8 @@ pyzmq
 fastapi==0.115.4
 uvicorn
 httpx
-setuptools==70.3.0
+setuptools
 ordered-set
+peft
+flashinfer @ git+https://github.com/flashinfer-ai/flashinfer.git@06309c4e
+s2wrapper @ git+https://github.com/bfshi/scaling_on_scales.git@60da2afe

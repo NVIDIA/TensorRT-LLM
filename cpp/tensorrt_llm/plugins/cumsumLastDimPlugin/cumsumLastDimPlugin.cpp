@@ -36,8 +36,6 @@ CumsumLastDimPlugin::CumsumLastDimPlugin(SizeType32 inputLength, nvinfer1::DataT
     , mTempStorageBytes(temp_storage_bytes)
     , mType(type)
 {
-    TLLM_CHECK_WITH_INFO((getSMVersion() >= 80) || (mType != DataType::kBF16),
-        "Unsupported data type, pre SM 80 GPUs do not support bfloat16");
     TLLM_CHECK_WITH_INFO((mType == DataType::kBF16) || (mType == DataType::kFLOAT) || (mType == DataType::kHALF)
             || (mType == DataType::kINT32),
         "Only support int, float, half, and bfloat16.");
@@ -55,7 +53,6 @@ CumsumLastDimPlugin::CumsumLastDimPlugin(void const* data, size_t length)
     read(d, mTempStorageBytes);
     read(d, mType);
     TLLM_CHECK(d == a + length);
-    TLLM_CHECK_WITH_INFO((getSMVersion() >= 80) || (mType != DataType::kBF16), "Unsupported data type");
     TLLM_CHECK_WITH_INFO((mType == DataType::kBF16) || (mType == DataType::kFLOAT) || (mType == DataType::kHALF)
             || (mType == DataType::kINT32),
         "Only support int, float, half, and bfloat16.");
@@ -91,7 +88,7 @@ void CumsumLastDimPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc cons
 
 size_t CumsumLastDimPlugin::getWorkspaceSizeNeeded(SizeType32 inputLength, nvinfer1::DataType type)
 {
-    size_t tempStorageBytes;
+    size_t tempStorageBytes{0};
     if (inputLength < LENGTH_LIMIT_FOR_BLOCKSCAN) // last dim unknown or small, use BlockScan
     {
         tempStorageBytes = 0;
@@ -215,7 +212,7 @@ void CumsumLastDimPlugin::serialize(void* buffer) const noexcept
     write(d, mInputLength);
     write(d, mTempStorageBytes);
     write(d, mType);
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 }
 
 void CumsumLastDimPlugin::destroy() noexcept
@@ -253,8 +250,8 @@ PluginFieldCollection const* CumsumLastDimPluginCreator::getFieldNames() noexcep
 IPluginV2* CumsumLastDimPluginCreator::createPlugin(char const* name, PluginFieldCollection const* fc) noexcept
 {
     PluginField const* fields = fc->fields;
-    int inputLength;
-    nvinfer1::DataType type;
+    int inputLength{};
+    nvinfer1::DataType type{};
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {

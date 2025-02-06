@@ -202,8 +202,8 @@ __global__ void topPSsampling(T const* sortedProbs, TokenIdType const* sortedIdV
     FinishedState* finishedOutput, float* cumLogProbs, float* outputLogProbs, SizeType32 const* beginOffsetBuf,
     SizeType32 const* offsetBuf, SizeType32 vocabSize, curandState_t* curandState, float const* randomVals,
     float const* topPs, TokenIdType const* endIds, SizeType32 maxBatchSize, bool const* skipDecode,
-    SizeType32 const* batchSlots, bool returnAllSelectedTokens, SizeType32 maxSeqLen, TokenIdType* outputIdCurrentStep,
-    bool const* skipOutputIdCurrentStep)
+    SizeType32 const* batchSlots, bool returnAllSelectedTokensFlag, bool const* returnAllSelectedTokensPerSlot,
+    SizeType32 maxSeqLen, TokenIdType* outputIdCurrentStep, bool const* skipOutputIdCurrentStep)
 {
     /**
      * Each block processes one request row sorted in descending order by probabilities.
@@ -241,6 +241,9 @@ __global__ void topPSsampling(T const* sortedProbs, TokenIdType const* sortedIdV
     auto const probThreshold = topPs[batchSlot];
     auto const currentStep = sequenceLength == nullptr ? 0 : sequenceLength[batchSlot];
     auto* outputIdsRequestPtr = idsPtrs == nullptr ? ids + batchSlot * maxSeqLen : idsPtrs[batchSlot];
+    auto const returnAllSelectedTokens = returnAllSelectedTokensPerSlot != nullptr
+        ? returnAllSelectedTokensPerSlot[batchSlot]
+        : returnAllSelectedTokensFlag;
     bool const sampleTokenInSelected = returnAllSelectedTokens && outputIdCurrentStep && curandState
         && skipOutputIdCurrentStep && !skipOutputIdCurrentStep[batchSlot];
 
@@ -439,8 +442,8 @@ void invokeBatchTopPSampling(TopPSamplingKernelParams<T> const& params, cudaStre
         params.outputIds, params.outputIdsPtrs, params.sequenceLength, params.finishedInput, params.finishedOutput,
         params.cumLogProbs, params.outputLogProbs, beginOffsetBuf, offsetBuf + 1, params.vocabSizePadded,
         params.curandState, params.randomVals, params.topPs, params.endIds, params.maxBatchSize, params.skipDecode,
-        params.batchSlots, params.returnAllSelectedTokens, params.maxSeqLen, params.outputIdCurrentStep,
-        params.skipOutputIdCurrentStep);
+        params.batchSlots, params.returnAllSelectedTokens, params.returnAllSelectedTokensPerSlot, params.maxSeqLen,
+        params.outputIdCurrentStep, params.skipOutputIdCurrentStep);
     sync_check_cuda_error();
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);

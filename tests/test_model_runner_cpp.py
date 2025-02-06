@@ -6,7 +6,6 @@ from bindings.binding_test_utils import *
 from transformers import AutoTokenizer
 from utils.cpp_paths import *
 from utils.llm_data import llm_models_root
-from utils.util import skip_pre_ampere
 
 from tensorrt_llm.runtime.model_runner_cpp import ModelRunnerCpp
 
@@ -22,7 +21,6 @@ def model_files(llm_root: Path, resource_path: Path, results_data_path: Path):
         prepare_model_tests(llm_root, resource_path, "gpt", model_cache_arg)
 
 
-@skip_pre_ampere  # ContextFMHAType with fp32 acc is not supported in pre-ampere architecture
 def test_logits_post_processor(model_files, model_path):
 
     # Define the logits post-processor callback

@@ -783,7 +783,7 @@ class DeciLMForCausalLM(DecoderModelForCausalLM):
             remove_input_padding: bool = False,
             use_gpt_attention_plugin: bool = False,
             paged_kv_cache: bool = False,
-            tokens_per_block: int = 64,
+            tokens_per_block: int = 32,
             mapping: Mapping = Mapping(),
             use_cache: bool = True,
             streamingllm: bool = False,

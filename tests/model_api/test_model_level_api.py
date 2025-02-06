@@ -9,9 +9,10 @@ from transformers import AutoTokenizer
 
 import tensorrt_llm
 from tensorrt_llm.builder import BuildConfig, build
-from tensorrt_llm.executor import GenerationExecutor, SamplingParams
+from tensorrt_llm.executor import GenerationExecutor
 from tensorrt_llm.models import LLaMAForCausalLM
 from tensorrt_llm.models.llama.config import LLaMAConfig
+from tensorrt_llm.sampling_params import SamplingParams
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root

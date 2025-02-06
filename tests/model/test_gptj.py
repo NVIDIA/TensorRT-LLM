@@ -34,7 +34,7 @@ from tensorrt_llm.network import net_guard
 from tensorrt_llm.plugin.plugin import ContextFMHAType
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import skip_fp32_accum_pre_ampere, unittest_name_func
+from utils.util import unittest_name_func
 
 
 class TestGPTJ(unittest.TestCase):
@@ -164,9 +164,6 @@ class TestGPTJ(unittest.TestCase):
 
     @parameterized.expand(load_test_cases, name_func=unittest_name_func)
     def test_gptj_plugin(self, context_fmha_flag, enable_remove_input_padding):
-
-        # Skip tests that are not supported in pre-ampere architecture
-        skip_fp32_accum_pre_ampere(context_fmha_flag)
 
         torch.random.manual_seed(0)
         use_refit = False

@@ -14,6 +14,8 @@
 # limitations under the License.
 
 import copy
+import os
+from os.path import join
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
@@ -48,6 +50,15 @@ _bindings_dtype_to_torch_dtype_dict = {
 SamplingConfigType = Union[SamplingConfig, trtllm.SamplingConfig]
 
 
+def _world_config_to_mapping(world_config: WorldConfig):
+    return Mapping(world_size=world_config.size,
+                   rank=world_config.rank,
+                   gpus_per_node=world_config.gpus_per_node,
+                   tp_size=world_config.tensor_parallelism,
+                   pp_size=world_config.pipeline_parallelism,
+                   cp_size=world_config.context_parallelism)
+
+
 class ModelRunnerCpp(ModelRunnerMixin):
     """
     An interface class that wraps Executor and provides generation methods.
@@ -69,50 +80,47 @@ class ModelRunnerCpp(ModelRunnerMixin):
         self.max_seq_len = max_seq_len
         self.max_beam_width = max_beam_width
         self.model_config = model_config
-        self.mapping = Mapping(world_size=world_config.size,
-                               rank=world_config.rank,
-                               gpus_per_node=world_config.gpus_per_node,
-                               tp_size=world_config.tensor_parallelism,
-                               pp_size=world_config.pipeline_parallelism,
-                               cp_size=world_config.context_parallelism)
+        self.mapping = _world_config_to_mapping(world_config)
         self.world_config = world_config
         self.use_kv_cache = use_kv_cache
         self.lora_manager = lora_manager
 
     @classmethod
-    def from_dir(
-        cls,
-        engine_dir: str,
-        *,
-        lora_dir: Optional[str] = None,
-        rank: int = 0,
-        max_batch_size: Optional[int] = None,
-        max_input_len: Optional[int] = None,
-        max_output_len: Optional[int] = None,
-        max_beam_width: Optional[int] = None,
-        max_attention_window_size: Optional[list[int]] = None,
-        sink_token_length: Optional[int] = None,
-        kv_cache_free_gpu_memory_fraction: Optional[float] = None,
-        cross_kv_cache_fraction: Optional[float] = None,
-        medusa_choices: list[list[int]] | None = None,
-        eagle_choices: list[list[int]] | None = None,
-        eagle_posterior_threshold: float | None = None,
-        lookahead_config: list[int] | None = None,
-        debug_mode: bool = False,
-        lora_ckpt_source: str = "hf",
-        gpu_weights_percent: float = 1,
-        max_tokens_in_paged_kv_cache: int | None = None,
-        kv_cache_enable_block_reuse: bool = False,
-        enable_chunked_context: bool = False,
-        is_enc_dec: bool = False,
-        multi_block_mode: bool = True,
-        enable_context_fmha_fp32_acc: Optional[bool] = None,
-        cuda_graph_mode: Optional[bool] = None,
-        logits_processor_map: Optional[Dict[str, LogitsProcessor]] = None,
-        device_ids: List[int] | None = None,
-        is_orchestrator_mode: bool = False,
-        use_runtime_defaults: bool = True,
-    ) -> 'ModelRunnerCpp':
+    def from_dir(cls,
+                 engine_dir: str,
+                 *,
+                 lora_dir: Optional[str] = None,
+                 rank: int = 0,
+                 max_batch_size: Optional[int] = None,
+                 max_input_len: Optional[int] = None,
+                 max_output_len: Optional[int] = None,
+                 max_beam_width: Optional[int] = None,
+                 max_attention_window_size: Optional[list[int]] = None,
+                 sink_token_length: Optional[int] = None,
+                 kv_cache_free_gpu_memory_fraction: Optional[float] = None,
+                 cross_kv_cache_fraction: Optional[float] = None,
+                 medusa_choices: list[list[int]] | None = None,
+                 eagle_choices: list[list[int]] | None = None,
+                 eagle_posterior_threshold: float | None = None,
+                 eagle_use_dynamic_tree: bool = False,
+                 eagle_dynamic_tree_max_top_k: Optional[int] = None,
+                 lookahead_config: list[int] | None = None,
+                 debug_mode: bool = False,
+                 lora_ckpt_source: str = "hf",
+                 gpu_weights_percent: float = 1,
+                 max_tokens_in_paged_kv_cache: int | None = None,
+                 kv_cache_enable_block_reuse: bool = False,
+                 enable_chunked_context: bool = False,
+                 is_enc_dec: bool = False,
+                 multi_block_mode: bool = True,
+                 enable_context_fmha_fp32_acc: Optional[bool] = None,
+                 cuda_graph_mode: Optional[bool] = None,
+                 logits_processor_map: Optional[Dict[str,
+                                                     LogitsProcessor]] = None,
+                 device_ids: List[int] | None = None,
+                 is_orchestrator_mode: bool = False,
+                 use_runtime_defaults: bool = True,
+                 gather_generation_logits: bool = False) -> 'ModelRunnerCpp':
         """
         Create a ModelRunnerCpp instance from an engine directory.
 
@@ -156,6 +164,10 @@ class ModelRunnerCpp(ModelRunnerMixin):
             eagle_posterior_threshold float:
                 Minimum token probability threshold for typical acceptance.
                 Value different from None enables typical acceptance in Eagle.
+            eagle_use_dynamic_tree bool:
+                Whether to use Eagle-2, which is dynamic tree.
+            eagle_dynamic_tree_max_top_k int:
+                The maximum number of draft tokens to expand for each node in Eagle-2.
             lora_ckpt_source (str):
                 Source of checkpoint. Should be one of ['hf', 'nemo'].
             max_tokens_in_paged_kv_cache (int):
@@ -179,6 +191,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 Device indices to run the Executor on.
             is_orchestrator_mode (bool):
                 The mode to run the model-runner, Leader mode by default.
+            gather_generation_logits (bool):
+                Enable gathering generation logits.
         Returns:
             ModelRunnerCpp: An instance of ModelRunnerCpp.
         """
@@ -191,74 +205,41 @@ class ModelRunnerCpp(ModelRunnerMixin):
         if cuda_graph_mode is not None:
             extended_runtime_perf_knob_config.cuda_graph_mode = cuda_graph_mode
 
+        model_config = None
+        is_multimodal = {'vision', 'llm'}.issubset({
+            name
+            for name in os.listdir(engine_dir)
+            if os.path.isdir(os.path.join(engine_dir, name))
+        })
+        encoder_path = None
+        decoder_path = None
+
         if is_enc_dec:
-            encoder_config_path = Path(engine_dir) / "encoder" / "config.json"
+            if is_multimodal:
+                encoder_path = join(engine_dir, 'vision')
+                decoder_path = join(engine_dir, 'llm')
+            else:
+                encoder_path = join(engine_dir, 'encoder')
+                decoder_path = join(engine_dir, 'decoder')
+
+            encoder_config_path = Path(encoder_path) / "config.json"
             encoder_json_config = GptJsonConfig.parse_file(encoder_config_path)
             encoder_model_config = encoder_json_config.model_config
-            decoder_config_path = Path(engine_dir) / "decoder" / "config.json"
+            decoder_config_path = Path(decoder_path) / "config.json"
             decoder_json_config = GptJsonConfig.parse_file(decoder_config_path)
             decoder_model_config = decoder_json_config.model_config
-            use_kv_cache = decoder_model_config.kv_cache_type != KVCacheType.DISABLED
 
-            if not use_kv_cache:
-                assert max_output_len == 1 or max_output_len is None, 'Disabled KV cache is intended for context phase only now.'
+            json_config = decoder_json_config
+            model_config = decoder_model_config
+            engine_dir = decoder_path
 
-            if max_input_len is None:
+            if max_input_len is None and not is_multimodal:
                 max_input_len = encoder_model_config.max_input_len
+        else:
+            config_path = Path(engine_dir) / "config.json"
+            json_config = GptJsonConfig.parse_file(config_path)
+            model_config = json_config.model_config
 
-            max_seq_len = decoder_model_config.max_seq_len
-            # specifically set max_seq_len as decoder config. max_seq_len >= decoder_prefix_length + max_output_len.
-
-            if max_batch_size is None:
-                max_batch_size = decoder_model_config.max_batch_size
-            else:
-                assert max_batch_size <= decoder_model_config.max_batch_size
-
-            tp_size = decoder_json_config.tensor_parallelism
-            pp_size = decoder_json_config.pipeline_parallelism
-            cp_size = decoder_json_config.context_parallelism
-            gpus_per_node = decoder_json_config.gpus_per_node
-            world_config = WorldConfig.mpi(tensor_parallelism=tp_size,
-                                           pipeline_parallelism=pp_size,
-                                           context_parallelism=cp_size,
-                                           gpus_per_node=gpus_per_node)
-            assert rank == world_config.rank
-
-            profiler.start('load tensorrt_llm engine')
-
-            kv_cache_config = trtllm.KvCacheConfig(
-                free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
-                cross_kv_cache_fraction=cross_kv_cache_fraction,
-                max_attention_window=max_attention_window_size,
-                sink_token_length=sink_token_length)
-
-            executor = trtllm.Executor(
-                Path(engine_dir) / "encoder",
-                Path(engine_dir) / "decoder", trtllm.ModelType.ENCODER_DECODER,
-                trtllm.ExecutorConfig(max_beam_width=max_beam_width,
-                                      kv_cache_config=kv_cache_config,
-                                      gpu_weights_percent=gpu_weights_percent,
-                                      extended_runtime_perf_knob_config=
-                                      extended_runtime_perf_knob_config))
-
-            profiler.stop('load tensorrt_llm engine')
-
-            loading_time = profiler.elapsed_time_in_sec(
-                "load tensorrt_llm engine")
-            logger.info(f'Load engine takes: {loading_time} sec')
-
-            return cls(executor,
-                       max_batch_size=max_batch_size,
-                       max_input_len=max_input_len,
-                       max_seq_len=max_seq_len,
-                       max_beam_width=max_beam_width,
-                       model_config=decoder_model_config,
-                       world_config=world_config,
-                       use_kv_cache=use_kv_cache)
-
-        config_path = Path(engine_dir) / "config.json"
-        json_config = GptJsonConfig.parse_file(config_path)
-        model_config = json_config.model_config
         use_kv_cache = model_config.kv_cache_type != KVCacheType.DISABLED
         if not model_config.use_cross_attention:
             assert cross_kv_cache_fraction is None, "cross_kv_cache_fraction should only be used with enc-dec models."
@@ -287,9 +268,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
                                        gpus_per_node=gpus_per_node)
         assert rank == world_config.rank
 
+        engine_config = EngineConfig.from_json_file(f"{engine_dir}/config.json")
         if model_config.use_lora_plugin and rank == 0:
-            engine_config = EngineConfig.from_json_file(
-                f"{engine_dir}/config.json")
             lora_manager = LoraManager()
             if lora_dir is None:
                 config_lora_dir = engine_config.build_config.lora_config.lora_dir
@@ -348,10 +328,11 @@ class ModelRunnerCpp(ModelRunnerMixin):
             if multi_block_mode is not None:
                 multi_block_mode = False  # Medusa doesn't support multi-block mode.
 
-        if eagle_choices is not None or eagle_posterior_threshold is not None:
+        if eagle_choices is not None or eagle_posterior_threshold is not None or eagle_use_dynamic_tree:
             greedy_sampling = eagle_posterior_threshold is None
             decoding_config.eagle_config = trtllm.EagleConfig(
-                eagle_choices, greedy_sampling, eagle_posterior_threshold)
+                eagle_choices, greedy_sampling, eagle_posterior_threshold,
+                eagle_use_dynamic_tree, eagle_dynamic_tree_max_top_k)
             if multi_block_mode is not None:
                 logger.warning(
                     f'Multi block mode is not supported for EAGLE. Disabling it.'
@@ -373,7 +354,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
         # model_config.max_input_len is not the upper bound of input length.
         # If runtime max_input_len is not properly set,
         # C++ runtime will throw an error when fetching new requests
-        if max_output_len is None:
+        if max_output_len is None or is_enc_dec:
             max_seq_len = model_config.max_seq_len
         else:
             max_seq_len = max_input_len + max_output_len
@@ -402,7 +383,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
             decoding_config=decoding_config,
             peft_cache_config=peft_cache_config,
             debug_config=debug_config,
-            gpu_weights_percent=gpu_weights_percent)
+            gpu_weights_percent=gpu_weights_percent,
+            gather_generation_logits=gather_generation_logits)
         trtllm_config.enable_chunked_context = enable_chunked_context
         trtllm_config.extended_runtime_perf_knob_config = extended_runtime_perf_knob_config
 
@@ -427,8 +409,11 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 logits_proc_config.processor_map = logits_processor_map
             trtllm_config.logits_post_processor_config = logits_proc_config
 
-        use_default_executor = True
-        if use_default_executor:
+        if is_enc_dec:
+            executor = trtllm.Executor(encoder_path, decoder_path,
+                                       trtllm.ModelType.ENCODER_DECODER,
+                                       trtllm_config)
+        else:
             executor = trtllm.Executor(Path(engine_dir),
                                        trtllm.ModelType.DECODER_ONLY,
                                        trtllm_config)
@@ -552,6 +537,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
             stop_words_list: list[list[int]] | None = None,
             return_dict: bool = False,
             output_sequence_lengths: bool = False,
+            output_generation_logits: bool = False,
             output_log_probs: bool = False,
             output_cum_log_probs: bool = False,
             prompt_table: Optional[Union[str, torch.Tensor]] = None,
@@ -633,7 +619,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 "beam_search_diversity_rate", "repetition_penalty",
                 "presence_penalty", "frequency_penalty", "length_penalty",
                 "early_stopping", "no_repeat_ngram_size", "random_seed",
-                "num_return_sequences"
+                "num_return_sequences", "min_p"
             ]
             rename_params = {"num_beams": "beam_width", "random_seed": "seed"}
             sampling_params = {
@@ -655,7 +641,8 @@ class ModelRunnerCpp(ModelRunnerMixin):
 
         output_config = trtllm.OutputConfig(
             return_context_logits=self.gather_context_logits,
-            return_generation_logits=self.gather_generation_logits,
+            return_generation_logits=self.gather_generation_logits
+            or output_generation_logits,
             return_log_probs=output_log_probs,
         )
 
@@ -749,11 +736,11 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 end_id=end_id,
                 return_dict=return_dict,
                 output_sequence_lengths=output_sequence_lengths,
+                output_generation_logits=output_generation_logits,
                 output_log_probs=output_log_probs,
                 output_cum_log_probs=output_cum_log_probs,
                 batch_input_ids=batch_input_ids,
                 streaming=streaming,
-                max_new_tokens=max_new_tokens,
                 sampling_config=sampling_config,
                 is_draft_target_model=is_draft_target_model,
             )
@@ -763,13 +750,13 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 end_id=end_id,
                 return_dict=return_dict,
                 output_sequence_lengths=output_sequence_lengths,
+                output_generation_logits=output_generation_logits,
                 output_log_probs=output_log_probs,
                 output_cum_log_probs=output_cum_log_probs,
                 batch_input_ids=batch_input_ids,
                 batch_input_ids_list=batch_input_ids_list,
                 streaming=streaming,
                 return_all_generated_tokens=return_all_generated_tokens,
-                max_new_tokens=max_new_tokens,
                 sampling_config=sampling_config,
                 is_draft_target_model=is_draft_target_model,
             )
@@ -865,11 +852,11 @@ class ModelRunnerCpp(ModelRunnerMixin):
         end_id,
         return_dict,
         output_sequence_lengths,
+        output_generation_logits,
         output_log_probs,
         output_cum_log_probs,
         batch_input_ids,
         streaming,
-        max_new_tokens: int,
         sampling_config: SamplingConfigType,
         is_draft_target_model: bool = False,
     ):
@@ -889,6 +876,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
             end_id=end_id,
             return_dict=return_dict,
             output_sequence_lengths=output_sequence_lengths,
+            output_generation_logits=output_generation_logits,
             output_log_probs=output_log_probs,
             output_cum_log_probs=output_cum_log_probs,
             batch_input_ids=batch_input_ids,
@@ -896,7 +884,6 @@ class ModelRunnerCpp(ModelRunnerMixin):
             streaming=streaming,
             request_ids=request_ids,
             return_all_generated_tokens=False,
-            max_new_tokens=max_new_tokens,
             sampling_config=sampling_config,
             is_draft_target_model=is_draft_target_model,
         )
@@ -908,13 +895,13 @@ class ModelRunnerCpp(ModelRunnerMixin):
         end_id,
         return_dict,
         output_sequence_lengths,
+        output_generation_logits,
         output_log_probs,
         output_cum_log_probs,
         batch_input_ids,
         batch_input_ids_list,
         streaming,
         return_all_generated_tokens,
-        max_new_tokens: int,
         sampling_config: SamplingConfigType,
         is_draft_target_model: bool = False,
     ):
@@ -938,6 +925,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 end_id=end_id,
                 return_dict=return_dict,
                 output_sequence_lengths=output_sequence_lengths,
+                output_generation_logits=output_generation_logits,
                 output_log_probs=output_log_probs,
                 output_cum_log_probs=output_cum_log_probs,
                 batch_input_ids=batch_input_ids,
@@ -945,7 +933,6 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 streaming=streaming,
                 request_ids=request_ids,
                 return_all_generated_tokens=return_all_generated_tokens,
-                max_new_tokens=max_new_tokens,
                 sampling_config=sampling_config,
                 is_draft_target_model=is_draft_target_model,
             )
@@ -958,6 +945,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
         end_id,
         return_dict,
         output_sequence_lengths,
+        output_generation_logits,
         output_log_probs,
         output_cum_log_probs,
         batch_input_ids,
@@ -965,7 +953,6 @@ class ModelRunnerCpp(ModelRunnerMixin):
         streaming,
         request_ids,
         return_all_generated_tokens,
-        max_new_tokens: int,
         sampling_config: SamplingConfigType,
         is_draft_target_model: bool,
     ):
@@ -1045,7 +1032,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 assert context_logits is not None
                 outputs['context_logits'] = context_logits
 
-            if self.gather_generation_logits:
+            if self.gather_generation_logits or output_generation_logits:
                 gen_logits = None
                 if is_draft_target_model:
                     # Put the outputs in a list rather than a tensor since their

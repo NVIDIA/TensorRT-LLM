@@ -318,8 +318,15 @@ public:
 
             if (!mGenT2TLatency.mDataTimes.empty())
             {
-
                 mGenT2TLatency.calculate();
+                std::vector<float> userTokensPerSecond;
+                userTokensPerSecond.reserve(mGenT2TLatency.mDataTimes.size());
+                for (auto const& latency : mGenT2TLatency.mDataTimes)
+                {
+                    userTokensPerSecond.push_back(1000.F / latency);
+                }
+                mAvgUserTokensPerSecond = std::accumulate(userTokensPerSecond.begin(), userTokensPerSecond.end(), 0.F)
+                    / userTokensPerSecond.size();
             }
             if (!mGenExcludeFirstIterT2TLatency.mDataTimes.empty())
             {
@@ -348,6 +355,10 @@ public:
         printf("[BENCHMARK] total_latency(ms) %.2f\n", mTotalLatency);
         printf("[BENCHMARK] seq_throughput(seq/sec) %.2f\n", mSeqThroughput);
         printf("[BENCHMARK] token_throughput(token/sec) %.2f\n", mTokenThroughput);
+        if (mStreaming)
+        {
+            printf("[BENCHMARK] user_tokens_per_second(tokens/sec/user) %.2f\n", mAvgUserTokensPerSecond);
+        }
         printf("[BENCHMARK] avg_acceptance_rate(tokens/decoding steps) %.2f\n\n", mAcceptanceRate);
 
         mSeqLatency.report();
@@ -396,6 +407,7 @@ public:
                 auto excludeFirstIterIngterHeader = mGenExcludeFirstIterT2TLatency.genHeaders();
                 headers.insert(headers.end(), std::make_move_iterator(excludeFirstIterIngterHeader.begin()),
                     std::make_move_iterator(excludeFirstIterIngterHeader.end()));
+                headers.push_back("avg_user_tokens_per_second(tokens/sec/user)");
             }
             if (mCalculateKVCacheTransferTime)
             {
@@ -421,7 +433,7 @@ public:
                 {
 
                     outputFile << "," << mGenFirstTokenLatency << "," << mGenT2TLatency << ","
-                               << mGenExcludeFirstIterT2TLatency;
+                               << mGenExcludeFirstIterT2TLatency << "," << mAvgUserTokensPerSecond;
                 }
                 if (mCalculateKVCacheTransferTime)
                 {
@@ -499,6 +511,7 @@ private:
     bool mOutputHasInput;
     bool mCalculateKVCacheTransferTime;
     bool mCalculateQueueTime;
+    float mAvgUserTokensPerSecond{};
 };
 
 texec::Request makeExecutorContextRequest(Sample const& sample, SizeType32 const& beamWidth,

@@ -79,7 +79,7 @@ def build_engines(model_cache: str, only_multi_gpu: bool):
                         cwd=models_dir)
 
     hf_dir = models_dir / model_name
-    assert hf_dir.is_dir()
+    assert hf_dir.is_dir(), f"testing {hf_dir}"
 
     engine_dir = models_dir / 'rt_engine' / model_name
 
@@ -104,7 +104,7 @@ def build_engines(model_cache: str, only_multi_gpu: bool):
             [
                 f'--tp_size={tp_size}', f'--pp_size={pp_size}',
                 f'--cp_size={cp_size}'
-            ], [])
+            ], ['--use_paged_context_fmha=disable'])
 
     if not only_multi_gpu:
         print(f"\nBuilding lookahead engine")

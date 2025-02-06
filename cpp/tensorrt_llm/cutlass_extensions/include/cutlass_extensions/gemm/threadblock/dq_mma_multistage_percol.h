@@ -558,8 +558,8 @@ public:
                     = cutlass::NumericArrayConverter<ElementA, ElementScale, ConversionVectorWidth, RoundStyle>;
 
                 FragmentOperandB converted_frag_B_operand = Converter::convert(converted_frag_B);
-                run_warp_mma(warp_mma, accum, warp_frag_A[warp_mma_k % 2], converted_frag_B_operand, accum,
-                    warp_tileB_k_compute_offset);
+                warp_mma(
+                    accum, warp_frag_A[warp_mma_k % 2], converted_frag_B_operand, accum, warp_tileB_k_compute_offset);
 
                 // Issue global->shared copies for the this stage
                 if (warp_mma_k < Base::kWarpGemmIterations - 1)

@@ -7,12 +7,9 @@ from itertools import chain
 from typing import List, Optional, Set, Tuple
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import InferenceRequest
 from tensorrt_llm.bench.dataclasses.reporting import (NewRequestPerfItemTuple,
-                                                      StatsKeeper,
-                                                      report_latency_statistics,
-                                                      report_statistics)
+                                                      StatsKeeper)
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
 
@@ -24,7 +21,7 @@ class LlmManager:
                  llm: LLM,
                  outbox: asyncio.Queue[NewRequestPerfItemTuple],
                  streaming: bool,
-                 concurrency: Optional[int] = None) -> None:
+                 concurrency: int = -1) -> None:
         self.llm = llm
         self._inbox: asyncio.Queue[Tuple[InferenceRequest,
                                          SamplingParams]] = asyncio.Queue()
@@ -34,19 +31,18 @@ class LlmManager:
         self._running = asyncio.Event()
         self._tasks: Set[asyncio.Task] = set()
         self._backend_task = None
-        self.concurrency = concurrency
         self._concurrency_semaphore = asyncio.Semaphore(
-            concurrency) if concurrency else None
+            concurrency) if concurrency > 0 else None
         self.streaming = streaming
 
     async def process_request(self, request: InferenceRequest,
                               sampling_params: SamplingParams):
         # Set up sampling params with inference request
         sampling_params.max_tokens = request.output_tokens
-        request_start_timestamp = time.perf_counter_ns()
-        time_on_first_token = None
 
         async with semaphore_guard(self._concurrency_semaphore):
+            request_start_timestamp = time.perf_counter_ns()
+            time_on_first_token = None
             # Schedule the request in the LLM API (asynchronously)
             output: RequestOutput = self.llm.generate_async(
                 request.input_ids,
@@ -61,16 +57,22 @@ class LlmManager:
                 # Wait for the response to return to us.
                 response: RequestOutput = await output.aresult()
 
+        response_end_timestamp = time.perf_counter_ns()
+
         # Mark that the response returned. Construct a record to send to statistics.
         tokens = list(chain(*[beam.token_ids for beam in response.outputs]))
-        response_end_timestamp = time.perf_counter_ns()
-        request_perf_item = NewRequestPerfItemTuple(request_start_timestamp,
-                                                    response_end_timestamp,
-                                                    response.request_id,
-                                                    len(request.input_ids),
-                                                    response.finished, False,
-                                                    tokens, len(tokens),
-                                                    time_on_first_token)
+        request_perf_item = NewRequestPerfItemTuple(
+            start_timestamp=request_start_timestamp,
+            end_timestamp=response_end_timestamp,
+            request_id=response.request_id,
+            num_input_tokens=len(request.input_ids),
+            response_is_final=response.finished,
+            error=False,
+            tokens=tokens,
+            decoding_iteration=len(tokens),
+            time_on_first_token=time_on_first_token,
+        )
+
         # Register the new request perf items in the outbound queue for statistics keeping
         await self._outbox.put(request_perf_item)
 
@@ -132,23 +134,22 @@ async def enqueue_messages(backend: LlmManager,
     submit_finished.set()
 
 
-async def async_benchmark(runtime_config: RuntimeConfig,
-                          requests: List[InferenceRequest],
-                          streaming: bool,
-                          concurrency: Optional[int] = None,
-                          for_latency: bool = False) -> None:
+async def async_benchmark(
+    llm: LLM,
+    sampling_params: SamplingParams,
+    requests: List[InferenceRequest],
+    streaming: bool,
+    concurrency: int = -1,
+) -> StatsKeeper:
     outbox = asyncio.Queue()
-    sampling_params = SamplingParams(end_id=-1, pad_id=-1, beam_width=1)
     statistics = StatsKeeper()
     submit_finished = asyncio.Event()
 
     try:
-        logger.info("Setting up throughput benchmark.")
-        llm = LLM(**runtime_config.get_llm_args().to_dict(), )
-
+        logger.info("Starting benchmarking async task.")
         backend = LlmManager(llm, outbox, streaming, concurrency=concurrency)
-        logger.info("Creating backend and request enqueue tasks.")
         backend.run()
+
         enqueue_task = asyncio.create_task(
             enqueue_messages(backend, requests, sampling_params,
                              submit_finished))
@@ -165,14 +166,10 @@ async def async_benchmark(runtime_config: RuntimeConfig,
 
         logger.info("Benchmark complete.")
 
-        if for_latency:
-            report_latency_statistics(statistics, runtime_config, logger)
-        else:
-            report_statistics(statistics, runtime_config, logger, streaming)
+        return statistics
 
     except asyncio.CancelledError:
         enqueue_task.cancel()
 
     finally:
         backend.stop()
-        llm.__exit__(None, None, None)

@@ -21,6 +21,17 @@
 namespace tensorrt_llm::runtime::lora
 {
 
+LoraModuleConfig::LoraModuleConfig(LoraModuleConfig::TensorPtr loraConfigTensor)
+{
+    auto const dataPtr = bufferCast<int32_t>(*loraConfigTensor);
+    // backwards compatibility with pre-dora configs
+    auto const configSupportsDora = loraConfigTensor->getShape().d[1] >= lora::kLORA_CONFIG_ROW_SIZE;
+    moduleId = dataPtr[lora::kLORA_CONFIG_MODULE_OFF];
+    layerId = dataPtr[lora::kLORA_CONFIG_LAYER_OFF];
+    adapterSize = dataPtr[lora::kLORA_CONFIG_ADAPTER_SIZE_OFF];
+    isDora = configSupportsDora ? dataPtr[lora::kLORA_CONFIG_IS_DORA_OFF] : false;
+}
+
 void loraValidateRequestTensorDims(std::optional<ITensor::SharedPtr> const& optReqLoraWeights,
     std::optional<ITensor::SharedPtr> const& optReqLoraConfig)
 {
@@ -46,8 +57,10 @@ void loraValidateRequestTensorDims(std::optional<ITensor::SharedPtr> const& optR
 
     TLLM_CHECK_WITH_INFO(keys->getShape().d[1] == weights->getShape().d[1],
         "Expected dim1 lora_weights and lora_keys to have the same size");
-    TLLM_CHECK_WITH_INFO(keys->getShape().d[2] == kLORA_CONFIG_ROW_SIZE,
-        "Expected dim2 of lora_keys to have a size of " + std::to_string(kLORA_CONFIG_ROW_SIZE));
+    TLLM_CHECK_WITH_INFO(
+        keys->getShape().d[2] == kLORA_CONFIG_ROW_SIZE or keys->getShape().d[2] == kLORA_CONFIG_PRE_DORA_ROW_SIZE,
+        "Expected dim2 of lora_keys to have a size in [" + std::to_string(kLORA_CONFIG_PRE_DORA_ROW_SIZE) + ", "
+            + std::to_string(kLORA_CONFIG_ROW_SIZE) + "]");
 }
 
 void loraValidateRequestTensors(std::optional<std::uint64_t> const& optTaskId,
@@ -62,18 +75,23 @@ void loraValidateRequestTensors(std::optional<std::uint64_t> const& optTaskId,
 
         auto weights = optReqLoraWeights.value();
         auto config = optReqLoraConfig.value();
+        config = config->getShape().nbDims == 2
+            ? config
+            : ITensor::view(config, ITensor::makeShape({config->getShape().d[1], config->getShape().d[2]}));
+
         SizeType32 nbModelLayers = modelConfig.getNbAttentionLayers();
         TLLM_CHECK_WITH_INFO(weights->getDataType() == modelConfig.getDataType(),
             "Expected lora weights to be the same data type as base model");
 
         auto loraModules = modelConfig.getLoraModules();
-        auto configPtr = bufferCast<SizeType32>(*config);
         auto maxAdapterSize = modelConfig.getMaxLoraRank();
-        for (SizeType32 row = 0; row < config->getShape().d[1]; ++row)
+        for (SizeType32 row = 0; row < config->getShape().d[0]; ++row)
         {
-            auto modId = configPtr[row * kLORA_CONFIG_ROW_SIZE + kLORA_CONFIG_MODULE_OFF];
-            auto layerId = configPtr[row * kLORA_CONFIG_ROW_SIZE + kLORA_CONFIG_LAYER_OFF];
-            auto adapterSize = configPtr[row * kLORA_CONFIG_ROW_SIZE + kLORA_CONFIG_ADAPTER_SIZE_OFF];
+            LoraModuleConfig const loraConfig(ITensor::slice(config, row, 1));
+            auto modId = loraConfig.moduleId;
+            auto layerId = loraConfig.layerId;
+            auto adapterSize = loraConfig.adapterSize;
+            bool const isDora = loraConfig.isDora;
 
             TLLM_CHECK_WITH_INFO(
                 layerId >= 0 && layerId < nbModelLayers, "Expected layerId to be in the range [0, numModelLayers)");
@@ -82,7 +100,7 @@ void loraValidateRequestTensors(std::optional<std::uint64_t> const& optTaskId,
                 loraModules.begin(), loraModules.end(), [modId](LoraModule const& m) { return m.value() == modId; });
             std::string moduleName(LoraModule::toModuleName(modId));
             TLLM_CHECK_WITH_INFO(it != loraModules.end(), "lora module " + moduleName + " not enabled for this model");
-            TLLM_CHECK_WITH_INFO(it->flattenedInOutSize(adapterSize) <= weights->getShape().d[2],
+            TLLM_CHECK_WITH_INFO(it->flattenedInOutSize(adapterSize, isDora) <= weights->getShape().d[2],
                 "lora_weights has to few values for " + moduleName);
             TLLM_CHECK_WITH_INFO(adapterSize <= maxAdapterSize,
                 "Invalid low_rank (" + std::to_string(adapterSize) + "). low_rank must be smaller than mMaxLowRank ("

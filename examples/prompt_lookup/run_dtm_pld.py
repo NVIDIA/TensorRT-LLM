@@ -80,7 +80,7 @@ class PLDPool:  # Ngrams pool for Prompt-Lookup-Decoding
 
             # Find match
             for size in range(min(self.mmns, prefix_len[bi] - 1), 0, -1):
-                pattern = prefix[bi][-size:]
+                pattern = tuple(prefix[bi][-size:].tolist())
                 if pattern not in self.pool[gbi]:
                     continue
                 if self.is_use_oldest:

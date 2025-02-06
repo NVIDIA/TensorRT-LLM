@@ -195,7 +195,7 @@ class GenerationMixin:
             enable_ctx_gen_opt_profiles=False,
             remove_input_padding=False,
             use_gpt_attention_plugin=False,
-            tokens_per_block=64,
+            tokens_per_block=32,
             mapping=Mapping(),
             streamingllm=False,
             attn_layer_idx=None,
@@ -525,9 +525,8 @@ class GenerationMixin:
         remove_input_padding=False,
         use_gpt_attention_plugin=False,
         use_gemm_plugin=False,
-        tokens_per_block=64,
+        tokens_per_block=32,
         gather_context_logits=False,
-        gather_generation_logits=False,
         dtype=None,
         num_heads=None,
         mapping=Mapping(),
@@ -721,10 +720,10 @@ class GenerationMixin:
                     lora_weight_pointer = Tensor(
                         name=f'{lora_module}_lora_weights_pointers_{i}',
                         dtype=trt.int64,
-                        shape=[-1, 2],
+                        shape=[-1, 3],
                         dim_range=OrderedDict([
                             ('batch_size_beam_width', bb_range),
-                            ('in_out', [2] * num_profiles),
+                            ('in_out_scales', [3] * num_profiles),
                         ]))
                     lora_weight_pointer_dict.update({
                         f"{lora_module}_lora_weights_pointers":

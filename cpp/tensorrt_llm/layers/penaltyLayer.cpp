@@ -202,6 +202,28 @@ void PenaltyLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, TensorCo
             batchSlots, getLimitsPenalty(DecodingPenaltyType::MinLength), "min length");
     }
 
+    // Reset penalty workspace
+    auto const workspaceSizePerBatch
+        = mDecoderDomain.getMaxDecodingTokens() * mConfiguredBeamWidth * mDecoderDomain.getVocabSize();
+    for (size_t bi = 0; bi < batchSize; ++bi)
+    {
+        auto batchSlot = runtime::bufferCast<runtime::SizeType32>(*batchSlots)[bi];
+
+        if (mPenaltyWorkspaceDevice)
+        {
+            auto deviceSlice = runtime::IBuffer::slice(
+                mPenaltyWorkspaceDevice, batchSlot * workspaceSizePerBatch, workspaceSizePerBatch);
+            mBufferManager->setZero(*deviceSlice);
+        }
+
+        if (mPenaltyWorkspacePrevDevice)
+        {
+            auto deviceSlice = runtime::IBuffer::slice(
+                mPenaltyWorkspacePrevDevice, batchSlot * workspaceSizePerBatch, workspaceSizePerBatch);
+            mBufferManager->setZero(*deviceSlice);
+        }
+    }
+
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 

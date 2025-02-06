@@ -23,6 +23,7 @@ This document shows how to build and run an Encoder-Decoder (Enc-Dec) model in T
     - [Reminders](#reminders)
     - [Attention Scaling Factors](#attention-scaling-factors)
     - [Run FairSeq NMT (Neural Machine Translation) models](#run-fairseq-nmt-neural-machine-translation-models)
+    - [FP8 Post-Training Quantization](#fp8-post-training-quantization)
 
 ## Overview
 
@@ -421,3 +422,40 @@ trtllm-build --checkpoint_dir tmp/trt_models/wmt14/${INFERENCE_PRECISION}/decode
 # Run
 mpirun --allow-run-as-root -np ${WORLD_SIZE} python3 run.py --engine_dir tmp/trt_engines/wmt14/${INFERENCE_PRECISION} --engine_name wmt14 --model_name tmp/fairseq_models/wmt14/${INFERENCE_PRECISION} --max_new_token=24 --num_beams=1
 ```
+
+### FP8 Post-Training Quantization
+
+The examples below uses the NVIDIA Modelopt (AlgorithMic Model Optimization) toolkit for the model quantization process.
+
+First make sure Modelopt toolkit `nvidia-modelopt>=0.22.1` is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation)).
+> **Note:** Modelopt 0.22.1 is not yet released.
+
+#### Get quantized checkpoint with ModelOpt
+Currently supported conversion are `bart-large-cnn` and `T5` family. For `bart`, please set `--dtype float16`; for `T5` family, please set `--dtype float32` due to known bug with apex+HF mentioned in [transformer:issue/34264](https://github.com/huggingface/transformers/issues/34264).
+
+```bash
+# Example: quantize bart-large-cnn using 4-way tensor parallelism on a node with 8 GPUs (but only use 4 of them, for demonstration purpose) into FP8 weight and convert to TRTLLM checkpoint.
+export MODEL_NAME="bart-large-cnn"
+export MODEL_TYPE="bart"
+export INFERENCE_PRECISION="float16"
+export TP_SIZE=4
+export PP_SIZE=1
+export WORLD_SIZE=4
+export MAX_BEAM_WIDTH=1
+python ../quantization/quantize.py \
+                --model_dir tmp/hf_models/${MODEL_NAME} \
+                --dtype ${INFERENCE_PRECISION} \
+                --qformat fp8 \
+                --kv_cache_dtype fp8 \
+                --output_dir tmp/trt_models/${MODEL_NAME}/fp8 \
+                --calib_size 512 \
+                --batch_size 16 \
+                --tp_size ${TP_SIZE} \
+                --pp_size ${PP_SIZE}
+```
+
+The rest may follow the same command in [Build TensorRT engine(s)](#build-tensorrt-engines), with some notes:
+* For `bart`, please add `--use_fp8_context_fmha enable` for fp8 context fmha support. For `t5`, context fmha is not supported due to relative attention bias.
+* Please ensure `--paged_kv_cache enable` for decoder for fp8 paged kv cache.
+* Please use `--gemm_plugin auto`, `--bert_attention_plugin auto`, `--gpt_attention_plugin auto` instead of setting precision to these plugins.
+* Please use CPP runtime for better performance.

@@ -28,14 +28,22 @@ from .lora import LoraRuntimeParams
 from .normalization import LayerNorm
 
 
-def fc_gate_lora(hidden_states, lora, lora_layer_params):
+def fc_gate_lora(hidden_states, lora, fused_gate_up_lora, lora_layer_params):
     if lora_layer_params is not None:
         mlp_fc_lora_params = lora_layer_params.get_runtime_params(
             0, "mlp_h_to_4h")
         mlp_gate_lora_params = lora_layer_params.get_runtime_params(
             0, "mlp_gate")
+        mlp_gate_up_lora_params = lora_layer_params.get_runtime_params(
+            0, "mlp_gate_up")
 
-        if mlp_fc_lora_params is not None and mlp_gate_lora_params is not None:
+        if mlp_gate_up_lora_params is not None:
+            assert fused_gate_up_lora is not None
+            mlp_gate_up_lora = fused_gate_up_lora(hidden_states,
+                                                  mlp_gate_up_lora_params)
+            return mlp_gate_up_lora
+
+        elif mlp_fc_lora_params is not None and mlp_gate_lora_params is not None:
             mlp_in_lora_params = LoraRuntimeParams(
                 lora_ranks=[
                     mlp_fc_lora_params.lora_ranks[0],
@@ -52,6 +60,36 @@ def fc_gate_lora(hidden_states, lora, lora_layer_params):
             mlp_in_result = concat([mlp_gate_lora, mlp_fc_lora],
                                    dim=mlp_fc_lora.rank() - 1)
             return mlp_in_result
+    return None
+
+
+def fc_gate_dora(hidden_states, dora, fused_gate_up_dora, lora_layer_params):
+    if lora_layer_params is not None:
+        mlp_fc_lora_params = lora_layer_params.get_runtime_params(
+            0, "mlp_h_to_4h")
+        mlp_gate_lora_params = lora_layer_params.get_runtime_params(
+            0, "mlp_gate")
+        mlp_gate_up_lora_params = lora_layer_params.get_runtime_params(
+            0, "mlp_gate_up")
+
+        if mlp_gate_up_lora_params is not None:
+            assert fused_gate_up_dora is not None
+            return fused_gate_up_dora(hidden_states, mlp_gate_up_lora_params)
+
+        if mlp_fc_lora_params is not None and mlp_gate_lora_params is not None:
+            mlp_in_lora_params = LoraRuntimeParams(
+                lora_ranks=[
+                    mlp_fc_lora_params.lora_ranks[0],
+                    mlp_gate_lora_params.lora_ranks[0]
+                ],
+                lora_weights_pointers=[
+                    mlp_fc_lora_params.lora_weights_pointers[0],
+                    mlp_gate_lora_params.lora_weights_pointers[0]
+                ],
+                host_request_types=mlp_fc_lora_params.host_request_types,
+                host_context_lengths=mlp_fc_lora_params.host_context_lengths)
+
+            return dora(hidden_states, mlp_in_lora_params)
     return None
 
 
@@ -108,14 +146,23 @@ class MLP(Module):
         self.is_expert = is_expert
         # see optimize_model's add_lora for LoRA initialization
         self.lora = None
+        self.dora = None
 
     def forward(self, hidden_states, lora_layer_params=None, gegelu_limit=None):
+        if lora_layer_params is not None:
+            assert lora_layer_params.get_runtime_params(
+                0, "mlp_gate_up"
+            ) is None, f"LoRA module 'mlp_gate_up' is not supported in {self}"
         if is_gated_activation(self.hidden_act):
             inter = self.fc(hidden_states)
-            lora_result = fc_gate_lora(hidden_states, self.lora,
+            lora_result = fc_gate_lora(hidden_states, self.lora, None,
                                        lora_layer_params)
             if lora_result is not None:
                 inter = inter + lora_result
+                if self.dora is not None:
+                    inter = fc_gate_dora(inter, self.dora,
+                                         self.fused_gate_up_dora,
+                                         lora_layer_params)
         else:
             mlp_fc_lora_params = None
             if lora_layer_params is not None:
@@ -183,6 +230,10 @@ class GatedMLP(MLP):
                 hidden_states,
                 lora_layer_params=None,
                 all_reduce_params: Optional[AllReduceParams] = None):
+        if lora_layer_params is not None:
+            assert lora_layer_params.get_runtime_params(
+                0, "mlp_gate_up"
+            ) is None, f"LoRA module 'mlp_gate_up' is not supported in {self}"
 
         mlp_fc_lora_params = None
         if lora_layer_params is not None:
@@ -257,7 +308,10 @@ class FusedGatedMLP(Module):
                               is_expert=is_expert)
 
         # see optimize_model's add_lora for LoRA initialization
-        self.lora = None
+        self.lora = None  # used for split up and gate proj
+        self.fused_gate_up_lora = None  # used for merged up_gate proj
+        self.dora = None
+        self.fused_gate_up_dora = None
 
     def fc_gate_plugin(self, hidden_states, lora_layer_params=None):
         # Combine the following pattern
@@ -283,7 +337,8 @@ class FusedGatedMLP(Module):
 
             if mlp_fc_lora_params is not None or mlp_gate_lora_params is not None:
                 raise NotImplementedError(
-                    f"LoRA not yet implemented for gemm_swiglu_plugin")
+                    f"LoRA of splitting fc and gate is not yet implemented for gemm_swiglu_plugin"
+                )
 
         if self.hidden_act != 'silu':
             raise NotImplementedError(
@@ -324,6 +379,11 @@ class FusedGatedMLP(Module):
             inter = gemm_swiglu(hidden_states, self.fused_fc.weight.value, None,
                                 scale_d0, scale_d1, scale_output)
 
+        lora_result = fc_gate_lora(hidden_states, self.lora,
+                                   self.fused_gate_up_lora, lora_layer_params)
+        if lora_result is not None:
+            inter = inter + lora_result
+
         return inter
 
     def fc_gate(self, hidden_states, lora_layer_params=None):
@@ -339,9 +399,12 @@ class FusedGatedMLP(Module):
 
         inter = self.fused_fc(hidden_states)
 
-        lora_result = fc_gate_lora(hidden_states, self.lora, lora_layer_params)
+        lora_result = fc_gate_lora(hidden_states, self.lora,
+                                   self.fused_gate_up_lora, lora_layer_params)
         if lora_result is not None:
             inter = inter + lora_result
+            if self.dora is not None:
+                inter = fc_gate_dora(inter, self.dora, lora_layer_params)
 
         if self.hidden_act == 'silu':
             inter = ACT2FN['swiglu'](inter)

@@ -7,7 +7,7 @@ repos:
     rev: v1.1.13
     hooks:
     -   id: remove-crlf
--   repo:  https://github.com/google/yapf
+-   repo: https://github.com/google/yapf
     rev: v0.43.0
     hooks:
     -   id: yapf
@@ -47,4 +47,4 @@ repos:
         - --skip=".git,3rdparty"
         - --exclude-file=examples/whisper/tokenizer.py
         - --ignore-words-list=rouge,inout,atleast,strat,nd,subtile,thrid,improbe
-        exclude: 'tests/llm-test-defs/turtle/test_input_files'
+        exclude: 'tests/llm-test-defs/turtle/test_input_files|.*/test_star_attention_input.jsonl'

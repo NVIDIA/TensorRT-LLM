@@ -240,6 +240,8 @@ struct BiasSoftmaxParams
     int32_t const* beamWidths{nullptr};
     //! input buffer[batchSize], optional. Indices of rows of data in memory pool
     int32_t const* batchSlots{nullptr};
+    //! input buffer[batchSize], optional. min_p values per request
+    float* minPs{nullptr};
     //! current batch size
     int32_t batchSize{0};
     //! max batch size
@@ -256,6 +258,8 @@ struct BiasSoftmaxParams
     bool batchSlotsLogits{false};
     //! flag to indicate the layout of logitsPtrs
     bool ptrsForBeams{false};
+    //! input buffer [maxBatchSize]. Flags whether to skip decoding per request
+    bool const* skipDecode{nullptr};
 
     void checkParams()
     {

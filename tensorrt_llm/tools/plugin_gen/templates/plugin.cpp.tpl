@@ -43,7 +43,7 @@ static bool triton_kernels_loaded = false;
     {% for arg in params -%}
     read(d, [[arg.name]]);
     {% endfor %}
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 }
 
 
@@ -195,7 +195,7 @@ void [[ plugin_name ]]::serialize(void* buffer) const noexcept
     {% for arg in params -%}
     write(d, [[arg.name]]);
     {% endfor %}
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 
 }
 

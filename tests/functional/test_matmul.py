@@ -26,8 +26,7 @@ import tensorrt_llm
 from tensorrt_llm import Tensor
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import (create_session, run_session, skip_bf16_pre_ampere,
-                        unittest_name_func)
+from utils.util import create_session, run_session, unittest_name_func
 
 
 class TestMatmul(unittest.TestCase):
@@ -94,9 +93,6 @@ class TestMatmul(unittest.TestCase):
                            ('float32', True, False), ('float32', True, True)],
                           name_func=unittest_name_func)
     def test_matmul(self, dtype, transa, transb):
-        # Skip tests that are not supported in pre-ampere architecture
-        skip_bf16_pre_ampere(dtype)
-
         bs = 2
         inseq = 16
         hidden_size = 768

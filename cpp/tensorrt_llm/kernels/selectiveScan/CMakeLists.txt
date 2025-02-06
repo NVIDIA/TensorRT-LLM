@@ -18,11 +18,6 @@
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
 
-filter_cuda_archs("80" SRC_CPP)
-filter_cuda_archs("86" SRC_CPP)
-filter_cuda_archs("89" SRC_CPP)
-filter_cuda_archs("90" SRC_CPP)
-
 add_library(selective_scan_src OBJECT ${SRC_CPP} ${SRC_CU})
 foreach(target_name selective_scan_src)
   set_property(TARGET ${target_name} PROPERTY POSITION_INDEPENDENT_CODE ON)
@@ -48,6 +43,8 @@ foreach(target_name selective_scan_src)
     # No kernels should be parsed, unless hopper is specified. This is a build
     # time improvement
     target_compile_definitions(${target_name} PRIVATE COMPILE_HOPPER_TMA_GEMMS)
+    target_compile_definitions(${target_name}
+                               PRIVATE COMPILE_HOPPER_TMA_GROUPED_GEMMS)
   endif()
 
   # Suppress GCC note: the ABI for passing parameters with 64-byte alignment has

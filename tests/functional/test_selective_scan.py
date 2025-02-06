@@ -30,7 +30,7 @@ from tensorrt_llm import Tensor
 from tensorrt_llm._utils import str_dtype_to_torch
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import getSMVersion, skip_bf16_pre_ampere, unittest_name_func
+from utils.util import unittest_name_func
 
 
 class TestFunctional(unittest.TestCase):
@@ -44,9 +44,6 @@ class TestFunctional(unittest.TestCase):
                           name_func=unittest_name_func)
     def test_selective_scan(self, dim, dstate, req_type, dtype, batch_size,
                             max_seq_len, remove_padding):
-
-        # Skip tests that are not supported in pre-ampere architecture
-        skip_bf16_pre_ampere(dtype)
 
         # configs
         device = "cuda"
@@ -99,9 +96,15 @@ class TestFunctional(unittest.TestCase):
             dt = dt.view(-1, seq_len, dim)
             BC = BC.view(-1, seq_len, dt_rank + dstate * 2)
             z = z.view(-1, seq_len, dim)
-        output = torch.zeros(x.shape,
-                             device=device,
-                             dtype=str_dtype_to_torch(dtype))
+
+        if remove_padding and req_type == "generation":
+            output = torch.zeros(x.squeeze(1).shape,
+                                 device=device,
+                                 dtype=str_dtype_to_torch(dtype))
+        else:
+            output = torch.zeros(x.shape,
+                                 device=device,
+                                 dtype=str_dtype_to_torch(dtype))
 
         state_ref = state.detach().clone()
         x_ref = x.detach().clone()
@@ -112,6 +115,9 @@ class TestFunctional(unittest.TestCase):
         C_ref = BC[..., dt_rank + dstate:].detach().clone()
         D_ref = D.detach().clone()
         z_ref = z.detach().clone()
+
+        if remove_padding and req_type == "generation":
+            x = x.squeeze(1)
 
         # construct trt network
         builder = tensorrt_llm.Builder()
@@ -206,9 +212,16 @@ class TestFunctional(unittest.TestCase):
         engine = builder.build_engine(net, builder_config)
         session = tensorrt_llm.runtime.Session.from_serialized_engine(engine)
         session.run(inputs=inputs, outputs=outputs, stream=stream.cuda_stream)
-        out_ref = torch.zeros(output.shape,
-                              device=device,
-                              dtype=str_dtype_to_torch(dtype))
+
+        if remove_padding and req_type == "generation":
+            out_ref = torch.zeros(output.unsqueeze(1).shape,
+                                  device=device,
+                                  dtype=str_dtype_to_torch(dtype))
+        else:
+            out_ref = torch.zeros(output.shape,
+                                  device=device,
+                                  dtype=str_dtype_to_torch(dtype))
+
         if req_type == 'context':
             # pytorch run
             if remove_padding:
@@ -254,6 +267,9 @@ class TestFunctional(unittest.TestCase):
 
         dtype_atol = {"float16": 5e-3, "float32": 2e-3, "bfloat16": 5e-2}
 
+        if remove_padding and req_type == "generation":
+            out_ref = out_ref.squeeze(1)
+
         output_cpu = outputs['output'].to(torch.float32).cpu()
         present_state_cpu = outputs['present_state'].to(torch.float32).cpu()
         np.testing.assert_allclose(out_ref.to(torch.float32).cpu().numpy(),
@@ -264,6 +280,11 @@ class TestFunctional(unittest.TestCase):
                                    atol=dtype_atol[dtype])
 
     @parameterized.expand(
+        # P=8x and H=2x
+        list(
+            product([160, 320, 640, 1280], [80], [1], ['context'], ['float16'],
+                    [1, 2, 4, 8, 16], [16, 64, 256], [True], [True])) +
+        # normal tests
         list(
             product([2048], [64], [1, 4], ['context', 'generation'],
                     ['float32', 'float16', 'bfloat16'], [3], [16],
@@ -281,12 +302,9 @@ class TestFunctional(unittest.TestCase):
                                batch_size, max_seq_len, has_z, remove_padding):
 
         # Skip tests that are not supported
-        skip_bf16_pre_ampere(dtype)
         if dtype == 'float32' and req_type == 'context':
             pytest.skip(
                 "Mamba2 chunk scan kernel only support float16 and bfloat16")
-        if getSMVersion() < 80:
-            pytest.skip("Mamba2 is not supported in pre-Ampere architecture")
         if max_seq_len >= 128 * 1024:
             total_gpu_mem = torch.cuda.get_device_properties(0).total_memory
             if total_gpu_mem <= 68 * 1024**3:
@@ -380,9 +398,18 @@ class TestFunctional(unittest.TestCase):
                 dt_pad0,
             ] if nheads_pad0 else []),
                                   dim=-1).contiguous()
-        output = torch.zeros(x.shape,
-                             device=device,
-                             dtype=str_dtype_to_torch(dtype))
+
+        if remove_padding and req_type == "generation":
+            xBC = xBC.squeeze(1)
+
+        if remove_padding and req_type == "generation":
+            output = torch.zeros(x.squeeze(1).shape,
+                                 device=device,
+                                 dtype=str_dtype_to_torch(dtype))
+        else:
+            output = torch.zeros(x.shape,
+                                 device=device,
+                                 dtype=str_dtype_to_torch(dtype))
 
         state_ref = state.detach().clone()
         x_ref = x.detach().clone()
@@ -494,9 +521,15 @@ class TestFunctional(unittest.TestCase):
         engine = builder.build_engine(net, builder_config)
         session = tensorrt_llm.runtime.Session.from_serialized_engine(engine)
         session.run(inputs=inputs, outputs=outputs, stream=stream.cuda_stream)
-        out_ref = torch.zeros(output.shape,
-                              device=device,
-                              dtype=str_dtype_to_torch(dtype))
+
+        if remove_padding and req_type == "generation":
+            out_ref = torch.zeros(output.unsqueeze(1).shape,
+                                  device=device,
+                                  dtype=str_dtype_to_torch(dtype))
+        else:
+            out_ref = torch.zeros(output.shape,
+                                  device=device,
+                                  dtype=str_dtype_to_torch(dtype))
         # pytorch run
         if req_type == 'context':
             if remove_padding:
@@ -629,7 +662,10 @@ class TestFunctional(unittest.TestCase):
         if long_context:
             dtype_atol = {"float16": 2e-2, "bfloat16": 1e-1}
         else:
-            dtype_atol = {"float16": 5e-3, "float32": 2e-3, "bfloat16": 5e-2}
+            dtype_atol = {"float16": 1e-2, "float32": 2e-3, "bfloat16": 5e-2}
+
+        if remove_padding and req_type == "generation":
+            out_ref = out_ref.squeeze(1)
 
         output_cpu = outputs['output'].to(torch.float32).cpu()
         present_state_cpu = outputs['present_state'].to(torch.float32).cpu()

@@ -140,6 +140,8 @@ public:
         PeftCacheManagerConfig const& config, runtime::ModelConfig const& modelConfig,
         runtime::WorldConfig const& worldConfig, runtime::BufferManager const& bufferManager);
 
+    void prefetchLoraWeights(std::string const& modelDir, runtime::BufferManager const& bufferManager);
+
 private:
     std::unique_ptr<runtime::LoraCache> mHostLoraCache;
     std::unique_ptr<runtime::LoraCache> mDeviceLoraCache;

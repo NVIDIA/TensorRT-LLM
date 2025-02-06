@@ -147,3 +147,7 @@ target_link_libraries(
 add_executable(executorExampleFastLogits executorExampleFastLogits.cpp)
 target_link_libraries(executorExampleFastLogits nvinfer_plugin_tensorrt_llm
                       cxxopts::cxxopts ${MPI_C_LIBRARIES})
+
+add_executable(executorExampleDisaggregated executorExampleDisaggregated.cpp)
+target_link_libraries(executorExampleDisaggregated nvinfer_plugin_tensorrt_llm
+                      cxxopts::cxxopts ${MPI_C_LIBRARIES})

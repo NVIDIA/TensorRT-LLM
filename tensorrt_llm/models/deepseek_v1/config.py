@@ -80,7 +80,7 @@ class DeepSeekV1Config(PretrainedConfig):
             top_k=getattr(hf_config, 'num_experts_per_tok', 0),
             normalization_mode=getattr(
                 hf_config, 'moe_normalization_mode',
-                MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE),
+                MoeConfig.ExpertScaleNormalizationMode.NONE),
         )
         moe_config.validate()
         return cls(architecture=hf_config.architectures[0],

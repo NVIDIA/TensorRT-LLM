@@ -18,11 +18,11 @@
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
 
-filter_cuda_archs("70" SRC_CPP)
 filter_cuda_archs("80" SRC_CPP)
 filter_cuda_archs("86" SRC_CPP)
 filter_cuda_archs("89" SRC_CPP)
 filter_cuda_archs("90" SRC_CPP)
+filter_cuda_archs("120" SRC_CPP)
 
 add_library(context_attention_src OBJECT ${SRC_CPP} ${SRC_CU})
 set_property(TARGET context_attention_src PROPERTY POSITION_INDEPENDENT_CODE ON)
