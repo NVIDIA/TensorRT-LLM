@@ -465,8 +465,7 @@ public:
                 typename TransformBAfterLDS::result_type converted_frag_B
                     = lds_converter(warp_frag_B[warp_tileB_k_load_offset % 2]);
                 warp_dequantizer_.dequantize(converted_frag_B, warp_frag_scales, warp_frag_zero);
-                run_warp_mma(
-                    warp_mma, accum, warp_frag_A[warp_mma_k % 2], converted_frag_B, accum, warp_tileB_k_compute_offset);
+                warp_mma(accum, warp_frag_A[warp_mma_k % 2], converted_frag_B, accum, warp_tileB_k_compute_offset);
             }
 
             // Load the scales needed for the next tile iteration

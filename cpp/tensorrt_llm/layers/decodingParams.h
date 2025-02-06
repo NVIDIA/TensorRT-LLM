@@ -151,6 +151,7 @@ public:
     // baseSamplingLayer
     std::optional<std::vector<runtime::SizeType32>> runtimeTopK; // [1] or [setupBatchSize] on cpu
     std::optional<std::vector<float>> runtimeTopP;               // [1] or [setupBatchSize] on cpu
+    std::optional<std::vector<float>> runtimeMinP;               // [1] or [setupBatchSize] on cpu
 
     // topPSamplingLayer
     std::optional<std::vector<float>> topPDecay;                   // [setupBatchSize], must between [0, 1]
@@ -361,12 +362,14 @@ public:
     TensorPtr draftProbs;
     TensorPtr targetProbs;
     TensorPtr numDraftTokens;
+    TensorPtr numDraftTokensHost;
     TensorPtr draftTokenIds;
     TensorPtr useDraftLogits;
     TensorPtr useDraftLogitsHost;
-    runtime::SizeType32 step;
-    float constantThreshold;
-    bool useRandomAcceptanceThreshold;
+
+    runtime::SizeType32 step{};
+    float constantThreshold{};
+    bool useRandomAcceptanceThreshold{};
 
     //! optional parameters
     //! [localBatchSize]
@@ -529,6 +532,7 @@ public:
 
     //! [maxBatchSize] int* (2-d array), each int* has [maxBeamWidth, maxSeqLen]
     TensorPtr outputIdsPtr;
+    TensorPtr outputIdsPtrHost;
     //! [maxBatchSize] int* (2-d array), each int* has [maxBeamWidth, maxSeqLen]
     TensorPtr parentIdsPtr;
 

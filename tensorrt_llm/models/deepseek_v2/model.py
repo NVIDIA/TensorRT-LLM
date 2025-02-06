@@ -13,9 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Optional
 
 import torch
+import transformers
 
 from ..._utils import pad_vocab_size, torch_dtype_to_str
 from ...functional import Tensor, non_gated_version, recv, send
@@ -25,9 +27,11 @@ from ...layers import (MOE, AttentionMaskType, ColumnLinear,
 from ...mapping import Mapping
 from ...module import Module
 from ...plugin import init_all_reduce_helper
+from ..model_weights_loader import ModelWeightsLoader
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
                               PretrainedConfig)
-from .convert import convert_deepseekv2, create_trt_config_from_hf
+from .config import DeepSeekV2Config
+from .convert import convert_deepseekv2, load_weights_from_hf_safetensors
 
 
 class DeepseekV2DecoderLayer(Module):
@@ -37,7 +41,7 @@ class DeepseekV2DecoderLayer(Module):
         self.layer_idx = layer_idx
         self.config = config
 
-        ### Input layernorm in Deepseek v2 is same as Llama
+        # Input layernorm in Deepseek v2 is same as Llama
         self.input_layernorm = RmsNorm(normalized_shape=config.hidden_size,
                                        eps=config.norm_epsilon,
                                        dtype=config.dtype)
@@ -73,27 +77,18 @@ class DeepseekV2DecoderLayer(Module):
             tp_size=config.mapping.tp_size,
             tp_rank=config.mapping.tp_rank)
 
-        ### Added deepseek MoE and shared_experts
-        ### First decoder layer: MLA + dense MLP + input_layernorm(RMSNorm) + post_attention_layernorm(RMSNorm)
-        ### Rest decoder layer: MLA + MoE MLP + MoE Gate + shared_experts(MLP) + input_layernorm(RMSNorm) + post_attention_layernorm(RMSNorm)
-        ### Added MLA in co-testing phase, use standard attention for MoE testing
+        # Added deepseek MoE and shared_experts
+        # First decoder layer: MLA + dense MLP + input_layernorm(RMSNorm) + post_attention_layernorm(RMSNorm)
+        # Rest decoder layer: MLA + MoE MLP + MoE Gate + shared_experts(MLP) + input_layernorm(RMSNorm) + post_attention_layernorm(RMSNorm)
+        # Added MLA in co-testing phase, use standard attention for MoE testing
 
-        ### Distinguish dense MLP and MoE MLP
+        # Distinguish dense MLP and MoE MLP
         # dense_config = DenseConfig(intermediate_size=config.intermediate_size)
-        moe_config = MoeConfig(
-            num_experts=config.moe_num_experts,
-            shared_expert_intermediate_size=config.moe_num_shared_experts *
-            config.moe_inter_size,
-            top_k=config.moe_top_k,
-            normalization_mode=config.moe_renorm_mode,
-            device_limited_n_group=config.moe_n_group,
-            device_limited_topk_group=config.moe_topk_group,
-            device_limited_routed_scaling_factor=config.
-            moe_routed_scaling_factor)
+        moe_config = config.moe
+        # In case of moe_config is a dict
+        if isinstance(moe_config, dict):
+            moe_config = MoeConfig.from_dict(moe_config)
 
-        # layer_config = LayerMLPConfig(config=[dense_config, moe_config], moe_layer_idx_min=0,
-        #                             moe_layer_idx_max=config.num_hidden_layers,
-        #                             total_num_layers=config.num_hidden_layers)
         if moe_config.num_experts > 0 and layer_idx > 0:
             hidden_act = config.hidden_act
             mlp_hidden_size = config.moe_inter_size
@@ -120,7 +115,7 @@ class DeepseekV2DecoderLayer(Module):
                           tp_size=config.mapping.tp_size,
                           **mlp_kwargs)
 
-        ### Pose layernorm in Deepseek v2 is same as Llama
+        # Pose layernorm in Deepseek v2 is same as Llama
         self.post_layernorm = RmsNorm(normalized_shape=config.hidden_size,
                                       eps=config.norm_epsilon,
                                       dtype=config.dtype)
@@ -221,6 +216,7 @@ class DeepseekV2Model(Module):
 
 
 class DeepseekV2ForCausalLM(DecoderModelForCausalLM):
+    config_class = DeepSeekV2Config
 
     def __init__(self, config: PretrainedConfig):
         transformer = DeepseekV2Model(config)
@@ -240,26 +236,25 @@ class DeepseekV2ForCausalLM(DecoderModelForCausalLM):
         super().__init__(config, transformer, lm_head)
 
     @classmethod
-    def from_hugging_face(cls,
-                          hf_model,
-                          model_dir,
-                          dtype: str = 'auto',
-                          mapping: Optional[Mapping] = None,
-                          override_fields={},
-                          **kwargs):
-        assert hf_model is not None
+    def from_hugging_face(
+            cls,
+            model_dir,
+            dtype: str = 'auto',
+            hf_model: Optional[transformers.PreTrainedModel] = None,
+            use_preloading: bool = False,
+            use_safetensors_loading: bool = False,
+            mapping: Optional[Mapping] = None,
+            override_fields={},
+            **kwargs):
+
         if mapping is None:
             mapping = Mapping()
-        config = create_trt_config_from_hf(model_dir,
-                                           dtype,
-                                           mapping=mapping,
-                                           override_fields=override_fields)
-        print(config)
-        pretrained_config = PretrainedConfig.from_dict(config)
-        pretrained_config.set_rank(mapping.rank)  # TODO:remove this hack
-
+        pretrained_config = DeepSeekV2Config.from_hugging_face(model_dir,
+                                                               dtype=dtype,
+                                                               mapping=mapping,
+                                                               **kwargs)
         if dtype == 'auto':
-            dtype = getattr(config, 'torch_dtype', None)
+            dtype = getattr(pretrained_config, 'torch_dtype', None)
         if dtype is None:
             dtype = 'float16'
         if isinstance(dtype, torch.dtype):
@@ -273,13 +268,93 @@ class DeepseekV2ForCausalLM(DecoderModelForCausalLM):
             dtype = 'float16'
 
         deepseek = cls.from_config(pretrained_config)
-        weights = convert_deepseekv2(
-            hf_model,
-            config,
-            mapping,
-            dtype=dtype,
-            use_parallel_embedding=config.get('use_parallel_embedding', False),
-            sharding_dim=config.get('embedding_sharding_dim', 0))
-        deepseek.load(weights)
 
-        return deepseek
+        # If use_preloading is True, load the model from hf_model
+        # If use_safetensors_loading is True, load the model from safetensors
+        # if TRTLLM_DISABLE_UNIFIED_CONVERTER is not set, load the model use unified converter (recommended and default)
+        if use_preloading:
+            weights = convert_deepseekv2(
+                hf_model,
+                pretrained_config,
+                mapping,
+                dtype=dtype,
+                use_parallel_embedding=pretrained_config.use_parallel_embedding,
+                sharding_dim=pretrained_config.embedding_sharding_dim)
+            deepseek.load(weights)
+            return deepseek
+
+        if os.environ.get("TRTLLM_DISABLE_UNIFIED_CONVERTER") is None:
+
+            custom_dict = {}
+            rank_experts = mapping.ep_experts(pretrained_config.moe.num_experts)
+            for index, module in enumerate(deepseek.transformer.layers):
+
+                if pretrained_config.q_lora_rank is not None:
+                    module.attention.tllm_to_externel_key_dict = {
+                        "fused_q_proj": ["q_b_proj.weight", "kv_b_proj.weight"],
+                        "q_b_proj": "q_b_proj.weight",  #v2
+                        "q_a_proj": "q_a_proj.weight",  #v2
+                        "kv_b_proj": "kv_b_proj.weight",
+                        "q_a_layernorm": "q_a_layernorm"
+                    }
+                    module.attention.fused_a.tllm_to_externel_key_dict = {
+                        "fused_a": ["q_a_proj", "kv_a_proj_with_mqa"]
+                    }  #v2
+                else:
+                    module.attention.tllm_to_externel_key_dict = {
+                        "fused_q_proj": ["q_proj.weight",
+                                         "kv_b_proj.weight"],  #v2 lite
+                        "q_b_proj": "q_proj.weight",  #v2 lite
+                        "kv_b_proj": "kv_b_proj.weight",
+                        "q_a_layernorm": "q_a_layernorm"
+                    }
+                    module.attention.fused_a.tllm_to_externel_key_dict = {
+                        "fused_a": "kv_a_proj_with_mqa"
+                    }  # v2 lite
+
+                module.attention.kv_a_layernorm.tllm_to_externel_key_dict = {
+                    'kv_a_layernorm': 'kv_a_layernorm'
+                }
+
+                if index > 0:
+
+                    module.mlp.shared_expert.fc.tllm_to_externel_key_dict = {
+                        "fc": ["up_proj", "gate_proj"],
+                        "shared_expert": "shared_experts"
+                    }
+                    module.mlp.shared_expert.proj.tllm_to_externel_key_dict = {
+                        "shared_expert": "shared_experts"
+                    }
+                    module.mlp.fc.tllm_to_externel_key_dict = {
+                        "fc": [
+                            f"experts.{expert}.up_proj"
+                            for expert in rank_experts
+                        ] + [
+                            f"experts.{expert}.gate_proj"
+                            for expert in rank_experts
+                        ]
+                    }
+                    module.mlp.proj.tllm_to_externel_key_dict = {
+                        "proj": [
+                            f"experts.{expert}.down_proj"
+                            for expert in rank_experts
+                        ]
+                    }
+                    module.mlp.router.tllm_to_externel_key_dict = {
+                        "mlp": "mlp",
+                        "router": "gate"
+                    }
+
+            loader = ModelWeightsLoader(model_dir, custom_dict)
+            loader.generate_tllm_weights(deepseek)
+            return deepseek
+
+        if use_safetensors_loading:
+            weights = load_weights_from_hf_safetensors(
+                model_dir,
+                pretrained_config,
+                mapping,
+                use_parallel_embedding=pretrained_config.use_parallel_embedding,
+                sharding_dim=pretrained_config.embedding_sharding_dim)
+            deepseek.load(weights)
+            return deepseek

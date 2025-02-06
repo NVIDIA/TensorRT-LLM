@@ -93,18 +93,18 @@ namespace detail
 {
 
 /// Partial specialization for bfloat16_t <= int32_t x 8 epilogues avoids shared memory bank conflicts.
-template <typename ThreadblockShape, typename WarpShape, typename InstructionShape, typename ThreadMap>
-struct DefaultIteratorsTensorOp<cutlass::bfloat16_t, int32_t, 8, ThreadblockShape, WarpShape, InstructionShape,
-    ThreadMap>
-{
-    using WarpTileIterator
-        = cutlass::epilogue::warp::TileIteratorTensorOpMixed<WarpShape, InstructionShape, int32_t, 32, 16, 8, 8>;
-
-    using SharedLoadIterator
-        = cutlass::epilogue::threadblock::SharedLoadIteratorMixed<ThreadMap, int32_t, 32, 16, 8, 8>;
-
-    static int const kFragmentsPerIteration = 2;
-};
+// template <typename ThreadblockShape, typename WarpShape, typename InstructionShape, typename ThreadMap>
+// struct DefaultIteratorsTensorOp<cutlass::bfloat16_t, int32_t, 8, ThreadblockShape, WarpShape, InstructionShape,
+//     ThreadMap>
+// {
+//     using WarpTileIterator
+//         = cutlass::epilogue::warp::TileIteratorTensorOpMixed<WarpShape, InstructionShape, int32_t, 32, 16, 8, 8>;
+//
+//     using SharedLoadIterator
+//         = cutlass::epilogue::threadblock::SharedLoadIteratorMixed<ThreadMap, int32_t, 32, 16, 8, 8>;
+//
+//     static int const kFragmentsPerIteration = 2;
+// };
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 

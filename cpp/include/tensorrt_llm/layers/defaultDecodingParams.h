@@ -114,6 +114,11 @@ public:
     {
         return 1 << 30;
     }
+
+    [[nodiscard]] __host__ __device__ static constexpr float getMinP()
+    {
+        return 0.0f;
+    }
 };
 } // namespace layers
 } // namespace tensorrt_llm

@@ -25,6 +25,7 @@ import pytest
 import torch
 from parameterized import parameterized
 from transformers import MistralConfig, MistralForCausalLM
+from transformers.cache_utils import DynamicCache
 
 import tensorrt_llm
 from tensorrt_llm import Builder
@@ -37,8 +38,7 @@ from tensorrt_llm.plugin.plugin import ContextFMHAType
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root
-from utils.util import (skip_bf16_pre_ampere, skip_fp32_accum_pre_ampere,
-                        unittest_name_func)
+from utils.util import unittest_name_func
 
 
 class TestMistralAndArctic(unittest.TestCase):
@@ -203,10 +203,6 @@ class TestMistralAndArctic(unittest.TestCase):
                        num_kv_heads,
                        residual_mlp,
                        is_arctic=False):
-        # Skip tests that are not supported in pre-ampere architecture
-        skip_bf16_pre_ampere(dtype)
-        skip_fp32_accum_pre_ampere(context_fmha_flag)
-
         PRECHECKED_GOOD_RANDOM_SEEDS = [1, 4, 5, 8]
         model = 'llama'
         log_level = 'error'
@@ -283,7 +279,7 @@ class TestMistralAndArctic(unittest.TestCase):
             with torch.no_grad():
                 hf_outputs = hf_mistral.forward(ctx_ids,
                                                 use_cache=True,
-                                                past_key_values=[])
+                                                past_key_values=DynamicCache())
             torch.cuda.synchronize()
             ref = hf_outputs.logits[:, -1, :]
 

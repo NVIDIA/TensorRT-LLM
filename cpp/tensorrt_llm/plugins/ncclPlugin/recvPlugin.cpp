@@ -132,8 +132,13 @@ int RecvPlugin::initialize() noexcept
     }
     ncclUniqueId id;
     COMM_SESSION.recvValue(id, mSrcRank, 0);
-    // Need static connection initialization for accurate KV cache size estimation
+// Need static connection initialization for accurate KV cache size estimation
+#if defined(_WIN32)
+    if (getenv("NCCL_RUNTIME_CONNECT") == nullptr)
+        _putenv_s("NCCL_RUNTIME_CONNECT", "0");
+#else
     setenv("NCCL_RUNTIME_CONNECT", "0", 0);
+#endif // _WIN32
     NCCLCHECK(ncclCommInitRank(&mComm, 2, id, 1));
     return 0;
 }
@@ -157,7 +162,7 @@ void RecvPlugin::serialize(void* buffer) const noexcept
     char *d = static_cast<char*>(buffer), *a = d;
     write(d, mType);
     write(d, mSrcRank);
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 }
 
 void RecvPlugin::destroy() noexcept
@@ -197,8 +202,8 @@ PluginFieldCollection const* RecvPluginCreator::getFieldNames() noexcept
 IPluginV2* RecvPluginCreator::createPlugin(char const* name, PluginFieldCollection const* fc) noexcept
 {
     PluginField const* fields = fc->fields;
-    int srcRank;
-    nvinfer1::DataType type;
+    int srcRank{};
+    nvinfer1::DataType type{};
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {

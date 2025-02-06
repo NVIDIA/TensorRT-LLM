@@ -40,6 +40,7 @@ from tensorrt_llm.models.modeling_utils import PretrainedConfig, PretrainedModel
 from tensorrt_llm.module import Module, ModuleList
 from tensorrt_llm.parameter import Parameter
 from tensorrt_llm.plugin.plugin import current_all_reduce_helper
+from tensorrt_llm.quantization import QuantMode
 
 layernorm_map = {
     LayerNormType.LayerNorm: LayerNorm,
@@ -54,7 +55,7 @@ mlp_map = {
 }
 
 
-class EncDecEmbedding(Module):
+class EncDecTransformer(Module):
 
     def __init__(self,
                  vocab_size,
@@ -69,26 +70,19 @@ class EncDecEmbedding(Module):
                  dtype=None,
                  use_parallel_embedding=False,
                  embedding_sharding_dim=0,
-                 mapping=Mapping()):
+                 mapping=Mapping(),
+                 has_model_final_layernorm=False,
+                 norm_epsilon=1e-05,
+                 is_decoder=False):
         super().__init__()
 
         self.layernorm_type = layernorm_type
         ln_type = layernorm_map[layernorm_type]
+        self.mapping = mapping
 
-        self.vocab_embedding = Embedding(
-            vocab_size,
-            hidden_size,
-            dtype=dtype,
-            tp_size=mapping.tp_size if use_parallel_embedding else 1,
-            tp_group=mapping.tp_group if use_parallel_embedding else None,
-            sharding_dim=embedding_sharding_dim,
-            tp_rank=mapping.tp_rank)
-
-        self.position_embedding = None
-        self.max_position_embeddings = max_position_embeddings
-        if has_position_embedding:
-            self.position_embedding = Embedding(
-                max_position_embeddings,
+        if self.mapping.is_first_pp_rank():
+            self.vocab_embedding = Embedding(
+                vocab_size,
                 hidden_size,
                 dtype=dtype,
                 tp_size=mapping.tp_size if use_parallel_embedding else 1,
@@ -96,39 +90,65 @@ class EncDecEmbedding(Module):
                 sharding_dim=embedding_sharding_dim,
                 tp_rank=mapping.tp_rank)
 
-        self.token_type_embedding = None
-        if type_vocab_size:
-            self.token_type_embedding = Embedding(
-                type_vocab_size,
-                hidden_size,
-                dtype=dtype,
-                tp_size=mapping.tp_size if use_parallel_embedding else 1,
-                tp_group=mapping.tp_group if use_parallel_embedding else None,
-                sharding_dim=embedding_sharding_dim,
-                tp_rank=mapping.tp_rank)
+            self.position_embedding = None
+            self.max_position_embeddings = max_position_embeddings
+            if has_position_embedding:
+                self.position_embedding = Embedding(
+                    max_position_embeddings,
+                    hidden_size,
+                    dtype=dtype,
+                    tp_size=mapping.tp_size if use_parallel_embedding else 1,
+                    tp_group=mapping.tp_group
+                    if use_parallel_embedding else None,
+                    sharding_dim=embedding_sharding_dim,
+                    tp_rank=mapping.tp_rank)
 
-        # e.g. BART true, T5 false
-        self.embedding_layernorm = None
-        if has_embedding_layernorm:
-            self.embedding_layernorm = ln_type(normalized_shape=hidden_size,
-                                               eps=layernorm_eps,
-                                               dtype=dtype)
+            self.token_type_embedding = None
+            if type_vocab_size:
+                self.token_type_embedding = Embedding(
+                    type_vocab_size,
+                    hidden_size,
+                    dtype=dtype,
+                    tp_size=mapping.tp_size if use_parallel_embedding else 1,
+                    tp_group=mapping.tp_group
+                    if use_parallel_embedding else None,
+                    sharding_dim=embedding_sharding_dim,
+                    tp_rank=mapping.tp_rank)
 
-        # e.g. BART true, T5 false
-        self.embedding_scale = 1.0
-        if has_embedding_scale:
-            self.embedding_scale = math.sqrt(hidden_size)
+            # e.g. BART true, T5 false
+            self.ln_embed = None
+            if has_embedding_layernorm:
+                self.ln_embed = ln_type(normalized_shape=hidden_size,
+                                        eps=layernorm_eps,
+                                        dtype=dtype)
 
-        # Note: embedding offset in BART is not considered as a standard. For the specific case,
-        # we just need to shrink its position embedding table by [offset:] during weight loading
+            # e.g. BART true, T5 false
+            self.embedding_scale = 1.0
+            if has_embedding_scale:
+                self.embedding_scale = math.sqrt(hidden_size)
 
-    def forward(self,
-                input_ids,
-                position_ids=None,
-                token_type_ids=None,
-                prompt_embedding_table=None,
-                prompt_tasks=None,
-                prompt_vocab_size=None):
+            # Note: embedding offset in BART is not considered as a standard. For the specific case,
+            # we just need to shrink its position embedding table by [offset:] during weight loading
+
+        self.layers = None
+        self.is_decoder = is_decoder
+        self.has_model_final_layernorm = has_model_final_layernorm
+        if self.mapping.is_last_pp_rank():
+            if self.has_model_final_layernorm:
+                self.ln_f = ln_type(normalized_shape=hidden_size,
+                                    eps=norm_epsilon,
+                                    dtype=dtype)
+
+    def assign_layers(self, layers):
+        self.layers = layers
+
+    def embedding(self,
+                  input_ids,
+                  position_ids=None,
+                  token_type_ids=None,
+                  prompt_embedding_table=None,
+                  prompt_tasks=None,
+                  prompt_vocab_size=None):
         # position_ids and token_type_ids are provided inputs
         # and should not be formulated deterministically
 
@@ -145,8 +165,8 @@ class EncDecEmbedding(Module):
         if self.token_type_embedding:
             x = x + self.token_type_embedding(token_type_ids)
 
-        if self.embedding_layernorm:
-            x = self.embedding_layernorm(x)
+        if self.ln_embed:
+            x = self.ln_embed(x)
 
         return x
 
@@ -174,7 +194,8 @@ class EncoderLayer(Module):
                  relative_attention=False,
                  max_distance=0,
                  num_buckets=0,
-                 fp16_clamping=False):
+                 fp16_clamping=False,
+                 quant_mode=QuantMode(0)):
         super().__init__()
 
         # e.g. BART regular, T5 RMS
@@ -199,7 +220,8 @@ class EncoderLayer(Module):
             dtype=dtype,
             relative_attention=relative_attention,
             max_distance=max_distance,
-            num_buckets=num_buckets)
+            num_buckets=num_buckets,
+            quant_mode=quant_mode)
 
         self.attention_layernorm = ln_type(normalized_shape=hidden_size,
                                            eps=layernorm_eps,
@@ -216,6 +238,7 @@ class EncoderLayer(Module):
             tp_group=mapping.tp_group,
             tp_size=mapping.tp_size,
             dtype=dtype,
+            quant_mode=quant_mode,
         )
 
         self.mlp_layernorm = ln_type(normalized_shape=hidden_size,
@@ -310,7 +333,8 @@ class DecoderLayer(Module):
                  num_buckets=0,
                  fp16_clamping=False,
                  skip_cross_kv=False,
-                 use_implicit_relative_attention=False):
+                 use_implicit_relative_attention=False,
+                 quant_mode=QuantMode(0)):
         super().__init__()
 
         # e.g. BART regular, T5 RMS
@@ -341,7 +365,8 @@ class DecoderLayer(Module):
             num_buckets=num_buckets,
             position_embedding_type=PositionEmbeddingType.relative
             if relative_attention else PositionEmbeddingType.learned_absolute,
-            use_implicit_relative_attention=use_implicit_relative_attention)
+            use_implicit_relative_attention=use_implicit_relative_attention,
+            quant_mode=quant_mode)
 
         self.self_attention_layernorm = ln_type(normalized_shape=hidden_size,
                                                 eps=layernorm_eps,
@@ -374,7 +399,8 @@ class DecoderLayer(Module):
             max_distance=max_distance,
             num_buckets=num_buckets,
             position_embedding_type=PositionEmbeddingType.learned_absolute,
-            skip_cross_kv=skip_cross_kv)
+            skip_cross_kv=skip_cross_kv,
+            quant_mode=quant_mode)
 
         self.cross_attention_layernorm = ln_type(normalized_shape=hidden_size,
                                                  eps=layernorm_eps,
@@ -391,6 +417,7 @@ class DecoderLayer(Module):
             tp_group=mapping.tp_group,
             tp_size=mapping.tp_size,
             dtype=dtype,
+            quant_mode=quant_mode,
         )
 
         self.mlp_layernorm = ln_type(normalized_shape=hidden_size,
@@ -517,7 +544,6 @@ class EncoderModel(PretrainedModel):
 
         # e.g. BART regular, T5 RMS
         self.layernorm_type = self.config.layernorm_type
-        ln_type = layernorm_map[self.layernorm_type]
 
         # e.g. BART true, T5 false
         self.has_attention_qkvo_bias = self.config.has_attention_qkvo_bias
@@ -544,23 +570,25 @@ class EncoderModel(PretrainedModel):
         self.mlp_type = MLPType.MLP if not hasattr(
             self.config, "mlp_type") else self.config.mlp_type
 
-        if self.mapping.is_first_pp_rank():
-            self.embedding = EncDecEmbedding(
-                self.config.vocab_size,
-                self.config.hidden_size,
-                max_position_embeddings=self.config.max_position_embeddings,
-                has_position_embedding=self.has_position_embedding,
-                type_vocab_size=type_vocab_size,
-                has_embedding_layernorm=self.config.has_embedding_layernorm,
-                has_embedding_scale=self.config.has_embedding_scale,
-                layernorm_eps=self.config.norm_epsilon,
-                layernorm_type=self.layernorm_type,
-                dtype=self.config.dtype,
-                use_parallel_embedding=self.config.use_parallel_embedding,
-                embedding_sharding_dim=self.config.embedding_sharding_dim,
-                mapping=self.mapping)
+        self.transformer = EncDecTransformer(
+            self.config.vocab_size,
+            self.config.hidden_size,
+            max_position_embeddings=self.config.max_position_embeddings,
+            has_position_embedding=self.has_position_embedding,
+            type_vocab_size=type_vocab_size,
+            has_embedding_layernorm=self.config.has_embedding_layernorm,
+            has_embedding_scale=self.config.has_embedding_scale,
+            layernorm_eps=self.config.norm_epsilon,
+            layernorm_type=self.layernorm_type,
+            dtype=self.config.dtype,
+            use_parallel_embedding=self.config.use_parallel_embedding,
+            embedding_sharding_dim=self.config.embedding_sharding_dim,
+            mapping=self.mapping,
+            has_model_final_layernorm=self.has_model_final_layernorm,
+            norm_epsilon=self.config.norm_epsilon,
+            is_decoder=False)
 
-        self.encoder_layers = ModuleList([
+        encoder_layers = ModuleList([
             EncoderLayer(
                 hidden_size=self.hidden_size,
                 ffn_hidden_size=self.config.intermediate_size,
@@ -584,16 +612,11 @@ class EncoderModel(PretrainedModel):
                 relative_attention=self.config.relative_attention,
                 max_distance=self.config.max_distance,
                 num_buckets=self.config.num_buckets,
-                fp16_clamping=self.fp16_clamping)
+                fp16_clamping=self.fp16_clamping,
+                quant_mode=self.config.quant_mode)
             for _ in self.mapping.pp_layers(self.total_num_layers)
         ])
-
-        if self.mapping.is_last_pp_rank():
-            if self.has_model_final_layernorm:
-                self.final_layernorm = ln_type(
-                    normalized_shape=self.config.hidden_size,
-                    eps=self.config.norm_epsilon,
-                    dtype=self.config.dtype)
+        self.transformer.assign_layers(encoder_layers)
 
     def check_config(self, config: PretrainedConfig):
         config.set_if_not_exist('has_position_embedding', False)
@@ -639,14 +662,15 @@ class EncoderModel(PretrainedModel):
                 prompt_embedding_table, prompt_tasks, prompt_vocab_size
             ] if prompt_embedding_table is not None else []
 
-            hidden_states = self.embedding(input_ids, position_ids,
-                                           token_type_ids, *ptuning_args)
+            hidden_states = self.transformer.embedding(input_ids, position_ids,
+                                                       token_type_ids,
+                                                       *ptuning_args)
             self.register_network_output('embedding_layer_output',
                                          hidden_states)
         else:
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
 
-        for layer_idx, encoder_layer in enumerate(self.encoder_layers):
+        for layer_idx, encoder_layer in enumerate(self.transformer.layers):
             lora_layer_params = None
             if lora_params is not None and lora_params.lora_ranks is not None:
                 lora_layer_params = lora_params.get_layer_params(layer_idx)
@@ -658,7 +682,7 @@ class EncoderModel(PretrainedModel):
 
         if self.mapping.is_last_pp_rank():
             if self.has_model_final_layernorm:
-                hidden_states = self.final_layernorm(hidden_states)
+                hidden_states = self.transformer.ln_f(hidden_states)
             hidden_states.mark_output('encoder_output', self._dtype)
         else:
             hidden_states = send(hidden_states, self.mapping.next_pp_rank())
@@ -854,9 +878,9 @@ class EncoderModel(PretrainedModel):
                     lora_weight_pointer = Tensor(
                         name=f'{lora_module}_lora_weights_pointers_{i}',
                         dtype=trt.int64,
-                        shape=[-1, 2],
+                        shape=[-1, 3],
                         dim_range=OrderedDict([('batch_size', [bs_range]),
-                                               ('in_out', [2])]))
+                                               ('in_out_scales', [3])]))
                     lora_weight_pointer_dict.update({
                         f'{lora_module}_lora_weights_pointers':
                         lora_weight_pointer
@@ -915,8 +939,8 @@ class EncoderModel(PretrainedModel):
         use_lora(self, lora_config)
 
     def use_prompt_tuning(self):
-        embedding = self.embedding.vocab_embedding
-        self.embedding.vocab_embedding = PromptTuningEmbedding(
+        embedding = self.transformer.vocab_embedding
+        self.transformer.vocab_embedding = PromptTuningEmbedding(
             num_embeddings=embedding.num_embeddings,
             embedding_dim=embedding.embedding_dim,
             dtype=embedding.dtype,
@@ -925,7 +949,7 @@ class EncoderModel(PretrainedModel):
             sharding_dim=embedding.sharding_dim,
             tp_rank=embedding.tp_rank)
 
-        self.embedding.vocab_embedding.weight.value = embedding.weight.raw_value
+        self.transformer.vocab_embedding.weight.value = embedding.weight.raw_value
 
     def precompute_relative_attention_bias(self, build_config):
         pass
@@ -946,7 +970,6 @@ class DecoderModel(PretrainedModel):
 
         # e.g. BART regular, T5 RMS
         self.layernorm_type = self.config.layernorm_type
-        ln_type = layernorm_map[self.layernorm_type]
 
         # e.g. BART true, T5 false
         self.has_attention_qkvo_bias = self.config.has_attention_qkvo_bias
@@ -993,24 +1016,26 @@ class DecoderModel(PretrainedModel):
         self.use_implicit_relative_attention = self.config.use_implicit_relative_attention if hasattr(
             self.config, "use_implicit_relative_attention") else False
 
-        if self.mapping.is_first_pp_rank():
-            self.embedding = EncDecEmbedding(
-                self.config.vocab_size,
-                self.config.hidden_size,
-                max_position_embeddings=self.config.max_position_embeddings,
-                has_position_embedding=self.config.has_position_embedding,
-                type_vocab_size=type_vocab_size,
-                has_embedding_layernorm=self.config.has_embedding_layernorm,
-                has_embedding_scale=self.config.has_embedding_scale,
-                layernorm_eps=self.config.norm_epsilon,
-                layernorm_type=self.config.layernorm_type,
-                dtype=self._dtype,
-                use_parallel_embedding=self.config.use_parallel_embedding,
-                embedding_sharding_dim=self.config.embedding_sharding_dim,
-                mapping=self.mapping)
+        self.transformer = EncDecTransformer(
+            self.config.vocab_size,
+            self.config.hidden_size,
+            max_position_embeddings=self.config.max_position_embeddings,
+            has_position_embedding=self.config.has_position_embedding,
+            type_vocab_size=type_vocab_size,
+            has_embedding_layernorm=self.config.has_embedding_layernorm,
+            has_embedding_scale=self.config.has_embedding_scale,
+            layernorm_eps=self.config.norm_epsilon,
+            layernorm_type=self.config.layernorm_type,
+            dtype=self._dtype,
+            use_parallel_embedding=self.config.use_parallel_embedding,
+            embedding_sharding_dim=self.config.embedding_sharding_dim,
+            mapping=self.mapping,
+            has_model_final_layernorm=self.has_model_final_layernorm,
+            norm_epsilon=self.config.norm_epsilon,
+            is_decoder=True)
 
         layers_range = self.mapping.pp_layers(self.total_num_layers)
-        self.decoder_layers = ModuleList([
+        decoder_layers = ModuleList([
             DecoderLayer(
                 local_layer_idx=layer_idx - layers_range[0],
                 hidden_size=self.config.hidden_size,
@@ -1036,16 +1061,12 @@ class DecoderModel(PretrainedModel):
                 fp16_clamping=self.fp16_clamping,
                 skip_cross_kv=self.skip_cross_kv,
                 use_implicit_relative_attention=self.
-                use_implicit_relative_attention) for layer_idx in layers_range
+                use_implicit_relative_attention,
+                quant_mode=self.config.quant_mode) for layer_idx in layers_range
         ])
+        self.transformer.assign_layers(decoder_layers)
 
         if self.mapping.is_last_pp_rank():
-            if self.has_model_final_layernorm:
-                self.final_layernorm = ln_type(
-                    normalized_shape=self.config.hidden_size,
-                    eps=self.config.norm_epsilon,
-                    dtype=self.config.dtype)
-
             self.lm_head = ColumnLinear(
                 self.config.hidden_size,
                 self.config.vocab_size,
@@ -1121,20 +1142,21 @@ class DecoderModel(PretrainedModel):
 
         # In PP, layer 0 has ids as inputs, all other layers have hidden_states as inputs
         if self.mapping.is_first_pp_rank():
-            hidden_states = self.embedding(decoder_input_ids, position_ids,
-                                           token_type_ids)
+            hidden_states = self.transformer.embedding(decoder_input_ids,
+                                                       position_ids,
+                                                       token_type_ids)
             self.register_network_output('embedding_layer_output',
                                          hidden_states)
         else:
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
 
-        kv_cache_params.fill_none_tensor_list(len(self.decoder_layers))
+        kv_cache_params.fill_none_tensor_list(len(self.transformer.layers))
 
         if use_cache:
             presents = []
 
         for i, (decoder_layer, past) in enumerate(
-                zip(self.decoder_layers, kv_cache_params.past_key_value)):
+                zip(self.transformer.layers, kv_cache_params.past_key_value)):
 
             lora_layer_params = None
             if lora_params is not None and lora_params.lora_ranks is not None:
@@ -1185,7 +1207,7 @@ class DecoderModel(PretrainedModel):
 
         if self.mapping.is_last_pp_rank():
             if self.has_model_final_layernorm:
-                hidden_states = self.final_layernorm(hidden_states)
+                hidden_states = self.transformer.ln_f(hidden_states)
 
             # [bs, seq, hidden_size] or [num_tokens, hidden_size] -> [bs, hidden_size]
             hidden_states = gather_last_token_logits(
@@ -1230,7 +1252,6 @@ class DecoderModel(PretrainedModel):
                        max_seq_len,
                        max_encoder_input_len,
                        gather_context_logits: bool = False,
-                       gather_generation_logits: bool = False,
                        lora_target_modules: List[str] = None,
                        use_cache=True,
                        *args,
@@ -1608,9 +1629,10 @@ class DecoderModel(PretrainedModel):
                     lora_weight_pointer = Tensor(
                         name=f'{lora_module}_lora_weights_pointers_{i}',
                         dtype=trt.int64,
-                        shape=[-1, 2],
+                        shape=[-1, 3],
                         dim_range=OrderedDict([('batch_size_beam_width',
-                                                [bb_range]), ('in_out', [2])]))
+                                                [bb_range]),
+                                               ('in_out_scales', [3])]))
                     lora_weight_pointer_dict.update({
                         f'{lora_module}_lora_weights_pointers':
                         lora_weight_pointer
@@ -1909,7 +1931,7 @@ class DecoderModel(PretrainedModel):
                 self.config.max_distance,
             )
             for layer_idx in range(self.num_layers):
-                self.decoder_layers[
+                self.transformer.layers[
                     layer_idx].self_attention.set_rel_attn_table(
                         build_config.max_seq_len, rel_attn_precomputed)
 
@@ -1919,23 +1941,17 @@ class WhisperEncoder(PretrainedModel):
     def __init__(self, config: PretrainedConfig):
         super().__init__(config)
         self._dtype = self.config.dtype
-        # Encoder conv needs to run in fp32 on Volta/Turing
-        major, minor = torch.cuda.get_device_capability()
-        if major >= 8:
-            self._conv_dtype = self._dtype
-        else:
-            self._conv_dtype = "float32"
         self.conv1 = Conv1d(config.n_mels,
                             config.hidden_size,
                             kernel_size=3,
                             padding=1,
-                            dtype=self._conv_dtype)
+                            dtype=self._dtype)
         self.conv2 = Conv1d(config.hidden_size,
                             config.hidden_size,
                             kernel_size=3,
                             stride=2,
                             padding=1,
-                            dtype=self._conv_dtype)
+                            dtype=self._dtype)
         self.position_embedding = Embedding(self.config.max_position_embeddings,
                                             self.config.hidden_size,
                                             dtype=self.config.dtype)
@@ -1965,9 +1981,8 @@ class WhisperEncoder(PretrainedModel):
             # BXT,D -> 1,BxT,D -> 1,D,BxT
             input_features = unsqueeze(input_features, 0)
             input_features = transpose(input_features, 1, 2)
-        # Encoder conv needs to run in fp32 on Volta/Turing
         x_type = input_features.dtype
-        input_features = cast(input_features, self._conv_dtype)
+        input_features = cast(input_features, self._dtype)
         x = self.conv1(input_features)
         x = gelu(x)
         x = self.conv2(x)

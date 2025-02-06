@@ -17,7 +17,7 @@ import struct
 import sys
 from typing import List, Tuple
 
-from cuda import cudart
+from cuda import cuda, cudart
 from cuda.cudart import cudaError_t
 
 from ._utils import mpi_comm
@@ -27,6 +27,11 @@ from .mapping import Mapping
 
 def _raise_if_error(error: cudaError_t):
     if error != cudaError_t.cudaSuccess:
+        raise RuntimeError(error)
+
+
+def _raise_if_error(error: cuda.CUresult):
+    if error != cuda.CUresult.CUDA_SUCCESS:
         raise RuntimeError(error)
 
 

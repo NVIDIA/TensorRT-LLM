@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2020-2024, NVIDIA CORPORATION. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -72,12 +72,16 @@ public:
         unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ, unsigned int sharedMemBytes,
         CUstream hStream, void** kernelParams, void** extra) const;
 
+    CUresult cuLaunchKernelEx(CUlaunchConfig const* config, CUfunction f, void** kernelParams, void** extra) const;
+
     CUresult cuTensorMapEncodeTiled(CUtensorMap* tensorMap, CUtensorMapDataType tensorDataType, cuuint32_t tensorRank,
         void* globalAddress, cuuint64_t const* globalDim, cuuint64_t const* globalStrides, cuuint32_t const* boxDim,
         cuuint32_t const* elementStrides, CUtensorMapInterleave interleave, CUtensorMapSwizzle swizzle,
         CUtensorMapL2promotion l2Promotion, CUtensorMapFloatOOBfill oobFill) const;
 
     CUresult cuMemcpyDtoH(void* dstHost, CUdeviceptr srcDevice, size_t ByteCount) const;
+
+    CUresult cuDeviceGetAttribute(int* pi, CUdevice_attribute attrib, CUdevice dev) const;
 
 private:
     void* handle;
@@ -101,11 +105,13 @@ private:
     CUresult (*_cuLaunchKernel)(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
         unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ, unsigned int sharedMemBytes,
         CUstream hStream, void** kernelParams, void** extra);
+    CUresult (*_cuLaunchKernelEx)(CUlaunchConfig const* config, CUfunction f, void** kernelParams, void** extra);
     CUresult (*_cuTensorMapEncodeTiled)(CUtensorMap* tensorMap, CUtensorMapDataType tensorDataType,
         cuuint32_t tensorRank, void* globalAddress, cuuint64_t const* globalDim, cuuint64_t const* globalStrides,
         cuuint32_t const* boxDim, cuuint32_t const* elementStrides, CUtensorMapInterleave interleave,
         CUtensorMapSwizzle swizzle, CUtensorMapL2promotion l2Promotion, CUtensorMapFloatOOBfill oobFill);
     CUresult (*_cuMemcpyDtoH)(void* dstHost, CUdeviceptr srcDevice, size_t ByteCount);
+    CUresult (*_cuDeviceGetAttribute)(int*, CUdevice_attribute attrib, CUdevice dev);
 };
 
 template <typename T>

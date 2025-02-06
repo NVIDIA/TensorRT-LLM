@@ -98,6 +98,21 @@ public:
         // For Eagle-2
         //! [1]
         TensorPtr useDynamicTreeHost;
+        //! [1]
+        TensorPtr dynamicTreeMaxTopKHost;
+        //! [maxBatchSize, maxDecodingDraftTokens] or [numSequences, maxDecodingDraftTokens]
+        TensorPtr prevScores;
+        //! [maxBatchSize, maxDecodingDraftTokens] or [numSequences, maxDecodingDraftTokens]
+        TensorPtr currentExpandIndices;
+        //! [maxBatchSize, numEagleLayers, maxDecodingDraftTokens * maxDecodingDraftTokens] or [numSequences,
+        //! numEagleLayers, maxDecodingDraftTokens * maxDecodingDraftTokens]
+        TensorPtr allLayersScores;
+        //! [maxBatchSize, numEagleLayers, maxDecodingDraftTokens * maxDecodingDraftTokens] or [numSequences,
+        //! numEagleLayers, maxDecodingDraftTokens * maxDecodingDraftTokens]
+        TensorPtr allLayersDraftTokenIds;
+        //! [maxBatchSize, numEagleLayers, maxDecodingDraftTokens * maxDecodingDraftTokens] or [numSequences,
+        //! numEagleLayers, maxDecodingDraftTokens * maxDecodingDraftTokens]
+        TensorPtr allLayersDraftTokenIdsPredecessor;
 
         void create(SizeType32 maxNumSequences, runtime::TllmRuntime const& runtime,
             runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig);

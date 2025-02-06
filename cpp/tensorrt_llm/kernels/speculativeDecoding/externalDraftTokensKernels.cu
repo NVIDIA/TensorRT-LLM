@@ -126,7 +126,7 @@ __global__ void acceptDraftTokensKernel(T const* draftProbs, T* targetProbs, Siz
     auto const numDraftTokens = numsDraftTokens[batchSlotBeamWidth];
     auto const useDraftLogits = batchUseDraftLogits[batchSlotBeamWidth];
 
-    if (draftTokenIdx > numDraftTokens || finishedInput[batchSlot].isSkipDecoding()
+    if (numDraftTokens == 0 || draftTokenIdx > numDraftTokens || finishedInput[batchSlot].isSkipDecoding()
         || finishedInput[batchSlot].isFinished())
     {
         if (tid == 0)
@@ -145,6 +145,17 @@ __global__ void acceptDraftTokensKernel(T const* draftProbs, T* targetProbs, Siz
         return;
     }
 
+    if (draftTokenIdx == numDraftTokens)
+    {
+        if (tid == 0)
+        {
+            batchIsAccepted[batchSlot] = false;
+            finishedOutput[batchSlot].setSkipDecoding();
+        }
+        return;
+    }
+    // else (draftTokenIdx < numDraftTokens)
+
     auto const logitsOffset = (batchSlot * maxDraftTokens + draftTokenIdx) * beamWidth * vocabSize;
     auto const draftProbsBatch = draftProbs + logitsOffset;
     auto const targetProbsBatch = targetProbs + (batchIdx * beamWidth * vocabSize);
@@ -153,29 +164,21 @@ __global__ void acceptDraftTokensKernel(T const* draftProbs, T* targetProbs, Siz
     __shared__ T sSumVal;
     if (tid == 0)
     {
-        if (draftTokenIdx < numDraftTokens)
+        auto const draftOutputTokenId = draftIds[batchSlot * maxDraftTokens + draftTokenIdx];
+        if (useDraftLogits)
         {
-            auto const draftOutputTokenId = draftIds[batchSlot * maxDraftTokens + draftTokenIdx];
-            if (useDraftLogits)
-            {
-                float threshold = randomThreshold ? curand_uniform(curandState + batchSlot) : constantThreshold;
-                auto const targetProb = static_cast<float>(targetProbsBatch[draftOutputTokenId]);
-                auto const draftProb = static_cast<float>(draftProbsBatch[draftOutputTokenId]);
-                isAccepted = targetProb > threshold * draftProb;
-            }
-            else
-            {
-                // Check if draft tokens are the same as target tokens
-                isAccepted = targetOutputIds[batchSlot] == draftOutputTokenId;
-            }
-            if (!isAccepted)
-            {
-                finishedOutput[batchSlot].setSkipDecoding();
-            }
+            float threshold = randomThreshold ? curand_uniform(curandState + batchSlot) : constantThreshold;
+            auto const targetProb = static_cast<float>(targetProbsBatch[draftOutputTokenId]);
+            auto const draftProb = static_cast<float>(draftProbsBatch[draftOutputTokenId]);
+            isAccepted = targetProb > threshold * draftProb;
         }
-        else // draftTokenIdx == numDraftTokens
+        else
         {
-            isAccepted = false;
+            // Check if draft tokens are the same as target tokens
+            isAccepted = targetOutputIds[batchSlot] == draftOutputTokenId;
+        }
+        if (!isAccepted)
+        {
             finishedOutput[batchSlot].setSkipDecoding();
         }
         batchIsAccepted[batchSlot] = isAccepted;
@@ -183,7 +186,7 @@ __global__ void acceptDraftTokensKernel(T const* draftProbs, T* targetProbs, Siz
 
     __syncthreads();
 
-    if (draftTokenIdx < numDraftTokens && useDraftLogits && !isAccepted)
+    if (useDraftLogits && !isAccepted)
     {
         // correct target distribution
         T const zeroVal = static_cast<T>(0.0F);

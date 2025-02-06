@@ -110,6 +110,7 @@ public:
         , mSizePerHead(mHiddenSize / mNbHeads)
         , mDataType(dtype)
         , mUseGptAttentionPlugin(false)
+        , mUseGemmAllReducePlugin(false)
         , mUseMambaConv1dPlugin(false)
         , mInputPacked{false}
         , mTokensPerBlock{kDEFAULT_NUM_TOKENS_PER_BLOCK}
@@ -128,7 +129,6 @@ public:
         , mRotaryEmbeddingDim(0)
         , mContextFMHA(false)
         , mPagedContextFMHA(false)
-        , mUseXQA{false}
         , mPpReduceScatter{false}
         , mUseLoraPlugin(false)
         , mMlpHiddenSize(0)
@@ -271,9 +271,19 @@ public:
         return mUseGptAttentionPlugin;
     }
 
+    [[nodiscard]] bool constexpr useGemmAllReducePlugin() const noexcept
+    {
+        return mUseGemmAllReducePlugin;
+    }
+
     void constexpr useGptAttentionPlugin(bool useGptAttentionPlugin) noexcept
     {
         mUseGptAttentionPlugin = useGptAttentionPlugin;
+    }
+
+    void constexpr useGemmAllReducePlugin(bool useGemmAllReducePlugin) noexcept
+    {
+        mUseGemmAllReducePlugin = useGemmAllReducePlugin;
     }
 
     [[nodiscard]] bool constexpr useMambaConv1dPlugin() const noexcept
@@ -665,8 +675,18 @@ public:
         {
             return nvinfer1::DataType::kINT8;
         }
-
-        return getDataType();
+        else if (getQuantMode().hasFp4KvCache())
+        {
+#ifdef ENABLE_FP4
+            return nvinfer1::DataType::kFP4;
+#else
+            throw std::runtime_error("Model has FP4 KV cache, but TRT-LLM was not compiled with FP4 enabled.");
+#endif
+        }
+        else
+        {
+            return getDataType();
+        }
     }
 
     [[nodiscard]] bool constexpr isTransformerBased() const noexcept
@@ -718,6 +738,16 @@ public:
     [[nodiscard]] nvinfer1::DataType constexpr getLogitsDtype() const noexcept
     {
         return mLogitsDtype;
+    }
+
+    void setGemmAllReduceDtype(nvinfer1::DataType inputDtype) noexcept
+    {
+        mGemmAllReduceDtype = inputDtype;
+    }
+
+    [[nodiscard]] nvinfer1::DataType constexpr getGemmAllReduceDtype() const noexcept
+    {
+        return mGemmAllReduceDtype;
     }
 
     void setUseShapeInference(bool useShapeInference) noexcept
@@ -809,6 +839,16 @@ public:
         mSkipCrossAttnBlocks = skipCrossAttnBlocks;
     }
 
+    [[nodiscard]] bool isMultiModal() const
+    {
+        return getModelName() == "multiModal";
+    }
+
+    [[nodiscard]] bool isWhisper() const
+    {
+        return getModelName() == "WhisperEncoder";
+    }
+
 private:
     SizeType32 mVocabSize;
     SizeType32 mNbLayers;
@@ -819,6 +859,8 @@ private:
     SizeType32 mSizePerHead;
     nvinfer1::DataType mDataType;
     bool mUseGptAttentionPlugin;
+    bool mUseGemmAllReducePlugin;
+    nvinfer1::DataType mGemmAllReduceDtype;
     bool mUseMambaConv1dPlugin;
     bool mInputPacked;
     bool mPagedState;
@@ -841,7 +883,6 @@ private:
 
     bool mContextFMHA;
     bool mPagedContextFMHA;
-    bool mUseXQA;
     bool mPpReduceScatter;
 
     bool mUseLoraPlugin;

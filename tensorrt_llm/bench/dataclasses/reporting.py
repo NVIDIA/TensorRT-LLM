@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
-from typing import Dict, List, NamedTuple
+from typing import Any, Dict, List, NamedTuple
 
+from tensorrt_llm._torch.pyexecutor.pytorch_model_engine import \
+    validate_and_set_kv_cache_quant
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.statistics import (BenchmarkStatistics,
                                                        PercentileStats,
@@ -177,6 +179,7 @@ class StatsKeeper:
 def report_statistics(statistics: StatsKeeper,
                       rt_cfg: RuntimeConfig,
                       logger: Logger,
+                      kwargs: Dict[str, Any],
                       streaming: bool = False) -> BenchmarkStatistics:
     """Report internal statistics about benchmark.
 
@@ -184,34 +187,66 @@ def report_statistics(statistics: StatsKeeper,
         statistics (StatsKeeper): A statistics container.
         rt_cfg (RuntimeConfig): Configuration for the run.
         logger (Logger): A logger for logging.
+        kwargs (Dict[str, Any]): Dictionary of LLM API kwargs.
         streaming (bool, optional): Streaming benchmark used. Defaults to False.
 
     Returns:
         BenchmarkStatistics: Benchmark statistics for the provided keeper.
     """
+    if rt_cfg.backend != 'pytorch':
+        config_path = rt_cfg.engine_dir / "config.json"
+        with open(config_path, "r") as config:
+            engine_config = json.load(config)
+        build_cfg = engine_config["build_config"]
+        pretrain_cfg = engine_config["pretrained_config"]
 
-    config_path = rt_cfg.engine_dir / "config.json"
-    with open(config_path, "r") as config:
-        engine_config = json.load(config)
+        logging_info = (
+            "\n\n===========================================================\n"
+            "= ENGINE DETAILS\n"
+            "===========================================================\n"
+            f"Model:\t\t\t{rt_cfg.model}\n"
+            f"Engine Directory:\t{rt_cfg.engine_dir}\n"
+            f"TensorRT-LLM Version:\t{rt_cfg.sw_version}\n"
+            f"Dtype:\t\t\t{pretrain_cfg['dtype']}\n"
+            f"KV Cache Dtype:\t\t{pretrain_cfg['quantization']['kv_cache_quant_algo']}\n"
+            f"Quantization:\t\t{pretrain_cfg['quantization']['quant_algo']}\n"
+            f"Max Input Length:\t{build_cfg['max_input_len']}\n"
+            f"Max Sequence Length:\t{build_cfg['max_seq_len']}\n"
+            f"\n")
+    else:
+        from tensorrt_llm._torch.model_config import ModelConfig
+        from tensorrt_llm._utils import torch_dtype_to_str
+
+        model = rt_cfg.model_path or rt_cfg.model
+        model_config = ModelConfig.from_pretrained(model,
+                                                   trust_remote_code=True)
+        validate_and_set_kv_cache_quant(
+            model_config, kwargs["pytorch_backend_config"].kv_cache_dtype)
+
+        dtype = torch_dtype_to_str(model_config.pretrained_config.torch_dtype)
+        quant_algo = model_config.quant_config.quant_algo
+        kv_cache_quant_algo = model_config.quant_config.kv_cache_quant_algo
+
+        logging_info = (
+            "\n\n===========================================================\n"
+            "= PyTorch backend\n"
+            "===========================================================\n"
+            f"Model:\t\t\t{rt_cfg.model}\n"
+            f"Model Path:\t\t{rt_cfg.model_path}\n"
+            f"TensorRT-LLM Version:\t{rt_cfg.sw_version}\n"
+            f"Dtype:\t\t\t{dtype}\n"
+            f"KV Cache Dtype:\t\t{kv_cache_quant_algo}\n"
+            f"Quantization:\t\t{quant_algo}\n"
+            # TODO
+            # f"Max Input Length:\t{build_cfg['max_input_len']}\n"
+            # f"Max Sequence Length:\t{build_cfg['max_seq_len']}\n"
+            f"\n")
 
     stats = statistics.generate_statistics_summary()
-    build_cfg = engine_config["build_config"]
-    pretrain_cfg = engine_config["pretrained_config"]
+
     total_latency_s = stats.total_latency_ns / 1.0e9
 
-    logging_info = (
-        "\n\n===========================================================\n"
-        "= ENGINE DETAILS\n"
-        "===========================================================\n"
-        f"Model:\t\t\t{rt_cfg.model}\n"
-        f"Engine Directory:\t{rt_cfg.engine_dir}\n"
-        f"TensorRT-LLM Version:\t{rt_cfg.sw_version}\n"
-        f"Dtype:\t\t\t{pretrain_cfg['dtype']}\n"
-        f"KV Cache Dtype:\t\t{pretrain_cfg['quantization']['kv_cache_quant_algo']}\n"
-        f"Quantization:\t\t{pretrain_cfg['quantization']['quant_algo']}\n"
-        f"Max Input Length:\t{build_cfg['max_input_len']}\n"
-        f"Max Sequence Length:\t{build_cfg['max_seq_len']}\n"
-        f"\n"
+    logging_info += (
         "===========================================================\n"
         "= WORLD + RUNTIME INFORMATION \n"
         "===========================================================\n"

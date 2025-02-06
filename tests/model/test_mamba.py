@@ -37,7 +37,7 @@ from tensorrt_llm.models.mamba.convert import (convert_from_hf_checkpoint,
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root
-from utils.util import skip_bf16_pre_ampere, unittest_name_func
+from utils.util import unittest_name_func
 
 
 class TestMamba(unittest.TestCase):
@@ -162,9 +162,6 @@ class TestMamba(unittest.TestCase):
     def test_mamba(self, gemm_plugin, mamba_conv1d_plugin, dtype,
                    remove_padding):
         from transformers import MambaConfig
-
-        # Skip tests that are not supported in pre-ampere architecture
-        skip_bf16_pre_ampere(dtype)
 
         RANDOM_SEEDS = [1, 4, 5, 8]
         seed_idx = random.randint(0, len(RANDOM_SEEDS) - 1)

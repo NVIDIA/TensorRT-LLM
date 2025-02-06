@@ -182,7 +182,7 @@ size_t QuantizeTensorPlugin::getSerializationSize() const noexcept
 void QuantizeTensorPlugin::serialize(void* buffer) const noexcept
 {
     char *d = static_cast<char*>(buffer), *a = d;
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 }
 
 void QuantizeTensorPlugin::destroy() noexcept

@@ -21,6 +21,7 @@
 #include "tensorrt_llm/runtime/generationConfig.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
+#include "tensorrt_llm/runtime/tllmBuffers.h"
 #include "tensorrt_llm/runtime/tllmRuntime.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
@@ -98,6 +99,8 @@ public:
     TensorPtr kvCacheBlockOffsetsDevice; // [numPools, batchSize * beamWidth, 2, maxBlocksPerSeq * 2]
     TensorPtr runtimePerfKnobsHost;      // can hold max 16 perf knobs
     TensorPtr contextProgressHost;
+
+    std::shared_ptr<IpcNvlsTensor> gemmAllReduceOutput; // stores output for gemmAllReduce plugin layer
 };
 
 } // namespace tensorrt_llm::runtime

@@ -3,9 +3,7 @@
 This document shows how to build and run a model using Medusa decoding([`Github`](https://github.com/FasterDecoding/Medusa), [`BLOG`](https://sites.google.com/view/medusa-llm)) in TensorRT-LLM on single GPU, single node multiple GPU.
 
 ## Overview
-Different from other models, Medusa decoding need a base model and Medusa heads.
-
-The TensorRT-LLM Medusa Decoding implementation can be found in [tensorrt_llm/models/medusa/model.py](../../tensorrt_llm/models/medusa/model.py). The implementation adds Medusa heads to a base model.
+Different from other models, Medusa decoding needs a base model and Medusa heads. The TensorRT-LLM Medusa Decoding implementation can be found in [tensorrt_llm/models/medusa/model.py](../../tensorrt_llm/models/medusa/model.py). The implementation adds Medusa heads to a base model.
 
 For more info about Medusa visit [speculative decoding documentation](https://nvidia.github.io/TensorRT-LLM/advanced/speculative-decoding.html).
 
@@ -19,7 +17,9 @@ For more info about Medusa visit [speculative decoding documentation](https://nv
 
 ## Usage
 The TensorRT-LLM Medusa example code is located in [`examples/medusa`](./). There is one [`convert_checkpoint.py`](./convert_checkpoint.py) file to convert and build the [TensorRT](https://developer.nvidia.com/tensorrt) engine(s) needed to run models with Medusa decoding support.
-In our example, we use the model from huggingface [`FasterDecoding/medusa-vicuna-7b-v1.3`](https://huggingface.co/FasterDecoding/medusa-vicuna-7b-v1.3), which is a LLAMA based model.
+In this example, we demonstrate the usage of two models:
+1. The Vucuna 7B model from Hugging Face [`FasterDecoding/medusa-vicuna-7b-v1.3`](https://huggingface.co/FasterDecoding/medusa-vicuna-7b-v1.3) with its Medusa heads [`medusa-vicuna-7b-v1.3`](https://huggingface.co/FasterDecoding/medusa-vicuna-7b-v1.3).
+2. The quantized checkpoint [`nvidia/Llama-3.1-8B-Medusa-FP8`](https://huggingface.co/nvidia/Llama-3.1-8B-Medusa-FP8) on Hugging Face by [TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer) (ModelOpt). This model is based on [Llama-3.1 8B](https://huggingface.co/meta-llama/Llama-3.1-8B) and enhanced with Medusa heads, with both the base model (except lm_head) and Medusa heads already quantized in FP8.
 
 ### Build TensorRT engine(s)
 Get the weights by downloading base model [`vicuna-7b-v1.3`](https://huggingface.co/lmsys/vicuna-7b-v1.3) and Medusa Heads [`medusa-vicuna-7b-v1.3`](https://huggingface.co/FasterDecoding/medusa-vicuna-7b-v1.3) from HF.
@@ -65,6 +65,33 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_medusa \
              --gemm_plugin float16 \
              --speculative_decoding_mode medusa \
              --max_batch_size 4
+
+# Convert and Build Llama-3.1-8B-Medusa by ModelOpt
+python convert_checkpoint.py --model_dir ./llama3.1-medusa-8b-hf_v0.1 \
+                             --output_dir ./tllm_checkpoint_1gpu_modelopt_llama_medusa \
+                             --dtype float16
+
+trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_modelopt_llama_medusa \
+             --output_dir ./tmp/modelopt/llama-8B-medusa/trt_engines/1-gpu/ \
+             --gemm_plugin float16 \
+             --speculative_decoding_mode medusa \
+             --max_batch_size 4
+
+
+# Convert and Build Llama-3.1-70B-Medusa by ModelOpt with 2-way tensor parallelism.
+python convert_checkpoint.py --model_dir ./llama-3.1-70b-medusa_vfp8-fp8-fp8 \
+                             --output_dir ./tllm_checkpoint_2gpu_modelopt_llama_medusa_70b \
+                             --dtype float16
+                             --tp_size 2
+                             --workers 2
+
+trtllm-build --checkpoint_dir ./tllm_checkpoint_2gpu_modelopt_llama_medusa_70b \
+             --output_dir ./tmp/modelopt/llama-70B-medusa/trt_engines/2-gpu/ \
+             --gemm_plugin float16 \
+             --speculative_decoding_mode medusa \
+             --max_batch_size 4
+
+
 ```
 
 ### FP8 Post-Training Quantization for Base Model
@@ -116,6 +143,24 @@ mpirun -np 4 --allow-run-as-root --oversubscribe \
                      --medusa_choices="[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], [0, 0, 0, 0], [0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [0, 0, 0, 1], [1, 6], [0, 7, 0]]" \
                      --temperature 1.0 \
                      --input_text "Once upon"
+
+# Medusa decoding using Llama-3.1-8B-Medusa by ModelOpt with 1 GPU
+python ../run.py --engine_dir ./tmp/modelopt/llama-8B-medusa/trt_engines/1-gpu/ \
+                 --tokenizer_dir ./llama3.1-medusa-8b-hf_v0.1 \
+                 --max_output_len=100 \
+                 --medusa_choices="[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], [0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [1, 6], [0, 7, 0]]" \
+                 --temperature 1.0 \
+                 --input_text "Once upon"
+
+# Medusa decoding using Llama-3.1-70B-Medusa by ModelOpt with 2 GPUs
+mpirun -np 2 --allow-run-as-root --oversubscribe \
+    python ../run.py --engine_dir ./tmp/modelopt/llama-70B-medusa/trt_engines/2-gpu/ \
+                     --tokenizer_dir ./llama-3.1-70b-medusa_vfp8-fp8-fp8 \
+                     --max_output_len=100 \
+                     --medusa_choices="[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], [0, 0, 0, 0], [0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [0, 0, 0, 1], [1, 6], [0, 7, 0]]" \
+                     --temperature 1.0 \
+                     --input_text "Once upon"
+
 ```
 
 And you will see output like this if run successfully:
@@ -151,6 +196,29 @@ mpirun -np 4 --allow-run-as-root --oversubscribe \
                            --use_py_session \
                            --temperature 1.0 \
                            --batch_size 1
+
+# Medusa decoding using Llama-3.1-8B-Medusa by ModelOpt with 1 GPU
+python ../summarize.py --engine_dir ./tmp/modelopt/llama-8B-medusa/trt_engines/1-gpu/ \
+                       --hf_model_dir ./llama3.1-medusa-8b-hf_v0.1 \
+                       --tokenizer_dir ./llama3.1-medusa-8b-hf_v0.1 \
+                       --test_trt_llm \
+                       --data_type fp16 \
+                       --medusa_choices="[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], [0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [1, 6], [0, 7, 0]]" \
+                       --use_py_session \
+                       --temperature 1.0 \
+                       --batch_size 1
+
+# Medusa decoding using Llama-3.1-70B-Medusa by ModelOpt with 2 GPUs
+mpirun -np 2 --allow-run-as-root --oversubscribe \
+    python ../summarize.py --engine_dir ./tmp/modelopt/llama-70B-medusa/trt_engines/2-gpu/ \
+                          --hf_model_dir ./llama-3.1-70b-medusa_vfp8-fp8-fp8 \
+                          --tokenizer_dir ./llama-3.1-70b-medusa_vfp8-fp8-fp8 \
+                          --test_trt_llm \
+                          --data_type fp16 \
+                          --medusa_choices="[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], [0, 0, 0, 0], [0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [0, 0, 0, 1], [1, 6], [0, 7, 0]]" \
+                          --use_py_session \
+                          --temperature 1.0 \
+                          --batch_size 1
 ```
 
 ### Medusa with Qwen2

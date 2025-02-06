@@ -30,6 +30,7 @@ import os
 import shutil
 import tempfile
 import time
+import weakref
 from argparse import Namespace
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
@@ -48,8 +49,7 @@ from ..bindings.executor import (BatchingType, CapacitySchedulerPolicy,
                                  ExtendedRuntimePerfKnobConfig, KvCacheConfig,
                                  LookaheadDecodingConfig, PeftCacheConfig,
                                  SchedulerConfig)
-from ..builder import (BuildConfig, Engine, EngineConfig, _init_max_seq_len,
-                       build)
+from ..builder import BuildConfig, Engine, EngineConfig, build
 from ..logger import logger
 from ..mapping import Mapping
 from ..models.automodel import MODEL_MAP, AutoConfig, AutoModelForCausalLM
@@ -59,9 +59,10 @@ from ..module import Module
 from .build_cache import (BuildCache, BuildCacheConfig, CachedStage,
                           get_build_cache_config_from_env)
 from .mpi_session import MPINodeState, MpiSession
-from .tokenizer import TokenizerBase, TransformersTokenizer, tokenizer_factory
+from .tokenizer import (TokenizerBase, TransformersTokenizer, load_hf_tokenizer,
+                        tokenizer_factory)
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
-from .utils import (GpuArch, append_docstring, download_hf_model,
+from .utils import (append_docstring, download_hf_model,
                     download_hf_pretrained_config, enable_llm_debug,
                     get_directory_size_in_gb, print_colored,
                     print_traceback_on_error)
@@ -123,6 +124,17 @@ class _ParallelConfig:
     @property
     def is_multi_gpu(self) -> bool:
         return self.world_size > 1
+
+    def to_mapping(self) -> Mapping:
+        return Mapping(world_size=self.world_size,
+                       rank=mpi_rank(),
+                       tp_size=self.tp_size,
+                       pp_size=self.pp_size,
+                       cp_size=self.cp_size,
+                       cp_config=self.cp_config,
+                       moe_tp_size=self.moe_tp_size,
+                       moe_ep_size=self.moe_ep_size,
+                       auto_parallel=self.auto_parallel)
 
 
 @dataclass(slots=True)
@@ -342,8 +354,7 @@ LLMARGS_DOCSTRING = r"""
 
         normalize_log_probs (bool): Whether to normalize log probabilities for the model. Defaults to False.
 
-        enable_processes_for_single_gpu (bool): Whether to enable processes for single GPU, Defaults to False.
-            This helps to improve the streaming generation performance.
+        gather_generation_logits (bool): Enable gathering generation logits.
 
         max_batch_size (int, optional): The maximum batch size for runtime. Defaults to None.
 
@@ -461,18 +472,24 @@ class LlmArgs:
 
     normalize_log_probs: bool = False
 
+    gather_generation_logits: bool = False
+
     extended_runtime_perf_knob_config: Optional[
         ExtendedRuntimePerfKnobConfig] = None
 
     # TODO: remove this option in the future
     use_runtime_defaults: bool = True
 
-    # TODO[chunweiy]: Enable this by default and remove the option in the future
-    enable_processes_for_single_gpu: bool = False
-
     max_batch_size: Optional[int] = None
     max_num_tokens: Optional[int] = None
 
+    # backend to use
+    backend: Optional[str] = None
+
+    # private options
+    _num_postprocess_workers: int = 0  # Number of postprocess worker processes
+    _postprocess_tokenizer_dir: Optional[str] = None
+    _postprocess_result_handler: Optional[Callable] = None
 
     def __post_init__(self):
         # TODO[chunweiy]: Enable this option in the future
@@ -576,7 +593,8 @@ class LlmArgs:
         speculative_model_obj = _ModelWrapper(
             self.speculative_model
         ) if self.speculative_model is not None else None
-        if model_obj.is_local_model:
+        if model_obj.is_local_model and getattr(self, 'backend',
+                                                None) != 'pytorch':
             # Load parallel_config from the engine.
             self.model_format = ModelLoader.get_model_format(self.model)
 
@@ -654,11 +672,6 @@ class LlmArgs:
         if self.build_config_mutable:
             if not self.build_config.max_num_tokens:
                 self.build_config.max_num_tokens = 2048
-
-            if not GpuArch.is_post_ampere():
-                self._config_arbitrator.setup("pre-ampere not supported",
-                                              config_name="plugin_config",
-                                              use_paged_context_fmha=False)
 
             self._setup_enable_chunked_context()
             self._setup_enable_streaming_llm()
@@ -827,11 +840,6 @@ class LlmArgs:
 
     def _setup_kv_cache_config(self):
         assert self.kv_cache_config is not None
-
-        if not GpuArch.is_post_ampere():
-            self._config_arbitrator.setup("pre-ampere not supported",
-                                          config_name="kv_cache_config",
-                                          enable_block_reuse=False)
 
         if self.kv_cache_config.enable_block_reuse:
             self._config_arbitrator.claim_func("enable_block_reuse",
@@ -1010,19 +1018,8 @@ class ModelLoader:
             self.llm_args.speculative_model
         ) if self.llm_args.speculative_model is not None else None
         self.convert_checkpoint_options = self.llm_args._convert_checkpoint_options
-        self.rank = mpi_rank() if llm_args.parallel_config.is_multi_gpu else 0
-        if llm_args.parallel_config.is_multi_gpu and not llm_args.parallel_config.auto_parallel:
-            self.mapping = Mapping(
-                tp_size=llm_args.parallel_config.tp_size,
-                pp_size=llm_args.parallel_config.pp_size,
-                cp_size=llm_args.parallel_config.cp_size,
-                moe_tp_size=llm_args.parallel_config.moe_tp_size,
-                moe_ep_size=llm_args.parallel_config.moe_ep_size,
-                rank=self.rank,
-                world_size=llm_args.parallel_config.world_size,
-            )
-        else:
-            self.mapping = Mapping()
+        self.rank = mpi_rank()
+        self.mapping = llm_args.parallel_config.to_mapping()
 
         self._build_pipeline = []
 
@@ -1031,7 +1028,7 @@ class ModelLoader:
             Path] = self.model_obj.model_dir if self.model_obj.is_local_model else None
 
         self._speculative_model_dir: Optional[
-            PATH] = self.speculative_model_obj.model_dir if self.speculative_model_obj is not None and self.model_obj.is_local_model else None
+            Path] = self.speculative_model_obj.model_dir if self.speculative_model_obj is not None and self.model_obj.is_local_model else None
         self._model_info: Optional[_ModelInfo] = None
         self._model_format = self.llm_args.model_format
 
@@ -1260,6 +1257,7 @@ class ModelLoader:
     def _download_hf_model(self):
         ''' Download HF model from third-party model hub like www.modelscope.cn or huggingface.  '''
         model_dir = None
+        speculative_model_dir = None
         # Only the rank0 are allowed to download model
         if mpi_rank() == 0:
             assert self._workspace is not None
@@ -1281,7 +1279,8 @@ class ModelLoader:
         if self.speculative_model_obj:
             self._speculative_model_dir = mpi_broadcast(speculative_model_dir,
                                                         root=0)
-            self.speculative_model_dir = self._speculative_model_dir
+            self.speculative_model_obj.model_dir = self._speculative_model_dir
+
             assert self.speculative_model_obj.is_local_model
 
     def _load_model_from_hf(self):
@@ -1291,6 +1290,52 @@ class ModelLoader:
             self._model_dir, self.llm_args.trust_remote_code,
             hasattr(self.llm_args, "speculative_model")
             and self.llm_args.speculative_model)
+
+        # Update quant_config if it's ModelOpt quantized ckpt
+        user_quant_config = self.llm_args.quant_config
+        hf_quant_config_path = Path(self._model_dir) / "hf_quant_config.json"
+        if hf_quant_config_path.exists():
+            logger.info(
+                f"Found {hf_quant_config_path}, pre-quantized checkpoints are used."
+            )
+            already_quantized = True
+            with open(hf_quant_config_path, "r") as f:
+                hf_quant_config = json.load(f)
+                hf_quant_algo = hf_quant_config["quantization"].get(
+                    "quant_algo")
+                if hf_quant_algo == "FP8" and user_quant_config.quant_algo \
+                        and user_quant_config.quant_algo != QuantAlgo.FP8:
+                    raise ValueError(
+                        f"Expecting quant_algo to be FP8, got {user_quant_config.quant_algo}."
+                    )
+                user_quant_config.quant_algo = hf_quant_algo
+                logger.info(f"quant_algo is set to {hf_quant_algo}")
+
+                hf_kv_cache_quant_algo = hf_quant_config["quantization"].get(
+                    "kv_cache_quant_algo")
+                if hf_kv_cache_quant_algo != user_quant_config.kv_cache_quant_algo:
+                    if user_quant_config.kv_cache_quant_algo is None:
+                        user_quant_config.kv_cache_quant_algo = hf_kv_cache_quant_algo
+                        logger.info(
+                            f"kv_cache_quant_algo is set to {hf_kv_cache_quant_algo}"
+                        )
+                    elif user_quant_config.kv_cache_quant_algo == QuantAlgo.FP8 and hf_kv_cache_quant_algo is None:
+                        logger.warning(
+                            f"User specified kv_cache_quant_algo {user_quant_config.kv_cache_quant_algo} "
+                            f"will overwrite {hf_kv_cache_quant_algo} from {hf_quant_config_path}."
+                        )
+                    else:
+                        raise ValueError(
+                            f"User specified kv_cache_quant_algo {user_quant_config.kv_cache_quant_algo}, "
+                            f"while it's {hf_kv_cache_quant_algo} in {hf_quant_config_path}."
+                        )
+        else:
+            already_quantized = False
+
+        # FP4 Gemm force to use plugin.
+        if self.llm_args.quant_config.quant_mode.has_nvfp4():
+            self.llm_args.build_config.plugin_config.gemm_plugin = "nvfp4"
+
         if self.llm_args.load_format == 'dummy':
             config = model_cls.config_class.from_hugging_face(
                 str(self._model_dir),
@@ -1300,7 +1345,7 @@ class ModelLoader:
                 **self.convert_checkpoint_options,
             )
             self.model = model_cls(config)
-        elif self.llm_args.quant_config.requires_calibration:
+        elif self.llm_args.quant_config.requires_calibration and not already_quantized:
             assert self.workspace is not None
             checkpoint_dir = f"{self.workspace}/quantized-checkpoint"
             if self.rank == 0:
@@ -1422,17 +1467,11 @@ class ModelLoader:
             model_dir,
             trust_remote_code: bool = True,
             use_fast: bool = True) -> Optional[TransformersTokenizer]:
-        try:
-
-            return TransformersTokenizer.from_pretrained(
-                model_dir,
-                legacy=False,
-                padding_side='left',
-                truncation_side='left',
-                trust_remote_code=trust_remote_code,
-                use_fast=use_fast)
-        except Exception as e:
-            logger.error(f"Failed to load tokenizer from {model_dir}: {e}")
+        if (tokenizer := load_hf_tokenizer(model_dir, trust_remote_code,
+                                           use_fast)) is not None:
+            return tokenizer
+        else:
+            logger.error(f"Failed to load tokenizer from {model_dir}")
             return None
 
 
@@ -1444,7 +1483,7 @@ class CachedModelLoader:
     def __init__(
         self,
         llm_args: LlmArgs,
-        llm_build_stats: "LlmBuildStats",
+        llm_build_stats: weakref.ReferenceType["LlmBuildStats"],
         mpi_session: Optional[MpiSession] = None,
         workspace: Optional[str] = None,
     ):
@@ -1497,6 +1536,24 @@ class CachedModelLoader:
                 self.llm_build_stats.engine_dir = self.model_loader.model_obj.model_dir
                 return self.llm_build_stats.engine_dir, self._hf_model_dir
 
+        if (self.llm_args.backend is not None):
+            if self.llm_args.backend != "pytorch":
+                raise ValueError(
+                    f'backend {self.llm_args.backend} is not supported.')
+
+            if self.model_loader.model_obj.is_hub_model:
+                hf_folder = download_hf_model(
+                    self.model_loader.model_obj.model_name,
+                    self.llm_args.revision)
+                self._hf_model_dir = hf_folder
+            else:
+                self._hf_model_dir = self.model_loader.model_obj.model_dir
+
+            if self.llm_args.quant_config.quant_algo is not None:
+                logger.warning(
+                    "QuantConfig for pytorch backend is ignored. You can load"
+                    "quantized model with hf_quant_config.json directly.")
+            return None, self._hf_model_dir
 
         return self._build_model(), self._hf_model_dir
 
@@ -1555,11 +1612,7 @@ class CachedModelLoader:
         assert self._hf_model_dir is not None
         return AutoConfig.from_hugging_face(
             self._hf_model_dir,
-            mapping=Mapping(world_size=self.llm_args.parallel_config.world_size,
-                            tp_size=self.llm_args.parallel_config.tp_size,
-                            pp_size=self.llm_args.parallel_config.pp_size,
-                            cp_size=self.llm_args.parallel_config.cp_size,
-                            cp_config=self.llm_args.parallel_config.cp_config),
+            mapping=self.llm_args.parallel_config.to_mapping(),
             quant_config=self.llm_args.quant_config,
             dtype=self.llm_args.dtype)
 

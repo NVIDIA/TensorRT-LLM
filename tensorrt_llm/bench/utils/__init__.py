@@ -20,7 +20,7 @@ VALID_CACHE_DTYPES = Literal["float16", "float8", "int8"]
 VALID_QUANT_ALGOS = Literal[f"{QuantAlgo.W8A16}", f"{QuantAlgo.W4A16}",
                             f"{QuantAlgo.W4A16_AWQ}", f"{QuantAlgo.W4A8_AWQ}",
                             f"{QuantAlgo.W4A16_GPTQ}", f"{QuantAlgo.FP8}",
-                            f"{QuantAlgo.INT8}"]
+                            f"{QuantAlgo.INT8}", f"{QuantAlgo.NVFP4}"]
 VALID_SCHEDULING_POLICIES = \
     Literal["max_utilization", "guaranteed_no_evict", "static"]
 

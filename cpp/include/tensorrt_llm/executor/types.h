@@ -442,8 +442,19 @@ struct RequestPerfMetrics
         SizeType32 kvCacheHitRate{0};
     };
 
+    struct SpeculativeDecodingMetrics
+    {
+        /// @brief Token acceptance rate for speculative decoding requests
+        FloatType acceptanceRate{0.f};
+        /// @brief Total number of accepted draft tokens
+        SizeType32 totalAcceptedDraftTokens{0};
+        /// @brief Total number of draft tokens used in the request
+        SizeType32 totalDraftTokens{0};
+    };
+
     TimingMetrics timingMetrics;
     KvCacheMetrics kvCacheMetrics;
+    SpeculativeDecodingMetrics speculativeDecoding;
 
     /// @brief First iteration where the request was processed
     std::optional<IterationType> firstIter;
@@ -497,17 +508,17 @@ public:
 
     static auto constexpr TopK()
     {
-        return DecodingMode{kTopK | kUsePenalties | kUseBanTokens | kStandardStopCriteria};
+        return DecodingMode{kTopK | kUsePenalties | kUseBanTokens | kStandardStopCriteria | kUseMinP};
     }
 
     static auto constexpr TopP()
     {
-        return DecodingMode{kTopP | kUsePenalties | kUseBanTokens | kStandardStopCriteria};
+        return DecodingMode{kTopP | kUsePenalties | kUseBanTokens | kStandardStopCriteria | kUseMinP};
     }
 
     static auto constexpr TopKTopP()
     {
-        return DecodingMode{kTopKTopP | kUsePenalties | kUseBanTokens | kStandardStopCriteria};
+        return DecodingMode{kTopKTopP | kUsePenalties | kUseBanTokens | kStandardStopCriteria | kUseMinP};
     }
 
     static auto constexpr BeamSearch()
@@ -609,6 +620,12 @@ public:
     auto constexpr useExplicitEosStop(bool explicitEosStop)
     {
         mState = setBitTo(kUseExplicitEosStop, explicitEosStop);
+        return *this;
+    }
+
+    auto constexpr useMinP(bool useMinP)
+    {
+        mState = setBitTo(kUseMinP, useMinP);
         return *this;
     }
 
@@ -737,6 +754,11 @@ public:
         return anyBitSet(kStandardStopCriteria | kUseExplicitEosStop);
     }
 
+    bool constexpr isUseMinP() const
+    {
+        return anyBitSet(kUseMinP);
+    }
+
     using UnderlyingType = uint32_t;
 
     bool operator==(DecodingMode const& other) const
@@ -767,12 +789,13 @@ private:
     static UnderlyingType constexpr kUseMaxLengthStop{1u << 7};
     static UnderlyingType constexpr kUseExplicitEosStop{1u << 8};
     static UnderlyingType constexpr kUseNoRepeatNgramSize{1u << 9};
+    static UnderlyingType constexpr kUseMinP{1u << 10};
     static UnderlyingType constexpr kStandardStopCriteria{kUseStopWords | kUseMaxLengthStop};
     static UnderlyingType constexpr kUseOccurrencePenalties{
         kUseRepetitionPenalties | kUseFrequencyPenalties | kUsePresencePenalties};
     static UnderlyingType constexpr kUsePenalties{kUseOccurrencePenalties | kUseTemperature | kUseMinLength};
     static UnderlyingType constexpr kUseBanTokens{kUseNoRepeatNgramSize | kUseBanWords};
-    static SizeType32 constexpr kNumFlags{10};
+    static SizeType32 constexpr kNumFlags{11};
     static UnderlyingType constexpr kAuto{1u << (kNumFlags + 0)};
     static UnderlyingType constexpr kTopK{1u << (kNumFlags + 1)};
     static UnderlyingType constexpr kTopP{1u << (kNumFlags + 2)};

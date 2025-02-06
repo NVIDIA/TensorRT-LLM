@@ -230,3 +230,30 @@ def _xgrammar_tokenizer_info(tokenizer):
         }
     else:
         raise ValueError(f"Unsupported tokenizer type: {type(tokenizer)}")
+
+
+def load_hf_tokenizer(model_dir: str,
+                      trust_remote_code: bool = True,
+                      use_fast: bool = True) -> Optional[TransformersTokenizer]:
+    ''' Load a tokenizer from a Hugging Face model directory.
+
+    Args:
+        model_dir (str): The model directory.
+        trust_remote_code (bool): Whether to trust the remote code.
+        use_fast (bool): Whether to use the fast tokenizer.
+
+    Returns:
+        A TransformersTokenizer object if the tokenizer is loaded successfully.
+    '''
+
+    try:
+        return TransformersTokenizer.from_pretrained(
+            model_dir,
+            legacy=False,
+            padding_side='left',
+            truncation_side='left',
+            trust_remote_code=trust_remote_code,
+            use_fast=use_fast)
+
+    except Exception:
+        return None

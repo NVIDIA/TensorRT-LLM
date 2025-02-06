@@ -15,6 +15,7 @@
  */
 #pragma once
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/xqaParams.h"
+#include "tensorrt_llm/kernels/trtllmGenKernels/fmha/fmhaRunner.h"
 
 namespace tensorrt_llm
 {
@@ -25,6 +26,8 @@ namespace jit
 
 bool supportConfigQGMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlugin);
 bool supportConfigHMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlugin);
+bool supportConfigTllmGen(
+    XQAParams const& xqaParams, int SM, bool forConfigurePlugin, TllmGenFmhaRunner const* tllmRunner);
 
 } // namespace jit
 } // namespace kernels

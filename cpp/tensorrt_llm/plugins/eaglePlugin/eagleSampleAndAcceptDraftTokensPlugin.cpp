@@ -68,7 +68,7 @@ nvinfer1::IPluginV2DynamicExt* EagleSampleAndAcceptDraftTokensPlugin::clone() co
 nvinfer1::DimsExprs EagleSampleAndAcceptDraftTokensPlugin::getOutputDimensions(
     int outputIndex, nvinfer1::DimsExprs const* inputs, int nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
 {
-    TLLM_CHECK(nbInputs == 9);
+    TLLM_CHECK(nbInputs == 10);
     TLLM_CHECK(outputIndex < 7);
     auto const batchSizeExpr = inputs[getIdx(InputIdxEntry::PATHS)].d[0];
     auto const maxDecodingDraftTokensExpr = inputs[getIdx(InputIdxEntry::DRAFT_TOKEN_IDS)].d[1];
@@ -207,7 +207,7 @@ void EagleSampleAndAcceptDraftTokensPlugin::samplePrimeHeadTokens(nvinfer1::Plug
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto const maxNumTokens = inputDesc[getIdx(InputIdxEntry::LOGITS)].dims.d[0];
+    // auto const maxNumTokens = inputDesc[getIdx(InputIdxEntry::LOGITS)].dims.d[0];
     auto const vocabSizePadded = inputDesc[getIdx(InputIdxEntry::LOGITS)].dims.d[1];
     auto const batchSize = inputDesc[getIdx(InputIdxEntry::PATHS)].dims.d[0];
     auto const maxDecodingTokens = inputDesc[getIdx(InputIdxEntry::PATHS)].dims.d[1];
@@ -262,13 +262,13 @@ void EagleSampleAndAcceptDraftTokensPlugin::doTypicalAcceptance(nvinfer1::Plugin
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto const maxNumTokens = inputDesc[getIdx(InputIdxEntry::LOGITS)].dims.d[0];
+    // auto const maxNumTokens = inputDesc[getIdx(InputIdxEntry::LOGITS)].dims.d[0];
     auto const vocabSizePadded = inputDesc[getIdx(InputIdxEntry::LOGITS)].dims.d[1];
 
     auto const batchSize = inputDesc[getIdx(InputIdxEntry::PATHS)].dims.d[0];
     auto const maxDecodingTokens = inputDesc[getIdx(InputIdxEntry::PATHS)].dims.d[1];
-    auto const maxPathLen = inputDesc[getIdx(InputIdxEntry::PATHS)].dims.d[2];
-    auto const maxDraftPathLen = maxPathLen - 1;
+    // auto const maxPathLen = inputDesc[getIdx(InputIdxEntry::PATHS)].dims.d[2];
+    // auto const maxDraftPathLen = maxPathLen - 1;
 
     auto logits = static_cast<T const*>(inputs[getIdx(InputIdxEntry::LOGITS)]);
     auto prevDraftLens = reinterpret_cast<SizeType32 const*>(inputs[getIdx(InputIdxEntry::DRAFT_LENS)]);
@@ -335,7 +335,7 @@ void EagleSampleAndAcceptDraftTokensPlugin::acceptDraftTokens(nvinfer1::PluginTe
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto const maxNumTokens = inputDesc[getIdx(InputIdxEntry::LOGITS)].dims.d[0];
+    // auto const maxNumTokens = inputDesc[getIdx(InputIdxEntry::LOGITS)].dims.d[0];
     auto const vocabSizePadded = inputDesc[getIdx(InputIdxEntry::LOGITS)].dims.d[1];
 
     auto const batchSize = inputDesc[getIdx(InputIdxEntry::PATHS)].dims.d[0];
@@ -343,11 +343,13 @@ void EagleSampleAndAcceptDraftTokensPlugin::acceptDraftTokens(nvinfer1::PluginTe
     auto const maxPathLen = inputDesc[getIdx(InputIdxEntry::PATHS)].dims.d[2];
     auto const maxDraftPathLen = maxPathLen - 1;
 
+    auto const useDynamicTree = *(reinterpret_cast<SizeType32 const*>(inputs[getIdx(InputIdxEntry::USE_DYNAMIC_TREE)]));
+
     int8_t* workspaceBytePtr = reinterpret_cast<int8_t*>(workspace);
     size_t offset{0};
 
-    auto const samplingWorkspaceSize
-        = getTopKWorkspaceSize<T>(batchSize, maxDecodingTokens, /* maxTopK */ 1, vocabSizePadded);
+    // auto const samplingWorkspaceSize
+    //     = getTopKWorkspaceSize<T>(batchSize, maxDecodingTokens, /* maxTopK */ 1, vocabSizePadded);
 
     TokenIdType* outputIds = reinterpret_cast<TokenIdType*>(
         tc::nextWorkspacePtr(workspaceBytePtr, offset, batchSize * maxDecodingTokens * sizeof(TokenIdType)));
@@ -371,9 +373,20 @@ void EagleSampleAndAcceptDraftTokensPlugin::acceptDraftTokens(nvinfer1::PluginTe
 
     acceptDraftTokensByIdsWithPaths(params);
 
-    // Copy input paths to the output
-    cudaMemcpyAsync(outputs[getIdx(OutputIdxEntry::NEXT_DRAFT_PATHS)], inputs[getIdx(InputIdxEntry::PATHS)],
-        batchSize * maxDecodingTokens * maxPathLen * sizeof(SizeType32), cudaMemcpyDeviceToDevice, stream);
+    if (useDynamicTree)
+    {
+        // For Eagle-2, after verification and acceptance, the original path becomes useless.
+        // All set to '-1'
+        cudaMemsetAsync(outputs[getIdx(OutputIdxEntry::NEXT_DRAFT_PATHS)], -1,
+            batchSize * maxDecodingTokens * maxPathLen * sizeof(SizeType32), stream);
+    }
+    else
+    {
+        // For Eagle-1
+        // Copy input paths to the output
+        cudaMemcpyAsync(outputs[getIdx(OutputIdxEntry::NEXT_DRAFT_PATHS)], inputs[getIdx(InputIdxEntry::PATHS)],
+            batchSize * maxDecodingTokens * maxPathLen * sizeof(SizeType32), cudaMemcpyDeviceToDevice, stream);
+    }
 
     sync_check_cuda_error();
 
@@ -469,7 +482,7 @@ void EagleSampleAndAcceptDraftTokensPlugin::serialize(void* buffer) const noexce
 {
     char *d = static_cast<char*>(buffer), *a = d;
     write(d, mDtype);
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 }
 
 void EagleSampleAndAcceptDraftTokensPlugin::destroy() noexcept
@@ -508,7 +521,7 @@ IPluginV2* EagleSampleAndAcceptDraftTokensPluginCreator::createPlugin(
     char const* name, PluginFieldCollection const* fc) noexcept
 {
     PluginField const* fields = fc->fields;
-    nvinfer1::DataType type;
+    nvinfer1::DataType type{};
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {

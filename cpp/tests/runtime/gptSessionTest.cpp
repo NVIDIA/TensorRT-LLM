@@ -13,21 +13,22 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 #ifndef TOP_LEVEL_DIR
 #error "Define TOP_LEVEL_DIR"
 #endif
 
-#include <gtest/gtest.h>
-
+#include "tensorrt_llm/runtime/gptSession.h"
 #include "modelSpec.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/common/stlUtils.h"
 #include "tensorrt_llm/plugins/api/tllmPlugin.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
-#include "tensorrt_llm/runtime/gptSession.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
 #include "tensorrt_llm/runtime/utils/numpyUtils.h"
+
+#include <gtest/gtest.h>
 
 #include <algorithm>
 #include <filesystem>
@@ -131,7 +132,7 @@ void verifyModelConfig(ModelConfig const& modelConfig, ModelSpec const& modelSpe
 void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, ModelIds const modelIds,
     SizeType32 beamWidth, std::initializer_list<int> const& batchSizes, fs::path const& resultsFile,
     std::shared_ptr<nvinfer1::ILogger> const& logger, bool cudaGraphMode, MicroBatchSizes microBatchSizes,
-    bool const isChatGlmTest = false)
+    bool const isChatGlmTest = false, bool const useRandomEndId = false)
 {
     auto manager = BufferManager(std::make_shared<CudaStream>());
 
@@ -193,7 +194,7 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
     }
 
     std::srand(42);
-    if (modelSpec.mRandomEndId)
+    if (useRandomEndId)
     {
         auto const endIdRow = std::rand() % nbGivenInputs;
         auto const endIdBeam = std::rand() % beamWidth;
@@ -213,7 +214,7 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
             SizeType32 const outputLength
                 = std::min(std::distance(seqBegin, padIt), std::distance(seqBegin, endIt)) - givenInputLengths[bi];
             SizeType32 expectedLen = givenInputLengths[bi] + std::min(outputLength, maxNewTokens);
-            if (modelSpec.mRandomEndId)
+            if (useRandomEndId)
             {
                 for (SizeType32 si = givenInputLengths[bi]; si < maxSeqLength; ++si)
                 {
@@ -303,13 +304,13 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
         {
             SizeType32 numSteps = 0;
             generationOutput.onTokenGenerated
-                = [&numSteps, &modelSpec, maxNewTokens](
+                = [&numSteps, &modelSpec, useRandomEndId, maxNewTokens](
                       [[maybe_unused]] GenerationOutput::TensorPtr const& outputIds, SizeType32 step, bool finished)
             {
                 // check that we execute the callback in each step
                 EXPECT_EQ(step, numSteps);
                 ++numSteps;
-                if (!modelSpec.mRandomEndId)
+                if (!useRandomEndId)
                 {
                     // check that we only finish after producing `maxNewTokens` tokens
                     EXPECT_TRUE(!finished || numSteps == maxNewTokens);
@@ -323,7 +324,7 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
             // compare outputs
             if (worldConfig.isFirstPipelineParallelRank())
             {
-                if (!modelSpec.mRandomEndId)
+                if (!useRandomEndId)
                 {
                     EXPECT_EQ(numSteps, maxNewTokens);
                 }
@@ -391,7 +392,12 @@ void testGptSession(fs::path const& modelPath, ModelSpec const& modelSpec, Model
 
 auto constexpr kBatchSizes = {1, 8};
 
-using ParamType = std::tuple<ModelParams, ModelSpec, SizeType32, bool, MicroBatchSizes, bool>;
+using ParamType = std::tuple<ModelParams, ModelSpec,
+    SizeType32,      // 2. beamWidth
+    bool,            // 3. CudaGraph
+    MicroBatchSizes, // 4.
+    bool,            // 5. isChatGlmTest
+    bool>;           // 6. useRandomEndId
 
 std::string generateTestName(testing::TestParamInfo<ParamType> const& info)
 {
@@ -418,7 +424,8 @@ std::string generateTestName(testing::TestParamInfo<ParamType> const& info)
         name.append("PP" + std::to_string(modelSpec.mPPSize));
     if (modelSpec.mTPSize > 1)
         name.append("TP" + std::to_string(modelSpec.mTPSize));
-    if (modelSpec.mRandomEndId)
+    auto const useRandomEndId = std::get<5>(info.param);
+    if (useRandomEndId)
         name.append("EndId");
     return name;
 }
@@ -438,13 +445,14 @@ TEST_P(ParamTest, Test)
     auto const cudaGraphMode = std::get<3>(GetParam());
     auto const microBatchSizes = std::get<4>(GetParam());
     auto const isChatGlmTest = std::get<5>(GetParam());
+    auto const useRandomEndId = std::get<6>(GetParam());
 
-    if (!modelSpec.mUsePackedInput && modelSpec.mRandomEndId)
+    if (!modelSpec.mUsePackedInput && useRandomEndId)
     {
         GTEST_SKIP() << "Test does not support endId test with padded inputs";
     }
 
-    if (modelSpec.mRandomEndId && beamWidth > 1)
+    if (useRandomEndId && beamWidth > 1)
     {
         GTEST_SKIP() << "Test does not support endId test with beam search";
     }
@@ -465,7 +473,7 @@ TEST_P(ParamTest, Test)
     }
 
     testGptSession(modelPath, modelSpec, modelIds, beamWidth, kBatchSizes, resultsFile, mLogger, cudaGraphMode,
-        microBatchSizes, isChatGlmTest);
+        microBatchSizes, isChatGlmTest, useRandomEndId);
 }
 
 INSTANTIATE_TEST_SUITE_P(GptSessionOtbTest, ParamTest,
@@ -481,7 +489,8 @@ INSTANTIATE_TEST_SUITE_P(GptSessionOtbTest, ParamTest,
         testing::Values(1),           // beamWidth
         testing::Values(false, true), // cudaGraphMode
         testing::Values(MicroBatchSizes(), MicroBatchSizes{3, 3}, MicroBatchSizes{3, 6}),
-        testing::Values(false)        // isChatGlmTest
+        testing::Values(false),       // isChatGlmTest
+        testing::Values(false)        // useRandomEndId
         ),
     generateTestName);
 
@@ -511,19 +520,33 @@ INSTANTIATE_TEST_SUITE_P(GptSessionTest, ParamTest,
                 .useGptAttentionPlugin()
                 .usePackedInput()
                 .setKVCacheType(KVCacheType::kPAGED)
-                .useDecoderPerRequest(),
-            ModelSpec{INPUT_FILE, nvinfer1::DataType::kHALF}
-                .useGptAttentionPlugin()
-                .usePackedInput()
-                .setKVCacheType(KVCacheType::kPAGED)
                 .useDecoderPerRequest()
-                .useRandomEndId()
 
                 ),
         testing::Values(1, 2),        // beamWidth
         testing::Values(false, true), // cudaGraphMode
         testing::Values(MicroBatchSizes(), MicroBatchSizes{3, 3}, MicroBatchSizes{3, 6}),
-        testing::Values(false)        // isChatGlmTest
+        testing::Values(false),       // isChatGlmTest
+        testing::Values(false)        // useRandomEndId
+        ),
+    generateTestName);
+
+INSTANTIATE_TEST_SUITE_P(GptSessionRandomEndIdTest, ParamTest,
+    testing::Combine(testing::Values(ModelParams{GPT_MODEL_DIR, {50256, 50256}}),
+        testing::Values(
+            // decoderBatch
+            ModelSpec{INPUT_FILE, nvinfer1::DataType::kHALF}
+                .useGptAttentionPlugin()
+                .usePackedInput()
+                .setKVCacheType(KVCacheType::kPAGED)
+                .useDecoderPerRequest()
+
+                ),
+        testing::Values(1, 2),        // beamWidth
+        testing::Values(false, true), // cudaGraphMode
+        testing::Values(MicroBatchSizes(), MicroBatchSizes{3, 3}, MicroBatchSizes{3, 6}),
+        testing::Values(false),       // isChatGlmTest
+        testing::Values(true)         // useRandomEndId
         ),
     generateTestName);
 
@@ -551,7 +574,8 @@ INSTANTIATE_TEST_SUITE_P(GptjSessionTest, ParamTest,
         testing::Values(1, 2),  // beamWidth
         testing::Values(false), // cudaGraphMode
         testing::Values(MicroBatchSizes()),
-        testing::Values(false)  // isChatGlmTest
+        testing::Values(false), // isChatGlmTest
+        testing::Values(false)  // useRandomEndId
         ),
     generateTestName);
 
@@ -563,7 +587,8 @@ INSTANTIATE_TEST_SUITE_P(MambaSessionOOTBTest, ParamTest,
         testing::Values(1),     // beamWidth
         testing::Values(false), // cudaGraphMode
         testing::Values(MicroBatchSizes()),
-        testing::Values(false)  // isChatGlmTest
+        testing::Values(false), // isChatGlmTest
+        testing::Values(false)  // useRandomEndId
         ),
     generateTestName);
 INSTANTIATE_TEST_SUITE_P(MambaSessionPluginTest, ParamTest,
@@ -572,7 +597,8 @@ INSTANTIATE_TEST_SUITE_P(MambaSessionPluginTest, ParamTest,
         testing::Values(1),     // beamWidth
         testing::Values(false), // cudaGraphMode
         testing::Values(MicroBatchSizes()),
-        testing::Values(false)  // isChatGlmTest
+        testing::Values(false), // isChatGlmTest
+        testing::Values(false)  // useRandomEndId
         ),
     generateTestName);
 
@@ -612,7 +638,8 @@ INSTANTIATE_TEST_SUITE_P(LlamaSessionTest, ParamTest,
         testing::Values(1, 2),  // beamWidth
         testing::Values(false), // cudaGraphMode
         testing::Values(MicroBatchSizes()),
-        testing::Values(false)  // isChatGlmTest
+        testing::Values(false), // isChatGlmTest
+        testing::Values(false)  // useRandomEndId
         ),
     generateTestName);
 
@@ -624,7 +651,8 @@ INSTANTIATE_TEST_SUITE_P(ChatGlmSessionTest, ParamTest,
         testing::Values(1, 2),  // beamWidth
         testing::Values(false), // cudaGraphMode
         testing::Values(MicroBatchSizes()),
-        testing::Values(true)   // isChatGlmTest
+        testing::Values(true),  // isChatGlmTest
+        testing::Values(false)  // useRandomEndId
         ),
     generateTestName);
 
@@ -636,7 +664,8 @@ INSTANTIATE_TEST_SUITE_P(ChatGlm2SessionTest, ParamTest,
         testing::Values(1, 2),  // beamWidth
         testing::Values(false), // cudaGraphMode
         testing::Values(MicroBatchSizes()),
-        testing::Values(true)   // isChatGlmTest
+        testing::Values(true),  // isChatGlmTest
+        testing::Values(false)  // useRandomEndId
         ),
     generateTestName);
 
@@ -648,7 +677,8 @@ INSTANTIATE_TEST_SUITE_P(ChatGlm3SessionTest, ParamTest,
         testing::Values(1, 2),  // beamWidth
         testing::Values(false), // cudaGraphMode
         testing::Values(MicroBatchSizes()),
-        testing::Values(true)   // isChatGlmTest
+        testing::Values(true),  // isChatGlmTest
+        testing::Values(false)  // useRandomEndId
         ),
     generateTestName);
 

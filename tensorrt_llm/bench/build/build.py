@@ -4,7 +4,6 @@ from pathlib import Path
 from typing import Tuple, get_args
 import click
 from click_option_group import AllOptionGroup, optgroup
-import yaml
 
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.utils.data import create_dataset_from_stream, initialize_tokenizer
@@ -16,6 +15,10 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.bench.build.dataclasses import ModelConfig
 from tensorrt_llm.bench.build.tuning import calc_engine_setting
+
+TUNED_QUANTS = {QuantAlgo.NVFP4, QuantAlgo.FP8, QuantAlgo.NO_QUANT, None}
+DEFAULT_MAX_BATCH_SIZE = BuildConfig.max_batch_size
+DEFAULT_MAX_NUM_TOKENS = BuildConfig.max_num_tokens
 
 
 def get_benchmark_engine_settings(
@@ -44,7 +47,7 @@ def get_benchmark_engine_settings(
         Tuple[int, int]: Tuple containing engine configuration information
         for engine build (max_batch_size, max_num_tokens).
     """
-    if quant_config.quant_algo in [QuantAlgo.FP8, QuantAlgo.NO_QUANT, None]:
+    if quant_config.quant_algo in TUNED_QUANTS:
         max_batch_size, max_num_tokens = calc_engine_setting(
             model_config,
             quant_config,
@@ -54,32 +57,17 @@ def get_benchmark_engine_settings(
             target_output_len,
         )
     else:
-        logger.info(f"Use configs specified in benchmark_config.yml.")
-        predefined_configs = load_predefined_config()
-        try:
-            configs = predefined_configs[
-                model_config.name][f"tp{tp_size}_pp{pp_size}"]
-            config = configs.get(target_input_len + target_output_len, None)
-            config = config if config is not None else configs.get("general")
-            max_batch_size = config['max_batch_size']
-            max_num_tokens = config['max_num_tokens']
-        except KeyError:
-            raise RuntimeError(
-                f"TP-{tp_size} x PP-{pp_size} is not a supported configuration."
-                "Please specify a valid benchmark configuration.")
+        max_batch_size = DEFAULT_MAX_BATCH_SIZE
+        max_num_tokens = DEFAULT_MAX_NUM_TOKENS
+        logger.warning(
+            f"Using default settings because quant_algo not supported. "
+            f"max_batch_size: {max_batch_size}, max_num_tokens: {max_num_tokens}."
+        )
 
     if max_batch_size <= 0 or max_num_tokens <= 0:
         raise RuntimeError(f"Unable to obtain correct settings for benchmark.")
 
     return max_batch_size, max_num_tokens
-
-
-def load_predefined_config():
-    settings_yml = Path(__file__).parent / "benchmark_config.yml"
-    with open(settings_yml, "r") as config:
-        configs = yaml.safe_load(config)
-
-    return configs
 
 
 def get_model_config(model_name: str, model_path: Path = None) -> ModelConfig:
@@ -91,14 +79,7 @@ def get_model_config(model_name: str, model_path: Path = None) -> ModelConfig:
     Raises:
         ValueError: When model is not supported.
     """
-    # Load up reference configurations to check for model support.
-    configs = load_predefined_config()
-    if model_name not in configs:
-        raise ValueError(f"'{model_name}' is not supported for now.")
-
-    model_config = ModelConfig.from_hf(model_name, model_path)
-
-    return model_config
+    return ModelConfig.from_hf(model_name, model_path)
 
 
 def apply_build_mode_settings(params):
@@ -120,8 +101,8 @@ def apply_build_mode_settings(params):
         logger.warning(
             "No engine build option is selected, use TRT-LLM default "
             "max_batch_size and max_num_tokens to build the engine.")
-        params['max_batch_size'] = 2048
-        params['max_num_tokens'] = 8192
+        params['max_batch_size'] = DEFAULT_MAX_BATCH_SIZE
+        params['max_num_tokens'] = DEFAULT_MAX_NUM_TOKENS
     elif sum([bool(opt) for opt in build_options]) > 1:
         raise ValueError("Multiple engine build options detected, please "
                          "choose only one engine build option. Exiting.")
@@ -249,18 +230,17 @@ def build_command(
     target_output_len: int = params.get("target_output_len")
 
     model_name = bench_env.model
-    checkpoint_path = bench_env.model_path or model_name
-    model_config = get_model_config(model_name, bench_env.model_path)
+    checkpoint_path = bench_env.checkpoint_path or model_name
+    model_config = get_model_config(model_name, bench_env.checkpoint_path)
     engine_dir = Path(bench_env.workspace, model_name,
                       f"tp_{tp_size}_pp_{pp_size}")
 
     # Set the compute quantization.
     quant_algo = QuantAlgo(quantization) if quantization is not None else None
-    quant_config = QuantConfig()
-    quant_config.quant_algo = quant_algo
-    # If the quantization is FP8, force the KV cache dtype to FP8.
-    quant_config.kv_cache_quant_algo = quant_algo.value \
-        if quant_algo == QuantAlgo.FP8 else None
+    quant_config = QuantConfig(quant_algo=quant_algo)
+    # If the quantization is NVFP4 or FP8, force the KV cache dtype to FP8.
+    if quant_algo in [QuantAlgo.NVFP4, QuantAlgo.FP8]:
+        quant_config.kv_cache_quant_algo = QuantAlgo.FP8
 
     # Initialize the HF tokenizer for the specified model.
     tokenizer = initialize_tokenizer(checkpoint_path)
@@ -306,33 +286,18 @@ def build_command(
     build_config.plugin_config.multiple_profiles = True
     # build_config.plugin_config._reduce_fusion = True
 
-    # Enable FHMA, and FP8 FMHA if FP8 quantization is enabled.
+    # Enable FHMA, and FP8 FMHA if NVFP4 or FP8 quantization is enabled.
     # TODO: Revisit, there is an issue with enabling FHMA. If only
-    # paged FMHA is enabled with FP8 quantization, the Builder
+    # paged FMHA is enabled with NVFP4 or FP8 quantization, the Builder
     # will not enable the FP8 FMHA.
     build_config.plugin_config.use_paged_context_fmha = True
-    build_config.plugin_config.use_fp8_context_fmha = True \
-         if quant_algo == QuantAlgo.FP8 else False
-
-    logger.info(
-        "\n===========================================================\n"
-        "= ENGINE BUILD INFO\n"
-        "===========================================================\n"
-        f"Model Name:\t\t{bench_env.model}\n"
-        f"Model Path:\t\t{bench_env.model_path}\n"
-        f"Workspace Directory:\t{bench_env.workspace}\n"
-        f"Engine Directory:\t{engine_dir}\n\n"
-        "===========================================================\n"
-        "= ENGINE CONFIGURATION DETAILS\n"
-        "===========================================================\n"
-        f"Max Sequence Length:\t\t{max_seq_len}\n"
-        f"Max Batch Size:\t\t\t{max_batch_size}\n"
-        f"Max Num Tokens:\t\t\t{max_num_tokens}\n"
-        f"Quantization:\t\t\t{quantization}\n"
-        "===========================================================\n")
+    if quant_algo in [QuantAlgo.NVFP4, QuantAlgo.FP8]:
+        build_config.plugin_config.use_fp8_context_fmha = True
+    # Enable nvfp4 gemm_plugin explicitly for Blackwell
+    if quant_algo == QuantAlgo.NVFP4:
+        build_config.plugin_config.gemm_plugin = "nvfp4"
 
     # Build the LLM engine with the LLMAPI.
-    logger.set_level("error")
     llm = LLM(checkpoint_path,
               tokenizer,
               dtype=model_config.dtype,
@@ -343,8 +308,26 @@ def build_command(
               workspace=bench_env.workspace)
     # Save the engine.
     llm.save(engine_dir)
-    llm._shutdown()
-    logger.set_level("info")
+    llm.shutdown()
+
+    logger.info(
+        "\n===========================================================\n"
+        "= ENGINE BUILD INFO\n"
+        "===========================================================\n"
+        f"Model Name:\t\t{bench_env.model}\n"
+        f"Model Path:\t\t{bench_env.checkpoint_path}\n"
+        f"Workspace Directory:\t{bench_env.workspace}\n"
+        f"Engine Directory:\t{engine_dir}\n\n"
+        "===========================================================\n"
+        "= ENGINE CONFIGURATION DETAILS\n"
+        "===========================================================\n"
+        f"Max Sequence Length:\t\t{max_seq_len}\n"
+        f"Max Batch Size:\t\t\t{max_batch_size}\n"
+        f"Max Num Tokens:\t\t\t{max_num_tokens}\n"
+        f"Quantization:\t\t\t{quant_config.quant_algo}\n"
+        f"KV Cache Dtype:\t\t\t{quant_config.kv_cache_quant_algo}\n"
+        "===========================================================\n")
+
     logger.info(
         "\n\n===========================================================\n"
         f"ENGINE SAVED: {engine_dir}\n"

@@ -50,9 +50,9 @@ The executor can process requests with different beam widths if the following co
 - The model was built with a `max_beam_width > 1`.
 - The executor is configured with a `maxBeamWidth > 1` (the configured `maxBeamWidth` must be less than or equal to the model's `max_beam_width`).
 - The requested beam widths are less than or equal to the configured `maxBeamWidth`.
-- For requests with two different beam widths, `x` and `y`, requests with beam width `y` are not enqueued until all responses for requests with beam width `x` have been awaited.
 
-The request queue of the executor must be empty to allow it to reconfigure itself for a new beam width. This reconfiguration will happen automatically when requests with a new beam width are enqueued. If requests with different beam widths are enqueued at the same time, the executor will encounter an error and terminate all requests prematurely.
+The executor may schedule successive requests with the same beam width at the same time. For successive requests with two different beam widths, `x` and `y`, requests with beam width `y` are not scheduled until all requests with beam width `x` have been processed.
+This allows the runtime to reconfigure itself for a new beam width when no requests are in flight. The reconfiguration happens automatically each time requests with a different beam width than currently configured are detected. Waiting for previous requests to finish and reconfiguring the runtime may cause significant overhead and reduce overall throughput.
 
 ### Controlling output with Logits Post-Processor
 

@@ -110,7 +110,7 @@ ITensor::UniquePtr ITensor::wrap(void* data, nvinfer1::DataType type, nvinfer1::
     auto memoryType = IBuffer::memoryType(data);
 
     ITensor::UniquePtr result;
-    auto const capacityInBytes = capacity * BufferDataType(type).getSize();
+    auto const capacityInBytes = capacity * BufferDataType(type).getSizeInBits() / 8;
     switch (memoryType)
     {
     case MemoryType::kPINNED:

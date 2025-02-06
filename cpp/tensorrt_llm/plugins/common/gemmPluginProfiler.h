@@ -222,8 +222,8 @@ public:
     void deserialize(char const*& data, GemmDims& dims, GemmIdType const& gemmId);
     size_t getSerializationSize(GemmIdType const& gemmId) const;
 
-    void profileTactics(
-        RunnerPtr const& runner, nvinfer1::DataType const& type, GemmDims const& dims, GemmIdType const& gemmId);
+    void profileTactics(RunnerPtr const& runner, nvinfer1::DataType const& type, GemmDims const& dims,
+        GemmIdType const& gemmId, bool hasCudaKernel = false);
 
     void setSelectionTactics(MNKProfileMapPtr const& map)
     {

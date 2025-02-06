@@ -23,8 +23,7 @@ import tensorrt_llm
 from tensorrt_llm import Tensor
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import (create_session, run_session, skip_bf16_pre_ampere,
-                        unittest_name_func)
+from utils.util import create_session, run_session, unittest_name_func
 
 
 class TestIdentity(unittest.TestCase):
@@ -37,9 +36,6 @@ class TestIdentity(unittest.TestCase):
                            ('bfloat16', False), ('bfloat16', True)],
                           name_func=unittest_name_func)
     def test_identity(self, dtype, use_plugin):
-        # Skip tests that are not supported in pre-ampere architecture
-        skip_bf16_pre_ampere(dtype)
-
         x_data = torch.randn(
             (4, 6, 3, 4),
             dtype=tensorrt_llm._utils.str_dtype_to_torch(dtype),

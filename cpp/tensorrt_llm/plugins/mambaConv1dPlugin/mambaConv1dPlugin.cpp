@@ -42,8 +42,6 @@ MambaConv1dPlugin::MambaConv1dPlugin(int dim, int dconv, int preStride, int post
     , mPagedState(pagedState)
     , mApplySilu(applySilu)
 {
-    TLLM_CHECK_WITH_INFO((getSMVersion() >= 80) || (mType != DataType::kBF16),
-        "Unsupported data type, pre SM 80 GPUs do not support bfloat16");
     TLLM_CHECK_WITH_INFO((mType == DataType::kBF16) || (mType == DataType::kFLOAT) || (mType == DataType::kHALF),
         "Only support float, half, and bfloat16.");
 }
@@ -61,7 +59,6 @@ MambaConv1dPlugin::MambaConv1dPlugin(void const* data, size_t length)
     read(d, mPagedState);
     read(d, mApplySilu);
     TLLM_CHECK(d == a + length);
-    TLLM_CHECK_WITH_INFO((getSMVersion() >= 80) || (mType != DataType::kBF16), "Unsupported data type");
     TLLM_CHECK_WITH_INFO((mType == DataType::kBF16) || (mType == DataType::kFLOAT) || (mType == DataType::kHALF),
         "Only support float, half, and bfloat16.");
 }
@@ -277,7 +274,7 @@ void MambaConv1dPlugin::serialize(void* buffer) const noexcept
     write(d, mRemovePadding);
     write(d, mPagedState);
     write(d, mApplySilu);
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 }
 
 void MambaConv1dPlugin::destroy() noexcept
@@ -321,11 +318,14 @@ PluginFieldCollection const* MambaConv1dPluginCreator::getFieldNames() noexcept
 IPluginV2* MambaConv1dPluginCreator::createPlugin(char const* name, PluginFieldCollection const* fc) noexcept
 {
     PluginField const* fields = fc->fields;
-    int dim, dconv, pre_stride, post_stride;
-    bool removePadding;
-    bool pagedState;
-    bool applySilu;
-    nvinfer1::DataType type;
+    int dim{};
+    int dconv{};
+    int pre_stride{};
+    int post_stride{};
+    bool removePadding{};
+    bool pagedState{};
+    bool applySilu{};
+    nvinfer1::DataType type{};
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {

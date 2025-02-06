@@ -20,14 +20,13 @@ import tensorrt as trt
 import torch
 
 from .._common import default_net, precision
-from .._utils import (fp32_array, is_same_dtype, str_dtype_to_torch,
-                      trt_dtype_to_torch)
+from .._utils import is_same_dtype, str_dtype_to_torch, trt_dtype_to_torch
 from ..functional import (ACT2FN, AllReduceFusionOp, AllReduceParams,
                           AttentionMaskType, PositionEmbeddingType,
                           RotaryScalingType, Tensor, allgather, allreduce, cast,
-                          concat, constant, embedding, generate_alibi_slopes,
-                          gpt_attention, matmul, mul, shape, slice, softmax,
-                          split, where)
+                          concat, constant, div, embedding,
+                          generate_alibi_slopes, gpt_attention, matmul, mul,
+                          shape, slice, softmax, split, where)
 from ..layers import MropeParams, SpecDecodingParams
 from ..layers.embedding import Embedding
 from ..layers.linear import Linear, RowLinear
@@ -36,12 +35,14 @@ from ..parameter import Parameter
 
 # isort: off
 from .functional import (
-    dequantize, fp8_rowwise_gemm, fp8_rowwise_rms_norm, postprocess_fp8_rowwise,
-    postprocess_weight_only, postprocess_weight_only_groupwise, quantize,
-    quantize_fp8_per_token, quantize_per_token, quantize_tensor,
-    validate_group_size, smooth_quant_gemm, smooth_quant_layer_norm,
-    smooth_quant_rms_norm, weight_only_groupwise_quant_matmul,
-    weight_only_quant_matmul, qserve_gemm_per_group, qserve_gemm_per_channel)
+    block_double_dequantize, dequantize, dynamic_quantize, fp4_gemm,
+    quantize_to_fp4_tensor, fp8_rowwise_gemm, fp8_rowwise_rms_norm,
+    postprocess_fp8_rowwise, postprocess_weight_only,
+    postprocess_weight_only_groupwise, quantize, quantize_fp8_per_token,
+    quantize_per_token, quantize_tensor, validate_group_size, smooth_quant_gemm,
+    smooth_quant_layer_norm, smooth_quant_rms_norm,
+    weight_only_groupwise_quant_matmul, weight_only_quant_matmul,
+    qserve_gemm_per_group, qserve_gemm_per_channel)
 # isort: on
 from .mode import QuantMode
 
@@ -1039,7 +1040,7 @@ class WeightOnlyGroupwiseQuantLinear(Linear):
         pre_quant_scale = self.prequant_scaling_factor.value if self.prequant_scaling_factor else None
         zero = self.zero.value if self.zero else None
         bias = self.bias.value if self.bias else None
-        alpha = self.alpha.value if self.alpha else None
+        alpha = self.alpha if self.alpha else None
 
         hidden_state = x
         x = weight_only_groupwise_quant_matmul(
@@ -1143,8 +1144,11 @@ class WeightOnlyGroupwiseQuantRowLinear(RowLinear):
 
         if use_w4a8_awq:
             self.alpha = Parameter(shape=(1, ), dtype="float32")
+            self.activation_scaling_factor = Parameter(shape=(1, ),
+                                                       dtype=trt.float32)
         else:
             self.register_parameter('alpha', None)
+            self.register_parameter('activation_scaling_factor', None)
 
         validate_group_size(self)
         if pre_quant_scale:
@@ -1161,7 +1165,11 @@ class WeightOnlyGroupwiseQuantRowLinear(RowLinear):
         pre_quant_scale = self.prequant_scaling_factor.value if self.prequant_scaling_factor else None
         zero = self.zero.value if self.zero else None
         bias = self.bias.value if self.bias else None
-        alpha = self.alpha.value if self.alpha else None
+        alpha = self.alpha if self.alpha else None
+        activation_scaling_factor = self.activation_scaling_factor.value if self.activation_scaling_factor else None
+
+        if self.alpha and x.dtype == trt.fp8:
+            x = dequantize(x, activation_scaling_factor, -1, self.dtype)
 
         hidden_state = x
         x = weight_only_groupwise_quant_matmul(
@@ -1576,7 +1584,18 @@ class FP8RowLinear(RowLinear):
         gemm_plugin = default_net().plugin_config.gemm_plugin
         low_latency_gemm_plugin = default_net(
         ).plugin_config.low_latency_gemm_plugin
-        if (low_latency_gemm_plugin == "fp8"):
+        gemm_allreduce_plugin = default_net(
+        ).plugin_config.gemm_allreduce_plugin
+        if gemm_allreduce_plugin:
+            ret = self.multiply_collect(quantized_out,
+                                        w_quant_out,
+                                        gemm_plugin=None,
+                                        use_fp8=True,
+                                        alpha=alpha,
+                                        lora_runtime_params=lora_runtime_params,
+                                        lora_hidden_state=lora_hidden_state,
+                                        all_reduce_params=all_reduce_params)
+        elif (low_latency_gemm_plugin == "fp8"):
             ret = self.multiply_collect(
                 quantized_out,
                 w_quant_out,
@@ -1977,8 +1996,7 @@ class Fp8RowwiseAttention(Module):
         assert self.attention_mask_type == AttentionMaskType.causal, \
             'Plugin only support masked MHA.'
         if self.kv_cache_scaling_factor is not None:
-            kv_orig_quant_scale = constant(fp32_array(
-                [1.0])) / self.kv_cache_scaling_factor.value
+            kv_orig_quant_scale = self.kv_cache_rcp_scaling_factor.value
             kv_quant_orig_scale = self.kv_cache_scaling_factor.value
         else:
             kv_orig_quant_scale = None
@@ -2061,6 +2079,296 @@ class Fp8RowwiseAttention(Module):
             return {tllm_key: torch.ones(1, )}
         else:
             return {tllm_key: weights}
+
+
+class FP4Linear(Linear):
+
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        bias=True,
+        dtype=None,
+        tp_group=None,
+        tp_size=1,
+        gather_output=True,
+        prefer_managed_weight=True,
+        is_qkv=False,
+    ):
+        super().__init__(in_features,
+                         out_features,
+                         bias=bias,
+                         dtype=dtype,
+                         tp_group=tp_group,
+                         tp_size=tp_size,
+                         gather_output=gather_output,
+                         prefer_managed_weight=prefer_managed_weight,
+                         is_qkv=is_qkv)
+        self.scaling_vector_size = 16
+        assert self.in_features % self.scaling_vector_size == 0, \
+            "Input features must be a multiple of 16 for FP4 GEMM"
+        self.weight = Parameter(shape=(self.out_features, self.in_features),
+                                dtype=trt.fp4)
+        self.weights_block_scaling_factor = Parameter(
+            shape=(self.out_features,
+                   self.in_features // self.scaling_vector_size),
+            dtype=trt.fp8)
+        self.weights_block_scaling_factor_interleaved = Parameter(
+            shape=(self.out_features,
+                   self.in_features // self.scaling_vector_size),
+            dtype=trt.fp8)
+        self.weights_global_scaling_factor = Parameter(shape=(1, ),
+                                                       dtype=trt.float32)
+        self.activation_global_scaling_factor = Parameter(shape=(1, ),
+                                                          dtype=trt.float32)
+        # alpha = 1.0 / (weight_global_scale * act_global_scale)
+        self.alpha = Parameter(shape=(1, ), dtype=trt.float32)
+        if self.is_qkv:
+            self.tllm_to_externel_key_dict = {
+                "weight":
+                ["weight", "weight_scale", "weight_scale_2", "input_scale"],
+                "weights_block_scaling_factor":
+                "",
+                "weights_block_scaling_factor_interleaved":
+                "",
+                "weights_global_scaling_factor":
+                "",
+                "activation_global_scaling_factor":
+                "",
+                "alpha":
+                "",
+            }
+        else:
+            self.tllm_to_externel_key_dict = {
+                "weight": ["weight"],
+                "weights_block_scaling_factor": "weight_scale",
+                "weights_block_scaling_factor_interleaved": "weight_scale",
+                "weights_global_scaling_factor": "weight_scale_2",
+                "activation_global_scaling_factor": "input_scale",
+                "alpha": ["weight_scale_2", "input_scale"],
+            }
+
+    def forward(self, x, lora_runtime_params=None):
+        assert lora_runtime_params is None, "lora is not supported on FP4Linear now"
+        if isinstance(x, (tuple, list)):
+            fp4_x, act_per_block_scale = x
+        else:
+            if default_net().plugin_config.gemm_plugin == 'nvfp4':
+                fp4_x, act_per_block_scale = quantize_to_fp4_tensor(
+                    x, div(1, self.activation_global_scaling_factor.value))
+            else:
+                fp4_x, act_per_block_scale = dynamic_quantize(
+                    x, self.activation_global_scaling_factor.value)
+        if default_net().plugin_config.gemm_plugin == 'nvfp4':
+            x = fp4_gemm(fp4_x, act_per_block_scale, self.weight.value,
+                         self.weights_block_scaling_factor_interleaved.value,
+                         self.alpha.value, self.dtype)
+        else:
+            quant_w = self.weight.value
+            scale_w = self.weights_block_scaling_factor.value
+            dequant_w = block_double_dequantize(
+                quant_w,
+                scale_w,
+                self.weights_global_scaling_factor.value,
+                dtype=trt.float16)
+            dequant_x = block_double_dequantize(
+                fp4_x,
+                act_per_block_scale,
+                self.activation_global_scaling_factor.value,
+                dtype=trt.float16)
+            x = matmul(dequant_x, dequant_w, transb=True).cast(self.dtype)
+
+        if self.bias is not None:
+            x = x + self.bias.value
+
+        if self.gather_output and self.tp_size > 1 and self.tp_group is not None:
+            # [dim0, local_dim] -> [dim0 * tp_size, local_dim] --> [dim0, local_dim * tp_size]
+            x = allgather(x, self.tp_group, gather_dim=1)
+
+        return x
+
+    def postprocess(self, tllm_key, weights, **kwargs):
+        if not any([
+                tllm_key.endswith(suffix)
+                for suffix in self.tllm_to_externel_key_dict
+        ]):
+            return super().postprocess(tllm_key, weights, **kwargs)
+        if self.is_qkv:
+            if tllm_key.endswith("weight"):
+                assert len(weights) == 12
+                qkv_weight = weights[0::4]
+                qkv_block_scale = weights[1::4]
+                qkv_global_scale = weights[2::4]
+                qkv_input_scale = weights[3::4]
+
+                # Ckpt uses qkv max is guaranteed. So no need to re-quantize.
+                qkv_input_scale = max(qkv_input_scale).reshape(1, ).to(
+                    torch.float32)
+                qkv_global_scale = max(qkv_global_scale).reshape(1, ).to(
+                    torch.float32)
+                qkv_weight = torch.cat(qkv_weight)
+                qkv_block_scale = torch.cat(qkv_block_scale)
+                return {
+                    tllm_key:
+                    qkv_weight,
+                    tllm_key.replace("weight", "weights_block_scaling_factor"):
+                    qkv_block_scale,
+                    tllm_key.replace(
+                        'weight', "weights_block_scaling_factor_interleaved"):
+                    torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
+                        qkv_block_scale.view(
+                            torch.uint8).cpu().contiguous()).reshape(
+                                qkv_block_scale.shape).view(
+                                    torch.float8_e4m3fn),
+                    tllm_key.replace("weight", "weights_global_scaling_factor"):
+                    qkv_global_scale,
+                    tllm_key.replace("weight", "activation_global_scaling_factor"):
+                    qkv_input_scale,
+                    tllm_key.replace("weight", "alpha"):
+                    qkv_input_scale * qkv_global_scale,
+                }
+            else:
+                return {}
+        else:
+            if tllm_key.endswith("weight"):
+                return weights
+            elif tllm_key.endswith("weights_block_scaling_factor"):
+                return weights
+            elif tllm_key.endswith("weights_block_scaling_factor_interleaved"):
+                return torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
+                    weights.view(torch.uint8).cpu().contiguous()).reshape(
+                        weights.shape).view(torch.float8_e4m3fn)
+            elif tllm_key.endswith("weights_global_scaling_factor"):
+                return weights.float()
+            elif tllm_key.endswith('activation_global_scaling_factor'):
+                return weights.float()
+            elif tllm_key.endswith('alpha'):
+                weight_global_sf = weights[0].float()
+                act_global_sf = weights[1].float()
+                return act_global_sf * weight_global_sf
+
+
+class FP4RowLinear(RowLinear):
+
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        bias=True,
+        dtype=None,
+        tp_group=None,
+        tp_size=1,
+    ):
+        super().__init__(in_features,
+                         out_features,
+                         bias=bias,
+                         dtype=dtype,
+                         tp_group=tp_group,
+                         tp_size=tp_size)
+        self.scaling_vector_size = 16
+        assert self.in_features % self.scaling_vector_size == 0, \
+            "Input features must be a multiple of 16 for FP4 GEMM"
+        self.weight = Parameter(shape=(self.out_features, self.in_features),
+                                dtype=trt.fp4)
+        self.weights_block_scaling_factor = Parameter(
+            shape=(self.out_features,
+                   self.in_features // self.scaling_vector_size),
+            dtype=trt.fp8)
+        self.weights_block_scaling_factor_interleaved = Parameter(
+            shape=(self.out_features,
+                   self.in_features // self.scaling_vector_size),
+            dtype=trt.fp8)
+        self.weights_global_scaling_factor = Parameter(shape=(1, ),
+                                                       dtype=trt.float32)
+        self.activation_global_scaling_factor = Parameter(shape=(1, ),
+                                                          dtype=trt.float32)
+        # alpha = 1.0 / (weight_global_scale * act_global_scale)
+        self.alpha = Parameter(shape=(1, ), dtype=trt.float32)
+
+        self.tllm_to_externel_key_dict = {
+            "weight": ["weight"],
+            "weights_block_scaling_factor": "weight_scale",
+            "weights_block_scaling_factor_interleaved": "weight_scale",
+            "weights_global_scaling_factor": "weight_scale_2",
+            "activation_global_scaling_factor": "input_scale",
+            "alpha": ["weight_scale_2", "input_scale"],
+        }
+
+    def forward(self, x, lora_runtime_params=None, all_reduce_params=None):
+        assert lora_runtime_params is None, "lora is not supported on FP4Linear now"
+
+        if isinstance(x, (tuple, list)):
+            fp4_x, act_per_block_scale = x
+        else:
+            if default_net().plugin_config.gemm_plugin == "nvfp4":
+                fp4_x, act_per_block_scale = quantize_to_fp4_tensor(
+                    x, div(1.0, self.activation_global_scaling_factor.value))
+            else:
+                # WAR for FP8 output attention
+                if x.dtype == trt.fp8:
+                    # Since the scale is NVFP4 scale, we need to make it back to fp8 scale
+                    new_scale_factor = self.activation_global_scaling_factor.raw_value
+                    new_scale_factor = constant(new_scale_factor * 6)
+                    x = dequantize(x, new_scale_factor, 0,
+                                   new_scale_factor.dtype)
+                fp4_x, act_per_block_scale = dynamic_quantize(
+                    x, self.activation_global_scaling_factor.value)
+        if default_net().plugin_config.gemm_plugin == "nvfp4":
+            x = fp4_gemm(fp4_x, act_per_block_scale, self.weight.value,
+                         self.weights_block_scaling_factor_interleaved.value,
+                         self.alpha.value, self.dtype)
+        else:
+            quant_w = self.weight.value
+            scale_w = self.weights_block_scaling_factor.value
+            dequant_x = block_double_dequantize(
+                fp4_x, act_per_block_scale,
+                self.activation_global_scaling_factor.value, trt.float16)
+            dequant_w = block_double_dequantize(
+                quant_w, scale_w, self.weights_global_scaling_factor.value,
+                trt.float16)
+            x = matmul(dequant_x, dequant_w, transb=True).cast(self.dtype)
+
+        if self.tp_size > 1 and self.tp_group is not None:
+            need_bias = self.bias is not None
+            fuse_bias_into_all_reduce = need_bias and (
+                all_reduce_params
+                is not None) and (all_reduce_params.fusion_op
+                                  == AllReduceFusionOp.RESIDUAL_RMS_NORM)
+            if fuse_bias_into_all_reduce:
+                all_reduce_params.bias = self.bias.value
+            x = allreduce(x, self.tp_group, all_reduce_params=all_reduce_params)
+            if need_bias and not fuse_bias_into_all_reduce:
+                x = x + self.bias.value
+            return x
+
+        if self.bias is not None:
+            x = x + self.bias.value
+
+        return x
+
+    def postprocess(self, tllm_key, weights, **kwargs):
+        if not any([
+                tllm_key.endswith(suffix)
+                for suffix in self.tllm_to_externel_key_dict
+        ]):
+            return super().postprocess(tllm_key, weights, **kwargs)
+
+        if tllm_key.endswith("weight"):
+            return weights
+        elif tllm_key.endswith("weights_block_scaling_factor"):
+            return weights
+        elif tllm_key.endswith("weights_block_scaling_factor_interleaved"):
+            return torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(
+                weights.view(torch.uint8).cpu().contiguous()).reshape(
+                    weights.shape).view(torch.float8_e4m3fn)
+        elif tllm_key.endswith("weights_global_scaling_factor"):
+            return weights.float()
+        elif tllm_key.endswith('activation_global_scaling_factor'):
+            return weights.float()
+        elif tllm_key.endswith('alpha'):
+            weight_global_sf = weights[0].float()
+            act_global_sf = weights[1].float()
+            return act_global_sf * weight_global_sf
 
 
 class SmoothQuantGatedMLP(SmoothQuantMLP):
@@ -2298,8 +2606,7 @@ class SmoothQuantAttention(Module):
             assert self.attention_mask_type == AttentionMaskType.causal, \
                 'Plugin only support masked MHA.'
             if self.kv_cache_scaling_factor is not None:
-                kv_orig_quant_scale = constant(fp32_array(
-                    [1.0])) / self.kv_cache_scaling_factor.value
+                kv_orig_quant_scale = self.kv_cache_rcp_scaling_factor.value
                 kv_quant_orig_scale = self.kv_cache_scaling_factor.value
             else:
                 kv_orig_quant_scale = None
@@ -2822,8 +3129,7 @@ class QServeAttention(Module):
             assert self.attention_mask_type == AttentionMaskType.causal, \
                 'Plugin only support masked MHA.'
             if self.kv_cache_scaling_factor is not None:
-                kv_orig_quant_scale = constant(fp32_array(
-                    [1.0])) / self.kv_cache_scaling_factor.value
+                kv_orig_quant_scale = self.kv_cache_rcp_scaling_factor.value
                 kv_quant_orig_scale = self.kv_cache_scaling_factor.value
             else:
                 kv_orig_quant_scale = None

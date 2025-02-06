@@ -45,9 +45,6 @@ SelectiveScanPlugin::SelectiveScanPlugin(int dim, int dstate, int dtRank, int nH
     , mIsMamba2(isMamba2)
     , mDriver(tensorrt_llm::common::CUDADriverWrapper::getInstance())
 {
-    TLLM_CHECK_WITH_INFO((getSMVersion() >= 80) || (!mIsMamba2), "Pre SM 80 GPUs do not support Mamba2");
-    TLLM_CHECK_WITH_INFO((getSMVersion() >= 80) || (mType != DataType::kBF16),
-        "Unsupported data type, pre SM 80 GPUs do not support bfloat16");
     TLLM_CHECK_WITH_INFO(
         (mChunkSize == 256 || mChunkSize == 128) || (!mIsMamba2), "Only support CHUNK_SIZE 256 or 128");
     TLLM_CHECK_WITH_INFO((mType == DataType::kBF16) || (mType == DataType::kFLOAT) || (mType == DataType::kHALF),
@@ -72,9 +69,6 @@ SelectiveScanPlugin::SelectiveScanPlugin(void const* data, size_t length)
     read(d, mZEnabled);
     read(d, mIsMamba2);
     TLLM_CHECK(d == a + length);
-    TLLM_CHECK_WITH_INFO((getSMVersion() >= 80) || (!mIsMamba2), "Pre SM 80 GPUs do not support Mamba2");
-    TLLM_CHECK_WITH_INFO((getSMVersion() >= 80) || (mType != DataType::kBF16),
-        "Unsupported data type, pre SM 80 GPUs do not support bfloat16");
     TLLM_CHECK_WITH_INFO(
         (mChunkSize == 256 || mChunkSize == 128) || (!mIsMamba2), "Only support CHUNK_SIZE 256 or 128");
     TLLM_CHECK_WITH_INFO((mType == DataType::kBF16) || (mType == DataType::kFLOAT) || (mType == DataType::kHALF),
@@ -210,7 +204,7 @@ void SelectiveScanPlugin::setSSMParams(SSMParamsBase& params, const size_t batch
 
     params.delta_softplus = deltaSoftplus;
     params.remove_padding = removePadding;
-    params.is_mamab2 = mIsMamba2;
+    params.is_mamba2 = mIsMamba2;
 
     // Set the pointers and strides.
     params.u_ptr = const_cast<void*>(x);
@@ -442,7 +436,7 @@ void SelectiveScanPlugin::serialize(void* buffer) const noexcept
     write(d, mPagedState);
     write(d, mZEnabled);
     write(d, mIsMamba2);
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 }
 
 void SelectiveScanPlugin::destroy() noexcept
@@ -490,9 +484,18 @@ PluginFieldCollection const* SelectiveScanPluginCreator::getFieldNames() noexcep
 IPluginV2* SelectiveScanPluginCreator::createPlugin(char const* name, PluginFieldCollection const* fc) noexcept
 {
     PluginField const* fields = fc->fields;
-    int dim, dstate, dtRank, nHeads, nGroups, chunkSize;
-    bool deltaSoftplus, removePadding, pagedState, zEnabled, isMamab2;
-    nvinfer1::DataType type;
+    int dim{};
+    int dstate{};
+    int dtRank{};
+    int nHeads{};
+    int nGroups{};
+    int chunkSize{};
+    bool deltaSoftplus{};
+    bool removePadding{};
+    bool pagedState{};
+    bool zEnabled{};
+    bool isMamab2{};
+    nvinfer1::DataType type{};
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {

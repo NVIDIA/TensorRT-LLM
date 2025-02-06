@@ -95,6 +95,7 @@ struct communicator
     int pipe_id; // which allreduce set of groups (pipeline rank in range of 0..pipeline_size)
     int sm_arch;
     int oneshot, pdl_launch;
+    int oneshot_force_enable_threshold;
 
     MPI_Comm comm_world, // clone of MPI_COMM_WORLD
         comm_inter,      // reduction group communicator (subset of the nodes) along GPU rail
@@ -145,4 +146,8 @@ int allreduce2_userbuff_inplace_rmsnorm_quant_impl(int const handler, size_t con
     size_t const out_offset, size_t const elements, int const hidden_size, void* beta, void* gamma, float eps,
     float* scalefactor, void* residual_in, void* residual_out, nvinfer1::DataType dataType, communicator* comm,
     cudaStream_t stream);
+int allreduce2_userbuff_inplace_rmsnorm_quant_fp4_impl(int const handler, size_t const offset, int const out_handler,
+    size_t const out_offset, int const scale_handler, size_t const scale_offset, size_t const elements,
+    int const hidden_size, void* beta, void* gamma, float eps, float* scalefactor, void* residual_in,
+    void* residual_out, nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream);
 } // namespace tensorrt_llm::kernels::ub

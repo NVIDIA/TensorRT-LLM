@@ -485,8 +485,9 @@ constexpr auto get_vectorized_atomic_add_op()
 
 } // namespace detail
 
-template <class TileShape, class ElementC, class StrideC, class ElementD, class StrideD, class ElementAccumulator,
-    class ElementCompute, class ElementBias, class StrideBias, class ElementScale, class StrideScale>
+template <class Arch, class TileShape, class ElementC, class StrideC, class ElementD, class StrideD,
+    class ElementAccumulator, class ElementCompute, class ElementBias, class StrideBias, class ElementScale,
+    class StrideScale>
 struct EpilogueMoeFusedFinalizeBuilder
 {
 
@@ -506,37 +507,64 @@ struct EpilogueMoeFusedFinalizeBuilder
     using CopyAtomS2R = DefaultCopy;
     using CopyAtomR2G = decltype(detail::get_vectorized_atomic_add_op<ElementD, EpiTileN>());
 
-    template <class EpilogueOp>
-    struct Sm90TmaWarpSpecializedAdapterWithSmemStorage : detail::Sm90TmaWarpSpecializedAdapter<EpilogueOp>
+    template <class Base, class EpilogueOp>
+    struct TmaWarpSpecializedAdapterWithSmemStorageImpl : Base
     {
         // We need to override this one using declaration because otherwise we double up on the smem
         using TensorMapStorage = typename EpilogueOp::TensorMapStorage;
 
-        using Base = detail::Sm90TmaWarpSpecializedAdapter<EpilogueOp>;
+        //        using Base = detail::Sm90TmaWarpSpecializedAdapter<EpilogueOp>;
 
         CUTLASS_HOST_DEVICE
-        Sm90TmaWarpSpecializedAdapterWithSmemStorage(
+        TmaWarpSpecializedAdapterWithSmemStorageImpl(
             typename EpilogueOp::Params const& params, [[maybe_unused]] typename Base::TensorStorage& shared_tensors)
             : Base(params)
         {
         }
 
-        // These functions depend on the type of TensorMapStorage
-        template <bool IsLoad>
-        CUTLASS_DEVICE void tensormaps_perform_update([[maybe_unused]] TensorMapStorage& shared_tensormap,
+        CUTLASS_DEVICE auto load_init([[maybe_unused]] typename EpilogueOp::Params const& params,
+            [[maybe_unused]] TensorMapStorage& shared_tensormaps, [[maybe_unused]] int32_t sm_count,
+            [[maybe_unused]] int32_t sm_idx)
+        {
+            return cute::make_tuple(nullptr);
+        }
+
+        CUTLASS_DEVICE auto store_init([[maybe_unused]] typename EpilogueOp::Params const& params,
+            [[maybe_unused]] TensorMapStorage& shared_tensormaps, [[maybe_unused]] int32_t sm_count,
+            [[maybe_unused]] int32_t sm_idx, [[maybe_unused]] int32_t warp_group_idx)
+        {
+            return cute::make_tuple(nullptr);
+        }
+
+        // Dummy methods to perform different parts of TMA/Tensormap modifications
+
+        template <bool IsLoad, class ProblemShapeMNKL>
+        CUTLASS_DEVICE void tensormaps_perform_update([[maybe_unused]] TensorMapStorage& shared_tensormaps,
             [[maybe_unused]] typename EpilogueOp::Params const& params,
-            [[maybe_unused]] cute::TmaDescriptor const* tensormap, [[maybe_unused]] int32_t next_batch)
+            [[maybe_unused]] cute::TmaDescriptor const* tensormap, [[maybe_unused]] ProblemShapeMNKL problem_shape,
+            [[maybe_unused]] int32_t next_batch, [[maybe_unused]] int32_t warp_group_idx)
         {
         }
 
         template <bool IsLoad>
-        CUTLASS_DEVICE void tensormaps_cp_fence_release([[maybe_unused]] TensorMapStorage& shared_tensormap,
-            [[maybe_unused]] cute::TmaDescriptor const* tensormap, [[maybe_unused]] uint32_t lane_predicate)
+        CUTLASS_DEVICE void tensormaps_cp_fence_release([[maybe_unused]] TensorMapStorage& shared_tensormaps,
+            [[maybe_unused]] cute::TmaDescriptor const* tensormap, [[maybe_unused]] int32_t warp_group_idx)
+        {
+        }
+
+        template <bool IsLoad>
+        CUTLASS_DEVICE void tensormaps_fence_acquire([[maybe_unused]] cute::TmaDescriptor const* tensormap)
         {
         }
     };
 
-    using CollectiveOp = Sm90TmaWarpSpecializedAdapterWithSmemStorage<
+    template <class EpilogueOp>
+    using TmaWarpSpecializedAdapterWithSmemStorage = TmaWarpSpecializedAdapterWithSmemStorageImpl<
+        std::conditional_t<Arch::kMinComputeCapability >= 100, detail::Sm100TmaWarpSpecializedAdapter<EpilogueOp>,
+            detail::Sm90TmaWarpSpecializedAdapter<EpilogueOp>>,
+        EpilogueOp>;
+
+    using CollectiveOp = TmaWarpSpecializedAdapterWithSmemStorage<
         EpilogueMoeFusedFinalize<StrideC, ElementD, StrideD, ThreadEpilogueOp, ElementBias, StrideBias, ElementScale,
             StrideScale, EpilogueTile, SmemLayoutAtomD, CopyAtomR2S, CopyAtomS2R, CopyAtomR2G>>;
 };

@@ -105,12 +105,13 @@ WorldConfig WorldConfig::mpi(SizeType32 gpusPerNode, std::optional<SizeType32> t
         mpiSize == tp * pp * cp, "MPI size %d != TP size %d * PP size %d * CP Size %d", mpiSize, tp, pp, cp);
     SizeType32 deviceCount{0};
     TLLM_CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
-    if ((mpiSize < gpusPerNode && deviceCount < mpiSize) || (mpiSize >= gpusPerNode && deviceCount < gpusPerNode))
+    if (deviceCount < std::min(mpiSize, gpusPerNode))
     {
-        TLLM_CHECK_WITH_INFO(deviceCount == 1,
-            "Detect %d GPUs, the GPU number is incompatible with %d gpusPerNode when MPI size is %d", deviceCount,
-            gpusPerNode, mpiSize);
-        TLLM_LOG_WARNING("gpusPerNode is %d but only detect single GPU, will set gpusPerNode to 1", gpusPerNode);
+        TLLM_LOG_WARNING(
+            "gpusPerNode is %d and mpiSize is %d, but only %d GPUs detected, which is smaller than min(mpiSize, "
+            "gpusPerNode). gpusPerNode will be set to %d",
+            gpusPerNode, mpiSize, deviceCount, deviceCount);
+        gpusPerNode = deviceCount;
         if (std::getenv("CUDA_VISIBLE_DEVICES") != nullptr || std::getenv("NVIDIA_VISIBLE_DEVICES") != nullptr)
         {
             std::ostringstream oss;
@@ -124,12 +125,11 @@ WorldConfig WorldConfig::mpi(SizeType32 gpusPerNode, std::optional<SizeType32> t
             }
             std::string envStr = oss.str();
             TLLM_LOG_WARNING(
-                "Detect%s, please provide the full device list instead of limiting to single device, "
+                "Detect%s, please provide the full device list instead of limiting to device list, "
                 "otherwise allreduce performance may be sub-optimal "
                 "since custom allreduce kernel relies on P2P access to peer devices.",
                 envStr.c_str());
         }
-        gpusPerNode = 1;
     }
 
     return WorldConfig{tp, pp, cp, mpiRank, gpusPerNode, deviceIds};

@@ -373,23 +373,12 @@ IPluginV2* Fp8RowwiseGemmPluginCreator::createPlugin(char const* name, PluginFie
 {
     PluginField const* fields = fc->fields;
     TLLM_CHECK(fc->nbFields == 3);
-    bool perTokenScaling, perChannelScaling;
-    nvinfer1::DataType type;
+    nvinfer1::DataType type{};
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {
         char const* attrName = fields[i].name;
-        if (!strcmp(attrName, "has_per_channel_scaling"))
-        {
-            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
-            perChannelScaling = static_cast<bool>(*(static_cast<int const*>(fields[i].data)));
-        }
-        else if (!strcmp(attrName, "has_per_token_scaling"))
-        {
-            TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
-            perTokenScaling = static_cast<bool>(*(static_cast<int const*>(fields[i].data)));
-        }
-        else if (!strcmp(attrName, "type_id"))
+        if (!strcmp(attrName, "type_id"))
         {
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             type = static_cast<nvinfer1::DataType>(*(static_cast<nvinfer1::DataType const*>(fields[i].data)));

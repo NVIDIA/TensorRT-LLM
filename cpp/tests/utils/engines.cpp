@@ -1,5 +1,6 @@
 #include "engines.h"
 
+#include "tensorrt_llm/batch_manager/transformerBuffers.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iTensor.h"

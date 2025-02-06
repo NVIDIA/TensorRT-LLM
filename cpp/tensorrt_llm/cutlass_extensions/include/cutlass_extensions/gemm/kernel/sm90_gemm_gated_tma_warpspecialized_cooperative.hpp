@@ -290,7 +290,8 @@ public:
         args.raster_order = params.scheduler.raster_order_ == TileScheduler::RasterOrder::AlongN
             ? TileScheduler::RasterOrderOptions::AlongN
             : TileScheduler::RasterOrderOptions::AlongM;
-        return TileScheduler::get_grid_shape(params.problem_shape, TileShape{}, ClusterShape{}, params.hw_info, args);
+        return TileScheduler::get_grid_shape(
+            params.scheduler, params.problem_shape, TileShape{}, ClusterShape{}, params.hw_info, args);
     }
 
     static dim3 get_block_shape()

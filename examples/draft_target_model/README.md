@@ -26,7 +26,6 @@ The Draft-Target-Model has 4 additional hyperparameters that you need to specify
 
 + We use a open-source `llama-v2-7B/13B` models as both draft and target model in this example.
 + `--use_paged_context_fmha=enable` must be specified since we need KVcache reuse in this approach.
-+ `--gather_generation_logits` is optional. In original paper, we accept the tokens by comparing logits of draft and target models, so this parameter is needed. But for simplification, we can accept the tokens by comparing the output token directly, in this occasion, we can skip this parameter.
 + `--speculative_decoding_mode=draft_tokens_external` and `--max_draft_len` must be specified for target model.
 
 ```bash
@@ -47,7 +46,6 @@ trtllm-build \
     --output_dir=./draft-engine \
     --gemm_plugin=float16 \
     --use_paged_context_fmha=enable \
-    --gather_generation_logits \
     --max_batch_size=4 \
     --max_input_len=3200 \
     --max_seq_len=4800
@@ -57,7 +55,6 @@ trtllm-build \
     --output_dir=./target-engine \
     --gemm_plugin=float16 \
     --use_paged_context_fmha=enable \
-    --gather_generation_logits \
     --speculative_decoding_mode=draft_tokens_external \
     --max_draft_len=10 \
     --max_batch_size=4 \
@@ -74,6 +71,7 @@ trtllm-build \
 + Only CPP session is supported, so `--use_py_session` must not be specified.
 + `--kv_cache_free_gpu_memory_fraction` should be specified if we want to place two models on one GPU, or one of the models would use out of the GPU memory.
 + `--num_beams` can not be specified as larger than 1 since beam search is not supported in this approach yet.
++ `--output_generation_logits` is optional. In original paper, we accept the tokens by comparing logits of draft and target models, so this parameter is needed. But for simplification, we can accept the tokens by comparing the output token directly, in this occasion, we can skip this parameter.
 
 ```bash
 cd examples/llama
@@ -86,5 +84,6 @@ python3 ../run.py \
     --max_output_len=256 \
     --kv_cache_enable_block_reuse \
     --kv_cache_free_gpu_memory_fraction=0.4 \
+    --output_generation_logits \
     --input_text="How does Draft-Sampling work?"
 ```

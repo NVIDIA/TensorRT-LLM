@@ -20,7 +20,8 @@ import transformers
 from ..._common import default_net
 from ..._utils import pad_vocab_size
 from ...functional import (AllReduceFusionOp, AllReduceParams, Tensor,
-                           allgather, concat, non_gated_version, recv, send)
+                           allgather, concat, constant, non_gated_version, recv,
+                           send, unsqueeze)
 from ...layers import (MOE, Attention, AttentionMaskType, ColumnLinear,
                        Embedding, FusedGatedMLP, GatedMLP,
                        PositionEmbeddingType, RmsNorm)
@@ -73,6 +74,7 @@ class LLaMADecoderLayer(Module):
             tp_group=config.mapping.tp_group,
             tp_size=config.mapping.tp_size,
             tp_rank=config.mapping.tp_rank,
+            q_scaling=1.0 / config.attention_multiplier,
             quant_mode=config.quant_mode,
             cp_group=config.mapping.cp_group,
             cp_size=config.mapping.cp_size,
@@ -153,13 +155,40 @@ class LLaMADecoderLayer(Module):
                     and self.layer_idx == 0) or self.layer_idx > 0:
                 hidden_states = self.input_layernorm(hidden_states)
 
+        reduce_fusion_op = AllReduceFusionOp.NONE
+        if default_net().plugin_config.reduce_fusion:
+            if default_net().plugin_config.user_buffer:
+                if self.config.quant_mode.has_fp8_qdq():
+                    reduce_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8
+                elif self.config.quant_mode.has_nvfp4():
+                    assert default_net(
+                    ).plugin_config.gemm_plugin == "nvfp4", "UB with nvfp4 model must use nvfp4 gemm plugin"
+                    reduce_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4
+                else:
+                    assert false, "UB must enabled with fp8 or nvfp4 model"
+            else:
+                reduce_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
+
         reduce_fusion_scale = None
         if default_net().plugin_config.reduce_fusion and default_net(
-        ).plugin_config.user_buffer and self.config.quant_mode.has_fp8_qdq:
+        ).plugin_config.user_buffer:
             if isinstance(self.mlp, FusedGatedMLP):
-                reduce_fusion_scale = self.mlp.fused_fc.activation_scaling_factor.value
+                if self.config.quant_mode.has_fp8_qdq():
+                    reduce_fusion_scale = constant(
+                        self.mlp.fused_fc.activation_scaling_factor.raw_value.
+                        copy())
+                elif self.config.quant_mode.has_nvfp4():
+                    reduce_fusion_scale = constant(
+                        self.mlp.fused_fc.activation_global_scaling_factor.
+                        raw_value.copy())
             else:
-                reduce_fusion_scale = self.mlp.fc.activation_scaling_factor.value
+                if self.config.quant_mode.has_fp8_qdq():
+                    reduce_fusion_scale = constant(
+                        self.mlp.fc.activation_scaling_factor.raw_value.copy())
+                elif self.config.quant_mode.has_nvfp4():
+                    reduce_fusion_scale = constant(
+                        self.mlp.fc.activation_global_scaling_factor.raw_value.
+                        copy())
         attention_output = self.attention(
             hidden_states,
             attention_mask=attention_mask,
@@ -169,9 +198,7 @@ class LLaMADecoderLayer(Module):
             attention_params=attention_params,
             lora_layer_params=lora_layer_params,
             all_reduce_params=AllReduceParams(
-                fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM
-                if default_net().plugin_config.reduce_fusion else
-                AllReduceFusionOp.NONE,
+                fusion_op=reduce_fusion_op,
                 residual=residual,
                 norm_weight=self.post_layernorm.weight.value,
                 scale=reduce_fusion_scale,
@@ -200,7 +227,7 @@ class LLaMADecoderLayer(Module):
             if default_net().plugin_config.reduce_fusion:
                 hidden_states, residual = attention_output
             else:
-                hidden_states = residual + attention_output
+                hidden_states = residual + attention_output * self.config.residual_multiplier
                 residual = hidden_states
                 hidden_states = self.post_layernorm(hidden_states)
             if next_layer_input_layernorm_args is not None:
@@ -208,9 +235,7 @@ class LLaMADecoderLayer(Module):
                     hidden_states,
                     lora_layer_params=lora_layer_params,
                     all_reduce_params=AllReduceParams(
-                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM
-                        if default_net().plugin_config.reduce_fusion else
-                        AllReduceFusionOp.NONE,
+                        fusion_op=reduce_fusion_op,
                         residual=residual,
                         norm_weight=next_layer_input_layernorm_args[0],
                         scale=next_layer_input_layernorm_args[2],
@@ -235,8 +260,7 @@ class LLaMADecoderLayer(Module):
                     else:
                         hidden_states = self.mlp(
                             hidden_states, lora_layer_params=lora_layer_params)
-                    hidden_states = residual + hidden_states
-
+                    hidden_states = residual + hidden_states * self.config.residual_multiplier
         if use_cache:
             return (hidden_states, presents)
         return hidden_states
@@ -248,11 +272,14 @@ class LLaMAModel(Module):
         super().__init__()
 
         self.mapping = config.mapping
+        self.vocab_size = config.vocab_size
+        self.has_partial_lora_mask = config.has_partial_lora_mask
         self.hidden_size = config.hidden_size
         if self.mapping.is_first_pp_rank():
             self.vocab_embedding = Embedding(config.vocab_size,
                                              config.hidden_size,
                                              dtype=config.dtype)
+            self.embedding_multiplier = config.embedding_multiplier
 
         self.layers = DecoderLayerList(LLaMADecoderLayer, config)
 
@@ -293,6 +320,7 @@ class LLaMAModel(Module):
 
         if self.mapping.is_first_pp_rank():
             hidden_states = self.vocab_embedding(input_ids, *ptuning_args)
+            hidden_states *= self.embedding_multiplier
         else:
             hidden_states = recv(hidden_states, self.mapping.prev_pp_rank())
             if default_net().plugin_config.pp_reduce_scatter:
@@ -307,6 +335,10 @@ class LLaMAModel(Module):
             hidden_states = concat([hidden_states, hidden_states_for_embed],
                                    dim=-1)
             hidden_states = self.fc(hidden_states)
+
+        if lora_params is not None and self.has_partial_lora_mask:
+            partial_lora_mask = input_ids > (self.vocab_size - 1)
+            lora_params.partial_lora_mask = unsqueeze(partial_lora_mask, -1)
 
         hidden_states = self.layers.forward(
             hidden_states,

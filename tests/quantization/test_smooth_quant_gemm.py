@@ -29,7 +29,7 @@ from tensorrt_llm import Tensor
 from tensorrt_llm.quantization.functional import smooth_quant_gemm
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import skip_pre_ampere, unittest_name_func
+from utils.util import unittest_name_func
 
 
 class TestSmoothQuantGemm(unittest.TestCase):
@@ -114,7 +114,6 @@ class TestSmoothQuantGemm(unittest.TestCase):
                 [True]),
         product(["float16", "float32"], [True, False], [True, False], [False])),
                           name_func=unittest_name_func)
-    @skip_pre_ampere  # SmoothQuant is not supported in pre-Ampere
     def test_matmul(self, dtype, per_token_scaling, per_channel_scaling,
                     use_plugin):
         bs = 2

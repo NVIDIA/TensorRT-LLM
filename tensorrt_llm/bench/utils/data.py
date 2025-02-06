@@ -85,7 +85,7 @@ def create_dataset_from_stream(
         # Each line should be a complete JSON dictionary with no indentation
         # or newline characters.
         data = json.loads(line)
-        logits = data.get("input_ids", None)
+        logits = data.get("input_ids", data.get("logits", None))
         prompt = data.get("prompt", None)
         task_id = data["task_id"]
         osl = data["output_tokens"]

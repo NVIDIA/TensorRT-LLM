@@ -17,6 +17,7 @@
 #include <gmock/gmock-matchers.h>
 #include <gtest/gtest.h>
 
+#include "tensorrt_llm/batch_manager/createNewDecoderRequests.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/executor/types.h"
@@ -32,9 +33,30 @@ using namespace tensorrt_llm::runtime;
 
 namespace tle = tensorrt_llm::executor;
 namespace tc = tensorrt_llm::common;
+namespace tb = tensorrt_llm::batch_manager;
 
 namespace
 {
+
+void newRequests(std::vector<SizeType32> const& seqSlots, std::vector<decoder_batch::Request> const& requests,
+    std::vector<SamplingConfig> const& samplingConfigs, ModelConfig const& modelConfig, GptDecoderBatched& decoder,
+    std::shared_ptr<CudaStream> runtimeStream, SizeType32 maxSequenceLength)
+{
+    auto newRequestsAlgo = tb::CreateNewDecoderRequests();
+    newRequestsAlgo(seqSlots, requests, samplingConfigs, modelConfig, decoder, runtimeStream, maxSequenceLength);
+
+    // Setup underlying decoder.
+    SizeType32 const localBatchSize = seqSlots.size();
+    ITensor::SharedPtr batchSlotsView = ITensor::slice(decoder.getBatchSlotsSetup(), 0, localBatchSize);
+    auto samplingConfig = SamplingConfig(samplingConfigs);
+    decoder.getUnderlyingDecoder().setup(
+        samplingConfig, localBatchSize, batchSlotsView, {decoder.getJointDecodingOutput()}, {requests});
+
+    auto const& stream = decoder.getDecoderStream();
+    CudaEvent event{};
+    stream->record(event);
+    runtimeStream->wait(event);
+}
 
 decoder_batch::Input prepareDecoderInputs(SizeType32 batchSize, SizeType32 maxBeamWidth, SizeType32 maxSeqLength,
     SizeType32 vocabSizePadded, nvinfer1::DataType dataType, std::vector<SamplingConfig>& samplingConfigs,
@@ -269,7 +291,7 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& sa
     {
         seqSlots.push_back(batchIdx);
     }
-    decoder.newRequests(seqSlots, requests, samplingConfigs, modelConfig);
+    newRequests(seqSlots, requests, samplingConfigs, modelConfig, decoder, streamPtr, maxSeqLength);
     cudaDeviceSynchronize();
 
     auto expectedLengths = tiledInputLengths;
@@ -306,7 +328,7 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& sa
     checkSequenceLengths(*outputs.sequenceLengths, expectedLengths, manager);
 
     std::vector<SamplingConfig> singleConfig = {samplingConfigs[0]};
-    decoder.newRequests({0}, {requests[0]}, singleConfig, modelConfig);
+    newRequests({0}, {requests[0]}, singleConfig, modelConfig, decoder, streamPtr, maxSeqLength);
     EXPECT_FALSE(decoder.getFinished()[0]);
 }
 
@@ -395,7 +417,7 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
     for (auto batchIdx = 0; batchIdx < batchSize; ++batchIdx)
     {
         std::vector<SamplingConfig> singleConfig = {samplingConfigs[batchIdx]};
-        decoder.newRequests({batchIdx}, {requests[batchIdx]}, singleConfig, modelConfig);
+        newRequests({batchIdx}, {requests[batchIdx]}, singleConfig, modelConfig, decoder, streamPtr, maxSeqLength);
 
         decoder.forward(outputs, inputs);
 
@@ -507,7 +529,7 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
     std::vector<SizeType32> seqSlots(batchSize);
     std::iota(seqSlots.begin(), seqSlots.end(), 0);
 
-    decoder.newRequests(seqSlots, requests, samplingConfigs, modelConfig);
+    newRequests(seqSlots, requests, samplingConfigs, modelConfig, decoder, streamPtr, maxSeqLength);
     cudaDeviceSynchronize();
 
     auto expectedLengths = tiledInputLengths;

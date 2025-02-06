@@ -47,20 +47,13 @@ class TestLowLatencyGemm(unittest.TestCase):
     def setUp(self) -> None:
         tensorrt_llm.logger.set_level('error')
 
-    def reference_gemm_fp8(self, x, w, dtype):
-        w = w.transpose(0, 1).to(dtype=torch.float32)
-        y = torch.matmul(x.to(torch.float32), w)
-        return y.to(str_dtype_to_torch(dtype))
-
     # float32
     def run_low_latency_gemm_sm90(self, m, n, k, output_dtype):
         torch.random.manual_seed(42)
         shape_x = (m, k)
         shape_w = (n, k)
-        x = torch.randint(-2, 2, shape_x,
-                          device="cuda").to(str_dtype_to_torch('fp8'))
-        w = torch.randint(-2, 2, shape_w,
-                          device="cuda").to(str_dtype_to_torch('fp8'))
+        x = torch.rand(shape_x, device="cuda").to(str_dtype_to_torch('fp8'))
+        w = torch.rand(shape_w, device="cuda").to(str_dtype_to_torch('fp8'))
         # Create builder
         builder = tensorrt_llm.Builder()
         # Create empty network
@@ -95,17 +88,24 @@ class TestLowLatencyGemm(unittest.TestCase):
                     outputs=outputs,
                     stream=stream.cuda_stream)
         torch.cuda.synchronize()
-        ref = self.reference_gemm_fp8(x, w, output_dtype)
-        np.testing.assert_allclose(ref.float().cpu().numpy(),
-                                   outputs['output'].cpu().float())
+        ref = torch._scaled_mm(
+            x,
+            w.t(),
+            scale_a=torch.tensor(1.0).cuda(),
+            scale_b=torch.tensor(1.0).cuda(),
+            out_dtype=str_dtype_to_torch(output_dtype),
+            use_fast_accum=True,
+        )
+        np.testing.assert_allclose(ref.float().cpu(),
+                                   outputs['output'].float().cpu())
 
     @pytest.mark.skipif(getSMVersion() != 90,
                         reason="LowLatencyGemm is only supported in SM90"
                         )  # Skip tests that are not supported in SM90
     def test_low_latency_gemm(self):
         m = 64
-        n = 128
-        k = 128
+        k = 8192
+        n = 8192
         output_dtype = "float32"
         self.run_low_latency_gemm_sm90(m, n, k, output_dtype)
         output_dtype = "float16"

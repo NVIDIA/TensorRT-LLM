@@ -33,8 +33,7 @@ from tensorrt_llm.functional import (AllReduceConfig, AllReduceParams,
 from tensorrt_llm.plugin.plugin import current_all_reduce_helper
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import (create_session, run_session, skip_bf16_pre_ampere,
-                        unittest_name_func)
+from utils.util import create_session, run_session, unittest_name_func
 
 
 class TestCommunicationPlugin(unittest.TestCase):
@@ -69,7 +68,6 @@ class TestCommunicationPlugin(unittest.TestCase):
     def test_allreduce(self, dtype: str, strategy: AllReduceStrategy,
                        config: AllReduceConfig, size: int):
 
-        skip_bf16_pre_ampere(dtype)
         if self.world_size == 1:
             pytest.skip("Skip single GPU NCCL")
 

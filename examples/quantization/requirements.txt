@@ -1,7 +1,8 @@
-tensorrt_llm==0.17.0.dev2024121700
+-c ../constraints.txt
+tensorrt_llm>=0.0.dev0
 datasets>=2.14.4
-nemo-toolkit[all]<=1.20.0,>=1.18.0
-rouge_score~=0.1.2
+nemo-toolkit[all]==2.0.0rc1
+rouge_score
 transformers_stream_generator==0.0.4
 tiktoken
 mpmath==1.3.0

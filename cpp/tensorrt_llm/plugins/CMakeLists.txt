@@ -42,14 +42,17 @@ set(PLUGIN_LISTS
     gemmSwigluPlugin
     fp8RowwiseGemmPlugin
     smoothQuantGemmPlugin
+    fp4GemmPlugin
     quantizePerTokenPlugin
     quantizeTensorPlugin
+    quantizeToFP4Plugin
     layernormQuantizationPlugin
     rmsnormQuantizationPlugin
     weightOnlyGroupwiseQuantMatmulPlugin
     weightOnlyQuantMatmulPlugin
     lookupPlugin
     loraPlugin
+    doraPlugin
     mixtureOfExperts
     selectiveScanPlugin
     mambaConv1dPlugin
@@ -60,7 +63,8 @@ set(PLUGIN_LISTS
     eaglePlugin
     lowLatencyGemmSwigluPlugin
     qserveGemmPlugin
-    cudaStreamPlugin)
+    cudaStreamPlugin
+    gemmAllReducePlugin)
 
 foreach(PLUGIN_ITER ${PLUGIN_LISTS})
   include_directories(${PLUGIN_ITER})
@@ -136,6 +140,10 @@ target_link_libraries(
   ${CUDA_RT_LIB}
   ${CMAKE_DL_LIBS}
   ${SHARED_TARGET})
+
+if(WIN32)
+  target_link_libraries(${PLUGIN_SHARED_TARGET} context_attention_src)
+endif()
 
 if(ENABLE_MULTI_DEVICE)
   target_link_libraries(${PLUGIN_SHARED_TARGET} ${MPI_C_LIBRARIES} ${NCCL_LIB})

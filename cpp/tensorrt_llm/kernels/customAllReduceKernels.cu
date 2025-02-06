@@ -1123,7 +1123,8 @@ template <typename T>
 bool is_lamport_supported(int token_num, int hidden_size)
 {
     static char* disableLamportReduceNormFusionChar = std::getenv("DISABLE_LAMPORT_REDUCE_NORM_FUSION");
-    bool disableLamportReduceNormFusion = (disableLamportReduceNormFusionChar != nullptr);
+    bool disableLamportReduceNormFusion
+        = (disableLamportReduceNormFusionChar != nullptr) || common::getEnvForceDeterministicAllReduce();
     if (disableLamportReduceNormFusion)
         return false;
     static int sm = tensorrt_llm::common::getSMVersion();

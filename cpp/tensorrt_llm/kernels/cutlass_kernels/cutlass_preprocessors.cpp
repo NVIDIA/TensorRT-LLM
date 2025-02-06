@@ -129,9 +129,17 @@ LayoutDetails getLayoutDetailsForTransform(QuantType quant_type, int arch)
     {
         return getLayoutDetailsForArch<cutlass::arch::Sm80>(quant_type);
     }
-    else if (arch == 90)
+    else if (arch >= 90 && arch < 100)
     {
         return getLayoutDetailsForArch<cutlass::arch::Sm90>(quant_type);
+    }
+    else if (arch == 120)
+    {
+        return getLayoutDetailsForArch<cutlass::arch::Sm80>(quant_type);
+    }
+    else if (arch >= 100)
+    {
+        return getLayoutDetailsForArch<cutlass::arch::Sm80>(quant_type);
     }
     else
     {
@@ -200,9 +208,6 @@ void permute_B_rows_for_mixed_gemm(int8_t* permuted_quantized_tensor, int8_t con
     int const elts_in_int32 = 32 / BITS_PER_ELT;
 
     int const num_vec_cols = num_cols / elts_in_int32;
-
-    TLLM_CHECK_WITH_INFO(
-        arch_version >= 75, "Unsupported Arch. Pre-volta not supported. Column interleave not needed on Volta.");
 
     TLLM_CHECK_WITH_INFO(num_rows % B_ROWS_PER_MMA == 0,
         fmtstr("Invalid shape for quantized tensor. Number of rows of quantized matrix must be a multiple of %d",
@@ -560,9 +565,14 @@ void preprocess_weights_for_mixed_gemm(int8_t* preprocessed_quantized_weight, in
     std::vector<size_t> const& shape, QuantType quant_type, bool force_interleave)
 {
     int arch = getSMVersion();
-    if (force_interleave && arch == 90)
+    if (force_interleave && arch >= 90)
     {
-        // Workaround for MOE which doesn't have specialised Hopper kernels yet
+        // Workaround for MOE which doesn't have specialized Hopper/Blackwell kernels yet
+        arch = 80;
+    }
+    // Force use sm80 kernel for GB20x.
+    if (arch == 120)
+    {
         arch = 80;
     }
     LayoutDetails details = getLayoutDetailsForTransform(quant_type, arch);
@@ -594,16 +604,13 @@ void preprocess_weights_for_mixed_gemm(int8_t* preprocessed_quantized_weight, in
         src_buf.swap(dst_buf);
     }
 
-    if (details.columns_interleaved > 1)
+    if (details.columns_interleaved > 1 && arch != 90)
     {
         interleave_column_major_tensor(dst_buf.data(), src_buf.data(), shape, quant_type, details);
         src_buf.swap(dst_buf);
     }
 
-    if (arch >= 70 && arch < 90)
-    {
-        add_bias_and_interleave_quantized_tensor_inplace(src_buf.data(), num_elts, quant_type);
-    }
+    add_bias_and_interleave_quantized_tensor_inplace(src_buf.data(), num_elts, quant_type);
     std::copy(src_buf.begin(), src_buf.end(), preprocessed_quantized_weight);
 }
 

@@ -156,6 +156,7 @@ void LoraCache::put(TaskIdType taskId, TensorPtr sourceWeights, TensorPtr source
         if (kVALUE_STATUS_MISSING != getStatus(taskId))
         {
             bumpTaskInProgress(taskId);
+            TLLM_LOG_DEBUG("%s return nullopt", __PRETTY_FUNCTION__);
             return std::nullopt;
         }
 
@@ -163,10 +164,12 @@ void LoraCache::put(TaskIdType taskId, TensorPtr sourceWeights, TensorPtr source
         TaskValuePtr cacheV = std::make_shared<TaskValue>(std::vector<std::size_t>{}, TaskLayerModuleConfigListPtr(),
             mInProgressTasks.begin(), true, false, false, true);
         mCacheMap.try_emplace(taskId, std::move(cacheV));
+        TLLM_LOG_DEBUG("%s return mCacheMap.at(taskId)", __PRETTY_FUNCTION__);
         return mCacheMap.at(taskId);
     }();
     if (!taskValuePtr)
     {
+        TLLM_LOG_DEBUG("%s return", __PRETTY_FUNCTION__);
         return;
     }
     auto taskValue = taskValuePtr.value();
@@ -294,7 +297,8 @@ void LoraCache::loadWeights(TaskValue& taskValue, TensorPtr weights, TensorPtr c
 
 std::vector<std::size_t> LoraCache::claimPagesWithEvict(SizeType32 numPages)
 {
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG(
+        "%s start, mPagedManagerConfig: %s", __PRETTY_FUNCTION__, runtime::to_string(mPageManagerConfig).c_str());
     TLLM_LOG_DEBUG("trying to claim " + std::to_string(numPages));
     std::lock_guard<std::mutex> pageLock(mPagesMutex);
     auto const availablePages = mCachePageManager->numAvailablePages();
@@ -460,13 +464,14 @@ SizeType32 LoraCache::determineNumPages(TensorPtr loraConfig) const
     SizeType32 const pageWidth = mPageManagerConfig.getPageWidth();
     for (SizeType32 row = 0; row < loraConfig->getShape().d[0]; ++row)
     {
-        auto const rowPtr = bufferCast<int32_t>(*ITensor::slice(loraConfig, row, 1));
-        auto const layerId = rowPtr[lora::kLORA_CONFIG_LAYER_OFF];
+        lora::LoraModuleConfig const config(ITensor::slice(loraConfig, row, 1));
+        auto const layerId = config.layerId;
         if (layerId >= firstLayerId && layerId < lastLayerId)
         {
-            auto const adapterSize = rowPtr[lora::kLORA_CONFIG_ADAPTER_SIZE_OFF];
-            auto const& module = mModuleIdToModule.at(rowPtr[lora::kLORA_CONFIG_MODULE_OFF]);
-            auto const localSize = module.localInOutSize(adapterSize, mWorldConfig.getTensorParallelism());
+            auto const adapterSize = config.adapterSize;
+            bool const isDora = config.isDora;
+            auto const& module = mModuleIdToModule.at(config.moduleId);
+            auto const localSize = module.localTotalSize(adapterSize, mWorldConfig.getTensorParallelism(), isDora);
             auto const numSlots = common::ceilDiv(localSize, pageWidth);
             if (numSlots + currSlot > slotsPerPage)
             {
@@ -477,7 +482,7 @@ SizeType32 LoraCache::determineNumPages(TensorPtr loraConfig) const
             currSlot += numSlots;
         }
     }
-    TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
+    TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
     return currPage + 1;
 }
 
@@ -573,6 +578,7 @@ std::vector<LoraCache::TaskLayerModuleConfig> LoraCache::copyToPages(TensorPtr s
     auto const tpRank = worldConfig.getTensorParallelRank();
     auto const ppSize = worldConfig.getPipelineParallelism();
     auto const ppRank = worldConfig.getPipelineParallelRank();
+    // TODO(oargov): why *attention* layers?
     auto const localNumLayers = modelConfig.getNbAttentionLayers(ppSize);
     auto const firstLayerId = ppRank * localNumLayers;
     auto const lastLayerId = firstLayerId + localNumLayers;
@@ -587,16 +593,17 @@ std::vector<LoraCache::TaskLayerModuleConfig> LoraCache::copyToPages(TensorPtr s
     auto const numRows = config->getShape().d[0];
     for (SizeType32 row = 0; row < numRows; ++row)
     {
-        auto const configPtr = bufferCast<int32_t>(*ITensor::slice(config, row, 1));
-        auto const layerId = configPtr[lora::kLORA_CONFIG_LAYER_OFF];
+        lora::LoraModuleConfig const loraConfig(ITensor::slice(config, row, 1));
+        auto const layerId = loraConfig.layerId;
         if (layerId >= firstLayerId && layerId < lastLayerId)
         {
-            auto const adapterSize = configPtr[lora::kLORA_CONFIG_ADAPTER_SIZE_OFF];
+            auto const adapterSize = loraConfig.adapterSize;
+            bool const isDora = loraConfig.isDora;
 
-            auto const modId = configPtr[lora::kLORA_CONFIG_MODULE_OFF];
+            auto const modId = loraConfig.moduleId;
             auto const& module = moduleIdToModule.at(modId);
-            auto const localInOutSize = module.localInOutSize(adapterSize, tpSize);
-            auto const rowSlots = common::ceilDiv(localInOutSize, pageWidth);
+            auto const localSize = module.localTotalSize(adapterSize, tpSize, isDora);
+            auto const rowSlots = common::ceilDiv(localSize, pageWidth);
             if (currSlot + rowSlots > slotsPerPage)
             {
                 currSlot = 0;
@@ -619,15 +626,18 @@ std::vector<LoraCache::TaskLayerModuleConfig> LoraCache::copyToPages(TensorPtr s
             auto const row = rowIndices[i];
             auto const currPage = rowPage[i];
             auto const currSlot = rowSlot[i];
-            auto const configPtr = bufferCast<int32_t>(*ITensor::slice(config, row, 1));
-            auto const layerId = configPtr[lora::kLORA_CONFIG_LAYER_OFF];
 
-            auto const adapterSize = configPtr[lora::kLORA_CONFIG_ADAPTER_SIZE_OFF];
+            lora::LoraModuleConfig const loraConfig(ITensor::slice(config, row, 1));
 
-            auto const modId = configPtr[lora::kLORA_CONFIG_MODULE_OFF];
+            auto const layerId = loraConfig.layerId;
+            auto const adapterSize = loraConfig.adapterSize;
+
+            bool const isDora = loraConfig.isDora;
+            auto const modId = loraConfig.moduleId;
+
             auto const& module = moduleIdToModule.at(modId);
-            auto const localInOutSize = module.localInOutSize(adapterSize, tpSize);
-            auto const rowSlots = common::ceilDiv(localInOutSize, pageWidth);
+            auto const localSize = module.localTotalSize(adapterSize, tpSize, isDora);
+            auto const rowSlots = common::ceilDiv(localSize, pageWidth);
 
             auto const inDim = module.inDim();
             auto const outDim = module.outDim();
@@ -636,6 +646,8 @@ std::vector<LoraCache::TaskLayerModuleConfig> LoraCache::copyToPages(TensorPtr s
             auto const outSize = module.outSize(adapterSize);
             auto const localInSize = module.localInSize(adapterSize, tpSize);
             auto const localOutSize = module.localOutSize(adapterSize, tpSize);
+            auto const magnitudeVecSize = isDora ? outDim : 0;
+            auto const localMagnitudeVecSize = module.localScalesSize(tpSize, isDora);
 
             TLLM_CHECK(module.inDimFirst() == false);
             TLLM_CHECK(module.outDimFirst() == true);
@@ -645,18 +657,22 @@ std::vector<LoraCache::TaskLayerModuleConfig> LoraCache::copyToPages(TensorPtr s
             auto const splitIn = module.inTpSplitDim() == 1;
             auto const splitOut = module.outTpSplitDim() == 0;
 
-            TensorPtr rowWeights
-                = ITensor::view(ITensor::slice(weights, row, 1), ITensor::makeShape({inSize + outSize}));
+            TensorPtr rowWeights = ITensor::view(
+                ITensor::slice(weights, row, 1), ITensor::makeShape({inSize + outSize + magnitudeVecSize}));
             TensorPtr weightsIn
                 = ITensor::view(ITensor::slice(rowWeights, 0, inSize), ITensor::makeShape({adapterSize, inDim}));
             TensorPtr weightsOut
                 = ITensor::view(ITensor::slice(rowWeights, inSize, outSize), ITensor::makeShape({outDim, adapterSize}));
+            TensorPtr magnitudeVec = ITensor::view(
+                ITensor::slice(rowWeights, inSize + outSize, magnitudeVecSize), ITensor::makeShape({magnitudeVecSize}));
 
             TensorPtr pageSlice = ITensor::slice(pages.at(currPage), currSlot, rowSlots);
             SizeType32 pageSliceSize = ITensor::volume(pageSlice->getShape());
             TensorPtr pageFlatView = ITensor::view(pageSlice, ITensor::makeShape({pageSliceSize}));
             TensorPtr targetWeightsIn = ITensor::slice(pageFlatView, 0, localInSize);
             TensorPtr targetWeightsOut = ITensor::slice(pageFlatView, localInSize, localOutSize);
+            TensorPtr targetMagnitudeVec
+                = ITensor::slice(pageFlatView, localInSize + localOutSize, localMagnitudeVecSize);
 
             if (!splitIn)
             {
@@ -670,6 +686,10 @@ std::vector<LoraCache::TaskLayerModuleConfig> LoraCache::copyToPages(TensorPtr s
             if (!splitOut)
             {
                 manager.copy(*weightsOut, *targetWeightsOut);
+                if (isDora)
+                {
+                    manager.copy(*magnitudeVec, *targetMagnitudeVec);
+                }
             }
             else
             {
@@ -678,12 +698,22 @@ std::vector<LoraCache::TaskLayerModuleConfig> LoraCache::copyToPages(TensorPtr s
                         ITensor::view(weightsOut, ITensor::makeShape({tpSize, localOutDim, adapterSize})), tpRank, 1),
                     ITensor::makeShape({localOutDim, adapterSize}));
                 manager.copy(*source, *targetWeightsOut);
+                if (isDora)
+                {
+                    TensorPtr magSource = ITensor::view(
+                        ITensor::slice(ITensor::view(magnitudeVec, ITensor::makeShape({tpSize, localMagnitudeVecSize})),
+                            tpRank, 1),
+                        ITensor::makeShape({localMagnitudeVecSize}));
+                    manager.copy(*magSource, *targetMagnitudeVec);
+                }
             }
 
             pageLocations[i] = LoraCache::TaskLayerModuleConfig{pageIds.at(currPage), currSlot, localInSize,
                 localOutSize, modId, layerId, adapterSize, static_cast<SizeType32>(rowSlots),
                 reinterpret_cast<std::int64_t>(targetWeightsIn->data()),
-                reinterpret_cast<std::int64_t>(targetWeightsOut->data())};
+                reinterpret_cast<std::int64_t>(targetWeightsOut->data()),
+                isDora ? std::optional<std::int64_t>(reinterpret_cast<std::int64_t>(targetMagnitudeVec->data()))
+                       : std::nullopt};
         };
         copyFn();
     }
@@ -713,17 +743,23 @@ std::map<size_t, std::pair<size_t, SizeType32>> LoraCache::copyTaskMapPages(Task
         auto& newPagePair = oldToNewPageIds.at(sourceConfigs[i].pageId);
         newPagePair.second += sourceConfigs[i].numSlots;
         targetConfigs[i].pageId = newPagePair.first;
+        bool const isDora = sourceConfigs[i].scalingVecPointer.has_value();
         auto page = targetCache.mCachePageManager->mutablePagePtr(targetConfigs[i].pageId);
         auto const slotId = targetConfigs[i].slotIdx;
         auto const numSlots = targetConfigs[i].numSlots;
         auto const inSize = targetConfigs[i].inSize;
         auto const outSize = targetConfigs[i].outSize;
+        auto const outDim = outSize / targetConfigs[i].adapterSize;
         TensorPtr slot = ITensor::view(ITensor::slice(page, slotId, numSlots),
             ITensor::makeShape({numSlots * targetCache.mPageManagerConfig.getPageWidth()}));
         targetConfigs[i].weightsInPointer = reinterpret_cast<std::int64_t>(
             ITensor::view(ITensor::slice(slot, 0, inSize), ITensor::makeShape({inSize}))->data());
         targetConfigs[i].weightsOutPointer = reinterpret_cast<std::int64_t>(
             ITensor::view(ITensor::slice(slot, inSize, outSize), ITensor::makeShape({outSize}))->data());
+        targetConfigs[i].scalingVecPointer = isDora
+            ? std::optional<std::int64_t>(reinterpret_cast<std::int64_t>(
+                ITensor::view(ITensor::slice(slot, inSize + outSize, outDim), ITensor::makeShape({outDim}))->data()))
+            : std::nullopt;
     }
 
     return oldToNewPageIds;

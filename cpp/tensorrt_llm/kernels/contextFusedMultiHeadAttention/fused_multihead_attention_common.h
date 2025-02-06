@@ -89,8 +89,13 @@ enum class AttentionInputLayout
 
 struct MHARunnerFixedParams
 {
-    // The FMHA data type.
+    // The FMHA input data type.
     Data_type dataType;
+    // The FMHA kv cache data type.
+    Data_type dataTypeKv;
+    // The FMHA data output type.
+    Data_type dataTypeOut;
+
     // Do we use fp32 accumulation ?
     // TODO(yibinl): remove forceFp32Acc from MHARunnerFixedParams after adding host_runtime_perf_knobs to
     // bertAttentionPlugin input tensors, so that we can change mLaunchParams.force_fp32_acc value in runtime.
@@ -105,6 +110,8 @@ struct MHARunnerFixedParams
     int numQHeads;
     // The number of Kv Heads.
     int numKvHeads;
+    // The number of tokens per kv cache block.
+    int numTokensPerBlock;
     // The head size.
     int headSize;
     // The head size of V.
@@ -151,7 +158,9 @@ struct MHARunnerFixedParams
         output += ", attention_input_layout = ";
         switch (attentionInputLayout)
         {
-        case AttentionInputLayout::PACKED_QKV: output += "packed_qkv"; break;
+        case AttentionInputLayout::PACKED_QKV:
+            output += "packed_qkv, num_tokens_per_block = " + std::to_string(numTokensPerBlock);
+            break;
         case AttentionInputLayout::Q_CONTIGUOUS_KV: output += "q_contiguous_kv"; break;
         case AttentionInputLayout::Q_PAGED_KV: output += "q_paged_kv"; break;
         default: TLLM_CHECK_WITH_INFO(false, "not supported.");
@@ -195,6 +204,8 @@ struct MHARunnerParams
     KVBlockArray pagedKvCache;
     // The output buffer ptr.
     void* outputPtr;
+    // The output scaling factor buffer ptr. (only used for FP4 output)
+    void* outputSfPtr;
     // The packed mask ptr.
     void const* packedMaskPtr;
     // The cumulative Q sequence lengths.
@@ -209,8 +220,11 @@ struct MHARunnerParams
     float const* scaleBmm1Ptr;
     // The bmm2 scale device ptr (only used by fp8 kernels).
     float const* scaleBmm2Ptr;
+    // The device scale for O scaling factor.
+    float const* oSfScalePtr;
     // The cuda stream.
     cudaStream_t stream;
+    // Force using fp32 accumulation data type.
     bool forceFp32Acc = false;
 };
 

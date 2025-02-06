@@ -15,8 +15,10 @@
 
 from typing import List
 
+import numpy as np
+
 from .._common import default_net
-from ..functional import Tensor, lora_plugin
+from ..functional import Tensor, constant, dora_plugin, lora_plugin, where
 from ..module import Module
 
 
@@ -31,6 +33,7 @@ class LoraRuntimeParams(object):
         max_encoder_context_length: Tensor = None,
         host_encoder_input_lengths: Tensor = None,
         weight_index: int = 0,
+        partial_lora_mask: Tensor = None,
     ):
 
         self.lora_ranks = lora_ranks
@@ -40,6 +43,7 @@ class LoraRuntimeParams(object):
         self.max_encoder_context_length = max_encoder_context_length
         self.host_encoder_input_lengths = host_encoder_input_lengths
         self.weight_index = weight_index
+        self.partial_lora_mask = partial_lora_mask  # Partial LoRA for https://arxiv.org/abs/2401.16420
 
 
 class Lora(Module):
@@ -74,8 +78,48 @@ class Lora(Module):
                 lora_weights_pointers=lora_runtime_params.lora_weights_pointers,
                 weight_index=lora_runtime_params.weight_index,
             )
+            if lora_runtime_params.partial_lora_mask is not None:
+                zero_tensor = constant(np.array([0.0], dtype=np.float16))
+                if isinstance(result, List):
+                    result = [
+                        where(lora_runtime_params.partial_lora_mask, r,
+                              zero_tensor) for r in result
+                    ]
+                elif isinstance(result, Tensor):
+                    result = where(lora_runtime_params.partial_lora_mask,
+                                   result, zero_tensor)
+                else:
+                    assert False
         else:
             assert False, "Not support lora without plugin"
+
+        return result
+
+
+class Dora(Module):
+
+    def __init__(self, out_hidden_sizes: List[int] = [0]) -> None:
+        super().__init__()
+        self.out_hidden_sizes = out_hidden_sizes
+
+    def forward(self,
+                x,
+                lora_runtime_params: LoraRuntimeParams = None,
+                is_cross_attention: bool = False):
+        assert lora_runtime_params.weight_index == 0, "DoRA does not support weight_index != 0"
+        if default_net().plugin_config.lora_plugin and default_net(
+        ).plugin_config.dora_plugin:
+            result = dora_plugin(
+                x,
+                out_hidden_sizes=self.out_hidden_sizes,
+                host_request_types=lora_runtime_params.host_request_types,
+                host_context_lengths=lora_runtime_params.host_context_lengths
+                if not is_cross_attention else
+                lora_runtime_params.host_encoder_input_lengths,
+                lora_weights_pointers=lora_runtime_params.lora_weights_pointers,
+            )
+        else:
+            assert False, "Not support dora without plugin"
 
         return result
 
@@ -91,6 +135,7 @@ class LoraParams(object):
         host_request_types: Tensor = None,
         host_encoder_input_lengths: Tensor = None,  # For cross attention
         weight_index: int = 0,
+        partial_lora_mask: Tensor = None,
     ):
 
         self.lora_ranks = lora_ranks
@@ -102,6 +147,8 @@ class LoraParams(object):
         self.host_encoder_input_lengths = host_encoder_input_lengths
         self.weight_index = weight_index
 
+        self.partial_lora_mask = partial_lora_mask  # Partial LoRA for https://arxiv.org/abs/2401.16420
+
     def get_layer_params(self, layer_idx: int):
         return LoraParams(
             lora_ranks=[self.lora_ranks[layer_idx]],
@@ -111,7 +158,7 @@ class LoraParams(object):
             host_request_types=self.host_request_types,
             host_encoder_input_lengths=self.host_encoder_input_lengths,
             weight_index=self.weight_index,
-        )
+            partial_lora_mask=self.partial_lora_mask)
 
     def get_runtime_params(self, layer_idx: int, lora_module: str):
         if f"{lora_module}_lora_ranks" in self.lora_ranks[layer_idx]:
@@ -128,6 +175,7 @@ class LoraParams(object):
                 host_request_types=self.host_request_types,
                 host_encoder_input_lengths=self.host_encoder_input_lengths,
                 weight_index=self.weight_index,
+                partial_lora_mask=self.partial_lora_mask,
             )
         else:
             return None

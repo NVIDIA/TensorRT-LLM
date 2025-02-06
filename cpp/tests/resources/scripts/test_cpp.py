@@ -268,10 +268,32 @@ def run_tests(build_dir: _pl.Path,
         "--config-ids-filter=0", "--no-generate-cache-pages"
     ]
 
+    generate_lora_data_args_prefetch_task_3 = [
+        python_exe,
+        str(resources_dir / "scripts" / "generate_test_lora_weights.py"),
+        "--out-dir=cpp/tests/resources/data/lora_prefetch/3",
+        "--target-file-name=model.lora_weights.npy",
+        "--config-file-name=model.lora_config.npy"
+    ]
+
+    generate_lora_data_args_prefetch_task_5 = [
+        python_exe,
+        str(resources_dir / "scripts" / "generate_test_lora_weights.py"),
+        "--out-dir=cpp/tests/resources/data/lora_prefetch/5",
+        "--target-file-name=model.lora_weights.npy",
+        "--config-file-name=model.lora_config.npy"
+    ]
+
     run_command(generate_lora_data_args_tp1, cwd=root_dir, timeout=100)
     run_command(generate_lora_data_args_tp2, cwd=root_dir, timeout=100)
     run_command(generate_multi_lora_tp2_args, cwd=root_dir, timeout=100)
     run_command(generate_gpt2_lora_data_args_tp1, cwd=root_dir, timeout=100)
+    run_command(generate_lora_data_args_prefetch_task_3,
+                cwd=root_dir,
+                timeout=100)
+    run_command(generate_lora_data_args_prefetch_task_5,
+                cwd=root_dir,
+                timeout=100)
 
     if not skip_unit_tests:
         run_unit_tests(build_dir=build_dir, timeout=test_timeout)
@@ -750,15 +772,17 @@ def run_single_gpu_tests(build_dir: _pl.Path,
                            parallel=parallel)
     if run_gpt:
         xml_output_file = build_dir / "results-single-gpu-disagg-executor_gpt.xml"
+        new_env = copy.copy(cpp_env)
+        new_env["TRTLLM_USE_MPI_KVCACHE"] = "1"
         trt_model_test = produce_mpirun_command(
             global_commands=["mpirun", "--allow-run-as-root"],
             nranks=2,
             local_commands=[
-                "tests/executor/executorTest",
+                "tests/executor/disaggExecutorTest",
                 "--gtest_filter=*GptSingleDeviceDisaggSymmetricExecutorTest*"
             ],
             leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
-        run_command(trt_model_test, cwd=build_dir, env=cpp_env, timeout=timeout)
+        run_command(trt_model_test, cwd=build_dir, env=new_env, timeout=timeout)
 
         run_spec_dec_tests(build_dir=build_dir)
 
@@ -788,6 +812,8 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
     run_command(mpi_utils_test, cwd=tests_dir, env=cpp_env, timeout=300)
 
     # Cache transceiver tests
+    new_env = copy.copy(cpp_env)
+    new_env["TRTLLM_USE_MPI_KVCACHE"] = "1"
     cache_trans_test = [
         "mpirun",
         "-n",
@@ -795,8 +821,10 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
         "--allow-run-as-root",
         "batch_manager/cacheTransceiverTest",
     ]
-    run_command(cache_trans_test, cwd=tests_dir, env=cpp_env, timeout=300)
+    run_command(cache_trans_test, cwd=tests_dir, env=new_env, timeout=300)
 
+    new_env = copy.copy(cpp_env)
+    new_env["TRTLLM_USE_MPI_KVCACHE"] = "1"
     # Cache transceiver tests
     cache_trans_test_8_proc = [
         "mpirun",
@@ -807,7 +835,7 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
     ]
     run_command(cache_trans_test_8_proc,
                 cwd=tests_dir,
-                env=cpp_env,
+                env=new_env,
                 timeout=600)
 
     xml_output_file = build_dir / "results-multi-gpu-real-decoder.xml"
@@ -822,10 +850,11 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
     run_command(trt_model_test, cwd=tests_dir, env=cpp_env,
                 timeout=timeout)  # expecting ~ 1200s
 
+    mgpu_env = copy.copy(cpp_env)
+    mgpu_env["RUN_LLAMA_MULTI_GPU"] = "true"
+
     #Executor test in leader mode
-    new_env = copy.copy(cpp_env)
     xml_output_file = build_dir / "results-multi-gpu-llama-exec-leader-mode.xml"
-    new_env["RUN_LLAMA_MULTI_GPU"] = "true"
     trt_model_test = produce_mpirun_command(
         global_commands=["mpirun", "--allow-run-as-root"],
         nranks=4,
@@ -834,35 +863,33 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
             "--gtest_filter=*LlamaExecutorTest*LeaderMode*:*LlamaMultiExecutorTest*LeaderMode*"
         ],
         leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
-    run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
+    # https://nvbugspro.nvidia.com/bug/5026255 disable below tests for now.
+    if False:
+        run_command(trt_model_test, cwd=tests_dir, env=mgpu_env, timeout=1500)
 
-    # Executor test in orchestrator mode
-    # https://nvbugs/4690328 - Disabled BW2 tests because of spurious failure
+    #Executor test in orchestrator mode
     xml_output_file = build_dir / "results-multi-gpu-llama-exec-orch-mode.xml"
     trt_model_test = [
         "mpirun", "-n", "1", "--allow-run-as-root", "executor/executorTest",
-        "--gtest_filter=*LlamaExecutorTest*OrchMode*:-*BW2*",
+        "--gtest_filter=*LlamaExecutorTest*OrchMode*",
         f"--gtest_output=xml:{xml_output_file}"
     ]
-    run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
+    run_command(trt_model_test, cwd=tests_dir, env=mgpu_env, timeout=1500)
 
     #EncDec test in leader mode
-    new_env = copy.copy(cpp_env)
     xml_output_file = build_dir / "results-multi-gpu-t5-exec-leader-mode.xml"
     trt_model_test = produce_mpirun_command(
         global_commands=["mpirun", "--allow-run-as-root"],
         nranks=4,
         local_commands=[
-            "executor/executorTest",
+            "executor/encDecTest",
             "--gtest_filter=T5MultiGPUTest/EncDecParamsTest.Forward*"
         ],
         leader_commands=[f"--gtest_output=xml:{xml_output_file}"],
     )
-    run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
+    run_command(trt_model_test, cwd=tests_dir, env=cpp_env, timeout=1500)
 
     #Logits processor and guided decoding test in leader mode
-    new_env = copy.copy(cpp_env)
-    new_env["RUN_LLAMA_MULTI_GPU"] = "true"
     xml_output_file = build_dir / "results-multi-gpu-logits-proc.xml"
     tp_pp_sizes = [(4, 1), (2, 2), (1, 4)]
     gtest_filter = [
@@ -881,103 +908,13 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
             "executor/executorTest", f"--gtest_filter={gtest_filter}"
         ],
         leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
-    run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
-
-    new_env = copy.copy(cpp_env)
-    xml_output_file = build_dir / "results-multi-gpu-disagg-executor-2-process.xml"
-    trt_model_test = produce_mpirun_command(
-        global_commands=["mpirun", "--allow-run-as-root"],
-        nranks=2,
-        local_commands=[
-            "executor/executorTest",
-            "--gtest_filter=*DisaggSymmetricExecutorTest*"
-        ],
-        leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
-    run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
-
-    new_env = copy.copy(cpp_env)
-    new_env["RUN_LLAMA_MULTI_GPU"] = "true"
-    xml_output_file = build_dir / "results-multi-gpu-disagg-executor-4-process.xml"
-    trt_model_test = produce_mpirun_command(
-        global_commands=["mpirun", "--allow-run-as-root"],
-        nranks=4,
-        local_commands=[
-            "executor/executorTest",
-            "--gtest_filter=*DisaggSymmetricExecutorTest*"
-        ],
-        leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
-    run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
-
-    new_env = copy.copy(cpp_env)
-    new_env["RUN_LLAMA_MULTI_GPU"] = "true"
-    xml_output_file = build_dir / "results-multi-gpu-disagg-executor-8-process.xml"
-    trt_model_test = produce_mpirun_command(
-        global_commands=["mpirun", "--allow-run-as-root"],
-        nranks=8,
-        local_commands=[
-            "executor/executorTest",
-            "--gtest_filter=*LlamaTP2PP2DisaggSymmetricExecutorTest*"
-        ],
-        leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
-    run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
-
-    new_env = copy.copy(cpp_env)
-    new_env["RUN_LLAMA_MULTI_GPU"] = "true"
-    xml_output_file = build_dir / "results-multi-gpu-disagg-asymmetric-executor-4-process.xml"
-    trt_model_test = produce_mpirun_command(
-        global_commands=["mpirun", "--allow-run-as-root"],
-        nranks=4,
-        local_commands=[
-            "executor/executorTest",
-            "--gtest_filter=*DisaggAsymmetricExecutorTest*"
-        ],
-        leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
-    run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
-
-    new_env = copy.copy(cpp_env)
-    new_env["RUN_LLAMA_MULTI_GPU"] = "true"
-    xml_output_file = build_dir / "results-multi-gpu-disagg-asymmetric-executor-6-process.xml"
-    trt_model_test = produce_mpirun_command(
-        global_commands=["mpirun", "--allow-run-as-root"],
-        nranks=6,
-        local_commands=[
-            "executor/executorTest",
-            "--gtest_filter=*DisaggAsymmetricExecutorTest*"
-        ],
-        leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
-    run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
-
-    new_env = copy.copy(cpp_env)
-    new_env["RUN_LLAMA_MULTI_GPU"] = "true"
-    xml_output_file = build_dir / "results-multi-gpu-disagg-asymmetric-executor-8-process.xml"
-    trt_model_test = produce_mpirun_command(
-        global_commands=["mpirun", "--allow-run-as-root"],
-        nranks=8,
-        local_commands=[
-            "executor/executorTest",
-            "--gtest_filter=*DisaggAsymmetricExecutorTest*"
-        ],
-        leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
-    run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
-
-    new_env = copy.copy(cpp_env)
-    new_env["RUN_LLAMA_MULTI_GPU"] = "true"
-    xml_output_file = build_dir / "results-multi-gpu-disagg-asymmetric-orchestrator-executor-7-process.xml"
-    trt_model_test = produce_mpirun_command(
-        global_commands=["mpirun", "--allow-run-as-root"],
-        nranks=7,
-        local_commands=[
-            "executor/executorTest",
-            "--gtest_filter=*DisaggOrchestratorParamsTest*"
-        ],
-        leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
-    run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
+    run_command(trt_model_test, cwd=tests_dir, env=mgpu_env, timeout=1500)
 
     # UCX transceiver tests, the test may not be built if ENABLE_UCX is 0
     if _os.path.exists(
             _os.path.join(tests_dir, "batch_manager/ucxDataTransceiverTest")):
-        new_env = copy.copy(cpp_env)
-        new_env["UCX_MEMTYPE_CACHE"] = "n"
+        ucx_env = copy.copy(cpp_env)
+        ucx_env["UCX_MEMTYPE_CACHE"] = "n"
         ucx_trans_test = [
             "mpirun",
             "-n",
@@ -985,7 +922,99 @@ def run_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
             "--allow-run-as-root",
             "batch_manager/ucxDataTransceiverTest",
         ]
-        run_command(ucx_trans_test, cwd=tests_dir, env=new_env, timeout=300)
+        run_command(ucx_trans_test, cwd=tests_dir, env=ucx_env, timeout=300)
+
+    run_disagg_tests(build_dir)
+
+
+def run_disagg_tests(build_dir: _pl.Path):
+    build_tests(build_dir=build_dir)
+
+    tests_dir = build_dir / "tests"
+    cpp_env = {**_os.environ}
+
+    new_env = copy.copy(cpp_env)
+    new_env["TRTLLM_USE_MPI_KVCACHE"] = "1"
+    xml_output_file = build_dir / "results-multi-gpu-disagg-executor-2-process.xml"
+    trt_model_test = produce_mpirun_command(
+        global_commands=["mpirun", "--allow-run-as-root"],
+        nranks=2,
+        local_commands=[
+            "executor/disaggExecutorTest",
+            "--gtest_filter=*DisaggSymmetricExecutorTest*"
+        ],
+        leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
+    run_command(trt_model_test, cwd=tests_dir, env=new_env, timeout=1500)
+
+    mgpu_env = copy.copy(cpp_env)
+    mgpu_env["RUN_LLAMA_MULTI_GPU"] = "true"
+    mgpu_env["TRTLLM_USE_MPI_KVCACHE"] = "1"
+    xml_output_file = build_dir / "results-multi-gpu-disagg-executor-4-process.xml"
+    trt_model_test = produce_mpirun_command(
+        global_commands=["mpirun", "--allow-run-as-root"],
+        nranks=4,
+        local_commands=[
+            "executor/disaggExecutorTest",
+            "--gtest_filter=*DisaggSymmetricExecutorTest*"
+        ],
+        leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
+    # https://nvbugspro.nvidia.com/bug/5026255 disable below tests for now.
+    run_command(trt_model_test, cwd=tests_dir, env=mgpu_env, timeout=1500)
+
+    xml_output_file = build_dir / "results-multi-gpu-disagg-executor-8-process.xml"
+    trt_model_test = produce_mpirun_command(
+        global_commands=["mpirun", "--allow-run-as-root"],
+        nranks=8,
+        local_commands=[
+            "executor/disaggExecutorTest",
+            "--gtest_filter=*LlamaTP2PP2DisaggSymmetricExecutorTest*"
+        ],
+        leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
+    run_command(trt_model_test, cwd=tests_dir, env=mgpu_env, timeout=1500)
+
+    xml_output_file = build_dir / "results-multi-gpu-disagg-asymmetric-executor-4-process.xml"
+    trt_model_test = produce_mpirun_command(
+        global_commands=["mpirun", "--allow-run-as-root"],
+        nranks=4,
+        local_commands=[
+            "executor/disaggExecutorTest",
+            "--gtest_filter=*DisaggAsymmetricExecutorTest*"
+        ],
+        leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
+    run_command(trt_model_test, cwd=tests_dir, env=mgpu_env, timeout=1500)
+
+    xml_output_file = build_dir / "results-multi-gpu-disagg-asymmetric-executor-6-process.xml"
+    trt_model_test = produce_mpirun_command(
+        global_commands=["mpirun", "--allow-run-as-root"],
+        nranks=6,
+        local_commands=[
+            "executor/disaggExecutorTest",
+            "--gtest_filter=*DisaggAsymmetricExecutorTest*"
+        ],
+        leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
+    run_command(trt_model_test, cwd=tests_dir, env=mgpu_env, timeout=1500)
+
+    xml_output_file = build_dir / "results-multi-gpu-disagg-asymmetric-executor-8-process.xml"
+    trt_model_test = produce_mpirun_command(
+        global_commands=["mpirun", "--allow-run-as-root"],
+        nranks=8,
+        local_commands=[
+            "executor/disaggExecutorTest",
+            "--gtest_filter=*DisaggAsymmetricExecutorTest*"
+        ],
+        leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
+    run_command(trt_model_test, cwd=tests_dir, env=mgpu_env, timeout=1500)
+
+    xml_output_file = build_dir / "results-multi-gpu-disagg-asymmetric-orchestrator-executor-7-process.xml"
+    trt_model_test = produce_mpirun_command(
+        global_commands=["mpirun", "--allow-run-as-root"],
+        nranks=7,
+        local_commands=[
+            "executor/disaggExecutorTest",
+            "--gtest_filter=*DisaggOrchestratorParamsTest*"
+        ],
+        leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
+    run_command(trt_model_test, cwd=tests_dir, env=mgpu_env, timeout=1500)
 
 
 def run_benchmarks(model_name: str, python_exe: str, root_dir: _pl.Path,

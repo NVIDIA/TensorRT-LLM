@@ -60,7 +60,7 @@ Tensor pack_fmha_mask_by_type(Tensor actual_q_seqlens, Tensor actual_kv_seqlens,
     maskParams.attentionMaskType = static_cast<ContextAttentionMaskType>(int(attention_mask_type));
 
     // Launch the pack mask kernel.
-    auto stream = at::cuda::getDefaultCUDAStream();
+    auto stream = at::cuda::getCurrentCUDAStream(actual_q_seqlens.get_device());
     invokeBuildPackedMask(maskParams, stream);
 
     return packed_mask;
@@ -133,7 +133,7 @@ Tensor pack_fmha_mask_by_input_helper(
     maskParams.validPosVal = T(valid_pos_value);
 
     // Launch the pack mask kernel.
-    auto stream = at::cuda::getDefaultCUDAStream();
+    auto stream = at::cuda::getCurrentCUDAStream(mask_input.get_device());
     invokeBuildPackedMask(maskParams, stream);
     sync_check_cuda_error();
 

@@ -38,7 +38,7 @@ namespace tc = tensorrt_llm::common;
 
 namespace
 {
-using Json = typename nlohmann::json::basic_json;
+using Json = nlohmann::json;
 
 template <typename FieldType>
 FieldType parseJsonFieldOr(Json const& json, std::string_view name, FieldType defaultValue)
@@ -78,6 +78,19 @@ std::optional<FieldType> parseJsonFieldOptional(Json const& json, std::string_vi
         TLLM_LOG_DEBUG("Optional value for parameter %s will not be set.", std::string(name).c_str());
     }
     return value;
+}
+
+static nvinfer1::DataType strToDType(std::string type)
+{
+    static const std::map<std::string, nvinfer1::DataType> typeMap = {{"int64", nvinfer1::DataType::kINT64},
+        {"int32", nvinfer1::DataType::kINT32}, {"int", nvinfer1::DataType::kINT32},
+        {"float32", nvinfer1::DataType::kFLOAT}, {"bfloat16", nvinfer1::DataType::kBF16},
+        {"float16", nvinfer1::DataType::kHALF}, {"bool", nvinfer1::DataType::kBOOL},
+        {"uint8", nvinfer1::DataType::kUINT8}, {"int8", nvinfer1::DataType::kINT8}, {"fp8", nvinfer1::DataType::kFP8},
+        {"int4", nvinfer1::DataType::kINT4}};
+
+    TLLM_CHECK_WITH_INFO(typeMap.count(type) > 0, type + " not found in strToDtype.");
+    return typeMap.at(type);
 }
 
 std::vector<ModelConfig::LayerType> buildLayerTypes(
@@ -127,10 +140,21 @@ std::vector<ModelConfig::LayerType> buildLayerTypes(
     return result;
 }
 
+ModelConfig parseMultimodalConfig(Json const& json, nvinfer1::DataType dataType)
+{
+    return ModelConfig{128, 10, 10, 0, 1, 128,
+        dataType}; // use dummy values because vision engines of multimodal models does not record this info in config
+}
+
 ModelConfig createModelConfig(
     Json const& json, bool engineVersionNone, SizeType32 tensorParallelism, nvinfer1::DataType dataType)
 {
     auto const& config = engineVersionNone ? json.at("builder_config") : json.at("pretrained_config");
+    auto const multiModalName = parseJsonFieldOptional<std::string>(config, "model_name");
+    if (multiModalName && multiModalName == std::string("multiModal"))
+    {
+        return parseMultimodalConfig(json, dataType);
+    }
 
     auto const* const archField = "architecture";
     auto const* const numLayersField = engineVersionNone ? "num_layers" : "num_hidden_layers";
@@ -276,7 +300,10 @@ void parseBuilderConfig(ModelConfig& modelConfig, Json const& builderConfig)
 {
     auto const maxBatchSize = parseJsonFieldOr(builderConfig, "max_batch_size", 0);
     auto const maxBeamWidth = parseJsonFieldOr(builderConfig, "max_beam_width", 0);
-    auto const maxInputLen = parseJsonFieldOr(builderConfig, "max_input_len", 0);
+    auto const maxInputLen = parseJsonFieldOr(builderConfig, "max_input_len",
+        modelConfig.isMultiModal()
+            ? maxBatchSize
+            : 0); // For multimodal model, used by microbatch scheduler to limit the number requests to schedule
     auto const maxSequenceLen = parseJsonFieldOr(builderConfig, "max_seq_len", 0);
     auto const maxNumTokens = parseJsonFieldOptional<SizeType32>(builderConfig, "max_num_tokens");
     auto const maxPromptEmbeddingTableSize
@@ -314,6 +341,8 @@ void parseBuilderConfig(ModelConfig& modelConfig, Json const& builderConfig)
 
 void parsePluginConfig(ModelConfig& modelConfig, Json const& pluginConfig)
 {
+    auto const useGemmAllReducePlugin
+        = pluginConfig.contains("gemm_allreduce_plugin") && !pluginConfig.at("gemm_allreduce_plugin").is_null();
     auto const useGptAttentionPlugin = !pluginConfig.at("gpt_attention_plugin").is_null();
     auto const useMambaConv1dPlugin
         = pluginConfig.contains("mamba_conv1d_plugin") && !pluginConfig.at("mamba_conv1d_plugin").is_null();
@@ -332,6 +361,12 @@ void parsePluginConfig(ModelConfig& modelConfig, Json const& pluginConfig)
         !removeInputPadding || modelConfig.getMaxNumTokens(), "Padding removal requires max_num_tokens to be set.");
 
     modelConfig.useGptAttentionPlugin(useGptAttentionPlugin);
+    modelConfig.useGemmAllReducePlugin(useGemmAllReducePlugin);
+    if (useGemmAllReducePlugin)
+    {
+        auto const outputStrType = pluginConfig.at("gemm_allreduce_plugin");
+        modelConfig.setGemmAllReduceDtype(strToDType(outputStrType));
+    }
     modelConfig.useMambaConv1dPlugin(useMambaConv1dPlugin);
     modelConfig.usePackedInput(removeInputPadding);
     modelConfig.usePagedState(pagedState);
@@ -413,8 +448,11 @@ GptJsonConfig parseJson(InputType&& input)
 
     auto const& builderConfig = engineVersionNone ? json.at("builder_config") : json.at("build_config");
 
-    auto const name = engineVersionNone ? builderConfig.at("name").template get<std::string>()
-                                        : json.at("pretrained_config").at("architecture").template get<std::string>();
+    auto const multiModalType = parseJsonFieldOptional<std::string>(builderConfig, "model_name");
+
+    auto const name = engineVersionNone
+        ? (multiModalType ? multiModalType.value() : builderConfig.at("name").template get<std::string>())
+        : json.at("pretrained_config").at("architecture").template get<std::string>();
 
     auto const tensorParallelism = engineVersionNone
         ? builderConfig.at("tensor_parallel").template get<SizeType32>()
@@ -450,14 +488,17 @@ GptJsonConfig parseJson(InputType&& input)
     }();
 
     auto modelConfig = createModelConfig(json, engineVersionNone, tensorParallelism, dataType);
+
     modelConfig.setModelName(name);
 
     parseBuilderConfig(modelConfig, builderConfig);
+    if (!modelConfig.isMultiModal())
+    {
+        auto const& pluginConfig = engineVersionNone ? json.at("plugin_config") : builderConfig.at("plugin_config");
+        parsePluginConfig(modelConfig, pluginConfig);
 
-    auto const& pluginConfig = engineVersionNone ? json.at("plugin_config") : builderConfig.at("plugin_config");
-    parsePluginConfig(modelConfig, pluginConfig);
-
-    parseLora(modelConfig, json, pluginConfig, engineVersionNone, tensorParallelism);
+        parseLora(modelConfig, json, pluginConfig, engineVersionNone, tensorParallelism);
+    }
 
     auto runtimeDefaults = engineVersionNone
         ? std::nullopt
@@ -646,6 +687,10 @@ GptJsonConfig parseJson(InputType&& input)
 
 std::string GptJsonConfig::engineFilename(WorldConfig const& worldConfig, std::string const& model) const
 {
+    if (mModelConfig.isMultiModal())
+    {
+        return "model.engine";
+    }
     TLLM_CHECK_WITH_INFO(getTensorParallelism() == worldConfig.getTensorParallelism(), "tensor parallelism mismatch");
     TLLM_CHECK_WITH_INFO(
         getPipelineParallelism() == worldConfig.getPipelineParallelism(), "pipeline parallelism mismatch");

@@ -21,6 +21,7 @@
 #include "tensorrt_llm/layers/defaultDecodingParams.h"
 #include "tensorrt_llm/runtime/common.h"
 
+#include <algorithm>
 #include <functional>
 #include <optional>
 #include <vector>
@@ -173,6 +174,8 @@ public:
         // Only used for tests.
         draftAcceptanceThreshold = fuseValues<FloatType>(
             configs, [&configs](size_t ci) { return configs[ci].draftAcceptanceThreshold; }, 0);
+        minP = fuseValues<FloatType>(
+            configs, [&configs](size_t ci) { return configs[ci].minP; }, layers::DefaultDecodingParams::getMinP());
     }
 
     explicit SamplingConfig(executor::SamplingConfig const& samplingConfig,
@@ -210,6 +213,7 @@ public:
         SET_FROM_OPTIONAL(lengthPenalty, LengthPenalty, FloatType)
         SET_FROM_OPTIONAL(earlyStopping, EarlyStopping, SizeType32)
         SET_FROM_OPTIONAL(noRepeatNgramSize, NoRepeatNgramSize, SizeType32)
+        SET_FROM_OPTIONAL(minP, MinP, FloatType)
 #undef SET_FROM_OPTIONAL
     }
 
@@ -255,6 +259,7 @@ public:
         valid &= validateVec("repetitionPenalty", repetitionPenalty, 0.f);
         valid &= validateVec("minLength", minLength, -1);
         valid &= validateVec("noRepeatNgramSize", noRepeatNgramSize, 0);
+        valid &= validateVec("minP", minP, -fltEpsilon, {1.f});
 
         valid &= validateVec("beamSearchDiversityRate", beamSearchDiversityRate, -fltEpsilon);
 
@@ -333,6 +338,7 @@ public:
     OptVec<FloatType> topPDecay;      // [batch_size], must between [0, 1]
     OptVec<FloatType> topPMin;        // [batch_size], must between [0, 1]
     OptVec<TokenIdType> topPResetIds; // [batch_size]
+    OptVec<FloatType> minP;           // [1] or [batch_size] on cpu
 
     // beam search layer
     OptVec<FloatType> beamSearchDiversityRate; // [1] or [batch_size]
@@ -359,7 +365,7 @@ public:
             && lengthPenalty == other.lengthPenalty && earlyStopping == other.earlyStopping
             && draftAcceptanceThreshold == other.draftAcceptanceThreshold && topKMedusaHeads == other.topKMedusaHeads
             && normalizeLogProbs == other.normalizeLogProbs && outputLogProbs == other.outputLogProbs
-            && cumLogProbs == other.cumLogProbs;
+            && cumLogProbs == other.cumLogProbs && minP == other.minP;
     }
 
     SizeType32 getNumReturnBeams() const

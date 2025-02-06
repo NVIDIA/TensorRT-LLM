@@ -24,7 +24,8 @@ The `LLM` class supports input from any of following:
 2. **Local Hugging Face models**: Uses a locally stored Hugging Face model.
 3. **Local TensorRT-LLM engine**: Built by `trtllm-build` tool or saved by the Python LLM API.
 
-You can use any of these formats interchangeably with the `LLM(model=<any-model-path>)` constructor.
+Any of these formats can be used interchangeably with the ``LLM(model=<any-model-path>)`` constructor.
+
 The following sections describe how to use these different formats for the LLM API.
 
 ### Hugging Face Hub
@@ -34,6 +35,8 @@ Using the Hugging Face Hub is as simple as specifying the repo name in the LLM c
 ```python
 llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 ```
+
+You can also directly load TensorRT Model Optimizer's [quantized checkpoints](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4) on Hugging Face Hub in the same way.
 
 ### Local Hugging Face Models
 
@@ -55,19 +58,18 @@ Using this model is subject to a [particular](https://ai.meta.com/resources/mode
 
 ### Local TensorRT-LLM Engine
 
-The LLM API can use a TensorRT-LLM engine.
 There are two ways to build a TensorRT-LLM engine:
 
 1. You can build the TensorRT-LLM engine from the Hugging Face model directly with the [`trtllm-build`](../commands/trtllm-build.rst) tool and then save the engine to disk for later use.
 Refer to the [README](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama) in the [`examples/llama`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/llama) repository on GitHub.
 
-   After the engine building is finished, you can load the model:
+   After the engine building is finished, we can load the model:
 
    ```python
    llm = LLM(model=<path_to_trt_engine>)
    ```
 
-2. Alternatively, you can use an `LLM` instance to create the engine and persist to local disk:
+2. Use an `LLM` instance to create the engine and persist to local disk:
 
    ```python
    llm = LLM(<model-path>)
@@ -99,3 +101,9 @@ The following tips typically assist new LLM API users who are familiar with othe
   Because the LLM API relies on the `mpi4py` library, put the LLM class in a function and protect the main entrypoint to the program under the `__main__` namespace to avoid a [recursive spawn](https://mpi4py.readthedocs.io/en/stable/mpi4py.futures.html#mpipoolexecutor) process in `mpi4py`.
 
   This limitation is applicable for multi-GPU inference only.
+
+- Cannot quit after generation
+
+  The LLM instance manages threads and processes, which may prevent its reference count from reaching zero. To address this issue, there are two common solutions:
+  1. Wrap the LLM instance in a function, as demonstrated in the quickstart guide. This will reduce the reference count and trigger the shutdown process.
+  2. Use LLM as an contextmanager, with the following code: `with LLM(...) as llm: ...`, the shutdown methed will be invoked automatically once it goes out of the `with`-statement block.

@@ -118,20 +118,27 @@ class Mapping(object):
             gpus_per_node=8,
             *,
             cp_size=1,
-            cp_config={},
+            cp_config=None,
             tp_size=1,
             pp_size=1,
             moe_tp_size=-1,  # -1 means no moe
-            moe_ep_size=-1):  # -1 means no moe
+            moe_ep_size=-1,  # -1 means no moe
+            auto_parallel=False):
         # set default values for non-moe cases
         if moe_tp_size == -1:
             moe_tp_size = tp_size
             moe_ep_size = 1
 
-        if pp_size * cp_size * tp_size != world_size:
-            raise ValueError(
-                f"world_size must equal to pp_size * cp_size * tp_size, but got {world_size} != {pp_size} * {cp_size} * {tp_size}"
-            )
+        if auto_parallel:
+            if tp_size != 1 or pp_size != 1 or tp_size != 1:
+                raise ValueError(
+                    f"When auto parallel is enabled, tp_size, pp_size, cp_size must be 1, but got {tp_size}, {pp_size}, {cp_size}."
+                )
+        else:
+            if tp_size * pp_size * cp_size != world_size:
+                raise ValueError(
+                    f"world_size must equal to tp_size * pp_size * cp_size, but got {world_size} != {tp_size} * {pp_size} * {cp_size}."
+                )
 
         moe_tp_ep_size = moe_tp_size * moe_ep_size
         if moe_tp_ep_size != tp_size:
@@ -144,10 +151,11 @@ class Mapping(object):
 
         self.tp_size = tp_size
         self.cp_size = cp_size
-        self.cp_config = cp_config
+        self.cp_config = cp_config if cp_config is not None else {}
         self.pp_size = pp_size
         self.moe_tp_size = moe_tp_size
         self.moe_ep_size = moe_ep_size
+        self.auto_parallel = auto_parallel
         self.world_size = world_size
         self.rank = rank
         self.gpus_per_node = gpus_per_node
@@ -191,26 +199,6 @@ class Mapping(object):
                               i * moe_tp_ep_size + (j + 1) * moe_ep_size)
                 self.moe_ep_groups.append(list(ranks))
 
-        self.pp_rank = self.rank // (self.tp_size * self.cp_size)
-        self.cp_rank = self.rank % (self.tp_size * self.cp_size) // self.tp_size
-        self.tp_rank = self.rank % self.tp_size
-        self.moe_tp_rank = self.tp_rank // self.moe_ep_size
-        self.moe_ep_rank = self.tp_rank % self.moe_ep_size
-
-        self.tp_group = self.tp_groups[self.pp_rank * self.cp_size +
-                                       self.cp_rank]
-        self.cp_group = self.cp_groups[self.pp_rank * self.tp_size +
-                                       self.tp_rank]
-        self.pp_group = self.pp_groups[self.cp_rank * self.tp_size +
-                                       self.tp_rank]
-        self.moe_tp_group = self.moe_tp_groups[self.pp_rank * moe_ep_size +
-                                               self.moe_ep_rank]
-        self.moe_ep_group = self.moe_ep_groups[self.pp_rank * moe_tp_size +
-                                               self.moe_tp_rank]
-
-        self.node_rank = self.rank // self.gpus_per_node
-        self.local_rank = self.rank % self.gpus_per_node
-
     def __eq__(self, other):
         if not isinstance(other, Mapping):
             return NotImplemented
@@ -221,13 +209,79 @@ class Mapping(object):
                 and self.tp_size == other.tp_size
                 and self.pp_size == other.pp_size
                 and self.moe_tp_size == other.moe_tp_size
-                and self.moe_ep_size == other.moe_ep_size)
+                and self.moe_ep_size == other.moe_ep_size
+                and self.auto_parallel == other.auto_parallel)
 
     def __hash__(self):
         return (hash(self.world_size) ^ hash(self.rank)
                 ^ hash(self.gpus_per_node) ^ hash(self.cp_size)
                 ^ hash(self.tp_size) ^ hash(self.pp_size)
-                ^ hash(self.moe_tp_size) ^ hash(self.moe_ep_size))
+                ^ hash(self.moe_tp_size) ^ hash(self.moe_ep_size)
+                ^ hash(self.auto_parallel))
+
+    @property
+    def rank(self):
+        return self._rank
+
+    @rank.setter
+    def rank(self, rank: int):
+        if not isinstance(rank, int) or rank < 0 or rank >= self.world_size:
+            raise ValueError(
+                f"Rank should be an integer between 0 and {self.world_size-1}, but got {rank}."
+            )
+        self._rank = rank
+
+    @property
+    def tp_rank(self):
+        return 0 if self.auto_parallel else self.rank % self.tp_size
+
+    @property
+    def pp_rank(self):
+        return 0 if self.auto_parallel else self.rank // (self.tp_size *
+                                                          self.cp_size)
+
+    @property
+    def cp_rank(self):
+        return 0 if self.auto_parallel else self.rank % (
+            self.tp_size * self.cp_size) // self.tp_size
+
+    @property
+    def moe_tp_rank(self):
+        return self.tp_rank // self.moe_ep_size
+
+    @property
+    def moe_ep_rank(self):
+        return self.tp_rank % self.moe_ep_size
+
+    @property
+    def tp_group(self):
+        return self.tp_groups[self.pp_rank * self.cp_size + self.cp_rank]
+
+    @property
+    def pp_group(self):
+        return self.pp_groups[self.cp_rank * self.tp_size + self.tp_rank]
+
+    @property
+    def cp_group(self):
+        return self.cp_groups[self.pp_rank * self.tp_size + self.tp_rank]
+
+    @property
+    def moe_tp_group(self):
+        return self.moe_tp_groups[self.pp_rank * self.moe_ep_size +
+                                  self.moe_ep_rank]
+
+    @property
+    def moe_ep_group(self):
+        return self.moe_ep_groups[self.pp_rank * self.moe_tp_size +
+                                  self.moe_tp_rank]
+
+    @property
+    def node_rank(self):
+        return self.rank // self.gpus_per_node
+
+    @property
+    def local_rank(self):
+        return self.rank % self.gpus_per_node
 
     def has_cp(self):
         return self.cp_size > 1
@@ -294,5 +348,6 @@ class Mapping(object):
             'tp_size': self.tp_size,
             'pp_size': self.pp_size,
             'moe_tp_size': self.moe_tp_size,
-            'moe_ep_size': self.moe_ep_size
+            'moe_ep_size': self.moe_ep_size,
+            'auto_parallel': self.auto_parallel,
         }

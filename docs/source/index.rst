@@ -14,6 +14,7 @@ Welcome to TensorRT-LLM's Documentation!
    overview.md
    quick-start-guide.md
    key-features.md
+   torch.md
    release-notes.md
 
 
@@ -106,6 +107,7 @@ Welcome to TensorRT-LLM's Documentation!
    advanced/expert-parallelism.md
    advanced/kv-cache-reuse.md
    advanced/speculative-decoding.md
+   advanced/disaggregated-service.md
 
 .. toctree::
    :maxdepth: 2
@@ -114,7 +116,7 @@ Welcome to TensorRT-LLM's Documentation!
 
    performance/perf-overview.md
    Benchmarking <performance/perf-benchmarking.md>
-   Best Practices <performance/perf-best-practices.md>
+   Best Practices <performance/introduction.md>
    performance/perf-analysis.md
 
 

@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include "tensorrt_llm/plugins/gemmPlugin/gemmPlugin.h"
@@ -31,6 +32,7 @@ namespace
 {
 
 using tensorrt_llm::common::check;
+using tensorrt_llm::common::CublasMMWrapper;
 
 void cublas_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tensor const& b,
     torch::Tensor const& scale_a, torch::Tensor const& scale_b)
@@ -40,9 +42,13 @@ void cublas_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tenso
     int32_t n = b.sizes()[1];
     int32_t k = a.sizes()[1];
 
-    auto cublasHandle = getCublasHandle();
-    auto cublasLtHandle = getCublasLtHandle();
-    auto cublasWrapper = getCublasMMWrapper(cublasHandle, cublasLtHandle, nullptr, nullptr);
+    thread_local std::shared_ptr<CublasMMWrapper> cublasWrapper;
+    if (cublasWrapper == nullptr)
+    {
+        auto cublasHandle = getCublasHandle();
+        auto cublasLtHandle = getCublasLtHandle();
+        cublasWrapper = std::make_shared<CublasMMWrapper>(cublasHandle, cublasLtHandle, nullptr, nullptr);
+    }
 
     auto const dtype = out.dtype();
     cudaDataType_t aType = CUDA_R_8F_E4M3;
@@ -93,8 +99,8 @@ void cublas_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tenso
 
     // got from cublasTest matmultFind
     int const algoID = 52;
-    check_cuda_error(
-        cublasLtMatmulAlgoInit(*cublasLtHandle, compType, scalarType, aType, bType, outType, outType, algoID, &algo));
+    check_cuda_error(cublasLtMatmulAlgoInit(
+        cublasWrapper->getCublasLtHandle(), compType, scalarType, aType, bType, outType, outType, algoID, &algo));
     int tileID = CUBLASLT_MATMUL_TILE_256x128;
     int swizzle = 0;
     uint16_t cta = CUBLASLT_CLUSTER_SHAPE_2x1x1;

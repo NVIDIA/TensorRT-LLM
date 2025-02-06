@@ -187,7 +187,7 @@ void benchmarkGptSession(std::filesystem::path const& dataPath, std::vector<int>
                     generationOutput.contextLogits
                         = bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kFLOAT);
                 }
-                if (session.getModelConfig().computeGenerationLogits())
+                if (session.getGatherGenerationLogits())
                 {
                     generationOutput.generationLogits
                         = bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kFLOAT);
@@ -306,7 +306,7 @@ void benchmarkGptSession(std::filesystem::path const& dataPath, std::vector<int>
                         std::cout << "generationOutput.contextLogits: " << *generationOutput.contextLogits << std::endl;
                     }
 
-                    if (session.getModelConfig().computeGenerationLogits() && printAllLogits)
+                    if (session.getGatherGenerationLogits() && printAllLogits)
                     {
                         std::cout << "generationOutput.generationLogits.shape: "
                                   << generationOutput.generationLogits->getShape()

@@ -134,10 +134,10 @@ std::vector<LowLatencyGemmSwigluPluginProfiler::Config> LowLatencyGemmSwigluPlug
 
 LowLatencyGemmSwigluPlugin::LowLatencyGemmSwigluPlugin(nvinfer1::DataType type, float scale_output, float scale_d0,
     float scale_d1, PluginProfilerPtr const& pluginProfiler)
-    : mScaleOutput(scale_output)
+    : mPluginProfiler(pluginProfiler)
+    , mScaleOutput(scale_output)
     , mScaleD0(scale_d0)
     , mScaleD1(scale_d1)
-    , mPluginProfiler(pluginProfiler)
 {
     init(type);
 }
@@ -402,10 +402,10 @@ IPluginV2* LowLatencyGemmSwigluPluginCreator::createPlugin(char const* name, Plu
 {
     PluginField const* fields = fc->fields;
     TLLM_CHECK(fc->nbFields == 4);
-    nvinfer1::DataType type;
-    float scale_output;
-    float scale_d0;
-    float scale_d1;
+    nvinfer1::DataType type{};
+    float scale_output{};
+    float scale_d0{};
+    float scale_d1{};
     for (int i = 0; i < fc->nbFields; i++)
     {
         char const* attrName = fields[i].name;

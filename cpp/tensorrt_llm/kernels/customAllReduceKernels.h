@@ -64,6 +64,8 @@ enum class AllReduceFusionOp : int8_t
     RESIDUAL_RMS_NORM = 1,
     LAST_PROCESS_FOR_UB = 2,
     RESIDUAL_RMS_PREPOST_NORM = 3,
+    RESIDUAL_RMS_NORM_QUANT_FP8 = 4,
+    RESIDUAL_RMS_NORM_QUANT_NVFP4 = 5,
 };
 
 struct AllReduceFusionParams

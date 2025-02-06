@@ -33,7 +33,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 from tensorrt_llm.models.phi.convert import load_weights_from_hf_model
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import skip_fp32_accum_pre_ampere, unittest_name_func
+from utils.util import unittest_name_func
 
 
 def compare_max_abs_error(ref, res, str):
@@ -166,9 +166,6 @@ class TestPhi(unittest.TestCase):
 
     @parameterized.expand(load_test_cases, name_func=unittest_name_func)
     def test_phi(self, context_fmha_flag, enable_remove_input_padding):
-
-        # Skip tests that are not supported in pre-ampere architecture
-        skip_fp32_accum_pre_ampere(context_fmha_flag)
 
         torch.random.manual_seed(0)
         use_refit = False

@@ -28,6 +28,12 @@ if __name__ == "__main__":
         default='cuda',
         choices=['cuda', 'cpu'])
     parser.add_argument(
+        "--device_map",
+        help="How to map the model on the devices",
+        default="auto",
+        choices=["auto", "sequential", "cpu", "gpu"],
+    )
+    parser.add_argument(
         '--calib_dataset',
         type=str,
         default='cnn_dailymail',
@@ -63,6 +69,7 @@ if __name__ == "__main__":
         help="Quantization format.",
         default="full_prec",
         choices=[
+            "nvfp4",
             "fp8",
             "int8_sq",
             "int4_awq",
@@ -171,7 +178,8 @@ if __name__ == "__main__":
             medusa_hidden_act=args.medusa_hidden_act,
             medusa_model_dir=args.medusa_model_dir,
             quant_medusa_head=args.quant_medusa_head,
-            auto_quantize_bits=args.auto_quantize_bits)
+            auto_quantize_bits=args.auto_quantize_bits,
+            device_map=args.device_map)
     elif args.nemo_ckpt_path is not None:
         quantize_nemo_and_export(nemo_ckpt_path=args.nemo_ckpt_path,
                                  decoder_type=args.decoder_type,

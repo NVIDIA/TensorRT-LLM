@@ -28,7 +28,7 @@ from tensorrt_llm import Tensor
 from tensorrt_llm._utils import str_dtype_to_torch
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.util import skip_bf16_pre_ampere, unittest_name_func
+from utils.util import unittest_name_func
 
 
 class TestFunctional(unittest.TestCase):
@@ -44,9 +44,6 @@ class TestFunctional(unittest.TestCase):
     def test_rg_lru(self, dim, req_type, dtype, batch_size, max_seq_len,
                     remove_padding, has_y, has_y_bias, enable_fuse_gate,
                     has_gate_bias):
-        # Skip tests that are not supported in pre-ampere architecture
-        skip_bf16_pre_ampere(dtype)
-
         # Skip cases of has_y = False but has_y_bias = True
         if not has_y and has_y_bias:
             pytest.skip(

@@ -51,7 +51,8 @@ public:
         uint64_t maxSeqIdleMicroseconds = executor::ExecutorConfig::kDefaultMaxSeqIdleMicroseconds,
         std::optional<executor::SpeculativeDecodingConfig> specDecConfig = std::nullopt,
         std::optional<executor::GuidedDecodingConfig> guidedDecodingConfig = std::nullopt,
-        bool isLeaderInOrchMode = false, std::optional<std::vector<std::string>> additionalOutputNames = std::nullopt)
+        bool isLeaderInOrchMode = false, std::optional<std::vector<std::string>> additionalOutputNames = std::nullopt,
+        bool gatherGenerationLogits = false)
         : kvCacheConfig{std::move(kvCacheConfig)}
         , enableTrtOverlap{enableTrtOverlap}
         , deviceIds(std::move(deviceIds))
@@ -71,6 +72,7 @@ public:
         , guidedDecodingConfig{std::move(guidedDecodingConfig)}
         , isLeaderInOrchMode{isLeaderInOrchMode}
         , additionalOutputNames{std::move(additionalOutputNames)}
+        , gatherGenerationLogits{gatherGenerationLogits}
     {
         if (guidedDecodingConfig)
         {
@@ -88,7 +90,8 @@ public:
             executorConfig.getMaxNumTokens(), executorConfig.getSchedulerConfig(),
             executorConfig.getExtendedRuntimePerfKnobConfig(), executorConfig.getDebugConfig(),
             executorConfig.getMaxSeqIdleMicroseconds(), executorConfig.getSpecDecConfig(),
-            executorConfig.getGuidedDecodingConfig(), isLeaderInOrchMode, executorConfig.getAdditionalOutputNames())
+            executorConfig.getGuidedDecodingConfig(), isLeaderInOrchMode, executorConfig.getAdditionalOutputNames(),
+            executorConfig.getGatherGenerationLogits())
     {
     }
 
@@ -112,6 +115,7 @@ public:
             && guidedDecodingConfig == other.guidedDecodingConfig                   //
             && isLeaderInOrchMode == other.isLeaderInOrchMode                       //
             && additionalOutputNames == other.additionalOutputNames                 //
+            && gatherGenerationLogits == other.gatherGenerationLogits               //
             ;
     }
 
@@ -140,6 +144,7 @@ public:
     // This rank is the leader worker in orchestrator mode
     bool isLeaderInOrchMode;
     std::optional<std::vector<std::string>> additionalOutputNames;
+    bool gatherGenerationLogits;
 };
 
 } // namespace tensorrt_llm::batch_manager

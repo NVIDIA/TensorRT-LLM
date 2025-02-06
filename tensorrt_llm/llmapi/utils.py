@@ -1,24 +1,60 @@
 import asyncio
+import collections
 import hashlib
 import io
 import os
 import sys
 import tempfile
 import threading
+import time
 import traceback
+import warnings
 import weakref
+from contextlib import contextmanager
 from functools import cache, wraps
 from pathlib import Path
 from queue import Queue
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, Iterable, List, Optional, Tuple
 
 import filelock
 import huggingface_hub
+import psutil
 import torch
 from huggingface_hub import snapshot_download
 from tqdm.auto import tqdm
 
 from tensorrt_llm.logger import Singleton, logger
+
+_nvtx_available = False
+
+try:
+    import nvtx
+
+    _nvtx_available = True
+
+except ImportError:
+    _nvtx_available = False
+
+_nvtx_available = _nvtx_available and os.getenv("TLLM_LLMAPI_ENABLE_NVTX",
+                                                "0") == "1"
+
+
+@contextmanager
+def _nvtx_range_faked(*args, **kwargs):
+    yield
+
+
+def nvtx_range(msg, color="grey", domain="TensorRT-LLM", category=None):
+    if _nvtx_available:
+        return nvtx.annotate(msg, color=color, category=category, domain=domain)
+    else:
+
+        return _nvtx_range_faked()
+
+
+def nvtx_mark(msg, color="grey", domain="TensorRT-LLM", category=None):
+    if _nvtx_available:
+        nvtx.mark(msg, color=color, category=category, domain=domain)
 
 
 def print_traceback_on_error(func):
@@ -51,6 +87,13 @@ def print_colored(message,
         writer.write(colors[color] + message + reset)
     else:
         writer.write(message)
+
+
+def print_colored_debug(message,
+                        color: Optional[str] = None,
+                        writer: io.TextIOWrapper = sys.stderr):
+    if enable_llm_debug():
+        print_colored(message, color, writer)
 
 
 def file_with_glob_exists(directory, glob) -> bool:
@@ -86,10 +129,6 @@ class GpuArch:
     @staticmethod
     def is_post_ampere() -> bool:
         return get_gpu_arch() >= 8
-
-    @staticmethod
-    def is_post_volta() -> bool:
-        return get_gpu_arch() >= 7
 
 
 def get_gpu_arch(device: int = 0) -> int:
@@ -160,10 +199,12 @@ class DisabledTqdm(tqdm):
 
 
 def download_hf_model(model: str, revision: Optional[str] = None) -> Path:
+    ignore_patterns = ["original/**/*"]
     with get_file_lock(model):
         hf_folder = snapshot_download(
             model,
             local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+            ignore_patterns=ignore_patterns,
             revision=revision,
             tqdm_class=DisabledTqdm)
     return Path(hf_folder)
@@ -241,9 +282,18 @@ class ManagedThread(threading.Thread):
         self.stop_event = threading.Event()
 
     def run(self):
+
         while not self.stop_event.is_set():
+            task = self.task
+            if isinstance(task, weakref.WeakMethod):
+                task = task()
+                if task is None:
+                    # Normally, this should not happen.
+                    logger.warning("WeakMethod is expired.")
+                    break
+
             try:
-                if not self.task(**self.kwargs):
+                if not task(**self.kwargs):
                     break
             except Exception as e:
                 logger.error(
@@ -257,106 +307,179 @@ class ManagedThread(threading.Thread):
         self.stop_event.set()
 
 
-@cache
+_enable_llm_debug_ = None
+
+
 def enable_llm_debug() -> bool:
     ''' Tell whether to enable the debug mode for LLM class.  '''
-    return os.environ.get("TLLM_LLM_ENABLE_DEBUG", "0") == "1"
+    global _enable_llm_debug_
+    if _enable_llm_debug_ is None:
+        _enable_llm_debug_ = os.environ.get("TLLM_LLM_ENABLE_DEBUG", "0") == "1"
+    return _enable_llm_debug_
+
+
+@cache
+def enable_worker_single_process_for_tp1() -> bool:
+    ''' Tell whether to make worker use single process for TP1.
+    This is helpful for return-logits performance and debugging. '''
+    return os.environ.get("TLLM_WORKER_USE_SINGLE_PROCESS", "0") == "1"
 
 
 class AsyncQueue:
-    '''
-    AsyncQueue is container containing `async_q` for `async get` and `sync_q` for sync `get`.
+    """
+    A queue-style container that provides both sync and async interface.
     This is used to provide a compatible interface for janus.Queue.
-    '''
+    """
 
     class EventLoopShutdownError(Exception):
         pass
 
+    class MixedSyncAsyncAPIError(Exception):
+        pass
+
     def __init__(self):
-        self._q = Queue()
-        self.async_q = _AsyncQueue(self._q)
-        self.sync_q = _SyncQueue(self._q, self.async_q._event)
+        self._q = collections.deque()
+        self._event = asyncio.Event()
+        self._tainted = False
+        self._sync_q = _SyncQueue(self)
+
+    @property
+    def sync_q(self):
+        return self._sync_q
+
+    def full(self) -> bool:
+        return len(self._q) == self._q.maxlen
+
+    def empty(self) -> bool:
+        return not self._q
+
+    def put(self, item) -> None:
+        self._q.append(item)
+        self._event.set()
+
+    # Decoupled put and notify.
+    # Deque is thread safe so we can put from outside the event loop.
+    # However, we have to schedule notify in event loop because it's not thread safe.
+    # In this case the notify part may get scheduled late, to the point that
+    # corresponding data in deque may have already been consumed.
+    # Avoid firing the event in this case.
+    def put_nowait(self, item) -> None:
+        self._q.append(item)
+
+    def notify(self) -> None:
+        if self._q:
+            self._event.set()
+
+    def unsafe_get(self):
+        # Unsafe get taints the queue, renders it unusable by async methods.
+        self._tainted = True
+        # Use exception to detect empty. Pre-check is not thread safe.
+        try:
+            return self._q.popleft()
+        except IndexError:
+            raise asyncio.QueueEmpty() from None
+
+    async def get(self, timeout=None):
+        if self._tainted:
+            raise AsyncQueue.MixedSyncAsyncAPIError()
+
+        if timeout is None or timeout > 0:
+            # This may raise asyncio.TimeoutError
+            await asyncio.wait_for(self._event.wait(), timeout=timeout)
+        elif not self._q:
+            raise asyncio.QueueEmpty()
+
+        res = self._q.popleft()
+        if not self._q:
+            self._event.clear()
+        return res
 
 
 class _SyncQueue:
-    '''
+    """
     A simplified Queue that provides a `put` method that is compatible with the asyncio event loop.
-    '''
+    """
 
     def __init__(self,
-                 queue: Queue,
-                 event: asyncio.Event,
+                 queue: "AsyncQueue",
                  loop: Optional[asyncio.AbstractEventLoop] = None):
-        self._q = queue
-        self._event = event
+        self._aq = queue
         self._loop = loop or asyncio.get_event_loop()
 
+    async def _notify(self):
+        self._aq.notify()
+
     def put(self, item) -> None:
-
-        async def _set_event(event):
-            event.set()
-
-        self._q.put_nowait(item)
+        self._aq.put_nowait(item)
 
         if self._loop.is_running():
-            asyncio.run_coroutine_threadsafe(_set_event(self._event),
-                                             self._loop)
+            asyncio.run_coroutine_threadsafe(self._notify(), self._loop)
         else:
-            raise AsyncQueue.EventLoopShutdownError
+            raise AsyncQueue.EventLoopShutdownError()
 
     def put_nowait(self, item) -> None:
-        ''' Put item without notify the event. '''
-        self._q.put_nowait(item)
+        """ Put item without notify the event. """
+        self._aq.put_nowait(item)
+
+    # Notify many queues in one coroutine, to cut down context switch overhead.
+    @staticmethod
+    async def _notify_many(queues: Iterable["_SyncQueue"]):
+        for queue in queues:
+            queue._aq.notify()
 
     @staticmethod
-    def notify_events(loop: asyncio.AbstractEventLoop,
-                      events: List[asyncio.Event]) -> None:
-        ''' Notify the events in the loop. '''
-
-        async def _set_events(events):
-            for event in events:
-                event.set()
+    def notify_many(loop: asyncio.AbstractEventLoop,
+                    queues: List["_SyncQueue"]) -> None:
+        """ Notify the events in the loop. """
 
         if loop.is_running():
-            asyncio.run_coroutine_threadsafe(_set_events(events), loop)
+            asyncio.run_coroutine_threadsafe(
+                _SyncQueue._notify_many(frozenset(queues)), loop)
         else:
-            raise AsyncQueue.EventLoopShutdownError
+            raise AsyncQueue.EventLoopShutdownError()
 
     @property
     def loop(self) -> asyncio.AbstractEventLoop:
         return self._loop
 
-    @property
-    def event(self) -> asyncio.Event:
-        return self._event
-
     def full(self) -> bool:
-        return self._q.full()
+        return self._aq.full()
 
     def get(self, timeout=None):
         # Here is the WAR for jupyter scenario where trt-llm detects the event loop existence.
         # However, this event loop launched by jupyter rather than trt-llm. It led the GenerationResult initialized
         # w/ AsyncQueue and call the get() unintentionally.
-        res = self._q.get()
-        if self._q.empty():
-            self._event.clear()
-        return res
+
+        warnings.warn(
+            "LLM API is running in async mode because you have a running event loop,"
+            " but you are using sync API. This may lead to potential performance loss."
+        )
+
+        # We can't call asyncio.run_coroutine_threadsafe(self._aq.get(), self.loop) and wait the returned Future,
+        # since we are in the same event loop, and we can't yield the thread while waiting result.
+        deadline = None if timeout is None else time.time() + timeout
+        while deadline is None or time.time() < deadline:
+            try:
+                return self._aq.unsafe_get()
+            except asyncio.QueueEmpty:
+                time.sleep(0.01)
 
 
-class _AsyncQueue:
+def set_sched_setaffinity(required_cores: int):
+    ''' Set the CPU affinity of the current process to the required number of
+    cores.
+
+    Known issue: This may race with other processes that also set the affinity.
     '''
-    A simplified asyncio.Queue that provides a `get` method that is compatible with the standard library Queue.
-    '''
+    cpu_percentages = psutil.cpu_percent(percpu=True)
+    # sort the cores by usage
+    free_cores = sorted(range(len(cpu_percentages)),
+                        key=lambda i: cpu_percentages[i])
 
-    def __init__(self, queue: Queue):
-        self._event = asyncio.Event()
-        self._q = queue
+    pid = os.getpid()
+    os.sched_setaffinity(pid, set(free_cores[:required_cores]))
 
-    async def get(self, timeout=None):
-        # This may raise asyncio.TimeoutError
-        await asyncio.wait_for(self._event.wait(), timeout=timeout)
 
-        res = self._q.get()
-        if self._q.empty():
-            self._event.clear()
-        return res
+def clear_sched_affinity(pid: int):
+    ''' Clear the CPU affinity of the current process. '''
+    os.sched_setaffinity(pid, set(range(psutil.cpu_count())))

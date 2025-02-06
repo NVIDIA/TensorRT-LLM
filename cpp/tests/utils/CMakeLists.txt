@@ -15,4 +15,6 @@
 
 add_library(testingUtils common.cpp engines.cpp executorUtils.cpp)
 target_link_libraries(testingUtils PUBLIC gtest_main ${SHARED_TARGET})
+target_link_libraries(testingUtils PRIVATE modelSpecStatic)
 target_include_directories(testingUtils PRIVATE ${MPI_C_INCLUDE_DIRS})
+target_compile_definitions(testingUtils PUBLIC TOP_LEVEL_DIR="${TOP_LEVEL_DIR}")

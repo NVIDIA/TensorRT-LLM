@@ -115,13 +115,24 @@ def convert_and_save_hf(args: argparse.Namespace):
 
     quant_config = args_to_quant_config(args)
     hf_model = None
+    import transformers
     if not args.load_by_shard and quant_config.quant_mode.has_any_quant():
-        import transformers
-        hf_model = transformers.AutoModelForCausalLM.from_pretrained(
+        hf_model = transformers.FalconForCausalLM.from_pretrained(
             model_dir,
             trust_remote_code=True,
             torch_dtype='auto',
             device_map='auto')
+    else:
+        # Initialize huggingface local cache.
+        # Huggingface copies the external configuration source (`configuration_falcon.py` here) into its local cache at
+        # `~/.cache/huggingface/modules/transformers_modules/<model-name>`,
+        # and if multiple threads attempt to do this concurrently, weird issue can happen:
+        # Some threads may see an empty configuration_falcon.py file and fail.
+        # Preload the config once to initialize local cache, so subsequent multithread loading won't fail.
+        _ = transformers.FalconConfig.from_pretrained(model_dir,
+                                                      trust_remote_code=True,
+                                                      torch_dtype='auto',
+                                                      device_map='auto')
 
     def convert_and_save_rank(args, rank: int):
         mapping = Mapping(world_size=world_size,
