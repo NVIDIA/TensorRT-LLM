@@ -7,7 +7,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>PyTorch Backend &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="_static/copybutton.css?v=76b2166b" />
 
@@ -15,7 +15,7 @@
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/doctools.js?v=9a2dae69"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="_static/copybutton.js?v=65e89d2a"></script>
@@ -126,7 +126,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="performance/introduction.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="performance/performance-tuning-guide/index.html">Performance Tuning Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -181,14 +181,14 @@ This feature is currently experimental, and the related API is subjected to chan
 <section id="quick-start">
 <h2>Quick Start<a class="headerlink" href="#quick-start" title="Link to this heading"></a></h2>
 <p>Here is a simple example to show how to use <code class="docutils literal notranslate"><span class="pre">tensorrt_llm._torch.LLM</span></code> API with Llama model.</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="kn">import</span><span class="w"> </span><span class="nn">argparse</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="kn">import</span> <span class="nn">argparse</span>
 <span class="linenos"> 2</span>
-<span class="linenos"> 3</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">SamplingParams</span>
-<span class="linenos"> 4</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span>
-<span class="linenos"> 5</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.pyexecutor.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">PyTorchConfig</span>
+<span class="linenos"> 3</span><span class="kn">from</span> <span class="nn">tensorrt_llm</span> <span class="kn">import</span> <span class="n">SamplingParams</span>
+<span class="linenos"> 4</span><span class="kn">from</span> <span class="nn">tensorrt_llm._torch</span> <span class="kn">import</span> <span class="n">LLM</span>
+<span class="linenos"> 5</span><span class="kn">from</span> <span class="nn">tensorrt_llm._torch.pyexecutor.config</span> <span class="kn">import</span> <span class="n">PyTorchConfig</span>
 <span class="linenos"> 6</span>
 <span class="linenos"> 7</span>
-<span class="linenos"> 8</span><span class="k">def</span><span class="w"> </span><span class="nf">parse_arguments</span><span class="p">():</span>
+<span class="linenos"> 8</span><span class="k">def</span> <span class="nf">parse_arguments</span><span class="p">():</span>
 <span class="linenos"> 9</span>    <span class="n">parser</span> <span class="o">=</span> <span class="n">argparse</span><span class="o">.</span><span class="n">ArgumentParser</span><span class="p">()</span>
 <span class="linenos">10</span>    <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s1">&#39;--model_dir&#39;</span><span class="p">,</span>
 <span class="linenos">11</span>                        <span class="nb">type</span><span class="o">=</span><span class="nb">str</span><span class="p">,</span>
@@ -205,7 +205,7 @@ This feature is currently experimental, and the related API is subjected to chan
 <span class="linenos">22</span>    <span class="k">return</span> <span class="n">args</span>
 <span class="linenos">23</span>
 <span class="linenos">24</span>
-<span class="linenos">25</span><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
+<span class="linenos">25</span><span class="k">def</span> <span class="nf">main</span><span class="p">():</span>
 <span class="linenos">26</span>    <span class="n">args</span> <span class="o">=</span> <span class="n">parse_arguments</span><span class="p">()</span>
 <span class="linenos">27</span>
 <span class="linenos">28</span>    <span class="n">pytorch_config</span> <span class="o">=</span> <span class="n">PyTorchConfig</span><span class="p">(</span>
@@ -241,7 +241,7 @@ This feature is currently experimental, and the related API is subjected to chan
 <h2>Quantization<a class="headerlink" href="#quantization" title="Link to this heading"></a></h2>
 <p>The PyTorch backend supports FP8 and NVFP4 quantization. You can pass quantized models in HF model hub,
 which are generated by <a class="reference external" href="https://github.com/NVIDIA/TensorRT-Model-Optimizer">TensorRT Model Optimizer</a>.</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span> <span class="nn">tensorrt_llm._torch</span> <span class="kn">import</span> <span class="n">LLM</span>
 <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s1">&#39;nvidia/Llama-3.1-8B-Instruct-FP8&#39;</span><span class="p">)</span>
 <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="s2">&quot;Hello, my name is&quot;</span><span class="p">)</span>
 </pre></div>
@@ -281,7 +281,7 @@ scripts/huggingface_example.sh<span class="w"> </span>--model<span class="w"> </
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f63ff110fb0>
+<jinja2.runtime.BlockReference object at 0x7fdeea038200>
 
 <div class="footer">
     <p>

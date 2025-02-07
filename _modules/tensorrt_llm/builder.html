@@ -6,7 +6,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>tensorrt_llm.builder &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
 
@@ -14,7 +14,7 @@
       <script src="../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../../_static/doctools.js?v=9a2dae69"></script>
       <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../_static/copybutton.js?v=65e89d2a"></script>
@@ -117,7 +117,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../performance/introduction.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -175,40 +175,40 @@
 <span class="c1"># WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.</span>
 <span class="c1"># See the License for the specific language governing permissions and</span>
 <span class="c1"># limitations under the License.</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">copy</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">shutil</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Dict</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Union</span>
+<span class="kn">import</span> <span class="nn">copy</span>
+<span class="kn">import</span> <span class="nn">json</span>
+<span class="kn">import</span> <span class="nn">math</span>
+<span class="kn">import</span> <span class="nn">os</span>
+<span class="kn">import</span> <span class="nn">shutil</span>
+<span class="kn">import</span> <span class="nn">time</span>
+<span class="kn">from</span> <span class="nn">dataclasses</span> <span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
+<span class="kn">from</span> <span class="nn">pathlib</span> <span class="kn">import</span> <span class="n">Path</span>
+<span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="n">Dict</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Union</span>
 
-<span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">tensorrt</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">trt</span>
+<span class="kn">import</span> <span class="nn">numpy</span> <span class="k">as</span> <span class="nn">np</span>
+<span class="kn">import</span> <span class="nn">tensorrt</span> <span class="k">as</span> <span class="nn">trt</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">._common</span><span class="w"> </span><span class="kn">import</span> <span class="n">_is_building</span><span class="p">,</span> <span class="n">check_max_num_tokens</span><span class="p">,</span> <span class="n">serialize_engine</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">._utils</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">get_sm_version</span><span class="p">,</span> <span class="n">np_bfloat16</span><span class="p">,</span> <span class="n">np_float8</span><span class="p">,</span> <span class="n">str_dtype_to_trt</span><span class="p">,</span>
+<span class="kn">from</span> <span class="nn">._common</span> <span class="kn">import</span> <span class="n">_is_building</span><span class="p">,</span> <span class="n">check_max_num_tokens</span><span class="p">,</span> <span class="n">serialize_engine</span>
+<span class="kn">from</span> <span class="nn">._utils</span> <span class="kn">import</span> <span class="p">(</span><span class="n">get_sm_version</span><span class="p">,</span> <span class="n">np_bfloat16</span><span class="p">,</span> <span class="n">np_float8</span><span class="p">,</span> <span class="n">str_dtype_to_trt</span><span class="p">,</span>
                      <span class="n">to_json_file</span><span class="p">,</span> <span class="n">trt_gte</span><span class="p">)</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.auto_parallel</span><span class="w"> </span><span class="kn">import</span> <span class="n">auto_parallel</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.auto_parallel.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">AutoParallelConfig</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.bindings</span><span class="w"> </span><span class="kn">import</span> <span class="n">KVCacheType</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.functional</span><span class="w"> </span><span class="kn">import</span> <span class="n">PositionEmbeddingType</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.graph_rewriting</span><span class="w"> </span><span class="kn">import</span> <span class="n">optimize</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.logger</span><span class="w"> </span><span class="kn">import</span> <span class="n">logger</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.lora_manager</span><span class="w"> </span><span class="kn">import</span> <span class="n">LoraConfig</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.models</span><span class="w"> </span><span class="kn">import</span> <span class="n">PretrainedConfig</span><span class="p">,</span> <span class="n">PretrainedModel</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.models.modeling_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">SpeculativeDecodingMode</span><span class="p">,</span> <span class="n">optimize_model</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.network</span><span class="w"> </span><span class="kn">import</span> <span class="n">Network</span><span class="p">,</span> <span class="n">net_guard</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.plugin</span><span class="w"> </span><span class="kn">import</span> <span class="n">PluginConfig</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.quantization</span><span class="w"> </span><span class="kn">import</span> <span class="n">QuantAlgo</span><span class="p">,</span> <span class="n">QuantMode</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.version</span><span class="w"> </span><span class="kn">import</span> <span class="n">__version__</span>
+<span class="kn">from</span> <span class="nn">.auto_parallel</span> <span class="kn">import</span> <span class="n">auto_parallel</span>
+<span class="kn">from</span> <span class="nn">.auto_parallel.config</span> <span class="kn">import</span> <span class="n">AutoParallelConfig</span>
+<span class="kn">from</span> <span class="nn">.bindings</span> <span class="kn">import</span> <span class="n">KVCacheType</span>
+<span class="kn">from</span> <span class="nn">.functional</span> <span class="kn">import</span> <span class="n">PositionEmbeddingType</span>
+<span class="kn">from</span> <span class="nn">.graph_rewriting</span> <span class="kn">import</span> <span class="n">optimize</span>
+<span class="kn">from</span> <span class="nn">.logger</span> <span class="kn">import</span> <span class="n">logger</span>
+<span class="kn">from</span> <span class="nn">.lora_manager</span> <span class="kn">import</span> <span class="n">LoraConfig</span>
+<span class="kn">from</span> <span class="nn">.models</span> <span class="kn">import</span> <span class="n">PretrainedConfig</span><span class="p">,</span> <span class="n">PretrainedModel</span>
+<span class="kn">from</span> <span class="nn">.models.modeling_utils</span> <span class="kn">import</span> <span class="n">SpeculativeDecodingMode</span><span class="p">,</span> <span class="n">optimize_model</span>
+<span class="kn">from</span> <span class="nn">.network</span> <span class="kn">import</span> <span class="n">Network</span><span class="p">,</span> <span class="n">net_guard</span>
+<span class="kn">from</span> <span class="nn">.plugin</span> <span class="kn">import</span> <span class="n">PluginConfig</span>
+<span class="kn">from</span> <span class="nn">.quantization</span> <span class="kn">import</span> <span class="n">QuantAlgo</span><span class="p">,</span> <span class="n">QuantMode</span>
+<span class="kn">from</span> <span class="nn">.version</span> <span class="kn">import</span> <span class="n">__version__</span>
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">ConfigEncoder</span><span class="p">(</span><span class="n">json</span><span class="o">.</span><span class="n">JSONEncoder</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">ConfigEncoder</span><span class="p">(</span><span class="n">json</span><span class="o">.</span><span class="n">JSONEncoder</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">default</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">obj</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">default</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">obj</span><span class="p">):</span>
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">obj</span><span class="p">,</span> <span class="n">KVCacheType</span><span class="p">):</span>
             <span class="c1"># For KVCacheType, convert it to string by split of &#39;KVCacheType.PAGED&#39;.</span>
             <span class="k">return</span> <span class="n">obj</span><span class="o">.</span><span class="fm">__str__</span><span class="p">()</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s1">&#39;.&#39;</span><span class="p">)[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
@@ -216,24 +216,24 @@
             <span class="k">return</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">default</span><span class="p">(</span><span class="n">obj</span><span class="p">)</span>
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">BuilderConfig</span><span class="p">(</span><span class="nb">object</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">BuilderConfig</span><span class="p">(</span><span class="nb">object</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
         <span class="c1"># intentionally use **kwargs, user should never call this ctor directly,</span>
         <span class="c1"># use Builder.create_builder_config() instead</span>
         <span class="k">pass</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_init</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">trt_builder_config</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">_init</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">trt_builder_config</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_trt_builder_config</span> <span class="o">=</span> <span class="n">trt_builder_config</span>
         <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
             <span class="nb">setattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
         <span class="k">return</span> <span class="bp">self</span>
 
     <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">trt_builder_config</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">trt</span><span class="o">.</span><span class="n">IBuilderConfig</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">trt_builder_config</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">trt</span><span class="o">.</span><span class="n">IBuilderConfig</span><span class="p">:</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_trt_builder_config</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">to_dict</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Dict</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">to_dict</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Dict</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&#39;&#39;&#39;return a dict with keys</span>
 <span class="sd">        {</span>
 <span class="sd">            &quot;builder_config&quot;: {</span>
@@ -263,23 +263,23 @@
         <span class="k">return</span> <span class="n">config</span>
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">Builder</span><span class="p">():</span>
+<span class="k">class</span> <span class="nc">Builder</span><span class="p">():</span>
 
     <span class="n">_ALLOWED_PRECISIONS</span> <span class="o">=</span> <span class="p">[</span>
         <span class="s1">&#39;float32&#39;</span><span class="p">,</span> <span class="s1">&#39;float16&#39;</span><span class="p">,</span> <span class="s1">&#39;bfloat16&#39;</span><span class="p">,</span> <span class="n">trt</span><span class="o">.</span><span class="n">DataType</span><span class="o">.</span><span class="n">HALF</span><span class="p">,</span> <span class="n">trt</span><span class="o">.</span><span class="n">DataType</span><span class="o">.</span><span class="n">FLOAT</span><span class="p">,</span>
         <span class="n">trt</span><span class="o">.</span><span class="n">DataType</span><span class="o">.</span><span class="n">BF16</span>
     <span class="p">]</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_trt_builder</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">Builder</span><span class="p">(</span><span class="n">logger</span><span class="o">.</span><span class="n">trt_logger</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">strongly_typed</span> <span class="o">=</span> <span class="kc">True</span>
 
     <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">trt_builder</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">trt</span><span class="o">.</span><span class="n">Builder</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">trt_builder</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">trt</span><span class="o">.</span><span class="n">Builder</span><span class="p">:</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_trt_builder</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">create_network</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Network</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">create_network</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Network</span><span class="p">:</span>
         <span class="n">explicit_batch_flag</span> <span class="o">=</span> <span class="mi">0</span>
         <span class="c1"># Explicit batch flag will be deprecated in TRT 10</span>
         <span class="k">if</span> <span class="s2">&quot;EXPLICIT_BATCH&quot;</span> <span class="ow">in</span> <span class="n">trt</span><span class="o">.</span><span class="n">NetworkDefinitionCreationFlag</span><span class="o">.</span><span class="n">__members__</span><span class="o">.</span><span class="n">keys</span><span class="p">(</span>
@@ -297,7 +297,7 @@
             <span class="k">return</span> <span class="n">Network</span><span class="p">()</span><span class="o">.</span><span class="n">_init</span><span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">trt_builder</span><span class="o">.</span><span class="n">create_network</span><span class="p">(</span><span class="n">explicit_batch_flag</span><span class="p">))</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">create_builder_config</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">create_builder_config</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                               <span class="n">precision</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">trt</span><span class="o">.</span><span class="n">DataType</span><span class="p">],</span>
                               <span class="n">timing_cache</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Path</span><span class="p">,</span>
                                                   <span class="n">trt</span><span class="o">.</span><span class="n">ITimingCache</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -408,7 +408,7 @@
                                      <span class="n">use_strip_plan</span><span class="o">=</span><span class="n">use_strip_plan</span><span class="p">,</span>
                                      <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_add_optimization_profile</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">network</span><span class="p">:</span> <span class="n">Network</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">_add_optimization_profile</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">network</span><span class="p">:</span> <span class="n">Network</span><span class="p">,</span>
                                   <span class="n">builder_config</span><span class="p">:</span> <span class="n">BuilderConfig</span><span class="p">):</span>
         <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">builder_config</span><span class="p">,</span> <span class="n">BuilderConfig</span><span class="p">)</span>
         <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">network</span><span class="p">,</span> <span class="n">Network</span><span class="p">)</span>
@@ -457,7 +457,7 @@
             <span class="n">network</span><span class="p">,</span> <span class="n">builder_config</span>
         <span class="p">),</span> <span class="s2">&quot;Validation of the tensor dimension ranges failed, please check the dimension ranges, find the offensive tensor and dimension name in above the error log&quot;</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_validate_named_dimensions</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">network</span><span class="p">:</span> <span class="n">Network</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">_validate_named_dimensions</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">network</span><span class="p">:</span> <span class="n">Network</span><span class="p">,</span>
                                    <span class="n">builder_config</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&#39;&#39;&#39;</span>
 <span class="sd">            For each profile, validate that the named dimensions of different input tensors in this profile all have same range.</span>
@@ -495,7 +495,7 @@
         <span class="k">return</span> <span class="n">valid</span>
 
     <span class="nd">@_is_building</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">refit_engine</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">network</span><span class="p">:</span> <span class="n">Network</span><span class="p">,</span> <span class="n">engine_buffer</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">trt</span><span class="o">.</span><span class="n">IHostMemory</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">refit_engine</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">network</span><span class="p">:</span> <span class="n">Network</span><span class="p">,</span> <span class="n">engine_buffer</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">trt</span><span class="o">.</span><span class="n">IHostMemory</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&#39;&#39;&#39;</span>
 <span class="sd">            @brief: Refit one TensorRT engine using weights from the network,</span>
 <span class="sd">                user should guarantee that the engine is built with REFIT flag, and the network has the same structure with the engine.</span>
@@ -535,7 +535,7 @@
         <span class="k">return</span> <span class="n">serialized_engine</span>
 
     <span class="nd">@_is_building</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">build_engine</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">build_engine</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                      <span class="n">network</span><span class="p">:</span> <span class="n">Network</span><span class="p">,</span>
                      <span class="n">builder_config</span><span class="p">:</span> <span class="n">BuilderConfig</span><span class="p">,</span>
                      <span class="n">managed_weights</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">trt</span><span class="o">.</span><span class="n">IHostMemory</span><span class="p">:</span>
@@ -610,7 +610,7 @@
         <span class="k">return</span> <span class="n">engine</span>
 
     <span class="nd">@staticmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">save_timing_cache</span><span class="p">(</span><span class="n">builder_config</span><span class="p">:</span> <span class="n">BuilderConfig</span><span class="p">,</span> <span class="n">out_path</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">save_timing_cache</span><span class="p">(</span><span class="n">builder_config</span><span class="p">:</span> <span class="n">BuilderConfig</span><span class="p">,</span> <span class="n">out_path</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&#39;&#39;&#39;Serialize timing cache of given builder config to file specified by out_path</span>
 <span class="sd">            return True if the cache is successfully serialized, False otherwise</span>
 <span class="sd">        &#39;&#39;&#39;</span>
@@ -629,7 +629,7 @@
         <span class="k">return</span> <span class="kc">True</span>
 
     <span class="nd">@staticmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">save_config</span><span class="p">(</span><span class="n">builder_config</span><span class="p">:</span> <span class="n">BuilderConfig</span><span class="p">,</span> <span class="n">config_path</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">save_config</span><span class="p">(</span><span class="n">builder_config</span><span class="p">:</span> <span class="n">BuilderConfig</span><span class="p">,</span> <span class="n">config_path</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
         <span class="n">config</span> <span class="o">=</span> <span class="n">builder_config</span><span class="o">.</span><span class="n">to_dict</span><span class="p">()</span>
         <span class="n">to_json_file</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="n">config_path</span><span class="p">)</span>
         <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="sa">f</span><span class="s1">&#39;Config saved to </span><span class="si">{</span><span class="n">config_path</span><span class="si">}</span><span class="s1">.&#39;</span><span class="p">)</span>
@@ -638,7 +638,7 @@
 <div class="viewcode-block" id="BuildConfig">
 <a class="viewcode-back" href="../../llm-api/reference.html#tensorrt_llm.llmapi.BuildConfig">[docs]</a>
 <span class="nd">@dataclass</span>
-<span class="k">class</span><span class="w"> </span><span class="nc">BuildConfig</span><span class="p">:</span>
+<span class="k">class</span> <span class="nc">BuildConfig</span><span class="p">:</span>
     <span class="n">max_input_len</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1024</span>
     <span class="n">max_seq_len</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">opt_batch_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">8</span>
@@ -676,7 +676,7 @@
     <span class="c1"># we need to handle it given model architecture.</span>
 <div class="viewcode-block" id="BuildConfig.update_kv_cache_type">
 <a class="viewcode-back" href="../../llm-api/reference.html#tensorrt_llm.llmapi.BuildConfig.update_kv_cache_type">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">update_kv_cache_type</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">model_architecture</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">update_kv_cache_type</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">model_architecture</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
         <span class="n">paged_kv_cache_attr</span> <span class="o">=</span> <span class="s1">&#39;paged_state&#39;</span> <span class="k">if</span> <span class="n">model_architecture</span> <span class="ow">in</span> <span class="p">[</span>
             <span class="s1">&#39;MambaForCausalLM&#39;</span><span class="p">,</span> <span class="s1">&#39;RecurrentGemmaForCausalLM&#39;</span>
         <span class="p">]</span> <span class="k">else</span> <span class="s1">&#39;paged_kv_cache&#39;</span>
@@ -703,7 +703,7 @@
         <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_type</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="nb">getattr</span><span class="p">(</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">plugin_config</span><span class="p">,</span> <span class="n">paged_kv_cache_attr</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
 
-        <span class="k">def</span><span class="w"> </span><span class="nf">override_attri</span><span class="p">(</span><span class="n">attr_name</span><span class="p">,</span> <span class="n">value</span><span class="p">):</span>
+        <span class="k">def</span> <span class="nf">override_attri</span><span class="p">(</span><span class="n">attr_name</span><span class="p">,</span> <span class="n">value</span><span class="p">):</span>
             <span class="n">val</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">plugin_config</span><span class="p">,</span> <span class="n">attr_name</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">val</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">val</span> <span class="o">!=</span> <span class="n">value</span><span class="p">:</span>
                 <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="sa">f</span><span class="s1">&#39;Overriding </span><span class="si">{</span><span class="n">attr_name</span><span class="si">}</span><span class="s1"> to </span><span class="si">{</span><span class="n">value</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">)</span>
@@ -725,7 +725,7 @@
 <div class="viewcode-block" id="BuildConfig.from_dict">
 <a class="viewcode-back" href="../../llm-api/reference.html#tensorrt_llm.llmapi.BuildConfig.from_dict">[docs]</a>
     <span class="nd">@classmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">from_dict</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">config</span><span class="p">,</span> <span class="n">plugin_config</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">from_dict</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">config</span><span class="p">,</span> <span class="n">plugin_config</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
         <span class="n">config</span> <span class="o">=</span> <span class="n">copy</span><span class="o">.</span><span class="n">deepcopy</span><span class="p">(</span>
             <span class="n">config</span>
         <span class="p">)</span>  <span class="c1"># it just does not make sense to change the input arg `config`</span>
@@ -809,7 +809,7 @@
 <div class="viewcode-block" id="BuildConfig.from_json_file">
 <a class="viewcode-back" href="../../llm-api/reference.html#tensorrt_llm.llmapi.BuildConfig.from_json_file">[docs]</a>
     <span class="nd">@classmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">from_json_file</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">config_file</span><span class="p">,</span> <span class="n">plugin_config</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">from_json_file</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">config_file</span><span class="p">,</span> <span class="n">plugin_config</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
         <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">config_file</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
             <span class="n">config</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
             <span class="k">return</span> <span class="n">BuildConfig</span><span class="o">.</span><span class="n">from_dict</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="n">plugin_config</span><span class="o">=</span><span class="n">plugin_config</span><span class="p">)</span></div>
@@ -817,7 +817,7 @@
 
 <div class="viewcode-block" id="BuildConfig.to_dict">
 <a class="viewcode-back" href="../../llm-api/reference.html#tensorrt_llm.llmapi.BuildConfig.to_dict">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">to_dict</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">to_dict</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="n">output</span> <span class="o">=</span> <span class="n">copy</span><span class="o">.</span><span class="n">deepcopy</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="vm">__dict__</span><span class="p">)</span>
         <span class="c1"># the enum KVCacheType cannot be converted automatically</span>
         <span class="k">if</span> <span class="n">output</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;kv_cache_type&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
@@ -831,7 +831,7 @@
 
 <div class="viewcode-block" id="BuildConfig.update_from_dict">
 <a class="viewcode-back" href="../../llm-api/reference.html#tensorrt_llm.llmapi.BuildConfig.update_from_dict">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">update_from_dict</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="nb">dict</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">update_from_dict</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="nb">dict</span><span class="p">):</span>
         <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">config</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
             <span class="k">if</span> <span class="ow">not</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">):</span>
                 <span class="k">raise</span> <span class="ne">AttributeError</span><span class="p">(</span>
@@ -841,33 +841,33 @@
 
 <div class="viewcode-block" id="BuildConfig.update">
 <a class="viewcode-back" href="../../llm-api/reference.html#tensorrt_llm.llmapi.BuildConfig.update">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">update</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">update</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">update_from_dict</span><span class="p">(</span><span class="n">kwargs</span><span class="p">)</span></div>
 </div>
 
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">EngineConfig</span><span class="p">:</span>
+<span class="k">class</span> <span class="nc">EngineConfig</span><span class="p">:</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">pretrained_config</span><span class="p">:</span> <span class="s1">&#39;PretrainedConfig&#39;</span><span class="p">,</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">pretrained_config</span><span class="p">:</span> <span class="s1">&#39;PretrainedConfig&#39;</span><span class="p">,</span>
                  <span class="n">build_config</span><span class="p">:</span> <span class="s1">&#39;BuildConfig&#39;</span><span class="p">,</span> <span class="n">version</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">pretrained_config</span> <span class="o">=</span> <span class="n">pretrained_config</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">build_config</span> <span class="o">=</span> <span class="n">build_config</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">version</span> <span class="o">=</span> <span class="n">version</span>
 
     <span class="nd">@classmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">from_json_file</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">config_file</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">from_json_file</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">config_file</span><span class="p">):</span>
         <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">config_file</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
             <span class="k">return</span> <span class="bp">cls</span><span class="o">.</span><span class="n">from_json_str</span><span class="p">(</span><span class="n">f</span><span class="o">.</span><span class="n">read</span><span class="p">())</span>
 
     <span class="nd">@classmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">from_json_str</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">config_str</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">from_json_str</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">config_str</span><span class="p">):</span>
         <span class="n">config</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">config_str</span><span class="p">)</span>
         <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="n">PretrainedConfig</span><span class="o">.</span><span class="n">from_dict</span><span class="p">(</span><span class="n">config</span><span class="p">[</span><span class="s1">&#39;pretrained_config&#39;</span><span class="p">]),</span>
                    <span class="n">BuildConfig</span><span class="o">.</span><span class="n">from_dict</span><span class="p">(</span><span class="n">config</span><span class="p">[</span><span class="s1">&#39;build_config&#39;</span><span class="p">]),</span>
                    <span class="n">config</span><span class="p">[</span><span class="s1">&#39;version&#39;</span><span class="p">])</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">to_dict</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">to_dict</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="n">build_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">to_dict</span><span class="p">()</span>
         <span class="n">build_config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;dry_run&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>  <span class="c1"># Not an Engine Characteristic</span>
         <span class="n">build_config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;visualize_network&#39;</span><span class="p">,</span>
@@ -879,9 +879,9 @@
         <span class="p">}</span>
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">Engine</span><span class="p">:</span>
+<span class="k">class</span> <span class="nc">Engine</span><span class="p">:</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">config</span><span class="p">:</span> <span class="n">EngineConfig</span><span class="p">,</span>
         <span class="n">engine</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="n">trt</span><span class="o">.</span><span class="n">IHostMemory</span><span class="p">,</span> <span class="kc">None</span><span class="p">],</span>
@@ -896,7 +896,7 @@
             <span class="k">if</span> <span class="ow">not</span> <span class="n">value</span><span class="o">.</span><span class="n">flags</span><span class="p">[</span><span class="s1">&#39;C_CONTIGUOUS&#39;</span><span class="p">]:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">managed_weights</span><span class="p">[</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">ascontiguousarray</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">save</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">engine_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">save</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">engine_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
         <span class="n">os</span><span class="o">.</span><span class="n">makedirs</span><span class="p">(</span><span class="n">engine_dir</span><span class="p">,</span> <span class="n">exist_ok</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
         <span class="n">lora_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">lora_config</span>
         <span class="n">lora_dirs</span> <span class="o">=</span> <span class="n">lora_config</span><span class="o">.</span><span class="n">lora_dir</span>
@@ -957,7 +957,7 @@
             <span class="n">serialize_managed_weights</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">managed_weights</span><span class="p">,</span> <span class="n">fn</span><span class="p">)</span>
 
     <span class="nd">@classmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">from_dir</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">engine_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">rank</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">from_dir</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">engine_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">rank</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">):</span>
         <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">engine_dir</span><span class="p">,</span> <span class="sa">f</span><span class="s1">&#39;rank</span><span class="si">{</span><span class="n">rank</span><span class="si">}</span><span class="s1">.engine&#39;</span><span class="p">),</span> <span class="s1">&#39;rb&#39;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
             <span class="n">engine_buffer</span> <span class="o">=</span> <span class="n">f</span><span class="o">.</span><span class="n">read</span><span class="p">()</span>
 
@@ -973,7 +973,7 @@
         <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="n">engine_buffer</span><span class="p">,</span> <span class="n">managed_weights</span><span class="p">)</span>
 
     <span class="nd">@classmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">from_buffer</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">from_buffer</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span>
                     <span class="n">engine_buffer</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="n">trt</span><span class="o">.</span><span class="n">IHostMemory</span><span class="p">,</span> <span class="nb">bytes</span><span class="p">],</span>
                     <span class="n">json_config_str</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
                     <span class="n">rank</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">):</span>
@@ -982,7 +982,7 @@
         <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="n">engine_buffer</span><span class="p">)</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">get_engine_version</span><span class="p">(</span><span class="n">engine_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Union</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="nb">str</span><span class="p">]:</span>
+<span class="k">def</span> <span class="nf">get_engine_version</span><span class="p">(</span><span class="n">engine_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Union</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="nb">str</span><span class="p">]:</span>
     <span class="n">engine_dir</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">engine_dir</span><span class="p">)</span>
     <span class="n">config_path</span> <span class="o">=</span> <span class="n">engine_dir</span> <span class="o">/</span> <span class="s2">&quot;config.json&quot;</span>
     <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">config_path</span><span class="p">,</span> <span class="s1">&#39;r&#39;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
@@ -994,7 +994,7 @@
     <span class="k">return</span> <span class="n">config</span><span class="p">[</span><span class="s1">&#39;version&#39;</span><span class="p">]</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">optimize_model_with_config</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="n">PretrainedModel</span><span class="p">,</span>
+<span class="k">def</span> <span class="nf">optimize_model_with_config</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="n">PretrainedModel</span><span class="p">,</span>
                                <span class="n">build_config</span><span class="p">:</span> <span class="n">BuildConfig</span><span class="p">):</span>
     <span class="n">use_auto_parallel</span> <span class="o">=</span> <span class="n">build_config</span><span class="o">.</span><span class="n">auto_parallel_config</span><span class="o">.</span><span class="n">enabled</span>
     <span class="n">gemm_swiglu_plugin</span> <span class="o">=</span> <span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gemm_swiglu_plugin</span>
@@ -1046,7 +1046,7 @@
     <span class="k">return</span> <span class="n">model</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">_init_max_seq_len</span><span class="p">(</span><span class="n">model_config</span><span class="p">,</span> <span class="n">build_config</span><span class="p">):</span>
+<span class="k">def</span> <span class="nf">_init_max_seq_len</span><span class="p">(</span><span class="n">model_config</span><span class="p">,</span> <span class="n">build_config</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">    If max_seq_len is not specified, set it to max_position_embeddings * rotary_factor</span>
 <span class="sd">    Additional checks to ensure max_seq_len, max_input_len, and max_num_tokens have valid values.</span>
@@ -1128,7 +1128,7 @@
             <span class="k">assert</span> <span class="n">build_config</span><span class="o">.</span><span class="n">max_input_len</span> <span class="o">&lt;=</span> <span class="n">build_config</span><span class="o">.</span><span class="n">max_seq_len</span><span class="p">,</span> <span class="s1">&#39;max_input_len should not be larger than max_seq_len&#39;</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">serialize_managed_weights</span><span class="p">(</span><span class="n">managed_weights</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">],</span>
+<span class="k">def</span> <span class="nf">serialize_managed_weights</span><span class="p">(</span><span class="n">managed_weights</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">],</span>
                               <span class="n">path</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="n">Path</span><span class="p">,</span>
                               <span class="n">metadata</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
     <span class="n">header</span> <span class="o">=</span> <span class="p">{}</span>
@@ -1173,7 +1173,7 @@
             <span class="n">f</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">buf</span><span class="p">)</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">deserialize_managed_weights</span><span class="p">(</span><span class="n">path</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">]:</span>
+<span class="k">def</span> <span class="nf">deserialize_managed_weights</span><span class="p">(</span><span class="n">path</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">]:</span>
     <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="s2">&quot;rb&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
         <span class="n">header_json_len</span> <span class="o">=</span> <span class="nb">int</span><span class="o">.</span><span class="n">from_bytes</span><span class="p">(</span><span class="n">f</span><span class="o">.</span><span class="n">read</span><span class="p">(</span><span class="mi">8</span><span class="p">),</span> <span class="n">byteorder</span><span class="o">=</span><span class="s2">&quot;little&quot;</span><span class="p">)</span>
         <span class="n">header_json</span> <span class="o">=</span> <span class="n">f</span><span class="o">.</span><span class="n">read</span><span class="p">(</span><span class="n">header_json_len</span><span class="p">)</span><span class="o">.</span><span class="n">decode</span><span class="p">()</span>
@@ -1207,7 +1207,7 @@
     <span class="k">return</span> <span class="n">managed_weights</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">build</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="n">PretrainedModel</span><span class="p">,</span> <span class="n">build_config</span><span class="p">:</span> <span class="n">BuildConfig</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Engine</span><span class="p">:</span>
+<span class="k">def</span> <span class="nf">build</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="n">PretrainedModel</span><span class="p">,</span> <span class="n">build_config</span><span class="p">:</span> <span class="n">BuildConfig</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Engine</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">&#39;&#39;&#39;Build engine from given model and optimization options specified in the build_config</span>
 <span class="sd">       WARNING: this function may change the given model object state in some optimization passes</span>
 <span class="sd">       to avoid cloning a model since normally the LLM models consumes large memory.</span>
@@ -1477,7 +1477,7 @@
                                        <span class="n">build_config</span><span class="o">.</span><span class="n">output_timing_cache</span><span class="p">)</span>
         <span class="k">assert</span> <span class="n">ok</span><span class="p">,</span> <span class="s2">&quot;Failed to save timing cache.&quot;</span>
 
-    <span class="kn">import</span><span class="w"> </span><span class="nn">psutil</span>
+    <span class="kn">import</span> <span class="nn">psutil</span>
 
     <span class="c1"># Get the current process</span>
     <span class="n">current_process</span> <span class="o">=</span> <span class="n">psutil</span><span class="o">.</span><span class="n">Process</span><span class="p">()</span>
@@ -1500,7 +1500,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f63fef6af30>
+<jinja2.runtime.BlockReference object at 0x7fdee4cb5d00>
 
 <div class="footer">
     <p>

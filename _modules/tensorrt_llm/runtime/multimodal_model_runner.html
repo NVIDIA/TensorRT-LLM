@@ -6,7 +6,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>tensorrt_llm.runtime.multimodal_model_runner &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="../../../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
 
@@ -14,7 +14,7 @@
       <script src="../../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../../../_static/doctools.js?v=9a2dae69"></script>
       <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
@@ -117,7 +117,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../performance/introduction.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -161,54 +161,54 @@
            <div itemprop="articleBody">
              
   <h1>Source code for tensorrt_llm.runtime.multimodal_model_runner</h1><div class="highlight"><pre>
-<span></span><span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">io</span><span class="w"> </span><span class="kn">import</span> <span class="n">BytesIO</span>
+<span></span><span class="kn">import</span> <span class="nn">json</span>
+<span class="kn">import</span> <span class="nn">os</span>
+<span class="kn">import</span> <span class="nn">sys</span>
+<span class="kn">from</span> <span class="nn">io</span> <span class="kn">import</span> <span class="n">BytesIO</span>
 
-<span class="kn">import</span><span class="w"> </span><span class="nn">requests</span>
+<span class="kn">import</span> <span class="nn">requests</span>
 
 <span class="c1"># isort: off</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
+<span class="kn">import</span> <span class="nn">torch</span>
+<span class="kn">import</span> <span class="nn">numpy</span> <span class="k">as</span> <span class="nn">np</span>
 <span class="c1"># isort: on</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Tuple</span>
+<span class="kn">import</span> <span class="nn">math</span>
+<span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Tuple</span>
 
-<span class="kn">import</span><span class="w"> </span><span class="nn">torch.nn.functional</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">F</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">huggingface_hub</span><span class="w"> </span><span class="kn">import</span> <span class="n">hf_hub_download</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">PIL</span><span class="w"> </span><span class="kn">import</span> <span class="n">Image</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">safetensors</span><span class="w"> </span><span class="kn">import</span> <span class="n">safe_open</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">torch</span><span class="w"> </span><span class="kn">import</span> <span class="n">nn</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">AutoConfig</span><span class="p">,</span> <span class="n">AutoModelForCausalLM</span><span class="p">,</span> <span class="n">AutoProcessor</span><span class="p">,</span>
+<span class="kn">import</span> <span class="nn">torch.nn.functional</span> <span class="k">as</span> <span class="nn">F</span>
+<span class="kn">from</span> <span class="nn">huggingface_hub</span> <span class="kn">import</span> <span class="n">hf_hub_download</span>
+<span class="kn">from</span> <span class="nn">PIL</span> <span class="kn">import</span> <span class="n">Image</span>
+<span class="kn">from</span> <span class="nn">safetensors</span> <span class="kn">import</span> <span class="n">safe_open</span>
+<span class="kn">from</span> <span class="nn">torch</span> <span class="kn">import</span> <span class="n">nn</span>
+<span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="p">(</span><span class="n">AutoConfig</span><span class="p">,</span> <span class="n">AutoModelForCausalLM</span><span class="p">,</span> <span class="n">AutoProcessor</span><span class="p">,</span>
                           <span class="n">AutoTokenizer</span><span class="p">)</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">..</span><span class="w"> </span><span class="kn">import</span> <span class="n">profiler</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.._utils</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">mpi_rank</span><span class="p">,</span> <span class="n">str_dtype_to_torch</span><span class="p">,</span> <span class="n">str_dtype_to_trt</span><span class="p">,</span>
+<span class="kn">from</span> <span class="nn">..</span> <span class="kn">import</span> <span class="n">profiler</span>
+<span class="kn">from</span> <span class="nn">.._utils</span> <span class="kn">import</span> <span class="p">(</span><span class="n">mpi_rank</span><span class="p">,</span> <span class="n">str_dtype_to_torch</span><span class="p">,</span> <span class="n">str_dtype_to_trt</span><span class="p">,</span>
                       <span class="n">supports_inflight_batching</span><span class="p">,</span> <span class="n">torch_dtype_to_trt</span><span class="p">,</span>
                       <span class="n">trt_dtype_to_torch</span><span class="p">)</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..functional</span><span class="w"> </span><span class="kn">import</span> <span class="n">RopeEmbeddingUtils</span><span class="p">,</span> <span class="n">RotaryScalingType</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..layers</span><span class="w"> </span><span class="kn">import</span> <span class="n">MropeParams</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..logger</span><span class="w"> </span><span class="kn">import</span> <span class="n">logger</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.enc_dec_model_runner</span><span class="w"> </span><span class="kn">import</span> <span class="n">EncDecModelRunner</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.model_runner</span><span class="w"> </span><span class="kn">import</span> <span class="n">ModelRunner</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.session</span><span class="w"> </span><span class="kn">import</span> <span class="n">Session</span><span class="p">,</span> <span class="n">TensorInfo</span>
+<span class="kn">from</span> <span class="nn">..functional</span> <span class="kn">import</span> <span class="n">RopeEmbeddingUtils</span><span class="p">,</span> <span class="n">RotaryScalingType</span>
+<span class="kn">from</span> <span class="nn">..layers</span> <span class="kn">import</span> <span class="n">MropeParams</span>
+<span class="kn">from</span> <span class="nn">..logger</span> <span class="kn">import</span> <span class="n">logger</span>
+<span class="kn">from</span> <span class="nn">.enc_dec_model_runner</span> <span class="kn">import</span> <span class="n">EncDecModelRunner</span>
+<span class="kn">from</span> <span class="nn">.model_runner</span> <span class="kn">import</span> <span class="n">ModelRunner</span>
+<span class="kn">from</span> <span class="nn">.session</span> <span class="kn">import</span> <span class="n">Session</span><span class="p">,</span> <span class="n">TensorInfo</span>
 
 <span class="k">try</span><span class="p">:</span>
-    <span class="kn">import</span><span class="w"> </span><span class="nn">tensorrt_llm.bindings</span>  <span class="c1"># NOQA</span>
+    <span class="kn">import</span> <span class="nn">tensorrt_llm.bindings</span>  <span class="c1"># NOQA</span>
     <span class="n">PYTHON_BINDINGS</span> <span class="o">=</span> <span class="kc">True</span>
 <span class="k">except</span> <span class="ne">ImportError</span><span class="p">:</span>
     <span class="n">PYTHON_BINDINGS</span> <span class="o">=</span> <span class="kc">False</span>
 
 <span class="k">if</span> <span class="n">PYTHON_BINDINGS</span><span class="p">:</span>
-    <span class="kn">from</span><span class="w"> </span><span class="nn">.model_runner_cpp</span><span class="w"> </span><span class="kn">import</span> <span class="n">ModelRunnerCpp</span>
+    <span class="kn">from</span> <span class="nn">.model_runner_cpp</span> <span class="kn">import</span> <span class="n">ModelRunnerCpp</span>
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">LlavaNextUtils</span><span class="p">:</span>
+<span class="k">class</span> <span class="nc">LlavaNextUtils</span><span class="p">:</span>
     <span class="c1"># https://github.com/haotian-liu/LLaVA/blob/main/llava/mm_utils.py</span>
 
     <span class="nd">@staticmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">select_best_resolution</span><span class="p">(</span><span class="n">original_size</span><span class="p">,</span> <span class="n">possible_resolutions</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">select_best_resolution</span><span class="p">(</span><span class="n">original_size</span><span class="p">,</span> <span class="n">possible_resolutions</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">            Selects the best resolution from a list of possible resolutions based on the original size.</span>
 
@@ -242,7 +242,7 @@
         <span class="k">return</span> <span class="n">best_fit</span>
 
     <span class="nd">@staticmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">get_anyres_image_grid_shape</span><span class="p">(</span><span class="n">image_size</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">get_anyres_image_grid_shape</span><span class="p">(</span><span class="n">image_size</span><span class="p">,</span>
                                     <span class="n">patch_size</span><span class="p">,</span>
                                     <span class="n">image_grid_pinpoints</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
@@ -263,7 +263,7 @@
         <span class="k">return</span> <span class="n">width</span> <span class="o">//</span> <span class="n">patch_size</span><span class="p">,</span> <span class="n">height</span> <span class="o">//</span> <span class="n">patch_size</span>
 
     <span class="nd">@staticmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">unpad_image</span><span class="p">(</span><span class="n">tensor</span><span class="p">,</span> <span class="n">original_size</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">unpad_image</span><span class="p">(</span><span class="n">tensor</span><span class="p">,</span> <span class="n">original_size</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">            Unpads a PyTorch tensor of a padded and resized image.</span>
 
@@ -294,7 +294,7 @@
         <span class="k">return</span> <span class="n">unpadded_tensor</span>
 
     <span class="nd">@staticmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">rearrange_image_features</span><span class="p">(</span><span class="n">image_feature</span><span class="p">,</span> <span class="n">image_newline</span><span class="p">,</span> <span class="n">image_size</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">rearrange_image_features</span><span class="p">(</span><span class="n">image_feature</span><span class="p">,</span> <span class="n">image_newline</span><span class="p">,</span> <span class="n">image_size</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">            Combine PyTorch feature grids from image patches.</span>
 
@@ -331,11 +331,11 @@
         <span class="k">return</span> <span class="n">image_feature</span>
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">LlavaOnevisionUtils</span><span class="p">:</span>
+<span class="k">class</span> <span class="nc">LlavaOnevisionUtils</span><span class="p">:</span>
     <span class="c1"># https://github.com/huggingface/transformers/blob/main/src/transformers/models/llava_onevision/modeling_llava_onevision.py</span>
 
     <span class="nd">@staticmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">pack_image_features</span><span class="p">(</span><span class="n">image_features</span><span class="p">,</span> <span class="n">image_sizes</span><span class="p">,</span> <span class="n">image_newline</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">pack_image_features</span><span class="p">(</span><span class="n">image_features</span><span class="p">,</span> <span class="n">image_sizes</span><span class="p">,</span> <span class="n">image_newline</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">        Reshape, unpad and then pack each image_feature into a single image_features tensor containing all visual vectors.</span>
 
@@ -424,7 +424,7 @@
         <span class="k">return</span> <span class="n">image_features</span>
 
     <span class="nd">@staticmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">apply_pooling</span><span class="p">(</span><span class="n">image_features</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">apply_pooling</span><span class="p">(</span><span class="n">image_features</span><span class="p">):</span>
         <span class="n">IMAGE_SIZE</span> <span class="o">=</span> <span class="mi">384</span>
         <span class="n">PATCH_SIZE</span> <span class="o">=</span> <span class="mi">14</span>
         <span class="n">height</span> <span class="o">=</span> <span class="n">width</span> <span class="o">=</span> <span class="n">IMAGE_SIZE</span> <span class="o">//</span> <span class="n">PATCH_SIZE</span>
@@ -445,9 +445,9 @@
 
 <div class="viewcode-block" id="MultimodalModelRunner">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">MultimodalModelRunner</span><span class="p">:</span>
+<span class="k">class</span> <span class="nc">MultimodalModelRunner</span><span class="p">:</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">args</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">args</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">args</span> <span class="o">=</span> <span class="n">args</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">runtime_rank</span> <span class="o">=</span> <span class="n">mpi_rank</span><span class="p">()</span>
@@ -545,23 +545,23 @@
 
 <div class="viewcode-block" id="MultimodalModelRunner.init_tokenizer">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.init_tokenizer">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">init_tokenizer</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">init_tokenizer</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;nougat&#39;</span><span class="p">:</span>
-            <span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">NougatTokenizerFast</span>
+            <span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">NougatTokenizerFast</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span> <span class="o">=</span> <span class="n">NougatTokenizerFast</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">hf_model_dir</span><span class="p">)</span>
         <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;neva&#39;</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;video-neva&#39;</span><span class="p">:</span>
-            <span class="kn">from</span><span class="w"> </span><span class="nn">sentencepiece</span><span class="w"> </span><span class="kn">import</span> <span class="n">SentencePieceProcessor</span>
+            <span class="kn">from</span> <span class="nn">sentencepiece</span> <span class="kn">import</span> <span class="n">SentencePieceProcessor</span>
 
             <span class="n">sp</span> <span class="o">=</span> <span class="n">SentencePieceProcessor</span><span class="p">(</span>
                 <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">hf_model_dir</span><span class="p">,</span> <span class="s1">&#39;tokenizer.model&#39;</span><span class="p">))</span>
 
-            <span class="k">class</span><span class="w"> </span><span class="nc">return_obj</span><span class="p">:</span>
+            <span class="k">class</span> <span class="nc">return_obj</span><span class="p">:</span>
 
-                <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">):</span>
+                <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">):</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">input_ids</span> <span class="o">=</span> <span class="n">input_ids</span>
 
-                <span class="k">def</span><span class="w"> </span><span class="fm">__getitem__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">):</span>
+                <span class="k">def</span> <span class="fm">__getitem__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">):</span>
                     <span class="k">if</span> <span class="n">name</span> <span class="ow">in</span> <span class="s2">&quot;input_ids&quot;</span><span class="p">:</span>
                         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_ids</span>
                     <span class="k">else</span><span class="p">:</span>
@@ -569,21 +569,21 @@
                             <span class="sa">f</span><span class="s2">&quot;&#39;return_obj&#39; has no item &#39;</span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2">&#39;&quot;</span><span class="p">)</span>
 
             <span class="c1"># sentencepiece does not follow the same interface as HF</span>
-            <span class="k">class</span><span class="w"> </span><span class="nc">HFTokenizerInterface</span><span class="p">():</span>
+            <span class="k">class</span> <span class="nc">HFTokenizerInterface</span><span class="p">():</span>
 
-                <span class="k">def</span><span class="w"> </span><span class="nf">encode</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">return_tensors</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+                <span class="k">def</span> <span class="nf">encode</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">return_tensors</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
                     <span class="n">out</span> <span class="o">=</span> <span class="n">sp</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
                     <span class="k">if</span> <span class="n">return_tensors</span> <span class="o">==</span> <span class="s2">&quot;pt&quot;</span><span class="p">:</span>
                         <span class="n">out</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">out</span><span class="p">)</span>
                     <span class="k">return</span> <span class="n">return_obj</span><span class="p">(</span><span class="n">out</span><span class="p">)</span>
 
-                <span class="k">def</span><span class="w"> </span><span class="fm">__call__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">return_tensors</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+                <span class="k">def</span> <span class="fm">__call__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">return_tensors</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
                     <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">return_tensors</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
 
-                <span class="k">def</span><span class="w"> </span><span class="nf">decode</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+                <span class="k">def</span> <span class="nf">decode</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
                     <span class="k">return</span> <span class="n">sp</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">tolist</span><span class="p">())</span>
 
-                <span class="k">def</span><span class="w"> </span><span class="nf">batch_decode</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+                <span class="k">def</span> <span class="nf">batch_decode</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
                     <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
 
             <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span> <span class="o">=</span> <span class="n">HFTokenizerInterface</span><span class="p">()</span>
@@ -608,16 +608,16 @@
 
 <div class="viewcode-block" id="MultimodalModelRunner.init_processor">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.init_processor">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">init_processor</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-        <span class="kn">from</span><span class="w"> </span><span class="nn">torchvision</span><span class="w"> </span><span class="kn">import</span> <span class="n">transforms</span>
+    <span class="k">def</span> <span class="nf">init_processor</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="kn">from</span> <span class="nn">torchvision</span> <span class="kn">import</span> <span class="n">transforms</span>
 
         <span class="k">if</span> <span class="s1">&#39;blip2&#39;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span><span class="p">:</span>
-            <span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">Blip2Processor</span>
+            <span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">Blip2Processor</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">processor</span> <span class="o">=</span> <span class="n">Blip2Processor</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">hf_model_dir</span><span class="p">)</span>
 
         <span class="k">elif</span> <span class="s1">&#39;nougat&#39;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span><span class="p">:</span>
-            <span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">NougatProcessor</span>
+            <span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">NougatProcessor</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">processor</span> <span class="o">=</span> <span class="n">NougatProcessor</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">hf_model_dir</span><span class="p">)</span>
 
@@ -641,7 +641,7 @@
                 <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">hf_model_dir</span><span class="p">,</span> <span class="n">trust_remote_code</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 
         <span class="k">elif</span> <span class="s1">&#39;internvl&#39;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span><span class="p">:</span>
-            <span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">CLIPImageProcessor</span>
+            <span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">CLIPImageProcessor</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">processor</span> <span class="o">=</span> <span class="n">CLIPImageProcessor</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
                 <span class="s1">&#39;OpenGVLab/InternViT-300M-448px&#39;</span>
             <span class="p">)</span>  <span class="c1"># You can change the InternViT model type according to your InternVL type</span>
@@ -662,9 +662,9 @@
 
         <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;vila&quot;</span><span class="p">:</span>
             <span class="n">sys</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">hf_model_dir</span> <span class="o">+</span> <span class="s2">&quot;/../VILA&quot;</span><span class="p">)</span>
-            <span class="kn">from</span><span class="w"> </span><span class="nn">llava.mm_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">process_images</span>
-            <span class="kn">from</span><span class="w"> </span><span class="nn">llava.model</span><span class="w"> </span><span class="kn">import</span> <span class="n">LlavaLlamaConfig</span>  <span class="c1"># noqa</span>
-            <span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">AutoModel</span>
+            <span class="kn">from</span> <span class="nn">llava.mm_utils</span> <span class="kn">import</span> <span class="n">process_images</span>
+            <span class="kn">from</span> <span class="nn">llava.model</span> <span class="kn">import</span> <span class="n">LlavaLlamaConfig</span>  <span class="c1"># noqa</span>
+            <span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">AutoModel</span>
             <span class="n">model</span> <span class="o">=</span> <span class="n">AutoModel</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">hf_model_dir</span><span class="p">,</span>
                 <span class="n">device_map</span><span class="o">=</span><span class="s1">&#39;auto&#39;</span><span class="p">,</span>
@@ -673,7 +673,7 @@
             <span class="n">vision_tower</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">get_vision_tower</span><span class="p">()</span>
             <span class="n">vision_tower</span><span class="o">.</span><span class="n">image_processor</span>
 
-            <span class="k">def</span><span class="w"> </span><span class="nf">processor</span><span class="p">(</span><span class="n">raw_image</span><span class="p">):</span>
+            <span class="k">def</span> <span class="nf">processor</span><span class="p">(</span><span class="n">raw_image</span><span class="p">):</span>
                 <span class="k">return</span> <span class="n">process_images</span><span class="p">(</span><span class="n">raw_image</span><span class="p">,</span> <span class="n">vision_tower</span><span class="o">.</span><span class="n">image_processor</span><span class="p">,</span>
                                       <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
                                                        <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">)</span>
@@ -681,13 +681,13 @@
             <span class="bp">self</span><span class="o">.</span><span class="n">processor</span> <span class="o">=</span> <span class="n">processor</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;mllama&#39;</span><span class="p">:</span>
-            <span class="kn">from</span><span class="w"> </span><span class="nn">.processor_wrapper</span><span class="w"> </span><span class="kn">import</span> <span class="n">MllamaProcessorWrapper</span>
+            <span class="kn">from</span> <span class="nn">.processor_wrapper</span> <span class="kn">import</span> <span class="n">MllamaProcessorWrapper</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">processor</span> <span class="o">=</span> <span class="n">MllamaProcessorWrapper</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">processor</span><span class="p">,</span> <span class="n">logger</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="MultimodalModelRunner.init_image_encoder">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.init_image_encoder">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">init_image_encoder</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">init_image_encoder</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;phi-3-vision&quot;</span><span class="p">:</span>
             <span class="n">model</span> <span class="o">=</span> <span class="n">AutoModelForCausalLM</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">hf_model_dir</span><span class="p">,</span>
@@ -731,7 +731,7 @@
 
 <div class="viewcode-block" id="MultimodalModelRunner.init_llm">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.init_llm">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">init_llm</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">init_llm</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">decoder_llm</span><span class="p">:</span>
             <span class="n">cross_kv_cache_fraction</span> <span class="o">=</span> <span class="kc">None</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;mllama&#39;</span><span class="p">:</span>
@@ -783,8 +783,8 @@
 
 <div class="viewcode-block" id="MultimodalModelRunner.video_preprocess">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.video_preprocess">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">video_preprocess</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">video_path</span><span class="p">):</span>
-        <span class="kn">from</span><span class="w"> </span><span class="nn">decord</span><span class="w"> </span><span class="kn">import</span> <span class="n">VideoReader</span>
+    <span class="k">def</span> <span class="nf">video_preprocess</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">video_path</span><span class="p">):</span>
+        <span class="kn">from</span> <span class="nn">decord</span> <span class="kn">import</span> <span class="n">VideoReader</span>
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">video_path</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
             <span class="n">vr</span> <span class="o">=</span> <span class="n">VideoReader</span><span class="p">(</span><span class="n">video_path</span><span class="p">)</span>
             <span class="n">num_frames</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_frames</span>
@@ -808,7 +808,7 @@
         <span class="k">else</span><span class="p">:</span>
             <span class="n">frames</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">video_path</span>
 
-        <span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">CLIPImageProcessor</span>
+        <span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">CLIPImageProcessor</span>
         <span class="n">processor</span> <span class="o">=</span> <span class="n">CLIPImageProcessor</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
             <span class="s2">&quot;openai/clip-vit-large-patch14&quot;</span><span class="p">,</span> <span class="n">torch_dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
         <span class="n">frames</span> <span class="o">=</span> <span class="n">processor</span><span class="o">.</span><span class="n">preprocess</span><span class="p">(</span><span class="n">frames</span><span class="p">,</span>
@@ -821,7 +821,7 @@
 
 <div class="viewcode-block" id="MultimodalModelRunner.preprocess">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.preprocess">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">preprocess</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">warmup</span><span class="p">,</span> <span class="n">pre_prompt</span><span class="p">,</span> <span class="n">post_prompt</span><span class="p">,</span> <span class="n">image</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">preprocess</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">warmup</span><span class="p">,</span> <span class="n">pre_prompt</span><span class="p">,</span> <span class="n">post_prompt</span><span class="p">,</span> <span class="n">image</span><span class="p">,</span>
                    <span class="n">other_vision_inputs</span><span class="p">):</span>
         <span class="c1"># same prompt for single/multiple image(s)</span>
         <span class="n">n_prompts_n_images</span> <span class="o">=</span> <span class="kc">False</span>
@@ -1074,7 +1074,7 @@
 <div class="viewcode-block" id="MultimodalModelRunner.tokenizer_image_token">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.tokenizer_image_token">[docs]</a>
     <span class="nd">@staticmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">tokenizer_image_token</span><span class="p">(</span><span class="n">batch_size</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">tokenizer_image_token</span><span class="p">(</span><span class="n">batch_size</span><span class="p">,</span>
                               <span class="n">pre_prompt</span><span class="p">,</span>
                               <span class="n">post_prompt</span><span class="p">,</span>
                               <span class="n">tokenizer</span><span class="p">,</span>
@@ -1084,7 +1084,7 @@
         <span class="k">else</span><span class="p">:</span>
             <span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span><span class="n">pre_prompt</span> <span class="o">+</span> <span class="n">post_prompt</span><span class="p">]</span>
 
-        <span class="k">def</span><span class="w"> </span><span class="nf">insert_separator</span><span class="p">(</span><span class="n">X</span><span class="p">,</span> <span class="n">sep</span><span class="p">):</span>
+        <span class="k">def</span> <span class="nf">insert_separator</span><span class="p">(</span><span class="n">X</span><span class="p">,</span> <span class="n">sep</span><span class="p">):</span>
             <span class="k">return</span> <span class="p">[</span>
                 <span class="n">ele</span> <span class="k">for</span> <span class="n">sublist</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">X</span><span class="p">,</span> <span class="p">[</span><span class="n">sep</span><span class="p">]</span> <span class="o">*</span> <span class="nb">len</span><span class="p">(</span><span class="n">X</span><span class="p">))</span> <span class="k">for</span> <span class="n">ele</span> <span class="ow">in</span> <span class="n">sublist</span>
             <span class="p">][:</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
@@ -1116,7 +1116,7 @@
 
 <div class="viewcode-block" id="MultimodalModelRunner.split_prompt_by_images">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.split_prompt_by_images">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">split_prompt_by_images</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tensor</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">split_prompt_by_images</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tensor</span><span class="p">):</span>
         <span class="n">batch_splits</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="k">for</span> <span class="n">batch</span> <span class="ow">in</span> <span class="n">tensor</span><span class="p">:</span>
             <span class="c1"># Find indices where value is zero (&lt;image&gt;)</span>
@@ -1140,7 +1140,7 @@
 
 <div class="viewcode-block" id="MultimodalModelRunner.prepare_position_ids_for_cogvlm">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.prepare_position_ids_for_cogvlm">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">prepare_position_ids_for_cogvlm</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">prepare_position_ids_for_cogvlm</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">):</span>
         <span class="n">batch_size</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">input_ids</span><span class="p">)</span>
         <span class="n">position_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">input_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">])</span>
         <span class="n">position_ids</span><span class="p">[</span><span class="mi">2</span><span class="p">:</span><span class="mi">1227</span><span class="p">]</span> <span class="o">=</span> <span class="mi">2</span>
@@ -1156,7 +1156,7 @@
 
 <div class="viewcode-block" id="MultimodalModelRunner.generate">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.generate">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">generate</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">generate</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">pre_prompt</span><span class="p">,</span>
                  <span class="n">post_prompt</span><span class="p">,</span>
                  <span class="n">image</span><span class="p">,</span>
@@ -1379,7 +1379,7 @@
 
 <div class="viewcode-block" id="MultimodalModelRunner.get_visual_features">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.get_visual_features">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">get_visual_features</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">image</span><span class="p">,</span> <span class="n">other_vision_inputs</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">get_visual_features</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">image</span><span class="p">,</span> <span class="n">other_vision_inputs</span><span class="p">):</span>
         <span class="n">visual_features</span> <span class="o">=</span> <span class="p">{</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">vision_input_names</span><span class="p">[</span><span class="mi">0</span><span class="p">]:</span>
             <span class="n">image</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">str_dtype_to_torch</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">vision_precision</span><span class="p">)),</span>
@@ -1423,7 +1423,7 @@
 
 <div class="viewcode-block" id="MultimodalModelRunner.setup_fake_prompts_vila">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.setup_fake_prompts_vila">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">setup_fake_prompts_vila</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">batch_size</span><span class="p">,</span> <span class="n">visual_features</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">setup_fake_prompts_vila</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">batch_size</span><span class="p">,</span> <span class="n">visual_features</span><span class="p">,</span>
                                 <span class="n">split_input_ids</span><span class="p">,</span> <span class="n">input_lengths</span><span class="p">):</span>
         <span class="c1"># visual_features (num_images, feature_len, token_embed)</span>
         <span class="c1"># Assemble fake prompts which points to image embedding actually</span>
@@ -1481,7 +1481,7 @@
 
 <div class="viewcode-block" id="MultimodalModelRunner.setup_fake_prompts">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.setup_fake_prompts">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">setup_fake_prompts</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">visual_features</span><span class="p">,</span> <span class="n">pre_input_ids</span><span class="p">,</span> <span class="n">post_input_ids</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">setup_fake_prompts</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">visual_features</span><span class="p">,</span> <span class="n">pre_input_ids</span><span class="p">,</span> <span class="n">post_input_ids</span><span class="p">,</span>
                            <span class="n">input_lengths</span><span class="p">):</span>
         <span class="c1"># Assemble fake prompts which points to image embedding actually</span>
         <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s1">&#39;num_frames&#39;</span><span class="p">)</span> <span class="ow">and</span> <span class="p">(</span><span class="n">visual_features</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
@@ -1553,7 +1553,7 @@
 
 <div class="viewcode-block" id="MultimodalModelRunner.get_rope_index">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.get_rope_index">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">get_rope_index</span><span class="p">(</span>
+    <span class="k">def</span> <span class="nf">get_rope_index</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">input_ids</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">LongTensor</span><span class="p">,</span>
         <span class="n">image_grid_thw</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">LongTensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -1724,7 +1724,7 @@
 
 <div class="viewcode-block" id="MultimodalModelRunner.setup_fake_prompts_qwen2vl">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.setup_fake_prompts_qwen2vl">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">setup_fake_prompts_qwen2vl</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">visual_features</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">setup_fake_prompts_qwen2vl</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">visual_features</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">,</span>
                                    <span class="n">vision_grid_thws</span><span class="p">,</span> <span class="n">attention_mask</span><span class="p">,</span>
                                    <span class="n">input_lengths</span><span class="p">):</span>
 
@@ -1804,7 +1804,7 @@
 
 <div class="viewcode-block" id="MultimodalModelRunner.ptuning_setup_fuyu">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.ptuning_setup_fuyu">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">ptuning_setup_fuyu</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">,</span> <span class="n">image_patches_indices</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">ptuning_setup_fuyu</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">,</span> <span class="n">image_patches_indices</span><span class="p">):</span>
         <span class="n">res_input_ids</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="k">for</span> <span class="n">cur_input_ids</span><span class="p">,</span> <span class="n">cur_image_patches_indices</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span>
                 <span class="n">input_ids</span><span class="p">,</span> <span class="n">image_patches_indices</span><span class="p">):</span>
@@ -1825,7 +1825,7 @@
 
 <div class="viewcode-block" id="MultimodalModelRunner.ptuning_setup_llava_next">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.ptuning_setup_llava_next">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">ptuning_setup_llava_next</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">visual_features</span><span class="p">,</span> <span class="n">pre_prompt</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">ptuning_setup_llava_next</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">visual_features</span><span class="p">,</span> <span class="n">pre_prompt</span><span class="p">,</span>
                                  <span class="n">post_prompt</span><span class="p">):</span>
         <span class="n">input_ids</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="n">fake_prompt_ids</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span>
@@ -1841,7 +1841,7 @@
 
 <div class="viewcode-block" id="MultimodalModelRunner.ptuning_setup_phi3">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.ptuning_setup_phi3">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">ptuning_setup_phi3</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">visual_features</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">,</span> <span class="n">num_img_tokens</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">ptuning_setup_phi3</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">visual_features</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">,</span> <span class="n">num_img_tokens</span><span class="p">):</span>
         <span class="n">fake_prompt_id</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">model_config</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">model_config</span><span class="o">.</span><span class="n">vocab_size</span> <span class="o">+</span> <span class="n">visual_features</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
@@ -1858,7 +1858,7 @@
 
 <div class="viewcode-block" id="MultimodalModelRunner.ptuning_setup">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.ptuning_setup">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">ptuning_setup</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">prompt_table</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">,</span> <span class="n">input_lengths</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">ptuning_setup</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">prompt_table</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">,</span> <span class="n">input_lengths</span><span class="p">):</span>
         <span class="n">hidden_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_config</span><span class="o">.</span><span class="n">hidden_size</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">runtime_mapping</span><span class="o">.</span><span class="n">tp_size</span>
         <span class="k">if</span> <span class="n">prompt_table</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">task_vocab_size</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span>
@@ -1901,9 +1901,9 @@
 
 <div class="viewcode-block" id="MultimodalModelRunner.load_test_data">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.load_test_data">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">load_test_data</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">image_path</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">video_path</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">load_test_data</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">image_path</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">video_path</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
 
-        <span class="k">def</span><span class="w"> </span><span class="nf">load_images</span><span class="p">(</span><span class="n">image_paths</span><span class="p">):</span>
+        <span class="k">def</span> <span class="nf">load_images</span><span class="p">(</span><span class="n">image_paths</span><span class="p">):</span>
             <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">image_paths</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
                 <span class="n">image_paths</span> <span class="o">=</span> <span class="p">[</span><span class="n">image_paths</span><span class="p">]</span>
             <span class="n">images</span> <span class="o">=</span> <span class="p">[]</span>
@@ -1983,7 +1983,7 @@
                     <span class="n">repo_id</span><span class="o">=</span><span class="s2">&quot;raushan-testing-hf/videos-test&quot;</span><span class="p">,</span>
                     <span class="n">filename</span><span class="o">=</span><span class="s2">&quot;sample_demo_1.mp4&quot;</span><span class="p">,</span>
                     <span class="n">repo_type</span><span class="o">=</span><span class="s2">&quot;dataset&quot;</span><span class="p">)</span>
-            <span class="kn">import</span><span class="w"> </span><span class="nn">av</span>
+            <span class="kn">import</span> <span class="nn">av</span>
             <span class="k">with</span> <span class="n">av</span><span class="o">.</span><span class="n">open</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">video_path</span><span class="p">)</span> <span class="k">as</span> <span class="n">container</span><span class="p">:</span>
                 <span class="n">total_frames</span> <span class="o">=</span> <span class="n">container</span><span class="o">.</span><span class="n">streams</span><span class="o">.</span><span class="n">video</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">frames</span>
                 <span class="k">assert</span> <span class="n">total_frames</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_frames</span>
@@ -2022,8 +2022,8 @@
 
 <div class="viewcode-block" id="MultimodalModelRunner.setup_inputs">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.setup_inputs">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">setup_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_text</span><span class="p">,</span> <span class="n">raw_image</span><span class="p">):</span>
-        <span class="kn">from</span><span class="w"> </span><span class="nn">..tools.multimodal_builder</span><span class="w"> </span><span class="kn">import</span> <span class="n">compute_rotary_pos_emb</span>
+    <span class="k">def</span> <span class="nf">setup_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_text</span><span class="p">,</span> <span class="n">raw_image</span><span class="p">):</span>
+        <span class="kn">from</span> <span class="nn">..tools.multimodal_builder</span> <span class="kn">import</span> <span class="n">compute_rotary_pos_emb</span>
         <span class="n">other_vision_inputs</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="n">other_decoder_inputs</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">[</span><span class="s1">&#39;qwen2_vl&#39;</span><span class="p">,</span> <span class="s1">&#39;vila&#39;</span><span class="p">,</span> <span class="s1">&#39;llava&#39;</span><span class="p">]:</span>
@@ -2038,8 +2038,8 @@
             <span class="n">pre_prompt</span> <span class="o">=</span> <span class="n">input_text</span>
             <span class="n">post_prompt</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="k">elif</span> <span class="s1">&#39;qwen2_vl&#39;</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span><span class="p">:</span>
-            <span class="kn">from</span><span class="w"> </span><span class="nn">qwen_vl_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">process_vision_info</span>
-            <span class="kn">from</span><span class="w"> </span><span class="nn">transformers.models.qwen2_vl.modeling_qwen2_vl</span><span class="w"> </span><span class="kn">import</span> \
+            <span class="kn">from</span> <span class="nn">qwen_vl_utils</span> <span class="kn">import</span> <span class="n">process_vision_info</span>
+            <span class="kn">from</span> <span class="nn">transformers.models.qwen2_vl.modeling_qwen2_vl</span> <span class="kn">import</span> \
                 <span class="n">VisionRotaryEmbedding</span>
             <span class="n">hf_config</span> <span class="o">=</span> <span class="n">AutoConfig</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">hf_model_dir</span><span class="p">)</span>
             <span class="n">processor</span> <span class="o">=</span> <span class="n">AutoProcessor</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">hf_model_dir</span><span class="p">)</span>
@@ -2359,7 +2359,7 @@
 
 <div class="viewcode-block" id="MultimodalModelRunner.run">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.MultimodalModelRunner.run">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">run</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_text</span><span class="p">,</span> <span class="n">input_image</span><span class="p">,</span> <span class="n">max_new_tokens</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">run</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_text</span><span class="p">,</span> <span class="n">input_image</span><span class="p">,</span> <span class="n">max_new_tokens</span><span class="p">):</span>
         <span class="n">input_text</span><span class="p">,</span> <span class="n">pre_prompt</span><span class="p">,</span> <span class="n">post_prompt</span><span class="p">,</span> <span class="n">processed_image</span><span class="p">,</span> <span class="n">decoder_input_ids</span><span class="p">,</span> <span class="n">other_vision_inputs</span><span class="p">,</span> <span class="n">other_decoder_inputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">setup_inputs</span><span class="p">(</span>
             <span class="n">input_text</span><span class="p">,</span> <span class="n">input_image</span><span class="p">)</span>
         <span class="n">output_text</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">pre_prompt</span><span class="p">,</span>
@@ -2383,7 +2383,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f63fe2498e0>
+<jinja2.runtime.BlockReference object at 0x7fdef64b9fa0>
 
 <div class="footer">
     <p>

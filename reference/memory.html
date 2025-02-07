@@ -7,7 +7,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Memory Usage of TensorRT-LLM &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
 
@@ -15,7 +15,7 @@
       <script src="../_static/jquery.js?v=5d32c60e"></script>
       <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../_static/doctools.js?v=9a2dae69"></script>
       <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../_static/copybutton.js?v=65e89d2a"></script>
@@ -120,7 +120,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../performance/introduction.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -248,8 +248,8 @@ Here some explanations on how these values affect the memory:</p>
 </section>
 <section id="memory-pool">
 <h2>Memory pool<a class="headerlink" href="#memory-pool" title="Link to this heading"></a></h2>
-<p>TensorRT-LLM C++ runtime is using stream-ordered memory allocator to allocate and free buffers, see <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/cpp/tensorrt_llm/runtime/bufferManager.cpp">BufferManager::initMemoryPool</a>, which uses the default memory pool managed by the CUDA driver. When a <code class="docutils literal notranslate"><span class="pre">GptSession</span></code> object is destroyed, memory is returned to the memory pool and can be reused by the next instance of a <code class="docutils literal notranslate"><span class="pre">GptSession</span></code> object. Memory will be released from the pool if it is required for other memory allocations.</p>
-<p>However, <code class="docutils literal notranslate"><span class="pre">nvidia-smi</span></code> may still show high memory occupation after memory is returned to the CUDA driver’s memory pool. This should not be a concern and is intended behavior. The amount of reserved and free memory in the pool can be inspected by <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/cpp/tensorrt_llm/runtime/bufferManager.cpp">BufferManager::memoryPoolReserved())</a> and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/rel/cpp/tensorrt_llm/runtime/bufferManager.cpp">BufferManager::memoryPoolFree())</a>, respectively.</p>
+<p>TensorRT-LLM C++ runtime is using stream-ordered memory allocator to allocate and free buffers, see <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/HEAD/cpp/tensorrt_llm/runtime/bufferManager.cpp">BufferManager::initMemoryPool</a>, which uses the default memory pool managed by the CUDA driver. When a <code class="docutils literal notranslate"><span class="pre">GptSession</span></code> object is destroyed, memory is returned to the memory pool and can be reused by the next instance of a <code class="docutils literal notranslate"><span class="pre">GptSession</span></code> object. Memory will be released from the pool if it is required for other memory allocations.</p>
+<p>However, <code class="docutils literal notranslate"><span class="pre">nvidia-smi</span></code> may still show high memory occupation after memory is returned to the CUDA driver’s memory pool. This should not be a concern and is intended behavior. The amount of reserved and free memory in the pool can be inspected by <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/HEAD/cpp/tensorrt_llm/runtime/bufferManager.cpp">BufferManager::memoryPoolReserved())</a> and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/HEAD/cpp/tensorrt_llm/runtime/bufferManager.cpp">BufferManager::memoryPoolFree())</a>, respectively.</p>
 </section>
 <section id="known-issues">
 <h2>Known Issues<a class="headerlink" href="#known-issues" title="Link to this heading"></a></h2>
@@ -309,7 +309,7 @@ Here some explanations on how these values affect the memory:</p>
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f63ff0f9400>
+<jinja2.runtime.BlockReference object at 0x7fdee76f50d0>
 
 <div class="footer">
     <p>

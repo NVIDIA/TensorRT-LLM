@@ -6,7 +6,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>tensorrt_llm.models.enc_dec.model &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="../../../../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../../../../_static/copybutton.css?v=76b2166b" />
 
@@ -14,7 +14,7 @@
       <script src="../../../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../../../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../../../../_static/doctools.js?v=9a2dae69"></script>
       <script src="../../../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../../../_static/copybutton.js?v=65e89d2a"></script>
@@ -117,7 +117,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../../performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../performance/introduction.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -175,34 +175,34 @@
 <span class="c1"># WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.</span>
 <span class="c1"># See the License for the specific language governing permissions and</span>
 <span class="c1"># limitations under the License.</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">collections</span><span class="w"> </span><span class="kn">import</span> <span class="n">OrderedDict</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">List</span><span class="p">,</span> <span class="n">Optional</span>
+<span class="kn">import</span> <span class="nn">math</span>
+<span class="kn">from</span> <span class="nn">collections</span> <span class="kn">import</span> <span class="n">OrderedDict</span>
+<span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="n">List</span><span class="p">,</span> <span class="n">Optional</span>
 
-<span class="kn">import</span><span class="w"> </span><span class="nn">tensorrt</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">trt</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="kn">import</span> <span class="nn">tensorrt</span> <span class="k">as</span> <span class="nn">trt</span>
+<span class="kn">import</span> <span class="nn">torch</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._common</span><span class="w"> </span><span class="kn">import</span> <span class="n">default_net</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">numpy_to_torch</span><span class="p">,</span> <span class="n">str_dtype_to_torch</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.functional</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">LayerNormPositionType</span><span class="p">,</span> <span class="n">LayerNormType</span><span class="p">,</span>
+<span class="kn">from</span> <span class="nn">tensorrt_llm._common</span> <span class="kn">import</span> <span class="n">default_net</span>
+<span class="kn">from</span> <span class="nn">tensorrt_llm._utils</span> <span class="kn">import</span> <span class="n">numpy_to_torch</span><span class="p">,</span> <span class="n">str_dtype_to_torch</span>
+<span class="kn">from</span> <span class="nn">tensorrt_llm.functional</span> <span class="kn">import</span> <span class="p">(</span><span class="n">LayerNormPositionType</span><span class="p">,</span> <span class="n">LayerNormType</span><span class="p">,</span>
                                      <span class="n">MLPType</span><span class="p">,</span> <span class="n">PositionEmbeddingType</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span>
                                      <span class="n">assertion</span><span class="p">,</span> <span class="n">cast</span><span class="p">,</span> <span class="n">gather_last_token_logits</span><span class="p">,</span>
                                      <span class="n">gelu</span><span class="p">,</span> <span class="n">maximum</span><span class="p">,</span> <span class="n">minimum</span><span class="p">,</span> <span class="n">recv</span><span class="p">,</span> <span class="n">send</span><span class="p">,</span> <span class="n">shape</span><span class="p">,</span>
                                      <span class="n">transpose</span><span class="p">,</span> <span class="n">unsqueeze</span><span class="p">)</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.layers</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">MLP</span><span class="p">,</span> <span class="n">Attention</span><span class="p">,</span> <span class="n">AttentionMaskParams</span><span class="p">,</span>
+<span class="kn">from</span> <span class="nn">tensorrt_llm.layers</span> <span class="kn">import</span> <span class="p">(</span><span class="n">MLP</span><span class="p">,</span> <span class="n">Attention</span><span class="p">,</span> <span class="n">AttentionMaskParams</span><span class="p">,</span>
                                  <span class="n">AttentionMaskType</span><span class="p">,</span> <span class="n">AttentionParams</span><span class="p">,</span>
                                  <span class="n">BertAttention</span><span class="p">,</span> <span class="n">ColumnLinear</span><span class="p">,</span> <span class="n">Conv1d</span><span class="p">,</span> <span class="n">Embedding</span><span class="p">,</span>
                                  <span class="n">FusedGatedMLP</span><span class="p">,</span> <span class="n">GatedMLP</span><span class="p">,</span> <span class="n">GroupNorm</span><span class="p">,</span>
                                  <span class="n">KeyValueCacheParams</span><span class="p">,</span> <span class="n">LayerNorm</span><span class="p">,</span> <span class="n">LoraParams</span><span class="p">,</span>
                                  <span class="n">PromptTuningEmbedding</span><span class="p">,</span> <span class="n">RmsNorm</span><span class="p">)</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.lora_manager</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">LoraConfig</span><span class="p">,</span>
+<span class="kn">from</span> <span class="nn">tensorrt_llm.lora_manager</span> <span class="kn">import</span> <span class="p">(</span><span class="n">LoraConfig</span><span class="p">,</span>
                                        <span class="n">get_default_trtllm_modules_to_hf_modules</span><span class="p">,</span>
                                        <span class="n">use_lora</span><span class="p">)</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.mapping</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.models.modeling_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">PretrainedConfig</span><span class="p">,</span> <span class="n">PretrainedModel</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.module</span><span class="w"> </span><span class="kn">import</span> <span class="n">Module</span><span class="p">,</span> <span class="n">ModuleList</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.parameter</span><span class="w"> </span><span class="kn">import</span> <span class="n">Parameter</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.plugin.plugin</span><span class="w"> </span><span class="kn">import</span> <span class="n">current_all_reduce_helper</span>
+<span class="kn">from</span> <span class="nn">tensorrt_llm.mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
+<span class="kn">from</span> <span class="nn">tensorrt_llm.models.modeling_utils</span> <span class="kn">import</span> <span class="n">PretrainedConfig</span><span class="p">,</span> <span class="n">PretrainedModel</span>
+<span class="kn">from</span> <span class="nn">tensorrt_llm.module</span> <span class="kn">import</span> <span class="n">Module</span><span class="p">,</span> <span class="n">ModuleList</span>
+<span class="kn">from</span> <span class="nn">tensorrt_llm.parameter</span> <span class="kn">import</span> <span class="n">Parameter</span>
+<span class="kn">from</span> <span class="nn">tensorrt_llm.plugin.plugin</span> <span class="kn">import</span> <span class="n">current_all_reduce_helper</span>
 
 <span class="n">layernorm_map</span> <span class="o">=</span> <span class="p">{</span>
     <span class="n">LayerNormType</span><span class="o">.</span><span class="n">LayerNorm</span><span class="p">:</span> <span class="n">LayerNorm</span><span class="p">,</span>
@@ -217,9 +217,9 @@
 <span class="p">}</span>
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">EncDecEmbedding</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">EncDecEmbedding</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">vocab_size</span><span class="p">,</span>
                  <span class="n">hidden_size</span><span class="p">,</span>
                  <span class="n">max_position_embeddings</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
@@ -285,7 +285,7 @@
         <span class="c1"># Note: embedding offset in BART is not considered as a standard. For the specific case,</span>
         <span class="c1"># we just need to shrink its position embedding table by [offset:] during weight loading</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                 <span class="n">input_ids</span><span class="p">,</span>
                 <span class="n">position_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">token_type_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
@@ -314,9 +314,9 @@
         <span class="k">return</span> <span class="n">x</span>
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">EncoderLayer</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">EncoderLayer</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">hidden_size</span><span class="p">,</span>
                  <span class="n">ffn_hidden_size</span><span class="p">,</span>
                  <span class="n">num_attention_heads</span><span class="p">,</span>
@@ -392,7 +392,7 @@
         <span class="c1"># residual add to avoid accuracy drop.</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">fp16_clamping</span> <span class="o">=</span> <span class="n">fp16_clamping</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                 <span class="n">hidden_states</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
                 <span class="n">attention_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">input_lengths</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
@@ -446,9 +446,9 @@
         <span class="k">return</span> <span class="n">hidden_states</span>
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">DecoderLayer</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">DecoderLayer</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="o">*</span><span class="p">,</span>
                  <span class="n">local_layer_idx</span><span class="p">,</span>
                  <span class="n">hidden_size</span><span class="p">,</span>
@@ -567,7 +567,7 @@
         <span class="c1"># residual add to avoid accuracy drop.</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">fp16_clamping</span> <span class="o">=</span> <span class="n">fp16_clamping</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                 <span class="n">hidden_states</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
                 <span class="n">encoder_output</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                 <span class="n">attention_mask_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
@@ -669,9 +669,9 @@
 
 <div class="viewcode-block" id="EncoderModel">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.EncoderModel">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">EncoderModel</span><span class="p">(</span><span class="n">PretrainedModel</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">EncoderModel</span><span class="p">(</span><span class="n">PretrainedModel</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">check_config</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span>
@@ -762,7 +762,7 @@
 
 <div class="viewcode-block" id="EncoderModel.check_config">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.EncoderModel.check_config">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">check_config</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">check_config</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">):</span>
         <span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;has_position_embedding&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
         <span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;type_vocab_size&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;rescale_before_lm_head&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
@@ -790,7 +790,7 @@
 
 <div class="viewcode-block" id="EncoderModel.forward">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.EncoderModel.forward">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                 <span class="n">input_ids</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
                 <span class="n">input_lengths</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">position_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
@@ -839,7 +839,7 @@
 
 <div class="viewcode-block" id="EncoderModel.prepare_inputs">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.EncoderModel.prepare_inputs">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">prepare_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">prepare_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                        <span class="n">max_batch_size</span><span class="p">,</span>
                        <span class="n">max_input_len</span><span class="p">,</span>
                        <span class="n">prompt_embedding_table_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
@@ -1087,13 +1087,13 @@
 
 <div class="viewcode-block" id="EncoderModel.use_lora">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.EncoderModel.use_lora">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">use_lora</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">lora_config</span><span class="p">:</span> <span class="n">LoraConfig</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">use_lora</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">lora_config</span><span class="p">:</span> <span class="n">LoraConfig</span><span class="p">):</span>
         <span class="n">use_lora</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">lora_config</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="EncoderModel.use_prompt_tuning">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.EncoderModel.use_prompt_tuning">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">use_prompt_tuning</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">use_prompt_tuning</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="n">embedding</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">embedding</span><span class="o">.</span><span class="n">vocab_embedding</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">embedding</span><span class="o">.</span><span class="n">vocab_embedding</span> <span class="o">=</span> <span class="n">PromptTuningEmbedding</span><span class="p">(</span>
             <span class="n">num_embeddings</span><span class="o">=</span><span class="n">embedding</span><span class="o">.</span><span class="n">num_embeddings</span><span class="p">,</span>
@@ -1109,7 +1109,7 @@
 
 <div class="viewcode-block" id="EncoderModel.precompute_relative_attention_bias">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.EncoderModel.precompute_relative_attention_bias">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">precompute_relative_attention_bias</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">build_config</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">precompute_relative_attention_bias</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">build_config</span><span class="p">):</span>
         <span class="k">pass</span></div>
 </div>
 
@@ -1117,9 +1117,9 @@
 
 <div class="viewcode-block" id="DecoderModel">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.DecoderModel">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">DecoderModel</span><span class="p">(</span><span class="n">PretrainedModel</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">DecoderModel</span><span class="p">(</span><span class="n">PretrainedModel</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">check_config</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
 
@@ -1263,7 +1263,7 @@
 
 <div class="viewcode-block" id="DecoderModel.check_config">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.DecoderModel.check_config">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">check_config</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">check_config</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">):</span>
         <span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;has_position_embedding&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
         <span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;type_vocab_size&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;rescale_before_lm_head&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
@@ -1291,7 +1291,7 @@
 
 <div class="viewcode-block" id="DecoderModel.forward">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.DecoderModel.forward">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                 <span class="n">decoder_input_ids</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
                 <span class="n">encoder_output</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
                 <span class="n">position_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
@@ -1417,7 +1417,7 @@
 
 <div class="viewcode-block" id="DecoderModel.prepare_inputs">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.DecoderModel.prepare_inputs">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">prepare_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">prepare_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                        <span class="n">max_batch_size</span><span class="p">,</span>
                        <span class="n">max_beam_width</span><span class="p">,</span>
                        <span class="n">max_decoder_input_len</span><span class="p">,</span>
@@ -2083,13 +2083,13 @@
 
 <div class="viewcode-block" id="DecoderModel.use_lora">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.DecoderModel.use_lora">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">use_lora</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">lora_config</span><span class="p">:</span> <span class="n">LoraConfig</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">use_lora</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">lora_config</span><span class="p">:</span> <span class="n">LoraConfig</span><span class="p">):</span>
         <span class="n">use_lora</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">lora_config</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">trtllm_modules_to_hf_modules</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="DecoderModel.precompute_relative_attention_bias">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.DecoderModel.precompute_relative_attention_bias">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">precompute_relative_attention_bias</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">build_config</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">precompute_relative_attention_bias</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">build_config</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">relative_attention</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_implicit_relative_attention</span><span class="p">:</span>
             <span class="n">relative_attention_bias_builder</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">tensorrt_llm</span><span class="o">.</span><span class="n">relative_attention_bias</span>
             <span class="n">rel_attn_precomputed</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span>
@@ -2118,9 +2118,9 @@
 
 <div class="viewcode-block" id="WhisperEncoder">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.WhisperEncoder">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">WhisperEncoder</span><span class="p">(</span><span class="n">PretrainedModel</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">WhisperEncoder</span><span class="p">(</span><span class="n">PretrainedModel</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_dtype</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span>
         <span class="c1"># Encoder conv needs to run in fp32 on Volta/Turing</span>
@@ -2163,7 +2163,7 @@
 
 <div class="viewcode-block" id="WhisperEncoder.forward">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.WhisperEncoder.forward">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                 <span class="n">input_features</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
                 <span class="n">input_lengths</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">position_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
@@ -2199,7 +2199,7 @@
 
 <div class="viewcode-block" id="WhisperEncoder.prepare_inputs">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.WhisperEncoder.prepare_inputs">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">prepare_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">max_batch_size</span><span class="o">=</span><span class="mi">16</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">prepare_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">max_batch_size</span><span class="o">=</span><span class="mi">16</span><span class="p">):</span>
 
         <span class="n">bs_range</span> <span class="o">=</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="p">(</span><span class="n">max_batch_size</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="mi">2</span><span class="p">,</span> <span class="n">max_batch_size</span><span class="p">]</span>
         <span class="n">min_feat_len</span><span class="p">,</span> <span class="n">optimal_feat_len</span> <span class="o">=</span> <span class="mi">10</span><span class="p">,</span> <span class="mi">1000</span>  <span class="c1"># 100ms, 10s</span>
@@ -2271,7 +2271,7 @@
 
 <div class="viewcode-block" id="WhisperEncoder.precompute_relative_attention_bias">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.WhisperEncoder.precompute_relative_attention_bias">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">precompute_relative_attention_bias</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">build_config</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">precompute_relative_attention_bias</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">build_config</span><span class="p">):</span>
         <span class="k">pass</span></div>
 </div>
 
@@ -2284,7 +2284,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f63fe94d8b0>
+<jinja2.runtime.BlockReference object at 0x7fdef8d8a600>
 
 <div class="footer">
     <p>

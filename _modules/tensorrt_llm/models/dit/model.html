@@ -6,7 +6,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>tensorrt_llm.models.dit.model &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="../../../../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../../../../_static/copybutton.css?v=76b2166b" />
 
@@ -14,7 +14,7 @@
       <script src="../../../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../../../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../../../../_static/doctools.js?v=9a2dae69"></script>
       <script src="../../../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../../../_static/copybutton.js?v=65e89d2a"></script>
@@ -117,7 +117,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../../performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../performance/introduction.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -176,35 +176,35 @@
 <span class="c1"># See the License for the specific language governing permissions and</span>
 <span class="c1"># limitations under the License.</span>
 
-<span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">collections</span><span class="w"> </span><span class="kn">import</span> <span class="n">OrderedDict</span>
+<span class="kn">import</span> <span class="nn">math</span>
+<span class="kn">from</span> <span class="nn">collections</span> <span class="kn">import</span> <span class="n">OrderedDict</span>
 
-<span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">tensorrt</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">trt</span>
+<span class="kn">import</span> <span class="nn">numpy</span> <span class="k">as</span> <span class="nn">np</span>
+<span class="kn">import</span> <span class="nn">tensorrt</span> <span class="k">as</span> <span class="nn">trt</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">..._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">str_dtype_to_trt</span><span class="p">,</span> <span class="n">trt_dtype_to_str</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">...functional</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">allgather</span><span class="p">,</span> <span class="n">arange</span><span class="p">,</span> <span class="n">chunk</span><span class="p">,</span> <span class="n">concat</span><span class="p">,</span> <span class="n">constant</span><span class="p">,</span>
+<span class="kn">from</span> <span class="nn">..._utils</span> <span class="kn">import</span> <span class="n">str_dtype_to_trt</span><span class="p">,</span> <span class="n">trt_dtype_to_str</span>
+<span class="kn">from</span> <span class="nn">...functional</span> <span class="kn">import</span> <span class="p">(</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">allgather</span><span class="p">,</span> <span class="n">arange</span><span class="p">,</span> <span class="n">chunk</span><span class="p">,</span> <span class="n">concat</span><span class="p">,</span> <span class="n">constant</span><span class="p">,</span>
                            <span class="n">cos</span><span class="p">,</span> <span class="n">exp</span><span class="p">,</span> <span class="n">expand</span><span class="p">,</span> <span class="n">shape</span><span class="p">,</span> <span class="n">silu</span><span class="p">,</span> <span class="n">sin</span><span class="p">,</span> <span class="nb">slice</span><span class="p">,</span> <span class="n">split</span><span class="p">,</span>
                            <span class="n">unsqueeze</span><span class="p">)</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">...layers</span><span class="w"> </span><span class="kn">import</span> <span class="n">MLP</span><span class="p">,</span> <span class="n">BertAttention</span><span class="p">,</span> <span class="n">Conv2d</span><span class="p">,</span> <span class="n">Embedding</span><span class="p">,</span> <span class="n">LayerNorm</span><span class="p">,</span> <span class="n">Linear</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">...mapping</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">...module</span><span class="w"> </span><span class="kn">import</span> <span class="n">Module</span><span class="p">,</span> <span class="n">ModuleList</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">...parameter</span><span class="w"> </span><span class="kn">import</span> <span class="n">Parameter</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">...plugin</span><span class="w"> </span><span class="kn">import</span> <span class="n">current_all_reduce_helper</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">...quantization</span><span class="w"> </span><span class="kn">import</span> <span class="n">QuantMode</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..modeling_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">PretrainedConfig</span><span class="p">,</span> <span class="n">PretrainedModel</span>
+<span class="kn">from</span> <span class="nn">...layers</span> <span class="kn">import</span> <span class="n">MLP</span><span class="p">,</span> <span class="n">BertAttention</span><span class="p">,</span> <span class="n">Conv2d</span><span class="p">,</span> <span class="n">Embedding</span><span class="p">,</span> <span class="n">LayerNorm</span><span class="p">,</span> <span class="n">Linear</span>
+<span class="kn">from</span> <span class="nn">...mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
+<span class="kn">from</span> <span class="nn">...module</span> <span class="kn">import</span> <span class="n">Module</span><span class="p">,</span> <span class="n">ModuleList</span>
+<span class="kn">from</span> <span class="nn">...parameter</span> <span class="kn">import</span> <span class="n">Parameter</span>
+<span class="kn">from</span> <span class="nn">...plugin</span> <span class="kn">import</span> <span class="n">current_all_reduce_helper</span>
+<span class="kn">from</span> <span class="nn">...quantization</span> <span class="kn">import</span> <span class="n">QuantMode</span>
+<span class="kn">from</span> <span class="nn">..modeling_utils</span> <span class="kn">import</span> <span class="n">PretrainedConfig</span><span class="p">,</span> <span class="n">PretrainedModel</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">modulate</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">shift</span><span class="p">,</span> <span class="n">scale</span><span class="p">,</span> <span class="n">dtype</span><span class="p">):</span>
+<span class="k">def</span> <span class="nf">modulate</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">shift</span><span class="p">,</span> <span class="n">scale</span><span class="p">,</span> <span class="n">dtype</span><span class="p">):</span>
     <span class="n">ones</span> <span class="o">=</span> <span class="mf">1.0</span>
     <span class="k">if</span> <span class="n">dtype</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">ones</span> <span class="o">=</span> <span class="n">constant</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">ones</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">))</span><span class="o">.</span><span class="n">cast</span><span class="p">(</span><span class="n">dtype</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">x</span> <span class="o">*</span> <span class="p">(</span><span class="n">ones</span> <span class="o">+</span> <span class="n">unsqueeze</span><span class="p">(</span><span class="n">scale</span><span class="p">,</span> <span class="mi">1</span><span class="p">))</span> <span class="o">+</span> <span class="n">unsqueeze</span><span class="p">(</span><span class="n">shift</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">TimestepEmbedder</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">TimestepEmbedder</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_size</span><span class="p">,</span> <span class="n">frequency_embedding_size</span><span class="o">=</span><span class="mi">256</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_size</span><span class="p">,</span> <span class="n">frequency_embedding_size</span><span class="o">=</span><span class="mi">256</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span> <span class="o">=</span> <span class="n">dtype</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">mlp1</span> <span class="o">=</span> <span class="n">Linear</span><span class="p">(</span><span class="n">frequency_embedding_size</span><span class="p">,</span>
@@ -214,7 +214,7 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">mlp2</span> <span class="o">=</span> <span class="n">Linear</span><span class="p">(</span><span class="n">hidden_size</span><span class="p">,</span> <span class="n">hidden_size</span><span class="p">,</span> <span class="n">bias</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">frequency_embedding_size</span> <span class="o">=</span> <span class="n">frequency_embedding_size</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">timestep_embedding</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">t</span><span class="p">,</span> <span class="n">dim</span><span class="p">,</span> <span class="n">max_period</span><span class="o">=</span><span class="mi">10000</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">timestep_embedding</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">t</span><span class="p">,</span> <span class="n">dim</span><span class="p">,</span> <span class="n">max_period</span><span class="o">=</span><span class="mi">10000</span><span class="p">):</span>
         <span class="n">half</span> <span class="o">=</span> <span class="n">dim</span> <span class="o">//</span> <span class="mi">2</span>
         <span class="n">freqs</span> <span class="o">=</span> <span class="n">exp</span><span class="p">(</span>
             <span class="o">-</span><span class="n">math</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="n">max_period</span><span class="p">)</span> <span class="o">*</span>
@@ -226,16 +226,16 @@
         <span class="k">assert</span> <span class="n">dim</span> <span class="o">%</span> <span class="mi">2</span> <span class="o">==</span> <span class="mi">0</span>
         <span class="k">return</span> <span class="n">embedding</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">t</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">t</span><span class="p">):</span>
         <span class="n">t_freq</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">timestep_embedding</span><span class="p">(</span><span class="n">t</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">frequency_embedding_size</span><span class="p">)</span>
         <span class="n">t_emb</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mlp2</span><span class="p">(</span><span class="n">silu</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">mlp1</span><span class="p">(</span><span class="n">t_freq</span><span class="p">)))</span>
 
         <span class="k">return</span> <span class="n">t_emb</span>
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">LabelEmbedder</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">LabelEmbedder</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">num_classes</span><span class="p">,</span> <span class="n">hidden_size</span><span class="p">,</span> <span class="n">dropout_prob</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">num_classes</span><span class="p">,</span> <span class="n">hidden_size</span><span class="p">,</span> <span class="n">dropout_prob</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
         <span class="n">use_cfg_embedding</span> <span class="o">=</span> <span class="n">dropout_prob</span> <span class="o">&gt;</span> <span class="mi">0</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">embedding_table</span> <span class="o">=</span> <span class="n">Embedding</span><span class="p">(</span><span class="n">num_classes</span> <span class="o">+</span> <span class="n">use_cfg_embedding</span><span class="p">,</span>
@@ -244,15 +244,15 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">num_classes</span> <span class="o">=</span> <span class="n">num_classes</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">dropout_prob</span> <span class="o">=</span> <span class="n">dropout_prob</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">labels</span><span class="p">,</span> <span class="n">force_drop_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">labels</span><span class="p">,</span> <span class="n">force_drop_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
         <span class="k">assert</span> <span class="n">force_drop_ids</span> <span class="ow">is</span> <span class="kc">None</span>
         <span class="n">embeddings</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">embedding_table</span><span class="p">(</span><span class="n">labels</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">embeddings</span>
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">PatchEmbed</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">PatchEmbed</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">img_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
                  <span class="n">patch_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
                  <span class="n">input_c</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
@@ -270,7 +270,7 @@
                            <span class="n">bias</span><span class="o">=</span><span class="n">bias</span><span class="p">,</span>
                            <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">):</span>
         <span class="k">assert</span> <span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">img_size</span>
         <span class="k">assert</span> <span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">3</span><span class="p">]</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">img_size</span>
         <span class="n">x</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">proj</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
@@ -278,9 +278,9 @@
         <span class="k">return</span> <span class="n">x</span>
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">DiTBlock</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">DiTBlock</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">hidden_size</span><span class="p">,</span>
                  <span class="n">num_heads</span><span class="p">,</span>
                  <span class="n">mapping</span><span class="o">=</span><span class="n">Mapping</span><span class="p">(),</span>
@@ -314,7 +314,7 @@
                                        <span class="n">bias</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
                                        <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">c</span><span class="p">,</span> <span class="n">input_lengths</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">c</span><span class="p">,</span> <span class="n">input_lengths</span><span class="p">):</span>
         <span class="n">c</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">adaLN_modulation</span><span class="p">(</span><span class="n">silu</span><span class="p">(</span><span class="n">c</span><span class="p">))</span>
         <span class="n">shift_msa</span><span class="p">,</span> <span class="n">scale_msa</span><span class="p">,</span> <span class="n">gate_msa</span><span class="p">,</span> <span class="n">shift_mlp</span><span class="p">,</span> <span class="n">scale_mlp</span><span class="p">,</span> <span class="n">gate_mlp</span> <span class="o">=</span> <span class="n">chunk</span><span class="p">(</span>
             <span class="n">c</span><span class="p">,</span> <span class="mi">6</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
@@ -327,9 +327,9 @@
         <span class="k">return</span> <span class="n">x</span>
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">FinalLayer</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">FinalLayer</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">hidden_size</span><span class="p">,</span>
                  <span class="n">patch_size</span><span class="p">,</span>
                  <span class="n">out_channels</span><span class="p">,</span>
@@ -351,7 +351,7 @@
                                        <span class="n">bias</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
                                        <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">c</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">c</span><span class="p">):</span>
         <span class="n">shift</span><span class="p">,</span> <span class="n">scale</span> <span class="o">=</span> <span class="n">chunk</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">adaLN_modulation</span><span class="p">(</span><span class="n">silu</span><span class="p">(</span><span class="n">c</span><span class="p">)),</span> <span class="mi">2</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
 
         <span class="n">x</span> <span class="o">=</span> <span class="n">modulate</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">norm_final</span><span class="p">(</span><span class="n">x</span><span class="p">),</span> <span class="n">shift</span><span class="p">,</span> <span class="n">scale</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
@@ -362,9 +362,9 @@
 
 <div class="viewcode-block" id="DiT">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.DiT">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">DiT</span><span class="p">(</span><span class="n">PretrainedModel</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">DiT</span><span class="p">(</span><span class="n">PretrainedModel</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">check_config</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">learn_sigma</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">learn_sigma</span>
@@ -413,7 +413,7 @@
 
 <div class="viewcode-block" id="DiT.check_config">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.DiT.check_config">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">check_config</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">check_config</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">):</span>
         <span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;input_size&#39;</span><span class="p">,</span> <span class="mi">32</span><span class="p">)</span>
         <span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;patch_size&#39;</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
         <span class="n">config</span><span class="o">.</span><span class="n">set_if_not_exist</span><span class="p">(</span><span class="s1">&#39;in_channels&#39;</span><span class="p">,</span> <span class="mi">4</span><span class="p">)</span>
@@ -427,7 +427,7 @@
 
 <div class="viewcode-block" id="DiT.unpatchify">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.DiT.unpatchify">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">unpatchify</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">unpatchify</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">):</span>
         <span class="n">c</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">out_channels</span>
         <span class="n">p</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">x_embedder</span><span class="o">.</span><span class="n">patch_size</span>
         <span class="n">h</span> <span class="o">=</span> <span class="n">w</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span><span class="o">**</span><span class="mf">0.5</span><span class="p">)</span>
@@ -441,7 +441,7 @@
 
 <div class="viewcode-block" id="DiT.forward">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.DiT.forward">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">latent</span><span class="p">,</span> <span class="n">timestep</span><span class="p">,</span> <span class="n">label</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">latent</span><span class="p">,</span> <span class="n">timestep</span><span class="p">,</span> <span class="n">label</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">        Forward pass of DiT.</span>
 <span class="sd">        latent: (N, C, H, W)</span>
@@ -458,7 +458,7 @@
 
 <div class="viewcode-block" id="DiT.forward_without_cfg">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.DiT.forward_without_cfg">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">forward_without_cfg</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">t</span><span class="p">,</span> <span class="n">y</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">forward_without_cfg</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">t</span><span class="p">,</span> <span class="n">y</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">        Forward pass without classifier-free guidance.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
@@ -491,7 +491,7 @@
 
 <div class="viewcode-block" id="DiT.forward_with_cfg">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.DiT.forward_with_cfg">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">forward_with_cfg</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">t</span><span class="p">,</span> <span class="n">y</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">forward_with_cfg</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">t</span><span class="p">,</span> <span class="n">y</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">        Forward pass with classifier-free guidance.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
@@ -520,7 +520,7 @@
 
 <div class="viewcode-block" id="DiT.prepare_inputs">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.DiT.prepare_inputs">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">prepare_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">max_batch_size</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">prepare_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">max_batch_size</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&#39;&#39;&#39;@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the</span>
 <span class="sd">            ranges of the dimensions of when using TRT dynamic shapes.</span>
 
@@ -530,7 +530,7 @@
         <span class="k">if</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
             <span class="n">current_all_reduce_helper</span><span class="p">()</span><span class="o">.</span><span class="n">set_workspace_tensor</span><span class="p">(</span><span class="n">mapping</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
 
-        <span class="k">def</span><span class="w"> </span><span class="nf">dit_default_range</span><span class="p">(</span><span class="n">max_batch_size</span><span class="p">):</span>
+        <span class="k">def</span> <span class="nf">dit_default_range</span><span class="p">(</span><span class="n">max_batch_size</span><span class="p">):</span>
             <span class="k">return</span> <span class="p">[</span><span class="mi">2</span><span class="p">,</span> <span class="nb">max</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="p">(</span><span class="n">max_batch_size</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="mi">2</span><span class="p">),</span> <span class="n">max_batch_size</span><span class="p">]</span>
 
         <span class="n">default_range</span> <span class="o">=</span> <span class="n">dit_default_range</span>
@@ -571,7 +571,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f63fe94d3d0>
+<jinja2.runtime.BlockReference object at 0x7fdef8d8bbf0>
 
 <div class="footer">
     <p>

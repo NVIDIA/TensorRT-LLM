@@ -6,7 +6,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>tensorrt_llm.models.modeling_utils &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="../../../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
 
@@ -14,7 +14,7 @@
       <script src="../../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../../../_static/doctools.js?v=9a2dae69"></script>
       <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
@@ -117,7 +117,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../performance/introduction.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -161,73 +161,73 @@
            <div itemprop="articleBody">
              
   <h1>Source code for tensorrt_llm.models.modeling_utils</h1><div class="highlight"><pre>
-<span></span><span class="kn">import</span><span class="w"> </span><span class="nn">argparse</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">copy</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">dataclasses</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">re</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">IntFlag</span><span class="p">,</span> <span class="n">auto</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">functools</span><span class="w"> </span><span class="kn">import</span> <span class="n">cached_property</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">Dict</span><span class="p">,</span> <span class="n">Generator</span><span class="p">,</span> <span class="n">List</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span>
+<span></span><span class="kn">import</span> <span class="nn">argparse</span>
+<span class="kn">import</span> <span class="nn">copy</span>
+<span class="kn">import</span> <span class="nn">dataclasses</span>
+<span class="kn">import</span> <span class="nn">json</span>
+<span class="kn">import</span> <span class="nn">os</span>
+<span class="kn">import</span> <span class="nn">re</span>
+<span class="kn">from</span> <span class="nn">enum</span> <span class="kn">import</span> <span class="n">IntFlag</span><span class="p">,</span> <span class="n">auto</span>
+<span class="kn">from</span> <span class="nn">functools</span> <span class="kn">import</span> <span class="n">cached_property</span>
+<span class="kn">from</span> <span class="nn">pathlib</span> <span class="kn">import</span> <span class="n">Path</span>
+<span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="p">(</span><span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">Dict</span><span class="p">,</span> <span class="n">Generator</span><span class="p">,</span> <span class="n">List</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span>
                     <span class="n">Union</span><span class="p">)</span>
 
-<span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">safetensors</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="kn">import</span> <span class="nn">numpy</span> <span class="k">as</span> <span class="nn">np</span>
+<span class="kn">import</span> <span class="nn">safetensors</span>
+<span class="kn">import</span> <span class="nn">torch</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">.._common</span><span class="w"> </span><span class="kn">import</span> <span class="n">default_net</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.._utils</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">QuantModeWrapper</span><span class="p">,</span> <span class="n">get_init_params</span><span class="p">,</span> <span class="n">numpy_to_torch</span><span class="p">,</span>
+<span class="kn">from</span> <span class="nn">.._common</span> <span class="kn">import</span> <span class="n">default_net</span>
+<span class="kn">from</span> <span class="nn">.._utils</span> <span class="kn">import</span> <span class="p">(</span><span class="n">QuantModeWrapper</span><span class="p">,</span> <span class="n">get_init_params</span><span class="p">,</span> <span class="n">numpy_to_torch</span><span class="p">,</span>
                       <span class="n">release_gc</span><span class="p">,</span> <span class="n">str_dtype_to_torch</span><span class="p">,</span> <span class="n">str_dtype_to_trt</span><span class="p">,</span>
                       <span class="n">trt_dtype_to_torch</span><span class="p">)</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..bindings</span><span class="w"> </span><span class="kn">import</span> <span class="n">KVCacheType</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..bindings.executor</span><span class="w"> </span><span class="kn">import</span> <span class="n">RuntimeDefaults</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..functional</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">PositionEmbeddingType</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">allgather</span><span class="p">,</span> <span class="n">constant</span><span class="p">,</span>
+<span class="kn">from</span> <span class="nn">..bindings</span> <span class="kn">import</span> <span class="n">KVCacheType</span>
+<span class="kn">from</span> <span class="nn">..bindings.executor</span> <span class="kn">import</span> <span class="n">RuntimeDefaults</span>
+<span class="kn">from</span> <span class="nn">..functional</span> <span class="kn">import</span> <span class="p">(</span><span class="n">PositionEmbeddingType</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">allgather</span><span class="p">,</span> <span class="n">constant</span><span class="p">,</span>
                           <span class="n">cp_split_plugin</span><span class="p">,</span> <span class="n">gather_last_token_logits</span><span class="p">,</span>
                           <span class="n">index_select</span><span class="p">,</span> <span class="n">tanh</span><span class="p">,</span> <span class="n">view</span><span class="p">)</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..layers</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">MLP</span><span class="p">,</span> <span class="n">AttentionParams</span><span class="p">,</span> <span class="n">Embedding</span><span class="p">,</span> <span class="n">FusedGatedMLP</span><span class="p">,</span>
+<span class="kn">from</span> <span class="nn">..layers</span> <span class="kn">import</span> <span class="p">(</span><span class="n">MLP</span><span class="p">,</span> <span class="n">AttentionParams</span><span class="p">,</span> <span class="n">Embedding</span><span class="p">,</span> <span class="n">FusedGatedMLP</span><span class="p">,</span>
                       <span class="n">FusedRgLru</span><span class="p">,</span> <span class="n">GatedMLP</span><span class="p">,</span> <span class="n">KeyValueCacheParams</span><span class="p">,</span> <span class="n">LoraParams</span><span class="p">,</span>
                       <span class="n">PromptTuningEmbedding</span><span class="p">,</span> <span class="n">RgLru</span><span class="p">)</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..layers.attention</span><span class="w"> </span><span class="kn">import</span> <span class="n">Attention</span><span class="p">,</span> <span class="n">BertAttention</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..layers.linear</span><span class="w"> </span><span class="kn">import</span> <span class="n">ColumnLinear</span><span class="p">,</span> <span class="n">Linear</span><span class="p">,</span> <span class="n">RowLinear</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..layers.lora</span><span class="w"> </span><span class="kn">import</span> <span class="n">Lora</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..layers.moe</span><span class="w"> </span><span class="kn">import</span> <span class="n">MOE</span><span class="p">,</span> <span class="n">MoeOOTB</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..logger</span><span class="w"> </span><span class="kn">import</span> <span class="n">logger</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..mapping</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..module</span><span class="w"> </span><span class="kn">import</span> <span class="n">Module</span><span class="p">,</span> <span class="n">ModuleList</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..parameter</span><span class="w"> </span><span class="kn">import</span> <span class="n">Parameter</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..plugin</span><span class="w"> </span><span class="kn">import</span> <span class="n">init_all_reduce_helper</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..quantization</span><span class="w"> </span><span class="kn">import</span> <span class="n">QuantMode</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..quantization.layers</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">FP8Linear</span><span class="p">,</span> <span class="n">Fp8RowwiseFusedGatedMLP</span><span class="p">,</span>
+<span class="kn">from</span> <span class="nn">..layers.attention</span> <span class="kn">import</span> <span class="n">Attention</span><span class="p">,</span> <span class="n">BertAttention</span>
+<span class="kn">from</span> <span class="nn">..layers.linear</span> <span class="kn">import</span> <span class="n">ColumnLinear</span><span class="p">,</span> <span class="n">Linear</span><span class="p">,</span> <span class="n">RowLinear</span>
+<span class="kn">from</span> <span class="nn">..layers.lora</span> <span class="kn">import</span> <span class="n">Lora</span>
+<span class="kn">from</span> <span class="nn">..layers.moe</span> <span class="kn">import</span> <span class="n">MOE</span><span class="p">,</span> <span class="n">MoeOOTB</span>
+<span class="kn">from</span> <span class="nn">..logger</span> <span class="kn">import</span> <span class="n">logger</span>
+<span class="kn">from</span> <span class="nn">..mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
+<span class="kn">from</span> <span class="nn">..module</span> <span class="kn">import</span> <span class="n">Module</span><span class="p">,</span> <span class="n">ModuleList</span>
+<span class="kn">from</span> <span class="nn">..parameter</span> <span class="kn">import</span> <span class="n">Parameter</span>
+<span class="kn">from</span> <span class="nn">..plugin</span> <span class="kn">import</span> <span class="n">init_all_reduce_helper</span>
+<span class="kn">from</span> <span class="nn">..quantization</span> <span class="kn">import</span> <span class="n">QuantMode</span>
+<span class="kn">from</span> <span class="nn">..quantization.layers</span> <span class="kn">import</span> <span class="p">(</span><span class="n">FP8Linear</span><span class="p">,</span> <span class="n">Fp8RowwiseFusedGatedMLP</span><span class="p">,</span>
                                    <span class="n">Fp8RowwiseGatedMLP</span><span class="p">,</span>
                                    <span class="n">WeightOnlyGroupwiseQuantLinear</span><span class="p">,</span>
                                    <span class="n">WeightOnlyGroupwiseQuantRowLinear</span><span class="p">,</span>
                                    <span class="n">WeightOnlyQuantLinear</span><span class="p">,</span>
                                    <span class="n">WeightOnlyQuantRowLinear</span><span class="p">)</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..quantization.mode</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">KV_CACHE_QUANT_ALGO_LIST</span><span class="p">,</span> <span class="n">QUANT_ALGO_LIST</span><span class="p">,</span>
+<span class="kn">from</span> <span class="nn">..quantization.mode</span> <span class="kn">import</span> <span class="p">(</span><span class="n">KV_CACHE_QUANT_ALGO_LIST</span><span class="p">,</span> <span class="n">QUANT_ALGO_LIST</span><span class="p">,</span>
                                  <span class="n">W8A8_SQ_PLUGIN_LIST</span><span class="p">,</span> <span class="n">QuantAlgo</span><span class="p">)</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..quantization.utils.fp4_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">float4_sf_dtype</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..top_model_mixin</span><span class="w"> </span><span class="kn">import</span> <span class="n">TopModelMixin</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.convert_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">weight_only_quantize_dict</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.generation_mixin</span><span class="w"> </span><span class="kn">import</span> <span class="n">GenerationMixin</span>
+<span class="kn">from</span> <span class="nn">..quantization.utils.fp4_utils</span> <span class="kn">import</span> <span class="n">float4_sf_dtype</span>
+<span class="kn">from</span> <span class="nn">..top_model_mixin</span> <span class="kn">import</span> <span class="n">TopModelMixin</span>
+<span class="kn">from</span> <span class="nn">.convert_utils</span> <span class="kn">import</span> <span class="n">weight_only_quantize_dict</span>
+<span class="kn">from</span> <span class="nn">.generation_mixin</span> <span class="kn">import</span> <span class="n">GenerationMixin</span>
 
 
 <span class="nd">@dataclasses</span><span class="o">.</span><span class="n">dataclass</span><span class="p">(</span><span class="n">kw_only</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-<span class="k">class</span><span class="w"> </span><span class="nc">Gemma2ConfigGroup</span><span class="p">:</span>
+<span class="k">class</span> <span class="nc">Gemma2ConfigGroup</span><span class="p">:</span>
     <span class="n">query_pre_attn_scalar</span><span class="p">:</span> <span class="nb">int</span>
     <span class="n">final_logit_softcapping</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span>
     <span class="n">attn_logit_softcapping</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span>
 
     <span class="nd">@classmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">keys</span><span class="p">(</span><span class="bp">cls</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">keys</span><span class="p">(</span><span class="bp">cls</span><span class="p">):</span>
         <span class="k">return</span> <span class="p">{</span><span class="n">f</span><span class="o">.</span><span class="n">name</span> <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="n">dataclasses</span><span class="o">.</span><span class="n">fields</span><span class="p">(</span><span class="bp">cls</span><span class="p">)}</span>
 
 
 <span class="k">if</span> <span class="n">TYPE_CHECKING</span><span class="p">:</span>
-    <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Type</span><span class="p">,</span> <span class="n">TypeVar</span>
+    <span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="n">Type</span><span class="p">,</span> <span class="n">TypeVar</span>
 
-    <span class="kn">from</span><span class="w"> </span><span class="nn">typing_extensions</span><span class="w"> </span><span class="kn">import</span> <span class="n">Self</span>
+    <span class="kn">from</span> <span class="nn">typing_extensions</span> <span class="kn">import</span> <span class="n">Self</span>
 
     <span class="n">ConfigGroups</span> <span class="o">=</span> <span class="n">Union</span><span class="p">[</span><span class="n">Gemma2ConfigGroup</span><span class="p">]</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;Groupings of config where, if one of said properties exists, we assume all of the properties exist (even if they are `None`)&quot;&quot;&quot;</span>
@@ -238,7 +238,7 @@
 
 <div class="viewcode-block" id="SpeculativeDecodingMode">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.SpeculativeDecodingMode">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">SpeculativeDecodingMode</span><span class="p">(</span><span class="n">IntFlag</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">SpeculativeDecodingMode</span><span class="p">(</span><span class="n">IntFlag</span><span class="p">):</span>
     <span class="c1"># [WARNING] KEEP BELOW DEFINITION IN SYNC WITH cpp/tensorrt_llm/runtime/speculativeDecodingMode.h</span>
     <span class="n">NONE</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
     <span class="n">DRAFT_TOKENS_EXTERNAL</span> <span class="o">=</span> <span class="n">auto</span><span class="p">()</span>
@@ -250,7 +250,7 @@
 <div class="viewcode-block" id="SpeculativeDecodingMode.from_arguments">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.SpeculativeDecodingMode.from_arguments">[docs]</a>
     <span class="nd">@staticmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">from_arguments</span><span class="p">(</span><span class="n">args</span><span class="p">:</span> <span class="n">argparse</span><span class="o">.</span><span class="n">Namespace</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">from_arguments</span><span class="p">(</span><span class="n">args</span><span class="p">:</span> <span class="n">argparse</span><span class="o">.</span><span class="n">Namespace</span><span class="p">):</span>
         <span class="k">if</span> <span class="n">args</span><span class="o">.</span><span class="n">speculative_decoding_mode</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="n">SpeculativeDecodingMode</span><span class="o">.</span><span class="n">NONE</span>
         <span class="k">elif</span> <span class="n">args</span><span class="o">.</span><span class="n">speculative_decoding_mode</span> <span class="o">==</span> <span class="s2">&quot;draft_tokens_external&quot;</span><span class="p">:</span>
@@ -272,7 +272,7 @@
 <div class="viewcode-block" id="QuantConfig">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig">[docs]</a>
 <span class="nd">@dataclasses</span><span class="o">.</span><span class="n">dataclass</span>
-<span class="k">class</span><span class="w"> </span><span class="nc">QuantConfig</span><span class="p">:</span>
+<span class="k">class</span> <span class="nc">QuantConfig</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">&#39;&#39;&#39;Serializable quantization configuration class, part of the PretrainedConfig</span>
 <span class="sd">    &#39;&#39;&#39;</span>
 
@@ -287,11 +287,11 @@
     <span class="n">exclude_modules</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">use_plugin_sq</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">use_plugin_sq</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_algo</span> <span class="ow">in</span> <span class="n">W8A8_SQ_PLUGIN_LIST</span>
 
     <span class="nd">@cached_property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">quant_mode</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">QuantModeWrapper</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">quant_mode</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">QuantModeWrapper</span><span class="p">:</span>
         <span class="n">quant_mode_list</span> <span class="o">=</span> <span class="p">[</span>
             <span class="n">QuantMode</span><span class="o">.</span><span class="n">from_quant_algo</span><span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">quant_algo</span><span class="p">,</span>
@@ -301,21 +301,21 @@
         <span class="k">return</span> <span class="n">QuantModeWrapper</span><span class="p">(</span><span class="n">quant_mode_list</span><span class="p">)</span>
 
     <span class="nd">@cached_property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">layer_quant_mode</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">QuantMode</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">layer_quant_mode</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">QuantMode</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">QuantMode</span><span class="o">.</span><span class="n">from_quant_algo</span><span class="p">(</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">quant_algo</span><span class="p">,</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_quant_algo</span><span class="p">,</span>
         <span class="p">)</span>
 
     <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">requires_calibration</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">requires_calibration</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_algo</span> <span class="ow">in</span> <span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="n">QUANT_ALGO_LIST</span><span class="p">)</span> <span class="o">-</span> <span class="p">{</span>
             <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W8A16</span><span class="p">,</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A16</span><span class="p">,</span>
             <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8_PER_CHANNEL_PER_TOKEN</span>
         <span class="p">})</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_quant_algo</span> <span class="ow">in</span> <span class="n">KV_CACHE_QUANT_ALGO_LIST</span>
 
     <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">requires_modelopt_quantization</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">requires_modelopt_quantization</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_algo</span> <span class="ow">in</span> <span class="p">[</span>
                 <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">NVFP4</span><span class="p">,</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8</span><span class="p">,</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A16_AWQ</span><span class="p">,</span>
                 <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A8_AWQ</span><span class="p">,</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W8A8_SQ_PER_CHANNEL</span><span class="p">,</span>
@@ -329,7 +329,7 @@
 
 <div class="viewcode-block" id="QuantConfig.get_quant_cfg">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.get_quant_cfg">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">get_quant_cfg</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">module_name</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">get_quant_cfg</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">module_name</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">exclude_modules</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">for</span> <span class="n">exclude_module</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">exclude_modules</span><span class="p">:</span>
                 <span class="k">if</span> <span class="n">exclude_module</span> <span class="o">==</span> <span class="n">module_name</span> <span class="ow">or</span> <span class="p">(</span>
@@ -342,7 +342,7 @@
 
 <div class="viewcode-block" id="QuantConfig.get_modelopt_qformat">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.get_modelopt_qformat">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">get_modelopt_qformat</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">get_modelopt_qformat</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="n">algo_to_modelopt_map</span> <span class="o">=</span> <span class="p">{</span>
             <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W8A16</span><span class="p">:</span> <span class="s2">&quot;int8_wo&quot;</span><span class="p">,</span>
             <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A16</span><span class="p">:</span> <span class="s2">&quot;int4_wo&quot;</span><span class="p">,</span>
@@ -362,7 +362,7 @@
 
 <div class="viewcode-block" id="QuantConfig.get_modelopt_kv_cache_dtype">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.get_modelopt_kv_cache_dtype">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">get_modelopt_kv_cache_dtype</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">get_modelopt_kv_cache_dtype</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="n">algo_to_modelopt_map</span> <span class="o">=</span> <span class="p">{</span>
             <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8</span><span class="p">:</span> <span class="s1">&#39;fp8&#39;</span><span class="p">,</span>
             <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">INT8</span><span class="p">:</span> <span class="s1">&#39;int8&#39;</span><span class="p">,</span>
@@ -377,27 +377,27 @@
 <div class="viewcode-block" id="QuantConfig.from_dict">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.from_dict">[docs]</a>
     <span class="nd">@classmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">from_dict</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="nb">dict</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">from_dict</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="nb">dict</span><span class="p">):</span>
         <span class="n">obj</span> <span class="o">=</span> <span class="bp">cls</span><span class="p">(</span><span class="o">**</span><span class="n">config</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">obj</span></div>
 
 
 <div class="viewcode-block" id="QuantConfig.to_dict">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.to_dict">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">to_dict</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">to_dict</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="n">dataclasses</span><span class="o">.</span><span class="n">asdict</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span></div>
 </div>
 
 
 
 <span class="nd">@dataclasses</span><span class="o">.</span><span class="n">dataclass</span>
-<span class="k">class</span><span class="w"> </span><span class="nc">LayerQuantConfig</span><span class="p">(</span><span class="n">QuantConfig</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">LayerQuantConfig</span><span class="p">(</span><span class="n">QuantConfig</span><span class="p">):</span>
     <span class="n">quant_algo</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">QuantConfig</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">kv_cache_quant_algo</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">QuantConfig</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">quantized_layers</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">QuantConfig</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">exclude_modules</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="o">*</span><span class="p">,</span>
                  <span class="n">quant_algo</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">QuantConfig</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">kv_cache_quant_algo</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">QuantConfig</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -423,23 +423,23 @@
             <span class="p">)</span>
 
     <span class="nd">@cached_property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">quant_mode</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">quant_mode</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="n">quant_mode_list</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">auto_quant_mode</span><span class="o">.</span><span class="n">values</span><span class="p">()))</span>
         <span class="k">return</span> <span class="n">QuantModeWrapper</span><span class="p">(</span><span class="n">quant_mode_list</span><span class="p">)</span>
 
     <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">layer_quant_mode</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">QuantMode</span><span class="p">]:</span>
+    <span class="k">def</span> <span class="nf">layer_quant_mode</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">QuantMode</span><span class="p">]:</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">auto_quant_mode</span>
 
     <span class="nd">@cached_property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">auto_quant_list</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">auto_quant_list</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="n">quant_list</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="k">for</span> <span class="n">_</span><span class="p">,</span> <span class="n">layer_config</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">quantized_layers</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
             <span class="n">quant_list</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">layer_config</span><span class="o">.</span><span class="n">quant_algo</span><span class="p">)</span>
         <span class="k">return</span> <span class="nb">list</span><span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="n">quant_list</span><span class="p">))</span>
 
     <span class="nd">@classmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">from_dict</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="nb">dict</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">from_dict</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="nb">dict</span><span class="p">):</span>
         <span class="n">quantized_layers</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;quantized_layers&#39;</span><span class="p">,</span> <span class="p">{})</span>
 
         <span class="n">quantized_layers_dict</span> <span class="o">=</span> <span class="p">{</span>
@@ -450,13 +450,13 @@
         <span class="n">obj</span> <span class="o">=</span> <span class="bp">cls</span><span class="p">(</span><span class="n">quantized_layers</span><span class="o">=</span><span class="n">quantized_layers_dict</span><span class="p">,</span> <span class="o">**</span><span class="n">config</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">obj</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">get_quant_cfg</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">module_name</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">get_quant_cfg</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">module_name</span><span class="p">):</span>
         <span class="k">if</span> <span class="n">module_name</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">quantized_layers</span><span class="o">.</span><span class="n">keys</span><span class="p">():</span>
             <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">quantized_layers</span><span class="p">[</span><span class="n">module_name</span><span class="p">]</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="k">return</span> <span class="n">QuantConfig</span><span class="p">()</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">get_modelopt_qformat</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">get_modelopt_qformat</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="n">algo_to_modelopt_map</span> <span class="o">=</span> <span class="p">{</span>
             <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">NVFP4</span><span class="p">:</span> <span class="s2">&quot;nvfp4&quot;</span><span class="p">,</span>
             <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8</span><span class="p">:</span> <span class="s2">&quot;fp8&quot;</span><span class="p">,</span>
@@ -469,7 +469,7 @@
             <span class="p">[</span><span class="n">algo_to_modelopt_map</span><span class="p">[</span><span class="n">item</span><span class="p">]</span> <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">auto_quant_list</span><span class="p">])</span>
         <span class="k">return</span> <span class="n">autoq_format</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">to_dict</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">to_dict</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="n">output</span> <span class="o">=</span> <span class="n">copy</span><span class="o">.</span><span class="n">deepcopy</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="vm">__dict__</span><span class="p">)</span>
         <span class="n">output</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;auto_quant_mode&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="n">output</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;quant_mode&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
@@ -483,9 +483,9 @@
 
 <div class="viewcode-block" id="PretrainedConfig">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedConfig">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">PretrainedConfig</span><span class="p">:</span>
+<span class="k">class</span> <span class="nc">PretrainedConfig</span><span class="p">:</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="o">*</span><span class="p">,</span>
                  <span class="n">architecture</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
                  <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
@@ -579,7 +579,7 @@
 <div class="viewcode-block" id="PretrainedConfig.create_runtime_defaults">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedConfig.create_runtime_defaults">[docs]</a>
     <span class="nd">@staticmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">create_runtime_defaults</span><span class="p">(</span>
+    <span class="k">def</span> <span class="nf">create_runtime_defaults</span><span class="p">(</span>
             <span class="n">defaults</span><span class="p">:</span> <span class="s2">&quot;RuntimeDefaultsIn&quot;</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="n">RuntimeDefaults</span><span class="p">]:</span>
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">defaults</span><span class="p">,</span> <span class="nb">dict</span><span class="p">):</span>
             <span class="k">return</span> <span class="n">RuntimeDefaults</span><span class="p">(</span><span class="o">**</span><span class="n">defaults</span><span class="p">)</span>
@@ -587,7 +587,7 @@
 
 
     <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">kv_dtype</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">kv_dtype</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="c1"># TODO: need to align the kv dtype</span>
         <span class="c1"># now assume the kv cache is for all layers</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_int8_kv_cache</span><span class="p">():</span>
@@ -599,7 +599,7 @@
 
 <div class="viewcode-block" id="PretrainedConfig.set_if_not_exist">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedConfig.set_if_not_exist">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">set_if_not_exist</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">set_if_not_exist</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span><span class="p">):</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">):</span>
             <span class="nb">setattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span></div>
 
@@ -607,9 +607,9 @@
 <div class="viewcode-block" id="PretrainedConfig.from_dict">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedConfig.from_dict">[docs]</a>
     <span class="nd">@classmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">from_dict</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="nb">dict</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">from_dict</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="nb">dict</span><span class="p">):</span>
         <span class="c1"># Maybe we need AutoConfig for this</span>
-        <span class="kn">from</span><span class="w"> </span><span class="nn">.</span><span class="w"> </span><span class="kn">import</span> <span class="n">MODEL_MAP</span>
+        <span class="kn">from</span> <span class="nn">.</span> <span class="kn">import</span> <span class="n">MODEL_MAP</span>
         <span class="n">model_cls</span> <span class="o">=</span> <span class="n">MODEL_MAP</span><span class="p">[</span><span class="n">config</span><span class="p">[</span><span class="s1">&#39;architecture&#39;</span><span class="p">]]</span>
         <span class="n">config_cls</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">model_cls</span><span class="p">,</span> <span class="s1">&#39;config_class&#39;</span><span class="p">,</span> <span class="bp">cls</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">config_cls</span><span class="p">(</span><span class="o">**</span><span class="n">config</span><span class="p">)</span></div>
@@ -617,7 +617,7 @@
 
 <div class="viewcode-block" id="PretrainedConfig.to_dict">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedConfig.to_dict">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">to_dict</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">to_dict</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="n">output</span> <span class="o">=</span> <span class="n">copy</span><span class="o">.</span><span class="n">deepcopy</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="vm">__dict__</span><span class="p">)</span>
 
         <span class="n">output</span><span class="p">[</span><span class="s1">&#39;position_embedding_type&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">position_embedding_type</span><span class="p">)</span>
@@ -631,7 +631,7 @@
 <div class="viewcode-block" id="PretrainedConfig.from_json_file">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedConfig.from_json_file">[docs]</a>
     <span class="nd">@classmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">from_json_file</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">config_file</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">from_json_file</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">config_file</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
         <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">config_file</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
             <span class="n">config</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
         <span class="n">obj</span> <span class="o">=</span> <span class="bp">cls</span><span class="o">.</span><span class="n">from_dict</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
@@ -650,61 +650,61 @@
 <div class="viewcode-block" id="PretrainedConfig.from_checkpoint">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedConfig.from_checkpoint">[docs]</a>
     <span class="nd">@classmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">from_checkpoint</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">ckpt_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">from_checkpoint</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">ckpt_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">cls</span><span class="o">.</span><span class="n">from_json_file</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">ckpt_dir</span><span class="p">,</span> <span class="s1">&#39;config.json&#39;</span><span class="p">))</span></div>
 
 
 <div class="viewcode-block" id="PretrainedConfig.to_json_file">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedConfig.to_json_file">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">to_json_file</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config_file</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">to_json_file</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config_file</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
         <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">config_file</span><span class="p">,</span> <span class="s1">&#39;w&#39;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
             <span class="n">json</span><span class="o">.</span><span class="n">dump</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">to_dict</span><span class="p">(),</span> <span class="n">f</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="PretrainedConfig.to_layer_quant_config">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedConfig.to_layer_quant_config">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">to_layer_quant_config</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config_file</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">to_layer_quant_config</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config_file</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
         <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">config_file</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
             <span class="n">config</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">quantization</span> <span class="o">=</span> <span class="n">LayerQuantConfig</span><span class="o">.</span><span class="n">from_dict</span><span class="p">(</span><span class="n">config</span><span class="p">)</span></div>
 
 
     <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">quant_mode</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">quant_mode</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">quantization</span><span class="o">.</span><span class="n">quant_mode</span>
 
     <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">quant_algo</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">quant_algo</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">quantization</span><span class="o">.</span><span class="n">quant_algo</span>
 
 <div class="viewcode-block" id="PretrainedConfig.get_quant_cfg">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedConfig.get_quant_cfg">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">get_quant_cfg</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">module_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">get_quant_cfg</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">module_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">quantization</span><span class="o">.</span><span class="n">get_quant_cfg</span><span class="p">(</span><span class="n">module_name</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="PretrainedConfig.set_rank">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedConfig.set_rank">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">set_rank</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rank</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">set_rank</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rank</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">rank</span> <span class="o">=</span> <span class="n">rank</span></div>
 
 
 <div class="viewcode-block" id="PretrainedConfig.get_config_group">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedConfig.get_config_group">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">get_config_group</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">group_cls</span><span class="p">:</span> <span class="s2">&quot;Type[CG]&quot;</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;CG&quot;</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">get_config_group</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">group_cls</span><span class="p">:</span> <span class="s2">&quot;Type[CG]&quot;</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;CG&quot;</span><span class="p">:</span>
         <span class="n">cfg</span> <span class="o">=</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">v</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">to_dict</span><span class="p">()</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">group_cls</span><span class="o">.</span><span class="n">keys</span><span class="p">()}</span>
         <span class="k">return</span> <span class="n">group_cls</span><span class="p">(</span><span class="o">**</span><span class="n">cfg</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="PretrainedConfig.has_config_group">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedConfig.has_config_group">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">has_config_group</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">group_cls</span><span class="p">:</span> <span class="s2">&quot;Type[CG]&quot;</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;bool&quot;</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">has_config_group</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">group_cls</span><span class="p">:</span> <span class="s2">&quot;Type[CG]&quot;</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;bool&quot;</span><span class="p">:</span>
         <span class="k">return</span> <span class="nb">all</span><span class="p">(</span><span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">)</span> <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">group_cls</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span></div>
 
 
 <div class="viewcode-block" id="PretrainedConfig.for_each_rank">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedConfig.for_each_rank">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">for_each_rank</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;Generator[Self, None, None]&quot;</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">for_each_rank</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;Generator[Self, None, None]&quot;</span><span class="p">:</span>
         <span class="k">for</span> <span class="n">rank</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">world_size</span><span class="p">):</span>
             <span class="n">config_copy</span> <span class="o">=</span> <span class="n">copy</span><span class="o">.</span><span class="n">deepcopy</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span>
             <span class="n">config_copy</span><span class="o">.</span><span class="n">set_rank</span><span class="p">(</span><span class="n">rank</span><span class="p">)</span>
@@ -713,15 +713,15 @@
 
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">DecoderLayerList</span><span class="p">(</span><span class="n">ModuleList</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">DecoderLayerList</span><span class="p">(</span><span class="n">ModuleList</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="bp">cls</span><span class="p">,</span> <span class="n">config</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="bp">cls</span><span class="p">,</span> <span class="n">config</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">num_hidden_layers</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">num_hidden_layers</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">layer_list</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">pp_layers</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">num_hidden_layers</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">quant_mode</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">([</span><span class="bp">cls</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="n">idx</span><span class="p">)</span> <span class="k">for</span> <span class="n">idx</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">layer_list</span><span class="p">])</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                 <span class="n">hidden_states</span><span class="p">,</span>
                 <span class="n">use_cache</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                 <span class="n">attention_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
@@ -808,9 +808,9 @@
         <span class="k">return</span> <span class="n">hidden_states</span>
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">PostInitCaller</span><span class="p">(</span><span class="nb">type</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">PostInitCaller</span><span class="p">(</span><span class="nb">type</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__call__</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__call__</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
         <span class="n">obj</span> <span class="o">=</span> <span class="nb">type</span><span class="o">.</span><span class="fm">__call__</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
         <span class="n">obj</span><span class="o">.</span><span class="n">__post_init__</span><span class="p">()</span>
         <span class="k">return</span> <span class="n">obj</span>
@@ -818,18 +818,18 @@
 
 <div class="viewcode-block" id="PretrainedModel">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedModel">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">PretrainedModel</span><span class="p">(</span><span class="n">Module</span><span class="p">,</span>
+<span class="k">class</span> <span class="nc">PretrainedModel</span><span class="p">(</span><span class="n">Module</span><span class="p">,</span>
                       <span class="n">GenerationMixin</span><span class="p">,</span>
                       <span class="n">TopModelMixin</span><span class="p">,</span>
                       <span class="n">metaclass</span><span class="o">=</span><span class="n">PostInitCaller</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
         <span class="n">init_all_reduce_helper</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">config</span> <span class="o">=</span> <span class="n">config</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-        <span class="kn">from</span><span class="w"> </span><span class="nn">..quantization.quantize</span><span class="w"> </span><span class="kn">import</span> <span class="n">quantize</span>
+    <span class="k">def</span> <span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="kn">from</span> <span class="nn">..quantization.quantize</span> <span class="kn">import</span> <span class="n">quantize</span>
         <span class="n">quantize</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">quantization</span><span class="p">)</span>
 
         <span class="c1"># Currently, use_parallel_embedding must be enabled before weight loading;</span>
@@ -839,16 +839,16 @@
 
 <div class="viewcode-block" id="PretrainedModel.release">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedModel.release">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">release</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">release</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="n">release_gc</span><span class="p">()</span></div>
 
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__del__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__del__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">release</span><span class="p">()</span>
 
 <div class="viewcode-block" id="PretrainedModel.check_config">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedModel.check_config">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">check_config</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">check_config</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">):</span>
         <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span>
             <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="vm">__class__</span><span class="si">}</span><span class="s2"> is an abstract class. Only classes inheriting this class can be called.&quot;</span>
         <span class="p">)</span></div>
@@ -857,14 +857,14 @@
 <div class="viewcode-block" id="PretrainedModel.from_config">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedModel.from_config">[docs]</a>
     <span class="nd">@classmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">from_config</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">from_config</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="n">config</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="PretrainedModel.from_checkpoint">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedModel.from_checkpoint">[docs]</a>
     <span class="nd">@classmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">from_checkpoint</span><span class="p">(</span>
+    <span class="k">def</span> <span class="nf">from_checkpoint</span><span class="p">(</span>
         <span class="bp">cls</span><span class="p">,</span>
         <span class="n">ckpt_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
         <span class="n">rank</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -906,7 +906,7 @@
 
 <div class="viewcode-block" id="PretrainedModel.load">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedModel.load">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">load</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">weights</span><span class="p">,</span> <span class="n">from_pruned</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">load</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">weights</span><span class="p">,</span> <span class="n">from_pruned</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
         <span class="n">required_names</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
         <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">param</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">named_parameters</span><span class="p">():</span>
             <span class="k">if</span> <span class="n">param</span><span class="o">.</span><span class="n">is_inited</span><span class="p">():</span>
@@ -948,7 +948,7 @@
 
 <div class="viewcode-block" id="PretrainedModel.save_checkpoint">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedModel.save_checkpoint">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">save_checkpoint</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">output_dir</span><span class="p">,</span> <span class="n">save_config</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">save_checkpoint</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">output_dir</span><span class="p">,</span> <span class="n">save_config</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
         <span class="c1"># multiple ranks could share same config.json, so adding a save_config parameter to let user avoiding writing config.json in all ranks</span>
         <span class="n">rank</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">rank</span>
         <span class="n">weights</span> <span class="o">=</span> <span class="p">{</span>
@@ -970,7 +970,7 @@
 
 <div class="viewcode-block" id="PretrainedModel.prepare_inputs">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedModel.prepare_inputs">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">prepare_inputs</span><span class="p">(</span>
+    <span class="k">def</span> <span class="nf">prepare_inputs</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">max_batch_size</span><span class="p">,</span>
         <span class="n">max_input_len</span><span class="p">,</span>
@@ -1121,7 +1121,7 @@
 <div class="viewcode-block" id="PretrainedModel.quantize">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.models.html#tensorrt_llm.llmapi.PretrainedModel.quantize">[docs]</a>
     <span class="nd">@classmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">quantize</span><span class="p">(</span>
+    <span class="k">def</span> <span class="nf">quantize</span><span class="p">(</span>
         <span class="bp">cls</span><span class="p">,</span>
         <span class="n">hf_model_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
         <span class="n">output_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
@@ -1157,7 +1157,7 @@
                 <span class="sa">f</span><span class="s2">&quot;The quant_config (</span><span class="si">{</span><span class="n">quant_config</span><span class="si">}</span><span class="s2">) should not call modelopt quantization&quot;</span>
             <span class="p">)</span>
 
-        <span class="kn">from</span><span class="w"> </span><span class="nn">..quantization</span><span class="w"> </span><span class="kn">import</span> <span class="n">quantize_and_export</span>
+        <span class="kn">from</span> <span class="nn">..quantization</span> <span class="kn">import</span> <span class="n">quantize_and_export</span>
         <span class="n">quantize_and_export</span><span class="p">(</span>
             <span class="n">model_dir</span><span class="o">=</span><span class="nb">str</span><span class="p">(</span><span class="n">hf_model_dir</span><span class="p">),</span>
             <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span>
@@ -1180,9 +1180,9 @@
 
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">DecoderModelForCausalLM</span><span class="p">(</span><span class="n">PretrainedModel</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">DecoderModelForCausalLM</span><span class="p">(</span><span class="n">PretrainedModel</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">,</span> <span class="n">transformer</span><span class="p">,</span> <span class="n">lm_head</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">,</span> <span class="n">transformer</span><span class="p">,</span> <span class="n">lm_head</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">transformer</span> <span class="o">=</span> <span class="n">transformer</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">lm_head</span> <span class="o">=</span> <span class="n">lm_head</span>
@@ -1192,7 +1192,7 @@
         <span class="n">Attention</span><span class="o">.</span><span class="n">create_attention_const_params</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">position_embedding_type</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">position_embedding_type</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                 <span class="n">input_ids</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
                 <span class="n">position_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">use_cache</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
@@ -1304,12 +1304,12 @@
             <span class="k">return</span> <span class="n">hidden_states</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">fuse_gate_mlp</span><span class="p">(</span>
+<span class="k">def</span> <span class="nf">fuse_gate_mlp</span><span class="p">(</span>
     <span class="n">model</span><span class="p">:</span> <span class="n">PretrainedModel</span><span class="p">,</span>
     <span class="n">gemm_swiglu_plugin_dtype</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="n">low_latency_gemm_swiglu_plugin_dtype</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">PretrainedModel</span><span class="p">:</span>
-    <span class="kn">from</span><span class="w"> </span><span class="nn">..quantization.quantize</span><span class="w"> </span><span class="kn">import</span> <span class="n">fp8_quantize</span>
+    <span class="kn">from</span> <span class="nn">..quantization.quantize</span> <span class="kn">import</span> <span class="n">fp8_quantize</span>
 
     <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">mlp</span><span class="p">,</span> <span class="n">layer</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">named_modules_with_parent</span><span class="p">():</span>
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">mlp</span><span class="p">,</span> <span class="n">GatedMLP</span><span class="p">):</span>
@@ -1448,10 +1448,10 @@
     <span class="k">return</span> <span class="n">model</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">unfuse_qkv_gemm</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="n">PretrainedModel</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">PretrainedModel</span><span class="p">:</span>
+<span class="k">def</span> <span class="nf">unfuse_qkv_gemm</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="n">PretrainedModel</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">PretrainedModel</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">&#39;&#39;&#39;Split all the models&#39; Attention layer&#39;s QKV GEMM into 3 GEMMs layer.q layer.k, layer.v and return the changed model</span>
 <span class="sd">    &#39;&#39;&#39;</span>
-    <span class="kn">from</span><span class="w"> </span><span class="nn">..quantization.quantize</span><span class="w"> </span><span class="kn">import</span> <span class="n">quantize</span>
+    <span class="kn">from</span> <span class="nn">..quantization.quantize</span> <span class="kn">import</span> <span class="n">quantize</span>
 
     <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">layer</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">named_modules</span><span class="p">():</span>
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">layer</span><span class="p">,</span> <span class="n">Attention</span><span class="p">)</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">layer</span><span class="o">.</span><span class="n">cross_attention</span><span class="p">:</span>
@@ -1528,7 +1528,7 @@
     <span class="k">return</span> <span class="n">model</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">fuse_rg_lru</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="n">PretrainedModel</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">PretrainedModel</span><span class="p">:</span>
+<span class="k">def</span> <span class="nf">fuse_rg_lru</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="n">PretrainedModel</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">PretrainedModel</span><span class="p">:</span>
     <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">rg_lru</span><span class="p">,</span> <span class="n">parent</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">named_modules_with_parent</span><span class="p">():</span>
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">rg_lru</span><span class="p">,</span> <span class="n">RgLru</span><span class="p">):</span>
             <span class="n">fused_layer</span> <span class="o">=</span> <span class="n">FusedRgLru</span><span class="p">(</span><span class="o">**</span><span class="n">get_init_params</span><span class="p">(</span><span class="n">rg_lru</span><span class="p">))</span>
@@ -1552,7 +1552,7 @@
     <span class="k">return</span> <span class="n">model</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">set_prompt_tuning</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="n">PretrainedModel</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">PretrainedModel</span><span class="p">:</span>
+<span class="k">def</span> <span class="nf">set_prompt_tuning</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="n">PretrainedModel</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">PretrainedModel</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">&#39;&#39;&#39;Replace the given models embedding layer with a PromptTuningEmbedding layer in-place, return the changed model</span>
 <span class="sd">       Pre-conditions: vocab_embedding exists</span>
 <span class="sd">       Post-conditions: isinstance(vocab_embedding, PromptTuningEmbedding)</span>
@@ -1568,7 +1568,7 @@
     <span class="k">return</span> <span class="n">model</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">add_lora</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="n">PretrainedModel</span><span class="p">,</span>
+<span class="k">def</span> <span class="nf">add_lora</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="n">PretrainedModel</span><span class="p">,</span>
              <span class="n">max_lora_rank</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">PretrainedModel</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">&#39;&#39;&#39; Add lora layers to the Attention/BertAttention/Linear/RowLinear/FusedGatedMLP layers to the given model, return the changed model</span>
 <span class="sd">    &#39;&#39;&#39;</span>
@@ -1617,7 +1617,7 @@
     <span class="k">return</span> <span class="n">model</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">to_ootb_moe</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="n">PretrainedModel</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">PretrainedModel</span><span class="p">:</span>
+<span class="k">def</span> <span class="nf">to_ootb_moe</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="n">PretrainedModel</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">PretrainedModel</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">&#39;&#39;&#39; Use OOTB MoE instead of MoE plugin, return the changed model</span>
 <span class="sd">    &#39;&#39;&#39;</span>
     <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">layer</span><span class="p">,</span> <span class="n">parent</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">named_modules_with_parent</span><span class="p">():</span>
@@ -1628,7 +1628,7 @@
     <span class="k">return</span> <span class="n">model</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">parallelize_embedding</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="n">PretrainedModel</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">PretrainedModel</span><span class="p">:</span>
+<span class="k">def</span> <span class="nf">parallelize_embedding</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="n">PretrainedModel</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">PretrainedModel</span><span class="p">:</span>
     <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">embedding</span><span class="p">,</span> <span class="n">parent</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">named_modules_with_parent</span><span class="p">():</span>
         <span class="n">layer_name</span> <span class="o">=</span> <span class="n">name</span><span class="o">.</span><span class="n">rsplit</span><span class="p">(</span><span class="s1">&#39;.&#39;</span><span class="p">,</span> <span class="mi">1</span><span class="p">)[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">embedding</span><span class="p">,</span> <span class="n">Embedding</span><span class="p">)</span> <span class="ow">and</span> <span class="n">embedding</span><span class="o">.</span><span class="n">tp_group</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
@@ -1642,7 +1642,7 @@
     <span class="k">return</span> <span class="n">model</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">share_embedding</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="n">PretrainedModel</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">PretrainedModel</span><span class="p">:</span>
+<span class="k">def</span> <span class="nf">share_embedding</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="n">PretrainedModel</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">PretrainedModel</span><span class="p">:</span>
     <span class="n">lm_head</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">vocab_embedding</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">layer</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">named_modules</span><span class="p">():</span>
@@ -1680,7 +1680,7 @@
     <span class="k">return</span> <span class="n">model</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">set_fp8_context_fhma</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="n">PretrainedModel</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">PretrainedModel</span><span class="p">:</span>
+<span class="k">def</span> <span class="nf">set_fp8_context_fhma</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="n">PretrainedModel</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">PretrainedModel</span><span class="p">:</span>
     <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">layer</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">named_modules</span><span class="p">():</span>
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">layer</span><span class="p">,</span> <span class="n">Attention</span><span class="p">)</span> <span class="ow">and</span> <span class="nb">hasattr</span><span class="p">(</span>
                 <span class="n">layer</span><span class="o">.</span><span class="n">dense</span><span class="p">,</span> <span class="s1">&#39;activation_scaling_factor&#39;</span><span class="p">):</span>
@@ -1696,7 +1696,7 @@
     <span class="k">return</span> <span class="n">model</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">optimize_model</span><span class="p">(</span>
+<span class="k">def</span> <span class="nf">optimize_model</span><span class="p">(</span>
     <span class="n">model</span><span class="p">:</span> <span class="n">PretrainedModel</span><span class="p">,</span>
     <span class="n">use_parallel_embedding</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
     <span class="n">share_embedding_table</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
@@ -1750,7 +1750,7 @@
     <span class="k">return</span> <span class="n">model</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">optimize_cross_qkv</span><span class="p">(</span><span class="n">model</span><span class="p">):</span>
+<span class="k">def</span> <span class="nf">optimize_cross_qkv</span><span class="p">(</span><span class="n">model</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">    For cross attention layer, we can skip computing the query of encoder_output.</span>
 <span class="sd">    So, add a new attribute &#39;kv&#39; in the cross_attention layer. This might lead to</span>
@@ -1829,7 +1829,7 @@
     <span class="k">return</span> <span class="n">model</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">preprocess_perlayer_weights</span><span class="p">(</span><span class="n">weights</span><span class="p">,</span>
+<span class="k">def</span> <span class="nf">preprocess_perlayer_weights</span><span class="p">(</span><span class="n">weights</span><span class="p">,</span>
                                 <span class="n">model_config</span><span class="p">,</span>
                                 <span class="n">quant_algo</span><span class="p">,</span>
                                 <span class="n">from_pruned</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
@@ -1947,7 +1947,7 @@
                                             <span class="n">plugin</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">preprocess_weights</span><span class="p">(</span><span class="n">weights</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">],</span>
+<span class="k">def</span> <span class="nf">preprocess_weights</span><span class="p">(</span><span class="n">weights</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">],</span>
                        <span class="n">model_config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">,</span>
                        <span class="n">from_pruned</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;This function in-place modifies weights and model_config, making them compatible with each other.</span>
@@ -1962,7 +1962,7 @@
 
     <span class="n">pattern_info</span> <span class="o">=</span> <span class="p">[</span><span class="s1">&#39;fc&#39;</span><span class="p">,</span> <span class="s1">&#39;gate&#39;</span><span class="p">,</span> <span class="s1">&#39;proj&#39;</span><span class="p">,</span> <span class="s1">&#39;qkv&#39;</span><span class="p">,</span> <span class="s1">&#39;dense&#39;</span><span class="p">]</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">add_kv_cache_rcp_scaling_factor</span><span class="p">(</span><span class="n">weights</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]):</span>
+    <span class="k">def</span> <span class="nf">add_kv_cache_rcp_scaling_factor</span><span class="p">(</span><span class="n">weights</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]):</span>
         <span class="n">new_entries</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="c1"># The unified converter generate_tllm_weights() already generates these rcp weights, but legacy</span>
         <span class="c1"># converters do not. Handle it here.</span>
@@ -2022,7 +2022,7 @@
     <span class="k">return</span> <span class="n">weights</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">get_kv_cache_type_from_legacy</span><span class="p">(</span><span class="n">use_cache</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
+<span class="k">def</span> <span class="nf">get_kv_cache_type_from_legacy</span><span class="p">(</span><span class="n">use_cache</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
                                   <span class="n">paged_kv_cache</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">KVCacheType</span><span class="p">:</span>
     <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
         <span class="k">if</span> <span class="n">paged_kv_cache</span><span class="p">:</span>
@@ -2033,7 +2033,7 @@
         <span class="k">return</span> <span class="n">KVCacheType</span><span class="o">.</span><span class="n">DISABLED</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">save_config</span><span class="p">(</span><span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">output_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+<span class="k">def</span> <span class="nf">save_config</span><span class="p">(</span><span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">output_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
                 <span class="n">log</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
     <span class="n">config_path</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">output_dir</span><span class="p">)</span> <span class="o">/</span> <span class="s2">&quot;config.json&quot;</span>
     <span class="k">if</span> <span class="n">log</span><span class="p">:</span>
@@ -2042,7 +2042,7 @@
     <span class="n">config_path</span><span class="o">.</span><span class="n">write_text</span><span class="p">(</span><span class="n">json</span><span class="o">.</span><span class="n">dumps</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">to_dict</span><span class="p">(),</span> <span class="n">indent</span><span class="o">=</span><span class="mi">4</span><span class="p">))</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">save_checkpoint</span><span class="p">(</span><span class="o">*</span><span class="p">,</span> <span class="n">output_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">weights</span><span class="p">:</span> <span class="nb">dict</span><span class="p">,</span> <span class="n">rank</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="k">def</span> <span class="nf">save_checkpoint</span><span class="p">(</span><span class="o">*</span><span class="p">,</span> <span class="n">output_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">weights</span><span class="p">:</span> <span class="nb">dict</span><span class="p">,</span> <span class="n">rank</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot; Checkpoint saver for weight loader.&quot;&quot;&quot;</span>
     <span class="n">safetensors</span><span class="o">.</span><span class="n">torch</span><span class="o">.</span><span class="n">save_file</span><span class="p">(</span>
         <span class="n">weights</span><span class="p">,</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">output_dir</span><span class="p">,</span> <span class="sa">f</span><span class="s1">&#39;rank</span><span class="si">{</span><span class="n">rank</span><span class="si">}</span><span class="s1">.safetensors&#39;</span><span class="p">))</span>
@@ -2055,7 +2055,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f63fe5cbb90>
+<jinja2.runtime.BlockReference object at 0x7fdef147dac0>
 
 <div class="footer">
     <p>

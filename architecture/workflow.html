@@ -7,7 +7,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>TensorRT-LLM Build Workflow &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
 
@@ -15,7 +15,7 @@
       <script src="../_static/jquery.js?v=5d32c60e"></script>
       <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../_static/doctools.js?v=9a2dae69"></script>
       <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../_static/copybutton.js?v=65e89d2a"></script>
@@ -127,7 +127,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../performance/introduction.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -190,9 +190,9 @@
 <section id="conversion-apis">
 <h2>Conversion APIs<a class="headerlink" href="#conversion-apis" title="Link to this heading"></a></h2>
 <p>The API for weight conversion of the LLaMA model looks like this. A <code class="docutils literal notranslate"><span class="pre">TopModelMixin</span></code> class is introduced, <code class="docutils literal notranslate"><span class="pre">from_hugging_face()</span></code> interface is declared, the <code class="docutils literal notranslate"><span class="pre">LLaMAForCausalLM</span></code> class inherits <code class="docutils literal notranslate"><span class="pre">TopModelMixin</span></code> (not direct parent class, but in its base class hierarchy), and implements the interface.</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">TopModelMixin</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span> <span class="nc">TopModelMixin</span>
     <span class="nd">@classmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">from_hugging_face</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">from_hugging_face</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span>
                           <span class="n">hf_model_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
                           <span class="n">dtype</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="s1">&#39;float16&#39;</span><span class="p">,</span>
                           <span class="n">mapping</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Mapping</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -200,9 +200,9 @@
         <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span><span class="s2">&quot;Subclass shall override this&quot;</span><span class="p">)</span>
 
 <span class="c1"># TopModelMixin is in the part of base class hierarchy</span>
-<span class="k">class</span><span class="w"> </span><span class="nc">LLaMAForCausalLM</span> <span class="p">(</span><span class="n">DecoderModelForCausalLM</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">LLaMAForCausalLM</span> <span class="p">(</span><span class="n">DecoderModelForCausalLM</span><span class="p">):</span>
     <span class="nd">@classmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">from_hugging_face</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">from_hugging_face</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span>
              <span class="n">hf_model_dir</span><span class="p">,</span>
              <span class="n">dtype</span><span class="o">=</span><span class="s1">&#39;float16&#39;</span><span class="p">,</span>
              <span class="n">mapping</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Mapping</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">LLaMAForCausalLM</span><span class="p">:</span>
@@ -253,9 +253,9 @@ can export TensorRT-LLM checkpoints, and the trtllm-build command needs to be ex
 <li><p>For the non-Modelopt quantization algorithms, users need to use the per-model convert_checkpoint.py scripts to export TensorRT-LLM checkpoints.</p></li>
 </ul>
 <p>Use the <code class="docutils literal notranslate"><span class="pre">quantize()</span></code> interface to unify the different quantization flows. The default implementation is added in the <code class="docutils literal notranslate"><span class="pre">PretrainedModel</span></code> class.</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">PretrainedModel</span><span class="p">:</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span> <span class="nc">PretrainedModel</span><span class="p">:</span>
     <span class="nd">@classmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">quantize</span><span class="p">(</span>
+    <span class="k">def</span> <span class="nf">quantize</span><span class="p">(</span>
         <span class="bp">cls</span><span class="p">,</span>
         <span class="n">hf_model_dir</span><span class="p">,</span>
         <span class="n">output_dir</span><span class="p">,</span>
@@ -269,9 +269,9 @@ can export TensorRT-LLM checkpoints, and the trtllm-build command needs to be ex
 <li><p>The default implementation only handles the Modelopt supported quantization. The LLaMA class then inherits this <code class="docutils literal notranslate"><span class="pre">PretrainedModel</span></code> and dispatches the Modelopt quantization to the super class’s default implementation.</p></li>
 <li><p>The model developer raises errors in the sub-class implementation if the new model is not supported by Modelopt yet.</p></li>
 </ul>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">LLaMAForCausalLM</span><span class="p">:</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span> <span class="nc">LLaMAForCausalLM</span><span class="p">:</span>
     <span class="nd">@classmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">quantize</span><span class="p">(</span>
+    <span class="k">def</span> <span class="nf">quantize</span><span class="p">(</span>
         <span class="bp">cls</span><span class="p">,</span>
         <span class="n">hf_model_dir</span><span class="p">,</span>
         <span class="n">output_dir</span><span class="p">,</span>
@@ -318,9 +318,9 @@ The usage of this API looks like this:</p>
 <p>The <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> CLI tool is a thin wrapper around this <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.build</span></code> API. The flags of the CLI tool are kept close to the fields of the <code class="docutils literal notranslate"><span class="pre">BuildConfig</span></code> class.</p>
 <p>If a model were to be saved into disk and then built to the engine later, TensorRT-LLM provides a <code class="docutils literal notranslate"><span class="pre">from_checkpoint</span></code> API to deserialize the checkpoint.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1">## TensorRT-LLM code</span>
-<span class="k">class</span><span class="w"> </span><span class="nc">PretrainedModel</span><span class="p">:</span>
+<span class="k">class</span> <span class="nc">PretrainedModel</span><span class="p">:</span>
     <span class="nd">@classmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">from_checkpoint</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">from_checkpoint</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span>
                     <span class="n">ckpt_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
                     <span class="n">rank</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
                     <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
@@ -370,7 +370,7 @@ The usage of this API looks like this:</p>
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f64011b4530>
+<jinja2.runtime.BlockReference object at 0x7fdebb92aa50>
 
 <div class="footer">
     <p>

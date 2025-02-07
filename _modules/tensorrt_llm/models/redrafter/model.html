@@ -6,7 +6,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>tensorrt_llm.models.redrafter.model &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="../../../../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../../../../_static/copybutton.css?v=76b2166b" />
 
@@ -14,7 +14,7 @@
       <script src="../../../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../../../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../../../../_static/doctools.js?v=9a2dae69"></script>
       <script src="../../../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../../../_static/copybutton.js?v=65e89d2a"></script>
@@ -117,7 +117,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../../performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../performance/introduction.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -176,27 +176,27 @@
 <span class="c1"># See the License for the specific language governing permissions and</span>
 <span class="c1"># limitations under the License.</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">collections</span><span class="w"> </span><span class="kn">import</span> <span class="n">OrderedDict</span>
+<span class="kn">from</span> <span class="nn">collections</span> <span class="kn">import</span> <span class="n">OrderedDict</span>
 
-<span class="kn">import</span><span class="w"> </span><span class="nn">tensorrt</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">trt</span>
+<span class="kn">import</span> <span class="nn">tensorrt</span> <span class="k">as</span> <span class="nn">trt</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._common</span><span class="w"> </span><span class="kn">import</span> <span class="n">default_net</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.bindings</span><span class="w"> </span><span class="kn">import</span> <span class="n">KVCacheType</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.functional</span><span class="w"> </span><span class="kn">import</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">cast</span><span class="p">,</span> <span class="n">categorical_sample</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.models</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLaMAForCausalLM</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.models.generation_mixin</span><span class="w"> </span><span class="kn">import</span> <span class="n">GenerationMixin</span>
+<span class="kn">from</span> <span class="nn">tensorrt_llm._common</span> <span class="kn">import</span> <span class="n">default_net</span>
+<span class="kn">from</span> <span class="nn">tensorrt_llm.bindings</span> <span class="kn">import</span> <span class="n">KVCacheType</span>
+<span class="kn">from</span> <span class="nn">tensorrt_llm.functional</span> <span class="kn">import</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">cast</span><span class="p">,</span> <span class="n">categorical_sample</span>
+<span class="kn">from</span> <span class="nn">tensorrt_llm.models</span> <span class="kn">import</span> <span class="n">LLaMAForCausalLM</span>
+<span class="kn">from</span> <span class="nn">tensorrt_llm.models.generation_mixin</span> <span class="kn">import</span> <span class="n">GenerationMixin</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">..._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">pad_vocab_size</span><span class="p">,</span> <span class="n">str_dtype_to_trt</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.drafter</span><span class="w"> </span><span class="kn">import</span> <span class="n">Drafter</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.redrafter_helper</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">_beam_search_candidates</span><span class="p">,</span> <span class="n">_beams2tree</span><span class="p">,</span>
+<span class="kn">from</span> <span class="nn">..._utils</span> <span class="kn">import</span> <span class="n">pad_vocab_size</span><span class="p">,</span> <span class="n">str_dtype_to_trt</span>
+<span class="kn">from</span> <span class="nn">.drafter</span> <span class="kn">import</span> <span class="n">Drafter</span>
+<span class="kn">from</span> <span class="nn">.redrafter_helper</span> <span class="kn">import</span> <span class="p">(</span><span class="n">_beam_search_candidates</span><span class="p">,</span> <span class="n">_beams2tree</span><span class="p">,</span>
                                <span class="n">_process_logits_and_hidden_states</span><span class="p">)</span>
 
 
 <div class="viewcode-block" id="ReDrafterForCausalLM">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.ReDrafterForCausalLM">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">ReDrafterForCausalLM</span><span class="p">(</span><span class="n">LLaMAForCausalLM</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">ReDrafterForCausalLM</span><span class="p">(</span><span class="n">LLaMAForCausalLM</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">):</span>
 
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span> <span class="o">=</span> <span class="n">str_dtype_to_trt</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
@@ -211,7 +211,7 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">is_rnn</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">redrafter_is_rnn</span>
         <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">drafter</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">dtype</span><span class="si">}</span><span class="s2"> != </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">drafter</span><span class="o">.</span><span class="n">dtype</span><span class="si">}</span><span class="s2">&quot;</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_fwd_helper</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">lm_logits</span><span class="p">,</span> <span class="n">embedding</span><span class="p">,</span> <span class="n">drafter</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">_fwd_helper</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">lm_logits</span><span class="p">,</span> <span class="n">embedding</span><span class="p">,</span> <span class="n">drafter</span><span class="p">,</span>
                     <span class="n">kwargs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&#39;&#39;&#39;</span>
 <span class="sd">        Must enable remove_input_padding:</span>
@@ -279,7 +279,7 @@
 
 <div class="viewcode-block" id="ReDrafterForCausalLM.forward">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.ReDrafterForCausalLM.forward">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">        0. run base model, get logits, hidden_states</span>
 <span class="sd">        &quot;&quot;&quot;</span>
@@ -319,7 +319,7 @@
 
 <div class="viewcode-block" id="ReDrafterForCausalLM.prepare_inputs">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.ReDrafterForCausalLM.prepare_inputs">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">prepare_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">prepare_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">        Inputs needed:</span>
 <span class="sd">            Assuming, max_gen_tokens = 1 + nb*(bl - 1), counting true token</span>
@@ -478,7 +478,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f63fe446ab0>
+<jinja2.runtime.BlockReference object at 0x7fdeec95d3a0>
 
 <div class="footer">
     <p>

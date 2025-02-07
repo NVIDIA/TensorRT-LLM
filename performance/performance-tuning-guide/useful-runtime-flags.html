@@ -1,0 +1,439 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../../">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Useful Runtime Options &mdash; tensorrt_llm  documentation</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=80d5e7a1" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=e59714d7" />
+      <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
+
+  
+      <script src="../../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="../../_static/doctools.js?v=9a2dae69"></script>
+      <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
+      <script src="../../_static/copybutton.js?v=65e89d2a"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="Performance Analysis" href="../perf-analysis.html" />
+    <link rel="prev" title="FP8 Quantization" href="fp8-quantization.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            tensorrt_llm
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../torch.html">PyTorch Backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../release-notes.html">Release Notes</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../installation/windows.html">Installing on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API Examples</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api-examples/index.html">LLM Examples Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api-examples/customization.html">Common Customizations</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api-examples/llm_api_examples.html">Examples</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-serve.html">trtllm-serve</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/core-concepts.html">Model Definition</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/core-concepts.html#compilation">Compilation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/core-concepts.html#runtime">Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/core-concepts.html#multi-gpu-and-multi-node-support">Multi-GPU and Multi-Node Support</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/executor.html">Executor API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/inference-request.html">Inference Request</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/inference-request.html#responses">Responses</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Performance Tuning Guide</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="index.html#prerequisite-knowledge">Prerequisite Knowledge</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="benchmarking-default-performance.html">Benchmarking Default Performance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="useful-build-time-flags.html">Useful Build-Time Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tuning-max-batch-size-and-max-num-tokens.html">Tuning Max Batch Size and Max Num Tokens</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deciding-model-sharding-strategy.html">Deciding Model Sharding Strategy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="fp8-quantization.html">FP8 Quantization</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">Useful Runtime Options</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#capacity-scheduler-policy">Capacity Scheduler Policy</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#context-chunking-policy">Context Chunking Policy</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#max-tokens-in-paged-kv-cache-and-kv-cache-free-gpu-memory-fraction">Max Tokens in Paged KV Cache and KV Cache Free GPU Memory Fraction</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#maximum-attention-window-size">Maximum Attention Window Size</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">tensorrt_llm</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">Performance Tuning Guide</a></li>
+      <li class="breadcrumb-item active">Useful Runtime Options</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="../../_sources/performance/performance-tuning-guide/useful-runtime-flags.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="useful-runtime-options">
+<span id="useful-runtime-flags"></span><h1>Useful Runtime Options<a class="headerlink" href="#useful-runtime-options" title="Link to this heading"></a></h1>
+<p>This part summarizes the runtime configuration knobs that can be tweaked to
+enhance the performance of already built engines. As compared to previous examples where
+the LLM-API was used to build and save an engine but not to process any requests,
+runtime knobs would be specified when you are using the LLM-API to actually run inference
+like in the <a class="reference internal" href="benchmarking-default-performance.html#before-you-begin-tensorrt-llm-llm-api"><span class="std std-ref">LLM-API end-to-end example</span></a></p>
+<section id="capacity-scheduler-policy">
+<h2>Capacity Scheduler Policy<a class="headerlink" href="#capacity-scheduler-policy" title="Link to this heading"></a></h2>
+<p>TensorRT-LLM currently supports three batch scheduler policies: <code class="docutils literal notranslate"><span class="pre">GUARANTEED_NO_EVICT</span></code> (default),
+<code class="docutils literal notranslate"><span class="pre">MAX_UTILIZATION</span></code> and <code class="docutils literal notranslate"><span class="pre">STATIC_BATCH</span></code>.</p>
+<p>The scheduling policy can be set to <code class="docutils literal notranslate"><span class="pre">MAX_UTILIZATION</span></code> to pack as many
+requests as possible at each iteration of the forward loop, when in-flight
+sequence batching is enabled. It maximizes the utilization of the GPUs by
+aggressively scheduling requests at the risk of having to pause requests if the
+KV cache size limit is reached.</p>
+<p>For a more conservative approach with respect to the KV cache limitations in
+terms of memory allocation, <code class="docutils literal notranslate"><span class="pre">CapacitySchedulerPolicy</span></code> should be set to
+<code class="docutils literal notranslate"><span class="pre">GUARANTEED_NO_EVICT</span></code> to guarantee that a started request is never paused.</p>
+<p>If the goal is to maximizes the throughput, users should try <code class="docutils literal notranslate"><span class="pre">MAX_UTILIZATION</span></code>.
+However, they need to keep in mind that it may have a negative impact on
+latency if requests have to be paused.</p>
+<p><code class="docutils literal notranslate"><span class="pre">STATIC_BATCH</span></code> is a legacy mode and is not recommended for production usage.</p>
+<p>To switch the capacity scheduler policy from the default of <code class="docutils literal notranslate"><span class="pre">GUARANTEED_NO_EVICT</span></code> to <code class="docutils literal notranslate"><span class="pre">MAX_UTILIZATION</span></code>
+you would modify the <a class="reference internal" href="benchmarking-default-performance.html#before-you-begin-tensorrt-llm-llm-api"><span class="std std-ref">LLM-API end-to-end example</span></a> to be:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span> <span class="nn">tensorrt_llm</span> <span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
+<span class="kn">from</span> <span class="nn">tensorrt_llm.bindings.executor</span> <span class="kn">import</span> <span class="n">SchedulerConfig</span><span class="p">,</span> <span class="n">CapacitySchedulerPolicy</span>
+
+
+<span class="k">def</span> <span class="nf">main</span><span class="p">():</span>
+    <span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span>
+        <span class="s2">&quot;Hello, I am&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;The president of the United States is&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;The capital of France is&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;The future of AI is&quot;</span><span class="p">,</span>
+    <span class="p">]</span>
+
+    <span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">temperature</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span> <span class="n">top_p</span><span class="o">=</span><span class="mf">0.95</span><span class="p">)</span>
+
+    <span class="n">scheduler_config</span> <span class="o">=</span> <span class="n">SchedulerConfig</span><span class="p">(</span>
+        <span class="n">capacity_scheduler_policy</span><span class="o">=</span><span class="n">CapacitySchedulerPolicy</span><span class="o">.</span><span class="n">MAX_UTILIZATION</span>
+    <span class="p">)</span>
+
+    <span class="n">llm</span>  <span class="o">=</span>  <span class="n">LLM</span><span class="p">(</span>
+    <span class="n">model</span><span class="o">=</span><span class="s2">&quot;meta-llama/Llama-3.3-70B-Instruct&quot;</span><span class="p">,</span>
+    <span class="n">tensor_parallel_size</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>
+    <span class="n">scheduler_config</span><span class="o">=</span><span class="n">scheduler_config</span>
+    <span class="p">)</span>
+
+    <span class="n">outputs</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
+
+    <span class="c1"># Print the outputs.</span>
+    <span class="k">for</span> <span class="n">output</span> <span class="ow">in</span> <span class="n">outputs</span><span class="p">:</span>
+        <span class="n">prompt</span> <span class="o">=</span> <span class="n">output</span><span class="o">.</span><span class="n">prompt</span>
+        <span class="n">generated_text</span> <span class="o">=</span> <span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">, Generated text: </span><span class="si">{</span><span class="n">generated_text</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+<span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
+    <span class="n">main</span><span class="p">()</span>
+</pre></div>
+</div>
+</section>
+<section id="context-chunking-policy">
+<h2>Context Chunking Policy<a class="headerlink" href="#context-chunking-policy" title="Link to this heading"></a></h2>
+<p>As discussed <a class="reference internal" href="tuning-max-batch-size-and-max-num-tokens.html#revisiting-paged-context-attention-and-context-chunking"><span class="std std-ref">previously</span></a> context chunking will increase the chance of batch processing between
+the context and the generation phase, thereby balancing the calculation amount
+of each iteration and typically increasing throughput.</p>
+<p>TensorRT-LLM currently supports two context chunking policies: <code class="docutils literal notranslate"><span class="pre">FIRST_COME_FIRST_SERVED</span></code> (default) which would prioritize scheduling all the context chunks of a request that comes in first,
+and <code class="docutils literal notranslate"><span class="pre">EQUAL_PROGRESS</span></code> which schedules context chunks from all requests before scheduling the next chunk of any request.</p>
+<p><code class="docutils literal notranslate"><span class="pre">FIRST_COME_FIRST_SERVED</span></code> should achieve overall better performance, while
+<code class="docutils literal notranslate"><span class="pre">EQUAL_PROGRESS</span></code> can be helpful in theory to make sure time to first token (TTFT)
+for most requests are relatively similar.</p>
+<p>To switch the context chunking policy from the default of <code class="docutils literal notranslate"><span class="pre">FIRST_COME_FIRST_SERVED</span></code> to <code class="docutils literal notranslate"><span class="pre">EQUAL_PROGRESS</span></code>
+you would modify the <a class="reference internal" href="benchmarking-default-performance.html#before-you-begin-tensorrt-llm-llm-api"><span class="std std-ref">LLM-API end-to-end example</span></a> to be:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span> <span class="nn">tensorrt_llm</span> <span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
+<span class="kn">from</span> <span class="nn">tensorrt_llm.bindings.executor</span> <span class="kn">import</span> <span class="n">SchedulerConfig</span><span class="p">,</span> <span class="n">ContextChunkingPolicy</span>
+
+
+<span class="k">def</span> <span class="nf">main</span><span class="p">():</span>
+    <span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span>
+        <span class="s2">&quot;Hello, I am&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;The president of the United States is&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;The capital of France is&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;The future of AI is&quot;</span><span class="p">,</span>
+    <span class="p">]</span>
+
+    <span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">temperature</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span> <span class="n">top_p</span><span class="o">=</span><span class="mf">0.95</span><span class="p">)</span>
+
+    <span class="n">scheduler_config</span> <span class="o">=</span> <span class="n">SchedulerConfig</span><span class="p">(</span>
+        <span class="n">context_chunking_policy</span><span class="o">=</span><span class="n">ContextChunkingPolicy</span><span class="o">.</span><span class="n">EQUAL_PROGRESS</span>
+    <span class="p">)</span>
+
+    <span class="n">llm</span>  <span class="o">=</span>  <span class="n">LLM</span><span class="p">(</span>
+    <span class="n">model</span><span class="o">=</span><span class="s2">&quot;meta-llama/Llama-3.3-70B-Instruct&quot;</span><span class="p">,</span>
+    <span class="n">tensor_parallel_size</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>
+    <span class="n">scheduler_config</span><span class="o">=</span><span class="n">scheduler_config</span>
+    <span class="p">)</span>
+
+    <span class="n">outputs</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
+
+    <span class="c1"># Print the outputs.</span>
+    <span class="k">for</span> <span class="n">output</span> <span class="ow">in</span> <span class="n">outputs</span><span class="p">:</span>
+        <span class="n">prompt</span> <span class="o">=</span> <span class="n">output</span><span class="o">.</span><span class="n">prompt</span>
+        <span class="n">generated_text</span> <span class="o">=</span> <span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">, Generated text: </span><span class="si">{</span><span class="n">generated_text</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+<span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
+    <span class="n">main</span><span class="p">()</span>
+</pre></div>
+</div>
+</section>
+<section id="max-tokens-in-paged-kv-cache-and-kv-cache-free-gpu-memory-fraction">
+<h2>Max Tokens in Paged KV Cache and KV Cache Free GPU Memory Fraction<a class="headerlink" href="#max-tokens-in-paged-kv-cache-and-kv-cache-free-gpu-memory-fraction" title="Link to this heading"></a></h2>
+<p>The <code class="docutils literal notranslate"><span class="pre">max_tokens_in_paged_kv_cache</span></code> and <code class="docutils literal notranslate"><span class="pre">kv_cache_free_gpu_mem_fraction</span></code>
+parameters can be used to control the maximum number of tokens handled by the
+KV cache manager. Setting them properly helps better control the amount of
+available memory for the KV cache manager during inference. Keeping in mind
+that increasing the amount of memory available to the KV cache manager tends to
+translate to a higher achievable throughput.</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">max_tokens_in_paged_kv_cache</span></code> flag directly sets the maximum number of
+tokens in the KV cache manager. When left unset, that value will be computed
+based on the <code class="docutils literal notranslate"><span class="pre">kv_cache_free_gpu_mem_fraction</span></code> setting.</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">kv_cache_free_gpu_mem_fraction</span></code> is a floating-point number between <code class="docutils literal notranslate"><span class="pre">0.0</span></code>
+and <code class="docutils literal notranslate"><span class="pre">1.0</span></code> that indicates the maximum fraction of GPU memory (after loading the
+model) that will be used for the KV cache. The default value is <code class="docutils literal notranslate"><span class="pre">0.90</span></code> and
+means that 90% of the free GPU memory will be used to save tokens in the KV
+cache. Based on that value, TensorRT-LLM can determine the maximum number of
+tokens in the KV cache manager.</p>
+<p>When both parameters are set, the maximum number of tokens in the KV cache
+manager will be set to the smaller value between <code class="docutils literal notranslate"><span class="pre">max_tokens_in_paged_kv_cache</span></code>
+and the value computed from the amount of memory available for the KV cache.</p>
+<p>Unless users clearly know the maximum number of tokens in the KV cache needed
+by the model, it is recommended to leave <code class="docutils literal notranslate"><span class="pre">max_tokens_in_paged_kv_cache</span></code> unset.
+For <code class="docutils literal notranslate"><span class="pre">kv_cache_free_gpu_mem_fraction</span></code>, if no other programs are executed on the
+same GPU, it is recommended to test with a as high value as <code class="docutils literal notranslate"><span class="pre">0.95</span></code> to target a
+high throughput. Note that the <code class="docutils literal notranslate"><span class="pre">kv_cache_free_gpu_mem_fraction</span></code> parameter
+cannot be set to <code class="docutils literal notranslate"><span class="pre">1.0</span></code> because some amount of memory has to be reserved for
+inputs and outputs.</p>
+<p>To set <code class="docutils literal notranslate"><span class="pre">kv_cache_free_gpu_mem_fraction</span></code> you would modify the <a class="reference internal" href="benchmarking-default-performance.html#before-you-begin-tensorrt-llm-llm-api"><span class="std std-ref">LLM-API end-to-end example</span></a> to be:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span> <span class="nn">tensorrt_llm</span> <span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
+<span class="kn">from</span> <span class="nn">tensorrt_llm.bindings.executor</span> <span class="kn">import</span> <span class="n">KvCacheConfig</span>
+
+
+<span class="k">def</span> <span class="nf">main</span><span class="p">():</span>
+    <span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span>
+        <span class="s2">&quot;Hello, I am&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;The president of the United States is&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;The capital of France is&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;The future of AI is&quot;</span><span class="p">,</span>
+    <span class="p">]</span>
+
+    <span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">temperature</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span> <span class="n">top_p</span><span class="o">=</span><span class="mf">0.95</span><span class="p">)</span>
+
+    <span class="n">kv_cache_config</span> <span class="o">=</span> <span class="n">KvCacheConfig</span><span class="p">(</span><span class="n">free_gpu_memory_fraction</span><span class="o">=</span><span class="mf">0.95</span><span class="p">)</span>
+
+    <span class="n">llm</span>  <span class="o">=</span>  <span class="n">LLM</span><span class="p">(</span>
+    <span class="n">model</span><span class="o">=</span><span class="s2">&quot;meta-llama/Llama-3.3-70B-Instruct&quot;</span><span class="p">,</span>
+    <span class="n">tensor_parallel_size</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span>
+    <span class="n">kv_cache_config</span><span class="o">=</span><span class="n">kv_cache_config</span>
+    <span class="p">)</span>
+
+    <span class="n">outputs</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
+
+    <span class="c1"># Print the outputs.</span>
+    <span class="k">for</span> <span class="n">output</span> <span class="ow">in</span> <span class="n">outputs</span><span class="p">:</span>
+        <span class="n">prompt</span> <span class="o">=</span> <span class="n">output</span><span class="o">.</span><span class="n">prompt</span>
+        <span class="n">generated_text</span> <span class="o">=</span> <span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">, Generated text: </span><span class="si">{</span><span class="n">generated_text</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+<span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
+    <span class="n">main</span><span class="p">()</span>
+</pre></div>
+</div>
+<p>If you wanted to set <code class="docutils literal notranslate"><span class="pre">max_tokens_in_paged_kv_cache</span></code> instead, you would replace <code class="docutils literal notranslate"><span class="pre">free_gpu_memory_fraction</span></code> with <code class="docutils literal notranslate"><span class="pre">max_tokens</span></code> and specify the number.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span>    <span class="n">kv_cache_config</span> <span class="o">=</span> <span class="n">KvCacheConfig</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=&lt;</span><span class="n">number</span> <span class="n">of</span> <span class="n">tokens</span><span class="o">&gt;</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="maximum-attention-window-size">
+<h2>Maximum Attention Window Size<a class="headerlink" href="#maximum-attention-window-size" title="Link to this heading"></a></h2>
+<p>The <code class="docutils literal notranslate"><span class="pre">max_attention_window_size</span></code> flag sets the maximum number of tokens that are
+attended to in order to generate one token when using techniques like sliding window
+attention. See this
+<a class="reference internal" href="../../advanced/gpt-attention.html#sliding-window-attention-cyclic-rolling-buffer-kv-cache"><span class="std std-ref">Document</span></a>
+for more details. It defaults to the maximum sequence length
+(<code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> when building the engine), which means
+that the feature is disabled by default.</p>
+<p>When set to a smaller value than <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> (during
+engine build), only the KV cache of the last <code class="docutils literal notranslate"><span class="pre">max_attention_window_size</span></code> tokens
+will be stored. If the input sequence length at runtime exceeds the
+<code class="docutils literal notranslate"><span class="pre">max_attention_window_size</span></code> value, the accuracy may start dropping, but the
+runtime performance will be better (due to the reduction in terms of
+computations and GPU memory allocation). Users can modify that value to
+increase runtime performance at the expense of reduced accuracy.</p>
+<p>Just like <a class="reference internal" href="#max-tokens-in-paged-kv-cache-and-kv-cache-free-gpu-memory-fraction"><span class="std std-ref"><code class="docutils literal notranslate"><span class="pre">kv_cache_free_gpu_mem_fraction</span></code></span></a>, <code class="docutils literal notranslate"><span class="pre">max_attention_window_size</span></code> can be specified in the LLM-API
+via <code class="docutils literal notranslate"><span class="pre">KVCacheConfig</span></code>. To specify <code class="docutils literal notranslate"><span class="pre">max_attention_window_size</span></code> you would instantiate <code class="docutils literal notranslate"><span class="pre">KVCacheConfig</span></code> like so</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span>    <span class="n">kv_cache_config</span> <span class="o">=</span> <span class="n">KvCacheConfig</span><span class="p">(</span><span class="n">max_attention_window</span><span class="o">=&lt;</span><span class="n">number</span> <span class="n">of</span> <span class="n">tokens</span><span class="o">&gt;</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="fp8-quantization.html" class="btn btn-neutral float-left" title="FP8 Quantization" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="../perf-analysis.html" class="btn btn-neutral float-right" title="Performance Analysis" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+<jinja2.runtime.BlockReference object at 0x7fdefb287500>
+
+<div class="footer">
+    <p>
+        Copyright © 2024 NVIDIA Corporation
+    </p>
+    <p>
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/" target="_blank" rel="noopener"
+            data-cms-ai="0">Privacy Policy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/" target="_blank" rel="noopener"
+            data-cms-ai="0">Manage My Privacy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/preferences/start/" target="_blank" rel="noopener"
+            data-cms-ai="0">Do Not Sell or Share My Data</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/" target="_blank"
+            rel="noopener" data-cms-ai="0">Terms of Service</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/" target="_blank" rel="noopener"
+            data-cms-ai="0">Accessibility</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/" target="_blank"
+            rel="noopener" data-cms-ai="0">Corporate Policies</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/product-security/" target="_blank" rel="noopener"
+            data-cms-ai="0">Product Security</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/contact/" target="_blank" rel="noopener"
+            data-cms-ai="0">Contact</a>
+    </p>
+</div>
+
+
+  </div>
+
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

@@ -7,7 +7,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Adding a New Model in PyTorch Backend &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
 
@@ -15,7 +15,7 @@
       <script src="../_static/jquery.js?v=5d32c60e"></script>
       <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../_static/doctools.js?v=9a2dae69"></script>
       <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../_static/copybutton.js?v=65e89d2a"></script>
@@ -118,7 +118,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../performance/introduction.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -199,14 +199,14 @@
 <section id="model-configuration">
 <h3>Model Configuration<a class="headerlink" href="#model-configuration" title="Link to this heading"></a></h3>
 <p>Suppose you want to support a new model named <code class="docutils literal notranslate"><span class="pre">MyModel</span></code>. If the model is already supported in HuggingFace’s transformers, you should bring the PyTorch modeling code and reuse HuggingFace’s configuration class. For example, our <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/models/modeling_llama.py</span></code> was adapted from HuggingFace’s <a class="reference external" href="https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py">modeling_llama.py</a>; in the modeling code, we reuse the configuration class:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">LlamaConfig</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">LlamaConfig</span>
 </pre></div>
 </div>
 <p>If the model is not registered in HuggingFace’s transformers, you need to define the configuration class in your <code class="docutils literal notranslate"><span class="pre">configuration_mymodel.py</span></code> following HuggingFace’s <a class="reference external" href="https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/configuration_llama.py">configuration_llama.py</a>:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">transformers.configuration_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">PretrainedConfig</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span> <span class="nn">transformers.configuration_utils</span> <span class="kn">import</span> <span class="n">PretrainedConfig</span>
 
-<span class="k">class</span><span class="w"> </span><span class="nc">MyConfig</span><span class="p">(</span><span class="n">PretrainedConfig</span><span class="p">):</span>
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">MyConfig</span><span class="p">(</span><span class="n">PretrainedConfig</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
         <span class="o">...</span>
 </pre></div>
 </div>
@@ -214,27 +214,27 @@
 <section id="model-definition">
 <h3>Model Definition<a class="headerlink" href="#model-definition" title="Link to this heading"></a></h3>
 <p>Remove any unnecessary code (e.g., training-specific code), and then rewrite some PyTorch modules. For a typical Transformer decoder model, you need to implement your <code class="docutils literal notranslate"><span class="pre">modeling_mymodel.py</span></code> like this:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Optional</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="n">Optional</span>
 
-<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">torch</span><span class="w"> </span><span class="kn">import</span> <span class="n">nn</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.attention_backend</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionMetadata</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.model_config</span><span class="w"> </span><span class="kn">import</span> <span class="n">ModelConfig</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.models.modeling_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">DecoderModel</span><span class="p">,</span> <span class="n">DecoderModelForCausalLM</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.modules.attention</span><span class="w"> </span><span class="kn">import</span> <span class="n">Attention</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.modules.decoder_layer</span><span class="w"> </span><span class="kn">import</span> <span class="n">DecoderLayer</span>
+<span class="kn">import</span> <span class="nn">torch</span>
+<span class="kn">from</span> <span class="nn">torch</span> <span class="kn">import</span> <span class="n">nn</span>
+<span class="kn">from</span> <span class="nn">tensorrt_llm._torch.attention_backend</span> <span class="kn">import</span> <span class="n">AttentionMetadata</span>
+<span class="kn">from</span> <span class="nn">tensorrt_llm._torch.model_config</span> <span class="kn">import</span> <span class="n">ModelConfig</span>
+<span class="kn">from</span> <span class="nn">tensorrt_llm._torch.models.modeling_utils</span> <span class="kn">import</span> <span class="n">DecoderModel</span><span class="p">,</span> <span class="n">DecoderModelForCausalLM</span>
+<span class="kn">from</span> <span class="nn">tensorrt_llm._torch.modules.attention</span> <span class="kn">import</span> <span class="n">Attention</span>
+<span class="kn">from</span> <span class="nn">tensorrt_llm._torch.modules.decoder_layer</span> <span class="kn">import</span> <span class="n">DecoderLayer</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">configuration_mymodel</span><span class="w"> </span><span class="kn">import</span> <span class="n">MyConfig</span>
+<span class="kn">from</span> <span class="nn">configuration_mymodel</span> <span class="kn">import</span> <span class="n">MyConfig</span>
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">MyAttention</span><span class="p">(</span><span class="n">Attention</span><span class="p">):</span>
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">model_config</span><span class="p">:</span> <span class="n">ModelConfig</span><span class="p">[</span><span class="n">MyConfig</span><span class="p">],</span> <span class="n">layer_idx</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">MyAttention</span><span class="p">(</span><span class="n">Attention</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">model_config</span><span class="p">:</span> <span class="n">ModelConfig</span><span class="p">[</span><span class="n">MyConfig</span><span class="p">],</span> <span class="n">layer_idx</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
         <span class="c1"># Use model_config to initialize the Attention module</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">MyDecoderLayer</span><span class="p">(</span><span class="n">DecoderLayer</span><span class="p">):</span>
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">model_config</span><span class="p">:</span> <span class="n">ModelConfig</span><span class="p">[</span><span class="n">MyConfig</span><span class="p">],</span> <span class="n">layer_idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">MyDecoderLayer</span><span class="p">(</span><span class="n">DecoderLayer</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">model_config</span><span class="p">:</span> <span class="n">ModelConfig</span><span class="p">[</span><span class="n">MyConfig</span><span class="p">],</span> <span class="n">layer_idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
         <span class="c1"># Use model_config to initialize the submodules</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">input_layernorm</span> <span class="o">=</span> <span class="o">...</span>
@@ -242,13 +242,13 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">post_attention_layernorm</span> <span class="o">=</span> <span class="o">...</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span> <span class="o">=</span> <span class="o">...</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">attn_metadata</span><span class="p">:</span> <span class="n">AttentionMetadata</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">attn_metadata</span><span class="p">:</span> <span class="n">AttentionMetadata</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
         <span class="c1"># Define the forward computation of a single decoder layer</span>
         <span class="o">...</span>
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">MyModel</span><span class="p">(</span><span class="n">DecoderModel</span><span class="p">):</span>
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">model_config</span><span class="p">:</span> <span class="n">ModelConfig</span><span class="p">[</span><span class="n">MyConfig</span><span class="p">]):</span>
+<span class="k">class</span> <span class="nc">MyModel</span><span class="p">(</span><span class="n">DecoderModel</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">model_config</span><span class="p">:</span> <span class="n">ModelConfig</span><span class="p">[</span><span class="n">MyConfig</span><span class="p">]):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">model_config</span><span class="p">)</span>
         <span class="c1"># Use model_config to initialize the submodules</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">embed_tokens</span> <span class="o">=</span> <span class="o">...</span>
@@ -256,7 +256,7 @@
             <span class="n">MyDecoderLayer</span><span class="p">(</span><span class="n">model_config</span><span class="p">,</span> <span class="n">layer_idx</span><span class="p">)</span> <span class="k">for</span> <span class="n">layer_idx</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">model_config</span><span class="o">.</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">num_hidden_layers</span><span class="p">)</span>
         <span class="p">])</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                 <span class="n">attn_metadata</span><span class="p">:</span> <span class="n">AttentionMetadata</span><span class="p">,</span>
                 <span class="n">input_ids</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">LongTensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                 <span class="n">position_ids</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">LongTensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -265,8 +265,8 @@
         <span class="o">...</span>
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">MyModelForCausalLM</span><span class="p">(</span><span class="n">DecoderModelForCausalLM</span><span class="p">[</span><span class="n">MyModel</span><span class="p">,</span> <span class="n">MyConfig</span><span class="p">]):</span>
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">model_config</span><span class="p">:</span> <span class="n">ModelConfig</span><span class="p">[</span><span class="n">MyConfig</span><span class="p">]):</span>
+<span class="k">class</span> <span class="nc">MyModelForCausalLM</span><span class="p">(</span><span class="n">DecoderModelForCausalLM</span><span class="p">[</span><span class="n">MyModel</span><span class="p">,</span> <span class="n">MyConfig</span><span class="p">]):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">model_config</span><span class="p">:</span> <span class="n">ModelConfig</span><span class="p">[</span><span class="n">MyConfig</span><span class="p">]):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">MyModel</span><span class="p">(</span><span class="n">model_config</span><span class="p">),</span>
                          <span class="n">config</span><span class="o">=</span><span class="n">model_config</span><span class="p">,</span>
                          <span class="n">hidden_size</span><span class="o">=</span><span class="n">model_config</span><span class="o">.</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
@@ -291,9 +291,9 @@
 <section id="weight-loading">
 <h3>Weight Loading<a class="headerlink" href="#weight-loading" title="Link to this heading"></a></h3>
 <p>The base class <code class="docutils literal notranslate"><span class="pre">DecoderModelForCausalLM</span></code> provides a <code class="docutils literal notranslate"><span class="pre">load_weights</span></code> method that loads the weights from the checkpoint file and assigns them to the corresponding layers in the model. However, if the default method does not work for <code class="docutils literal notranslate"><span class="pre">MyModelForCausalLM</span></code>, you need to implement your own <code class="docutils literal notranslate"><span class="pre">load_weights</span></code>:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">MyModelForCausalLM</span><span class="p">(</span><span class="n">DecoderModelForCausalLM</span><span class="p">[</span><span class="n">MyModel</span><span class="p">,</span> <span class="n">MyConfig</span><span class="p">]):</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span> <span class="nc">MyModelForCausalLM</span><span class="p">(</span><span class="n">DecoderModelForCausalLM</span><span class="p">[</span><span class="n">MyModel</span><span class="p">,</span> <span class="n">MyConfig</span><span class="p">]):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">load_weights</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">weights</span><span class="p">:</span> <span class="nb">dict</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">load_weights</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">weights</span><span class="p">:</span> <span class="nb">dict</span><span class="p">):</span>
         <span class="c1"># Define the weight loading logic</span>
         <span class="o">...</span>
 </pre></div>
@@ -320,18 +320,18 @@
 <section id="model-registration">
 <h3>Model Registration<a class="headerlink" href="#model-registration" title="Link to this heading"></a></h3>
 <p>The new model needs to be registered so that it can be recognized by the PyTorch runtime. The registration can be done simply by adding the <code class="docutils literal notranslate"><span class="pre">register_auto_model</span></code> decorator for <code class="docutils literal notranslate"><span class="pre">MyModelForCausalLM</span></code>:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.models.modeling_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">register_auto_model</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span> <span class="nn">tensorrt_llm._torch.models.modeling_utils</span> <span class="kn">import</span> <span class="n">register_auto_model</span>
 
 <span class="nd">@register_auto_model</span><span class="p">(</span><span class="s2">&quot;MyModelForCausalLM&quot;</span><span class="p">)</span>
-<span class="k">class</span><span class="w"> </span><span class="nc">MyModelForCausalLM</span><span class="p">(</span><span class="n">DecoderModelForCausalLM</span><span class="p">[</span><span class="n">MyModel</span><span class="p">,</span> <span class="n">MyConfig</span><span class="p">]):</span>
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">model_config</span><span class="p">:</span> <span class="n">ModelConfig</span><span class="p">[</span><span class="n">MyConfig</span><span class="p">]):</span>
+<span class="k">class</span> <span class="nc">MyModelForCausalLM</span><span class="p">(</span><span class="n">DecoderModelForCausalLM</span><span class="p">[</span><span class="n">MyModel</span><span class="p">,</span> <span class="n">MyConfig</span><span class="p">]):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">model_config</span><span class="p">:</span> <span class="n">ModelConfig</span><span class="p">[</span><span class="n">MyConfig</span><span class="p">]):</span>
        <span class="o">...</span>
 </pre></div>
 </div>
 <section id="core-models">
 <h4>Core Models<a class="headerlink" href="#core-models" title="Link to this heading"></a></h4>
 <p>To add the new model to core models, <code class="docutils literal notranslate"><span class="pre">modeling_mymodel.py</span></code> (and potentially <code class="docutils literal notranslate"><span class="pre">configuration_mymodel.py</span></code>) should be placed in <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/models</span></code>. Then, you need to import the modeling code in <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/models/__init__.py</span></code>:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">.modeling_mymodel</span><span class="w"> </span><span class="kn">import</span> <span class="n">MyModelForCausalLM</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span> <span class="nn">.modeling_mymodel</span> <span class="kn">import</span> <span class="n">MyModelForCausalLM</span>
 
 <span class="n">__all__</span> <span class="o">=</span> <span class="p">[</span>
     <span class="o">...</span><span class="p">,</span>
@@ -343,10 +343,10 @@
 <section id="out-of-tree-models">
 <h4>Out-of-Tree Models<a class="headerlink" href="#out-of-tree-models" title="Link to this heading"></a></h4>
 <p>Alternatively, you can register the new model as an out-of-tree model, so that you can use the new model without touching the TensorRT-LLM codebase. To do so, place <code class="docutils literal notranslate"><span class="pre">modeling_mymodel.py</span></code> (and potentially <code class="docutils literal notranslate"><span class="pre">configuration_mymodel.py</span></code>) in your working directory, and import the modeling code in your script:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">modeling_mymodel</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span> <span class="nn">tensorrt_llm._torch</span> <span class="kn">import</span> <span class="n">LLM</span>
+<span class="kn">import</span> <span class="nn">modeling_mymodel</span>
 
-<span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
+<span class="k">def</span> <span class="nf">main</span><span class="p">():</span>
     <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
 
 <span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
@@ -370,7 +370,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f63fee8a7b0>
+<jinja2.runtime.BlockReference object at 0x7fdeec6698e0>
 
 <div class="footer">
     <p>

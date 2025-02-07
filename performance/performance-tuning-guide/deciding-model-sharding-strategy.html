@@ -1,0 +1,271 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../../">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Deciding Model Sharding Strategy &mdash; tensorrt_llm  documentation</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=80d5e7a1" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=e59714d7" />
+      <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
+
+  
+      <script src="../../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
+      <script src="../../_static/doctools.js?v=9a2dae69"></script>
+      <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
+      <script src="../../_static/copybutton.js?v=65e89d2a"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="FP8 Quantization" href="fp8-quantization.html" />
+    <link rel="prev" title="Tuning Max Batch Size and Max Num Tokens" href="tuning-max-batch-size-and-max-num-tokens.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            tensorrt_llm
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../torch.html">PyTorch Backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../release-notes.html">Release Notes</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../installation/linux.html">Installing on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../installation/windows.html">Installing on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../installation/build-from-source-windows.html">Building from Source Code on Windows</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../installation/grace-hopper.html">Installing on Grace Hopper</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/index.html">API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">LLM API Examples</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api-examples/index.html">LLM Examples Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api-examples/customization.html">Common Customizations</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api-examples/llm_api_examples.html">Examples</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-serve.html">trtllm-serve</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/core-concepts.html">Model Definition</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/core-concepts.html#compilation">Compilation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/core-concepts.html#runtime">Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/core-concepts.html#multi-gpu-and-multi-node-support">Multi-GPU and Multi-Node Support</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/executor.html">Executor API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/inference-request.html">Inference Request</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/inference-request.html#responses">Responses</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/lora.html">Run gpt-2b + LoRA using GptManager / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/disaggregated-service.html">Disaggregated-Service (experimental)</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Performance Tuning Guide</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="index.html#prerequisite-knowledge">Prerequisite Knowledge</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="benchmarking-default-performance.html">Benchmarking Default Performance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="useful-build-time-flags.html">Useful Build-Time Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tuning-max-batch-size-and-max-num-tokens.html">Tuning Max Batch Size and Max Num Tokens</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">Deciding Model Sharding Strategy</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#how-to-think-about-model-sharding-communication-is-key">How to Think about Model Sharding: Communication is Key</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#how-to-set-tensor-parallelism-and-pipeline-parallelism">How to set Tensor Parallelism and Pipeline Parallelism</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="fp8-quantization.html">FP8 Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="useful-runtime-flags.html">Useful Runtime Options</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">tensorrt_llm</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">Performance Tuning Guide</a></li>
+      <li class="breadcrumb-item active">Deciding Model Sharding Strategy</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="../../_sources/performance/performance-tuning-guide/deciding-model-sharding-strategy.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="deciding-model-sharding-strategy">
+<span id="id1"></span><h1>Deciding Model Sharding Strategy<a class="headerlink" href="#deciding-model-sharding-strategy" title="Link to this heading"></a></h1>
+<p>Large models often can’t fit on one GPU and need to be sharded across multiple GPUs. The sharding strategies used to accomplish this can have significant impacts on performance. This guide walks through how to determine if tensor parallelism, pipeline parallelism, or a mix of both are the best strategy for you. If you are not familiar with tensor parallelism and pipeline parallelism please refer to <a class="reference external" href="https://developer.nvidia.com/blog/mastering-llm-techniques-inference-optimization/">Mastering LLM Techniques - Inference Optimization</a></p>
+<section id="how-to-think-about-model-sharding-communication-is-key">
+<h2>How to Think about Model Sharding: Communication is Key<a class="headerlink" href="#how-to-think-about-model-sharding-communication-is-key" title="Link to this heading"></a></h2>
+<p>Splitting your model weights between multiple GPUs requires them to communicate activations between each other, adding additional overhead. How expensive this overhead is on your system is the key factor in determining the best strategy for you.</p>
+<p>In pipeline parallelism, the model is split into sets of contiguous layers and each GPU houses one of these sets. In this setup, the only required communication is for each GPU to send the outputs of its set to the GPU with the next set.</p>
+<p><img alt="Pipeline Parallel Visualization" src="../../_images/Pipeline_Parallel_Vis.svg" /></p>
+<p>On the other hand, tensor parallelism takes each layer of the model and splits it between the GPUs. This means that every GPU houses a portion of every layer. However since each layer needs the full outputs of the previous layer as an input, each GPU has to perform the heavier All-Reduce communication operation to share its results with all other GPUs before it can begin processing the next layer. While this seems disadvantageous, because each GPU only holds partial layers, it also performs smaller matrix multiplications, allowing it to compute its outputs quicker.</p>
+<p><img alt="Tensor Parallel Visualization" src="../../_images/Tensor_Parallelism_Vis.svg" /></p>
+<p>Ultimately deciding the best strategy comes down to whether the extra overhead from the All-Reduce operation overshadows the gains from the smaller matrix multiplications. If the interconnects between the GPUs are sufficiently fast, the gains from the reduced computation burden per layer can outweigh the additional communication cost. Consequently, a general rule of thumb is that if your GPUs have fast connections between them like NVLink then tensor parallel is likely a good choice. However if the communication will go over slow connections (across nodes for example) pipeline parallel is likely better. Overall we provide the following guidelines:</p>
+<p><strong>If your model fits on one gpu:</strong> Unless you have a very specific reason, don’t shard your model. The best communication overhead is no communication overhead.</p>
+<p><strong>If your model fits in one node:</strong> Tensor parallel is likely the best option here, especially if you have fast connections between the GPUs like NVLink. If you don’t, then pipeline parallel might be needed. Start with tensor parallel and sanity check if pipeline parallel is better.</p>
+<p><strong>If your model is sharded across multiple nodes:</strong> Inter-node connections are typically significantly slower than intra-node connections, so if you have tensor parallelism across nodes it will be bottlenecked by the slow interconects. Consequently, a good starting point is having tensor parallelism within the node and pipeline parallelism between nodes. An exception is if you are running on NVL36 or NVL72 Blackwell systems. These have multinode NVLink so as long as you stay within the 36 or 72 GPUs, tensor parallel won’t be bottlenecked by inter-node connections.</p>
+</section>
+<section id="how-to-set-tensor-parallelism-and-pipeline-parallelism">
+<h2>How to set Tensor Parallelism and Pipeline Parallelism<a class="headerlink" href="#how-to-set-tensor-parallelism-and-pipeline-parallelism" title="Link to this heading"></a></h2>
+<p>The <code class="docutils literal notranslate"><span class="pre">LLM</span></code> class takes <code class="docutils literal notranslate"><span class="pre">tensor_parallel_size</span></code> and <code class="docutils literal notranslate"><span class="pre">pipeline_parallel_size</span></code> as parameters. <code class="docutils literal notranslate"><span class="pre">tensor_parallel_size</span> <span class="pre">*</span> <span class="pre">pipeline_parallel_size</span></code> should be equal to the total number of GPUs you are sharding the model over, referred to as the world size. For example, if you were sharding a model over 2 nodes, each with 16 GPUs, you might set tensor parallel to 8 (for tensor parallelism within the node) and pipeline parallel to 2 (pipeline parallel between nodes) like this:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span>
+        <span class="n">model</span><span class="o">=</span><span class="s2">&quot;/scratch/Llama-3.1-405B-Instruct&quot;</span><span class="p">,</span>
+        <span class="n">tensor_parallel_size</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span>
+        <span class="n">pipeline_parallel_size</span><span class="o">=</span><span class="mi">2</span>
+    <span class="p">)</span>
+</pre></div>
+</div>
+<p>If you are using the <a class="reference internal" href="benchmarking-default-performance.html#building-and-saving-engines-via-cli"><span class="std std-ref">CLI flow for building engines</span></a> you can specify tensor parallelism and pipeline parallelism by providing the <code class="docutils literal notranslate"><span class="pre">--tp_size</span></code> and <code class="docutils literal notranslate"><span class="pre">--tp_size</span></code> arguments to <code class="docutils literal notranslate"><span class="pre">convert_checkpoint.py</span></code></p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">python</span> <span class="n">examples</span><span class="o">/</span><span class="n">llama</span><span class="o">/</span><span class="n">convert_checkpoint</span><span class="o">.</span><span class="n">py</span> <span class="o">--</span><span class="n">model_dir</span> <span class="o">./</span><span class="n">tmp</span><span class="o">/</span><span class="n">llama</span><span class="o">/</span><span class="mi">405</span><span class="n">B</span><span class="o">/</span> \
+                            <span class="o">--</span><span class="n">output_dir</span> <span class="o">./</span><span class="n">tllm_checkpoint_16gpu_tp8_pp2</span> \
+                            <span class="o">--</span><span class="n">dtype</span> <span class="n">float16</span> \
+                            <span class="o">--</span><span class="n">tp_size</span> <span class="mi">8</span>
+                            <span class="o">--</span><span class="n">pp_size</span> <span class="mi">2</span>
+</pre></div>
+</div>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="tuning-max-batch-size-and-max-num-tokens.html" class="btn btn-neutral float-left" title="Tuning Max Batch Size and Max Num Tokens" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="fp8-quantization.html" class="btn btn-neutral float-right" title="FP8 Quantization" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+<jinja2.runtime.BlockReference object at 0x7fdef8acfec0>
+
+<div class="footer">
+    <p>
+        Copyright © 2024 NVIDIA Corporation
+    </p>
+    <p>
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/" target="_blank" rel="noopener"
+            data-cms-ai="0">Privacy Policy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/" target="_blank" rel="noopener"
+            data-cms-ai="0">Manage My Privacy</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/preferences/start/" target="_blank" rel="noopener"
+            data-cms-ai="0">Do Not Sell or Share My Data</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/" target="_blank"
+            rel="noopener" data-cms-ai="0">Terms of Service</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/" target="_blank" rel="noopener"
+            data-cms-ai="0">Accessibility</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/" target="_blank"
+            rel="noopener" data-cms-ai="0">Corporate Policies</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/product-security/" target="_blank" rel="noopener"
+            data-cms-ai="0">Product Security</a> |
+        <a class="Link" href="https://www.nvidia.com/en-us/contact/" target="_blank" rel="noopener"
+            data-cms-ai="0">Contact</a>
+    </p>
+</div>
+
+
+  </div>
+
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

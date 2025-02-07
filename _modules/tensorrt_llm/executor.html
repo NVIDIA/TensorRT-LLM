@@ -6,7 +6,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>tensorrt_llm.executor &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
 
@@ -14,7 +14,7 @@
       <script src="../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../../_static/doctools.js?v=9a2dae69"></script>
       <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../_static/copybutton.js?v=65e89d2a"></script>
@@ -117,7 +117,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../performance/introduction.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -161,54 +161,54 @@
            <div itemprop="articleBody">
              
   <h1>Source code for tensorrt_llm.executor</h1><div class="highlight"><pre>
-<span></span><span class="kn">import</span><span class="w"> </span><span class="nn">asyncio</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">atexit</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">concurrent.futures</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">copy</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">datetime</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">faulthandler</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">io</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">multiprocessing</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">pickle</span>  <span class="c1"># nosec B403</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">platform</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">signal</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">traceback</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">weakref</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">ABC</span><span class="p">,</span> <span class="n">abstractmethod</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">concurrent.futures</span><span class="w"> </span><span class="kn">import</span> <span class="n">ProcessPoolExecutor</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">multiprocessing.shared_memory</span><span class="w"> </span><span class="kn">import</span> <span class="n">SharedMemory</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">queue</span><span class="w"> </span><span class="kn">import</span> <span class="n">Empty</span><span class="p">,</span> <span class="n">Queue</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">Any</span><span class="p">,</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">Dict</span><span class="p">,</span> <span class="n">Generator</span><span class="p">,</span> <span class="n">List</span><span class="p">,</span> <span class="n">Literal</span><span class="p">,</span> <span class="n">NamedTuple</span><span class="p">,</span>
+<span></span><span class="kn">import</span> <span class="nn">asyncio</span>
+<span class="kn">import</span> <span class="nn">atexit</span>
+<span class="kn">import</span> <span class="nn">concurrent.futures</span>
+<span class="kn">import</span> <span class="nn">copy</span>
+<span class="kn">import</span> <span class="nn">datetime</span>
+<span class="kn">import</span> <span class="nn">faulthandler</span>
+<span class="kn">import</span> <span class="nn">io</span>
+<span class="kn">import</span> <span class="nn">json</span>
+<span class="kn">import</span> <span class="nn">multiprocessing</span>
+<span class="kn">import</span> <span class="nn">os</span>
+<span class="kn">import</span> <span class="nn">pickle</span>  <span class="c1"># nosec B403</span>
+<span class="kn">import</span> <span class="nn">platform</span>
+<span class="kn">import</span> <span class="nn">signal</span>
+<span class="kn">import</span> <span class="nn">time</span>
+<span class="kn">import</span> <span class="nn">traceback</span>
+<span class="kn">import</span> <span class="nn">weakref</span>
+<span class="kn">from</span> <span class="nn">abc</span> <span class="kn">import</span> <span class="n">ABC</span><span class="p">,</span> <span class="n">abstractmethod</span>
+<span class="kn">from</span> <span class="nn">concurrent.futures</span> <span class="kn">import</span> <span class="n">ProcessPoolExecutor</span>
+<span class="kn">from</span> <span class="nn">dataclasses</span> <span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
+<span class="kn">from</span> <span class="nn">multiprocessing.shared_memory</span> <span class="kn">import</span> <span class="n">SharedMemory</span>
+<span class="kn">from</span> <span class="nn">pathlib</span> <span class="kn">import</span> <span class="n">Path</span>
+<span class="kn">from</span> <span class="nn">queue</span> <span class="kn">import</span> <span class="n">Empty</span><span class="p">,</span> <span class="n">Queue</span>
+<span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="p">(</span><span class="n">Any</span><span class="p">,</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">Dict</span><span class="p">,</span> <span class="n">Generator</span><span class="p">,</span> <span class="n">List</span><span class="p">,</span> <span class="n">Literal</span><span class="p">,</span> <span class="n">NamedTuple</span><span class="p">,</span>
                     <span class="n">Optional</span><span class="p">,</span> <span class="n">Tuple</span><span class="p">,</span> <span class="n">Union</span><span class="p">)</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">weakref</span><span class="w"> </span><span class="kn">import</span> <span class="n">WeakMethod</span>
+<span class="kn">from</span> <span class="nn">weakref</span> <span class="kn">import</span> <span class="n">WeakMethod</span>
 
-<span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">zmq</span>
+<span class="kn">import</span> <span class="nn">numpy</span> <span class="k">as</span> <span class="nn">np</span>
+<span class="kn">import</span> <span class="nn">torch</span>
+<span class="kn">import</span> <span class="nn">zmq</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.logger</span><span class="w"> </span><span class="kn">import</span> <span class="n">logger</span><span class="p">,</span> <span class="n">set_level</span>
+<span class="kn">from</span> <span class="nn">tensorrt_llm.logger</span> <span class="kn">import</span> <span class="n">logger</span><span class="p">,</span> <span class="n">set_level</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">mpi_rank</span><span class="p">,</span> <span class="n">mpi_world_size</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.bindings</span><span class="w"> </span><span class="kn">import</span> <span class="n">executor</span> <span class="k">as</span> <span class="n">tllm</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.builder</span><span class="w"> </span><span class="kn">import</span> <span class="n">ConfigEncoder</span><span class="p">,</span> <span class="n">Engine</span><span class="p">,</span> <span class="n">EngineConfig</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.llmapi.mpi_session</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">MpiPoolSession</span><span class="p">,</span> <span class="n">MpiSession</span><span class="p">,</span>
+<span class="kn">from</span> <span class="nn">._utils</span> <span class="kn">import</span> <span class="n">mpi_rank</span><span class="p">,</span> <span class="n">mpi_world_size</span>
+<span class="kn">from</span> <span class="nn">.bindings</span> <span class="kn">import</span> <span class="n">executor</span> <span class="k">as</span> <span class="n">tllm</span>
+<span class="kn">from</span> <span class="nn">.builder</span> <span class="kn">import</span> <span class="n">ConfigEncoder</span><span class="p">,</span> <span class="n">Engine</span><span class="p">,</span> <span class="n">EngineConfig</span>
+<span class="kn">from</span> <span class="nn">.llmapi.mpi_session</span> <span class="kn">import</span> <span class="p">(</span><span class="n">MpiPoolSession</span><span class="p">,</span> <span class="n">MpiSession</span><span class="p">,</span>
                                  <span class="n">external_mpi_comm_available</span><span class="p">,</span>
                                  <span class="n">need_spawn_mpi_workers</span><span class="p">)</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.llmapi.tracer</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">VizTracer</span><span class="p">,</span> <span class="n">enable_llm_tracer</span><span class="p">,</span> <span class="n">get_tracer</span><span class="p">,</span>
+<span class="kn">from</span> <span class="nn">.llmapi.tracer</span> <span class="kn">import</span> <span class="p">(</span><span class="n">VizTracer</span><span class="p">,</span> <span class="n">enable_llm_tracer</span><span class="p">,</span> <span class="n">get_tracer</span><span class="p">,</span>
                             <span class="n">global_tracer</span><span class="p">,</span> <span class="n">set_global_tracer</span><span class="p">)</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.llmapi.utils</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">AsyncQueue</span><span class="p">,</span> <span class="n">ManagedThread</span><span class="p">,</span> <span class="n">_SyncQueue</span><span class="p">,</span>
+<span class="kn">from</span> <span class="nn">.llmapi.utils</span> <span class="kn">import</span> <span class="p">(</span><span class="n">AsyncQueue</span><span class="p">,</span> <span class="n">ManagedThread</span><span class="p">,</span> <span class="n">_SyncQueue</span><span class="p">,</span>
                            <span class="n">enable_llm_debug</span><span class="p">,</span>
                            <span class="n">enable_worker_single_process_for_tp1</span><span class="p">,</span> <span class="n">print_colored</span><span class="p">)</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.lora_manager</span><span class="w"> </span><span class="kn">import</span> <span class="n">LoraManager</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.prompt_adapter_manager</span><span class="w"> </span><span class="kn">import</span> <span class="n">PromptAdapterManager</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.runtime</span><span class="w"> </span><span class="kn">import</span> <span class="n">ModelConfig</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.runtime.model_runner</span><span class="w"> </span><span class="kn">import</span> <span class="n">_engine_config_to_model_config</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.sampling_params</span><span class="w"> </span><span class="kn">import</span> <span class="n">SamplingParams</span>
+<span class="kn">from</span> <span class="nn">.lora_manager</span> <span class="kn">import</span> <span class="n">LoraManager</span>
+<span class="kn">from</span> <span class="nn">.prompt_adapter_manager</span> <span class="kn">import</span> <span class="n">PromptAdapterManager</span>
+<span class="kn">from</span> <span class="nn">.runtime</span> <span class="kn">import</span> <span class="n">ModelConfig</span>
+<span class="kn">from</span> <span class="nn">.runtime.model_runner</span> <span class="kn">import</span> <span class="n">_engine_config_to_model_config</span>
+<span class="kn">from</span> <span class="nn">.sampling_params</span> <span class="kn">import</span> <span class="n">SamplingParams</span>
 
 <span class="n">unblock_corountine</span> <span class="o">=</span> <span class="kc">True</span>
 <span class="n">BATCH_RESP_IN_AWAIT</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">&quot;TLLM_EXECUTOR_BATCH_RESP_IN_AWAIT&quot;</span><span class="p">)</span> <span class="o">==</span> <span class="s2">&quot;1&quot;</span>
@@ -219,31 +219,31 @@
 
 
 <span class="nd">@dataclass</span><span class="p">(</span><span class="n">slots</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-<span class="k">class</span><span class="w"> </span><span class="nc">LoRARequest</span><span class="p">:</span>
+<span class="k">class</span> <span class="nc">LoRARequest</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot; Request for a LoRA adapter. &quot;&quot;&quot;</span>
     <span class="n">lora_name</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">lora_int_id</span><span class="p">:</span> <span class="nb">int</span>
     <span class="n">lora_path</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">exists</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">lora_path</span><span class="p">):</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;lora_path (</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">lora_path</span><span class="si">}</span><span class="s2">) does not exist.&quot;</span><span class="p">)</span>
 
     <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">adapter_id</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">adapter_id</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">lora_int_id</span>
 
     <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">name</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">name</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">lora_name</span>
 
     <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">path</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">path</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">lora_path</span>
 
 
 <span class="nd">@dataclass</span><span class="p">(</span><span class="n">slots</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-<span class="k">class</span><span class="w"> </span><span class="nc">PromptAdapterRequest</span><span class="p">:</span>
+<span class="k">class</span> <span class="nc">PromptAdapterRequest</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">    Request for a Prompt adapter.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
@@ -251,28 +251,28 @@
     <span class="n">prompt_adapter_id</span><span class="p">:</span> <span class="nb">int</span>
     <span class="n">prompt_adapter_local_path</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">exists</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">prompt_adapter_local_path</span><span class="p">):</span>
             <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">&quot;prompt_adapter_local_path (</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">prompt_adapter_local_path</span><span class="si">}</span><span class="s2">) does not exist.&quot;</span>
             <span class="p">)</span>
 
     <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">adapter_id</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">adapter_id</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">prompt_adapter_id</span>
 
     <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">name</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">name</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">prompt_adapter_name</span>
 
     <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">local_path</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">local_path</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">prompt_adapter_local_path</span>
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">GenerationRequest</span><span class="p">:</span>
+<span class="k">class</span> <span class="nc">GenerationRequest</span><span class="p">:</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">prompt_token_ids</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span>
                                 <span class="n">Union</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">List</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]]],</span>
@@ -302,14 +302,14 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">prompt_tuning_config</span> <span class="o">=</span> <span class="n">prompt_tuning_config</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">id</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">set_id</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="nb">id</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">set_id</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="nb">id</span><span class="p">):</span>
         <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">id</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;Request ID is already set: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">id</span><span class="si">}</span><span class="s2">&quot;</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">id</span> <span class="o">=</span> <span class="nb">id</span>
         <span class="k">return</span> <span class="bp">self</span>
 
 
 <span class="nd">@dataclass</span><span class="p">(</span><span class="n">slots</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-<span class="k">class</span><span class="w"> </span><span class="nc">CompletionOutput</span><span class="p">:</span>
+<span class="k">class</span> <span class="nc">CompletionOutput</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;The output data of one completion output of a request.</span>
 
 <span class="sd">    Args:</span>
@@ -346,41 +346,41 @@
                                                 <span class="nb">repr</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
 
     <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">length</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">length</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">token_ids</span><span class="p">)</span>
 
     <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">text_diff</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">text_diff</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">text</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">_last_text_len</span><span class="p">:]</span>
 
     <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">token_ids_diff</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+    <span class="k">def</span> <span class="nf">token_ids_diff</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">token_ids</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">_last_token_ids_len</span><span class="p">:]</span>
 
     <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">logprobs_diff</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="nb">float</span><span class="p">]:</span>
+    <span class="k">def</span> <span class="nf">logprobs_diff</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="nb">float</span><span class="p">]:</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">logprobs</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">_last_logprobs_len</span><span class="p">:]</span>
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">CppExecutorError</span><span class="p">(</span><span class="ne">RuntimeError</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">CppExecutorError</span><span class="p">(</span><span class="ne">RuntimeError</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">message</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">message</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">message</span> <span class="o">=</span> <span class="n">message</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">stack_trace</span> <span class="o">=</span> <span class="n">traceback</span><span class="o">.</span><span class="n">format_exc</span><span class="p">()</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">message</span><span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__str__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__str__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">message</span><span class="si">}</span><span class="se">\n</span><span class="s2">Stack trace:</span><span class="se">\n</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">stack_trace</span><span class="si">}</span><span class="s2">&quot;</span>
 
 
 <div class="viewcode-block" id="RequestError">
 <a class="viewcode-back" href="../../llm-api/reference.html#tensorrt_llm.llmapi.RequestError">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">RequestError</span><span class="p">(</span><span class="ne">RuntimeError</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">RequestError</span><span class="p">(</span><span class="ne">RuntimeError</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&#39;&#39;&#39; The error raised when the request is failed. &#39;&#39;&#39;</span></div>
 
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">GenerationResult</span><span class="p">:</span>
+<span class="k">class</span> <span class="nc">GenerationResult</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">&#39;&#39;&#39;</span>
 <span class="sd">    The result of a generation request. It can be used to wait for the completion of the request.</span>
 
@@ -389,7 +389,7 @@
 <span class="sd">        background_error_handler (Callable, optional): The error handler to process the errors from the background threads/processes. Defaults to None.</span>
 <span class="sd">    &#39;&#39;&#39;</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">generation_request</span><span class="p">:</span> <span class="n">GenerationRequest</span><span class="p">,</span>
                  <span class="n">background_error_handler</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Callable</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_done</span> <span class="o">=</span> <span class="kc">False</span>
@@ -418,23 +418,23 @@
                 <span class="n">background_error_handler</span><span class="p">)</span>
 
     <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">request_id</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">request_id</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_generation_request</span><span class="o">.</span><span class="n">id</span>
 
     <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">prompt_token_ids</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+    <span class="k">def</span> <span class="nf">prompt_token_ids</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_generation_request</span><span class="o">.</span><span class="n">prompt_token_ids</span>
 
     <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">finished</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">finished</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_done</span>
 
     <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">streaming</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">streaming</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_generation_request</span><span class="o">.</span><span class="n">streaming</span>
 
     <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">outputs</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="n">CompletionOutput</span><span class="p">]:</span>
+    <span class="k">def</span> <span class="nf">outputs</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="n">CompletionOutput</span><span class="p">]:</span>
         <span class="n">sampling_param</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_generation_request</span><span class="o">.</span><span class="n">sampling_params</span>
         <span class="k">if</span> <span class="p">(</span><span class="n">sampling_param</span><span class="o">.</span><span class="n">use_beam_search</span>
                 <span class="ow">or</span> <span class="n">sampling_param</span><span class="o">.</span><span class="n">n</span> <span class="o">==</span> <span class="n">sampling_param</span><span class="o">.</span><span class="n">best_of</span><span class="p">):</span>
@@ -451,7 +451,7 @@
             <span class="n">sorted_out</span><span class="o">.</span><span class="n">index</span> <span class="o">=</span> <span class="n">i</span>
         <span class="k">return</span> <span class="n">sorted_outputs</span><span class="p">[:</span><span class="n">sampling_param</span><span class="o">.</span><span class="n">n</span><span class="p">]</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">handle_sequence</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">response</span><span class="p">:</span> <span class="s2">&quot;GenerationExecutor.Response&quot;</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">handle_sequence</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">response</span><span class="p">:</span> <span class="s2">&quot;GenerationExecutor.Response&quot;</span><span class="p">,</span>
                         <span class="n">sequence_index</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot; Handle a single sequence in the response. &quot;&quot;&quot;</span>
 
@@ -493,7 +493,7 @@
             <span class="k">elif</span> <span class="n">response</span><span class="o">.</span><span class="n">finish_reasons</span><span class="p">[</span><span class="n">src_idx</span><span class="p">]</span> <span class="o">==</span> <span class="n">tllm</span><span class="o">.</span><span class="n">FinishReason</span><span class="o">.</span><span class="n">LENGTH</span><span class="p">:</span>
                 <span class="n">output</span><span class="o">.</span><span class="n">finish_reason</span> <span class="o">=</span> <span class="s1">&#39;length&#39;</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">handle_response</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">response</span><span class="p">:</span> <span class="s2">&quot;GenerationExecutor.Response&quot;</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">handle_response</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">response</span><span class="p">:</span> <span class="s2">&quot;GenerationExecutor.Response&quot;</span><span class="p">):</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_done</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">is_final</span>
 
@@ -518,74 +518,74 @@
                 <span class="n">handler</span> <span class="o">:=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_background_error_handler</span><span class="p">()):</span>
             <span class="n">handler</span><span class="p">()</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">result_step</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">result_step</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
         <span class="n">response</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">timeout</span><span class="o">=</span><span class="n">timeout</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">handle_response</span><span class="p">(</span><span class="n">response</span><span class="p">)</span>
 
-    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">aresult_step</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">async</span> <span class="k">def</span> <span class="nf">aresult_step</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">aqueue</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;The asyncio event loop was not present during initialization, so async operations are not available.&quot;</span>
         <span class="n">response</span> <span class="o">=</span> <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">aqueue</span><span class="o">.</span><span class="n">get</span><span class="p">()</span>
         <span class="n">global_tracer</span><span class="p">()</span><span class="o">.</span><span class="n">log_instant</span><span class="p">(</span><span class="s2">&quot;result_step.get&quot;</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">handle_response</span><span class="p">(</span><span class="n">response</span><span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">result</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;GenerationResult&quot;</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">result</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;GenerationResult&quot;</span><span class="p">:</span>
         <span class="k">while</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_done</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">result_step</span><span class="p">(</span><span class="n">timeout</span><span class="p">)</span>
         <span class="k">return</span> <span class="bp">self</span>
 
-    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">aresult</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;GenerationResult&quot;</span><span class="p">:</span>
+    <span class="k">async</span> <span class="k">def</span> <span class="nf">aresult</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;GenerationResult&quot;</span><span class="p">:</span>
         <span class="k">while</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_done</span><span class="p">:</span>
             <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">aresult_step</span><span class="p">()</span>
         <span class="k">return</span> <span class="bp">self</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__await__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__await__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">aresult</span><span class="p">()</span><span class="o">.</span><span class="fm">__await__</span><span class="p">()</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__iter__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__iter__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__next__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__next__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_done</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">StopIteration</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">result_step</span><span class="p">()</span>
         <span class="k">return</span> <span class="bp">self</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__aiter__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__aiter__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span>
 
-    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="fm">__anext__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">async</span> <span class="k">def</span> <span class="fm">__anext__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_done</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">StopAsyncIteration</span>
 
         <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">aresult_step</span><span class="p">()</span>
         <span class="k">return</span> <span class="bp">self</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">running</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">running</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
         <span class="k">return</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_done</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">cancelled</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">cancelled</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cancelled</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">cancel</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">cancel</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">raise</span> <span class="ne">NotImplementedError</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">done</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">done</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_done</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">exception</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">exception</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
         <span class="k">try</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">result</span><span class="p">(</span><span class="n">timeout</span><span class="p">)</span>
         <span class="k">except</span> <span class="ne">RuntimeError</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
             <span class="k">return</span> <span class="n">e</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_repr_fields</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">_repr_fields</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="p">[</span>
             <span class="s1">&#39;request_id&#39;</span><span class="p">,</span> <span class="s1">&#39;prompt_token_ids&#39;</span><span class="p">,</span> <span class="s1">&#39;outputs&#39;</span><span class="p">,</span> <span class="s1">&#39;finished&#39;</span><span class="p">,</span>
             <span class="s2">&quot;context_logits&quot;</span>
         <span class="p">]</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__repr__</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+    <span class="k">def</span> <span class="fm">__repr__</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
         <span class="nb">repr</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="k">for</span> <span class="n">field</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_repr_fields</span><span class="p">():</span>
             <span class="n">value</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">field</span><span class="p">)</span>
@@ -597,20 +597,20 @@
         <span class="nb">repr</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="vm">__class__</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">(</span><span class="si">{</span><span class="nb">repr</span><span class="si">}</span><span class="s2">)&quot;</span>
         <span class="k">return</span> <span class="nb">repr</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__hash__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__hash__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="nb">hash</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">request_id</span><span class="p">)</span>
 
 
 <div class="viewcode-block" id="NoStatsAvailable">
 <a class="viewcode-back" href="../../llm-api/reference.html#tensorrt_llm.llmapi.NoStatsAvailable">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">NoStatsAvailable</span><span class="p">(</span><span class="ne">Exception</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">NoStatsAvailable</span><span class="p">(</span><span class="ne">Exception</span><span class="p">):</span>
     <span class="k">pass</span></div>
 
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">GenerationExecutor</span><span class="p">(</span><span class="n">ABC</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">GenerationExecutor</span><span class="p">(</span><span class="n">ABC</span><span class="p">):</span>
 
-    <span class="k">class</span><span class="w"> </span><span class="nc">ResponseTensors</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+    <span class="k">class</span> <span class="nc">ResponseTensors</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
         <span class="n">output_token_ids</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span>
         <span class="c1"># context_logits is a tensor or a string denoting the path to the shared memory.</span>
         <span class="n">context_logits</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="nb">str</span><span class="p">]</span>
@@ -619,7 +619,7 @@
         <span class="n">log_probs</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">list</span><span class="p">]</span>
         <span class="n">cum_log_probs</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">list</span><span class="p">]</span>
 
-    <span class="k">class</span><span class="w"> </span><span class="nc">Response</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+    <span class="k">class</span> <span class="nc">Response</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot; The response from the cpp-executor to the Python main thread. &quot;&quot;&quot;</span>
         <span class="n">client_id</span><span class="p">:</span> <span class="nb">int</span>
         <span class="n">tensors</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="s2">&quot;GenerationExecutor.ResponseTensors&quot;</span><span class="p">]</span>
@@ -633,7 +633,7 @@
         <span class="c1">#    and stop the whole service.</span>
         <span class="n">error</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span> <span class="o">|</span> <span class="ne">Exception</span><span class="p">]</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_stats</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">stats_queue</span> <span class="o">=</span> <span class="kc">None</span>
 
@@ -648,10 +648,10 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">_last_client_id</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
 
     <span class="nd">@abstractmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">submit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request</span><span class="p">:</span> <span class="n">GenerationRequest</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">GenerationResult</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">submit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request</span><span class="p">:</span> <span class="n">GenerationRequest</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">GenerationResult</span><span class="p">:</span>
         <span class="k">pass</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">generate_async</span><span class="p">(</span>
+    <span class="k">def</span> <span class="nf">generate_async</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">prompt_token_ids</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
         <span class="n">sampling_params</span><span class="p">:</span> <span class="n">SamplingParams</span><span class="p">,</span>
@@ -676,7 +676,7 @@
                               <span class="n">prompt_tuning_config</span><span class="o">=</span><span class="n">prompt_tuning_config</span><span class="p">))</span>
         <span class="k">return</span> <span class="n">result</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">generate</span><span class="p">(</span>
+    <span class="k">def</span> <span class="nf">generate</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">prompt_token_ids</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">List</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]],</span>
         <span class="n">sampling_params</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="n">SamplingParams</span><span class="p">,</span> <span class="n">List</span><span class="p">[</span><span class="n">SamplingParams</span><span class="p">]],</span>
@@ -725,12 +725,12 @@
 
         <span class="k">return</span> <span class="n">futures</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_get_next_client_id</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">_get_next_client_id</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="c1"># (self._last_client_id + 1) % UINT64_MAX</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_last_client_id</span> <span class="o">=</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_last_client_id</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">&amp;</span> <span class="p">((</span><span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="mi">64</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_last_client_id</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_handle_background_error</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">error</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="ne">Exception</span> <span class="o">|</span> <span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">_handle_background_error</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">error</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="ne">Exception</span> <span class="o">|</span> <span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot; Process the errors from the threads or processes.</span>
 <span class="sd">        NOTE: This should be called in the main thread.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
@@ -762,10 +762,10 @@
             <span class="k">raise</span> <span class="n">e</span>
 
     <span class="nd">@abstractmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">shutdown</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">shutdown</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">pass</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">create_stats_queue</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">create_stats_queue</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="c1"># Stats queue is created during first submission to ensure event loop exists if it is needed.</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_stats</span><span class="p">:</span>
             <span class="k">if</span> <span class="n">has_event_loop</span><span class="p">():</span>
@@ -777,7 +777,7 @@
                 <span class="bp">self</span><span class="o">.</span><span class="n">stats_queue</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_stats</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">stats_aqueue</span> <span class="o">=</span> <span class="kc">None</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">get_stats</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">get_stats</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&#39;&#39;&#39; Get the stats from the runtime.</span>
 
 <span class="sd">        Exceptions:</span>
@@ -797,7 +797,7 @@
             <span class="k">raise</span> <span class="n">NoStatsAvailable</span>
         <span class="k">return</span> <span class="n">res</span>
 
-    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">aget_stats</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+    <span class="k">async</span> <span class="k">def</span> <span class="nf">aget_stats</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
 <span class="w">        </span><span class="sd">&#39;&#39;&#39; Get the stats from the runtime.</span>
 
 <span class="sd">        Exceptions:</span>
@@ -822,7 +822,7 @@
         <span class="k">return</span> <span class="n">res</span>
 
     <span class="nd">@staticmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">create</span><span class="p">(</span>
+    <span class="k">def</span> <span class="nf">create</span><span class="p">(</span>
         <span class="n">engine</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="n">Path</span><span class="p">,</span> <span class="n">Engine</span><span class="p">],</span>
         <span class="n">executor_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">tllm</span><span class="o">.</span><span class="n">ExecutorConfig</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">logits_post_processor_map</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Callable</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -886,7 +886,7 @@
                                          <span class="n">model_world_size</span><span class="o">=</span><span class="n">model_world_size</span><span class="p">,</span>
                                          <span class="n">mpi_session</span><span class="o">=</span><span class="n">mpi_session</span><span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">wait_first_completed</span><span class="p">(</span>
+    <span class="k">def</span> <span class="nf">wait_first_completed</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">futures</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">GenerationResult</span><span class="p">]</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Generator</span><span class="p">[</span><span class="n">GenerationResult</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="kc">None</span><span class="p">]:</span>
         <span class="n">wait_set</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="n">futures</span><span class="p">)</span>
@@ -906,39 +906,39 @@
                 <span class="n">wait_set</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">fut</span><span class="p">)</span>
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">ProcessPoolExecutorSession</span><span class="p">(</span><span class="n">MpiSession</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">ProcessPoolExecutorSession</span><span class="p">(</span><span class="n">MpiSession</span><span class="p">):</span>
     <span class="c1"># This process pool is introduced for better recoverable exceptions handling.</span>
     <span class="c1"># It replaces MpiPoolExecutor for single-gpu case.</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">n_workers</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">n_workers</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">n_workers</span> <span class="o">=</span> <span class="n">n_workers</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">mpi_pool</span> <span class="o">=</span> <span class="n">ProcessPoolExecutor</span><span class="p">(</span><span class="n">max_workers</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">n_workers</span><span class="p">,</span>
                                             <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">submit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">task</span><span class="p">:</span> <span class="n">Callable</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">submit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">task</span><span class="p">:</span> <span class="n">Callable</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span>
                <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="n">concurrent</span><span class="o">.</span><span class="n">futures</span><span class="o">.</span><span class="n">Future</span><span class="p">]:</span>
         <span class="k">return</span> <span class="p">[</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">mpi_pool</span><span class="o">.</span><span class="n">submit</span><span class="p">(</span><span class="n">task</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
             <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">n_workers</span><span class="p">)</span>
         <span class="p">]</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">submit_sync</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">task</span><span class="p">:</span> <span class="n">Callable</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="n">Any</span><span class="p">]:</span>
+    <span class="k">def</span> <span class="nf">submit_sync</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">task</span><span class="p">:</span> <span class="n">Callable</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="n">Any</span><span class="p">]:</span>
         <span class="n">futures</span> <span class="o">=</span> <span class="p">[</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">mpi_pool</span><span class="o">.</span><span class="n">submit</span><span class="p">(</span><span class="n">task</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
             <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">n_workers</span><span class="p">)</span>
         <span class="p">]</span>
         <span class="k">return</span> <span class="p">[</span><span class="n">future</span><span class="o">.</span><span class="n">result</span><span class="p">()</span> <span class="k">for</span> <span class="n">future</span> <span class="ow">in</span> <span class="n">futures</span><span class="p">]</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">shutdown</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">shutdown</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">mpi_pool</span><span class="o">.</span><span class="n">shutdown</span><span class="p">(</span><span class="n">wait</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">ExecutorBindingsWorker</span><span class="p">(</span><span class="n">GenerationExecutor</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">ExecutorBindingsWorker</span><span class="p">(</span><span class="n">GenerationExecutor</span><span class="p">):</span>
 
-    <span class="k">class</span><span class="w"> </span><span class="nc">WorkerExit</span><span class="p">(</span><span class="ne">GeneratorExit</span><span class="p">):</span>
+    <span class="k">class</span> <span class="nc">WorkerExit</span><span class="p">(</span><span class="ne">GeneratorExit</span><span class="p">):</span>
         <span class="k">pass</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">engine</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="n">Path</span><span class="p">,</span> <span class="n">Engine</span><span class="p">],</span>
         <span class="n">executor_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">tllm</span><span class="o">.</span><span class="n">ExecutorConfig</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -962,7 +962,7 @@
             <span class="n">executor_config</span><span class="o">.</span><span class="n">logits_post_processor_config</span> <span class="o">=</span> <span class="n">tllm</span><span class="o">.</span><span class="n">LogitsPostProcessorConfig</span><span class="p">(</span>
                 <span class="n">processor_map</span><span class="o">=</span><span class="n">logits_post_processor_map</span><span class="p">,</span> <span class="n">replicate</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
 
-        <span class="k">def</span><span class="w"> </span><span class="nf">_create_engine</span><span class="p">():</span>
+        <span class="k">def</span> <span class="nf">_create_engine</span><span class="p">():</span>
             <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">engine</span><span class="p">,</span> <span class="n">Engine</span><span class="p">):</span>
                 <span class="k">return</span> <span class="n">tllm</span><span class="o">.</span><span class="n">Executor</span><span class="p">(</span><span class="n">engine</span><span class="o">.</span><span class="n">engine</span><span class="p">,</span>
                                      <span class="n">json</span><span class="o">.</span><span class="n">dumps</span><span class="p">(</span><span class="n">engine</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">to_dict</span><span class="p">(),</span>
@@ -975,7 +975,7 @@
             <span class="k">if</span> <span class="n">use_default_executor</span><span class="p">:</span>
                 <span class="k">return</span> <span class="n">tllm</span><span class="o">.</span><span class="n">Executor</span><span class="p">(</span><span class="n">engine</span><span class="p">,</span> <span class="n">tllm</span><span class="o">.</span><span class="n">ModelType</span><span class="o">.</span><span class="n">DECODER_ONLY</span><span class="p">,</span>
                                      <span class="n">executor_config</span><span class="p">)</span>
-            <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.pyexecutor.backend_registries.backend_registry</span><span class="w"> </span><span class="kn">import</span> \
+            <span class="kn">from</span> <span class="nn">tensorrt_llm._torch.pyexecutor.backend_registries.backend_registry</span> <span class="kn">import</span> \
                 <span class="n">unique_create_executor</span>
             <span class="k">return</span> <span class="n">unique_create_executor</span><span class="p">(</span><span class="n">engine</span><span class="p">,</span>
                                           <span class="n">tllm</span><span class="o">.</span><span class="n">ModelType</span><span class="o">.</span><span class="n">DECODER_ONLY</span><span class="p">,</span>
@@ -1011,7 +1011,7 @@
             <span class="n">error_queue</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_error_queue</span><span class="p">,</span>
             <span class="n">name</span><span class="o">=</span><span class="s2">&quot;dispatch_stats_thread&quot;</span><span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">create_stats_queue</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">create_stats_queue</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="c1"># Stats queue is created during first submission to ensure event loop exists if it is needed.</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_stats</span><span class="p">:</span>
             <span class="k">if</span> <span class="n">has_event_loop</span><span class="p">():</span>
@@ -1023,17 +1023,17 @@
                 <span class="bp">self</span><span class="o">.</span><span class="n">stats_queue</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_stats</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">stats_aqueue</span> <span class="o">=</span> <span class="kc">None</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">set_result_queue</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">queue</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">set_result_queue</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">queue</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;In multi-gpu mode, result_queue will be set here to communicate between the proxy and the worker 0 process.&quot;&quot;&quot;</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">result_queue</span> <span class="o">=</span> <span class="n">queue</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">set_stats_queue</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">queue</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">set_stats_queue</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">queue</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;In multi-gpu mode, stats_queue will be set here to communicate between the proxy and the worker 0 process.&quot;&quot;&quot;</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_stats</span> <span class="o">=</span> <span class="n">queue</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">stats_queue</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_stats</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">stats_aqueue</span> <span class="o">=</span> <span class="kc">None</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">return_queue</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">client_id</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">return_queue</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">client_id</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot; If a centralized result queue is registered (used for communication with the proxy)</span>
 <span class="sd">            send the message there.</span>
 <span class="sd">            Otherwise, push the result directly in the GenerationResult queue.</span>
@@ -1042,27 +1042,27 @@
             <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">result_queue</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_results</span><span class="p">[</span><span class="n">client_id</span><span class="p">]</span><span class="o">.</span><span class="n">queue</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">start_awaiter_thread</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">start_awaiter_thread</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">engine</span><span class="o">.</span><span class="n">can_enqueue_requests</span><span class="p">(</span>
         <span class="p">)</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">await_response_thread</span><span class="o">.</span><span class="n">is_alive</span><span class="p">():</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">await_response_thread</span><span class="o">.</span><span class="n">start</span><span class="p">()</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">start_stats_thread</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">start_stats_thread</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">engine</span><span class="o">.</span><span class="n">can_enqueue_requests</span><span class="p">(</span>
         <span class="p">)</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">dispatch_stats_thread</span><span class="o">.</span><span class="n">is_alive</span><span class="p">():</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">dispatch_stats_thread</span><span class="o">.</span><span class="n">start</span><span class="p">()</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_engine_response_callback</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">response</span><span class="p">:</span> <span class="n">tllm</span><span class="o">.</span><span class="n">Response</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">_engine_response_callback</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">response</span><span class="p">:</span> <span class="n">tllm</span><span class="o">.</span><span class="n">Response</span><span class="p">):</span>
         <span class="k">return</span> <span class="n">response</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">await_response_task</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">await_response_task</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
         <span class="c1"># TODO(zhenhuan, chunwei): keep only batch branch after more tests</span>
         <span class="k">if</span> <span class="n">BATCH_RESP_IN_AWAIT</span><span class="p">:</span>
             <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_batch_await_response_task</span><span class="p">()</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_await_response_task</span><span class="p">()</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_await_response_task</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">_await_response_task</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
         <span class="c1"># Get responses and place in queue.</span>
 
         <span class="n">async_queues</span> <span class="o">=</span> <span class="p">[]</span>
@@ -1131,7 +1131,7 @@
 
         <span class="k">return</span> <span class="kc">True</span>  <span class="c1"># success</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_batch_await_response_task</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">_batch_await_response_task</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
         <span class="c1"># Get responses and place in queue.</span>
         <span class="n">result_queue_array</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="k">for</span> <span class="n">response</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">engine</span><span class="o">.</span><span class="n">await_responses</span><span class="p">(</span><span class="n">timeout</span><span class="o">=</span><span class="n">datetime</span><span class="o">.</span><span class="n">timedelta</span><span class="p">(</span>
@@ -1192,10 +1192,10 @@
 
         <span class="k">return</span> <span class="kc">True</span>  <span class="c1"># success</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_has_background_error</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">_has_background_error</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
         <span class="k">return</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_error_queue</span><span class="o">.</span><span class="n">empty</span><span class="p">()</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_create_error_response</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">client_id</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">GenerationExecutor</span><span class="o">.</span><span class="n">Response</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">_create_error_response</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">client_id</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">GenerationExecutor</span><span class="o">.</span><span class="n">Response</span><span class="p">:</span>
         <span class="n">bck_error</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_error_queue</span><span class="o">.</span><span class="n">get_nowait</span><span class="p">()</span>
         <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">bck_error</span><span class="p">,</span> <span class="ne">Exception</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">GenerationExecutor</span><span class="o">.</span><span class="n">Response</span><span class="p">(</span><span class="n">client_id</span><span class="p">,</span>
@@ -1207,7 +1207,7 @@
 
     <span class="n">stats_count</span> <span class="o">=</span> <span class="mi">0</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">dispatch_stats_task</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">dispatch_stats_task</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
         <span class="n">time</span><span class="o">.</span><span class="n">sleep</span><span class="p">(</span><span class="mf">0.1</span><span class="p">)</span>
         <span class="c1"># Get stats and place in queue.</span>
         <span class="k">for</span> <span class="n">stats</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">engine</span><span class="o">.</span><span class="n">get_latest_iteration_stats</span><span class="p">():</span>
@@ -1225,27 +1225,27 @@
 
         <span class="k">return</span> <span class="kc">True</span>  <span class="c1"># success</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">start</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">start</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">create_stats_queue</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">start_awaiter_thread</span><span class="p">()</span>
         <span class="c1"># TODO: Replace this with a decent get_stats implementation</span>
         <span class="c1">#self.start_stats_thread()</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_load_lora_adapter</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">lora_request</span><span class="p">:</span> <span class="n">LoRARequest</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">_load_lora_adapter</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">lora_request</span><span class="p">:</span> <span class="n">LoRARequest</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_lora_manager</span><span class="o">.</span><span class="n">load_from_ckpt</span><span class="p">(</span>
             <span class="p">[</span><span class="n">lora_request</span><span class="o">.</span><span class="n">path</span><span class="p">],</span>
             <span class="n">model_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_runtime_model_config</span><span class="p">,</span>
             <span class="n">runtime_mapping</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
             <span class="n">uids</span><span class="o">=</span><span class="p">[</span><span class="nb">str</span><span class="p">(</span><span class="n">lora_request</span><span class="o">.</span><span class="n">adapter_id</span><span class="p">)])</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_load_prompt_adapter</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">_load_prompt_adapter</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                              <span class="n">prompt_adapter_request</span><span class="p">:</span> <span class="n">PromptAdapterRequest</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_prompt_adapter_manager</span><span class="o">.</span><span class="n">load_from_ckpt</span><span class="p">(</span>
             <span class="p">[</span><span class="n">prompt_adapter_request</span><span class="o">.</span><span class="n">local_path</span><span class="p">],</span>
             <span class="n">model_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_runtime_model_config</span><span class="p">,</span>
             <span class="n">uids</span><span class="o">=</span><span class="p">[</span><span class="nb">str</span><span class="p">(</span><span class="n">prompt_adapter_request</span><span class="o">.</span><span class="n">adapter_id</span><span class="p">)])</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_enqueue_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request</span><span class="p">:</span> <span class="n">GenerationRequest</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">_enqueue_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request</span><span class="p">:</span> <span class="n">GenerationRequest</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
         <span class="k">assert</span> <span class="n">request</span><span class="o">.</span><span class="n">id</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lora_manager</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">request</span><span class="o">.</span><span class="n">lora_request</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_load_lora_adapter</span><span class="p">(</span><span class="n">request</span><span class="o">.</span><span class="n">lora_request</span><span class="p">)</span>
@@ -1311,7 +1311,7 @@
         <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
             <span class="k">raise</span> <span class="n">RequestError</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">e</span><span class="p">))</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">submit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request</span><span class="p">:</span> <span class="n">GenerationRequest</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">GenerationResult</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">submit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request</span><span class="p">:</span> <span class="n">GenerationRequest</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">GenerationResult</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot; Low-level API to the executor. Return a &quot;future&quot; GenerationResult which can be waited. &quot;&quot;&quot;</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">start</span><span class="p">()</span>
 
@@ -1335,7 +1335,7 @@
 
         <span class="k">return</span> <span class="n">result</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">shutdown</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">shutdown</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="n">enable_llm_debug</span><span class="p">():</span>
             <span class="k">try</span><span class="p">:</span>
                 <span class="n">print_colored</span><span class="p">(</span><span class="s1">&#39;Proxy.shutdown...</span><span class="se">\n</span><span class="s1">&#39;</span><span class="p">,</span> <span class="s2">&quot;yellow&quot;</span><span class="p">)</span>
@@ -1364,32 +1364,32 @@
         <span class="c1"># Check if there are any errors from the threads before shutdown.</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_handle_background_error</span><span class="p">()</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">block_subordinates</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">block_subordinates</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">rank</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">:</span>
             <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">engine</span><span class="p">,</span> <span class="n">tllm</span><span class="o">.</span><span class="n">Executor</span><span class="p">):</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
                 <span class="k">raise</span> <span class="bp">self</span><span class="o">.</span><span class="n">WorkerExit</span><span class="p">(</span>
                     <span class="s2">&quot;block_subordinates() should be used in a `with ExecutorBindingsWorker() as ...:` block&quot;</span>
                 <span class="p">)</span>
-            <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.pyexecutor.py_executor</span><span class="w"> </span><span class="kn">import</span> <span class="n">PyExecutor</span>
+            <span class="kn">from</span> <span class="nn">tensorrt_llm._torch.pyexecutor.py_executor</span> <span class="kn">import</span> <span class="n">PyExecutor</span>
             <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">engine</span><span class="p">,</span> <span class="n">PyExecutor</span><span class="p">):</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">engine</span><span class="o">.</span><span class="n">wait_shutdown</span><span class="p">()</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__enter__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__enter__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__exit__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">exc_type</span><span class="p">,</span> <span class="n">exc_value</span><span class="p">,</span> <span class="n">traceback</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="k">def</span> <span class="fm">__exit__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">exc_type</span><span class="p">,</span> <span class="n">exc_value</span><span class="p">,</span> <span class="n">traceback</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
         <span class="k">return</span> <span class="n">exc_type</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">exc_type</span> <span class="o">==</span> <span class="n">ExecutorBindingsWorker</span><span class="o">.</span><span class="n">WorkerExit</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__del__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__del__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">ZeroMqQueue</span><span class="p">:</span>
+<span class="k">class</span> <span class="nc">ZeroMqQueue</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">&#39;&#39;&#39; A Queue-like container for IPC using ZeroMQ. &#39;&#39;&#39;</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">address</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">is_server</span><span class="p">:</span> <span class="nb">bool</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">address</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">is_server</span><span class="p">:</span> <span class="nb">bool</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&#39;&#39;&#39;</span>
 <span class="sd">        Parameters:</span>
 <span class="sd">            address (Tuple[str, str], optional): The address (tcp-ip_port, authkey) for the IPC. Defaults to None.</span>
@@ -1411,7 +1411,7 @@
             <span class="p">)</span>  <span class="c1"># Binds to the address and occupy a port immediately</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">address</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">socket</span><span class="o">.</span><span class="n">getsockopt</span><span class="p">(</span><span class="n">zmq</span><span class="o">.</span><span class="n">LAST_ENDPOINT</span><span class="p">)</span><span class="o">.</span><span class="n">decode</span><span class="p">()</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">setup_lazily</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">setup_lazily</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_setup_done</span><span class="p">:</span>
             <span class="k">return</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_setup_done</span> <span class="o">=</span> <span class="kc">True</span>
@@ -1421,7 +1421,7 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">poller</span> <span class="o">=</span> <span class="n">zmq</span><span class="o">.</span><span class="n">Poller</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">poller</span><span class="o">.</span><span class="n">register</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">socket</span><span class="p">,</span> <span class="n">zmq</span><span class="o">.</span><span class="n">POLLIN</span><span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">poll</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">poll</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">        Parameters:</span>
 <span class="sd">            timeout (int): Timeout in seconds</span>
@@ -1434,7 +1434,7 @@
         <span class="k">else</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">False</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">put</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">obj</span><span class="p">:</span> <span class="n">Any</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">put</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">obj</span><span class="p">:</span> <span class="n">Any</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">setup_lazily</span><span class="p">()</span>
 
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">obj</span><span class="p">,</span> <span class="n">GenerationExecutor</span><span class="o">.</span><span class="n">Response</span><span class="p">):</span>
@@ -1448,7 +1448,7 @@
         <span class="n">message</span> <span class="o">=</span> <span class="n">pickle</span><span class="o">.</span><span class="n">dumps</span><span class="p">(</span><span class="n">obj</span><span class="p">)</span>  <span class="c1"># nosec B301</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">socket</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">message</span><span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">get</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Any</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">get</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Any</span><span class="p">:</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">setup_lazily</span><span class="p">()</span>
 
         <span class="n">message</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">socket</span><span class="o">.</span><span class="n">recv</span><span class="p">()</span>
@@ -1463,7 +1463,7 @@
                                               <span class="n">error</span><span class="o">=</span><span class="n">obj</span><span class="o">.</span><span class="n">error</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">obj</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">close</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">close</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">socket</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">socket</span><span class="o">.</span><span class="n">close</span><span class="p">()</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">socket</span> <span class="o">=</span> <span class="kc">None</span>
@@ -1471,7 +1471,7 @@
             <span class="bp">self</span><span class="o">.</span><span class="n">context</span><span class="o">.</span><span class="n">term</span><span class="p">()</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">context</span> <span class="o">=</span> <span class="kc">None</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_store_tensors_in_shmm</span><span class="p">(</span>
+    <span class="k">def</span> <span class="nf">_store_tensors_in_shmm</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">tensors</span><span class="p">:</span> <span class="n">GenerationExecutor</span><span class="o">.</span><span class="n">ResponseTensors</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">GenerationExecutor</span><span class="o">.</span><span class="n">ResponseTensors</span><span class="p">:</span>
         <span class="k">if</span> <span class="n">tensors</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
@@ -1479,7 +1479,7 @@
 
         <span class="c1"># The tensors are huge and cannot be transferred through socket directly. We need to store them in shared memory,</span>
         <span class="c1"># and replace the tensors with the shared memory path.</span>
-        <span class="k">def</span><span class="w"> </span><span class="nf">store_tensor</span><span class="p">(</span><span class="n">tensor</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+        <span class="k">def</span> <span class="nf">store_tensor</span><span class="p">(</span><span class="n">tensor</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
             <span class="k">if</span> <span class="n">tensor</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="k">return</span> <span class="kc">None</span>
             <span class="c1"># NOTE: We create random shmm here rather than two specific shmm for context and generation logit, since the</span>
@@ -1500,13 +1500,13 @@
             <span class="n">cum_log_probs</span><span class="o">=</span><span class="n">tensors</span><span class="o">.</span><span class="n">cum_log_probs</span><span class="p">,</span>
         <span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_load_tensors_from_shmm</span><span class="p">(</span>
+    <span class="k">def</span> <span class="nf">_load_tensors_from_shmm</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">tensors</span><span class="p">:</span> <span class="n">GenerationExecutor</span><span class="o">.</span><span class="n">ResponseTensors</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">GenerationExecutor</span><span class="o">.</span><span class="n">ResponseTensors</span><span class="p">:</span>
         <span class="k">if</span> <span class="n">tensors</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="n">tensors</span>
 
-        <span class="k">def</span><span class="w"> </span><span class="nf">load_tensor</span><span class="p">(</span><span class="n">tensor</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]:</span>
+        <span class="k">def</span> <span class="nf">load_tensor</span><span class="p">(</span><span class="n">tensor</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]:</span>
             <span class="k">if</span> <span class="n">tensor</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">tensor</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">):</span>
                 <span class="k">return</span> <span class="n">tensor</span>
 
@@ -1524,17 +1524,17 @@
             <span class="n">cum_log_probs</span><span class="o">=</span><span class="n">tensors</span><span class="o">.</span><span class="n">cum_log_probs</span><span class="p">,</span>
         <span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__del__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__del__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">close</span><span class="p">()</span>
 
 
 <span class="n">IpcQueue</span> <span class="o">=</span> <span class="n">ZeroMqQueue</span>
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">FusedIpcQueue</span><span class="p">:</span>
+<span class="k">class</span> <span class="nc">FusedIpcQueue</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">&#39;&#39;&#39; A Queue-like container for IPC with optional message batched. &#39;&#39;&#39;</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">address</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="o">*</span><span class="p">,</span>
                  <span class="n">is_server</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
@@ -1552,11 +1552,11 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">_send_thread</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">sending_queue</span> <span class="o">=</span> <span class="n">Queue</span><span class="p">()</span> <span class="k">if</span> <span class="n">fuse_message</span> <span class="k">else</span> <span class="kc">None</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">setup_sender</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">setup_sender</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">fuse_message</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">_send_thread</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span>
 
-        <span class="k">def</span><span class="w"> </span><span class="nf">send_task</span><span class="p">():</span>
+        <span class="k">def</span> <span class="nf">send_task</span><span class="p">():</span>
             <span class="k">while</span> <span class="kc">True</span><span class="p">:</span>
                 <span class="n">qsize</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">sending_queue</span><span class="o">.</span><span class="n">qsize</span><span class="p">()</span>
                 <span class="k">if</span> <span class="n">qsize</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
@@ -1575,20 +1575,20 @@
                                           <span class="n">error_queue</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">error_queue</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_send_thread</span><span class="o">.</span><span class="n">start</span><span class="p">()</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">put</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">obj</span><span class="p">:</span> <span class="n">Any</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">put</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">obj</span><span class="p">:</span> <span class="n">Any</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">setup_sender</span><span class="p">()</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">fuse_message</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">sending_queue</span><span class="o">.</span><span class="n">put_nowait</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_prepare_message</span><span class="p">(</span><span class="n">obj</span><span class="p">))</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_prepare_message</span><span class="p">(</span><span class="n">obj</span><span class="p">))</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">get</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Any</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">get</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Any</span><span class="p">:</span>
         <span class="n">obj</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">get</span><span class="p">()</span>
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">obj</span><span class="p">,</span> <span class="nb">list</span><span class="p">):</span>
             <span class="k">return</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">_process_message</span><span class="p">(</span><span class="n">o</span><span class="p">)</span> <span class="k">for</span> <span class="n">o</span> <span class="ow">in</span> <span class="n">obj</span><span class="p">]</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_process_message</span><span class="p">(</span><span class="n">obj</span><span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_prepare_message</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">obj</span><span class="p">:</span> <span class="n">Any</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Any</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">_prepare_message</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">obj</span><span class="p">:</span> <span class="n">Any</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Any</span><span class="p">:</span>
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">obj</span><span class="p">,</span> <span class="n">GenerationExecutor</span><span class="o">.</span><span class="n">Response</span><span class="p">):</span>
             <span class="n">tensors</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">_store_tensors_in_shmm</span><span class="p">(</span><span class="n">obj</span><span class="o">.</span><span class="n">tensors</span><span class="p">)</span>
             <span class="k">return</span> <span class="n">GenerationExecutor</span><span class="o">.</span><span class="n">Response</span><span class="p">(</span>
@@ -1600,7 +1600,7 @@
                 <span class="n">error</span><span class="o">=</span><span class="n">obj</span><span class="o">.</span><span class="n">error</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">obj</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_process_message</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">obj</span><span class="p">:</span> <span class="n">Any</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Any</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">_process_message</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">obj</span><span class="p">:</span> <span class="n">Any</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Any</span><span class="p">:</span>
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">obj</span><span class="p">,</span> <span class="n">GenerationExecutor</span><span class="o">.</span><span class="n">Response</span><span class="p">):</span>
             <span class="n">tensors</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">_load_tensors_from_shmm</span><span class="p">(</span><span class="n">obj</span><span class="o">.</span><span class="n">tensors</span><span class="p">)</span>
             <span class="k">return</span> <span class="n">GenerationExecutor</span><span class="o">.</span><span class="n">Response</span><span class="p">(</span>
@@ -1613,19 +1613,19 @@
         <span class="k">return</span> <span class="n">obj</span>
 
     <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">address</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">,</span> <span class="nb">bytes</span><span class="p">]:</span>
+    <span class="k">def</span> <span class="nf">address</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">,</span> <span class="nb">bytes</span><span class="p">]:</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">address</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__del__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__del__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">close</span><span class="p">()</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">print_fuse_stats</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">print_fuse_stats</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_message_counter</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
             <span class="n">print_colored</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">&quot;IPCQueue: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_message_counter</span><span class="si">}</span><span class="s2"> messages, </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_obj_counter</span><span class="si">}</span><span class="s2"> objects sent, average: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_obj_counter</span><span class="o">/</span><span class="bp">self</span><span class="o">.</span><span class="n">_message_counter</span><span class="si">}</span><span class="s2">.</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
                 <span class="s2">&quot;green&quot;</span><span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">close</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">close</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">close</span><span class="p">()</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_send_thread</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
@@ -1637,10 +1637,10 @@
             <span class="bp">self</span><span class="o">.</span><span class="n">print_fuse_stats</span><span class="p">()</span>
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">ExecutorBindingsProxy</span><span class="p">(</span><span class="n">GenerationExecutor</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">ExecutorBindingsProxy</span><span class="p">(</span><span class="n">GenerationExecutor</span><span class="p">):</span>
     <span class="n">READY_SIGNAL</span> <span class="o">=</span> <span class="sa">b</span><span class="s2">&quot;READY&quot;</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">workers_kwargs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">,</span>
                  <span class="n">model_world_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
                  <span class="n">mpi_session</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">MpiSession</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -1682,7 +1682,7 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">_start_executor_workers</span><span class="p">()</span>
 
     <span class="nd">@staticmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">workers_main</span><span class="p">(</span>
+    <span class="k">def</span> <span class="nf">workers_main</span><span class="p">(</span>
         <span class="n">engine</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="n">Path</span><span class="p">,</span> <span class="n">Engine</span><span class="p">],</span>
         <span class="n">request_queue_addr</span><span class="p">:</span> <span class="n">Tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">,</span> <span class="nb">bytes</span><span class="p">],</span>
         <span class="n">request_error_queue_addr</span><span class="p">:</span> <span class="n">Tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">,</span> <span class="nb">bytes</span><span class="p">],</span>
@@ -1703,7 +1703,7 @@
             <span class="n">set_global_tracer</span><span class="p">(</span><span class="n">tracer</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="n">_torch_model_class_mapping</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.models.modeling_auto</span><span class="w"> </span><span class="kn">import</span> \
+            <span class="kn">from</span> <span class="nn">tensorrt_llm._torch.models.modeling_auto</span> <span class="kn">import</span> \
                 <span class="n">MODEL_CLASS_MAPPING</span>
             <span class="n">MODEL_CLASS_MAPPING</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="o">**</span><span class="n">_torch_model_class_mapping</span><span class="p">)</span>
 
@@ -1719,7 +1719,7 @@
                                            <span class="n">is_server</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                                            <span class="n">fuse_message</span><span class="o">=</span><span class="ow">not</span> <span class="n">BATCH_RESP_IN_AWAIT</span><span class="p">)</span>
 
-        <span class="k">def</span><span class="w"> </span><span class="nf">notify_proxy_threads_to_quit</span><span class="p">():</span>
+        <span class="k">def</span> <span class="nf">notify_proxy_threads_to_quit</span><span class="p">():</span>
             <span class="c1"># Signal the dispatcher thread in the proxy to quit</span>
             <span class="n">result_queue</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="kc">None</span><span class="p">)</span>
             <span class="c1"># Signal the stats thread in the proxy to quit</span>
@@ -1770,14 +1770,14 @@
                 <span class="k">if</span> <span class="n">mpi_rank</span><span class="p">()</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
                     <span class="n">request_error_queue</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="n">err</span><span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">dispatch_result_task</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">dispatch_result_task</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
         <span class="k">if</span> <span class="p">(</span><span class="n">res</span> <span class="o">:=</span> <span class="bp">self</span><span class="o">.</span><span class="n">result_queue</span><span class="o">.</span><span class="n">get</span><span class="p">())</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">False</span>  <span class="c1"># shutdown the thread</span>
 
         <span class="n">async_queues</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="n">event_loop</span> <span class="o">=</span> <span class="kc">None</span>
 
-        <span class="k">def</span><span class="w"> </span><span class="nf">process_res</span><span class="p">(</span><span class="n">res</span><span class="p">):</span>
+        <span class="k">def</span> <span class="nf">process_res</span><span class="p">(</span><span class="n">res</span><span class="p">):</span>
             <span class="n">client_id</span> <span class="o">=</span> <span class="n">res</span><span class="o">.</span><span class="n">client_id</span>
             <span class="k">nonlocal</span> <span class="n">event_loop</span>
             <span class="k">nonlocal</span> <span class="n">async_queues</span>
@@ -1807,7 +1807,7 @@
 
         <span class="k">return</span> <span class="kc">True</span>  <span class="c1"># success</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">dispatch_stats_task</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">dispatch_stats_task</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
         <span class="c1"># get-stats is not urgent, so we can sleep a bit</span>
 
         <span class="n">time</span><span class="o">.</span><span class="n">sleep</span><span class="p">(</span><span class="mf">0.1</span><span class="p">)</span>
@@ -1838,7 +1838,7 @@
 
         <span class="k">return</span> <span class="kc">True</span>  <span class="c1"># success</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_start_dispatch_threads</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">_start_dispatch_threads</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">dispatch_result_thread</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
 
             <span class="bp">self</span><span class="o">.</span><span class="n">dispatch_result_thread</span> <span class="o">=</span> <span class="n">ManagedThread</span><span class="p">(</span>
@@ -1857,11 +1857,11 @@
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_handle_background_error</span><span class="p">()</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_start_executor_workers</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">_start_executor_workers</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
 
         <span class="n">self_ref</span> <span class="o">=</span> <span class="n">weakref</span><span class="o">.</span><span class="n">ref</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span>
 
-        <span class="k">def</span><span class="w"> </span><span class="nf">mpi_done_callback</span><span class="p">(</span><span class="n">future</span><span class="p">:</span> <span class="n">concurrent</span><span class="o">.</span><span class="n">futures</span><span class="o">.</span><span class="n">Future</span><span class="p">):</span>
+        <span class="k">def</span> <span class="nf">mpi_done_callback</span><span class="p">(</span><span class="n">future</span><span class="p">:</span> <span class="n">concurrent</span><span class="o">.</span><span class="n">futures</span><span class="o">.</span><span class="n">Future</span><span class="p">):</span>
             <span class="c1"># This is called when the MPI worker is done, so future.exception() will not block.</span>
             <span class="k">if</span> <span class="n">future</span><span class="o">.</span><span class="n">exception</span><span class="p">()</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="k">if</span> <span class="n">self_</span> <span class="o">:=</span> <span class="n">self_ref</span><span class="p">():</span>
@@ -1869,7 +1869,7 @@
 
         <span class="n">tracer_init_kwargs</span> <span class="o">=</span> <span class="n">get_tracer</span><span class="p">()</span><span class="o">.</span><span class="n">init_kwargs</span> <span class="k">if</span> <span class="n">enable_llm_tracer</span><span class="p">(</span>
         <span class="p">)</span> <span class="k">else</span> <span class="kc">None</span>
-        <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.models.modeling_auto</span><span class="w"> </span><span class="kn">import</span> <span class="n">MODEL_CLASS_MAPPING</span>
+        <span class="kn">from</span> <span class="nn">tensorrt_llm._torch.models.modeling_auto</span> <span class="kn">import</span> <span class="n">MODEL_CLASS_MAPPING</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">mpi_futures</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span><span class="o">.</span><span class="n">submit</span><span class="p">(</span>
             <span class="n">ExecutorBindingsProxy</span><span class="o">.</span><span class="n">workers_main</span><span class="p">,</span>
             <span class="o">**</span><span class="bp">self</span><span class="o">.</span><span class="n">workers_kwargs</span><span class="p">,</span>
@@ -1889,7 +1889,7 @@
         <span class="k">if</span> <span class="n">ready_signal</span> <span class="o">!=</span> <span class="n">ExecutorBindingsProxy</span><span class="o">.</span><span class="n">READY_SIGNAL</span><span class="p">:</span>
             <span class="k">raise</span> <span class="n">ready_signal</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">shutdown</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">shutdown</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="n">enable_llm_debug</span><span class="p">():</span>
             <span class="k">try</span><span class="p">:</span>
                 <span class="n">print_colored</span><span class="p">(</span><span class="s1">&#39;Proxy.shutdown...</span><span class="se">\n</span><span class="s1">&#39;</span><span class="p">,</span> <span class="s2">&quot;yellow&quot;</span><span class="p">)</span>
@@ -1939,7 +1939,7 @@
         <span class="c1"># Process the errors in-case error during shutting down the threads</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_handle_background_error</span><span class="p">()</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">submit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request</span><span class="p">:</span> <span class="n">GenerationRequest</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">GenerationResult</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">submit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request</span><span class="p">:</span> <span class="n">GenerationRequest</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">GenerationResult</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">            Low-level API to the executor. Return a &quot;future&quot; GenerationResult which can be waited.</span>
 <span class="sd">            Forwards the request to the workers through the request queue.</span>
@@ -1962,13 +1962,13 @@
 
         <span class="k">return</span> <span class="n">result</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__del__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__del__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__enter__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__enter__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__exit__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">exc_type</span><span class="p">,</span> <span class="n">exc_value</span><span class="p">,</span> <span class="n">traceback</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__exit__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">exc_type</span><span class="p">,</span> <span class="n">exc_value</span><span class="p">,</span> <span class="n">traceback</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
         <span class="k">return</span> <span class="kc">False</span>  <span class="c1"># propagate the exception</span>
 
@@ -1979,7 +1979,7 @@
     <span class="n">faulthandler</span><span class="o">.</span><span class="n">register</span><span class="p">(</span><span class="n">signal</span><span class="o">.</span><span class="n">SIGINT</span><span class="p">,</span> <span class="n">all_threads</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">has_event_loop</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="k">def</span> <span class="nf">has_event_loop</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
     <span class="k">try</span><span class="p">:</span>
         <span class="n">asyncio</span><span class="o">.</span><span class="n">get_running_loop</span><span class="p">()</span>
     <span class="k">except</span> <span class="ne">RuntimeError</span><span class="p">:</span>
@@ -1994,7 +1994,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f63fedcfef0>
+<jinja2.runtime.BlockReference object at 0x7fdebe9a03e0>
 
 <div class="footer">
     <p>

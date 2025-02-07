@@ -6,7 +6,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>tensorrt_llm.models.phi3.model &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../../../../_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="../../../../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../../../../_static/copybutton.css?v=76b2166b" />
 
@@ -14,7 +14,7 @@
       <script src="../../../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../../../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../../../../_static/doctools.js?v=9a2dae69"></script>
       <script src="../../../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../../../_static/copybutton.js?v=65e89d2a"></script>
@@ -117,7 +117,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../../performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../../performance/introduction.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -161,28 +161,28 @@
            <div itemprop="articleBody">
              
   <h1>Source code for tensorrt_llm.models.phi3.model</h1><div class="highlight"><pre>
-<span></span><span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Union</span>
+<span></span><span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Union</span>
 
-<span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">AutoModelForCausalLM</span>
+<span class="kn">import</span> <span class="nn">numpy</span> <span class="k">as</span> <span class="nn">np</span>
+<span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">AutoModelForCausalLM</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">..._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">pad_vocab_size</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">...functional</span><span class="w"> </span><span class="kn">import</span> <span class="n">PositionEmbeddingType</span><span class="p">,</span> <span class="n">Tensor</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">...layers</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">MLP</span><span class="p">,</span> <span class="n">MOE</span><span class="p">,</span> <span class="n">Attention</span><span class="p">,</span> <span class="n">AttentionMaskType</span><span class="p">,</span>
+<span class="kn">from</span> <span class="nn">..._utils</span> <span class="kn">import</span> <span class="n">pad_vocab_size</span>
+<span class="kn">from</span> <span class="nn">...functional</span> <span class="kn">import</span> <span class="n">PositionEmbeddingType</span><span class="p">,</span> <span class="n">Tensor</span>
+<span class="kn">from</span> <span class="nn">...layers</span> <span class="kn">import</span> <span class="p">(</span><span class="n">MLP</span><span class="p">,</span> <span class="n">MOE</span><span class="p">,</span> <span class="n">Attention</span><span class="p">,</span> <span class="n">AttentionMaskType</span><span class="p">,</span>
                        <span class="n">BlockSparseAttnParams</span><span class="p">,</span> <span class="n">ColumnLinear</span><span class="p">,</span> <span class="n">Embedding</span><span class="p">,</span>
                        <span class="n">LayerNorm</span><span class="p">,</span> <span class="n">MoeConfig</span><span class="p">,</span> <span class="n">RmsNorm</span><span class="p">)</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">...lora_manager</span><span class="w"> </span><span class="kn">import</span> <span class="n">LoraConfig</span><span class="p">,</span> <span class="n">use_lora</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">...mapping</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">...module</span><span class="w"> </span><span class="kn">import</span> <span class="n">Module</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..modeling_utils</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">DecoderLayerList</span><span class="p">,</span> <span class="n">DecoderModelForCausalLM</span><span class="p">,</span>
+<span class="kn">from</span> <span class="nn">...lora_manager</span> <span class="kn">import</span> <span class="n">LoraConfig</span><span class="p">,</span> <span class="n">use_lora</span>
+<span class="kn">from</span> <span class="nn">...mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
+<span class="kn">from</span> <span class="nn">...module</span> <span class="kn">import</span> <span class="n">Module</span>
+<span class="kn">from</span> <span class="nn">..modeling_utils</span> <span class="kn">import</span> <span class="p">(</span><span class="n">DecoderLayerList</span><span class="p">,</span> <span class="n">DecoderModelForCausalLM</span><span class="p">,</span>
                               <span class="n">PretrainedConfig</span><span class="p">,</span> <span class="n">QuantConfig</span><span class="p">)</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">Phi3Config</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.convert</span><span class="w"> </span><span class="kn">import</span> <span class="n">load_weights_from_hf_model</span>
+<span class="kn">from</span> <span class="nn">.config</span> <span class="kn">import</span> <span class="n">Phi3Config</span>
+<span class="kn">from</span> <span class="nn">.convert</span> <span class="kn">import</span> <span class="n">load_weights_from_hf_model</span>
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">Phi3DecoderLayer</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">Phi3DecoderLayer</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">,</span> <span class="n">layer_idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">,</span> <span class="n">layer_idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">config</span> <span class="o">=</span> <span class="n">config</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">layer_idx</span> <span class="o">=</span> <span class="n">layer_idx</span>
@@ -297,7 +297,7 @@
                           <span class="n">bias</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">small_variant</span><span class="p">,</span>
                           <span class="o">**</span><span class="n">mlp_kwargs</span><span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">hidden_states</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
         <span class="n">attention_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
@@ -339,9 +339,9 @@
 
 <div class="viewcode-block" id="Phi3Model">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.Phi3Model">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">Phi3Model</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">Phi3Model</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">vocab_embedding</span> <span class="o">=</span> <span class="n">Embedding</span><span class="p">(</span><span class="n">num_embeddings</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span>
                                          <span class="n">embedding_dim</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
@@ -363,7 +363,7 @@
 
 <div class="viewcode-block" id="Phi3Model.forward">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.Phi3Model.forward">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">input_ids</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
         <span class="n">position_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
@@ -405,10 +405,10 @@
 
 <div class="viewcode-block" id="Phi3ForCausalLM">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.Phi3ForCausalLM">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">Phi3ForCausalLM</span><span class="p">(</span><span class="n">DecoderModelForCausalLM</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">Phi3ForCausalLM</span><span class="p">(</span><span class="n">DecoderModelForCausalLM</span><span class="p">):</span>
     <span class="n">config_class</span> <span class="o">=</span> <span class="n">Phi3Config</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">):</span>
         <span class="n">transformer</span> <span class="o">=</span> <span class="n">Phi3Model</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
         <span class="n">vocab_size_padded</span> <span class="o">=</span> <span class="n">pad_vocab_size</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span>
                                            <span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">)</span>
@@ -432,14 +432,14 @@
 <div class="viewcode-block" id="Phi3ForCausalLM.from_hugging_face">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.Phi3ForCausalLM.from_hugging_face">[docs]</a>
     <span class="nd">@classmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">from_hugging_face</span><span class="p">(</span>
+    <span class="k">def</span> <span class="nf">from_hugging_face</span><span class="p">(</span>
             <span class="bp">cls</span><span class="p">,</span>
             <span class="n">hf_model_or_dir</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="s1">&#39;transformers.PreTrainedModel&#39;</span><span class="p">],</span>
             <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s1">&#39;auto&#39;</span><span class="p">,</span>
             <span class="n">mapping</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Mapping</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
             <span class="n">quant_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">QuantConfig</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
             <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
-        <span class="kn">import</span><span class="w"> </span><span class="nn">transformers</span>
+        <span class="kn">import</span> <span class="nn">transformers</span>
 
         <span class="k">assert</span> <span class="n">hf_model_or_dir</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
         <span class="n">use_preloading</span> <span class="o">=</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">hf_model_or_dir</span><span class="p">,</span>
@@ -475,7 +475,7 @@
 
 <div class="viewcode-block" id="Phi3ForCausalLM.use_lora">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.Phi3ForCausalLM.use_lora">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">use_lora</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">lora_config</span><span class="p">:</span> <span class="n">LoraConfig</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">use_lora</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">lora_config</span><span class="p">:</span> <span class="n">LoraConfig</span><span class="p">):</span>
         <span class="n">use_lora</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">lora_config</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">trtllm_modules_to_hf_modules</span><span class="p">)</span></div>
 </div>
 
@@ -488,7 +488,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f63fe3c07d0>
+<jinja2.runtime.BlockReference object at 0x7fdee4a0dfa0>
 
 <div class="footer">
     <p>

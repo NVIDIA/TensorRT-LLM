@@ -7,7 +7,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Graph Rewriting Module &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
 
@@ -15,7 +15,7 @@
       <script src="../_static/jquery.js?v=5d32c60e"></script>
       <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../_static/doctools.js?v=9a2dae69"></script>
       <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../_static/copybutton.js?v=65e89d2a"></script>
@@ -131,7 +131,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../performance/introduction.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -261,18 +261,18 @@ techniques to optimize the underlying graph.  It provides a wrapper similar to P
 <section id="classical-workflow">
 <h2>Classical Workflow<a class="headerlink" href="#classical-workflow" title="Link to this heading"></a></h2>
 <p>There are specific routines for defining a GW pattern. Let’s start with a simple example: replacing a sum layer with a subtract layer, which can also be found in the <code class="docutils literal notranslate"><span class="pre">test_graph_rewriting.py</span></code> file.</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">NaivePatternRewriter_ReplaceAddWithSub</span><span class="p">(</span><span class="n">PatternRewriter</span><span class="p">):</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span> <span class="nc">NaivePatternRewriter_ReplaceAddWithSub</span><span class="p">(</span><span class="n">PatternRewriter</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="s1">&#39;replace_add_with_sub&#39;</span><span class="p">,</span>
                          <span class="n">root_layer</span><span class="o">=</span><span class="p">{</span><span class="n">trt</span><span class="o">.</span><span class="n">LayerType</span><span class="o">.</span><span class="n">ELEMENTWISE</span><span class="p">},</span>
                          <span class="n">separate_match_rewrite</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">match</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">layer</span><span class="p">:</span> <span class="n">Layer</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">match</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">layer</span><span class="p">:</span> <span class="n">Layer</span><span class="p">):</span>
         <span class="c1"># The rewriter will stop at the first matched layer, and then the Rewriter will enter the rewrite() to do the rewriting.</span>
         <span class="k">return</span> <span class="n">layer</span><span class="o">.</span><span class="n">as_layer</span><span class="p">()</span><span class="o">.</span><span class="n">op</span> <span class="o">==</span> <span class="n">trt</span><span class="o">.</span><span class="n">ElementWiseOperation</span><span class="o">.</span><span class="n">SUM</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">rewrite</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">layer</span><span class="p">:</span> <span class="n">Layer</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">rewrite</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">layer</span><span class="p">:</span> <span class="n">Layer</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="c1"># The layer here should be an Elementwise_SUM layer.</span>
         <span class="k">with</span> <span class="n">net_guard</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">network</span><span class="p">):</span>
             <span class="c1"># There are several stages to replace some subgraph with another subgraph:</span>
@@ -301,13 +301,13 @@ techniques to optimize the underlying graph.  It provides a wrapper similar to P
 <p>In Stage 2, we rely on operators and layers commonly used during the network building phase. Ideally, you can replace them with any network structure during GW.</p>
 <p>For the usage of <code class="docutils literal notranslate"><span class="pre">FLayerInfo</span></code>, let’s rewrite the <code class="docutils literal notranslate"><span class="pre">gpt_attention</span></code> to enable the <code class="docutils literal notranslate"><span class="pre">remove-padding</span></code> feature. <code class="docutils literal notranslate"><span class="pre">gpt_attention</span></code> is actually</p>
 <p>a TensorRT plugin, so we need <code class="docutils literal notranslate"><span class="pre">FLayerInfo</span></code> to hold the original Tensor-wise inputs to help create new <code class="docutils literal notranslate"><span class="pre">gpt_attention</span></code> layers.</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">GPTAttentionPluginRemovePaddingRewritePass</span><span class="p">(</span><span class="n">PatternRewriter</span><span class="p">):</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span> <span class="nc">GPTAttentionPluginRemovePaddingRewritePass</span><span class="p">(</span><span class="n">PatternRewriter</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="s1">&#39;gpt_attention_plugin_remove_padding&#39;</span><span class="p">,</span>
                          <span class="n">root_layer</span><span class="o">=</span><span class="p">{</span><span class="n">trt</span><span class="o">.</span><span class="n">LayerType</span><span class="o">.</span><span class="n">PLUGIN_V2</span><span class="p">})</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">match_and_rewrite</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">layer</span><span class="p">:</span> <span class="n">Layer</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">match_and_rewrite</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">layer</span><span class="p">:</span> <span class="n">Layer</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
         <span class="k">if</span> <span class="n">layer</span><span class="o">.</span><span class="n">as_layer</span><span class="p">()</span><span class="o">.</span><span class="n">type</span> <span class="o">!=</span> <span class="n">trt</span><span class="o">.</span><span class="n">LayerType</span><span class="o">.</span><span class="n">PLUGIN_V2</span> <span class="ow">or</span> \
                 <span class="n">layer</span><span class="o">.</span><span class="n">as_layer</span><span class="p">()</span><span class="o">.</span><span class="n">plugin</span><span class="o">.</span><span class="n">plugin_namespace</span> <span class="o">!=</span> <span class="s1">&#39;tensorrt_llm&#39;</span> <span class="ow">or</span> \
                 <span class="n">layer</span><span class="o">.</span><span class="n">as_layer</span><span class="p">()</span><span class="o">.</span><span class="n">plugin</span><span class="o">.</span><span class="n">plugin_type</span> <span class="o">!=</span> <span class="s1">&#39;GPTAttention&#39;</span><span class="p">:</span>
@@ -382,7 +382,7 @@ techniques to optimize the underlying graph.  It provides a wrapper similar to P
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f692bae8c20>
+<jinja2.runtime.BlockReference object at 0x7fdebe923c80>
 
 <div class="footer">
     <p>

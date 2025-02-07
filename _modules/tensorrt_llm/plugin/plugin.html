@@ -6,7 +6,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>tensorrt_llm.plugin.plugin &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="../../../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
 
@@ -14,7 +14,7 @@
       <script src="../../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../../../_static/doctools.js?v=9a2dae69"></script>
       <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
@@ -117,7 +117,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../performance/introduction.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -175,36 +175,36 @@
 <span class="c1"># WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.</span>
 <span class="c1"># See the License for the specific language governing permissions and</span>
 <span class="c1"># limitations under the License.</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">argparse</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">ctypes</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">platform</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">collections</span><span class="w"> </span><span class="kn">import</span> <span class="n">OrderedDict</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">asdict</span><span class="p">,</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span><span class="p">,</span> <span class="n">fields</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">IntEnum</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">textwrap</span><span class="w"> </span><span class="kn">import</span> <span class="n">dedent</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">List</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Tuple</span>
+<span class="kn">import</span> <span class="nn">argparse</span>
+<span class="kn">import</span> <span class="nn">ctypes</span>
+<span class="kn">import</span> <span class="nn">os</span>
+<span class="kn">import</span> <span class="nn">platform</span>
+<span class="kn">from</span> <span class="nn">collections</span> <span class="kn">import</span> <span class="n">OrderedDict</span>
+<span class="kn">from</span> <span class="nn">dataclasses</span> <span class="kn">import</span> <span class="n">asdict</span><span class="p">,</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span><span class="p">,</span> <span class="n">fields</span>
+<span class="kn">from</span> <span class="nn">enum</span> <span class="kn">import</span> <span class="n">IntEnum</span>
+<span class="kn">from</span> <span class="nn">pathlib</span> <span class="kn">import</span> <span class="n">Path</span>
+<span class="kn">from</span> <span class="nn">textwrap</span> <span class="kn">import</span> <span class="n">dedent</span>
+<span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="n">List</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Tuple</span>
 
-<span class="kn">import</span><span class="w"> </span><span class="nn">tensorrt</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">trt</span>
+<span class="kn">import</span> <span class="nn">tensorrt</span> <span class="k">as</span> <span class="nn">trt</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">.._ipc_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">IpcMemory</span><span class="p">,</span> <span class="n">can_access_peer</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">get_sm_version</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..bindings.internal.runtime</span><span class="w"> </span><span class="kn">import</span> <span class="n">lamport_initialize_all</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..logger</span><span class="w"> </span><span class="kn">import</span> <span class="n">logger</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..mapping</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
+<span class="kn">from</span> <span class="nn">.._ipc_utils</span> <span class="kn">import</span> <span class="n">IpcMemory</span><span class="p">,</span> <span class="n">can_access_peer</span>
+<span class="kn">from</span> <span class="nn">.._utils</span> <span class="kn">import</span> <span class="n">get_sm_version</span>
+<span class="kn">from</span> <span class="nn">..bindings.internal.runtime</span> <span class="kn">import</span> <span class="n">lamport_initialize_all</span>
+<span class="kn">from</span> <span class="nn">..logger</span> <span class="kn">import</span> <span class="n">logger</span>
+<span class="kn">from</span> <span class="nn">..mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
 
 <span class="n">TRT_LLM_PLUGIN_NAMESPACE</span> <span class="o">=</span> <span class="s1">&#39;tensorrt_llm&#39;</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">plugin_lib_path</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="k">def</span> <span class="nf">plugin_lib_path</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
     <span class="n">project_dir</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="vm">__file__</span><span class="p">)</span><span class="o">.</span><span class="n">parent</span><span class="o">.</span><span class="n">parent</span><span class="o">.</span><span class="n">absolute</span><span class="p">()</span>
     <span class="n">dyn_lib</span> <span class="o">=</span> <span class="s2">&quot;libnvinfer_plugin_tensorrt_llm.so&quot;</span> <span class="k">if</span> <span class="n">platform</span><span class="o">.</span><span class="n">system</span><span class="p">(</span>
     <span class="p">)</span> <span class="o">!=</span> <span class="s2">&quot;Windows&quot;</span> <span class="k">else</span> <span class="s2">&quot;nvinfer_plugin_tensorrt_llm.dll&quot;</span>
     <span class="k">return</span> <span class="nb">str</span><span class="p">(</span><span class="n">project_dir</span><span class="o">.</span><span class="n">joinpath</span><span class="p">(</span><span class="s2">&quot;libs&quot;</span><span class="p">,</span> <span class="n">dyn_lib</span><span class="p">))</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">_load_plugin_lib</span><span class="p">():</span>
+<span class="k">def</span> <span class="nf">_load_plugin_lib</span><span class="p">():</span>
     <span class="n">on_windows</span> <span class="o">=</span> <span class="n">platform</span><span class="o">.</span><span class="n">system</span><span class="p">()</span> <span class="o">==</span> <span class="s2">&quot;Windows&quot;</span>
     <span class="n">winmode</span> <span class="o">=</span> <span class="mi">0</span> <span class="k">if</span> <span class="n">on_windows</span> <span class="k">else</span> <span class="kc">None</span>
     <span class="n">handle</span> <span class="o">=</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">CDLL</span><span class="p">(</span><span class="n">plugin_lib_path</span><span class="p">(),</span>
@@ -214,7 +214,7 @@
         <span class="n">handle</span><span class="o">.</span><span class="n">initTrtLlmPlugins</span><span class="o">.</span><span class="n">argtypes</span> <span class="o">=</span> <span class="p">[</span><span class="n">ctypes</span><span class="o">.</span><span class="n">c_void_p</span><span class="p">,</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">c_char_p</span><span class="p">]</span>
         <span class="n">handle</span><span class="o">.</span><span class="n">initTrtLlmPlugins</span><span class="o">.</span><span class="n">restype</span> <span class="o">=</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">c_bool</span>
     <span class="k">except</span> <span class="ne">AttributeError</span> <span class="k">as</span> <span class="n">err</span><span class="p">:</span>
-        <span class="k">raise</span> <span class="ne">ImportError</span><span class="p">(</span><span class="s1">&#39;TensorRT-LLM Plugin is unavailable&#39;</span><span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="nn">err</span>
+        <span class="k">raise</span> <span class="ne">ImportError</span><span class="p">(</span><span class="s1">&#39;TensorRT-LLM Plugin is unavailable&#39;</span><span class="p">)</span> <span class="kn">from</span> <span class="nn">err</span>
 
     <span class="k">try</span><span class="p">:</span>
         <span class="k">assert</span> <span class="n">handle</span><span class="o">.</span><span class="n">initTrtLlmPlugins</span><span class="p">(</span>
@@ -227,12 +227,12 @@
 <span class="s2">        https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170#latest-microsoft-visual-c-redistributable-version</span>
 <span class="s2">        &quot;&quot;&quot;</span>
         <span class="n">err_msg</span> <span class="o">=</span> <span class="n">dedent</span><span class="p">(</span><span class="n">windows_err</span> <span class="k">if</span> <span class="n">on_windows</span> <span class="k">else</span> <span class="s2">&quot;Unknown error&quot;</span><span class="p">)</span>
-        <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="n">err_msg</span><span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="nn">e</span>
+        <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="n">err_msg</span><span class="p">)</span> <span class="kn">from</span> <span class="nn">e</span>
     <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
         <span class="k">raise</span> <span class="n">e</span>
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">ContextFMHAType</span><span class="p">(</span><span class="n">IntEnum</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">ContextFMHAType</span><span class="p">(</span><span class="n">IntEnum</span><span class="p">):</span>
     <span class="n">disabled</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="c1"># FP16 I/O, FP16 Accumulation</span>
     <span class="n">enabled</span> <span class="o">=</span> <span class="mi">1</span>
@@ -252,13 +252,13 @@
 <span class="p">}</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">_make_plugin_property</span><span class="p">(</span><span class="n">field_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">field_type</span><span class="p">:</span> <span class="nb">type</span><span class="p">):</span>
+<span class="k">def</span> <span class="nf">_make_plugin_property</span><span class="p">(</span><span class="n">field_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">field_type</span><span class="p">:</span> <span class="nb">type</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">bind</span><span class="p">(</span><span class="n">field_name</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">bind</span><span class="p">(</span><span class="n">field_name</span><span class="p">):</span>
         <span class="n">storage_name</span> <span class="o">=</span> <span class="sa">f</span><span class="s1">&#39;_</span><span class="si">{</span><span class="n">field_name</span><span class="si">}</span><span class="s1">&#39;</span>
 
         <span class="nd">@property</span>
-        <span class="k">def</span><span class="w"> </span><span class="nf">prop</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">def</span> <span class="nf">prop</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
             <span class="n">field_value</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">storage_name</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">field_name</span> <span class="o">!=</span> <span class="s1">&#39;dtype&#39;</span> <span class="ow">and</span> <span class="n">field_value</span> <span class="o">==</span> <span class="s1">&#39;auto&#39;</span><span class="p">:</span>
                 <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span>
@@ -266,7 +266,7 @@
                 <span class="k">return</span> <span class="n">field_value</span>
 
         <span class="nd">@prop</span><span class="o">.</span><span class="n">setter</span>
-        <span class="k">def</span><span class="w"> </span><span class="nf">prop</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">value</span><span class="p">):</span>
+        <span class="k">def</span> <span class="nf">prop</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">value</span><span class="p">):</span>
             <span class="k">if</span> <span class="n">field_type</span> <span class="ow">is</span> <span class="nb">bool</span><span class="p">:</span>
                 <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">bool</span><span class="p">),</span> \
                     <span class="sa">f</span><span class="s2">&quot;Plugin </span><span class="si">{</span><span class="n">field_name</span><span class="si">}</span><span class="s2"> expects </span><span class="si">{</span><span class="n">field_type</span><span class="si">}</span><span class="s2">, got </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">value</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span>
@@ -287,9 +287,9 @@
     <span class="k">return</span> <span class="n">bind</span><span class="p">(</span><span class="n">field_name</span><span class="p">)</span>
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">PluginConfigMeta</span><span class="p">(</span><span class="nb">type</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">PluginConfigMeta</span><span class="p">(</span><span class="nb">type</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__new__</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">bases</span><span class="p">,</span> <span class="n">attrs</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__new__</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">bases</span><span class="p">,</span> <span class="n">attrs</span><span class="p">):</span>
         <span class="k">for</span> <span class="n">storage_name</span><span class="p">,</span> <span class="n">field_type</span> <span class="ow">in</span> <span class="n">attrs</span><span class="p">[</span><span class="s1">&#39;__annotations__&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
             <span class="k">assert</span> <span class="n">storage_name</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s1">&#39;_&#39;</span><span class="p">)</span>
             <span class="n">field_name</span> <span class="o">=</span> <span class="n">storage_name</span><span class="o">.</span><span class="n">lstrip</span><span class="p">(</span><span class="s1">&#39;_&#39;</span><span class="p">)</span>
@@ -300,7 +300,7 @@
 <div class="viewcode-block" id="PluginConfig">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.plugin.html#tensorrt_llm.plugin.PluginConfig">[docs]</a>
 <span class="nd">@dataclass</span><span class="p">(</span><span class="n">slots</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-<span class="k">class</span><span class="w"> </span><span class="nc">PluginConfig</span><span class="p">(</span><span class="n">metaclass</span><span class="o">=</span><span class="n">PluginConfigMeta</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">PluginConfig</span><span class="p">(</span><span class="n">metaclass</span><span class="o">=</span><span class="n">PluginConfigMeta</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;The config that manages plugin-related options.</span>
 
 <span class="sd">    There are two option categories:</span>
@@ -581,7 +581,7 @@
             <span class="s2">&quot;ReduceScatter + AllGather targeting large MoE models.&quot;</span>
         <span class="p">})</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">update_from_dict</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="nb">dict</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">update_from_dict</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="nb">dict</span><span class="p">):</span>
         <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">config</span><span class="o">.</span><span class="n">keys</span><span class="p">():</span>
             <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">):</span>
                 <span class="n">value_to_be_update</span> <span class="o">=</span> <span class="n">config</span><span class="p">[</span><span class="n">name</span><span class="p">]</span>
@@ -596,13 +596,13 @@
                 <span class="nb">setattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">value_to_be_update</span><span class="p">)</span>
 
     <span class="nd">@classmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">from_dict</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="nb">dict</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">from_dict</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="nb">dict</span><span class="p">):</span>
         <span class="n">plugin_config</span> <span class="o">=</span> <span class="bp">cls</span><span class="p">()</span>
         <span class="n">plugin_config</span><span class="o">.</span><span class="n">update_from_dict</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">plugin_config</span>
 
     <span class="nd">@classmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">from_arguments</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">args</span><span class="p">:</span> <span class="n">argparse</span><span class="o">.</span><span class="n">Namespace</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">from_arguments</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">args</span><span class="p">:</span> <span class="n">argparse</span><span class="o">.</span><span class="n">Namespace</span><span class="p">):</span>
         <span class="n">args</span> <span class="o">=</span> <span class="nb">vars</span><span class="p">(</span><span class="n">args</span><span class="p">)</span>
         <span class="n">obj</span> <span class="o">=</span> <span class="bp">cls</span><span class="o">.</span><span class="n">from_dict</span><span class="p">(</span><span class="n">args</span><span class="p">)</span>
 
@@ -613,7 +613,7 @@
 
         <span class="k">return</span> <span class="n">obj</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">to_dict</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">to_dict</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="n">config</span> <span class="o">=</span> <span class="n">asdict</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span>
         <span class="c1"># Remove prefix &quot;_&quot; of the storage name</span>
         <span class="n">config</span> <span class="o">=</span> <span class="p">{</span><span class="n">key</span><span class="o">.</span><span class="n">lstrip</span><span class="p">(</span><span class="s1">&#39;_&#39;</span><span class="p">):</span> <span class="n">value</span> <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">config</span><span class="o">.</span><span class="n">items</span><span class="p">()}</span>
@@ -621,7 +621,7 @@
 
 <div class="viewcode-block" id="PluginConfig.to_legacy_setting">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.plugin.html#tensorrt_llm.plugin.PluginConfig.to_legacy_setting">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">to_legacy_setting</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">to_legacy_setting</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&#39;&#39;&#39;Legacy setting means that all of the plugins and features are</span>
 <span class="sd">        disabled, this is needed for the legacy `build.py` script, which will be</span>
 <span class="sd">        migrated to the centralized building script `tensorrt_llm/commands/build.py`.</span>
@@ -639,7 +639,7 @@
                 <span class="nb">setattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">field_name</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span></div>
 
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">validate</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">validate</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="n">unsupported_plugins</span> <span class="o">=</span> <span class="p">{</span>
             <span class="c1"># bert_attention_plugin is handled within BertAttention</span>
             <span class="mi">100</span><span class="p">:</span> <span class="p">[</span>
@@ -657,7 +657,7 @@
                         <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">plugin</span><span class="si">}</span><span class="s2">=</span><span class="si">{</span><span class="n">val</span><span class="si">}</span><span class="s2"> is not supported on SM </span><span class="si">{</span><span class="n">sm</span><span class="si">}</span><span class="s2">.&quot;</span><span class="p">)</span>
 
     <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">context_fmha_type</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">context_fmha_type</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">bert_context_fmha_fp32_acc</span><span class="p">:</span>
             <span class="k">return</span> <span class="n">ContextFMHAType</span><span class="o">.</span><span class="n">enabled_with_fp32_acc</span>
         <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">context_fmha</span><span class="p">:</span>
@@ -665,11 +665,11 @@
         <span class="k">else</span><span class="p">:</span>
             <span class="k">return</span> <span class="n">ContextFMHAType</span><span class="o">.</span><span class="n">disabled</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">is_context_fmha_enabled</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">is_context_fmha_enabled</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">context_fmha_type</span> <span class="o">!=</span> <span class="n">ContextFMHAType</span><span class="o">.</span><span class="n">disabled</span>
 
     <span class="nd">@context_fmha_type</span><span class="o">.</span><span class="n">setter</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">context_fmha_type</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">value</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">context_fmha_type</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">value</span><span class="p">):</span>
         <span class="k">if</span> <span class="n">value</span> <span class="o">==</span> <span class="n">ContextFMHAType</span><span class="o">.</span><span class="n">disabled</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">context_fmha</span> <span class="o">=</span> <span class="kc">False</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">bert_context_fmha_fp32_acc</span> <span class="o">=</span> <span class="kc">False</span>
@@ -680,7 +680,7 @@
             <span class="k">elif</span> <span class="n">value</span> <span class="o">==</span> <span class="n">ContextFMHAType</span><span class="o">.</span><span class="n">enabled_with_fp32_acc</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">bert_context_fmha_fp32_acc</span> <span class="o">=</span> <span class="kc">True</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">set_smooth_quant_plugins</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;auto&quot;</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">set_smooth_quant_plugins</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;auto&quot;</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">smooth_quant_gemm_plugin</span> <span class="o">=</span> <span class="n">dtype</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">rmsnorm_quantization_plugin</span> <span class="o">=</span> <span class="n">dtype</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">layernorm_quantization_plugin</span> <span class="o">=</span> <span class="n">dtype</span>
@@ -688,13 +688,13 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">quantize_tensor_plugin</span> <span class="o">=</span> <span class="kc">True</span>
         <span class="k">return</span> <span class="bp">self</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">set_qserve_plugins</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;auto&quot;</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">set_qserve_plugins</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;auto&quot;</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">qserve_gemm_plugin</span> <span class="o">=</span> <span class="n">dtype</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">rmsnorm_quantization_plugin</span> <span class="o">=</span> <span class="n">dtype</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">quantize_per_token_plugin</span> <span class="o">=</span> <span class="kc">True</span>
         <span class="k">return</span> <span class="bp">self</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">set_fp8_rowwise_quant_plugins</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;auto&quot;</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">set_fp8_rowwise_quant_plugins</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;auto&quot;</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">fp8_rowwise_gemm_plugin</span> <span class="o">=</span> <span class="n">dtype</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">rmsnorm_quantization_plugin</span> <span class="o">=</span> <span class="n">dtype</span>
         <span class="c1"># self.layernorm_quantization_plugin = dtype</span>
@@ -702,22 +702,22 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">quantize_tensor_plugin</span> <span class="o">=</span> <span class="kc">True</span>
         <span class="k">return</span> <span class="bp">self</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">set_context_fmha</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">context_fmha_type</span><span class="o">=</span><span class="n">ContextFMHAType</span><span class="o">.</span><span class="n">enabled</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">set_context_fmha</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">context_fmha_type</span><span class="o">=</span><span class="n">ContextFMHAType</span><span class="o">.</span><span class="n">enabled</span><span class="p">):</span>
         <span class="k">assert</span> <span class="nb">type</span><span class="p">(</span><span class="n">context_fmha_type</span><span class="p">)</span> <span class="o">==</span> <span class="n">ContextFMHAType</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">context_fmha_type</span> <span class="o">=</span> <span class="n">context_fmha_type</span>
         <span class="k">return</span> <span class="bp">self</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">enable_paged_kv_cache</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tokens_per_block</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">64</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">enable_paged_kv_cache</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tokens_per_block</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">64</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">paged_kv_cache</span> <span class="o">=</span> <span class="kc">True</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span> <span class="o">=</span> <span class="n">tokens_per_block</span>
         <span class="k">return</span> <span class="bp">self</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">set_nccl_plugin</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;auto&quot;</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">set_nccl_plugin</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;auto&quot;</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">nccl_plugin</span> <span class="o">=</span> <span class="n">dtype</span>
         <span class="n">init_all_reduce_helper</span><span class="p">()</span>
         <span class="k">return</span> <span class="bp">self</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">set_lora_plugin</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">set_lora_plugin</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">lora_plugin</span> <span class="o">=</span> <span class="n">dtype</span>
         <span class="k">return</span> <span class="bp">self</span></div>
 
@@ -756,7 +756,7 @@
 <span class="p">]</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">add_plugin_argument</span><span class="p">(</span><span class="n">parser</span><span class="p">:</span> <span class="n">argparse</span><span class="o">.</span><span class="n">ArgumentParser</span><span class="p">):</span>
+<span class="k">def</span> <span class="nf">add_plugin_argument</span><span class="p">(</span><span class="n">parser</span><span class="p">:</span> <span class="n">argparse</span><span class="o">.</span><span class="n">ArgumentParser</span><span class="p">):</span>
     <span class="n">plugin_config</span> <span class="o">=</span> <span class="n">PluginConfig</span><span class="p">()</span>
     <span class="k">for</span> <span class="n">field</span> <span class="ow">in</span> <span class="n">fields</span><span class="p">(</span><span class="n">plugin_config</span><span class="p">):</span>
         <span class="c1"># Remove prefix &quot;_&quot; of the storage name</span>
@@ -796,12 +796,12 @@
     <span class="k">return</span> <span class="n">parser</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">force_all_reduce_deterministic</span><span class="p">():</span>
+<span class="k">def</span> <span class="nf">force_all_reduce_deterministic</span><span class="p">():</span>
     <span class="k">return</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">&quot;FORCE_DETERMINISTIC&quot;</span><span class="p">,</span> <span class="s2">&quot;0&quot;</span><span class="p">)</span> <span class="o">==</span> <span class="s2">&quot;1&quot;</span> <span class="ow">or</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span>
         <span class="s2">&quot;FORCE_ALL_REDUCE_DETERMINISTIC&quot;</span><span class="p">,</span> <span class="s2">&quot;0&quot;</span><span class="p">)</span> <span class="o">==</span> <span class="s2">&quot;1&quot;</span>
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">CustomAllReduceHelper</span><span class="p">:</span>
+<span class="k">class</span> <span class="nc">CustomAllReduceHelper</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">        Globally visible class to help usage of custom_all_reduce plugin.</span>
 <span class="sd">        Provides the following utilities:</span>
@@ -819,13 +819,13 @@
     <span class="n">POINTERS_PER_RANK</span> <span class="o">=</span> <span class="mi">7</span>
     <span class="n">POINTERS_OF_COUNTER</span> <span class="o">=</span> <span class="mi">2</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">workspace</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">set_workspace_tensor</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">set_workspace_tensor</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                              <span class="n">mapping</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">,</span>
                              <span class="n">num_profiles</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
-        <span class="kn">from</span><span class="w"> </span><span class="nn">..functional</span><span class="w"> </span><span class="kn">import</span> <span class="n">Tensor</span>
+        <span class="kn">from</span> <span class="nn">..functional</span> <span class="kn">import</span> <span class="n">Tensor</span>
         <span class="n">workspace_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">POINTERS_PER_RANK</span> <span class="o">*</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">POINTERS_OF_COUNTER</span>
 
         <span class="n">dim_range</span> <span class="o">=</span> <span class="kc">None</span>
@@ -841,7 +841,7 @@
         <span class="p">)</span>
 
     <span class="nd">@staticmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">max_workspace_size_auto</span><span class="p">(</span><span class="n">tp_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">max_workspace_size_auto</span><span class="p">(</span><span class="n">tp_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
         <span class="k">if</span> <span class="n">force_all_reduce_deterministic</span><span class="p">():</span>
             <span class="n">workspace_size</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">&quot;FORCE_ALLREDUCE_KERNEL_WORKSPACE_SIZE&quot;</span><span class="p">,</span>
                                        <span class="s2">&quot;1000000000&quot;</span><span class="p">)</span>
@@ -851,9 +851,9 @@
         <span class="k">return</span> <span class="mi">8_000_000</span>
 
     <span class="nd">@staticmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">allocate_workspace</span><span class="p">(</span><span class="n">mapping</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">allocate_workspace</span><span class="p">(</span><span class="n">mapping</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">,</span>
                            <span class="n">size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="n">IpcMemory</span><span class="p">],</span> <span class="s2">&quot;torch.tensor&quot;</span><span class="p">]:</span>
-        <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+        <span class="kn">import</span> <span class="nn">torch</span>
 
         <span class="c1"># Force pull mode and disable lamport when force deterministic is enabled, for reducing device memory usage.</span>
         <span class="n">force_deterministic</span> <span class="o">=</span> <span class="n">force_all_reduce_deterministic</span><span class="p">()</span>
@@ -903,12 +903,12 @@
 <span class="n">custom_all_reduce_helper</span> <span class="o">=</span> <span class="kc">None</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">init_all_reduce_helper</span><span class="p">():</span>
+<span class="k">def</span> <span class="nf">init_all_reduce_helper</span><span class="p">():</span>
     <span class="k">global</span> <span class="n">custom_all_reduce_helper</span>
     <span class="n">custom_all_reduce_helper</span> <span class="o">=</span> <span class="n">CustomAllReduceHelper</span><span class="p">()</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">current_all_reduce_helper</span><span class="p">():</span>
+<span class="k">def</span> <span class="nf">current_all_reduce_helper</span><span class="p">():</span>
     <span class="k">global</span> <span class="n">custom_all_reduce_helper</span>
     <span class="k">assert</span> <span class="n">custom_all_reduce_helper</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;You must call `init_all_reduce_helper` first&quot;</span>
     <span class="k">return</span> <span class="n">custom_all_reduce_helper</span>
@@ -921,7 +921,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f63fe3c1010>
+<jinja2.runtime.BlockReference object at 0x7fdeef1c6630>
 
 <div class="footer">
     <p>

@@ -6,7 +6,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>tensorrt_llm.quantization.quantize_by_modelopt &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="../../../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
 
@@ -14,7 +14,7 @@
       <script src="../../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../../../_static/doctools.js?v=9a2dae69"></script>
       <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
@@ -117,7 +117,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../performance/introduction.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -179,28 +179,28 @@
 <span class="sd">Adapted from examples/quantization/hf_ptq.py</span>
 <span class="sd">&quot;&quot;&quot;</span>
 
-<span class="kn">import</span><span class="w"> </span><span class="nn">copy</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">random</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">importlib.metadata</span><span class="w"> </span><span class="kn">import</span> <span class="n">version</span>
+<span class="kn">import</span> <span class="nn">copy</span>
+<span class="kn">import</span> <span class="nn">json</span>
+<span class="kn">import</span> <span class="nn">os</span>
+<span class="kn">import</span> <span class="nn">random</span>
+<span class="kn">import</span> <span class="nn">sys</span>
+<span class="kn">import</span> <span class="nn">time</span>
+<span class="kn">from</span> <span class="nn">importlib.metadata</span> <span class="kn">import</span> <span class="n">version</span>
 
-<span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">accelerate.hooks</span><span class="w"> </span><span class="kn">import</span> <span class="n">remove_hook_from_module</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">datasets</span><span class="w"> </span><span class="kn">import</span> <span class="n">load_dataset</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">safetensors.torch</span><span class="w"> </span><span class="kn">import</span> <span class="n">load_file</span><span class="p">,</span> <span class="n">save_file</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">torch.utils.data</span><span class="w"> </span><span class="kn">import</span> <span class="n">DataLoader</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">AutoConfig</span><span class="p">,</span> <span class="n">AutoModelForCausalLM</span><span class="p">,</span> <span class="n">AutoProcessor</span><span class="p">,</span>
+<span class="kn">import</span> <span class="nn">numpy</span> <span class="k">as</span> <span class="nn">np</span>
+<span class="kn">import</span> <span class="nn">torch</span>
+<span class="kn">from</span> <span class="nn">accelerate.hooks</span> <span class="kn">import</span> <span class="n">remove_hook_from_module</span>
+<span class="kn">from</span> <span class="nn">datasets</span> <span class="kn">import</span> <span class="n">load_dataset</span>
+<span class="kn">from</span> <span class="nn">safetensors.torch</span> <span class="kn">import</span> <span class="n">load_file</span><span class="p">,</span> <span class="n">save_file</span>
+<span class="kn">from</span> <span class="nn">torch.utils.data</span> <span class="kn">import</span> <span class="n">DataLoader</span>
+<span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="p">(</span><span class="n">AutoConfig</span><span class="p">,</span> <span class="n">AutoModelForCausalLM</span><span class="p">,</span> <span class="n">AutoProcessor</span><span class="p">,</span>
                           <span class="n">AutoTokenizer</span><span class="p">)</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">.._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">release_gc</span><span class="p">,</span> <span class="n">str_dtype_to_torch</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..logger</span><span class="w"> </span><span class="kn">import</span> <span class="n">logger</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..mapping</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.image_processing</span><span class="w"> </span><span class="kn">import</span> <span class="n">MllamaImageProcessor</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.mode</span><span class="w"> </span><span class="kn">import</span> <span class="n">QuantAlgo</span>
+<span class="kn">from</span> <span class="nn">.._utils</span> <span class="kn">import</span> <span class="n">release_gc</span><span class="p">,</span> <span class="n">str_dtype_to_torch</span>
+<span class="kn">from</span> <span class="nn">..logger</span> <span class="kn">import</span> <span class="n">logger</span>
+<span class="kn">from</span> <span class="nn">..mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
+<span class="kn">from</span> <span class="nn">.image_processing</span> <span class="kn">import</span> <span class="n">MllamaImageProcessor</span>
+<span class="kn">from</span> <span class="nn">.mode</span> <span class="kn">import</span> <span class="n">QuantAlgo</span>
 
 <span class="n">EMPTY_CFG</span> <span class="o">=</span> <span class="p">{</span>
     <span class="s2">&quot;quant_cfg&quot;</span><span class="p">:</span> <span class="p">{</span>
@@ -257,8 +257,8 @@
 <span class="p">}</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">quant_cfg_choices</span><span class="p">():</span>
-    <span class="kn">import</span><span class="w"> </span><span class="nn">modelopt.torch.quantization</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">mtq</span>
+<span class="k">def</span> <span class="nf">quant_cfg_choices</span><span class="p">():</span>
+    <span class="kn">import</span> <span class="nn">modelopt.torch.quantization</span> <span class="k">as</span> <span class="nn">mtq</span>
     <span class="n">QUANT_CFG_CHOICES</span> <span class="o">=</span> <span class="p">{</span>
         <span class="s2">&quot;int8_sq&quot;</span><span class="p">:</span> <span class="n">mtq</span><span class="o">.</span><span class="n">INT8_SMOOTHQUANT_CFG</span><span class="p">,</span>
         <span class="s2">&quot;fp8&quot;</span><span class="p">:</span> <span class="n">mtq</span><span class="o">.</span><span class="n">FP8_DEFAULT_CFG</span><span class="p">,</span>
@@ -311,23 +311,23 @@
 <span class="n">MULTIMODAL_DATASETS</span> <span class="o">=</span> <span class="p">[</span><span class="s1">&#39;scienceqa&#39;</span><span class="p">,</span> <span class="s1">&#39;science_qa&#39;</span><span class="p">]</span>
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">_CustomDataset</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">utils</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">Dataset</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">_CustomDataset</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">utils</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">Dataset</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">encodings</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">encodings</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">encodings</span> <span class="o">=</span> <span class="n">encodings</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__getitem__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">idx</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__getitem__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">idx</span><span class="p">):</span>
         <span class="n">item</span> <span class="o">=</span> <span class="p">{</span>
             <span class="n">key</span><span class="p">:</span> <span class="n">val</span><span class="p">[</span><span class="n">idx</span><span class="p">]</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">(</span><span class="kc">False</span><span class="p">)</span>
             <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">val</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">encodings</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
         <span class="p">}</span>
         <span class="k">return</span> <span class="n">item</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__len__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__len__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">encodings</span><span class="p">[</span><span class="s2">&quot;input_ids&quot;</span><span class="p">])</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">get_tokenizer</span><span class="p">(</span><span class="n">ckpt_path</span><span class="p">,</span> <span class="n">max_seq_length</span><span class="o">=</span><span class="mi">2048</span><span class="p">,</span> <span class="n">model_type</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+<span class="k">def</span> <span class="nf">get_tokenizer</span><span class="p">(</span><span class="n">ckpt_path</span><span class="p">,</span> <span class="n">max_seq_length</span><span class="o">=</span><span class="mi">2048</span><span class="p">,</span> <span class="n">model_type</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
     <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Initializing tokenizer from </span><span class="si">{</span><span class="n">ckpt_path</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
     <span class="n">tokenizer</span> <span class="o">=</span> <span class="n">AutoTokenizer</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
         <span class="n">ckpt_path</span><span class="p">,</span>
@@ -348,7 +348,7 @@
     <span class="k">return</span> <span class="n">tokenizer</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">get_processor</span><span class="p">(</span><span class="n">ckpt_path</span><span class="p">,</span> <span class="n">max_seq_length</span><span class="o">=</span><span class="mi">2048</span><span class="p">,</span> <span class="n">model_type</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+<span class="k">def</span> <span class="nf">get_processor</span><span class="p">(</span><span class="n">ckpt_path</span><span class="p">,</span> <span class="n">max_seq_length</span><span class="o">=</span><span class="mi">2048</span><span class="p">,</span> <span class="n">model_type</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
     <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Initializing tokenizer from </span><span class="si">{</span><span class="n">ckpt_path</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
     <span class="n">processor</span> <span class="o">=</span> <span class="n">AutoProcessor</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
         <span class="n">ckpt_path</span><span class="p">,</span>
@@ -373,10 +373,10 @@
     <span class="k">return</span> <span class="n">processor</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">_get_vila_model</span><span class="p">(</span><span class="n">model_dir</span><span class="p">):</span>
+<span class="k">def</span> <span class="nf">_get_vila_model</span><span class="p">(</span><span class="n">model_dir</span><span class="p">):</span>
     <span class="n">sys</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">model_dir</span> <span class="o">+</span> <span class="s2">&quot;/../VILA&quot;</span><span class="p">)</span>
-    <span class="kn">from</span><span class="w"> </span><span class="nn">llava.model</span><span class="w"> </span><span class="kn">import</span> <span class="n">LlavaLlamaConfig</span><span class="p">,</span> <span class="n">LlavaLlamaModel</span>  <span class="c1"># noqa</span>
-    <span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">AutoModel</span>
+    <span class="kn">from</span> <span class="nn">llava.model</span> <span class="kn">import</span> <span class="n">LlavaLlamaConfig</span><span class="p">,</span> <span class="n">LlavaLlamaModel</span>  <span class="c1"># noqa</span>
+    <span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">AutoModel</span>
     <span class="n">model</span> <span class="o">=</span> <span class="n">AutoModel</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
         <span class="n">model_dir</span><span class="p">,</span>
         <span class="n">device_map</span><span class="o">=</span><span class="s1">&#39;auto&#39;</span><span class="p">,</span>
@@ -385,23 +385,23 @@
     <span class="k">return</span> <span class="n">model</span><span class="o">.</span><span class="n">llm</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">get_hf_config</span><span class="p">(</span><span class="n">ckpt_path</span><span class="p">):</span>
+<span class="k">def</span> <span class="nf">get_hf_config</span><span class="p">(</span><span class="n">ckpt_path</span><span class="p">):</span>
     <span class="k">if</span> <span class="s2">&quot;mpt&quot;</span> <span class="ow">in</span> <span class="n">ckpt_path</span><span class="p">:</span>
         <span class="c1"># MPT-7B cannot get initialized from AutoConfig</span>
-        <span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">MptConfig</span>
+        <span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">MptConfig</span>
         <span class="k">return</span> <span class="n">MptConfig</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">ckpt_path</span><span class="p">)</span>
     <span class="k">else</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">AutoConfig</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">ckpt_path</span><span class="p">,</span> <span class="n">trust_remote_code</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">_get_llava_qwen_model</span><span class="p">(</span><span class="n">model_dir</span><span class="p">,</span> <span class="n">dtype</span><span class="p">,</span> <span class="n">device</span><span class="p">):</span>
+<span class="k">def</span> <span class="nf">_get_llava_qwen_model</span><span class="p">(</span><span class="n">model_dir</span><span class="p">,</span> <span class="n">dtype</span><span class="p">,</span> <span class="n">device</span><span class="p">):</span>
     <span class="k">if</span> <span class="s2">&quot;hf&quot;</span> <span class="ow">in</span> <span class="n">model_dir</span><span class="p">:</span>
-        <span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">LlavaOnevisionForConditionalGeneration</span>
+        <span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">LlavaOnevisionForConditionalGeneration</span>
         <span class="n">model</span> <span class="o">=</span> <span class="n">LlavaOnevisionForConditionalGeneration</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
             <span class="n">model_dir</span><span class="p">,</span> <span class="n">torch_dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span> <span class="n">device_map</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
         <span class="n">model</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">language_model</span>
     <span class="k">else</span><span class="p">:</span>
-        <span class="kn">from</span><span class="w"> </span><span class="nn">llava.model.builder</span><span class="w"> </span><span class="kn">import</span> <span class="n">load_pretrained_model</span>
+        <span class="kn">from</span> <span class="nn">llava.model.builder</span> <span class="kn">import</span> <span class="n">load_pretrained_model</span>
         <span class="n">_</span><span class="p">,</span> <span class="n">model</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">load_pretrained_model</span><span class="p">(</span><span class="n">model_dir</span><span class="p">,</span>
                                                <span class="kc">None</span><span class="p">,</span>
                                                <span class="s1">&#39;llava_qwen&#39;</span><span class="p">,</span>
@@ -410,7 +410,7 @@
     <span class="k">return</span> <span class="n">model</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">get_model</span><span class="p">(</span><span class="n">ckpt_path</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+<span class="k">def</span> <span class="nf">get_model</span><span class="p">(</span><span class="n">ckpt_path</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
               <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s1">&#39;bfloat16&#39;</span><span class="p">,</span>
               <span class="n">device</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s1">&#39;cuda&#39;</span><span class="p">,</span>
               <span class="n">device_map</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;auto&quot;</span><span class="p">):</span>
@@ -421,13 +421,13 @@
 
     <span class="n">model_cls</span> <span class="o">=</span> <span class="n">AutoModelForCausalLM</span>
     <span class="k">if</span> <span class="n">hf_config</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;llava&quot;</span><span class="p">:</span>
-        <span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">LlavaForConditionalGeneration</span>
+        <span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">LlavaForConditionalGeneration</span>
         <span class="n">model_cls</span> <span class="o">=</span> <span class="n">LlavaForConditionalGeneration</span>
     <span class="k">elif</span> <span class="n">hf_config</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;mpt&quot;</span><span class="p">:</span>
-        <span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">MptForCausalLM</span>
+        <span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">MptForCausalLM</span>
         <span class="n">model_cls</span> <span class="o">=</span> <span class="n">MptForCausalLM</span>
     <span class="k">elif</span> <span class="n">hf_config</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;mllama&#39;</span><span class="p">:</span>
-        <span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">MllamaForConditionalGeneration</span>
+        <span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">MllamaForConditionalGeneration</span>
         <span class="n">model_cls</span> <span class="o">=</span> <span class="n">MllamaForConditionalGeneration</span>
 
     <span class="k">if</span> <span class="s2">&quot;vila&quot;</span> <span class="ow">in</span> <span class="n">ckpt_path</span><span class="p">:</span>
@@ -435,7 +435,7 @@
     <span class="k">elif</span> <span class="s2">&quot;llava-onevision-qwen2&quot;</span> <span class="ow">in</span> <span class="n">ckpt_path</span><span class="p">:</span>
         <span class="n">model</span> <span class="o">=</span> <span class="n">_get_llava_qwen_model</span><span class="p">(</span><span class="n">ckpt_path</span><span class="p">,</span> <span class="n">dtype</span><span class="p">,</span> <span class="n">device</span><span class="p">)</span>
     <span class="k">elif</span> <span class="n">hf_config</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;glm&quot;</span><span class="p">:</span>
-        <span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">AutoModelForSeq2SeqLM</span>
+        <span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">AutoModelForSeq2SeqLM</span>
         <span class="n">model</span> <span class="o">=</span> <span class="n">AutoModelForSeq2SeqLM</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">ckpt_path</span><span class="p">,</span>
                                                       <span class="n">device_map</span><span class="o">=</span><span class="s2">&quot;cuda&quot;</span><span class="p">,</span>
                                                       <span class="n">torch_dtype</span><span class="o">=</span><span class="n">torch_dtype</span><span class="p">,</span>
@@ -460,7 +460,7 @@
     <span class="k">return</span> <span class="n">model</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">get_model_type</span><span class="p">(</span><span class="n">model</span><span class="p">):</span>
+<span class="k">def</span> <span class="nf">get_model_type</span><span class="p">(</span><span class="n">model</span><span class="p">):</span>
     <span class="k">if</span> <span class="nb">type</span><span class="p">(</span><span class="n">model</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span> <span class="ow">in</span> <span class="n">MODEL_NAME_PATTERN_MAP</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">MODEL_NAME_PATTERN_MAP</span><span class="p">[</span><span class="nb">type</span><span class="p">(</span><span class="n">model</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="p">]</span>
     <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">MODEL_NAME_PATTERN_MAP</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
@@ -469,7 +469,7 @@
     <span class="k">return</span> <span class="kc">None</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">get_calib_dataloader</span><span class="p">(</span><span class="n">dataset_name_or_dir</span><span class="o">=</span><span class="s2">&quot;cnn_dailymail&quot;</span><span class="p">,</span>
+<span class="k">def</span> <span class="nf">get_calib_dataloader</span><span class="p">(</span><span class="n">dataset_name_or_dir</span><span class="o">=</span><span class="s2">&quot;cnn_dailymail&quot;</span><span class="p">,</span>
                          <span class="n">tokenizer</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                          <span class="n">batch_size</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
                          <span class="n">calib_size</span><span class="o">=</span><span class="mi">512</span><span class="p">,</span>
@@ -555,15 +555,15 @@
     <span class="k">return</span> <span class="n">calib_dataloader</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">quantize_model</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">quant_cfg</span><span class="p">,</span> <span class="n">calib_dataloader</span><span class="p">,</span> <span class="n">batch_size</span><span class="p">,</span> <span class="n">qformat</span><span class="p">,</span>
+<span class="k">def</span> <span class="nf">quantize_model</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">quant_cfg</span><span class="p">,</span> <span class="n">calib_dataloader</span><span class="p">,</span> <span class="n">batch_size</span><span class="p">,</span> <span class="n">qformat</span><span class="p">,</span>
                    <span class="n">auto_quantize_bits</span><span class="p">):</span>
-    <span class="kn">import</span><span class="w"> </span><span class="nn">modelopt.torch.quantization</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">mtq</span>
+    <span class="kn">import</span> <span class="nn">modelopt.torch.quantization</span> <span class="k">as</span> <span class="nn">mtq</span>
 
     <span class="c1"># NOTE: for ModelOpt v0.19 release</span>
     <span class="c1"># calibrate_loop = dataset_utils.create_forward_loop(</span>
     <span class="c1">#     calib_dataloader, dataloader=calib_dataloader)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">calibrate_loop</span><span class="p">():</span>
+    <span class="k">def</span> <span class="nf">calibrate_loop</span><span class="p">():</span>
         <span class="k">if</span> <span class="n">calib_dataloader</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span>
         <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
@@ -610,7 +610,7 @@
     <span class="k">if</span> <span class="n">auto_quantize_bits</span><span class="p">:</span>
         <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">&quot;Starting mixed precision quantization...&quot;</span><span class="p">)</span>
 
-        <span class="kn">from</span><span class="w"> </span><span class="nn">packaging</span><span class="w"> </span><span class="kn">import</span> <span class="n">version</span> <span class="k">as</span> <span class="n">v</span>
+        <span class="kn">from</span> <span class="nn">packaging</span> <span class="kn">import</span> <span class="n">version</span> <span class="k">as</span> <span class="n">v</span>
         <span class="n">opt_kwargs</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="n">modelopt_version</span> <span class="o">=</span> <span class="n">version</span><span class="p">(</span><span class="s1">&#39;nvidia-modelopt&#39;</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">v</span><span class="o">.</span><span class="n">parse</span><span class="p">(</span><span class="n">modelopt_version</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">v</span><span class="o">.</span><span class="n">parse</span><span class="p">(</span><span class="s2">&quot;0.21&quot;</span><span class="p">):</span>
@@ -667,7 +667,7 @@
     <span class="k">return</span> <span class="n">model</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">combine_medusa_weight</span><span class="p">(</span><span class="n">tp_size</span><span class="p">,</span> <span class="n">pp_size</span><span class="p">,</span> <span class="n">base_model_output_dir</span><span class="p">,</span>
+<span class="k">def</span> <span class="nf">combine_medusa_weight</span><span class="p">(</span><span class="n">tp_size</span><span class="p">,</span> <span class="n">pp_size</span><span class="p">,</span> <span class="n">base_model_output_dir</span><span class="p">,</span>
                           <span class="n">num_medusa_heads</span><span class="p">,</span> <span class="n">num_medusa_layers</span><span class="p">,</span> <span class="n">max_draft_len</span><span class="p">,</span>
                           <span class="n">medusa_hidden_act</span><span class="p">,</span> <span class="n">medusa_model_dir</span><span class="p">,</span>
                           <span class="n">quant_medusa_head</span><span class="p">):</span>
@@ -692,7 +692,7 @@
                           <span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
                           <span class="n">pp_size</span><span class="o">=</span><span class="n">pp_size</span><span class="p">)</span>
         <span class="c1"># 1. Load medusa weight for each rank</span>
-        <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.models.medusa.weight</span><span class="w"> </span><span class="kn">import</span> <span class="n">load_medusa_hf</span>
+        <span class="kn">from</span> <span class="nn">tensorrt_llm.models.medusa.weight</span> <span class="kn">import</span> <span class="n">load_medusa_hf</span>
         <span class="n">medusa_weights</span> <span class="o">=</span> <span class="n">load_medusa_hf</span><span class="p">(</span><span class="n">medusa_path</span><span class="o">=</span><span class="n">medusa_model_dir</span><span class="p">,</span>
                                         <span class="n">num_medusa_heads</span><span class="o">=</span><span class="n">num_medusa_heads</span><span class="p">,</span>
                                         <span class="n">num_medusa_layers</span><span class="o">=</span><span class="n">num_medusa_layers</span><span class="p">,</span>
@@ -736,7 +736,7 @@
 
 <div class="viewcode-block" id="quantize_and_export">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.quantization.html#tensorrt_llm.quantization.quantize_and_export">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">quantize_and_export</span><span class="p">(</span><span class="o">*</span><span class="p">,</span>
+<span class="k">def</span> <span class="nf">quantize_and_export</span><span class="p">(</span><span class="o">*</span><span class="p">,</span>
                         <span class="n">model_dir</span><span class="p">,</span>
                         <span class="n">device</span><span class="p">,</span>
                         <span class="n">calib_dataset</span><span class="p">,</span>
@@ -766,16 +766,16 @@
 <span class="sd">        the quantized model as TRT-LLM checkpoint</span>
 <span class="sd">    &#39;&#39;&#39;</span>
     <span class="k">try</span><span class="p">:</span>
-        <span class="kn">import</span><span class="w"> </span><span class="nn">modelopt</span>  <span class="c1"># noqa</span>
+        <span class="kn">import</span> <span class="nn">modelopt</span>  <span class="c1"># noqa</span>
     <span class="k">except</span> <span class="ne">ImportError</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
         <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span>
             <span class="s2">&quot;Failed to import modelopt, pls check the Modelopt installation. Currently it is known to be unsupported on Windows OS&quot;</span>
         <span class="p">)</span>
         <span class="k">raise</span> <span class="n">e</span>
 
-    <span class="kn">from</span><span class="w"> </span><span class="nn">modelopt.torch.export</span><span class="w"> </span><span class="kn">import</span> <span class="n">export_tensorrt_llm_checkpoint</span>
+    <span class="kn">from</span> <span class="nn">modelopt.torch.export</span> <span class="kn">import</span> <span class="n">export_tensorrt_llm_checkpoint</span>
 
-    <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.models.convert_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">infer_dtype</span>
+    <span class="kn">from</span> <span class="nn">tensorrt_llm.models.convert_utils</span> <span class="kn">import</span> <span class="n">infer_dtype</span>
 
     <span class="k">if</span> <span class="ow">not</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">():</span>
         <span class="k">raise</span> <span class="ne">EnvironmentError</span><span class="p">(</span><span class="s2">&quot;GPU is required for inference.&quot;</span><span class="p">)</span>
@@ -943,7 +943,7 @@
             <span class="n">qwen_config</span> <span class="o">=</span> <span class="n">AutoConfig</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">model_dir</span><span class="p">,</span>
                                                      <span class="n">trust_remote_code</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
             <span class="k">try</span><span class="p">:</span>
-                <span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">LlavaOnevisionConfig</span>
+                <span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">LlavaOnevisionConfig</span>
                 <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">qwen_config</span><span class="p">,</span> <span class="n">LlavaOnevisionConfig</span><span class="p">):</span>
                     <span class="n">qwen_config</span> <span class="o">=</span> <span class="n">qwen_config</span><span class="o">.</span><span class="n">text_config</span>
             <span class="k">except</span><span class="p">:</span>
@@ -1010,7 +1010,7 @@
 
         <span class="c1"># Workaround for mllama</span>
         <span class="k">if</span> <span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;mllama&#39;</span><span class="p">:</span>
-            <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.models.mllama.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">MLLaMAConfig</span>
+            <span class="kn">from</span> <span class="nn">tensorrt_llm.models.mllama.config</span> <span class="kn">import</span> <span class="n">MLLaMAConfig</span>
             <span class="n">config</span> <span class="o">=</span> <span class="n">MLLaMAConfig</span><span class="o">.</span><span class="n">from_hugging_face</span><span class="p">(</span>
                 <span class="n">model_dir</span><span class="p">,</span>
                 <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
@@ -1035,10 +1035,10 @@
 
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">unwrap_model</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">module_instances</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+<span class="k">def</span> <span class="nf">unwrap_model</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">module_instances</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
     <span class="c1"># Reference: https://github.com/NVIDIA/Megatron-LM/blob/core_r0.8.0/megatron/training/utils.py</span>
-    <span class="kn">from</span><span class="w"> </span><span class="nn">megatron.core</span><span class="w"> </span><span class="kn">import</span> <span class="n">DistributedDataParallel</span> <span class="k">as</span> <span class="n">DDP</span>
-    <span class="kn">from</span><span class="w"> </span><span class="nn">megatron.core.transformer.module</span><span class="w"> </span><span class="kn">import</span> <span class="n">Float16Module</span>
+    <span class="kn">from</span> <span class="nn">megatron.core</span> <span class="kn">import</span> <span class="n">DistributedDataParallel</span> <span class="k">as</span> <span class="n">DDP</span>
+    <span class="kn">from</span> <span class="nn">megatron.core.transformer.module</span> <span class="kn">import</span> <span class="n">Float16Module</span>
 
     <span class="k">if</span> <span class="n">module_instances</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">module_instances</span> <span class="o">=</span> <span class="p">(</span><span class="n">DDP</span><span class="p">,</span> <span class="n">Float16Module</span><span class="p">)</span>
@@ -1057,7 +1057,7 @@
     <span class="k">return</span> <span class="n">unwrapped_model</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">get_nemo_calib_dataloader</span><span class="p">(</span><span class="n">dataset_name_or_dir</span><span class="o">=</span><span class="s2">&quot;cnn_dailymail&quot;</span><span class="p">,</span>
+<span class="k">def</span> <span class="nf">get_nemo_calib_dataloader</span><span class="p">(</span><span class="n">dataset_name_or_dir</span><span class="o">=</span><span class="s2">&quot;cnn_dailymail&quot;</span><span class="p">,</span>
                               <span class="n">batch_size</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span>
                               <span class="n">calib_size</span><span class="o">=</span><span class="mi">512</span><span class="p">,</span>
                               <span class="n">max_sequence_length</span><span class="o">=</span><span class="mi">512</span><span class="p">):</span>
@@ -1094,33 +1094,33 @@
         <span class="k">yield</span> <span class="n">batch</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">quantize_nemo_and_export</span><span class="p">(</span><span class="o">*</span><span class="p">,</span> <span class="n">nemo_ckpt_path</span><span class="p">,</span> <span class="n">decoder_type</span><span class="p">,</span> <span class="n">calib_dataset</span><span class="p">,</span>
+<span class="k">def</span> <span class="nf">quantize_nemo_and_export</span><span class="p">(</span><span class="o">*</span><span class="p">,</span> <span class="n">nemo_ckpt_path</span><span class="p">,</span> <span class="n">decoder_type</span><span class="p">,</span> <span class="n">calib_dataset</span><span class="p">,</span>
                              <span class="n">calib_tp_size</span><span class="p">,</span> <span class="n">calib_pp_size</span><span class="p">,</span> <span class="n">dtype</span><span class="p">,</span> <span class="n">qformat</span><span class="p">,</span>
                              <span class="n">kv_cache_dtype</span><span class="p">,</span> <span class="n">calib_size</span><span class="p">,</span> <span class="n">batch_size</span><span class="p">,</span>
                              <span class="n">calib_max_seq_length</span><span class="p">,</span> <span class="n">awq_block_size</span><span class="p">,</span> <span class="n">output_dir</span><span class="p">,</span>
                              <span class="n">tp_size</span><span class="p">,</span> <span class="n">pp_size</span><span class="p">,</span> <span class="n">cp_size</span><span class="p">,</span> <span class="n">seed</span><span class="p">):</span>
     <span class="k">try</span><span class="p">:</span>
-        <span class="kn">import</span><span class="w"> </span><span class="nn">modelopt</span>  <span class="c1"># noqa</span>
+        <span class="kn">import</span> <span class="nn">modelopt</span>  <span class="c1"># noqa</span>
     <span class="k">except</span> <span class="ne">ImportError</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
         <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span>
             <span class="s2">&quot;Failed to import modelopt, pls check the modelopt installation. Currently it is known to be unsupported on Windows OS&quot;</span>
         <span class="p">)</span>
         <span class="k">raise</span> <span class="n">e</span>
 
-    <span class="kn">import</span><span class="w"> </span><span class="nn">modelopt.torch.quantization</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">mtq</span>
-    <span class="kn">from</span><span class="w"> </span><span class="nn">megatron.core</span><span class="w"> </span><span class="kn">import</span> <span class="n">parallel_state</span>
-    <span class="kn">from</span><span class="w"> </span><span class="nn">megatron.core.transformer.module</span><span class="w"> </span><span class="kn">import</span> <span class="n">Float16Module</span>
-    <span class="kn">from</span><span class="w"> </span><span class="nn">modelopt.torch.export</span><span class="w"> </span><span class="kn">import</span> <span class="n">export_tensorrt_llm_checkpoint</span>
-    <span class="kn">from</span><span class="w"> </span><span class="nn">modelopt.torch.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">print_rank_0</span>
-    <span class="kn">from</span><span class="w"> </span><span class="nn">nemo.collections.nlp.models.language_modeling.megatron_gpt_model</span><span class="w"> </span><span class="kn">import</span> \
+    <span class="kn">import</span> <span class="nn">modelopt.torch.quantization</span> <span class="k">as</span> <span class="nn">mtq</span>
+    <span class="kn">from</span> <span class="nn">megatron.core</span> <span class="kn">import</span> <span class="n">parallel_state</span>
+    <span class="kn">from</span> <span class="nn">megatron.core.transformer.module</span> <span class="kn">import</span> <span class="n">Float16Module</span>
+    <span class="kn">from</span> <span class="nn">modelopt.torch.export</span> <span class="kn">import</span> <span class="n">export_tensorrt_llm_checkpoint</span>
+    <span class="kn">from</span> <span class="nn">modelopt.torch.utils</span> <span class="kn">import</span> <span class="n">print_rank_0</span>
+    <span class="kn">from</span> <span class="nn">nemo.collections.nlp.models.language_modeling.megatron_gpt_model</span> <span class="kn">import</span> \
         <span class="n">MegatronGPTModel</span>
-    <span class="kn">from</span><span class="w"> </span><span class="nn">nemo.collections.nlp.modules.common.text_generation_strategy</span><span class="w"> </span><span class="kn">import</span> \
+    <span class="kn">from</span> <span class="nn">nemo.collections.nlp.modules.common.text_generation_strategy</span> <span class="kn">import</span> \
         <span class="n">GPTModelTextGenerationStrategy</span>
-    <span class="kn">from</span><span class="w"> </span><span class="nn">nemo.collections.nlp.parts.nlp_overrides</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+    <span class="kn">from</span> <span class="nn">nemo.collections.nlp.parts.nlp_overrides</span> <span class="kn">import</span> <span class="p">(</span>
         <span class="n">NLPDDPStrategy</span><span class="p">,</span> <span class="n">NLPSaveRestoreConnector</span><span class="p">)</span>
-    <span class="kn">from</span><span class="w"> </span><span class="nn">nemo.utils.model_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">load_config</span><span class="p">,</span> <span class="n">save_artifacts</span>
-    <span class="kn">from</span><span class="w"> </span><span class="nn">omegaconf.omegaconf</span><span class="w"> </span><span class="kn">import</span> <span class="n">open_dict</span>
-    <span class="kn">from</span><span class="w"> </span><span class="nn">pytorch_lightning.trainer.trainer</span><span class="w"> </span><span class="kn">import</span> <span class="n">Trainer</span>
+    <span class="kn">from</span> <span class="nn">nemo.utils.model_utils</span> <span class="kn">import</span> <span class="n">load_config</span><span class="p">,</span> <span class="n">save_artifacts</span>
+    <span class="kn">from</span> <span class="nn">omegaconf.omegaconf</span> <span class="kn">import</span> <span class="n">open_dict</span>
+    <span class="kn">from</span> <span class="nn">pytorch_lightning.trainer.trainer</span> <span class="kn">import</span> <span class="n">Trainer</span>
 
     <span class="k">if</span> <span class="ow">not</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">():</span>
         <span class="k">raise</span> <span class="ne">EnvironmentError</span><span class="p">(</span><span class="s2">&quot;GPU is required for the inference.&quot;</span><span class="p">)</span>
@@ -1185,7 +1185,7 @@
     <span class="c1"># Check whether the DDP is initialized</span>
     <span class="k">if</span> <span class="n">parallel_state</span><span class="o">.</span><span class="n">is_unitialized</span><span class="p">():</span>
 
-        <span class="k">def</span><span class="w"> </span><span class="nf">dummy</span><span class="p">():</span>
+        <span class="k">def</span> <span class="nf">dummy</span><span class="p">():</span>
             <span class="k">return</span>
 
         <span class="k">if</span> <span class="n">model</span><span class="o">.</span><span class="n">trainer</span><span class="o">.</span><span class="n">strategy</span><span class="o">.</span><span class="n">launcher</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
@@ -1265,7 +1265,7 @@
 
         <span class="n">dataloader</span> <span class="o">=</span> <span class="p">[</span><span class="n">data</span> <span class="k">for</span> <span class="n">data</span> <span class="ow">in</span> <span class="n">dataloader</span><span class="p">]</span>
 
-        <span class="k">def</span><span class="w"> </span><span class="nf">forward_loop</span><span class="p">(</span><span class="n">model</span><span class="p">):</span>
+        <span class="k">def</span> <span class="nf">forward_loop</span><span class="p">(</span><span class="n">model</span><span class="p">):</span>
             <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">batch</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">dataloader</span><span class="p">):</span>
                 <span class="n">print_rank_0</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Calibrating batch </span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
                 <span class="n">model</span><span class="o">.</span><span class="n">predict_step</span><span class="p">(</span><span class="n">batch</span><span class="p">,</span> <span class="n">i</span><span class="p">)</span>
@@ -1339,7 +1339,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f63fe2a9c10>
+<jinja2.runtime.BlockReference object at 0x7fdee4a7d790>
 
 <div class="footer">
     <p>

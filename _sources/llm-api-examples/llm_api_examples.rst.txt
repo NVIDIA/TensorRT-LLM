@@ -5,15 +5,15 @@ Examples
    :maxdepth: 2
    :caption: Scripts
 
-   llm_guided_decoding
-   llm_inference
+   llm_medusa_decoding
+   llm_multilora
    llm_inference_async
-   llm_inference_async_streaming
-   llm_inference_customize
    llm_inference_distributed
    llm_logits_processor
    llm_lookahead_decoding
-   llm_medusa_decoding
-   llm_multilora
    llm_quantization
+   llm_inference_async_streaming
+   llm_guided_decoding
+   llm_inference
+   llm_inference_customize
    llm_auto_parallel

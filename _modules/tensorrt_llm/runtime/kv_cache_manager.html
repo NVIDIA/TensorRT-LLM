@@ -6,7 +6,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>tensorrt_llm.runtime.kv_cache_manager &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="../../../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
 
@@ -14,7 +14,7 @@
       <script src="../../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../../../_static/doctools.js?v=9a2dae69"></script>
       <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
@@ -117,7 +117,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../performance/introduction.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -175,42 +175,42 @@
 <span class="c1"># WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.</span>
 <span class="c1"># See the License for the specific language governing permissions and</span>
 <span class="c1"># limitations under the License.</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">collections</span><span class="w"> </span><span class="kn">import</span> <span class="n">defaultdict</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">List</span>
+<span class="kn">from</span> <span class="nn">collections</span> <span class="kn">import</span> <span class="n">defaultdict</span>
+<span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="n">List</span>
 
-<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="kn">import</span> <span class="nn">torch</span>
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">Block</span><span class="p">(</span><span class="nb">object</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">Block</span><span class="p">(</span><span class="nb">object</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">block_idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">block_idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">idx</span> <span class="o">=</span> <span class="n">block_idx</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">ref_count</span> <span class="o">=</span> <span class="mi">0</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">add_link</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">add_link</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">ref_count</span> <span class="o">+=</span> <span class="mi">1</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">remove_link</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">remove_link</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">ref_count</span> <span class="o">-=</span> <span class="mi">1</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">has_link</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">has_link</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">ref_count</span> <span class="o">&gt;</span> <span class="mi">0</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">is_shared</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">is_shared</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">ref_count</span> <span class="o">&gt;</span> <span class="mi">1</span>
 
 
 <div class="viewcode-block" id="GenerationSequence">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSequence">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">GenerationSequence</span><span class="p">(</span><span class="nb">object</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">GenerationSequence</span><span class="p">(</span><span class="nb">object</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">seq_idx</span><span class="p">,</span> <span class="n">batch_idx</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">seq_idx</span><span class="p">,</span> <span class="n">batch_idx</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">seq_idx</span> <span class="o">=</span> <span class="n">seq_idx</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">batch_idx</span> <span class="o">=</span> <span class="n">batch_idx</span>
 
 <div class="viewcode-block" id="GenerationSequence.get_batch_idx">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSequence.get_batch_idx">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">get_batch_idx</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">get_batch_idx</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">        Returns idx of sequence in batch</span>
 <span class="sd">        &quot;&quot;&quot;</span>
@@ -219,23 +219,23 @@
 
 <div class="viewcode-block" id="GenerationSequence.get_seq_idx">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSequence.get_seq_idx">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">get_seq_idx</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">get_seq_idx</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">        Returns sequence idx</span>
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">seq_idx</span></div>
 
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__eq__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">another</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__eq__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">another</span><span class="p">):</span>
         <span class="k">return</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">another</span><span class="p">,</span> <span class="s1">&#39;seq_idx&#39;</span><span class="p">)</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">seq_idx</span> <span class="o">==</span> <span class="n">another</span><span class="o">.</span><span class="n">seq_idx</span> <span class="ow">and</span> \
             <span class="nb">hasattr</span><span class="p">(</span><span class="n">another</span><span class="p">,</span> <span class="s1">&#39;batch_idx&#39;</span><span class="p">)</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">batch_idx</span> <span class="o">==</span> <span class="n">another</span><span class="o">.</span><span class="n">batch_idx</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__hash__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__hash__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">seq_idx</span></div>
 
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">BlocksManager</span><span class="p">(</span><span class="nb">object</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">BlocksManager</span><span class="p">(</span><span class="nb">object</span><span class="p">):</span>
     <span class="n">_sizeof</span> <span class="o">=</span> <span class="p">{</span>
         <span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">:</span> <span class="mi">4</span><span class="p">,</span>
         <span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">:</span> <span class="mi">2</span><span class="p">,</span>
@@ -243,7 +243,7 @@
         <span class="n">torch</span><span class="o">.</span><span class="n">int8</span><span class="p">:</span> <span class="mi">1</span>
     <span class="p">}</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="o">*</span><span class="p">,</span>
                  <span class="n">num_layers</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
                  <span class="n">num_blocks</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
@@ -272,13 +272,13 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">allocated_blocks</span> <span class="o">=</span> <span class="n">defaultdict</span><span class="p">(</span>
             <span class="k">lambda</span><span class="p">:</span> <span class="p">[[]</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">beam_width</span><span class="p">)])</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">has_free_block</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">has_free_block</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">        Returns True if we have at least 1 free block</span>
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="k">return</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">free_blocks</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">allocate</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">allocate</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">owner</span><span class="p">:</span> <span class="n">GenerationSequence</span><span class="p">,</span>
                  <span class="n">share_across_beam</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
@@ -297,7 +297,7 @@
             <span class="n">block</span><span class="o">.</span><span class="n">add_link</span><span class="p">()</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">allocated_blocks</span><span class="p">[</span><span class="n">owner</span><span class="p">][</span><span class="n">bi</span><span class="p">]</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">block</span><span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">replace_shared_block</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">owner</span><span class="p">:</span> <span class="n">GenerationSequence</span><span class="p">,</span> <span class="n">block_idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">replace_shared_block</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">owner</span><span class="p">:</span> <span class="n">GenerationSequence</span><span class="p">,</span> <span class="n">block_idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">        Replace the shared block.</span>
 <span class="sd">        Free the shared block, and allocate blocks with share_across_beam=False</span>
@@ -321,7 +321,7 @@
             <span class="bp">self</span><span class="o">.</span><span class="n">allocated_blocks</span><span class="p">[</span><span class="n">owner</span><span class="p">][</span><span class="n">bi</span><span class="p">][</span><span class="n">block_idx</span><span class="p">]</span> <span class="o">=</span> <span class="n">block</span>
         <span class="k">return</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">free</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">owner</span><span class="p">:</span> <span class="n">GenerationSequence</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">free</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">owner</span><span class="p">:</span> <span class="n">GenerationSequence</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">        Unlink all blocks of given owner.</span>
 <span class="sd">        Moves blocks with ref_count == 0 to free.</span>
@@ -338,26 +338,26 @@
         <span class="c1"># Remove owner from allocated blocks</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">allocated_blocks</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">owner</span><span class="p">)</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">get_number_blocks</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">owner</span><span class="p">:</span> <span class="n">GenerationSequence</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">get_number_blocks</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">owner</span><span class="p">:</span> <span class="n">GenerationSequence</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">        Returns number of blocks allocated to the sequence owner</span>
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="k">return</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">allocated_blocks</span><span class="p">[</span><span class="n">owner</span><span class="p">][</span><span class="mi">0</span><span class="p">])</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">get_k_or_v_block_offset</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">block_idx</span><span class="p">,</span> <span class="n">field_idx</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">get_k_or_v_block_offset</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">block_idx</span><span class="p">,</span> <span class="n">field_idx</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">        Get offset in memory pool to K or V block. field_idx should be 0 (K) or 1 (V).</span>
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="k">return</span> <span class="n">block_idx</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_layers</span> <span class="o">*</span> <span class="mi">2</span> <span class="o">+</span> <span class="n">field_idx</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">get_offset_array</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">beam_width</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">get_offset_array</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">beam_width</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">        Returns array of [batch size, beam_width, 2, max_blocks_per_seq] of offsets</span>
 <span class="sd">        to the allocated blocks in memory pool</span>
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="k">assert</span> <span class="p">(</span><span class="n">beam_width</span> <span class="o">&lt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">beam_width</span><span class="p">)</span>
 
-        <span class="k">def</span><span class="w"> </span><span class="nf">create_nested_list</span><span class="p">(</span><span class="n">dims</span><span class="p">):</span>
+        <span class="k">def</span> <span class="nf">create_nested_list</span><span class="p">(</span><span class="n">dims</span><span class="p">):</span>
 <span class="w">            </span><span class="sd">&quot;&quot;&quot;Recursive function to generate nested list.&quot;&quot;&quot;</span>
             <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">dims</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
                 <span class="k">return</span> <span class="p">[</span><span class="mi">0</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">dims</span><span class="p">[</span><span class="mi">0</span><span class="p">])]</span>
@@ -380,7 +380,7 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">offset_array</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">offset_array</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">offset_array</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">get_continuous_caches</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">memory_pool</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">get_continuous_caches</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">memory_pool</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">        Returns continuous KV caches.</span>
 <span class="sd">        Used only for debug purposes.</span>
@@ -418,9 +418,9 @@
 
 <div class="viewcode-block" id="KVCacheManager">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.KVCacheManager">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">KVCacheManager</span><span class="p">(</span><span class="nb">object</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">KVCacheManager</span><span class="p">(</span><span class="nb">object</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="o">*</span><span class="p">,</span>
                  <span class="n">num_layers</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
                  <span class="n">num_blocks</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
@@ -464,7 +464,7 @@
 
 <div class="viewcode-block" id="KVCacheManager.step">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.KVCacheManager.step">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">step</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">finished</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">bool</span><span class="p">]):</span>
+    <span class="k">def</span> <span class="nf">step</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">finished</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">bool</span><span class="p">]):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">        Iterate to the next generation step.</span>
 <span class="sd">        Add new blocks where needed and clear finished sequences.</span>
@@ -509,7 +509,7 @@
 
 <div class="viewcode-block" id="KVCacheManager.add_sequence">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.KVCacheManager.add_sequence">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">add_sequence</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">add_sequence</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                      <span class="n">sequence</span><span class="p">:</span> <span class="n">GenerationSequence</span><span class="p">,</span>
                      <span class="n">context_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
                      <span class="n">always_share_across_beam</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">):</span>
@@ -554,7 +554,7 @@
 
 <div class="viewcode-block" id="KVCacheManager.get_block_offsets">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.KVCacheManager.get_block_offsets">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">get_block_offsets</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">beam_width</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+    <span class="k">def</span> <span class="nf">get_block_offsets</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">beam_width</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">        Returns array of offsets into memory pools</span>
 <span class="sd">        &quot;&quot;&quot;</span>
@@ -563,9 +563,9 @@
 
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">KVCacheUpdater</span><span class="p">:</span>
+<span class="k">class</span> <span class="nc">KVCacheUpdater</span><span class="p">:</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">use_paged_kv_cache</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">num_layers</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">num_kv_heads</span> <span class="o">=</span> <span class="kc">None</span>
@@ -576,7 +576,7 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_manager</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">host_kv_cache_pool_pointers</span> <span class="o">=</span> <span class="kc">None</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">init_linear_kv_cache</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">num_layers</span><span class="p">,</span> <span class="n">num_kv_heads</span><span class="p">,</span> <span class="n">head_dim</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">init_linear_kv_cache</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">num_layers</span><span class="p">,</span> <span class="n">num_kv_heads</span><span class="p">,</span> <span class="n">head_dim</span><span class="p">,</span>
                              <span class="n">kv_cache_type</span><span class="p">,</span> <span class="n">past_key_value_list</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">use_paged_kv_cache</span> <span class="o">=</span> <span class="kc">False</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">num_layers</span> <span class="o">=</span> <span class="n">num_layers</span>
@@ -586,7 +586,7 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">elt_size</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">kv_cache_type</span><span class="p">)</span><span class="o">.</span><span class="n">element_size</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">max_kv_cache_length</span> <span class="o">=</span> <span class="n">past_key_value_list</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">3</span><span class="p">]</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">init_paged_kv_cache</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">num_layers</span><span class="p">,</span> <span class="n">num_kv_heads</span><span class="p">,</span> <span class="n">head_dim</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">init_paged_kv_cache</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">num_layers</span><span class="p">,</span> <span class="n">num_kv_heads</span><span class="p">,</span> <span class="n">head_dim</span><span class="p">,</span>
                             <span class="n">kv_cache_type</span><span class="p">,</span> <span class="n">kv_cache_manager</span><span class="p">,</span>
                             <span class="n">host_kv_cache_pool_pointers</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">use_paged_kv_cache</span> <span class="o">=</span> <span class="kc">True</span>
@@ -597,7 +597,7 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">host_kv_cache_pool_pointers</span> <span class="o">=</span> <span class="n">host_kv_cache_pool_pointers</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">elt_size</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">kv_cache_type</span><span class="p">)</span><span class="o">.</span><span class="n">element_size</span><span class="p">()</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">update</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">accepted_draft_token_offsets</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">update</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">accepted_draft_token_offsets</span><span class="p">,</span>
                <span class="n">packed_accepted_draft_tokens_indices</span><span class="p">,</span> <span class="n">sequence_length_buffer</span><span class="p">,</span>
                <span class="n">rewind_tokens</span><span class="p">):</span>
         <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">rewind_tokens</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="ow">or</span> <span class="nb">isinstance</span><span class="p">(</span>
@@ -664,7 +664,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f63fe3c17c0>
+<jinja2.runtime.BlockReference object at 0x7fdee4a7f5f0>
 
 <div class="footer">
     <p>

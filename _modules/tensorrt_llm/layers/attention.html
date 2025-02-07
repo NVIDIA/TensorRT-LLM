@@ -6,7 +6,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>tensorrt_llm.layers.attention &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="../../../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
 
@@ -14,7 +14,7 @@
       <script src="../../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../../../_static/doctools.js?v=9a2dae69"></script>
       <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
@@ -117,7 +117,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../performance/introduction.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -175,19 +175,19 @@
 <span class="c1"># WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.</span>
 <span class="c1"># See the License for the specific language governing permissions and</span>
 <span class="c1"># limitations under the License.</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">List</span><span class="p">,</span> <span class="n">Optional</span>
+<span class="kn">import</span> <span class="nn">math</span>
+<span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="n">List</span><span class="p">,</span> <span class="n">Optional</span>
 
-<span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">tensorrt</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">trt</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="kn">import</span> <span class="nn">numpy</span> <span class="k">as</span> <span class="nn">np</span>
+<span class="kn">import</span> <span class="nn">tensorrt</span> <span class="k">as</span> <span class="nn">trt</span>
+<span class="kn">import</span> <span class="nn">torch</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">.._common</span><span class="w"> </span><span class="kn">import</span> <span class="n">default_net</span><span class="p">,</span> <span class="n">precision</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.._utils</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">fp32_array</span><span class="p">,</span> <span class="n">get_sm_version</span><span class="p">,</span> <span class="n">int32_array</span><span class="p">,</span> <span class="n">is_same_dtype</span><span class="p">,</span>
+<span class="kn">from</span> <span class="nn">.._common</span> <span class="kn">import</span> <span class="n">default_net</span><span class="p">,</span> <span class="n">precision</span>
+<span class="kn">from</span> <span class="nn">.._utils</span> <span class="kn">import</span> <span class="p">(</span><span class="n">fp32_array</span><span class="p">,</span> <span class="n">get_sm_version</span><span class="p">,</span> <span class="n">int32_array</span><span class="p">,</span> <span class="n">is_same_dtype</span><span class="p">,</span>
                       <span class="n">set_obj_attrs</span><span class="p">,</span> <span class="n">trt_dtype_to_np</span><span class="p">,</span> <span class="n">trt_dtype_to_str</span><span class="p">)</span>
 
 <span class="c1"># isort: off</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..functional</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+<span class="kn">from</span> <span class="nn">..functional</span> <span class="kn">import</span> <span class="p">(</span>
     <span class="n">ACT2FN</span><span class="p">,</span> <span class="n">AllReduceParams</span><span class="p">,</span> <span class="n">AttentionMaskType</span><span class="p">,</span> <span class="n">Conditional</span><span class="p">,</span> <span class="n">LayerNormType</span><span class="p">,</span>
     <span class="n">PositionEmbeddingType</span><span class="p">,</span> <span class="n">RopeEmbeddingUtils</span><span class="p">,</span> <span class="n">RotaryScalingType</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span>
     <span class="n">allgather</span><span class="p">,</span> <span class="n">arange</span><span class="p">,</span> <span class="n">bert_attention</span><span class="p">,</span> <span class="n">cast</span><span class="p">,</span> <span class="n">clip</span><span class="p">,</span> <span class="n">concat</span><span class="p">,</span> <span class="n">constant</span><span class="p">,</span> <span class="n">embedding</span><span class="p">,</span>
@@ -195,14 +195,14 @@
     <span class="n">generate_alibi_slopes</span><span class="p">,</span> <span class="n">generate_logn_scaling</span><span class="p">,</span> <span class="n">gpt_attention</span><span class="p">,</span> <span class="n">matmul</span><span class="p">,</span>
     <span class="n">minimum</span><span class="p">,</span> <span class="n">repeat_interleave</span><span class="p">,</span> <span class="n">shape</span><span class="p">,</span> <span class="nb">slice</span><span class="p">,</span> <span class="n">softmax</span><span class="p">,</span> <span class="n">split</span><span class="p">,</span> <span class="n">unsqueeze</span><span class="p">,</span> <span class="n">where</span><span class="p">)</span>
 <span class="c1"># isort: on</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..mapping</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..module</span><span class="w"> </span><span class="kn">import</span> <span class="n">Module</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..parameter</span><span class="w"> </span><span class="kn">import</span> <span class="n">Parameter</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..quantization</span><span class="w"> </span><span class="kn">import</span> <span class="n">QuantMode</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..quantization.functional</span><span class="w"> </span><span class="kn">import</span> <span class="n">dequantize</span><span class="p">,</span> <span class="n">quantize</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.linear</span><span class="w"> </span><span class="kn">import</span> <span class="n">ColumnLinear</span><span class="p">,</span> <span class="n">RowLinear</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.lora</span><span class="w"> </span><span class="kn">import</span> <span class="n">LoraRuntimeParams</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.normalization</span><span class="w"> </span><span class="kn">import</span> <span class="n">GroupNorm</span><span class="p">,</span> <span class="n">LayerNorm</span><span class="p">,</span> <span class="n">RmsNorm</span>
+<span class="kn">from</span> <span class="nn">..mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
+<span class="kn">from</span> <span class="nn">..module</span> <span class="kn">import</span> <span class="n">Module</span>
+<span class="kn">from</span> <span class="nn">..parameter</span> <span class="kn">import</span> <span class="n">Parameter</span>
+<span class="kn">from</span> <span class="nn">..quantization</span> <span class="kn">import</span> <span class="n">QuantMode</span>
+<span class="kn">from</span> <span class="nn">..quantization.functional</span> <span class="kn">import</span> <span class="n">dequantize</span><span class="p">,</span> <span class="n">quantize</span>
+<span class="kn">from</span> <span class="nn">.linear</span> <span class="kn">import</span> <span class="n">ColumnLinear</span><span class="p">,</span> <span class="n">RowLinear</span>
+<span class="kn">from</span> <span class="nn">.lora</span> <span class="kn">import</span> <span class="n">LoraRuntimeParams</span>
+<span class="kn">from</span> <span class="nn">.normalization</span> <span class="kn">import</span> <span class="n">GroupNorm</span><span class="p">,</span> <span class="n">LayerNorm</span><span class="p">,</span> <span class="n">RmsNorm</span>
 
 <span class="n">layernorm_map</span> <span class="o">=</span> <span class="p">{</span>
     <span class="n">LayerNormType</span><span class="o">.</span><span class="n">LayerNorm</span><span class="p">:</span> <span class="n">LayerNorm</span><span class="p">,</span>
@@ -213,7 +213,7 @@
 
 <div class="viewcode-block" id="make_causal_mask">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.make_causal_mask">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">make_causal_mask</span><span class="p">(</span><span class="n">bsz</span><span class="p">,</span> <span class="n">tgt_len</span><span class="p">,</span> <span class="n">past_key_values_length</span><span class="p">,</span> <span class="n">dtype</span><span class="p">):</span>
+<span class="k">def</span> <span class="nf">make_causal_mask</span><span class="p">(</span><span class="n">bsz</span><span class="p">,</span> <span class="n">tgt_len</span><span class="p">,</span> <span class="n">past_key_values_length</span><span class="p">,</span> <span class="n">dtype</span><span class="p">):</span>
     <span class="n">_range</span> <span class="o">=</span> <span class="n">arange</span><span class="p">(</span><span class="n">start</span><span class="o">=</span><span class="n">constant</span><span class="p">(</span><span class="n">int32_array</span><span class="p">(</span><span class="mi">0</span><span class="p">)),</span>
                     <span class="n">end</span><span class="o">=</span><span class="n">tgt_len</span><span class="p">,</span>
                     <span class="n">dtype</span><span class="o">=</span><span class="n">trt_dtype_to_str</span><span class="p">(</span><span class="n">dtype</span><span class="p">))</span>
@@ -235,7 +235,7 @@
 
 <div class="viewcode-block" id="compute_relative_bias">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.compute_relative_bias">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">compute_relative_bias</span><span class="p">(</span><span class="n">query_length</span><span class="p">,</span>
+<span class="k">def</span> <span class="nf">compute_relative_bias</span><span class="p">(</span><span class="n">query_length</span><span class="p">,</span>
                           <span class="n">key_length</span><span class="p">,</span>
                           <span class="n">num_buckets</span><span class="p">,</span>
                           <span class="n">max_distance</span><span class="p">,</span>
@@ -245,7 +245,7 @@
                           <span class="n">tp_group</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                           <span class="n">tp_rank</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">make_relative_position_bucket</span><span class="p">(</span><span class="n">relative_position</span><span class="p">,</span> <span class="n">bidirectional</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">make_relative_position_bucket</span><span class="p">(</span><span class="n">relative_position</span><span class="p">,</span> <span class="n">bidirectional</span><span class="p">,</span>
                                       <span class="n">num_buckets</span><span class="p">,</span> <span class="n">max_distance</span><span class="p">):</span>
         <span class="n">relative_buckets</span> <span class="o">=</span> <span class="mi">0</span>
         <span class="k">if</span> <span class="n">bidirectional</span><span class="p">:</span>
@@ -302,9 +302,9 @@
 
 <div class="viewcode-block" id="AttentionMaskParams">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.AttentionMaskParams">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">AttentionMaskParams</span><span class="p">(</span><span class="nb">object</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">AttentionMaskParams</span><span class="p">(</span><span class="nb">object</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">self_attention_mask</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">self_attention_packed_mask</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">cross_attention_mask</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -318,9 +318,9 @@
 
 <div class="viewcode-block" id="AttentionParams">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.AttentionParams">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">AttentionParams</span><span class="p">(</span><span class="nb">object</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">AttentionParams</span><span class="p">(</span><span class="nb">object</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">sequence_length</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">context_lengths</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">host_context_lengths</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -358,7 +358,7 @@
 
 <div class="viewcode-block" id="AttentionParams.fill_attention_const_params_for_rope">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.AttentionParams.fill_attention_const_params_for_rope">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">fill_attention_const_params_for_rope</span><span class="p">(</span>
+    <span class="k">def</span> <span class="nf">fill_attention_const_params_for_rope</span><span class="p">(</span>
             <span class="bp">self</span><span class="p">,</span>
             <span class="n">embed_positions</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
             <span class="n">rotary_inv_freq</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -371,7 +371,7 @@
 
 <div class="viewcode-block" id="AttentionParams.fill_attention_const_params_for_long_rope">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.AttentionParams.fill_attention_const_params_for_long_rope">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">fill_attention_const_params_for_long_rope</span><span class="p">(</span>
+    <span class="k">def</span> <span class="nf">fill_attention_const_params_for_long_rope</span><span class="p">(</span>
             <span class="bp">self</span><span class="p">,</span> <span class="n">embed_positions</span><span class="p">,</span> <span class="n">long_rope_embed_positions</span><span class="p">,</span> <span class="n">rotary_inv_freq</span><span class="p">,</span>
             <span class="n">long_rope_rotary_inv_freq</span><span class="p">,</span> <span class="n">embed_positions_for_gpt_attention</span><span class="p">,</span>
             <span class="n">long_rope_embed_positions_for_gpt_attention</span><span class="p">,</span> <span class="n">short_mscale</span><span class="p">,</span>
@@ -389,7 +389,7 @@
 
 <div class="viewcode-block" id="AttentionParams.is_valid_cross_attn">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.AttentionParams.is_valid_cross_attn">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">is_valid_cross_attn</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">do_cross_attention</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">is_valid_cross_attn</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">do_cross_attention</span><span class="p">):</span>
         <span class="k">if</span> <span class="n">do_cross_attention</span><span class="p">:</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_input_lengths</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="k">return</span> <span class="kc">False</span>
@@ -400,7 +400,7 @@
 
 <div class="viewcode-block" id="AttentionParams.is_valid">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.AttentionParams.is_valid">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">is_valid</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">gpt_attention_plugin</span><span class="p">,</span> <span class="n">remove_input_padding</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">is_valid</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">gpt_attention_plugin</span><span class="p">,</span> <span class="n">remove_input_padding</span><span class="p">,</span>
                  <span class="n">use_kv_cache</span><span class="p">):</span>
         <span class="k">if</span> <span class="n">gpt_attention_plugin</span><span class="p">:</span>
             <span class="k">if</span> <span class="n">use_kv_cache</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">sequence_length</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
@@ -429,9 +429,9 @@
 
 <div class="viewcode-block" id="SpecDecodingParams">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.SpecDecodingParams">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">SpecDecodingParams</span><span class="p">:</span>
+<span class="k">class</span> <span class="nc">SpecDecodingParams</span><span class="p">:</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">spec_decoding_is_generation_length_variable</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
                  <span class="n">spec_decoding_max_generation_length</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
                  <span class="n">spec_decoding_generation_lengths</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -450,9 +450,9 @@
 
 <div class="viewcode-block" id="MropeParams">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.MropeParams">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">MropeParams</span><span class="p">:</span>
+<span class="k">class</span> <span class="nc">MropeParams</span><span class="p">:</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">mrope_rotary_cos_sin</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">mrope_position_deltas</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -464,9 +464,9 @@
 
 <div class="viewcode-block" id="KeyValueCacheParams">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.KeyValueCacheParams">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">KeyValueCacheParams</span><span class="p">:</span>
+<span class="k">class</span> <span class="nc">KeyValueCacheParams</span><span class="p">:</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">past_key_value</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">host_past_key_value_lengths</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">host_max_attention_window_sizes</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -498,7 +498,7 @@
 
 <div class="viewcode-block" id="KeyValueCacheParams.get_first_past_key_value">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.KeyValueCacheParams.get_first_past_key_value">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">get_first_past_key_value</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">get_first_past_key_value</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">past_key_value</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">None</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">past_key_value</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span></div>
@@ -506,14 +506,14 @@
 
 <div class="viewcode-block" id="KeyValueCacheParams.fill_none_tensor_list">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.KeyValueCacheParams.fill_none_tensor_list">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">fill_none_tensor_list</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">list_size</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">fill_none_tensor_list</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">list_size</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">past_key_value</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">past_key_value</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">([</span><span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="n">list_size</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="KeyValueCacheParams.is_valid">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.KeyValueCacheParams.is_valid">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">is_valid</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">gpt_attention_plugin</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">is_valid</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">gpt_attention_plugin</span><span class="p">):</span>
         <span class="k">if</span> <span class="n">gpt_attention_plugin</span><span class="p">:</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">host_past_key_value_lengths</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="k">return</span> <span class="kc">False</span>
@@ -531,9 +531,9 @@
 
 <div class="viewcode-block" id="BlockSparseAttnParams">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.BlockSparseAttnParams">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">BlockSparseAttnParams</span><span class="p">:</span>
+<span class="k">class</span> <span class="nc">BlockSparseAttnParams</span><span class="p">:</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">block_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">64</span><span class="p">,</span>
                  <span class="n">homo_head_pattern</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
                  <span class="n">num_local_blocks</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">16</span><span class="p">,</span>
@@ -547,9 +547,9 @@
 
 <div class="viewcode-block" id="Attention">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.Attention">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">Attention</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">Attention</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="o">*</span><span class="p">,</span>
                  <span class="n">local_layer_idx</span><span class="p">,</span>
                  <span class="n">hidden_size</span><span class="p">,</span>
@@ -777,7 +777,7 @@
 <div class="viewcode-block" id="Attention.create_attention_const_params">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.Attention.create_attention_const_params">[docs]</a>
     <span class="nd">@staticmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">create_attention_const_params</span><span class="p">(</span><span class="n">model_cls</span><span class="p">,</span> <span class="n">config</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">create_attention_const_params</span><span class="p">(</span><span class="n">model_cls</span><span class="p">,</span> <span class="n">config</span><span class="p">):</span>
         <span class="c1"># get rotary parameters.</span>
         <span class="n">hidden_size</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span>
         <span class="n">num_attention_heads</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">num_attention_heads</span>
@@ -893,7 +893,7 @@
 <div class="viewcode-block" id="Attention.fill_attention_params">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.Attention.fill_attention_params">[docs]</a>
     <span class="nd">@staticmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">fill_attention_params</span><span class="p">(</span><span class="n">model_cls</span><span class="p">,</span> <span class="n">attention_params</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">fill_attention_params</span><span class="p">(</span><span class="n">model_cls</span><span class="p">,</span> <span class="n">attention_params</span><span class="p">):</span>
         <span class="k">if</span> <span class="n">model_cls</span><span class="o">.</span><span class="n">position_embedding_type</span><span class="o">.</span><span class="n">is_rope</span><span class="p">():</span>
             <span class="k">if</span> <span class="n">attention_params</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="n">attention_params</span> <span class="o">=</span> <span class="n">AttentionParams</span><span class="p">()</span>
@@ -915,7 +915,7 @@
         <span class="k">return</span> <span class="n">attention_params</span></div>
 
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_get_output_orig_quant_scale</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">_get_output_orig_quant_scale</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="n">attention_output_orig_quant_scale</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_output_orig_quant_scale</span><span class="o">.</span><span class="n">value</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_output_orig_quant_scale</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
         <span class="k">if</span> <span class="n">attention_output_orig_quant_scale</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="p">(</span>
                 <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gemm_plugin</span> <span class="o">==</span> <span class="s1">&#39;nvfp4&#39;</span>
@@ -927,7 +927,7 @@
 
 <div class="viewcode-block" id="Attention.forward">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.Attention.forward">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">hidden_states</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
         <span class="n">attention_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
@@ -1113,7 +1113,7 @@
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">cross_attention</span> <span class="ow">and</span> <span class="n">encoder_output</span><span class="p">:</span>
             <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">encoder_output</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">)</span>
 
-            <span class="k">def</span><span class="w"> </span><span class="nf">compute_cross_kv</span><span class="p">(</span><span class="n">encoder_output</span><span class="p">):</span>
+            <span class="k">def</span> <span class="nf">compute_cross_kv</span><span class="p">(</span><span class="n">encoder_output</span><span class="p">):</span>
                 <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s1">&#39;kv&#39;</span><span class="p">):</span>
                     <span class="c1"># We optimize the graph by adding kv in the cross attention layer, preventing computing the</span>
                     <span class="c1"># query of encoder_output.</span>
@@ -1349,7 +1349,7 @@
 
             <span class="k">assert</span> <span class="n">logn_scaling</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;plan TensorRT mode does not support logn scaling now&quot;</span>
 
-            <span class="k">def</span><span class="w"> </span><span class="nf">transpose_for_scores</span><span class="p">(</span><span class="n">x</span><span class="p">,</span>
+            <span class="k">def</span> <span class="nf">transpose_for_scores</span><span class="p">(</span><span class="n">x</span><span class="p">,</span>
                                      <span class="n">rotary</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
                                      <span class="n">is_kv</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">):</span>
                 <span class="n">_num_attention_heads</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_kv_heads</span> <span class="k">if</span> <span class="n">is_kv</span> <span class="k">else</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span>
@@ -1710,7 +1710,7 @@
 
 <div class="viewcode-block" id="Attention.set_rel_attn_table">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.Attention.set_rel_attn_table">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">set_rel_attn_table</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">max_seq_len</span><span class="p">,</span> <span class="n">precomputed_relative_attention</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">set_rel_attn_table</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">max_seq_len</span><span class="p">,</span> <span class="n">precomputed_relative_attention</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">rel_attn_table</span> <span class="o">=</span> <span class="n">Parameter</span><span class="p">(</span><span class="n">shape</span><span class="o">=</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">,</span>
                                                <span class="n">max_seq_len</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span>
                                                <span class="n">max_seq_len</span> <span class="o">+</span> <span class="mi">1</span><span class="p">),</span>
@@ -1720,7 +1720,7 @@
 
 <div class="viewcode-block" id="Attention.postprocess">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.Attention.postprocess">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">postprocess</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tllm_key</span><span class="p">,</span> <span class="n">weights</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">postprocess</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tllm_key</span><span class="p">,</span> <span class="n">weights</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
         <span class="k">if</span> <span class="n">tllm_key</span><span class="o">.</span><span class="n">endswith</span><span class="p">(</span><span class="s2">&quot;kv_cache_scaling_factor&quot;</span><span class="p">):</span>
             <span class="k">if</span> <span class="n">weights</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="k">return</span> <span class="p">{</span><span class="n">tllm_key</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">ones</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="p">)</span><span class="o">.</span><span class="n">float</span><span class="p">()}</span>
@@ -1747,9 +1747,9 @@
 
 <div class="viewcode-block" id="BertAttention">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.BertAttention">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">BertAttention</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">BertAttention</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">hidden_size</span><span class="p">,</span>
                  <span class="n">num_attention_heads</span><span class="p">,</span>
                  <span class="n">max_position_embeddings</span><span class="o">=</span><span class="mi">1024</span><span class="p">,</span>
@@ -1833,7 +1833,7 @@
 
 <div class="viewcode-block" id="BertAttention.forward">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.BertAttention.forward">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                 <span class="n">hidden_states</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
                 <span class="n">attention_mask</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">input_lengths</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
@@ -1900,7 +1900,7 @@
                 <span class="n">max_input_length</span><span class="o">=</span><span class="n">max_input_length</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="c1"># plain TRT mode</span>
-            <span class="k">def</span><span class="w"> </span><span class="nf">transpose_for_scores</span><span class="p">(</span><span class="n">x</span><span class="p">):</span>
+            <span class="k">def</span> <span class="nf">transpose_for_scores</span><span class="p">(</span><span class="n">x</span><span class="p">):</span>
                 <span class="n">new_x_shape</span> <span class="o">=</span> <span class="n">concat</span><span class="p">([</span>
                     <span class="n">shape</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span>
                     <span class="n">shape</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">,</span>
@@ -1966,9 +1966,9 @@
 
 <div class="viewcode-block" id="CogVLMAttention">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.CogVLMAttention">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">CogVLMAttention</span><span class="p">(</span><span class="n">Attention</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">CogVLMAttention</span><span class="p">(</span><span class="n">Attention</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span>
             <span class="bp">self</span><span class="p">,</span>
             <span class="o">*</span><span class="p">,</span>
             <span class="n">local_layer_idx</span><span class="p">,</span>
@@ -2025,7 +2025,7 @@
 
 <div class="viewcode-block" id="CogVLMAttention.forward">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.CogVLMAttention.forward">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                 <span class="n">hidden_states</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
                 <span class="n">use_cache</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                 <span class="n">kv_cache_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
@@ -2136,9 +2136,9 @@
 
 <div class="viewcode-block" id="DeepseekV2Attention">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.DeepseekV2Attention">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">DeepseekV2Attention</span><span class="p">(</span><span class="n">Attention</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">DeepseekV2Attention</span><span class="p">(</span><span class="n">Attention</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span>
             <span class="bp">self</span><span class="p">,</span>
             <span class="o">*</span><span class="p">,</span>
             <span class="n">local_layer_idx</span><span class="p">,</span>
@@ -2203,7 +2203,7 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">rotary_scaling</span> <span class="o">=</span> <span class="n">rotary_scaling</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">shard_dim</span> <span class="o">=</span> <span class="mi">1</span>
 
-        <span class="k">def</span><span class="w"> </span><span class="nf">yarn_get_mscale</span><span class="p">(</span><span class="n">scale</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">mscale</span><span class="o">=</span><span class="mi">1</span><span class="p">):</span>
+        <span class="k">def</span> <span class="nf">yarn_get_mscale</span><span class="p">(</span><span class="n">scale</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">mscale</span><span class="o">=</span><span class="mi">1</span><span class="p">):</span>
             <span class="k">if</span> <span class="n">scale</span> <span class="o">&lt;=</span> <span class="mi">1</span><span class="p">:</span>
                 <span class="k">return</span> <span class="mf">1.0</span>
             <span class="k">return</span> <span class="mf">0.1</span> <span class="o">*</span> <span class="n">mscale</span> <span class="o">*</span> <span class="n">math</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="n">scale</span><span class="p">)</span> <span class="o">+</span> <span class="mf">1.0</span>
@@ -2280,7 +2280,7 @@
 
 <div class="viewcode-block" id="DeepseekV2Attention.weight_loader">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.DeepseekV2Attention.weight_loader">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">weight_loader</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">mapping</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">param</span><span class="p">:</span> <span class="n">Parameter</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">weight_loader</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">mapping</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">param</span><span class="p">:</span> <span class="n">Parameter</span><span class="p">,</span>
                       <span class="n">loaded_weight</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">):</span>
         <span class="c1"># use_parallel_embedding</span>
         <span class="n">tp_rank</span> <span class="o">=</span> <span class="n">mapping</span><span class="o">.</span><span class="n">tp_rank</span>
@@ -2295,7 +2295,7 @@
 
 <div class="viewcode-block" id="DeepseekV2Attention.forward">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.DeepseekV2Attention.forward">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                 <span class="n">hidden_states</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
                 <span class="n">use_cache</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                 <span class="n">spec_decoding_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
@@ -2455,7 +2455,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f63fedc33e0>
+<jinja2.runtime.BlockReference object at 0x7fdeec6fe960>
 
 <div class="footer">
     <p>

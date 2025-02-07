@@ -6,7 +6,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>tensorrt_llm.layers.mlp &mdash; tensorrt_llm  documentation</title>
-      <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=80d5e7a1" />
       <link rel="stylesheet" type="text/css" href="../../../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
 
@@ -14,7 +14,7 @@
       <script src="../../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../../../_static/doctools.js?v=9a2dae69"></script>
       <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
@@ -117,7 +117,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-benchmarking.html">Benchmarking</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../performance/introduction.html">Best Practices</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../performance/perf-analysis.html">Performance Analysis</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Reference</span></p>
@@ -175,25 +175,25 @@
 <span class="c1"># WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.</span>
 <span class="c1"># See the License for the specific language governing permissions and</span>
 <span class="c1"># limitations under the License.</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Optional</span>
+<span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="n">Optional</span>
 
-<span class="kn">import</span><span class="w"> </span><span class="nn">tensorrt</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">trt</span>
+<span class="kn">import</span> <span class="nn">tensorrt</span> <span class="k">as</span> <span class="nn">trt</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">.._common</span><span class="w"> </span><span class="kn">import</span> <span class="n">default_net</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..functional</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">ACT2FN</span><span class="p">,</span> <span class="n">AllReduceParams</span><span class="p">,</span> <span class="n">cast</span><span class="p">,</span> <span class="n">concat</span><span class="p">,</span> <span class="n">gemm_swiglu</span><span class="p">,</span>
+<span class="kn">from</span> <span class="nn">.._common</span> <span class="kn">import</span> <span class="n">default_net</span>
+<span class="kn">from</span> <span class="nn">..functional</span> <span class="kn">import</span> <span class="p">(</span><span class="n">ACT2FN</span><span class="p">,</span> <span class="n">AllReduceParams</span><span class="p">,</span> <span class="n">cast</span><span class="p">,</span> <span class="n">concat</span><span class="p">,</span> <span class="n">gemm_swiglu</span><span class="p">,</span>
                           <span class="n">is_gated_activation</span><span class="p">,</span> <span class="n">low_latency_gemm_swiglu</span><span class="p">)</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..module</span><span class="w"> </span><span class="kn">import</span> <span class="n">Module</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..quantization</span><span class="w"> </span><span class="kn">import</span> <span class="n">QuantMode</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..quantization.functional</span><span class="w"> </span><span class="kn">import</span> <span class="n">quantize</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..quantization.layers</span><span class="w"> </span><span class="kn">import</span> <span class="n">FP8Linear</span><span class="p">,</span> <span class="n">FP8RowLinear</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.linear</span><span class="w"> </span><span class="kn">import</span> <span class="n">ColumnLinear</span><span class="p">,</span> <span class="n">RowLinear</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.lora</span><span class="w"> </span><span class="kn">import</span> <span class="n">LoraRuntimeParams</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.normalization</span><span class="w"> </span><span class="kn">import</span> <span class="n">LayerNorm</span>
+<span class="kn">from</span> <span class="nn">..module</span> <span class="kn">import</span> <span class="n">Module</span>
+<span class="kn">from</span> <span class="nn">..quantization</span> <span class="kn">import</span> <span class="n">QuantMode</span>
+<span class="kn">from</span> <span class="nn">..quantization.functional</span> <span class="kn">import</span> <span class="n">quantize</span>
+<span class="kn">from</span> <span class="nn">..quantization.layers</span> <span class="kn">import</span> <span class="n">FP8Linear</span><span class="p">,</span> <span class="n">FP8RowLinear</span>
+<span class="kn">from</span> <span class="nn">.linear</span> <span class="kn">import</span> <span class="n">ColumnLinear</span><span class="p">,</span> <span class="n">RowLinear</span>
+<span class="kn">from</span> <span class="nn">.lora</span> <span class="kn">import</span> <span class="n">LoraRuntimeParams</span>
+<span class="kn">from</span> <span class="nn">.normalization</span> <span class="kn">import</span> <span class="n">LayerNorm</span>
 
 
 <div class="viewcode-block" id="fc_gate_lora">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.mlp.fc_gate_lora">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">fc_gate_lora</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="n">lora</span><span class="p">,</span> <span class="n">lora_layer_params</span><span class="p">):</span>
+<span class="k">def</span> <span class="nf">fc_gate_lora</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="n">lora</span><span class="p">,</span> <span class="n">lora_layer_params</span><span class="p">):</span>
     <span class="k">if</span> <span class="n">lora_layer_params</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">mlp_fc_lora_params</span> <span class="o">=</span> <span class="n">lora_layer_params</span><span class="o">.</span><span class="n">get_runtime_params</span><span class="p">(</span>
             <span class="mi">0</span><span class="p">,</span> <span class="s2">&quot;mlp_h_to_4h&quot;</span><span class="p">)</span>
@@ -223,9 +223,9 @@
 
 <div class="viewcode-block" id="MLP">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.mlp.MLP">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">MLP</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">MLP</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">hidden_size</span><span class="p">,</span>
         <span class="n">ffn_hidden_size</span><span class="p">,</span>
@@ -279,7 +279,7 @@
 
 <div class="viewcode-block" id="MLP.forward">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.mlp.MLP.forward">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">lora_layer_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">gegelu_limit</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">lora_layer_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">gegelu_limit</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
         <span class="k">if</span> <span class="n">is_gated_activation</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">hidden_act</span><span class="p">):</span>
             <span class="n">inter</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">fc</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
             <span class="n">lora_result</span> <span class="o">=</span> <span class="n">fc_gate_lora</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">lora</span><span class="p">,</span>
@@ -312,9 +312,9 @@
 
 <div class="viewcode-block" id="GatedMLP">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.mlp.GatedMLP">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">GatedMLP</span><span class="p">(</span><span class="n">MLP</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">GatedMLP</span><span class="p">(</span><span class="n">MLP</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">hidden_size</span><span class="p">,</span>
         <span class="n">ffn_hidden_size</span><span class="p">,</span>
@@ -355,7 +355,7 @@
 
 <div class="viewcode-block" id="GatedMLP.forward">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.mlp.GatedMLP.forward">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                 <span class="n">hidden_states</span><span class="p">,</span>
                 <span class="n">lora_layer_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">all_reduce_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">AllReduceParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
@@ -391,9 +391,9 @@
 
 <div class="viewcode-block" id="FusedGatedMLP">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.mlp.FusedGatedMLP">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">FusedGatedMLP</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">FusedGatedMLP</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">hidden_size</span><span class="p">,</span>
         <span class="n">ffn_hidden_size</span><span class="p">,</span>
@@ -441,7 +441,7 @@
 
 <div class="viewcode-block" id="FusedGatedMLP.fc_gate_plugin">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.mlp.FusedGatedMLP.fc_gate_plugin">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">fc_gate_plugin</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">lora_layer_params</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">fc_gate_plugin</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">lora_layer_params</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
         <span class="c1"># Combine the following pattern</span>
         <span class="c1">#</span>
         <span class="c1">#   SiLU(FC(x)) * Gate(x)</span>
@@ -511,7 +511,7 @@
 
 <div class="viewcode-block" id="FusedGatedMLP.fc_gate">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.mlp.FusedGatedMLP.fc_gate">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">fc_gate</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">lora_layer_params</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">fc_gate</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">,</span> <span class="n">lora_layer_params</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
         <span class="c1"># Combine the following pattern</span>
         <span class="c1">#</span>
         <span class="c1">#   SiLU(FC(x)) * Gate(x)</span>
@@ -541,7 +541,7 @@
 
 <div class="viewcode-block" id="FusedGatedMLP.forward">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.mlp.FusedGatedMLP.forward">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                 <span class="n">hidden_states</span><span class="p">,</span>
                 <span class="n">lora_layer_params</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                 <span class="n">all_reduce_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">AllReduceParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
@@ -573,7 +573,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7f63feba2120>
+<jinja2.runtime.BlockReference object at 0x7fdeeecf8230>
 
 <div class="footer">
     <p>
