@@ -26,8 +26,7 @@ This document shows how to build and run the `DeepSeek-v3` model in TensorRT-LLM
 - IB: Inflight Batching
 
 ***Please Note:***
-- Prefer using BF16 over FP16 for DeepSeek-V3 since model original training precision is FP8 and we found direct convert FP8 -> FP16 may cause unknown accuracy issues.
-
+- Prefer using FP8 for DeepSeek-V3 since model original training precision is FP8.  
 
 ## Prerequisite
 
@@ -37,7 +36,9 @@ First, please download DeepSeek-V3 weights from HF https://huggingface.co/deepse
 git lfs install
 git clone https://huggingface.co/deepseek-ai/DeepSeek-V3-Base
 ```
-**Optional**: Convert the FP8 checkpoint to BF16. This is not necessary unless you want to run the model E2E in BF16 precision.
+**Optional**: Convert the FP8 checkpoint to BF16. 
+
+**This is not necessary unless you want to run the model E2E in BF16 precision.**
 ```bash
 git clone https://github.com/deepseek-ai/DeepSeek-V3.git
 cd DeepSeek-V3/inference/
@@ -47,7 +48,7 @@ cp /path/to/DeepSeek-V3/config.json /path/to/DeepSeek-V3/configuration_deepseek.
 
 ## Hardware
 
-The DeepSeek-V3 model requires at least 16x80G GPU memory, model contains 660B parameters, roughly 1.3TB memory (with BF16 precision).
+The DeepSeek-V3 model requires at least 8x141G GPU memory, model contains 660B parameters, roughly 660GB memory (with FP8 precision).
 
 ***Caution: Current TRT-LLM MLA kernel only supports Hopper architecture (SM90). Ampere architecture (SM80 & SM86) will be supported in the future release.***
 
@@ -82,14 +83,14 @@ To convert FP8 checkpoint:
 ```bash
 # Convert Deepseek-v3 HF Native FP8 weights to TensorRT-LLM checkpoint.
 python convert_checkpoint.py --model_dir ./DeepSeek-V3 \
-                            --output_dir ./trtllm_checkpoint_deepseek_v3_16gpu_fp8 \
+                            --output_dir ./trtllm_checkpoint_deepseek_v3_8gpu_fp8 \
                             --dtype bfloat16 \
                             --use_fp8_weights \
-                            --tp_size 16 \
+                            --tp_size 8 \
                             --workers 8 # using multiple workers can accelerate the conversion process
 ```
 
-To convert BF16 checkpoint:
+**Optional**: To convert BF16 checkpoint:
 ```bash
 # Convert Deepseek-v3 HF weights to TensorRT-LLM checkpoint in BF16.
 python convert_checkpoint.py --model_dir ./DeepSeek-V3 \
@@ -106,8 +107,8 @@ After the checkpoint conversion, the TensorRT engine(s) can be built with the Te
 For FP8:
 ```bash
 # Build FP8 engine
-trtllm-build --checkpoint_dir ./trtllm_checkpoint_deepseek_v3_16gpu_fp8 \
-            --output_dir ./trtllm_engines/deepseek_v3/fp8/tp16-sel4096-isl2048-bs4 \
+trtllm-build --checkpoint_dir ./trtllm_checkpoint_deepseek_v3_8gpu_fp8 \
+            --output_dir ./trtllm_engines/deepseek_v3/fp8/tp8-sel4096-isl2048-bs4 \
             --max_batch_size 4 \
             --max_seq_len 4096 \
             --max_input_len 2048 \
@@ -137,7 +138,7 @@ Test the FP8 engines with [run.py](../run.py) script:
 python3 ../run.py --input_text "Today is a nice day." \
         --max_output_len 30 \
         --tokenizer_dir ./DeepSeek-V3 \
-        --engine_dir ./trtllm_engines/deepseek_v3/fp8/tp16-sel4096-isl2048-bs4 \
+        --engine_dir ./trtllm_engines/deepseek_v3/fp8/tp8-sel4096-isl2048-bs4 \
         --top_p 0.95 \
         --temperature 0.3
 
@@ -186,7 +187,7 @@ wget https://people.eecs.berkeley.edu/~hendrycks/data.tar && tar -xf data.tar
 # Run MMLU evaluation
 python3 mmlu.py \
         --hf_model_dir ${MODEL_DIR} \
-        --engine_dir ./trtllm_engines/deepseek_v3/fp8/tp16-sel4096-isl2048-bs4 \
+        --engine_dir ./trtllm_engines/deepseek_v3/fp8/tp8-sel4096-isl2048-bs4 \
         --data_dir mmlu_data \
         --test_trt_llm 2>&1 | tee ${ENGINE_DIR}/test_with_mmlu.log
 ```
