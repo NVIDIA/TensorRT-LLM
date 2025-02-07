@@ -203,7 +203,7 @@ If you wanted to set `max_tokens_in_paged_kv_cache` instead, you would replace `
 The `max_attention_window_size` flag sets the maximum number of tokens that are
 attended to in order to generate one token when using techniques like sliding window
 attention. See this
-[Document](../advanced/gpt-attention.md#sliding-window-attention-cyclic-rolling-buffer-kv-cache)
+[Document](../../advanced/gpt-attention.md#sliding-window-attention-cyclic-rolling-buffer-kv-cache)
 for more details. It defaults to the maximum sequence length
 (`max_seq_len` when building the engine), which means
 that the feature is disabled by default.
