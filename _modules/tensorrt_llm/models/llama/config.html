@@ -14,7 +14,7 @@
       <script src="../../../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../../../_static/doctools.js?v=9a2dae69"></script>
+      <script src="../../../../_static/doctools.js?v=9bcbadda"></script>
       <script src="../../../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../../../_static/copybutton.js?v=65e89d2a"></script>
@@ -233,6 +233,7 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">attention_multiplier</span> <span class="o">=</span> <span class="n">attention_multiplier</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">residual_multiplier</span> <span class="o">=</span> <span class="n">residual_multiplier</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">output_multiplier_scale</span> <span class="o">=</span> <span class="n">output_multiplier_scale</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">has_partial_lora_mask</span> <span class="o">=</span> <span class="kc">False</span>
 
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
 
@@ -270,6 +271,7 @@
         <span class="kn">import</span> <span class="nn">transformers</span>
 
         <span class="n">trust_remote_code</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;trust_remote_code&#39;</span><span class="p">,</span> <span class="kc">True</span><span class="p">)</span>
+        <span class="n">has_partial_lora_mask</span> <span class="o">=</span> <span class="kc">False</span>
 
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">hf_config_or_dir</span><span class="p">,</span> <span class="n">transformers</span><span class="o">.</span><span class="n">PretrainedConfig</span><span class="p">):</span>
             <span class="n">hf_config</span> <span class="o">=</span> <span class="n">hf_config_or_dir</span>
@@ -301,6 +303,10 @@
                     <span class="s2">&quot;architectures&quot;</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span>
                 <span class="n">hf_config</span><span class="o">.</span><span class="n">llm_cfg</span><span class="p">[</span><span class="s2">&quot;dtype&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">hf_config</span><span class="o">.</span><span class="n">llm_cfg</span><span class="p">[</span><span class="s2">&quot;torch_dtype&quot;</span><span class="p">]</span>
                 <span class="n">hf_config</span> <span class="o">=</span> <span class="n">PretrainedConfig</span><span class="o">.</span><span class="n">from_dict</span><span class="p">(</span><span class="n">hf_config</span><span class="o">.</span><span class="n">llm_cfg</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">hf_config</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;internlmxcomposer2&#39;</span><span class="p">:</span>
+                <span class="c1"># InternLM-XComposer2 has a mask for partial lora</span>
+                <span class="c1"># Therefore we need an additional flag for this mask</span>
+                <span class="n">has_partial_lora_mask</span> <span class="o">=</span> <span class="kc">True</span>
 
         <span class="n">num_key_value_heads</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">hf_config</span><span class="p">,</span> <span class="s2">&quot;num_key_value_heads&quot;</span><span class="p">,</span>
                                       <span class="n">hf_config</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">)</span>
@@ -371,6 +377,7 @@
             <span class="n">moe</span><span class="o">=</span><span class="n">moe_config</span><span class="p">,</span>
             <span class="n">mapping</span><span class="o">=</span><span class="n">mapping</span><span class="p">,</span>
             <span class="n">quantization</span><span class="o">=</span><span class="n">quant_config</span><span class="p">,</span>
+            <span class="n">has_partial_lora_mask</span><span class="o">=</span><span class="n">has_partial_lora_mask</span><span class="p">,</span>
             <span class="n">remove_duplicated_kv_heads</span><span class="o">=</span><span class="n">remove_duplicated_kv_heads</span><span class="p">,</span>
             <span class="n">tie_word_embeddings</span><span class="o">=</span><span class="n">tie_word_embeddings</span><span class="p">,</span>
             <span class="n">embedding_multiplier</span><span class="o">=</span><span class="n">embedding_multiplier</span><span class="p">,</span>
@@ -448,7 +455,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fa25b9740e0>
+<jinja2.runtime.BlockReference object at 0x7f9b7cc86a80>
 
 <div class="footer">
     <p>

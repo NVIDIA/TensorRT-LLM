@@ -40,18 +40,6 @@ ________________
 .. doxygenfile:: decodingOutput.h
    :project: TensorRT-LLM
 
-eagleBuffers.h
-______________
-
-.. doxygenfile:: eagleBuffers.h
-   :project: TensorRT-LLM
-
-explicitDraftTokensBuffers.h
-____________________________
-
-.. doxygenfile:: explicitDraftTokensBuffers.h
-   :project: TensorRT-LLM
-
 generationInput.h
 _________________
 
@@ -64,46 +52,10 @@ __________________
 .. doxygenfile:: generationOutput.h
    :project: TensorRT-LLM
 
-gptDecoder.h
-____________
-
-.. doxygenfile:: gptDecoder.h
-   :project: TensorRT-LLM
-
-gptDecoderBatched.h
-___________________
-
-.. doxygenfile:: gptDecoderBatched.h
-   :project: TensorRT-LLM
-
 gptJsonConfig.h
 _______________
 
 .. doxygenfile:: gptJsonConfig.h
-   :project: TensorRT-LLM
-
-gptSession.h
-____________
-
-.. doxygenfile:: gptSession.h
-   :project: TensorRT-LLM
-
-iBuffer.h
-_________
-
-.. doxygenfile:: iBuffer.h
-   :project: TensorRT-LLM
-
-iGptDecoderBatched.h
-____________________
-
-.. doxygenfile:: iGptDecoderBatched.h
-   :project: TensorRT-LLM
-
-iStatefulGptDecoder.h
-_____________________
-
-.. doxygenfile:: iStatefulGptDecoder.h
    :project: TensorRT-LLM
 
 iTensor.h
@@ -116,18 +68,6 @@ ipcUtils.h
 __________
 
 .. doxygenfile:: ipcUtils.h
-   :project: TensorRT-LLM
-
-lookaheadBuffers.h
-__________________
-
-.. doxygenfile:: lookaheadBuffers.h
-   :project: TensorRT-LLM
-
-lookaheadModule.h
-_________________
-
-.. doxygenfile:: lookaheadModule.h
    :project: TensorRT-LLM
 
 loraCache.h
@@ -160,12 +100,6 @@ ________________
 .. doxygenfile:: memoryCounters.h
    :project: TensorRT-LLM
 
-modelConfig.h
-_____________
-
-.. doxygenfile:: modelConfig.h
-   :project: TensorRT-LLM
-
 promptTuningParams.h
 ____________________
 
@@ -190,12 +124,6 @@ _________________
 .. doxygenfile:: runtimeDefaults.h
    :project: TensorRT-LLM
 
-samplingConfig.h
-________________
-
-.. doxygenfile:: samplingConfig.h
-   :project: TensorRT-LLM
-
 speculativeDecodingMode.h
 _________________________
 
@@ -218,5 +146,77 @@ worldConfig.h
 _____________
 
 .. doxygenfile:: worldConfig.h
+   :project: TensorRT-LLM
+
+eagleBuffers.h
+______________
+
+.. doxygenfile:: eagleBuffers.h
+   :project: TensorRT-LLM
+
+explicitDraftTokensBuffers.h
+____________________________
+
+.. doxygenfile:: explicitDraftTokensBuffers.h
+   :project: TensorRT-LLM
+
+gptDecoder.h
+____________
+
+.. doxygenfile:: gptDecoder.h
+   :project: TensorRT-LLM
+
+gptDecoderBatched.h
+___________________
+
+.. doxygenfile:: gptDecoderBatched.h
+   :project: TensorRT-LLM
+
+gptSession.h
+____________
+
+.. doxygenfile:: gptSession.h
+   :project: TensorRT-LLM
+
+iBuffer.h
+_________
+
+.. doxygenfile:: iBuffer.h
+   :project: TensorRT-LLM
+
+iGptDecoderBatched.h
+____________________
+
+.. doxygenfile:: iGptDecoderBatched.h
+   :project: TensorRT-LLM
+
+iStatefulGptDecoder.h
+_____________________
+
+.. doxygenfile:: iStatefulGptDecoder.h
+   :project: TensorRT-LLM
+
+lookaheadBuffers.h
+__________________
+
+.. doxygenfile:: lookaheadBuffers.h
+   :project: TensorRT-LLM
+
+lookaheadModule.h
+_________________
+
+.. doxygenfile:: lookaheadModule.h
+   :project: TensorRT-LLM
+
+modelConfig.h
+_____________
+
+.. doxygenfile:: modelConfig.h
+   :project: TensorRT-LLM
+
+samplingConfig.h
+________________
+
+.. doxygenfile:: samplingConfig.h
    :project: TensorRT-LLM
 

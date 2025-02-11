@@ -14,7 +14,7 @@
       <script src="../../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../../_static/doctools.js?v=9a2dae69"></script>
+      <script src="../../../_static/doctools.js?v=9bcbadda"></script>
       <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
@@ -179,6 +179,7 @@
 
 <span class="kn">import</span> <span class="nn">contextlib</span>
 <span class="kn">from</span> <span class="nn">dataclasses</span> <span class="kn">import</span> <span class="n">dataclass</span>
+<span class="kn">from</span> <span class="nn">math</span> <span class="kn">import</span> <span class="n">prod</span>
 <span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="n">Any</span><span class="p">,</span> <span class="n">Dict</span><span class="p">,</span> <span class="n">List</span><span class="p">,</span> <span class="n">Optional</span>
 
 <span class="c1"># isort: off</span>
@@ -210,9 +211,48 @@
 <span class="k">class</span> <span class="nc">TensorInfo</span><span class="p">:</span>
     <span class="n">name</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">dtype</span><span class="p">:</span> <span class="n">trt</span><span class="o">.</span><span class="n">DataType</span>
-    <span class="n">shape</span><span class="p">:</span> <span class="nb">tuple</span></div>
+    <span class="n">shape</span><span class="p">:</span> <span class="nb">tuple</span>
 
     <span class="c1"># add more info like strides, formats if needed</span>
+
+<div class="viewcode-block" id="TensorInfo.numel">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.TensorInfo.numel">[docs]</a>
+    <span class="k">def</span> <span class="nf">numel</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">return</span> <span class="n">prod</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="TensorInfo.view">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.TensorInfo.view">[docs]</a>
+    <span class="k">def</span> <span class="nf">view</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">*</span><span class="n">shape</span><span class="p">):</span>
+        <span class="k">assert</span> <span class="nb">set</span><span class="p">(</span><span class="nb">map</span><span class="p">(</span><span class="nb">type</span><span class="p">,</span> <span class="n">shape</span><span class="p">))</span> <span class="o">==</span> <span class="p">{</span><span class="nb">int</span><span class="p">}</span>
+        <span class="n">n_unknown</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="nb">tuple</span><span class="p">(</span><span class="nb">filter</span><span class="p">(</span><span class="k">lambda</span> <span class="n">l</span><span class="p">:</span> <span class="n">l</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">,</span> <span class="n">shape</span><span class="p">)))</span>
+        <span class="n">new_shape</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">shape</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">n_unknown</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">assert</span> <span class="n">prod</span><span class="p">(</span><span class="n">shape</span><span class="p">)</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">numel</span><span class="p">()</span>
+        <span class="k">elif</span> <span class="n">n_unknown</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="n">n_known_elements</span> <span class="o">=</span> <span class="n">prod</span><span class="p">(</span><span class="nb">filter</span><span class="p">(</span><span class="k">lambda</span> <span class="n">l</span><span class="p">:</span> <span class="n">l</span> <span class="o">&gt;=</span> <span class="mi">0</span><span class="p">,</span> <span class="n">shape</span><span class="p">))</span>
+            <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">l</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">new_shape</span><span class="p">):</span>
+                <span class="k">if</span> <span class="n">l</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span><span class="p">:</span>
+                    <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">numel</span><span class="p">()</span> <span class="o">%</span> <span class="n">n_known_elements</span> <span class="o">==</span> <span class="mi">0</span>
+                    <span class="n">new_shape</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">numel</span><span class="p">()</span> <span class="o">//</span> <span class="n">n_known_elements</span>
+                    <span class="k">break</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s1">&#39;More than one dimensions need to be inferred!&#39;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">TensorInfo</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">new_shape</span><span class="p">))</span></div>
+
+
+    <span class="k">def</span> <span class="fm">__len__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+
+<div class="viewcode-block" id="TensorInfo.squeeze">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.TensorInfo.squeeze">[docs]</a>
+    <span class="k">def</span> <span class="nf">squeeze</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">):</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="n">dim</span><span class="p">]</span> <span class="o">!=</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;dim </span><span class="si">{</span><span class="n">dim</span><span class="si">}</span><span class="s2"> is </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="n">dim</span><span class="p">]</span><span class="si">}</span><span class="s2"> instead of 1!&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">TensorInfo</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
+                          <span class="bp">self</span><span class="o">.</span><span class="n">shape</span><span class="p">[:</span><span class="n">dim</span><span class="p">]</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="n">dim</span> <span class="o">+</span> <span class="mi">1</span><span class="p">:])</span></div>
+</div>
+
 
 
 <div class="viewcode-block" id="Session">
@@ -484,7 +524,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fa25c01fbf0>
+<jinja2.runtime.BlockReference object at 0x7f9b7a289160>
 
 <div class="footer">
     <p>

@@ -14,7 +14,7 @@
       <script src="../../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../../_static/doctools.js?v=9a2dae69"></script>
+      <script src="../../../_static/doctools.js?v=9bcbadda"></script>
       <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
@@ -174,6 +174,7 @@
     <span class="s1">&#39;ExecutorConfig&#39;</span><span class="p">,</span>
     <span class="s1">&#39;SchedulerConfig&#39;</span><span class="p">,</span>
     <span class="s1">&#39;KvCacheConfig&#39;</span><span class="p">,</span>
+    <span class="s1">&#39;KvCacheRetentionConfig&#39;</span><span class="p">,</span>
     <span class="s1">&#39;LookaheadDecodingConfig&#39;</span><span class="p">,</span>
     <span class="s1">&#39;MedusaDecodingConfig&#39;</span><span class="p">,</span>
     <span class="s1">&#39;ContextChunkingPolicy&#39;</span><span class="p">,</span>
@@ -189,6 +190,7 @@
 
 <span class="kn">import</span> <span class="nn">copy</span>
 <span class="kn">import</span> <span class="nn">json</span>
+<span class="kn">import</span> <span class="nn">math</span>
 <span class="kn">import</span> <span class="nn">os</span>
 <span class="kn">import</span> <span class="nn">shutil</span>
 <span class="kn">import</span> <span class="nn">tempfile</span>
@@ -206,12 +208,15 @@
 
 <span class="kn">from</span> <span class="nn">.._utils</span> <span class="kn">import</span> <span class="n">mpi_barrier</span><span class="p">,</span> <span class="n">mpi_broadcast</span><span class="p">,</span> <span class="n">mpi_rank</span><span class="p">,</span> <span class="n">release_gc</span>
 <span class="kn">from</span> <span class="nn">..auto_parallel</span> <span class="kn">import</span> <span class="n">AutoParallelConfig</span><span class="p">,</span> <span class="n">infer_cluster_config</span>
+<span class="c1"># yapf: disable</span>
 <span class="kn">from</span> <span class="nn">..bindings.executor</span> <span class="kn">import</span> <span class="p">(</span><span class="n">BatchingType</span><span class="p">,</span> <span class="n">CapacitySchedulerPolicy</span><span class="p">,</span>
                                  <span class="n">ContextChunkingPolicy</span><span class="p">,</span> <span class="n">DecodingConfig</span><span class="p">,</span>
-                                 <span class="n">DecodingMode</span><span class="p">,</span> <span class="n">ExecutorConfig</span><span class="p">,</span>
+                                 <span class="n">DecodingMode</span><span class="p">,</span> <span class="n">EagleConfig</span><span class="p">,</span> <span class="n">ExecutorConfig</span><span class="p">,</span>
                                  <span class="n">ExtendedRuntimePerfKnobConfig</span><span class="p">,</span> <span class="n">KvCacheConfig</span><span class="p">,</span>
+                                 <span class="n">KvCacheRetentionConfig</span><span class="p">,</span>
                                  <span class="n">LookaheadDecodingConfig</span><span class="p">,</span> <span class="n">PeftCacheConfig</span><span class="p">,</span>
                                  <span class="n">SchedulerConfig</span><span class="p">)</span>
+<span class="c1"># yapf: enable</span>
 <span class="kn">from</span> <span class="nn">..builder</span> <span class="kn">import</span> <span class="n">BuildConfig</span><span class="p">,</span> <span class="n">Engine</span><span class="p">,</span> <span class="n">EngineConfig</span><span class="p">,</span> <span class="n">build</span>
 <span class="kn">from</span> <span class="nn">..logger</span> <span class="kn">import</span> <span class="n">logger</span>
 <span class="kn">from</span> <span class="nn">..mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
@@ -222,9 +227,10 @@
 <span class="kn">from</span> <span class="nn">.build_cache</span> <span class="kn">import</span> <span class="p">(</span><span class="n">BuildCache</span><span class="p">,</span> <span class="n">BuildCacheConfig</span><span class="p">,</span> <span class="n">CachedStage</span><span class="p">,</span>
                           <span class="n">get_build_cache_config_from_env</span><span class="p">)</span>
 <span class="kn">from</span> <span class="nn">.mpi_session</span> <span class="kn">import</span> <span class="n">MPINodeState</span><span class="p">,</span> <span class="n">MpiSession</span>
-<span class="kn">from</span> <span class="nn">.tokenizer</span> <span class="kn">import</span> <span class="n">TokenizerBase</span><span class="p">,</span> <span class="n">TransformersTokenizer</span><span class="p">,</span> <span class="n">tokenizer_factory</span>
+<span class="kn">from</span> <span class="nn">.tokenizer</span> <span class="kn">import</span> <span class="p">(</span><span class="n">TokenizerBase</span><span class="p">,</span> <span class="n">TransformersTokenizer</span><span class="p">,</span> <span class="n">load_hf_tokenizer</span><span class="p">,</span>
+                        <span class="n">tokenizer_factory</span><span class="p">)</span>
 <span class="c1"># TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import</span>
-<span class="kn">from</span> <span class="nn">.utils</span> <span class="kn">import</span> <span class="p">(</span><span class="n">GpuArch</span><span class="p">,</span> <span class="n">append_docstring</span><span class="p">,</span> <span class="n">download_hf_model</span><span class="p">,</span>
+<span class="kn">from</span> <span class="nn">.utils</span> <span class="kn">import</span> <span class="p">(</span><span class="n">append_docstring</span><span class="p">,</span> <span class="n">download_hf_model</span><span class="p">,</span>
                     <span class="n">download_hf_pretrained_config</span><span class="p">,</span> <span class="n">enable_llm_debug</span><span class="p">,</span>
                     <span class="n">get_directory_size_in_gb</span><span class="p">,</span> <span class="n">print_colored</span><span class="p">,</span>
                     <span class="n">print_traceback_on_error</span><span class="p">)</span>
@@ -236,9 +242,11 @@
     <span class="n">tp_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
     <span class="n">pp_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
     <span class="n">cp_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
+    <span class="n">gpus_per_node</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">8</span>
     <span class="n">moe_tp_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
     <span class="n">moe_ep_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
     <span class="n">cp_config</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
+    <span class="n">enable_attention_dp</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="n">auto_parallel</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
     <span class="n">_world_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
@@ -273,6 +281,12 @@
                 <span class="s2">&quot;world_size &gt; 1 is only supported in auto parallel mode.&quot;</span><span class="p">)</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">pp_size</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">cp_size</span>
 
+    <span class="nd">@property</span>
+    <span class="k">def</span> <span class="nf">world_size_per_node</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="n">world_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">world_size</span>
+        <span class="n">total_nodes</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">ceil</span><span class="p">(</span><span class="n">world_size</span> <span class="o">/</span> <span class="bp">self</span><span class="o">.</span><span class="n">gpus_per_node</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">world_size</span> <span class="o">//</span> <span class="n">total_nodes</span>  <span class="c1">#TODO is this right?</span>
+
     <span class="nd">@world_size</span><span class="o">.</span><span class="n">setter</span>
     <span class="k">def</span> <span class="nf">world_size</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">world_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">auto_parallel</span><span class="p">:</span>
@@ -290,10 +304,12 @@
     <span class="k">def</span> <span class="nf">to_mapping</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Mapping</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">Mapping</span><span class="p">(</span><span class="n">world_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">world_size</span><span class="p">,</span>
                        <span class="n">rank</span><span class="o">=</span><span class="n">mpi_rank</span><span class="p">(),</span>
+                       <span class="n">gpus_per_node</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">gpus_per_node</span><span class="p">,</span>
                        <span class="n">tp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
                        <span class="n">pp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">pp_size</span><span class="p">,</span>
                        <span class="n">cp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">cp_size</span><span class="p">,</span>
                        <span class="n">cp_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">cp_config</span><span class="p">,</span>
+                       <span class="n">enable_attention_dp</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_attention_dp</span><span class="p">,</span>
                        <span class="n">moe_tp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_tp_size</span><span class="p">,</span>
                        <span class="n">moe_ep_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_ep_size</span><span class="p">,</span>
                        <span class="n">auto_parallel</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">auto_parallel</span><span class="p">)</span>
@@ -385,6 +401,17 @@
 
 
 <span class="nd">@dataclass</span>
+<span class="k">class</span> <span class="nc">EagleDecodingConfig</span><span class="p">:</span>
+    <span class="n">eagle_choices</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">greedy_sampling</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="n">posterior_threshold</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">use_dynamic_tree</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="n">dynamic_tree_max_topK</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">num_eagle_layers</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">max_non_leaves_per_layer</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+
+
+<span class="nd">@dataclass</span>
 <span class="k">class</span> <span class="nc">_ModelWrapper</span><span class="p">:</span>
     <span class="n">model</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Path</span><span class="p">]</span>
 
@@ -461,6 +488,8 @@
 
 <span class="s2">        context_parallel_size (int): The context parallel size. Defaults to 1.</span>
 
+<span class="s2">        gpus_per_node (Optional[int]): The number of GPUs per node. Defaults to None for automatic configure.</span>
+
 <span class="s2">        load_format (Literal[&#39;auto&#39;, &#39;dummy&#39;]): The format of the model weights to load.</span>
 <span class="s2">            * &#39;auto&#39; will try to load the weights from the provided checkpoint.</span>
 <span class="s2">            * &#39;dummy&#39; will initialize the weights with random values, which is mainly for profiling.</span>
@@ -512,6 +541,8 @@
 
 <span class="s2">        moe_expert_parallel_size (int, optional): The expert parallel size for MoE models&#39;s expert weights.</span>
 
+<span class="s2">        enable_attention_dp (bool, optional): Enable attention data parallel. Defaults to False.</span>
+
 <span class="s2">        fast_build: (bool): Enable features for faster engine building.</span>
 <span class="s2">            This may cause some performance degradation and is currently incompatible with int8/int4 quantization.</span>
 <span class="s2">            Defaults to False.</span>
@@ -528,6 +559,7 @@
 
 <span class="s2">        normalize_log_probs (bool): Whether to normalize log probabilities for the model. Defaults to False.</span>
 
+<span class="s2">        gather_generation_logits (bool): Enable gathering generation logits.</span>
 
 <span class="s2">        max_batch_size (int, optional): The maximum batch size for runtime. Defaults to None.</span>
 
@@ -572,9 +604,13 @@
 
     <span class="n">context_parallel_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
 
+    <span class="n">gpus_per_node</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+
     <span class="n">moe_tensor_parallel_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="n">moe_expert_parallel_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="n">enable_attention_dp</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
     <span class="n">cp_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
 
@@ -645,6 +681,8 @@
 
     <span class="n">normalize_log_probs</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
+    <span class="n">gather_generation_logits</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+
     <span class="n">extended_runtime_perf_knob_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span>
         <span class="n">ExtendedRuntimePerfKnobConfig</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
 
@@ -656,6 +694,11 @@
 
     <span class="c1"># backend to use</span>
     <span class="n">backend</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="c1"># private options</span>
+    <span class="n">_num_postprocess_workers</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>  <span class="c1"># Number of postprocess worker processes</span>
+    <span class="n">_postprocess_tokenizer_dir</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">_postprocess_result_handler</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Callable</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="k">def</span> <span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="c1"># TODO[chunweiy]: Enable this option in the future</span>
@@ -677,6 +720,12 @@
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span> <span class="o">==</span> <span class="s1">&#39;bfloat16&#39;</span><span class="p">:</span>
                 <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="s2">&quot;Pre SM 80 GPUs do not support bfloat16&quot;</span><span class="p">)</span>
 
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">gpus_per_node</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;Using default gpus_per_node: </span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">device_count</span><span class="p">()</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">gpus_per_node</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">device_count</span><span class="p">()</span>
+        <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">gpus_per_node</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">moe_tensor_parallel_size</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">moe_tensor_parallel_size</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span>
 
@@ -687,8 +736,10 @@
             <span class="n">tp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tensor_parallel_size</span><span class="p">,</span>
             <span class="n">pp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">pipeline_parallel_size</span><span class="p">,</span>
             <span class="n">cp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">context_parallel_size</span><span class="p">,</span>
+            <span class="n">gpus_per_node</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">gpus_per_node</span><span class="p">,</span>
             <span class="n">moe_tp_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_tensor_parallel_size</span><span class="p">,</span>
             <span class="n">moe_ep_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_expert_parallel_size</span><span class="p">,</span>
+            <span class="n">enable_attention_dp</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_attention_dp</span><span class="p">,</span>
             <span class="n">cp_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">cp_config</span><span class="p">,</span>
             <span class="n">auto_parallel</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">auto_parallel</span><span class="p">)</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">auto_parallel</span><span class="p">:</span>
@@ -788,7 +839,29 @@
 
         <span class="bp">self</span><span class="o">.</span><span class="n">calib_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">calib_config</span> <span class="ow">or</span> <span class="n">CalibConfig</span><span class="p">()</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">build_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">build_config</span> <span class="ow">or</span> <span class="n">BuildConfig</span><span class="p">()</span>
+        <span class="c1"># Note: max_batch_size and max_num_tokens in LlmArgs are for runtime,</span>
+        <span class="c1"># which will be passed to the C++ Executor API, overwriting the values</span>
+        <span class="c1"># from an built engine. In order to set build configuration, it is</span>
+        <span class="c1"># recommended to use build_config instead.</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">build_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_batch_size</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_batch_size</span> <span class="o">!=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_batch_size</span><span class="p">:</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">&quot;Conflict detected in LlmArgs build_config.max_batch_size &quot;</span>
+                    <span class="sa">f</span><span class="s2">&quot;(</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_batch_size</span><span class="si">}</span><span class="s2">) != max_batch_size (</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">max_batch_size</span><span class="si">}</span><span class="s2">).&quot;</span>
+                    <span class="sa">f</span><span class="s2">&quot;The &#39;max_batch_size&#39; specified in LlmArgs is ignored at &quot;</span>
+                    <span class="sa">f</span><span class="s2">&quot;engine build and will override at runtime.&quot;</span><span class="p">)</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_num_tokens</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_num_tokens</span> <span class="o">!=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_num_tokens</span><span class="p">:</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">&quot;Conflict detected in LlmArgs build_config.max_num_tokens &quot;</span>
+                    <span class="sa">f</span><span class="s2">&quot;(</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_num_tokens</span><span class="si">}</span><span class="s2">) != max_batch_size (</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">max_num_tokens</span><span class="si">}</span><span class="s2">).&quot;</span>
+                    <span class="sa">f</span><span class="s2">&quot;The &#39;max_num_tokens&#39; specified in LlmArgs is ignored at &quot;</span>
+                    <span class="sa">f</span><span class="s2">&quot;engine build and will override at runtime.&quot;</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">build_config</span> <span class="o">=</span> <span class="n">BuildConfig</span><span class="p">()</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_batch_size</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_batch_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_batch_size</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_num_tokens</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_num_tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_num_tokens</span>
 
         <span class="c1"># TODO(xiweny): remove the checker when manage weights support all data types</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">fast_build</span> <span class="ow">and</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">quant_config</span><span class="o">.</span><span class="n">quant_algo</span> <span class="ow">is</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8</span>
@@ -826,6 +899,16 @@
                 <span class="bp">self</span><span class="o">.</span><span class="n">decoding_config</span> <span class="o">=</span> <span class="n">DecodingConfig</span><span class="p">(</span>
                     <span class="n">decoding_mode</span><span class="o">=</span><span class="n">DecodingMode</span><span class="o">.</span><span class="n">Medusa</span><span class="p">(),</span>
                     <span class="n">medusa_choices</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">medusa_choices</span><span class="p">)</span>
+            <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span> <span class="n">EagleDecodingConfig</span><span class="p">):</span>
+                <span class="n">eagle_config</span> <span class="o">=</span> <span class="n">EagleConfig</span><span class="p">(</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">eagle_choices</span><span class="p">,</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">greedy_sampling</span><span class="p">,</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">posterior_threshold</span><span class="p">,</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">use_dynamic_tree</span><span class="p">,</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">dynamic_tree_max_topK</span><span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">decoding_config</span> <span class="o">=</span> <span class="n">DecodingConfig</span><span class="p">(</span>
+                    <span class="n">decoding_mode</span><span class="o">=</span><span class="n">DecodingMode</span><span class="o">.</span><span class="n">Eagle</span><span class="p">(),</span>
+                    <span class="n">eagle_config</span><span class="o">=</span><span class="n">eagle_config</span><span class="p">)</span>
             <span class="k">else</span><span class="p">:</span>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Speculative config type not recognized&quot;</span><span class="p">)</span>
 
@@ -838,11 +921,6 @@
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">build_config_mutable</span><span class="p">:</span>
             <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_num_tokens</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_num_tokens</span> <span class="o">=</span> <span class="mi">2048</span>
-
-            <span class="k">if</span> <span class="ow">not</span> <span class="n">GpuArch</span><span class="o">.</span><span class="n">is_post_ampere</span><span class="p">():</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">_config_arbitrator</span><span class="o">.</span><span class="n">setup</span><span class="p">(</span><span class="s2">&quot;pre-ampere not supported&quot;</span><span class="p">,</span>
-                                              <span class="n">config_name</span><span class="o">=</span><span class="s2">&quot;plugin_config&quot;</span><span class="p">,</span>
-                                              <span class="n">use_paged_context_fmha</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
 
             <span class="bp">self</span><span class="o">.</span><span class="n">_setup_enable_chunked_context</span><span class="p">()</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_setup_enable_streaming_llm</span><span class="p">()</span>
@@ -891,11 +969,13 @@
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">&quot;cp_size </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">cp_size</span><span class="si">}</span><span class="s2"> is not consistent with the engine&#39;s cp_size </span><span class="si">{</span><span class="n">mapping</span><span class="o">.</span><span class="n">cp_size</span><span class="si">}</span><span class="s2">&quot;</span>
             <span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">parallel_config</span> <span class="o">=</span> <span class="n">_ParallelConfig</span><span class="p">(</span><span class="n">tp_size</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
-                                               <span class="n">pp_size</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">pp_size</span><span class="p">,</span>
-                                               <span class="n">cp_size</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">cp_size</span><span class="p">,</span>
-                                               <span class="n">moe_tp_size</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">moe_tp_size</span><span class="p">,</span>
-                                               <span class="n">moe_ep_size</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">moe_ep_size</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">parallel_config</span> <span class="o">=</span> <span class="n">_ParallelConfig</span><span class="p">(</span>
+            <span class="n">tp_size</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
+            <span class="n">pp_size</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">pp_size</span><span class="p">,</span>
+            <span class="n">cp_size</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">cp_size</span><span class="p">,</span>
+            <span class="n">gpus_per_node</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">gpus_per_node</span><span class="p">,</span>
+            <span class="n">moe_tp_size</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">moe_tp_size</span><span class="p">,</span>
+            <span class="n">moe_ep_size</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">moe_ep_size</span><span class="p">)</span>
 
     <span class="k">def</span> <span class="nf">_load_config_from_ckpt</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">ckpt_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">):</span>
         <span class="n">pretrained_config</span> <span class="o">=</span> <span class="n">PretrainedConfig</span><span class="o">.</span><span class="n">from_json_file</span><span class="p">(</span><span class="n">ckpt_dir</span> <span class="o">/</span>
@@ -906,7 +986,7 @@
         <span class="n">moe_tp_size</span> <span class="o">=</span> <span class="n">pretrained_config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">moe_tp_size</span>
         <span class="n">moe_ep_size</span> <span class="o">=</span> <span class="n">pretrained_config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">moe_ep_size</span>
         <span class="n">world_size</span> <span class="o">=</span> <span class="n">pretrained_config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">world_size</span>
-
+        <span class="n">gpus_per_node</span> <span class="o">=</span> <span class="n">pretrained_config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">gpus_per_node</span>
         <span class="c1"># load parallel_config</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">!=</span> <span class="mi">1</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">!=</span> <span class="n">tp_size</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
@@ -929,6 +1009,7 @@
             <span class="bp">self</span><span class="o">.</span><span class="n">parallel_config</span> <span class="o">=</span> <span class="n">_ParallelConfig</span><span class="p">(</span><span class="n">tp_size</span><span class="o">=</span><span class="n">tp_size</span><span class="p">,</span>
                                                    <span class="n">pp_size</span><span class="o">=</span><span class="n">pp_size</span><span class="p">,</span>
                                                    <span class="n">cp_size</span><span class="o">=</span><span class="n">cp_size</span><span class="p">,</span>
+                                                   <span class="n">gpus_per_node</span><span class="o">=</span><span class="n">gpus_per_node</span><span class="p">,</span>
                                                    <span class="n">moe_tp_size</span><span class="o">=</span><span class="n">moe_tp_size</span><span class="p">,</span>
                                                    <span class="n">moe_ep_size</span><span class="o">=</span><span class="n">moe_ep_size</span><span class="p">)</span>
 
@@ -1011,11 +1092,6 @@
 
     <span class="k">def</span> <span class="nf">_setup_kv_cache_config</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
-
-        <span class="k">if</span> <span class="ow">not</span> <span class="n">GpuArch</span><span class="o">.</span><span class="n">is_post_ampere</span><span class="p">():</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_config_arbitrator</span><span class="o">.</span><span class="n">setup</span><span class="p">(</span><span class="s2">&quot;pre-ampere not supported&quot;</span><span class="p">,</span>
-                                          <span class="n">config_name</span><span class="o">=</span><span class="s2">&quot;kv_cache_config&quot;</span><span class="p">,</span>
-                                          <span class="n">enable_block_reuse</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">enable_block_reuse</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_config_arbitrator</span><span class="o">.</span><span class="n">claim_func</span><span class="p">(</span><span class="s2">&quot;enable_block_reuse&quot;</span><span class="p">,</span>
@@ -1433,6 +1509,7 @@
     <span class="k">def</span> <span class="nf">_download_hf_model</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&#39;&#39;&#39; Download HF model from third-party model hub like www.modelscope.cn or huggingface.  &#39;&#39;&#39;</span>
         <span class="n">model_dir</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">speculative_model_dir</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="c1"># Only the rank0 are allowed to download model</span>
         <span class="k">if</span> <span class="n">mpi_rank</span><span class="p">()</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
             <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">_workspace</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
@@ -1461,10 +1538,12 @@
     <span class="k">def</span> <span class="nf">_load_model_from_hf</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&#39;&#39;&#39; Load a TRT-LLM model from a HF model. &#39;&#39;&#39;</span>
         <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">_model_dir</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+
         <span class="n">model_cls</span> <span class="o">=</span> <span class="n">AutoModelForCausalLM</span><span class="o">.</span><span class="n">get_trtllm_model_class</span><span class="p">(</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_model_dir</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">trust_remote_code</span><span class="p">,</span>
-            <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="p">,</span> <span class="s2">&quot;speculative_model&quot;</span><span class="p">)</span>
-            <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">speculative_model</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">decoding_config</span><span class="o">.</span><span class="n">decoding_mode</span>
+            <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="p">,</span> <span class="s2">&quot;speculative_model&quot;</span><span class="p">)</span>
+            <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">speculative_model</span> <span class="k">else</span> <span class="kc">None</span><span class="p">)</span>
 
         <span class="c1"># Update quant_config if it&#39;s ModelOpt quantized ckpt</span>
         <span class="n">user_quant_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">quant_config</span>
@@ -1547,9 +1626,9 @@
                 <span class="kc">True</span><span class="p">,</span>  <span class="c1"># TODO:TRTLLM-195 to enhance the weights loading memory usage and chose best location</span>
                 <span class="n">trust_remote_code</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">trust_remote_code</span><span class="p">,</span>
                 <span class="n">speculative_model</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_speculative_model_dir</span><span class="p">,</span>
-                <span class="n">medusa_num_heads</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span>
-                <span class="n">num_medusa_heads</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span>
-                                               <span class="n">MedusaDecodingConfig</span><span class="p">)</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
+                <span class="n">speculative_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">speculative_config</span>
+                <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span>
+                                  <span class="n">LookaheadDecodingConfig</span><span class="p">)</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
                 <span class="o">**</span><span class="bp">self</span><span class="o">.</span><span class="n">convert_checkpoint_options</span><span class="p">,</span>
             <span class="p">)</span>
 
@@ -1642,17 +1721,11 @@
             <span class="n">model_dir</span><span class="p">,</span>
             <span class="n">trust_remote_code</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
             <span class="n">use_fast</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="n">TransformersTokenizer</span><span class="p">]:</span>
-        <span class="k">try</span><span class="p">:</span>
-
-            <span class="k">return</span> <span class="n">TransformersTokenizer</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
-                <span class="n">model_dir</span><span class="p">,</span>
-                <span class="n">legacy</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                <span class="n">padding_side</span><span class="o">=</span><span class="s1">&#39;left&#39;</span><span class="p">,</span>
-                <span class="n">truncation_side</span><span class="o">=</span><span class="s1">&#39;left&#39;</span><span class="p">,</span>
-                <span class="n">trust_remote_code</span><span class="o">=</span><span class="n">trust_remote_code</span><span class="p">,</span>
-                <span class="n">use_fast</span><span class="o">=</span><span class="n">use_fast</span><span class="p">)</span>
-        <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
-            <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Failed to load tokenizer from </span><span class="si">{</span><span class="n">model_dir</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">e</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="p">(</span><span class="n">tokenizer</span> <span class="o">:=</span> <span class="n">load_hf_tokenizer</span><span class="p">(</span><span class="n">model_dir</span><span class="p">,</span> <span class="n">trust_remote_code</span><span class="p">,</span>
+                                           <span class="n">use_fast</span><span class="p">))</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">tokenizer</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Failed to load tokenizer from </span><span class="si">{</span><span class="n">model_dir</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
             <span class="k">return</span> <span class="kc">None</span>
 
 
@@ -1716,10 +1789,12 @@
                 <span class="p">)</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">llm_build_stats</span><span class="o">.</span><span class="n">engine_dir</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_loader</span><span class="o">.</span><span class="n">model_obj</span><span class="o">.</span><span class="n">model_dir</span>
                 <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_build_stats</span><span class="o">.</span><span class="n">engine_dir</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span>
-        <span class="kn">from</span> <span class="nn">tensorrt_llm._torch.pyexecutor.backend_registries.backend_registry</span> <span class="kn">import</span> \
-            <span class="n">get_backend_info</span>
-        <span class="k">if</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">backend</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">and</span> <span class="n">get_backend_info</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">backend</span><span class="p">,</span> <span class="s1">&#39;need_hf_model&#39;</span><span class="p">):</span>
+
+        <span class="k">if</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">backend</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">):</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">backend</span> <span class="o">!=</span> <span class="s2">&quot;pytorch&quot;</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s1">&#39;backend </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">llm_args</span><span class="o">.</span><span class="n">backend</span><span class="si">}</span><span class="s1"> is not supported.&#39;</span><span class="p">)</span>
+
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_loader</span><span class="o">.</span><span class="n">model_obj</span><span class="o">.</span><span class="n">is_hub_model</span><span class="p">:</span>
                 <span class="n">hf_folder</span> <span class="o">=</span> <span class="n">download_hf_model</span><span class="p">(</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">model_loader</span><span class="o">.</span><span class="n">model_obj</span><span class="o">.</span><span class="n">model_name</span><span class="p">,</span>
@@ -1914,7 +1989,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fa25bb17620>
+<jinja2.runtime.BlockReference object at 0x7f96d1597800>
 
 <div class="footer">
     <p>

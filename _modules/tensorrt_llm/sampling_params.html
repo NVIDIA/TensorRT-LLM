@@ -14,7 +14,7 @@
       <script src="../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../_static/doctools.js?v=9a2dae69"></script>
+      <script src="../../_static/doctools.js?v=9bcbadda"></script>
       <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../_static/copybutton.js?v=65e89d2a"></script>
@@ -264,6 +264,7 @@
 <span class="sd">        length_penalty (float): Controls how to penalize longer sequences in beam search. Default is 0.f</span>
 <span class="sd">        early_stopping (int): Controls whether the generation process finishes once beamWidth sentences are generated (ends with end_token)</span>
 <span class="sd">        no_repeat_ngram_size (int): Controls how many repeat ngram size are acceptable. Default is 1 &lt;&lt; 30.</span>
+<span class="sd">        min_p (float): scale the most likely token to determine the minimum token probability. Default is 0.0.</span>
 
 <span class="sd">        return_log_probs (bool): Controls if Result should contain log probabilities. Default is false.</span>
 <span class="sd">        return_context_logits (bool): Controls if Result should contain the context logits. Default is false.</span>
@@ -338,6 +339,7 @@
     <span class="n">length_penalty</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">early_stopping</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">no_repeat_ngram_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">min_p</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="c1"># Keep the below fields in sync with tllme.OutputConfig</span>
     <span class="n">return_log_probs</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
@@ -361,6 +363,8 @@
     <span class="n">truncate_prompt_tokens</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">skip_special_tokens</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="n">spaces_between_special_tokens</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+
+    <span class="n">BATCHED_POST_PROCESSOR_NAME</span> <span class="o">=</span> <span class="n">tllme</span><span class="o">.</span><span class="n">Request</span><span class="o">.</span><span class="n">BATCHED_POST_PROCESSOR_NAME</span>
 
     <span class="k">def</span> <span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">pad_id</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
@@ -523,7 +527,8 @@
             <span class="s2">&quot;top_p_decay&quot;</span><span class="p">,</span> <span class="s2">&quot;seed&quot;</span><span class="p">,</span> <span class="s2">&quot;random_seed&quot;</span><span class="p">,</span> <span class="s2">&quot;temperature&quot;</span><span class="p">,</span> <span class="s2">&quot;min_tokens&quot;</span><span class="p">,</span>
             <span class="s2">&quot;min_length&quot;</span><span class="p">,</span> <span class="s2">&quot;beam_search_diversity_rate&quot;</span><span class="p">,</span> <span class="s2">&quot;repetition_penalty&quot;</span><span class="p">,</span>
             <span class="s2">&quot;presence_penalty&quot;</span><span class="p">,</span> <span class="s2">&quot;frequency_penalty&quot;</span><span class="p">,</span> <span class="s2">&quot;length_penalty&quot;</span><span class="p">,</span>
-            <span class="s2">&quot;early_stopping&quot;</span><span class="p">,</span> <span class="s2">&quot;no_repeat_ngram_size&quot;</span><span class="p">,</span> <span class="s2">&quot;num_return_sequences&quot;</span>
+            <span class="s2">&quot;early_stopping&quot;</span><span class="p">,</span> <span class="s2">&quot;no_repeat_ngram_size&quot;</span><span class="p">,</span> <span class="s2">&quot;num_return_sequences&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;min_p&quot;</span>
         <span class="p">}</span>
         <span class="n">found_fields</span> <span class="o">=</span> <span class="p">{</span>
             <span class="n">f</span>
@@ -618,7 +623,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fa25b808920>
+<jinja2.runtime.BlockReference object at 0x7f9b7a3e18e0>
 
 <div class="footer">
     <p>

@@ -14,7 +14,7 @@
       <script src="../../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../../_static/doctools.js?v=9a2dae69"></script>
+      <script src="../../../_static/doctools.js?v=9bcbadda"></script>
       <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
@@ -186,7 +186,8 @@
 <span class="kn">from</span> <span class="nn">.._utils</span> <span class="kn">import</span> <span class="n">set_obj_attrs</span><span class="p">,</span> <span class="n">str_dtype_to_torch</span><span class="p">,</span> <span class="n">str_dtype_to_trt</span>
 <span class="kn">from</span> <span class="nn">..functional</span> <span class="kn">import</span> <span class="p">(</span><span class="n">AllReduceFusionOp</span><span class="p">,</span> <span class="n">AllReduceParams</span><span class="p">,</span> <span class="n">Tensor</span><span class="p">,</span>
                           <span class="n">_add_plugin_info</span><span class="p">,</span> <span class="n">_create_tensor</span><span class="p">,</span> <span class="n">allgather</span><span class="p">,</span>
-                          <span class="n">allreduce</span><span class="p">,</span> <span class="n">cast</span><span class="p">,</span> <span class="n">low_latency_gemm</span><span class="p">,</span> <span class="n">matmul</span><span class="p">)</span>
+                          <span class="n">allreduce</span><span class="p">,</span> <span class="n">cast</span><span class="p">,</span> <span class="n">gemm_allreduce</span><span class="p">,</span> <span class="n">low_latency_gemm</span><span class="p">,</span>
+                          <span class="n">matmul</span><span class="p">)</span>
 <span class="kn">from</span> <span class="nn">..mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
 <span class="kn">from</span> <span class="nn">..module</span> <span class="kn">import</span> <span class="n">Module</span>
 <span class="kn">from</span> <span class="nn">..parameter</span> <span class="kn">import</span> <span class="n">Parameter</span>
@@ -356,6 +357,7 @@
 
         <span class="c1"># see optimize_model&#39;s add_lora for LoRA initialization</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">lora</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">dora</span> <span class="o">=</span> <span class="kc">None</span>
 
 <div class="viewcode-block" id="LinearBase.weight_loader">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.linear.LinearBase.weight_loader">[docs]</a>
@@ -396,10 +398,13 @@
             <span class="n">use_gemm_plugin</span> <span class="o">=</span> <span class="n">gemm_plugin</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">gemm_plugin</span> <span class="o">!=</span> <span class="s1">&#39;nvfp4&#39;</span>
             <span class="n">use_low_latency_gemm_plugin</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">(</span>
             <span class="p">)</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">low_latency_gemm_plugin</span> <span class="o">==</span> <span class="s1">&#39;fp8&#39;</span>
+            <span class="n">use_gemm_allreduce_plugin</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">(</span>
+            <span class="p">)</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gemm_allreduce_plugin</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
             <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">get_managed_tensor</span><span class="p">(</span>
                 <span class="n">network</span><span class="o">=</span><span class="n">default_net</span><span class="p">(),</span>
                 <span class="n">need_transpose</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">weight_is_kn</span><span class="p">()</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">use_gemm_plugin</span>
-                <span class="ow">and</span> <span class="ow">not</span> <span class="n">use_low_latency_gemm_plugin</span><span class="p">)</span>
+                <span class="ow">and</span> <span class="ow">not</span> <span class="n">use_low_latency_gemm_plugin</span>
+                <span class="ow">and</span> <span class="ow">not</span> <span class="n">use_gemm_allreduce_plugin</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">get_constant_tensor</span><span class="p">(</span><span class="n">network</span><span class="o">=</span><span class="n">default_net</span><span class="p">())</span></div>
 
@@ -446,6 +451,9 @@
                 <span class="k">if</span> <span class="n">lora_hidden_state</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">lora_hidden_state</span><span class="p">,</span>
                 <span class="n">lora_runtime_params</span><span class="o">=</span><span class="n">lora_runtime_params</span><span class="p">,</span>
             <span class="p">)</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">dora</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">x</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">dora</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">lora_runtime_params</span><span class="o">=</span><span class="n">lora_runtime_params</span><span class="p">)</span>
+
         <span class="k">return</span> <span class="n">x</span></div>
 
 
@@ -629,6 +637,10 @@
                     <span class="n">weights</span> <span class="o">=</span> <span class="n">w</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">in_features</span><span class="p">)</span>  <span class="c1"># Weight</span>
                 <span class="k">else</span><span class="p">:</span>
                     <span class="n">weights</span> <span class="o">=</span> <span class="n">w</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span>  <span class="c1"># Bias</span>
+
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">weights</span><span class="p">,</span> <span class="nb">list</span><span class="p">):</span>
+            <span class="n">weights</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span><span class="n">weights</span><span class="p">)</span>
+
         <span class="n">weights</span> <span class="o">=</span> <span class="n">weights</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">str_dtype_to_torch</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">dtype</span><span class="p">))</span>
         <span class="k">return</span> <span class="p">{</span><span class="n">tllm_key</span><span class="p">:</span> <span class="n">weights</span><span class="p">}</span></div>
 </div>
@@ -678,6 +690,55 @@
         <span class="k">return</span> <span class="mi">1</span></div>
 
 
+<div class="viewcode-block" id="RowLinear.multiply_collect">
+<a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.linear.RowLinear.multiply_collect">[docs]</a>
+    <span class="k">def</span> <span class="nf">multiply_collect</span><span class="p">(</span>
+            <span class="bp">self</span><span class="p">,</span>
+            <span class="n">x</span><span class="p">,</span>
+            <span class="n">weight</span><span class="p">,</span>
+            <span class="n">gemm_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="n">low_latency_gemm_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="n">use_fp8</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+            <span class="n">alpha</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="n">lora_runtime_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">LoraRuntimeParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="n">lora_hidden_state</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+
+        <span class="n">gemm_allreduce_plugin</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">(</span>
+        <span class="p">)</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gemm_allreduce_plugin</span>
+        <span class="k">if</span> <span class="n">gemm_allreduce_plugin</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">lora_runtime_params</span> <span class="o">!=</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">lora_hidden_state</span> <span class="o">!=</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+                    <span class="s2">&quot;gemm_allreduce_plugin not supported with lora.&quot;</span><span class="p">)</span>
+
+            <span class="n">output_dtype</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span>
+            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">output_dtype</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
+                <span class="n">output_dtype</span> <span class="o">=</span> <span class="n">str_dtype_to_trt</span><span class="p">(</span><span class="n">output_dtype</span><span class="p">)</span>
+
+            <span class="n">x</span> <span class="o">=</span> <span class="n">gemm_allreduce</span><span class="p">(</span>
+                <span class="n">a</span><span class="o">=</span><span class="n">x</span><span class="p">,</span>
+                <span class="n">b</span><span class="o">=</span><span class="n">weight</span><span class="p">,</span>
+                <span class="n">transa</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>  <span class="c1"># row-major</span>
+                <span class="n">transb</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>  <span class="c1"># col-major</span>
+                <span class="n">alpha</span><span class="o">=</span><span class="n">alpha</span><span class="p">,</span>
+                <span class="n">group</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tp_group</span><span class="p">,</span>  <span class="c1"># ranks participating</span>
+                <span class="n">output_dtype</span><span class="o">=</span><span class="n">output_dtype</span><span class="p">,</span>
+                <span class="n">fp8_inputs_override</span><span class="o">=</span><span class="n">use_fp8</span><span class="p">)</span>
+
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">bias</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">bias</span> <span class="o">=</span> <span class="n">cast</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">bias</span><span class="o">.</span><span class="n">value</span><span class="p">,</span> <span class="n">x</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_expert</span><span class="p">:</span>
+                    <span class="n">x</span> <span class="o">=</span> <span class="n">x</span> <span class="o">+</span> <span class="n">bias</span> <span class="o">/</span> <span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="n">x</span> <span class="o">=</span> <span class="n">x</span> <span class="o">+</span> <span class="n">bias</span>
+            <span class="k">return</span> <span class="n">x</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">return</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">multiply_collect</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="n">gemm_plugin</span><span class="p">,</span>
+                                            <span class="n">low_latency_gemm_plugin</span><span class="p">,</span> <span class="n">use_fp8</span><span class="p">,</span>
+                                            <span class="n">alpha</span><span class="p">,</span> <span class="n">lora_runtime_params</span><span class="p">,</span>
+                                            <span class="n">lora_hidden_state</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span></div>
+
+
 <div class="viewcode-block" id="RowLinear.collect_and_bias">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.linear.RowLinear.collect_and_bias">[docs]</a>
     <span class="k">def</span> <span class="nf">collect_and_bias</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
@@ -720,7 +781,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fa25c5d3e60>
+<jinja2.runtime.BlockReference object at 0x7f96d1370140>
 
 <div class="footer">
     <p>

@@ -14,7 +14,7 @@
       <script src="../../../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../../../_static/doctools.js?v=9a2dae69"></script>
+      <script src="../../../../_static/doctools.js?v=9bcbadda"></script>
       <script src="../../../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../../../_static/copybutton.js?v=65e89d2a"></script>
@@ -1339,9 +1339,10 @@
                     <span class="n">lora_weight_pointer</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
                         <span class="n">name</span><span class="o">=</span><span class="sa">f</span><span class="s1">&#39;</span><span class="si">{</span><span class="n">lora_module</span><span class="si">}</span><span class="s1">_lora_weights_pointers_</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">,</span>
                         <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int64</span><span class="p">,</span>
-                        <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">],</span>
+                        <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">3</span><span class="p">],</span>
                         <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;batch_size_beam_width&#39;</span><span class="p">,</span>
-                                                <span class="p">[</span><span class="n">bb_range</span><span class="p">]),</span> <span class="p">(</span><span class="s1">&#39;in_out&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">2</span><span class="p">])]))</span>
+                                                <span class="p">[</span><span class="n">bb_range</span><span class="p">]),</span>
+                                               <span class="p">(</span><span class="s1">&#39;in_out_scales&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">3</span><span class="p">])]))</span>
                     <span class="n">lora_weight_pointer_dict</span><span class="o">.</span><span class="n">update</span><span class="p">({</span>
                         <span class="sa">f</span><span class="s1">&#39;</span><span class="si">{</span><span class="n">lora_module</span><span class="si">}</span><span class="s1">_lora_weights_pointers&#39;</span><span class="p">:</span>
                         <span class="n">lora_weight_pointer</span>
@@ -1746,7 +1747,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fa2582bf230>
+<jinja2.runtime.BlockReference object at 0x7f9b781d0cb0>
 
 <div class="footer">
     <p>

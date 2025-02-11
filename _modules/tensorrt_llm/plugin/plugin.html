@@ -14,7 +14,7 @@
       <script src="../../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../../_static/doctools.js?v=9a2dae69"></script>
+      <script src="../../../_static/doctools.js?v=9bcbadda"></script>
       <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
@@ -249,6 +249,7 @@
     <span class="p">[</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span> <span class="s2">&quot;float16&quot;</span><span class="p">,</span> <span class="s2">&quot;float32&quot;</span><span class="p">,</span> <span class="s2">&quot;bfloat16&quot;</span><span class="p">,</span> <span class="s2">&quot;int32&quot;</span><span class="p">,</span> <span class="s2">&quot;fp8&quot;</span><span class="p">,</span> <span class="s2">&quot;nvfp4&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">],</span>
     <span class="s2">&quot;low_latency_gemm_plugin&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;fp8&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">],</span>
     <span class="s2">&quot;low_latency_gemm_swiglu_plugin&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;fp8&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">],</span>
+    <span class="s2">&quot;gemm_allreduce_plugin&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;float16&quot;</span><span class="p">,</span> <span class="s2">&quot;bfloat16&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">]</span>
 <span class="p">}</span>
 
 
@@ -384,6 +385,9 @@
     <span class="n">_lora_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                                         <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                                         <span class="n">metadata</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;help&quot;</span><span class="p">:</span> <span class="s2">&quot;Enable LoRA.&quot;</span><span class="p">})</span>
+    <span class="n">_dora_plugin</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                               <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                               <span class="n">metadata</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;help&quot;</span><span class="p">:</span> <span class="s2">&quot;Enable DoRA.&quot;</span><span class="p">})</span>
     <span class="n">_weight_only_groupwise_quant_matmul_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
@@ -462,6 +466,11 @@
             <span class="s2">&quot;The GEMM + SwiGLU fusion plugin that optimized specially for low latency scenarios.&quot;</span>
         <span class="p">})</span>
 
+    <span class="n">_gemm_allreduce_plugin</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;help&quot;</span><span class="p">:</span> <span class="s2">&quot;The GEMM + AllReduce kernel fusion plugin.&quot;</span><span class="p">})</span>
+
     <span class="c1"># Features</span>
     <span class="n">_context_fmha</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
@@ -494,6 +503,14 @@
             <span class="s2">&quot;help&quot;</span><span class="p">:</span>
             <span class="s2">&quot;Pack different tokens together, which reduces both the amount of computations and memory consumption.&quot;</span>
         <span class="p">})</span>
+    <span class="n">_norm_quant_fusion</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span>
+            <span class="s2">&quot;Fuse the LayerNorm and quantization kernels into a single kernel, &quot;</span>
+            <span class="s2">&quot;resulting in improved end-to-end performance.&quot;</span>
+        <span class="p">})</span>
     <span class="n">_reduce_fusion</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
         <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
@@ -513,25 +530,31 @@
             <span class="s2">&quot;is currently only supported for the FP8 LLAMA model.&quot;</span>
         <span class="p">})</span>
     <span class="n">_tokens_per_block</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
-        <span class="n">default</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">32</span><span class="p">,</span>
         <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
         <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
             <span class="s2">&quot;help&quot;</span><span class="p">:</span>
             <span class="s2">&quot;Define how many tokens are contained in each paged kv cache block.&quot;</span>
         <span class="p">})</span>
     <span class="n">_use_paged_context_fmha</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
-        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
         <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
         <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
             <span class="s2">&quot;help&quot;</span><span class="p">:</span>
             <span class="s2">&quot;Allow advanced features like KV cache reuse and chunked context.&quot;</span>
         <span class="p">})</span>
     <span class="n">_use_fp8_context_fmha</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
-        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
         <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
         <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
             <span class="s2">&quot;help&quot;</span><span class="p">:</span>
             <span class="s2">&quot;When FP8 quantization is activated, the attention can be further accelerated by enabling FP8 Context FMHA&quot;</span>
+        <span class="p">})</span>
+    <span class="n">_fuse_fp4_quant</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">&quot;help&quot;</span><span class="p">:</span> <span class="s2">&quot;Whether to fuse FP4 quantization into attention kernel.&quot;</span>
         <span class="p">})</span>
     <span class="n">_multiple_profiles</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
@@ -707,7 +730,7 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">context_fmha_type</span> <span class="o">=</span> <span class="n">context_fmha_type</span>
         <span class="k">return</span> <span class="bp">self</span>
 
-    <span class="k">def</span> <span class="nf">enable_paged_kv_cache</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tokens_per_block</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">64</span><span class="p">):</span>
+    <span class="k">def</span> <span class="nf">enable_paged_kv_cache</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tokens_per_block</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">32</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">paged_kv_cache</span> <span class="o">=</span> <span class="kc">True</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_block</span> <span class="o">=</span> <span class="n">tokens_per_block</span>
         <span class="k">return</span> <span class="bp">self</span>
@@ -719,6 +742,10 @@
 
     <span class="k">def</span> <span class="nf">set_lora_plugin</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">lora_plugin</span> <span class="o">=</span> <span class="n">dtype</span>
+        <span class="k">return</span> <span class="bp">self</span>
+
+    <span class="k">def</span> <span class="nf">set_dora_plugin</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">enable</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">dora_plugin</span> <span class="o">=</span> <span class="n">enable</span>
         <span class="k">return</span> <span class="bp">self</span></div>
 
 
@@ -733,11 +760,13 @@
     <span class="s2">&quot;gemm_swiglu_plugin&quot;</span><span class="p">,</span>
     <span class="s2">&quot;fp8_rowwise_gemm_plugin&quot;</span><span class="p">,</span>
     <span class="s2">&quot;lora_plugin&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;dora_plugin&quot;</span><span class="p">,</span>
     <span class="s2">&quot;moe_plugin&quot;</span><span class="p">,</span>
     <span class="s2">&quot;mamba_conv1d_plugin&quot;</span><span class="p">,</span>
     <span class="s2">&quot;nccl_plugin&quot;</span><span class="p">,</span>
     <span class="s2">&quot;low_latency_gemm_plugin&quot;</span><span class="p">,</span>
     <span class="s2">&quot;low_latency_gemm_swiglu_plugin&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;gemm_allreduce_plugin&quot;</span><span class="p">,</span>
 
     <span class="c1"># Features</span>
     <span class="s2">&quot;context_fmha&quot;</span><span class="p">,</span>
@@ -746,9 +775,11 @@
     <span class="s2">&quot;tokens_per_block&quot;</span><span class="p">,</span>
     <span class="s2">&quot;use_paged_context_fmha&quot;</span><span class="p">,</span>
     <span class="s2">&quot;use_fp8_context_fmha&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;fuse_fp4_quant&quot;</span><span class="p">,</span>
     <span class="s2">&quot;multiple_profiles&quot;</span><span class="p">,</span>
     <span class="s2">&quot;paged_state&quot;</span><span class="p">,</span>
     <span class="s2">&quot;streamingllm&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;norm_quant_fusion&quot;</span><span class="p">,</span>
     <span class="s2">&quot;reduce_fusion&quot;</span><span class="p">,</span>
     <span class="s2">&quot;user_buffer&quot;</span><span class="p">,</span>
     <span class="s2">&quot;use_fused_mlp&quot;</span><span class="p">,</span>
@@ -921,7 +952,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fa25bd5ebd0>
+<jinja2.runtime.BlockReference object at 0x7f9b7a3cf2c0>
 
 <div class="footer">
     <p>

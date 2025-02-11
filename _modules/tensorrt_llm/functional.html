@@ -14,7 +14,7 @@
       <script src="../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../_static/doctools.js?v=9a2dae69"></script>
+      <script src="../../_static/doctools.js?v=9bcbadda"></script>
       <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../_static/copybutton.js?v=65e89d2a"></script>
@@ -4672,6 +4672,123 @@
 
 
 
+<div class="viewcode-block" id="gemm_allreduce">
+<a class="viewcode-back" href="../../python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.gemm_allreduce">[docs]</a>
+<span class="k">def</span> <span class="nf">gemm_allreduce</span><span class="p">(</span><span class="n">a</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+                   <span class="n">b</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+                   <span class="n">group</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
+                   <span class="n">transa</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+                   <span class="n">transb</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+                   <span class="n">alpha</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                   <span class="n">output_dtype</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">trt</span><span class="o">.</span><span class="n">DataType</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                   <span class="n">fp8_inputs_override</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&#39;&#39;&#39;</span>
+<span class="sd">    Add an operation that performs fused GEMM+AllReduce.</span>
+
+<span class="sd">    Parameters:</span>
+<span class="sd">        a: Tensor</span>
+<span class="sd">            Input tensor A</span>
+<span class="sd">        b: Tensor</span>
+<span class="sd">            Input tensor B</span>
+<span class="sd">        group: List[int]</span>
+<span class="sd">            Ranks participating in collective</span>
+<span class="sd">        transa: bool</span>
+<span class="sd">            Whether or not input tensor A is transposed</span>
+<span class="sd">        transb: bool</span>
+<span class="sd">            Whether or not input tensor B is transposed</span>
+<span class="sd">        alpha: float</span>
+<span class="sd">            Alpha for GEMM -&gt; beta * C + (alpha * acc)</span>
+<span class="sd">        output_dtype: trt.DataType</span>
+<span class="sd">            Output type for plugin. If it is None, we</span>
+<span class="sd">            will use type set in plugin_config.</span>
+<span class="sd">        fp8_inputs_override: bool</span>
+<span class="sd">            TRT graph does not detect FP8 inputs correctly. This</span>
+<span class="sd">            flag is used to override the derived input tensor</span>
+<span class="sd">            types so that our plugin knows to issue FP8 MMAs.</span>
+
+<span class="sd">    Returns:</span>
+<span class="sd">        Returns GEMM output tensor which has been reduced across ranks.</span>
+<span class="sd">    &#39;&#39;&#39;</span>
+
+    <span class="c1"># Output tensor needs to be bound to externally mananged</span>
+    <span class="c1"># memory so keep track of layer index so we can assign</span>
+    <span class="c1"># output tensor unique label.</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">gemm_allreduce</span><span class="p">,</span> <span class="s1">&#39;layer_idx&#39;</span><span class="p">):</span>
+        <span class="n">gemm_allreduce</span><span class="o">.</span><span class="n">layer_idx</span> <span class="o">=</span> <span class="mi">0</span>
+
+    <span class="c1"># Check inputs</span>
+    <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">a</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span> <span class="n">trt</span><span class="o">.</span><span class="n">DataType</span><span class="p">)</span>
+    <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">b</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span> <span class="n">trt</span><span class="o">.</span><span class="n">DataType</span><span class="p">)</span>
+
+    <span class="k">if</span> <span class="n">fp8_inputs_override</span><span class="p">:</span>
+        <span class="k">assert</span> <span class="p">(</span>
+            <span class="nb">isinstance</span><span class="p">(</span><span class="n">alpha</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">)</span> <span class="ow">and</span> <span class="n">alpha</span><span class="o">.</span><span class="n">dtype</span> <span class="o">==</span> <span class="n">np</span><span class="o">.</span><span class="n">float32</span>
+            <span class="ow">and</span> <span class="n">alpha</span><span class="o">.</span><span class="n">size</span> <span class="o">==</span> <span class="mi">1</span>
+        <span class="p">),</span> <span class="s2">&quot;`alpha` must be passed as a float32 ndarray if `fp8_inputs_override` is enabled for gemm_allreduce_plugin&quot;</span>
+        <span class="k">assert</span> <span class="n">a</span><span class="o">.</span><span class="n">dtype</span> <span class="o">==</span> <span class="n">trt</span><span class="o">.</span><span class="n">fp8</span>
+        <span class="k">assert</span> <span class="n">b</span><span class="o">.</span><span class="n">dtype</span> <span class="o">==</span> <span class="n">trt</span><span class="o">.</span><span class="n">fp8</span>
+
+    <span class="k">if</span> <span class="n">output_dtype</span> <span class="o">==</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">output_dtype</span> <span class="o">=</span> <span class="n">str_dtype_to_trt</span><span class="p">(</span>
+            <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">gemm_allreduce_plugin</span><span class="p">)</span>
+    <span class="k">assert</span> <span class="n">output_dtype</span> <span class="ow">in</span> <span class="p">[</span><span class="n">trt</span><span class="o">.</span><span class="n">float16</span><span class="p">,</span> <span class="n">trt</span><span class="o">.</span><span class="n">bfloat16</span>
+                            <span class="p">]</span>  <span class="c1"># TODO(xsimmons): expand support for other types</span>
+    <span class="n">alpha</span> <span class="o">=</span> <span class="n">alpha</span> <span class="k">if</span> <span class="n">alpha</span> <span class="k">else</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="mf">1.0</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+
+    <span class="n">plugin_creator</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">get_plugin_registry</span><span class="p">()</span><span class="o">.</span><span class="n">get_plugin_creator</span><span class="p">(</span>
+        <span class="s1">&#39;GemmAllReduce&#39;</span><span class="p">,</span> <span class="s1">&#39;1&#39;</span><span class="p">,</span> <span class="n">TRT_LLM_PLUGIN_NAMESPACE</span><span class="p">)</span>
+    <span class="k">assert</span> <span class="n">plugin_creator</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+
+    <span class="n">trt_type_a</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">fp8</span> <span class="k">if</span> <span class="n">fp8_inputs_override</span> <span class="k">else</span> <span class="n">a</span><span class="o">.</span><span class="n">dtype</span>
+    <span class="n">trt_type_b</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">fp8</span> <span class="k">if</span> <span class="n">fp8_inputs_override</span> <span class="k">else</span> <span class="n">b</span><span class="o">.</span><span class="n">dtype</span>
+
+    <span class="c1"># create plugin fields</span>
+    <span class="n">field_type_a</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span><span class="s1">&#39;type_a&#39;</span><span class="p">,</span>
+                                   <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">([</span><span class="nb">int</span><span class="p">(</span><span class="n">trt_type_a</span><span class="p">)],</span> <span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
+                                   <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT32</span><span class="p">)</span>
+    <span class="n">field_type_b</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span><span class="s1">&#39;type_b&#39;</span><span class="p">,</span>
+                                   <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">([</span><span class="nb">int</span><span class="p">(</span><span class="n">trt_type_b</span><span class="p">)],</span> <span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
+                                   <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT32</span><span class="p">)</span>
+    <span class="n">field_type_d</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span><span class="s1">&#39;type_d&#39;</span><span class="p">,</span>
+                                   <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">([</span><span class="nb">int</span><span class="p">(</span><span class="n">output_dtype</span><span class="p">)],</span> <span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
+                                   <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT32</span><span class="p">)</span>
+    <span class="n">field_transa</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span><span class="s1">&#39;transa&#39;</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">transa</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
+                                   <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT32</span><span class="p">)</span>
+    <span class="n">field_transb</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span><span class="s1">&#39;transb&#39;</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">transb</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
+                                   <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT32</span><span class="p">)</span>
+    <span class="n">field_alpha</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span><span class="s1">&#39;alpha&#39;</span><span class="p">,</span> <span class="n">alpha</span><span class="o">.</span><span class="n">flatten</span><span class="p">(),</span>
+                                  <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">FLOAT32</span><span class="p">)</span>
+    <span class="n">field_group</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span><span class="s1">&#39;group&#39;</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">group</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
+                                  <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT32</span><span class="p">)</span>
+
+    <span class="c1"># create plugin</span>
+    <span class="n">fields</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldCollection</span><span class="p">([</span>
+        <span class="n">field_type_a</span><span class="p">,</span> <span class="n">field_type_b</span><span class="p">,</span> <span class="n">field_type_d</span><span class="p">,</span> <span class="n">field_transa</span><span class="p">,</span> <span class="n">field_transb</span><span class="p">,</span>
+        <span class="n">field_alpha</span><span class="p">,</span> <span class="n">field_group</span>
+    <span class="p">])</span>
+    <span class="n">plugin</span> <span class="o">=</span> <span class="n">plugin_creator</span><span class="o">.</span><span class="n">create_plugin</span><span class="p">(</span><span class="s2">&quot;gemm_allreduce&quot;</span><span class="p">,</span> <span class="n">fields</span><span class="p">)</span>
+    <span class="c1"># define symbolic input tensors.</span>
+    <span class="c1"># note this does NOT allocate memory.</span>
+    <span class="n">inputs</span> <span class="o">=</span> <span class="p">[</span><span class="n">a</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">,</span> <span class="n">b</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">]</span>
+    <span class="n">layer</span> <span class="o">=</span> <span class="n">default_trtnet</span><span class="p">()</span><span class="o">.</span><span class="n">add_plugin_v2</span><span class="p">(</span><span class="n">inputs</span><span class="p">,</span> <span class="n">plugin</span><span class="p">)</span>
+    <span class="n">_add_plugin_info</span><span class="p">(</span><span class="n">layer</span><span class="p">,</span> <span class="n">plugin_creator</span><span class="p">,</span> <span class="s2">&quot;gemm_allreduce&quot;</span><span class="p">,</span> <span class="n">fields</span><span class="p">)</span>
+    <span class="c1"># define symbolic output tensors</span>
+    <span class="c1"># both output tensors point to same physical memory but</span>
+    <span class="c1"># one has unicast address and other has multicast address</span>
+    <span class="n">uc_output</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
+    <span class="n">mc_output</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
+    <span class="k">assert</span> <span class="n">uc_output</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+    <span class="k">assert</span> <span class="n">mc_output</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+    <span class="c1"># mark outputs so that we can bind our own allocated memory in runtime</span>
+    <span class="c1"># (see generation.py)</span>
+    <span class="n">uc_output</span><span class="o">.</span><span class="n">mark_output</span><span class="p">(</span><span class="sa">f</span><span class="s1">&#39;gemm_allreduce_uc_out_</span><span class="si">{</span><span class="n">gemm_allreduce</span><span class="o">.</span><span class="n">layer_idx</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">)</span>
+    <span class="n">mc_output</span><span class="o">.</span><span class="n">mark_output</span><span class="p">(</span><span class="sa">f</span><span class="s1">&#39;gemm_allreduce_mc_out_</span><span class="si">{</span><span class="n">gemm_allreduce</span><span class="o">.</span><span class="n">layer_idx</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">)</span>
+    <span class="n">gemm_allreduce</span><span class="o">.</span><span class="n">layer_idx</span> <span class="o">+=</span> <span class="mi">1</span>
+
+    <span class="k">return</span> <span class="n">uc_output</span></div>
+
+
+
 <div class="viewcode-block" id="bert_attention">
 <a class="viewcode-back" href="../../python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.bert_attention">[docs]</a>
 <span class="k">def</span> <span class="nf">bert_attention</span><span class="p">(</span><span class="n">tensor</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
@@ -5383,6 +5500,7 @@
     <span class="n">kv_orig_quant_scale</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="n">kv_quant_orig_scale</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="n">attention_output_orig_quant_scale</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">attention_output_sf_scale</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="n">kv_cache_quant_mode</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="n">QuantModeWrapper</span><span class="p">,</span> <span class="n">QuantMode</span><span class="p">]</span> <span class="o">=</span> <span class="n">QuantMode</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span>
     <span class="n">max_context_length</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="n">mask_type</span><span class="p">:</span> <span class="n">AttentionMaskType</span> <span class="o">=</span> <span class="n">AttentionMaskType</span><span class="o">.</span><span class="n">causal</span><span class="p">,</span>
@@ -5925,6 +6043,10 @@
     <span class="n">use_cache_pf</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span><span class="s2">&quot;use_cache&quot;</span><span class="p">,</span>
                                    <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">([</span><span class="n">use_cache</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
                                    <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT32</span><span class="p">)</span>
+    <span class="n">fuse_fp4_quant</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">fuse_fp4_quant</span>
+    <span class="n">fuse_fp4_quant_pf</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span>
+        <span class="s2">&quot;fuse_fp4_quant&quot;</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">int8</span><span class="p">(</span><span class="n">fuse_fp4_quant</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int8</span><span class="p">),</span>
+        <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT8</span><span class="p">)</span>
     <span class="n">skip_attn_pf</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span>
         <span class="s2">&quot;skip_attn&quot;</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">([</span><span class="n">skip_attn</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int8</span><span class="p">),</span>
         <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT8</span><span class="p">)</span>
@@ -5957,7 +6079,8 @@
         <span class="n">is_spec_decoding_enabled</span><span class="p">,</span> <span class="n">spec_decoding_is_generation_length_variable</span><span class="p">,</span>
         <span class="n">spec_decoding_max_generation_length</span><span class="p">,</span> <span class="n">is_mla_enabled</span><span class="p">,</span> <span class="n">q_lora_rank</span><span class="p">,</span>
         <span class="n">kv_lora_rank</span><span class="p">,</span> <span class="n">qk_nope_head_dim</span><span class="p">,</span> <span class="n">qk_rope_head_dim</span><span class="p">,</span> <span class="n">v_head_dim</span><span class="p">,</span>
-        <span class="n">skip_attn_pf</span><span class="p">,</span> <span class="n">cp_size</span><span class="p">,</span> <span class="n">cp_rank</span><span class="p">,</span> <span class="n">cp_group</span><span class="p">,</span> <span class="n">use_logn_scaling</span>
+        <span class="n">fuse_fp4_quant_pf</span><span class="p">,</span> <span class="n">skip_attn_pf</span><span class="p">,</span> <span class="n">cp_size</span><span class="p">,</span> <span class="n">cp_rank</span><span class="p">,</span> <span class="n">cp_group</span><span class="p">,</span>
+        <span class="n">use_logn_scaling</span>
     <span class="p">])</span>
 
     <span class="n">attn_plug</span> <span class="o">=</span> <span class="n">attn_plg_creator</span><span class="o">.</span><span class="n">create_plugin</span><span class="p">(</span><span class="s2">&quot;causal_attn&quot;</span><span class="p">,</span> <span class="n">pfc</span><span class="p">)</span>
@@ -6006,6 +6129,10 @@
         <span class="k">assert</span> <span class="n">default_net</span><span class="p">(</span>
         <span class="p">)</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">use_fp8_context_fmha</span><span class="p">,</span> <span class="s2">&quot;FP8 Context FMHA needs to be enabled&quot;</span>
         <span class="n">plug_inputs</span> <span class="o">+=</span> <span class="p">[</span><span class="n">attention_output_orig_quant_scale</span><span class="p">]</span>
+
+    <span class="k">if</span> <span class="n">fuse_fp4_quant</span><span class="p">:</span>
+        <span class="k">assert</span> <span class="n">attention_output_sf_scale</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;attention_output_sf_scale must be provided when fuse_fp4_quant is enabled.&quot;</span>
+        <span class="n">plug_inputs</span> <span class="o">+=</span> <span class="p">[</span><span class="n">attention_output_sf_scale</span><span class="p">]</span>
 
     <span class="k">if</span> <span class="n">rotary_inv_freq</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">plug_inputs</span> <span class="o">+=</span> <span class="p">[</span><span class="n">rotary_inv_freq</span><span class="p">]</span>
@@ -6072,13 +6199,20 @@
     <span class="n">layer</span> <span class="o">=</span> <span class="n">default_trtnet</span><span class="p">()</span><span class="o">.</span><span class="n">add_plugin_v2</span><span class="p">(</span><span class="n">plug_inputs</span><span class="p">,</span> <span class="n">attn_plug</span><span class="p">)</span>
     <span class="n">_add_plugin_info</span><span class="p">(</span><span class="n">layer</span><span class="p">,</span> <span class="n">attn_plg_creator</span><span class="p">,</span> <span class="s2">&quot;causal_attn&quot;</span><span class="p">,</span> <span class="n">pfc</span><span class="p">)</span>
     <span class="n">output</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
+    <span class="n">expected_outputs</span> <span class="o">=</span> <span class="mi">1</span>
+
+    <span class="c1"># The output scaling factor tensor.</span>
+    <span class="n">output_sf</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="k">if</span> <span class="n">fuse_fp4_quant</span><span class="p">:</span>
+        <span class="n">output_sf</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="n">expected_outputs</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
+        <span class="n">expected_outputs</span> <span class="o">+=</span> <span class="mi">1</span>
+
     <span class="n">present_key_value</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="k">if</span> <span class="n">use_cache</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">paged_kv_cache_flag</span><span class="p">:</span>
-        <span class="n">present_key_value</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
+        <span class="n">present_key_value</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="n">expected_outputs</span><span class="p">),</span>
+                                           <span class="n">layer</span><span class="p">)</span>
         <span class="k">assert</span> <span class="n">present_key_value</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
-        <span class="n">expected_outputs</span> <span class="o">=</span> <span class="mi">2</span>
-    <span class="k">else</span><span class="p">:</span>
-        <span class="n">expected_outputs</span> <span class="o">=</span> <span class="mi">1</span>
+        <span class="n">expected_outputs</span> <span class="o">+=</span> <span class="mi">1</span>
 
     <span class="k">assert</span> <span class="n">layer</span><span class="o">.</span><span class="n">num_outputs</span> <span class="o">==</span> <span class="n">expected_outputs</span><span class="p">,</span> \
         <span class="sa">f</span><span class="s2">&quot;Plugin outputs number mismatch with expected, got </span><span class="si">{</span><span class="n">layer</span><span class="o">.</span><span class="n">num_outputs</span><span class="si">}</span><span class="s2">, expected </span><span class="si">{</span><span class="n">expected_outputs</span><span class="si">}</span><span class="s2">&quot;</span>
@@ -6089,13 +6223,16 @@
             <span class="c1"># past key value</span>
             <span class="n">layer</span><span class="o">.</span><span class="n">get_input</span><span class="p">(</span><span class="mi">8</span><span class="p">)</span><span class="o">.</span><span class="n">set_dynamic_range</span><span class="p">(</span><span class="o">-</span><span class="mi">127</span><span class="p">,</span> <span class="mi">127</span><span class="p">)</span>
             <span class="c1"># present key value</span>
-            <span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">set_dynamic_range</span><span class="p">(</span><span class="o">-</span><span class="mi">127</span><span class="p">,</span> <span class="mi">127</span><span class="p">)</span>
+            <span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="n">expected_outputs</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">set_dynamic_range</span><span class="p">(</span><span class="o">-</span><span class="mi">127</span><span class="p">,</span> <span class="mi">127</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">layer</span><span class="o">.</span><span class="n">get_input</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span><span class="o">.</span><span class="n">set_dynamic_range</span><span class="p">(</span><span class="o">-</span><span class="mi">127</span><span class="p">,</span> <span class="mi">127</span><span class="p">)</span>
             <span class="n">layer</span><span class="o">.</span><span class="n">get_input</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">set_dynamic_range</span><span class="p">(</span><span class="o">-</span><span class="mi">127</span><span class="p">,</span> <span class="mi">127</span><span class="p">)</span>
-            <span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span><span class="o">.</span><span class="n">set_dynamic_range</span><span class="p">(</span><span class="o">-</span><span class="mi">127</span><span class="p">,</span> <span class="mi">127</span><span class="p">)</span>
+            <span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="n">expected_outputs</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">set_dynamic_range</span><span class="p">(</span><span class="o">-</span><span class="mi">127</span><span class="p">,</span> <span class="mi">127</span><span class="p">)</span>
 
     <span class="k">assert</span> <span class="n">output</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+    <span class="k">if</span> <span class="n">fuse_fp4_quant</span><span class="p">:</span>
+        <span class="k">assert</span> <span class="n">output_sf</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+        <span class="k">return</span> <span class="p">(</span><span class="n">output</span><span class="p">,</span> <span class="n">output_sf</span><span class="p">),</span> <span class="n">present_key_value</span>
     <span class="k">return</span> <span class="n">output</span><span class="p">,</span> <span class="n">present_key_value</span></div>
 
 
@@ -6627,8 +6764,8 @@
 <span class="sd">        lora_ranks : cpu Tensor with shape [batch_size]</span>
 <span class="sd">            The low_rank of each request</span>
 
-<span class="sd">        lora_weights_pointers : cpu int64 Tensor with shape [batch_size, 2]</span>
-<span class="sd">            The weights pointers of each request. Consist of in_pointer and out_pointer.</span>
+<span class="sd">        lora_weights_pointers : cpu int64 Tensor with shape [batch_size, 3]</span>
+<span class="sd">            The weights pointers of each request. Consist of in_pointer, out_pointer and possibly a scales vector pointer.</span>
 
 <span class="sd">        weight_index : int</span>
 <span class="sd">            The index of weight if the weight pointer pointing to multiple weights.</span>
@@ -6701,6 +6838,78 @@
             <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="n">i</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span><span class="o">.</span><span class="n">cast</span><span class="p">(</span><span class="nb">input</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
             <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">num_lora_modules</span><span class="p">)</span>
         <span class="p">]</span></div>
+
+
+
+<div class="viewcode-block" id="dora_plugin">
+<a class="viewcode-back" href="../../python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.dora_plugin">[docs]</a>
+<span class="k">def</span> <span class="nf">dora_plugin</span><span class="p">(</span><span class="n">activations</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+                <span class="n">out_hidden_sizes</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
+                <span class="n">lora_weights_pointers</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">Tensor</span><span class="p">],</span>
+                <span class="n">host_request_types</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
+                <span class="n">host_context_lengths</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&#39;&#39;&#39;</span>
+<span class="sd">    The DoRA plugin applies column-wise scaling to the output of a LoRA layer.</span>
+
+<span class="sd">    Parameters:</span>
+<span class="sd">        input : Tensor (On GPU)</span>
+<span class="sd">            The input tensor. Its shape is [batch_size, seq_len, dim] or [num_tokens, dim] for remove_input_padding</span>
+
+<span class="sd">        out_hidden_sizes : list[int]</span>
+<span class="sd">            The output hidden size of each adapter in the related LoRA module.</span>
+<span class="sd">            For example, for a qkv projection out_hidden_sizes should be [q_dim, k_dim, v_dim].</span>
+
+<span class="sd">        host_request_types : Tensor = None</span>
+<span class="sd">            The tensor on the host that indicates if a request is in context or</span>
+<span class="sd">            generation phase. Its shape is [batch_size]. See Inflight Batching</span>
+<span class="sd">            in docs/source/advanced/gpt-attention.md,</span>
+
+<span class="sd">        host_context_lengths: cpu Tensor = None</span>
+<span class="sd">            A host tensor that contains the lengths of the different inputs,</span>
+
+<span class="sd">    Return:</span>
+<span class="sd">        The tensor produced by that layer.</span>
+
+<span class="sd">    &#39;&#39;&#39;</span>
+    <span class="k">assert</span> <span class="n">host_context_lengths</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">default_net</span><span class="p">(</span>
+    <span class="p">)</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">remove_input_padding</span>
+
+    <span class="n">dora_plg_creator</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">get_plugin_registry</span><span class="p">()</span><span class="o">.</span><span class="n">get_creator</span><span class="p">(</span>
+        <span class="s1">&#39;Dora&#39;</span><span class="p">,</span> <span class="s1">&#39;1&#39;</span><span class="p">,</span> <span class="n">TRT_LLM_PLUGIN_NAMESPACE</span><span class="p">)</span>
+    <span class="k">assert</span> <span class="n">dora_plg_creator</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+
+    <span class="n">out_hidden_sizes</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span>
+        <span class="sa">f</span><span class="s2">&quot;out_hidden_sizes&quot;</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">out_hidden_sizes</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
+        <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT32</span><span class="p">)</span>
+
+    <span class="n">remove_input_padding</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span>
+        <span class="s2">&quot;remove_input_padding&quot;</span><span class="p">,</span>
+        <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">int8</span><span class="p">(</span><span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">remove_input_padding</span><span class="p">),</span>
+                 <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">int8</span><span class="p">),</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT8</span><span class="p">)</span>
+
+    <span class="n">lora_dtype</span> <span class="o">=</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">lora_plugin</span>
+    <span class="n">type_id</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginField</span><span class="p">(</span>
+        <span class="s2">&quot;type&quot;</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="nb">int</span><span class="p">(</span><span class="n">str_dtype_to_trt</span><span class="p">(</span><span class="n">lora_dtype</span><span class="p">)),</span> <span class="n">np</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
+        <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldType</span><span class="o">.</span><span class="n">INT32</span><span class="p">)</span>
+
+    <span class="n">pfc</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">PluginFieldCollection</span><span class="p">(</span>
+        <span class="p">[</span><span class="n">type_id</span><span class="p">,</span> <span class="n">remove_input_padding</span><span class="p">,</span> <span class="n">out_hidden_sizes</span><span class="p">])</span>
+
+    <span class="n">dora_plug</span> <span class="o">=</span> <span class="n">dora_plg_creator</span><span class="o">.</span><span class="n">create_plugin</span><span class="p">(</span><span class="s2">&quot;dora&quot;</span><span class="p">,</span> <span class="n">pfc</span><span class="p">,</span>
+                                               <span class="n">trt</span><span class="o">.</span><span class="n">TensorRTPhase</span><span class="o">.</span><span class="n">BUILD</span><span class="p">)</span>
+
+    <span class="n">plug_inputs</span> <span class="o">=</span> <span class="p">[</span><span class="n">activations</span><span class="o">.</span><span class="n">cast</span><span class="p">(</span><span class="n">lora_dtype</span><span class="p">),</span> <span class="n">host_request_types</span>
+                   <span class="p">]</span> <span class="o">+</span> <span class="n">lora_weights_pointers</span>
+
+    <span class="k">if</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">remove_input_padding</span><span class="p">:</span>
+        <span class="n">plug_inputs</span> <span class="o">+=</span> <span class="p">[</span><span class="n">host_context_lengths</span><span class="p">]</span>
+
+    <span class="n">plug_inputs</span> <span class="o">=</span> <span class="p">[</span><span class="n">i</span><span class="o">.</span><span class="n">trt_tensor</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">plug_inputs</span><span class="p">]</span>
+
+    <span class="n">layer</span> <span class="o">=</span> <span class="n">default_trtnet</span><span class="p">()</span><span class="o">.</span><span class="n">add_plugin_v3</span><span class="p">(</span><span class="n">plug_inputs</span><span class="p">,</span> <span class="p">[],</span> <span class="n">dora_plug</span><span class="p">)</span>
+    <span class="n">_add_plugin_info</span><span class="p">(</span><span class="n">layer</span><span class="p">,</span> <span class="n">dora_plg_creator</span><span class="p">,</span> <span class="s2">&quot;dora&quot;</span><span class="p">,</span> <span class="n">pfc</span><span class="p">)</span>
+    <span class="n">output</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span><span class="o">.</span><span class="n">cast</span><span class="p">(</span><span class="n">activations</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">output</span></div>
 
 
 
@@ -7547,7 +7756,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fa25bb5c860>
+<jinja2.runtime.BlockReference object at 0x7f96d13dbec0>
 
 <div class="footer">
     <p>
