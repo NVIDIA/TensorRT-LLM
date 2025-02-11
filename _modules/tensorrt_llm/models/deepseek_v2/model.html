@@ -14,7 +14,7 @@
       <script src="../../../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../../../_static/doctools.js?v=9a2dae69"></script>
+      <script src="../../../../_static/doctools.js?v=9bcbadda"></script>
       <script src="../../../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../../../_static/copybutton.js?v=65e89d2a"></script>
@@ -176,9 +176,11 @@
 <span class="c1"># See the License for the specific language governing permissions and</span>
 <span class="c1"># limitations under the License.</span>
 
+<span class="kn">import</span> <span class="nn">os</span>
 <span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="n">Optional</span>
 
 <span class="kn">import</span> <span class="nn">torch</span>
+<span class="kn">import</span> <span class="nn">transformers</span>
 
 <span class="kn">from</span> <span class="nn">..._utils</span> <span class="kn">import</span> <span class="n">pad_vocab_size</span><span class="p">,</span> <span class="n">torch_dtype_to_str</span>
 <span class="kn">from</span> <span class="nn">...functional</span> <span class="kn">import</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">non_gated_version</span><span class="p">,</span> <span class="n">recv</span><span class="p">,</span> <span class="n">send</span>
@@ -188,10 +190,11 @@
 <span class="kn">from</span> <span class="nn">...mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
 <span class="kn">from</span> <span class="nn">...module</span> <span class="kn">import</span> <span class="n">Module</span>
 <span class="kn">from</span> <span class="nn">...plugin</span> <span class="kn">import</span> <span class="n">init_all_reduce_helper</span>
+<span class="kn">from</span> <span class="nn">..model_weights_loader</span> <span class="kn">import</span> <span class="n">ModelWeightsLoader</span>
 <span class="kn">from</span> <span class="nn">..modeling_utils</span> <span class="kn">import</span> <span class="p">(</span><span class="n">DecoderLayerList</span><span class="p">,</span> <span class="n">DecoderModelForCausalLM</span><span class="p">,</span>
                               <span class="n">PretrainedConfig</span><span class="p">)</span>
 <span class="kn">from</span> <span class="nn">.config</span> <span class="kn">import</span> <span class="n">DeepSeekV2Config</span>
-<span class="kn">from</span> <span class="nn">.convert</span> <span class="kn">import</span> <span class="n">convert_deepseekv2</span>
+<span class="kn">from</span> <span class="nn">.convert</span> <span class="kn">import</span> <span class="n">convert_deepseekv2</span><span class="p">,</span> <span class="n">load_weights_from_hf_safetensors</span>
 
 
 <span class="k">class</span> <span class="nc">DeepseekV2DecoderLayer</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
@@ -248,9 +251,7 @@
         <span class="c1"># In case of moe_config is a dict</span>
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">moe_config</span><span class="p">,</span> <span class="nb">dict</span><span class="p">):</span>
             <span class="n">moe_config</span> <span class="o">=</span> <span class="n">MoeConfig</span><span class="o">.</span><span class="n">from_dict</span><span class="p">(</span><span class="n">moe_config</span><span class="p">)</span>
-        <span class="c1"># layer_config = LayerMLPConfig(config=[dense_config, moe_config], moe_layer_idx_min=0,</span>
-        <span class="c1">#                             moe_layer_idx_max=config.num_hidden_layers,</span>
-        <span class="c1">#                             total_num_layers=config.num_hidden_layers)</span>
+
         <span class="k">if</span> <span class="n">moe_config</span><span class="o">.</span><span class="n">num_experts</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="ow">and</span> <span class="n">layer_idx</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
             <span class="n">hidden_act</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">hidden_act</span>
             <span class="n">mlp_hidden_size</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">moe_inter_size</span>
@@ -275,6 +276,7 @@
                           <span class="n">bias</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                           <span class="n">tp_group</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_group</span><span class="p">,</span>
                           <span class="n">tp_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
+                          <span class="n">quant_mode</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">quant_mode</span><span class="p">,</span>
                           <span class="o">**</span><span class="n">mlp_kwargs</span><span class="p">)</span>
 
         <span class="c1"># Pose layernorm in Deepseek v2 is same as Llama</span>
@@ -402,14 +404,17 @@
 <div class="viewcode-block" id="DeepseekV2ForCausalLM.from_hugging_face">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.DeepseekV2ForCausalLM.from_hugging_face">[docs]</a>
     <span class="nd">@classmethod</span>
-    <span class="k">def</span> <span class="nf">from_hugging_face</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span>
-                          <span class="n">hf_model</span><span class="p">,</span>
-                          <span class="n">model_dir</span><span class="p">,</span>
-                          <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s1">&#39;auto&#39;</span><span class="p">,</span>
-                          <span class="n">mapping</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Mapping</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-                          <span class="n">override_fields</span><span class="o">=</span><span class="p">{},</span>
-                          <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
-        <span class="k">assert</span> <span class="n">hf_model</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+    <span class="k">def</span> <span class="nf">from_hugging_face</span><span class="p">(</span>
+            <span class="bp">cls</span><span class="p">,</span>
+            <span class="n">model_dir</span><span class="p">,</span>
+            <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s1">&#39;auto&#39;</span><span class="p">,</span>
+            <span class="n">hf_model</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">transformers</span><span class="o">.</span><span class="n">PreTrainedModel</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="n">use_preloading</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+            <span class="n">use_safetensors_loading</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+            <span class="n">mapping</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Mapping</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="n">override_fields</span><span class="o">=</span><span class="p">{},</span>
+            <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+
         <span class="k">if</span> <span class="n">mapping</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">mapping</span> <span class="o">=</span> <span class="n">Mapping</span><span class="p">()</span>
         <span class="n">pretrained_config</span> <span class="o">=</span> <span class="n">DeepSeekV2Config</span><span class="o">.</span><span class="n">from_hugging_face</span><span class="p">(</span><span class="n">model_dir</span><span class="p">,</span>
@@ -431,16 +436,96 @@
             <span class="n">dtype</span> <span class="o">=</span> <span class="s1">&#39;float16&#39;</span>
 
         <span class="n">deepseek</span> <span class="o">=</span> <span class="bp">cls</span><span class="o">.</span><span class="n">from_config</span><span class="p">(</span><span class="n">pretrained_config</span><span class="p">)</span>
-        <span class="n">weights</span> <span class="o">=</span> <span class="n">convert_deepseekv2</span><span class="p">(</span>
-            <span class="n">hf_model</span><span class="p">,</span>
-            <span class="n">pretrained_config</span><span class="p">,</span>
-            <span class="n">mapping</span><span class="p">,</span>
-            <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
-            <span class="n">use_parallel_embedding</span><span class="o">=</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">use_parallel_embedding</span><span class="p">,</span>
-            <span class="n">sharding_dim</span><span class="o">=</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">embedding_sharding_dim</span><span class="p">)</span>
-        <span class="n">deepseek</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">weights</span><span class="p">)</span>
 
-        <span class="k">return</span> <span class="n">deepseek</span></div>
+        <span class="c1"># If use_preloading is True, load the model from hf_model</span>
+        <span class="c1"># If use_safetensors_loading is True, load the model from safetensors</span>
+        <span class="c1"># if TRTLLM_DISABLE_UNIFIED_CONVERTER is not set, load the model use unified converter (recommended and default)</span>
+        <span class="k">if</span> <span class="n">use_preloading</span><span class="p">:</span>
+            <span class="n">weights</span> <span class="o">=</span> <span class="n">convert_deepseekv2</span><span class="p">(</span>
+                <span class="n">hf_model</span><span class="p">,</span>
+                <span class="n">pretrained_config</span><span class="p">,</span>
+                <span class="n">mapping</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+                <span class="n">use_parallel_embedding</span><span class="o">=</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">use_parallel_embedding</span><span class="p">,</span>
+                <span class="n">sharding_dim</span><span class="o">=</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">embedding_sharding_dim</span><span class="p">)</span>
+            <span class="n">deepseek</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">weights</span><span class="p">)</span>
+            <span class="k">return</span> <span class="n">deepseek</span>
+
+        <span class="k">if</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;TRTLLM_DISABLE_UNIFIED_CONVERTER&quot;</span><span class="p">)</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+
+            <span class="n">custom_dict</span> <span class="o">=</span> <span class="p">{}</span>
+            <span class="n">rank_experts</span> <span class="o">=</span> <span class="n">mapping</span><span class="o">.</span><span class="n">ep_experts</span><span class="p">(</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">moe</span><span class="o">.</span><span class="n">num_experts</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">index</span><span class="p">,</span> <span class="n">module</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">deepseek</span><span class="o">.</span><span class="n">transformer</span><span class="o">.</span><span class="n">layers</span><span class="p">):</span>
+
+                <span class="k">if</span> <span class="n">pretrained_config</span><span class="o">.</span><span class="n">q_lora_rank</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="n">module</span><span class="o">.</span><span class="n">attention</span><span class="o">.</span><span class="n">tllm_to_externel_key_dict</span> <span class="o">=</span> <span class="p">{</span>
+                        <span class="s2">&quot;fused_q_proj&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;q_b_proj.weight&quot;</span><span class="p">,</span> <span class="s2">&quot;kv_b_proj.weight&quot;</span><span class="p">],</span>
+                        <span class="s2">&quot;q_b_proj&quot;</span><span class="p">:</span> <span class="s2">&quot;q_b_proj.weight&quot;</span><span class="p">,</span>  <span class="c1">#v2</span>
+                        <span class="s2">&quot;q_a_proj&quot;</span><span class="p">:</span> <span class="s2">&quot;q_a_proj.weight&quot;</span><span class="p">,</span>  <span class="c1">#v2</span>
+                        <span class="s2">&quot;kv_b_proj&quot;</span><span class="p">:</span> <span class="s2">&quot;kv_b_proj.weight&quot;</span><span class="p">,</span>
+                        <span class="s2">&quot;q_a_layernorm&quot;</span><span class="p">:</span> <span class="s2">&quot;q_a_layernorm&quot;</span>
+                    <span class="p">}</span>
+                    <span class="n">module</span><span class="o">.</span><span class="n">attention</span><span class="o">.</span><span class="n">fused_a</span><span class="o">.</span><span class="n">tllm_to_externel_key_dict</span> <span class="o">=</span> <span class="p">{</span>
+                        <span class="s2">&quot;fused_a&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;q_a_proj&quot;</span><span class="p">,</span> <span class="s2">&quot;kv_a_proj_with_mqa&quot;</span><span class="p">]</span>
+                    <span class="p">}</span>  <span class="c1">#v2</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="n">module</span><span class="o">.</span><span class="n">attention</span><span class="o">.</span><span class="n">tllm_to_externel_key_dict</span> <span class="o">=</span> <span class="p">{</span>
+                        <span class="s2">&quot;fused_q_proj&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;q_proj.weight&quot;</span><span class="p">,</span>
+                                         <span class="s2">&quot;kv_b_proj.weight&quot;</span><span class="p">],</span>  <span class="c1">#v2 lite</span>
+                        <span class="s2">&quot;q_b_proj&quot;</span><span class="p">:</span> <span class="s2">&quot;q_proj.weight&quot;</span><span class="p">,</span>  <span class="c1">#v2 lite</span>
+                        <span class="s2">&quot;kv_b_proj&quot;</span><span class="p">:</span> <span class="s2">&quot;kv_b_proj.weight&quot;</span><span class="p">,</span>
+                        <span class="s2">&quot;q_a_layernorm&quot;</span><span class="p">:</span> <span class="s2">&quot;q_a_layernorm&quot;</span>
+                    <span class="p">}</span>
+                    <span class="n">module</span><span class="o">.</span><span class="n">attention</span><span class="o">.</span><span class="n">fused_a</span><span class="o">.</span><span class="n">tllm_to_externel_key_dict</span> <span class="o">=</span> <span class="p">{</span>
+                        <span class="s2">&quot;fused_a&quot;</span><span class="p">:</span> <span class="s2">&quot;kv_a_proj_with_mqa&quot;</span>
+                    <span class="p">}</span>  <span class="c1"># v2 lite</span>
+
+                <span class="n">module</span><span class="o">.</span><span class="n">attention</span><span class="o">.</span><span class="n">kv_a_layernorm</span><span class="o">.</span><span class="n">tllm_to_externel_key_dict</span> <span class="o">=</span> <span class="p">{</span>
+                    <span class="s1">&#39;kv_a_layernorm&#39;</span><span class="p">:</span> <span class="s1">&#39;kv_a_layernorm&#39;</span>
+                <span class="p">}</span>
+
+                <span class="k">if</span> <span class="n">index</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+
+                    <span class="n">module</span><span class="o">.</span><span class="n">mlp</span><span class="o">.</span><span class="n">shared_expert</span><span class="o">.</span><span class="n">fc</span><span class="o">.</span><span class="n">tllm_to_externel_key_dict</span> <span class="o">=</span> <span class="p">{</span>
+                        <span class="s2">&quot;fc&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;up_proj&quot;</span><span class="p">,</span> <span class="s2">&quot;gate_proj&quot;</span><span class="p">],</span>
+                        <span class="s2">&quot;shared_expert&quot;</span><span class="p">:</span> <span class="s2">&quot;shared_experts&quot;</span>
+                    <span class="p">}</span>
+                    <span class="n">module</span><span class="o">.</span><span class="n">mlp</span><span class="o">.</span><span class="n">shared_expert</span><span class="o">.</span><span class="n">proj</span><span class="o">.</span><span class="n">tllm_to_externel_key_dict</span> <span class="o">=</span> <span class="p">{</span>
+                        <span class="s2">&quot;shared_expert&quot;</span><span class="p">:</span> <span class="s2">&quot;shared_experts&quot;</span>
+                    <span class="p">}</span>
+                    <span class="n">module</span><span class="o">.</span><span class="n">mlp</span><span class="o">.</span><span class="n">fc</span><span class="o">.</span><span class="n">tllm_to_externel_key_dict</span> <span class="o">=</span> <span class="p">{</span>
+                        <span class="s2">&quot;fc&quot;</span><span class="p">:</span> <span class="p">[</span>
+                            <span class="sa">f</span><span class="s2">&quot;experts.</span><span class="si">{</span><span class="n">expert</span><span class="si">}</span><span class="s2">.up_proj&quot;</span>
+                            <span class="k">for</span> <span class="n">expert</span> <span class="ow">in</span> <span class="n">rank_experts</span>
+                        <span class="p">]</span> <span class="o">+</span> <span class="p">[</span>
+                            <span class="sa">f</span><span class="s2">&quot;experts.</span><span class="si">{</span><span class="n">expert</span><span class="si">}</span><span class="s2">.gate_proj&quot;</span>
+                            <span class="k">for</span> <span class="n">expert</span> <span class="ow">in</span> <span class="n">rank_experts</span>
+                        <span class="p">]</span>
+                    <span class="p">}</span>
+                    <span class="n">module</span><span class="o">.</span><span class="n">mlp</span><span class="o">.</span><span class="n">proj</span><span class="o">.</span><span class="n">tllm_to_externel_key_dict</span> <span class="o">=</span> <span class="p">{</span>
+                        <span class="s2">&quot;proj&quot;</span><span class="p">:</span> <span class="p">[</span>
+                            <span class="sa">f</span><span class="s2">&quot;experts.</span><span class="si">{</span><span class="n">expert</span><span class="si">}</span><span class="s2">.down_proj&quot;</span>
+                            <span class="k">for</span> <span class="n">expert</span> <span class="ow">in</span> <span class="n">rank_experts</span>
+                        <span class="p">]</span>
+                    <span class="p">}</span>
+                    <span class="n">module</span><span class="o">.</span><span class="n">mlp</span><span class="o">.</span><span class="n">router</span><span class="o">.</span><span class="n">tllm_to_externel_key_dict</span> <span class="o">=</span> <span class="p">{</span>
+                        <span class="s2">&quot;mlp&quot;</span><span class="p">:</span> <span class="s2">&quot;mlp&quot;</span><span class="p">,</span>
+                        <span class="s2">&quot;router&quot;</span><span class="p">:</span> <span class="s2">&quot;gate&quot;</span>
+                    <span class="p">}</span>
+
+            <span class="n">loader</span> <span class="o">=</span> <span class="n">ModelWeightsLoader</span><span class="p">(</span><span class="n">model_dir</span><span class="p">,</span> <span class="n">custom_dict</span><span class="p">)</span>
+            <span class="n">loader</span><span class="o">.</span><span class="n">generate_tllm_weights</span><span class="p">(</span><span class="n">deepseek</span><span class="p">)</span>
+            <span class="k">return</span> <span class="n">deepseek</span>
+
+        <span class="k">if</span> <span class="n">use_safetensors_loading</span><span class="p">:</span>
+            <span class="n">weights</span> <span class="o">=</span> <span class="n">load_weights_from_hf_safetensors</span><span class="p">(</span>
+                <span class="n">model_dir</span><span class="p">,</span>
+                <span class="n">pretrained_config</span><span class="p">,</span>
+                <span class="n">mapping</span><span class="p">,</span>
+                <span class="n">use_parallel_embedding</span><span class="o">=</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">use_parallel_embedding</span><span class="p">,</span>
+                <span class="n">sharding_dim</span><span class="o">=</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">embedding_sharding_dim</span><span class="p">)</span>
+            <span class="n">deepseek</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">weights</span><span class="p">)</span>
+            <span class="k">return</span> <span class="n">deepseek</span></div>
 </div>
 
 </pre></div>
@@ -452,7 +537,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fa2584d6db0>
+<jinja2.runtime.BlockReference object at 0x7f9b7cb6e480>
 
 <div class="footer">
     <p>

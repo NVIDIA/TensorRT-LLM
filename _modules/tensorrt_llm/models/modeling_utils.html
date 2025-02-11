@@ -14,7 +14,7 @@
       <script src="../../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../../_static/doctools.js?v=9a2dae69"></script>
+      <script src="../../../_static/doctools.js?v=9bcbadda"></script>
       <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
@@ -168,6 +168,7 @@
 <span class="kn">import</span> <span class="nn">os</span>
 <span class="kn">import</span> <span class="nn">re</span>
 <span class="kn">from</span> <span class="nn">enum</span> <span class="kn">import</span> <span class="n">IntFlag</span><span class="p">,</span> <span class="n">auto</span>
+<span class="kn">from</span> <span class="nn">fnmatch</span> <span class="kn">import</span> <span class="n">fnmatch</span>
 <span class="kn">from</span> <span class="nn">functools</span> <span class="kn">import</span> <span class="n">cached_property</span>
 <span class="kn">from</span> <span class="nn">pathlib</span> <span class="kn">import</span> <span class="n">Path</span>
 <span class="kn">from</span> <span class="nn">typing</span> <span class="kn">import</span> <span class="p">(</span><span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">Dict</span><span class="p">,</span> <span class="n">Generator</span><span class="p">,</span> <span class="n">List</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span>
@@ -191,7 +192,7 @@
                       <span class="n">PromptTuningEmbedding</span><span class="p">,</span> <span class="n">RgLru</span><span class="p">)</span>
 <span class="kn">from</span> <span class="nn">..layers.attention</span> <span class="kn">import</span> <span class="n">Attention</span><span class="p">,</span> <span class="n">BertAttention</span>
 <span class="kn">from</span> <span class="nn">..layers.linear</span> <span class="kn">import</span> <span class="n">ColumnLinear</span><span class="p">,</span> <span class="n">Linear</span><span class="p">,</span> <span class="n">RowLinear</span>
-<span class="kn">from</span> <span class="nn">..layers.lora</span> <span class="kn">import</span> <span class="n">Lora</span>
+<span class="kn">from</span> <span class="nn">..layers.lora</span> <span class="kn">import</span> <span class="n">Dora</span><span class="p">,</span> <span class="n">Lora</span>
 <span class="kn">from</span> <span class="nn">..layers.moe</span> <span class="kn">import</span> <span class="n">MOE</span><span class="p">,</span> <span class="n">MoeOOTB</span>
 <span class="kn">from</span> <span class="nn">..logger</span> <span class="kn">import</span> <span class="n">logger</span>
 <span class="kn">from</span> <span class="nn">..mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
@@ -395,19 +396,16 @@
     <span class="n">quant_algo</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">QuantConfig</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">kv_cache_quant_algo</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">QuantConfig</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">quantized_layers</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">QuantConfig</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
-    <span class="n">exclude_modules</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="o">*</span><span class="p">,</span>
                  <span class="n">quant_algo</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">QuantConfig</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">kv_cache_quant_algo</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">QuantConfig</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="n">quantized_layers</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">QuantConfig</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-                 <span class="n">exclude_modules</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">quant_algo</span> <span class="o">=</span> <span class="n">quant_algo</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">quantized_layers</span> <span class="o">=</span> <span class="n">quantized_layers</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_quant_algo</span> <span class="o">=</span> <span class="n">kv_cache_quant_algo</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">exclude_modules</span> <span class="o">=</span> <span class="n">exclude_modules</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">auto_quant_mode</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">layer_config</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">quantized_layers</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">auto_quant_mode</span><span class="o">.</span><span class="n">update</span><span class="p">({</span>
@@ -427,9 +425,14 @@
         <span class="n">quant_mode_list</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">auto_quant_mode</span><span class="o">.</span><span class="n">values</span><span class="p">()))</span>
         <span class="k">return</span> <span class="n">QuantModeWrapper</span><span class="p">(</span><span class="n">quant_mode_list</span><span class="p">)</span>
 
-    <span class="nd">@property</span>
-    <span class="k">def</span> <span class="nf">layer_quant_mode</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">QuantMode</span><span class="p">]:</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">auto_quant_mode</span>
+    <span class="c1">#@lru_cache(maxsize=None)</span>
+    <span class="k">def</span> <span class="nf">layer_quant_mode</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">layer_name</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">QuantMode</span><span class="p">:</span>
+
+        <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">quant_mode</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">auto_quant_mode</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="k">if</span> <span class="n">fnmatch</span><span class="p">(</span><span class="n">layer_name</span><span class="p">,</span> <span class="n">name</span><span class="p">):</span>
+                <span class="k">return</span> <span class="n">quant_mode</span>
+
+        <span class="k">return</span> <span class="n">QuantMode</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
 
     <span class="nd">@cached_property</span>
     <span class="k">def</span> <span class="nf">auto_quant_list</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
@@ -450,11 +453,15 @@
         <span class="n">obj</span> <span class="o">=</span> <span class="bp">cls</span><span class="p">(</span><span class="n">quantized_layers</span><span class="o">=</span><span class="n">quantized_layers_dict</span><span class="p">,</span> <span class="o">**</span><span class="n">config</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">obj</span>
 
+    <span class="c1">#@lru_cache(maxsize=None)</span>
     <span class="k">def</span> <span class="nf">get_quant_cfg</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">module_name</span><span class="p">):</span>
-        <span class="k">if</span> <span class="n">module_name</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">quantized_layers</span><span class="o">.</span><span class="n">keys</span><span class="p">():</span>
-            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">quantized_layers</span><span class="p">[</span><span class="n">module_name</span><span class="p">]</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="k">return</span> <span class="n">QuantConfig</span><span class="p">()</span>
+        <span class="n">quant_res</span> <span class="o">=</span> <span class="n">QuantConfig</span><span class="p">()</span>
+
+        <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">quant_cfg</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">quantized_layers</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="k">if</span> <span class="n">fnmatch</span><span class="p">(</span><span class="n">module_name</span><span class="p">,</span> <span class="n">name</span><span class="p">):</span>
+                <span class="n">quant_res</span> <span class="o">=</span> <span class="n">quant_cfg</span>
+                <span class="k">break</span>
+        <span class="k">return</span> <span class="n">quant_res</span>
 
     <span class="k">def</span> <span class="nf">get_modelopt_qformat</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="n">algo_to_modelopt_map</span> <span class="o">=</span> <span class="p">{</span>
@@ -473,10 +480,8 @@
         <span class="n">output</span> <span class="o">=</span> <span class="n">copy</span><span class="o">.</span><span class="n">deepcopy</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="vm">__dict__</span><span class="p">)</span>
         <span class="n">output</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;auto_quant_mode&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="n">output</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;quant_mode&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
-        <span class="n">output</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;exclude_modules&#39;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">per_layer_config</span> <span class="ow">in</span> <span class="n">output</span><span class="p">[</span><span class="s1">&#39;quantized_layers&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
             <span class="n">per_layer_config</span> <span class="o">=</span> <span class="n">per_layer_config</span><span class="o">.</span><span class="n">to_dict</span><span class="p">()</span>
-            <span class="n">per_layer_config</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s1">&#39;exclude_modules&#39;</span><span class="p">)</span>
             <span class="n">output</span><span class="p">[</span><span class="s1">&#39;quantized_layers&#39;</span><span class="p">][</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="n">per_layer_config</span>
         <span class="k">return</span> <span class="n">output</span>
 
@@ -594,6 +599,8 @@
             <span class="k">return</span> <span class="s1">&#39;int8&#39;</span>
         <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_fp8_kv_cache</span><span class="p">():</span>
             <span class="k">return</span> <span class="s1">&#39;fp8&#39;</span>
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">quant_mode</span><span class="o">.</span><span class="n">has_fp4_kv_cache</span><span class="p">():</span>
+            <span class="k">return</span> <span class="s1">&#39;fp4&#39;</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span>
 
@@ -666,6 +673,18 @@
     <span class="k">def</span> <span class="nf">to_layer_quant_config</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config_file</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
         <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">config_file</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
             <span class="n">config</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">architecture</span> <span class="o">==</span> <span class="s2">&quot;MixtralForCausalLM&quot;</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">layer_name</span> <span class="ow">in</span> <span class="nb">list</span><span class="p">(</span><span class="n">config</span><span class="p">[</span><span class="s2">&quot;quantized_layers&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">keys</span><span class="p">()):</span>
+                <span class="n">quant_cfg</span> <span class="o">=</span> <span class="n">config</span><span class="p">[</span><span class="s2">&quot;quantized_layers&quot;</span><span class="p">][</span><span class="n">layer_name</span><span class="p">]</span>
+                <span class="k">if</span> <span class="s2">&quot;mlp.fc&quot;</span> <span class="ow">in</span> <span class="n">layer_name</span> <span class="ow">or</span> <span class="s2">&quot;mlp.proj&quot;</span> <span class="ow">in</span> <span class="n">layer_name</span><span class="p">:</span>
+                    <span class="n">moe_name</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">layer_name</span><span class="o">.</span><span class="n">rsplit</span><span class="p">(</span><span class="s1">&#39;.&#39;</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+                    <span class="k">if</span> <span class="n">moe_name</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">config</span><span class="p">[</span><span class="s2">&quot;quantized_layers&quot;</span><span class="p">]:</span>
+                        <span class="n">config</span><span class="p">[</span><span class="s2">&quot;quantized_layers&quot;</span><span class="p">][</span><span class="n">moe_name</span><span class="p">]</span> <span class="o">=</span> <span class="n">quant_cfg</span>
+                    <span class="k">else</span><span class="p">:</span>
+                        <span class="k">assert</span> <span class="n">quant_cfg</span> <span class="o">==</span> <span class="n">config</span><span class="p">[</span><span class="s2">&quot;quantized_layers&quot;</span><span class="p">][</span>
+                            <span class="n">moe_name</span><span class="p">],</span> <span class="s2">&quot;MoE module needs to have the same quantization format for non-rounter sub-modules&quot;</span>
+
         <span class="bp">self</span><span class="o">.</span><span class="n">quantization</span> <span class="o">=</span> <span class="n">LayerQuantConfig</span><span class="o">.</span><span class="n">from_dict</span><span class="p">(</span><span class="n">config</span><span class="p">)</span></div>
 
 
@@ -755,6 +774,7 @@
                 <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;spec_decoding_params&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">spec_decoding_params</span>
             <span class="k">if</span> <span class="n">mrope_params</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;mrope_params&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">mrope_params</span>
+
             <span class="k">if</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">reduce_fusion</span><span class="p">:</span>
                 <span class="k">if</span> <span class="n">layer_idx</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">layer_list</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">layer_list</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]:</span>
                     <span class="n">qkv_activation_scaling_factor</span> <span class="o">=</span> <span class="kc">None</span>
@@ -772,6 +792,20 @@
                         <span class="bp">self</span><span class="p">[</span><span class="n">layer_idx</span> <span class="o">+</span> <span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">input_layernorm</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">value</span><span class="p">,</span>
                         <span class="bp">self</span><span class="p">[</span><span class="n">layer_idx</span> <span class="o">+</span> <span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">input_layernorm</span><span class="o">.</span><span class="n">eps</span><span class="p">,</span>
                         <span class="n">qkv_activation_scaling_factor</span><span class="p">)</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;next_layer_input_layernorm_args&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="k">elif</span> <span class="n">default_net</span><span class="p">()</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">norm_quant_fusion</span><span class="p">:</span>
+                <span class="k">if</span> <span class="n">layer_idx</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">layer_list</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">layer_list</span><span class="p">[</span><span class="mi">0</span><span class="p">]:</span>
+                    <span class="k">try</span><span class="p">:</span>
+                        <span class="n">activation_scaling_factor</span> <span class="o">=</span> <span class="n">constant</span><span class="p">(</span>
+                            <span class="bp">self</span><span class="p">[</span><span class="n">layer_idx</span> <span class="o">+</span> <span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">attention</span><span class="o">.</span><span class="n">qkv</span><span class="o">.</span>
+                            <span class="n">activation_global_scaling_factor</span><span class="o">.</span><span class="n">raw_value</span><span class="o">.</span><span class="n">copy</span><span class="p">())</span>
+                    <span class="k">except</span><span class="p">:</span>
+                        <span class="n">activation_scaling_factor</span> <span class="o">=</span> <span class="kc">None</span>
+                    <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;next_layer_input_layernorm_args&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span>
+                        <span class="bp">self</span><span class="p">[</span><span class="n">layer_idx</span> <span class="o">+</span> <span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">input_layernorm</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">value</span><span class="p">,</span>
+                        <span class="bp">self</span><span class="p">[</span><span class="n">layer_idx</span> <span class="o">+</span> <span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">input_layernorm</span><span class="o">.</span><span class="n">eps</span><span class="p">,</span>
+                        <span class="n">activation_scaling_factor</span><span class="p">)</span>
                 <span class="k">else</span><span class="p">:</span>
                     <span class="n">kwargs</span><span class="p">[</span><span class="s1">&#39;next_layer_input_layernorm_args&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
 
@@ -985,7 +1019,6 @@
         <span class="n">speculative_decoding_draft_tokens_external</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
         <span class="n">spec_decoding_is_generation_length_variable</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
         <span class="n">gather_context_logits</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
-        <span class="n">gather_generation_logits</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
         <span class="n">lora_target_modules</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">opt_batch_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
         <span class="n">num_hidden_layers</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -1042,7 +1075,6 @@
             <span class="n">position_encoding_2d</span><span class="o">=</span><span class="n">position_encoding_2d</span><span class="p">,</span>
             <span class="n">mapping</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">mapping</span><span class="p">,</span>
             <span class="n">gather_context_logits</span><span class="o">=</span><span class="n">gather_context_logits</span><span class="p">,</span>
-            <span class="n">gather_generation_logits</span><span class="o">=</span><span class="n">gather_generation_logits</span><span class="p">,</span>
             <span class="n">use_lora_plugin</span><span class="o">=</span><span class="n">use_lora_plugin</span><span class="p">,</span>
             <span class="n">max_draft_len</span><span class="o">=</span><span class="n">max_draft_len</span><span class="p">,</span>
             <span class="n">speculative_decoding_draft_tokens_external</span><span class="o">=</span>
@@ -1569,7 +1601,8 @@
 
 
 <span class="k">def</span> <span class="nf">add_lora</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="n">PretrainedModel</span><span class="p">,</span>
-             <span class="n">max_lora_rank</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">PretrainedModel</span><span class="p">:</span>
+             <span class="n">max_lora_rank</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
+             <span class="n">with_dora</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">PretrainedModel</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">&#39;&#39;&#39; Add lora layers to the Attention/BertAttention/Linear/RowLinear/FusedGatedMLP layers to the given model, return the changed model</span>
 <span class="sd">    &#39;&#39;&#39;</span>
     <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">layer</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">named_modules</span><span class="p">():</span>
@@ -1589,6 +1622,14 @@
                 <span class="p">],</span>
                 <span class="n">max_low_rank</span><span class="o">=</span><span class="n">max_rank</span><span class="p">,</span>
             <span class="p">)</span>
+
+            <span class="k">if</span> <span class="n">with_dora</span><span class="p">:</span>
+                <span class="n">layer</span><span class="o">.</span><span class="n">qkv_dora</span> <span class="o">=</span> <span class="n">Dora</span><span class="p">(</span><span class="n">out_hidden_sizes</span><span class="o">=</span><span class="p">[</span>
+                    <span class="n">layer</span><span class="o">.</span><span class="n">num_attention_heads</span> <span class="o">*</span> <span class="n">layer</span><span class="o">.</span><span class="n">attention_head_size</span><span class="p">,</span>
+                    <span class="n">layer</span><span class="o">.</span><span class="n">num_attention_kv_heads</span> <span class="o">*</span> <span class="n">layer</span><span class="o">.</span><span class="n">attention_head_size</span><span class="p">,</span>
+                    <span class="n">layer</span><span class="o">.</span><span class="n">num_attention_kv_heads</span> <span class="o">*</span> <span class="n">layer</span><span class="o">.</span><span class="n">attention_head_size</span>
+                <span class="p">],</span> <span class="p">)</span>
+
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">layer</span><span class="p">,</span> <span class="p">(</span><span class="n">Linear</span><span class="p">,</span> <span class="n">RowLinear</span><span class="p">)):</span>
             <span class="k">if</span> <span class="n">max_rank</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="n">max_rank</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">in_features</span><span class="p">,</span> <span class="n">layer</span><span class="o">.</span><span class="n">out_features</span><span class="p">)</span>
@@ -1597,6 +1638,9 @@
                 <span class="n">out_hidden_sizes</span><span class="o">=</span><span class="p">[</span><span class="n">layer</span><span class="o">.</span><span class="n">out_features</span><span class="p">],</span>
                 <span class="n">max_low_rank</span><span class="o">=</span><span class="n">max_rank</span><span class="p">,</span>
             <span class="p">)</span>
+            <span class="k">if</span> <span class="n">with_dora</span><span class="p">:</span>
+                <span class="n">layer</span><span class="o">.</span><span class="n">dora</span> <span class="o">=</span> <span class="n">Dora</span><span class="p">(</span><span class="n">out_hidden_sizes</span><span class="o">=</span><span class="p">[</span><span class="n">layer</span><span class="o">.</span><span class="n">out_features</span><span class="p">])</span>
+
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">layer</span><span class="p">,</span> <span class="p">(</span><span class="n">MLP</span><span class="p">,</span> <span class="n">FusedGatedMLP</span><span class="p">)):</span>
             <span class="k">if</span> <span class="n">max_rank</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="n">max_rank</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
@@ -1609,6 +1653,27 @@
                 <span class="p">],</span>
                 <span class="n">max_low_rank</span><span class="o">=</span><span class="n">max_rank</span><span class="p">,</span>
             <span class="p">)</span>
+
+            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">layer</span><span class="p">,</span> <span class="n">FusedGatedMLP</span><span class="p">):</span>
+                <span class="n">layer</span><span class="o">.</span><span class="n">fused_gate_up_lora</span> <span class="o">=</span> <span class="n">Lora</span><span class="p">(</span>
+                    <span class="n">in_hidden_size</span><span class="o">=</span><span class="n">layer</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+                    <span class="n">out_hidden_sizes</span><span class="o">=</span><span class="p">[</span>
+                        <span class="n">layer</span><span class="o">.</span><span class="n">ffn_hidden_size</span> <span class="o">*</span> <span class="mi">2</span> <span class="o">//</span> <span class="n">layer</span><span class="o">.</span><span class="n">tp_size</span>
+                    <span class="p">],</span>
+                    <span class="n">max_low_rank</span><span class="o">=</span><span class="n">max_rank</span><span class="p">,</span>
+                <span class="p">)</span>
+
+            <span class="k">if</span> <span class="n">with_dora</span><span class="p">:</span>
+                <span class="n">layer</span><span class="o">.</span><span class="n">dora</span> <span class="o">=</span> <span class="n">Dora</span><span class="p">(</span><span class="n">out_hidden_sizes</span><span class="o">=</span><span class="p">[</span>
+                    <span class="n">layer</span><span class="o">.</span><span class="n">ffn_hidden_size</span> <span class="o">//</span> <span class="n">layer</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
+                    <span class="n">layer</span><span class="o">.</span><span class="n">ffn_hidden_size</span> <span class="o">//</span> <span class="n">layer</span><span class="o">.</span><span class="n">tp_size</span>
+                <span class="p">],</span> <span class="p">)</span>
+
+                <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">layer</span><span class="p">,</span> <span class="n">FusedGatedMLP</span><span class="p">):</span>
+                    <span class="n">layer</span><span class="o">.</span><span class="n">fused_gate_up_dora</span> <span class="o">=</span> <span class="n">Dora</span><span class="p">(</span><span class="n">out_hidden_sizes</span><span class="o">=</span><span class="p">[</span>
+                        <span class="n">layer</span><span class="o">.</span><span class="n">ffn_hidden_size</span> <span class="o">*</span> <span class="mi">2</span> <span class="o">//</span> <span class="n">layer</span><span class="o">.</span><span class="n">tp_size</span>
+                    <span class="p">],</span> <span class="p">)</span>
+
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">layer</span><span class="p">,</span> <span class="n">MOE</span><span class="p">):</span>
             <span class="k">if</span> <span class="n">max_rank</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="n">max_rank</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
@@ -1693,6 +1758,20 @@
                      <span class="p">]</span> <span class="o">/</span> <span class="n">layer</span><span class="o">.</span><span class="n">dense</span><span class="o">.</span><span class="n">activation_global_scaling_factor</span><span class="o">.</span><span class="n">raw_value</span>
             <span class="n">layer</span><span class="o">.</span><span class="n">attention_output_orig_quant_scale</span> <span class="o">=</span> <span class="n">Parameter</span><span class="p">(</span>
                 <span class="n">value</span><span class="o">=</span><span class="n">scale</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="s1">&#39;float32&#39;</span><span class="p">)</span>
+
+    <span class="k">return</span> <span class="n">model</span>
+
+
+<span class="k">def</span> <span class="nf">set_fuse_fp4_quant</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="n">PretrainedModel</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">PretrainedModel</span><span class="p">:</span>
+    <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">layer</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">named_modules</span><span class="p">():</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">layer</span><span class="p">,</span> <span class="n">Attention</span><span class="p">)</span> <span class="ow">and</span> <span class="nb">hasattr</span><span class="p">(</span>
+                <span class="n">layer</span><span class="o">.</span><span class="n">dense</span><span class="p">,</span> <span class="s1">&#39;activation_global_scaling_factor&#39;</span><span class="p">):</span>
+            <span class="n">scale</span> <span class="o">=</span> <span class="p">[</span><span class="mf">1.0</span>
+                     <span class="p">]</span> <span class="o">/</span> <span class="n">layer</span><span class="o">.</span><span class="n">dense</span><span class="o">.</span><span class="n">activation_global_scaling_factor</span><span class="o">.</span><span class="n">raw_value</span>
+            <span class="n">layer</span><span class="o">.</span><span class="n">attention_output_sf_scale</span> <span class="o">=</span> <span class="n">Parameter</span><span class="p">(</span><span class="n">value</span><span class="o">=</span><span class="n">scale</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span>
+                <span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">),</span>
+                                                        <span class="n">dtype</span><span class="o">=</span><span class="s1">&#39;float32&#39;</span><span class="p">)</span>
+
     <span class="k">return</span> <span class="n">model</span>
 
 
@@ -1710,7 +1789,9 @@
     <span class="n">use_lora</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
     <span class="n">max_lora_rank</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="n">use_fp8_context_fmha</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+    <span class="n">fuse_fp4_quant</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
     <span class="n">use_optimize_cross_qkv</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+    <span class="n">use_dora</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">PretrainedModel</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">    Run optimization passes on model.</span>
@@ -1740,9 +1821,11 @@
     <span class="k">if</span> <span class="n">use_prompt_tuning</span><span class="p">:</span>
         <span class="n">model</span> <span class="o">=</span> <span class="n">set_prompt_tuning</span><span class="p">(</span><span class="n">model</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">use_lora</span><span class="p">:</span>
-        <span class="n">model</span> <span class="o">=</span> <span class="n">add_lora</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">max_lora_rank</span><span class="p">)</span>
+        <span class="n">model</span> <span class="o">=</span> <span class="n">add_lora</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">max_lora_rank</span><span class="p">,</span> <span class="n">with_dora</span><span class="o">=</span><span class="n">use_dora</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">use_fp8_context_fmha</span><span class="p">:</span>
         <span class="n">model</span> <span class="o">=</span> <span class="n">set_fp8_context_fhma</span><span class="p">(</span><span class="n">model</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">fuse_fp4_quant</span><span class="p">:</span>
+        <span class="n">model</span> <span class="o">=</span> <span class="n">set_fuse_fp4_quant</span><span class="p">(</span><span class="n">model</span><span class="p">)</span>
     <span class="k">if</span> <span class="ow">not</span> <span class="n">use_lora</span> <span class="ow">and</span> <span class="n">use_optimize_cross_qkv</span> <span class="ow">is</span> <span class="kc">True</span><span class="p">:</span>
         <span class="c1"># This optimization is not supported when we use lora</span>
         <span class="n">model</span> <span class="o">=</span> <span class="n">optimize_cross_qkv</span><span class="p">(</span><span class="n">model</span><span class="p">)</span>
@@ -2002,11 +2085,12 @@
         <span class="k">if</span> <span class="n">quant_algo</span> <span class="o">!=</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">MIXED_PRECISION</span><span class="p">:</span>
             <span class="n">layer_quant_algo</span> <span class="o">=</span> <span class="n">quant_algo</span>
         <span class="k">else</span><span class="p">:</span>
-            <span class="k">if</span> <span class="n">base_name</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">quant_config</span><span class="o">.</span><span class="n">quantized_layers</span><span class="o">.</span><span class="n">keys</span><span class="p">():</span>
+            <span class="n">quant_cfg</span> <span class="o">=</span> <span class="n">quant_config</span><span class="o">.</span><span class="n">get_quant_cfg</span><span class="p">(</span><span class="n">base_name</span><span class="p">)</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">quant_cfg</span><span class="o">.</span><span class="n">quant_algo</span><span class="p">:</span>
                 <span class="n">new_weights</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">layer_weights</span><span class="p">)</span>
                 <span class="k">continue</span>
-            <span class="n">layer_quant_algo</span> <span class="o">=</span> <span class="n">quant_config</span><span class="o">.</span><span class="n">quantized_layers</span><span class="p">[</span>
-                <span class="n">base_name</span><span class="p">]</span><span class="o">.</span><span class="n">quant_algo</span>
+
+            <span class="n">layer_quant_algo</span> <span class="o">=</span> <span class="n">quant_cfg</span><span class="o">.</span><span class="n">quant_algo</span>
 
         <span class="n">preprocess_perlayer_weights</span><span class="p">(</span><span class="n">layer_weights</span><span class="p">,</span> <span class="n">model_config</span><span class="p">,</span>
                                     <span class="n">layer_quant_algo</span><span class="p">,</span> <span class="n">from_pruned</span><span class="p">)</span>
@@ -2055,7 +2139,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fa2581060c0>
+<jinja2.runtime.BlockReference object at 0x7f9b7a2c3290>
 
 <div class="footer">
     <p>

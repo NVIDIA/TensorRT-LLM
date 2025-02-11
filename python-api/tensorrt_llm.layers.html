@@ -15,7 +15,7 @@
       <script src="../_static/jquery.js?v=5d32c60e"></script>
       <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../_static/doctools.js?v=9a2dae69"></script>
+      <script src="../_static/doctools.js?v=9bcbadda"></script>
       <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../_static/copybutton.js?v=65e89d2a"></script>
@@ -110,6 +110,7 @@
 </li>
 <li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.layers.attention.DeepseekV2Attention"><code class="docutils literal notranslate"><span class="pre">DeepseekV2Attention</span></code></a><ul>
 <li class="toctree-l4"><a class="reference internal" href="#tensorrt_llm.layers.attention.DeepseekV2Attention.forward"><code class="docutils literal notranslate"><span class="pre">DeepseekV2Attention.forward()</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="#tensorrt_llm.layers.attention.DeepseekV2Attention.postprocess"><code class="docutils literal notranslate"><span class="pre">DeepseekV2Attention.postprocess()</span></code></a></li>
 <li class="toctree-l4"><a class="reference internal" href="#tensorrt_llm.layers.attention.DeepseekV2Attention.weight_loader"><code class="docutils literal notranslate"><span class="pre">DeepseekV2Attention.weight_loader()</span></code></a></li>
 </ul>
 </li>
@@ -181,6 +182,7 @@
 </li>
 <li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.layers.linear.RowLinear"><code class="docutils literal notranslate"><span class="pre">RowLinear</span></code></a><ul>
 <li class="toctree-l4"><a class="reference internal" href="#tensorrt_llm.layers.linear.RowLinear.collect_and_bias"><code class="docutils literal notranslate"><span class="pre">RowLinear.collect_and_bias()</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="#tensorrt_llm.layers.linear.RowLinear.multiply_collect"><code class="docutils literal notranslate"><span class="pre">RowLinear.multiply_collect()</span></code></a></li>
 <li class="toctree-l4"><a class="reference internal" href="#tensorrt_llm.layers.linear.RowLinear.tp_split_dim"><code class="docutils literal notranslate"><span class="pre">RowLinear.tp_split_dim()</span></code></a></li>
 </ul>
 </li>
@@ -201,6 +203,7 @@
 <li class="toctree-l4"><a class="reference internal" href="#tensorrt_llm.layers.mlp.MLP.forward"><code class="docutils literal notranslate"><span class="pre">MLP.forward()</span></code></a></li>
 </ul>
 </li>
+<li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.layers.mlp.fc_gate_dora"><code class="docutils literal notranslate"><span class="pre">fc_gate_dora()</span></code></a></li>
 <li class="toctree-l3"><a class="reference internal" href="#tensorrt_llm.layers.mlp.fc_gate_lora"><code class="docutils literal notranslate"><span class="pre">fc_gate_lora()</span></code></a></li>
 </ul>
 </li>
@@ -432,6 +435,11 @@
 <dl class="py method">
 <dt class="sig sig-object py" id="tensorrt_llm.layers.attention.DeepseekV2Attention.forward">
 <span class="sig-name descname"><span class="pre">forward</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">hidden_states</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="tensorrt_llm.functional.html#tensorrt_llm.functional.Tensor" title="tensorrt_llm.functional.Tensor"><span class="pre">Tensor</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">use_cache</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">spec_decoding_params</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kv_cache_params</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">attention_params</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/layers/attention.html#DeepseekV2Attention.forward"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.layers.attention.DeepseekV2Attention.forward" title="Link to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.layers.attention.DeepseekV2Attention.postprocess">
+<span class="sig-name descname"><span class="pre">postprocess</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">tllm_key</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">weights</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/layers/attention.html#DeepseekV2Attention.postprocess"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.layers.attention.DeepseekV2Attention.postprocess" title="Link to this definition"></a></dt>
 <dd></dd></dl>
 
 <dl class="py method">
@@ -694,6 +702,11 @@ the number of tokens used for each task, should be equal to prompt_embedding_tab
 <dd></dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.layers.linear.RowLinear.multiply_collect">
+<span class="sig-name descname"><span class="pre">multiply_collect</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">x</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">weight</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">gemm_plugin</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">low_latency_gemm_plugin</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">use_fp8</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">alpha</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">ndarray</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lora_runtime_params</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">LoraRuntimeParams</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lora_hidden_state</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="tensorrt_llm.functional.html#tensorrt_llm.functional.Tensor" title="tensorrt_llm.functional.Tensor"><span class="pre">Tensor</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/layers/linear.html#RowLinear.multiply_collect"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.layers.linear.RowLinear.multiply_collect" title="Link to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="tensorrt_llm.layers.linear.RowLinear.tp_split_dim">
 <em class="property"><span class="pre">classmethod</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">tp_split_dim</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">int</span></span></span><a class="reference internal" href="../_modules/tensorrt_llm/layers/linear.html#RowLinear.tp_split_dim"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.layers.linear.RowLinear.tp_split_dim" title="Link to this definition"></a></dt>
 <dd></dd></dl>
@@ -747,8 +760,13 @@ the number of tokens used for each task, should be equal to prompt_embedding_tab
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="tensorrt_llm.layers.mlp.fc_gate_dora">
+<span class="sig-prename descclassname"><span class="pre">tensorrt_llm.layers.mlp.</span></span><span class="sig-name descname"><span class="pre">fc_gate_dora</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">hidden_states</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dora</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">fused_gate_up_dora</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lora_layer_params</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/layers/mlp.html#fc_gate_dora"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.layers.mlp.fc_gate_dora" title="Link to this definition"></a></dt>
+<dd></dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="tensorrt_llm.layers.mlp.fc_gate_lora">
-<span class="sig-prename descclassname"><span class="pre">tensorrt_llm.layers.mlp.</span></span><span class="sig-name descname"><span class="pre">fc_gate_lora</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">hidden_states</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lora</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lora_layer_params</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/layers/mlp.html#fc_gate_lora"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.layers.mlp.fc_gate_lora" title="Link to this definition"></a></dt>
+<span class="sig-prename descclassname"><span class="pre">tensorrt_llm.layers.mlp.</span></span><span class="sig-name descname"><span class="pre">fc_gate_lora</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">hidden_states</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lora</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">fused_gate_up_lora</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lora_layer_params</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/tensorrt_llm/layers/mlp.html#fc_gate_lora"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.layers.mlp.fc_gate_lora" title="Link to this definition"></a></dt>
 <dd></dd></dl>
 
 </section>
@@ -815,7 +833,7 @@ the number of tokens used for each task, should be equal to prompt_embedding_tab
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fa25b762d50>
+<jinja2.runtime.BlockReference object at 0x7f9b6c7335f0>
 
 <div class="footer">
     <p>

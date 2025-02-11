@@ -14,7 +14,7 @@
       <script src="../../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../../_static/doctools.js?v=9a2dae69"></script>
+      <script src="../../../_static/doctools.js?v=9bcbadda"></script>
       <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
@@ -254,6 +254,16 @@
         <span class="s2">&quot;axis&quot;</span><span class="p">:</span> <span class="kc">None</span><span class="p">,</span>
         <span class="s2">&quot;enable&quot;</span><span class="p">:</span> <span class="kc">True</span>
     <span class="p">},</span>
+    <span class="s2">&quot;*.k.output_quantizer&quot;</span><span class="p">:</span> <span class="p">{</span>
+        <span class="s2">&quot;num_bits&quot;</span><span class="p">:</span> <span class="mi">8</span><span class="p">,</span>
+        <span class="s2">&quot;axis&quot;</span><span class="p">:</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="s2">&quot;enable&quot;</span><span class="p">:</span> <span class="kc">True</span>
+    <span class="p">},</span>
+    <span class="s2">&quot;*.v.output_quantizer&quot;</span><span class="p">:</span> <span class="p">{</span>
+        <span class="s2">&quot;num_bits&quot;</span><span class="p">:</span> <span class="mi">8</span><span class="p">,</span>
+        <span class="s2">&quot;axis&quot;</span><span class="p">:</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="s2">&quot;enable&quot;</span><span class="p">:</span> <span class="kc">True</span>
+    <span class="p">},</span>
 <span class="p">}</span>
 
 
@@ -271,6 +281,10 @@
     <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">mtq</span><span class="p">,</span> <span class="s2">&quot;NVFP4_DEFAULT_CFG&quot;</span><span class="p">):</span>
         <span class="n">QUANT_CFG_CHOICES</span><span class="p">[</span><span class="s2">&quot;nvfp4&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">mtq</span><span class="o">.</span><span class="n">NVFP4_DEFAULT_CFG</span>
     <span class="k">return</span> <span class="n">QUANT_CFG_CHOICES</span>
+
+
+<span class="k">def</span> <span class="nf">model_type_is_enc_dec</span><span class="p">(</span><span class="n">model_type</span><span class="p">):</span>
+    <span class="k">return</span> <span class="n">model_type</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;t5&quot;</span><span class="p">,</span> <span class="s2">&quot;bart&quot;</span><span class="p">]</span>
 
 
 <span class="n">MODEL_NAME_PATTERN_MAP</span> <span class="o">=</span> <span class="p">{</span>
@@ -298,6 +312,7 @@
     <span class="s2">&quot;PhiMoEForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;phi3&quot;</span><span class="p">,</span>
     <span class="s2">&quot;Phi3SmallForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;phi3small&quot;</span><span class="p">,</span>
     <span class="s2">&quot;Phi3ForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;phi3&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;Phi3VForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;phi3&quot;</span><span class="p">,</span>
     <span class="s2">&quot;Starcoder2ForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;gptnext&quot;</span><span class="p">,</span>
     <span class="s2">&quot;GPTBigCodeForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;gptnext&quot;</span><span class="p">,</span>
     <span class="s2">&quot;GLM&quot;</span><span class="p">:</span> <span class="s2">&quot;glm&quot;</span><span class="p">,</span>
@@ -306,6 +321,8 @@
     <span class="s2">&quot;DeepseekForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;deepseek&quot;</span><span class="p">,</span>
     <span class="s2">&quot;GraniteForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;granite&quot;</span><span class="p">,</span>
     <span class="s2">&quot;GraniteMoeForCausalLM&quot;</span><span class="p">:</span> <span class="s2">&quot;granitemoe&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;T5&quot;</span><span class="p">:</span> <span class="s2">&quot;t5&quot;</span><span class="p">,</span>
+    <span class="s2">&quot;Bart&quot;</span><span class="p">:</span> <span class="s2">&quot;bart&quot;</span>
 <span class="p">}</span>
 
 <span class="n">MULTIMODAL_DATASETS</span> <span class="o">=</span> <span class="p">[</span><span class="s1">&#39;scienceqa&#39;</span><span class="p">,</span> <span class="s1">&#39;science_qa&#39;</span><span class="p">]</span>
@@ -325,6 +342,23 @@
 
     <span class="k">def</span> <span class="fm">__len__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">encodings</span><span class="p">[</span><span class="s2">&quot;input_ids&quot;</span><span class="p">])</span>
+
+
+<span class="k">class</span> <span class="nc">EncDecModelWrapper</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
+
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hf_model</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">hf_model</span> <span class="o">=</span> <span class="n">hf_model</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">model_type</span> <span class="o">=</span> <span class="n">get_model_type</span><span class="p">(</span><span class="n">hf_model</span><span class="p">)</span>
+
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">hf_model</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+
+    <span class="k">def</span> <span class="fm">__getattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">):</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="k">return</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__getattr__</span><span class="p">(</span><span class="n">name</span><span class="p">)</span>
+        <span class="k">except</span> <span class="ne">AttributeError</span><span class="p">:</span>
+            <span class="k">return</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">hf_model</span><span class="p">,</span> <span class="n">name</span><span class="p">)</span>
 
 
 <span class="k">def</span> <span class="nf">get_tokenizer</span><span class="p">(</span><span class="n">ckpt_path</span><span class="p">,</span> <span class="n">max_seq_length</span><span class="o">=</span><span class="mi">2048</span><span class="p">,</span> <span class="n">model_type</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
@@ -440,6 +474,13 @@
                                                       <span class="n">device_map</span><span class="o">=</span><span class="s2">&quot;cuda&quot;</span><span class="p">,</span>
                                                       <span class="n">torch_dtype</span><span class="o">=</span><span class="n">torch_dtype</span><span class="p">,</span>
                                                       <span class="n">trust_remote_code</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="k">elif</span> <span class="n">model_type_is_enc_dec</span><span class="p">(</span><span class="n">hf_config</span><span class="o">.</span><span class="n">model_type</span><span class="p">):</span>
+        <span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">AutoModelForSeq2SeqLM</span>
+        <span class="n">model</span> <span class="o">=</span> <span class="n">AutoModelForSeq2SeqLM</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">ckpt_path</span><span class="p">,</span>
+                                                      <span class="n">device_map</span><span class="o">=</span><span class="n">device</span><span class="p">,</span>
+                                                      <span class="n">torch_dtype</span><span class="o">=</span><span class="n">torch_dtype</span><span class="p">,</span>
+                                                      <span class="n">trust_remote_code</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="n">model</span> <span class="o">=</span> <span class="n">EncDecModelWrapper</span><span class="p">(</span><span class="n">hf_model</span><span class="o">=</span><span class="n">model</span><span class="p">)</span>
     <span class="k">else</span><span class="p">:</span>
         <span class="n">model</span> <span class="o">=</span> <span class="n">model_cls</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
             <span class="n">ckpt_path</span><span class="p">,</span>
@@ -461,6 +502,8 @@
 
 
 <span class="k">def</span> <span class="nf">get_model_type</span><span class="p">(</span><span class="n">model</span><span class="p">):</span>
+    <span class="k">if</span> <span class="nb">type</span><span class="p">(</span><span class="n">model</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span> <span class="o">==</span> <span class="s2">&quot;EncDecModelWrapper&quot;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">model</span><span class="o">.</span><span class="n">model_type</span>
     <span class="k">if</span> <span class="nb">type</span><span class="p">(</span><span class="n">model</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span> <span class="ow">in</span> <span class="n">MODEL_NAME_PATTERN_MAP</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">MODEL_NAME_PATTERN_MAP</span><span class="p">[</span><span class="nb">type</span><span class="p">(</span><span class="n">model</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="p">]</span>
     <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">MODEL_NAME_PATTERN_MAP</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
@@ -793,6 +836,7 @@
 
     <span class="n">model</span> <span class="o">=</span> <span class="n">get_model</span><span class="p">(</span><span class="n">model_dir</span><span class="p">,</span> <span class="n">dtype</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span> <span class="n">device_map</span><span class="o">=</span><span class="n">device_map</span><span class="p">)</span>
     <span class="n">model_type</span> <span class="o">=</span> <span class="n">get_model_type</span><span class="p">(</span><span class="n">model</span><span class="p">)</span>
+    <span class="n">is_enc_dec</span> <span class="o">=</span> <span class="n">model_type_is_enc_dec</span><span class="p">(</span><span class="n">model_type</span><span class="p">)</span>
     <span class="k">if</span> <span class="s2">&quot;vila&quot;</span> <span class="ow">in</span> <span class="n">model_dir</span><span class="p">:</span>
         <span class="n">tokenizer</span> <span class="o">=</span> <span class="n">get_tokenizer</span><span class="p">(</span><span class="n">model_dir</span> <span class="o">+</span> <span class="s2">&quot;/llm&quot;</span><span class="p">,</span>
                                   <span class="n">max_seq_length</span><span class="o">=</span><span class="n">tokenizer_max_seq_length</span><span class="p">,</span>
@@ -894,7 +938,7 @@
         <span class="k">if</span> <span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;mllama&#39;</span><span class="p">:</span>
             <span class="n">model</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">language_model</span>
         <span class="n">export_tensorrt_llm_checkpoint</span><span class="p">(</span>
-            <span class="n">model</span><span class="p">,</span>
+            <span class="n">model</span><span class="o">.</span><span class="n">hf_model</span> <span class="k">if</span> <span class="n">is_enc_dec</span> <span class="k">else</span> <span class="n">model</span><span class="p">,</span>
             <span class="n">model_type</span><span class="p">,</span>
             <span class="nb">getattr</span><span class="p">(</span><span class="n">torch</span><span class="p">,</span> <span class="n">dtype</span><span class="p">),</span>
             <span class="n">export_dir</span><span class="o">=</span><span class="n">export_path</span><span class="p">,</span>
@@ -902,125 +946,141 @@
             <span class="n">inference_pipeline_parallel</span><span class="o">=</span><span class="n">pp_size</span><span class="p">,</span>
         <span class="p">)</span>
 
-        <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;r&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
-            <span class="n">tensorrt_llm_config</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
+        <span class="n">export_paths</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="n">tensorrt_llm_configs</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">is_enc_dec</span><span class="p">:</span>
+            <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;r&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                <span class="n">tensorrt_llm_config</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
+            <span class="n">tensorrt_llm_configs</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">tensorrt_llm_config</span><span class="p">)</span>
+            <span class="n">export_paths</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">export_path</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">component</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;encoder&quot;</span><span class="p">,</span> <span class="s2">&quot;decoder&quot;</span><span class="p">]:</span>
+                <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/</span><span class="si">{</span><span class="n">component</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;r&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                    <span class="n">tensorrt_llm_config</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
+                <span class="n">tensorrt_llm_configs</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">tensorrt_llm_config</span><span class="p">)</span>
+                <span class="n">export_paths</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/</span><span class="si">{</span><span class="n">component</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
 
-        <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s2">&quot;model_type&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">model_type</span>
-        <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s2">&quot;architecture&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">architecture</span>
+        <span class="k">for</span> <span class="n">export_path</span><span class="p">,</span> <span class="n">tensorrt_llm_config</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">export_paths</span><span class="p">,</span>
+                                                    <span class="n">tensorrt_llm_configs</span><span class="p">):</span>
 
-        <span class="c1"># Workaround for wo quantization</span>
-        <span class="k">if</span> <span class="n">qformat</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;int8_wo&quot;</span><span class="p">,</span> <span class="s2">&quot;int4_wo&quot;</span><span class="p">,</span> <span class="s2">&quot;full_prec&quot;</span><span class="p">]:</span>
-            <span class="k">if</span> <span class="n">qformat</span> <span class="o">==</span> <span class="s2">&quot;int8_wo&quot;</span><span class="p">:</span>
+            <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s2">&quot;model_type&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">model_type</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">is_enc_dec</span><span class="p">:</span>
+                <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s2">&quot;architecture&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">architecture</span>
+
+            <span class="c1"># Workaround for wo quantization</span>
+            <span class="k">if</span> <span class="n">qformat</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;int8_wo&quot;</span><span class="p">,</span> <span class="s2">&quot;int4_wo&quot;</span><span class="p">,</span> <span class="s2">&quot;full_prec&quot;</span><span class="p">]:</span>
+                <span class="k">if</span> <span class="n">qformat</span> <span class="o">==</span> <span class="s2">&quot;int8_wo&quot;</span><span class="p">:</span>
+                    <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s2">&quot;quantization&quot;</span><span class="p">][</span>
+                        <span class="s2">&quot;quant_algo&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W8A16</span>
+                <span class="k">elif</span> <span class="n">qformat</span> <span class="o">==</span> <span class="s2">&quot;int4_wo&quot;</span><span class="p">:</span>
+                    <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s2">&quot;quantization&quot;</span><span class="p">][</span>
+                        <span class="s2">&quot;quant_algo&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A16</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s2">&quot;quantization&quot;</span><span class="p">][</span><span class="s2">&quot;quant_algo&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+
+            <span class="c1"># HF uses rope_scaling while tensorrt_llm uses rotary_scaling</span>
+            <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="s2">&quot;rope_scaling&quot;</span>
+                       <span class="p">)</span> <span class="ow">and</span> <span class="s2">&quot;rotary_scaling&quot;</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">tensorrt_llm_config</span><span class="p">:</span>
+                <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s2">&quot;rotary_scaling&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span>
+                    <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="s2">&quot;rope_scaling&quot;</span><span class="p">)</span>
+            <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;w&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                <span class="n">json</span><span class="o">.</span><span class="n">dump</span><span class="p">(</span><span class="n">tensorrt_llm_config</span><span class="p">,</span> <span class="n">f</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span>
+
+            <span class="c1"># Workaround for Modelopt 0.9.x fp8_kv_cache knob issue</span>
+            <span class="k">if</span> <span class="n">qformat</span> <span class="ow">in</span> <span class="p">[</span><span class="s1">&#39;fp8&#39;</span><span class="p">,</span> <span class="s1">&#39;nvfp4&#39;</span><span class="p">]</span> <span class="ow">and</span> <span class="n">kv_cache_dtype</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;r&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                    <span class="n">tensorrt_llm_config</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
                 <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s2">&quot;quantization&quot;</span><span class="p">][</span>
-                    <span class="s2">&quot;quant_algo&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W8A16</span>
-            <span class="k">elif</span> <span class="n">qformat</span> <span class="o">==</span> <span class="s2">&quot;int4_wo&quot;</span><span class="p">:</span>
-                <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s2">&quot;quantization&quot;</span><span class="p">][</span>
-                    <span class="s2">&quot;quant_algo&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">W4A16</span>
-            <span class="k">else</span><span class="p">:</span>
-                <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s2">&quot;quantization&quot;</span><span class="p">][</span><span class="s2">&quot;quant_algo&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+                    <span class="s2">&quot;kv_cache_quant_algo&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+                <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;w&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                    <span class="n">json</span><span class="o">.</span><span class="n">dump</span><span class="p">(</span><span class="n">tensorrt_llm_config</span><span class="p">,</span> <span class="n">f</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span>
 
-        <span class="c1"># HF uses rope_scaling while tensorrt_llm uses rotary_scaling</span>
-        <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span>
-                <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="p">,</span>
-                <span class="s2">&quot;rope_scaling&quot;</span><span class="p">)</span> <span class="ow">and</span> <span class="s2">&quot;rotary_scaling&quot;</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">tensorrt_llm_config</span><span class="p">:</span>
-            <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s2">&quot;rotary_scaling&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span>
-                <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="s2">&quot;rope_scaling&quot;</span><span class="p">)</span>
-        <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;w&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
-            <span class="n">json</span><span class="o">.</span><span class="n">dump</span><span class="p">(</span><span class="n">tensorrt_llm_config</span><span class="p">,</span> <span class="n">f</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span>
+            <span class="c1"># Workaround for qwen version</span>
+            <span class="k">if</span> <span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;qwen&#39;</span><span class="p">:</span>
+                <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;r&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                    <span class="n">tensorrt_llm_config</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
+                <span class="n">qwen_config</span> <span class="o">=</span> <span class="n">AutoConfig</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">model_dir</span><span class="p">,</span>
+                                                         <span class="n">trust_remote_code</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+                <span class="k">try</span><span class="p">:</span>
+                    <span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">LlavaOnevisionConfig</span>
+                    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">qwen_config</span><span class="p">,</span> <span class="n">LlavaOnevisionConfig</span><span class="p">):</span>
+                        <span class="n">qwen_config</span> <span class="o">=</span> <span class="n">qwen_config</span><span class="o">.</span><span class="n">text_config</span>
+                <span class="k">except</span><span class="p">:</span>
+                    <span class="k">pass</span>
+                <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s2">&quot;qwen_type&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">qwen_config</span><span class="o">.</span><span class="n">model_type</span>
+                <span class="k">if</span> <span class="n">qwen_config</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;qwen2&quot;</span><span class="p">:</span>
+                    <span class="n">tensorrt_llm_config</span><span class="p">[</span>
+                        <span class="s2">&quot;norm_epsilon&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">qwen_config</span><span class="o">.</span><span class="n">rms_norm_eps</span>
+                    <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s2">&quot;rotary_base&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">qwen_config</span><span class="o">.</span><span class="n">rope_theta</span>
+                <span class="n">tensorrt_llm_config</span><span class="p">[</span>
+                    <span class="s2">&quot;intermediate_size&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">qwen_config</span><span class="o">.</span><span class="n">intermediate_size</span>
+                <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;w&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                    <span class="n">json</span><span class="o">.</span><span class="n">dump</span><span class="p">(</span><span class="n">tensorrt_llm_config</span><span class="p">,</span> <span class="n">f</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span>
 
-        <span class="c1"># Workaround for Modelopt 0.9.x fp8_kv_cache knob issue</span>
-        <span class="k">if</span> <span class="n">qformat</span> <span class="ow">in</span> <span class="p">[</span><span class="s1">&#39;fp8&#39;</span><span class="p">,</span> <span class="s1">&#39;nvfp4&#39;</span><span class="p">]</span> <span class="ow">and</span> <span class="n">kv_cache_dtype</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;r&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
-                <span class="n">tensorrt_llm_config</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
-            <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s2">&quot;quantization&quot;</span><span class="p">][</span><span class="s2">&quot;kv_cache_quant_algo&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
-            <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;w&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
-                <span class="n">json</span><span class="o">.</span><span class="n">dump</span><span class="p">(</span><span class="n">tensorrt_llm_config</span><span class="p">,</span> <span class="n">f</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span>
+            <span class="c1"># Set rotary parameters correctly for chatglm.</span>
+            <span class="k">if</span> <span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;chatglm&#39;</span><span class="p">:</span>
+                <span class="n">rotary_base</span> <span class="o">=</span> <span class="mf">10000.0</span>
+                <span class="n">rotary_embedding_scaling</span> <span class="o">=</span> <span class="kc">None</span>
+                <span class="n">chatglm_config</span> <span class="o">=</span> <span class="n">AutoConfig</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
+                    <span class="n">model_dir</span><span class="p">,</span> <span class="n">trust_remote_code</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+                <span class="n">chatglm_version</span> <span class="o">=</span> <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s1">&#39;chatglm_version&#39;</span><span class="p">]</span>
+                <span class="n">rope_ratio</span> <span class="o">=</span> <span class="n">tensorrt_llm_config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;rope_ratio&#39;</span><span class="p">,</span> <span class="mf">1.0</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">chatglm_version</span> <span class="o">==</span> <span class="s1">&#39;chatglm2&#39;</span><span class="p">:</span>
+                    <span class="k">if</span> <span class="n">rope_ratio</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+                        <span class="n">rotary_embedding_scaling</span> <span class="o">=</span> <span class="p">{</span>
+                            <span class="s1">&#39;type&#39;</span><span class="p">:</span> <span class="s1">&#39;linear&#39;</span><span class="p">,</span>
+                            <span class="s1">&#39;factor&#39;</span><span class="p">:</span> <span class="n">rope_ratio</span>
+                        <span class="p">}</span>
+                <span class="k">elif</span> <span class="n">chatglm_version</span> <span class="o">==</span> <span class="s1">&#39;chatglm3&#39;</span><span class="p">:</span>
+                    <span class="n">rotary_base</span> <span class="o">*=</span> <span class="n">rope_ratio</span>
 
-        <span class="c1"># Workaround for qwen version</span>
-        <span class="k">if</span> <span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;qwen&#39;</span><span class="p">:</span>
-            <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;r&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
-                <span class="n">tensorrt_llm_config</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
-            <span class="n">qwen_config</span> <span class="o">=</span> <span class="n">AutoConfig</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">model_dir</span><span class="p">,</span>
-                                                     <span class="n">trust_remote_code</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-            <span class="k">try</span><span class="p">:</span>
-                <span class="kn">from</span> <span class="nn">transformers</span> <span class="kn">import</span> <span class="n">LlavaOnevisionConfig</span>
-                <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">qwen_config</span><span class="p">,</span> <span class="n">LlavaOnevisionConfig</span><span class="p">):</span>
-                    <span class="n">qwen_config</span> <span class="o">=</span> <span class="n">qwen_config</span><span class="o">.</span><span class="n">text_config</span>
-            <span class="k">except</span><span class="p">:</span>
-                <span class="k">pass</span>
-            <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s2">&quot;qwen_type&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">qwen_config</span><span class="o">.</span><span class="n">model_type</span>
-            <span class="k">if</span> <span class="n">qwen_config</span><span class="o">.</span><span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;qwen2&quot;</span><span class="p">:</span>
-                <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s2">&quot;norm_epsilon&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">qwen_config</span><span class="o">.</span><span class="n">rms_norm_eps</span>
-                <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s2">&quot;rotary_base&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">qwen_config</span><span class="o">.</span><span class="n">rope_theta</span>
-            <span class="n">tensorrt_llm_config</span><span class="p">[</span>
-                <span class="s2">&quot;intermediate_size&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">qwen_config</span><span class="o">.</span><span class="n">intermediate_size</span>
-            <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;w&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
-                <span class="n">json</span><span class="o">.</span><span class="n">dump</span><span class="p">(</span><span class="n">tensorrt_llm_config</span><span class="p">,</span> <span class="n">f</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span>
+                <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;r&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                    <span class="n">tensorrt_llm_config</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
+                <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s1">&#39;rotary_base&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">rotary_base</span>
+                <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s1">&#39;rotary_scaling&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">rotary_embedding_scaling</span>
+                <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s1">&#39;rotary_pct&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="mf">0.5</span>
+                <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;w&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                    <span class="n">json</span><span class="o">.</span><span class="n">dump</span><span class="p">(</span><span class="n">tensorrt_llm_config</span><span class="p">,</span> <span class="n">f</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span>
 
-        <span class="c1"># Set rotary parameters correctly for chatglm.</span>
-        <span class="k">if</span> <span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;chatglm&#39;</span><span class="p">:</span>
-            <span class="n">rotary_base</span> <span class="o">=</span> <span class="mf">10000.0</span>
-            <span class="n">rotary_embedding_scaling</span> <span class="o">=</span> <span class="kc">None</span>
-            <span class="n">chatglm_config</span> <span class="o">=</span> <span class="n">AutoConfig</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">model_dir</span><span class="p">,</span>
-                                                        <span class="n">trust_remote_code</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-            <span class="n">chatglm_version</span> <span class="o">=</span> <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s1">&#39;chatglm_version&#39;</span><span class="p">]</span>
-            <span class="n">rope_ratio</span> <span class="o">=</span> <span class="n">tensorrt_llm_config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;rope_ratio&#39;</span><span class="p">,</span> <span class="mf">1.0</span><span class="p">)</span>
-            <span class="k">if</span> <span class="n">chatglm_version</span> <span class="o">==</span> <span class="s1">&#39;chatglm2&#39;</span><span class="p">:</span>
-                <span class="k">if</span> <span class="n">rope_ratio</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
-                    <span class="n">rotary_embedding_scaling</span> <span class="o">=</span> <span class="p">{</span>
-                        <span class="s1">&#39;type&#39;</span><span class="p">:</span> <span class="s1">&#39;linear&#39;</span><span class="p">,</span>
-                        <span class="s1">&#39;factor&#39;</span><span class="p">:</span> <span class="n">rope_ratio</span>
-                    <span class="p">}</span>
-            <span class="k">elif</span> <span class="n">chatglm_version</span> <span class="o">==</span> <span class="s1">&#39;chatglm3&#39;</span><span class="p">:</span>
-                <span class="n">rotary_base</span> <span class="o">*=</span> <span class="n">rope_ratio</span>
+            <span class="c1"># context parallel</span>
+            <span class="k">if</span> <span class="n">cp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+                <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;r&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                    <span class="n">tensorrt_llm_config</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
+                <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s2">&quot;mapping&quot;</span><span class="p">][</span><span class="s2">&quot;cp_size&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">cp_size</span>
+                <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s2">&quot;mapping&quot;</span><span class="p">][</span><span class="s2">&quot;world_size&quot;</span><span class="p">]</span> <span class="o">*=</span> <span class="n">cp_size</span>
+                <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;w&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                    <span class="n">json</span><span class="o">.</span><span class="n">dump</span><span class="p">(</span><span class="n">tensorrt_llm_config</span><span class="p">,</span> <span class="n">f</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span>
 
-            <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;r&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
-                <span class="n">tensorrt_llm_config</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
-            <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s1">&#39;rotary_base&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">rotary_base</span>
-            <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s1">&#39;rotary_scaling&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">rotary_embedding_scaling</span>
-            <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s1">&#39;rotary_pct&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="mf">0.5</span>
-            <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;w&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
-                <span class="n">json</span><span class="o">.</span><span class="n">dump</span><span class="p">(</span><span class="n">tensorrt_llm_config</span><span class="p">,</span> <span class="n">f</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;gptnext&#39;</span><span class="p">:</span>
+                <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;r&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                    <span class="n">tensorrt_llm_config</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s1">&#39;max_position_embeddings&#39;</span><span class="p">]</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s1">&#39;max_position_embeddings&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span>
+                        <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="s2">&quot;n_positions&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+                <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;w&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                    <span class="n">json</span><span class="o">.</span><span class="n">dump</span><span class="p">(</span><span class="n">tensorrt_llm_config</span><span class="p">,</span> <span class="n">f</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span>
 
-        <span class="c1"># context parallel</span>
-        <span class="k">if</span> <span class="n">cp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
-            <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;r&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
-                <span class="n">tensorrt_llm_config</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
-            <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s2">&quot;mapping&quot;</span><span class="p">][</span><span class="s2">&quot;cp_size&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">cp_size</span>
-            <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s2">&quot;mapping&quot;</span><span class="p">][</span><span class="s2">&quot;world_size&quot;</span><span class="p">]</span> <span class="o">*=</span> <span class="n">cp_size</span>
-            <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;w&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
-                <span class="n">json</span><span class="o">.</span><span class="n">dump</span><span class="p">(</span><span class="n">tensorrt_llm_config</span><span class="p">,</span> <span class="n">f</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span>
+            <span class="c1"># Workaround for combining medusa head</span>
+            <span class="c1"># TODO: move these integration into modelopt to avoid redundant reading and writing</span>
+            <span class="k">if</span> <span class="n">medusa_model_dir</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">combine_medusa_weight</span><span class="p">(</span><span class="n">tp_size</span><span class="p">,</span> <span class="n">pp_size</span><span class="p">,</span> <span class="n">export_path</span><span class="p">,</span>
+                                      <span class="n">num_medusa_heads</span><span class="p">,</span> <span class="n">num_medusa_layers</span><span class="p">,</span>
+                                      <span class="n">max_draft_len</span><span class="p">,</span> <span class="n">medusa_hidden_act</span><span class="p">,</span>
+                                      <span class="n">medusa_model_dir</span><span class="p">,</span> <span class="n">quant_medusa_head</span><span class="p">)</span>
 
-        <span class="k">if</span> <span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;gptnext&#39;</span><span class="p">:</span>
-            <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;r&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
-                <span class="n">tensorrt_llm_config</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
-            <span class="k">if</span> <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s1">&#39;max_position_embeddings&#39;</span><span class="p">]</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="s1">&#39;max_position_embeddings&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span>
-                    <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="s2">&quot;n_positions&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
-            <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;w&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
-                <span class="n">json</span><span class="o">.</span><span class="n">dump</span><span class="p">(</span><span class="n">tensorrt_llm_config</span><span class="p">,</span> <span class="n">f</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span>
+            <span class="c1"># Workaround for mllama</span>
+            <span class="k">if</span> <span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;mllama&#39;</span><span class="p">:</span>
+                <span class="kn">from</span> <span class="nn">tensorrt_llm.models.mllama.config</span> <span class="kn">import</span> <span class="n">MLLaMAConfig</span>
+                <span class="n">config</span> <span class="o">=</span> <span class="n">MLLaMAConfig</span><span class="o">.</span><span class="n">from_hugging_face</span><span class="p">(</span>
+                    <span class="n">model_dir</span><span class="p">,</span>
+                    <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+                <span class="p">)</span>
+                <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">config</span><span class="o">.</span><span class="n">to_dict</span><span class="p">()</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+                    <span class="k">if</span> <span class="n">key</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">tensorrt_llm_config</span><span class="p">:</span>
+                        <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">value</span>
 
-        <span class="c1"># Workaround for combining medusa head</span>
-        <span class="c1"># TODO: move these integration into modelopt to avoid redundant reading and writing</span>
-        <span class="k">if</span> <span class="n">medusa_model_dir</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">combine_medusa_weight</span><span class="p">(</span><span class="n">tp_size</span><span class="p">,</span> <span class="n">pp_size</span><span class="p">,</span> <span class="n">export_path</span><span class="p">,</span>
-                                  <span class="n">num_medusa_heads</span><span class="p">,</span> <span class="n">num_medusa_layers</span><span class="p">,</span>
-                                  <span class="n">max_draft_len</span><span class="p">,</span> <span class="n">medusa_hidden_act</span><span class="p">,</span>
-                                  <span class="n">medusa_model_dir</span><span class="p">,</span> <span class="n">quant_medusa_head</span><span class="p">)</span>
-
-        <span class="c1"># Workaround for mllama</span>
-        <span class="k">if</span> <span class="n">model_type</span> <span class="o">==</span> <span class="s1">&#39;mllama&#39;</span><span class="p">:</span>
-            <span class="kn">from</span> <span class="nn">tensorrt_llm.models.mllama.config</span> <span class="kn">import</span> <span class="n">MLLaMAConfig</span>
-            <span class="n">config</span> <span class="o">=</span> <span class="n">MLLaMAConfig</span><span class="o">.</span><span class="n">from_hugging_face</span><span class="p">(</span>
-                <span class="n">model_dir</span><span class="p">,</span>
-                <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
-            <span class="p">)</span>
-            <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">config</span><span class="o">.</span><span class="n">to_dict</span><span class="p">()</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
-                <span class="k">if</span> <span class="n">key</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">tensorrt_llm_config</span><span class="p">:</span>
-                    <span class="n">tensorrt_llm_config</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">value</span>
-
-            <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;w&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
-                <span class="n">json</span><span class="o">.</span><span class="n">dump</span><span class="p">(</span><span class="n">tensorrt_llm_config</span><span class="p">,</span> <span class="n">f</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span>
+                <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">export_path</span><span class="si">}</span><span class="s2">/config.json&quot;</span><span class="p">,</span> <span class="s2">&quot;w&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                    <span class="n">json</span><span class="o">.</span><span class="n">dump</span><span class="p">(</span><span class="n">tensorrt_llm_config</span><span class="p">,</span> <span class="n">f</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span>
 
         <span class="n">end_time</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span>
         <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
@@ -1339,7 +1399,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fa25bffffb0>
+<jinja2.runtime.BlockReference object at 0x7f9b7a358710>
 
 <div class="footer">
     <p>

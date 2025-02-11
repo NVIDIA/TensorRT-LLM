@@ -14,7 +14,7 @@
       <script src="../../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../../_static/doctools.js?v=9a2dae69"></script>
+      <script src="../../../_static/doctools.js?v=9bcbadda"></script>
       <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
@@ -202,7 +202,7 @@
 
 <span class="kn">from</span> <span class="nn">.._utils</span> <span class="kn">import</span> <span class="p">(</span><span class="n">pad_vocab_size</span><span class="p">,</span> <span class="n">str_dtype_to_torch</span><span class="p">,</span> <span class="n">torch_to_numpy</span><span class="p">,</span>
                       <span class="n">trt_dtype_to_torch</span><span class="p">)</span>
-<span class="kn">from</span> <span class="nn">..bindings</span> <span class="kn">import</span> <span class="n">KVCacheType</span>
+<span class="kn">from</span> <span class="nn">..bindings</span> <span class="kn">import</span> <span class="n">KVCacheType</span><span class="p">,</span> <span class="n">ipc_nvls_allocate</span><span class="p">,</span> <span class="n">ipc_nvls_free</span>
 <span class="kn">from</span> <span class="nn">..logger</span> <span class="kn">import</span> <span class="n">logger</span>
 <span class="kn">from</span> <span class="nn">..lora_manager</span> <span class="kn">import</span> <span class="n">LoraManager</span>
 <span class="kn">from</span> <span class="nn">..mapping</span> <span class="kn">import</span> <span class="n">Mapping</span>
@@ -500,8 +500,8 @@
         <span class="n">context</span> <span class="o">=</span> <span class="n">engine</span><span class="o">.</span><span class="n">create_execution_context</span><span class="p">(</span>
             <span class="n">trt</span><span class="o">.</span><span class="n">ExecutionContextAllocationStrategy</span><span class="o">.</span><span class="n">USER_MANAGED</span><span class="p">)</span>
         <span class="n">n_op</span> <span class="o">=</span> <span class="n">engine</span><span class="o">.</span><span class="n">num_optimization_profiles</span>
-        <span class="n">mwn</span> <span class="o">=</span> <span class="mi">0</span>  <span class="c1"># Maximum Width of tensor Name</span>
-        <span class="n">mws</span> <span class="o">=</span> <span class="mi">0</span>  <span class="c1"># Maximum Width of tensor Shape</span>
+        <span class="n">max_name_width</span> <span class="o">=</span> <span class="mi">0</span>  <span class="c1"># Maximum Width of tensor Name</span>
+        <span class="n">max_shape_width</span> <span class="o">=</span> <span class="mi">0</span>  <span class="c1"># Maximum Width of tensor Shape</span>
         <span class="n">tensor_name_list</span> <span class="o">=</span> <span class="p">[</span>
             <span class="n">engine</span><span class="o">.</span><span class="n">get_tensor_name</span><span class="p">(</span><span class="n">i</span><span class="p">)</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">engine</span><span class="o">.</span><span class="n">num_io_tensors</span><span class="p">)</span>
         <span class="p">]</span>
@@ -510,7 +510,7 @@
         <span class="n">tid</span> <span class="o">=</span> <span class="p">{}</span>  <span class="c1"># Tensor Information Dictionary</span>
         <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">tensor_name_list</span><span class="p">:</span>
             <span class="n">item</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">()</span>
-            <span class="n">mwn</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">mwn</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">name</span><span class="p">))</span>
+            <span class="n">max_name_width</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">max_name_width</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">name</span><span class="p">))</span>
             <span class="n">item</span><span class="p">[</span><span class="s2">&quot;mode&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s1">&#39;I&#39;</span> <span class="k">if</span> <span class="n">engine</span><span class="o">.</span><span class="n">get_tensor_mode</span><span class="p">(</span>
                 <span class="n">name</span><span class="p">)</span> <span class="o">==</span> <span class="n">trt</span><span class="o">.</span><span class="n">TensorIOMode</span><span class="o">.</span><span class="n">INPUT</span> <span class="k">else</span> <span class="s1">&#39;O&#39;</span>
             <span class="n">item</span><span class="p">[</span><span class="s2">&quot;location&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s1">&#39;GPU&#39;</span> <span class="k">if</span> <span class="n">engine</span><span class="o">.</span><span class="n">get_tensor_location</span><span class="p">(</span>
@@ -525,7 +525,8 @@
                     <span class="k">else</span><span class="p">:</span>
                         <span class="n">shape</span> <span class="o">=</span> <span class="n">engine</span><span class="o">.</span><span class="n">get_tensor_profile_value</span><span class="p">(</span><span class="n">k</span><span class="p">,</span> <span class="n">name</span><span class="p">)</span>
                     <span class="n">item</span><span class="p">[</span><span class="s2">&quot;profile_list&quot;</span><span class="p">][</span><span class="n">k</span><span class="p">]</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">shape</span><span class="p">)</span>
-                    <span class="n">mws</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">mws</span><span class="p">,</span> <span class="o">*</span><span class="p">[</span><span class="nb">len</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">s</span><span class="p">))</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">shape</span><span class="p">])</span>
+                    <span class="n">max_shape_width</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">max_shape_width</span><span class="p">,</span>
+                                          <span class="o">*</span><span class="p">[</span><span class="nb">len</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">s</span><span class="p">))</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">shape</span><span class="p">])</span>
             <span class="n">tid</span><span class="p">[</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="n">item</span>
         <span class="c1"># Set input shape to get output shape</span>
         <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n_op</span><span class="p">):</span>
@@ -546,32 +547,61 @@
 
         <span class="c1"># Print information of engine input / output</span>
         <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">&quot;Information of engine input / output.&quot;</span><span class="p">)</span>
-        <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="s1">&#39;=&#39;</span><span class="o">*</span><span class="p">(</span><span class="n">mwn</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">mws</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">24</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
-        <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="s1">&#39;Name&#39;</span><span class="si">:</span><span class="s2">^</span><span class="si">{</span><span class="n">mwn</span><span class="si">}}</span><span class="s2">|I/O|Location|DataType|</span><span class="si">{</span><span class="s1">&#39;Shape&#39;</span><span class="si">:</span><span class="s2">^</span><span class="si">{</span><span class="n">mws</span><span class="si">}}</span><span class="s2">|&quot;</span><span class="p">)</span>
-        <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="s1">&#39;-&#39;</span><span class="o">*</span><span class="p">(</span><span class="n">mwn</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">mws</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">24</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="s1">&#39;=&#39;</span><span class="o">*</span><span class="p">(</span><span class="n">max_name_width</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">max_shape_width</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">24</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="s1">&#39;Name&#39;</span><span class="si">:</span><span class="s2">^</span><span class="si">{</span><span class="n">max_name_width</span><span class="si">}}</span><span class="s2">|I/O|Location|DataType|</span><span class="si">{</span><span class="s1">&#39;Shape&#39;</span><span class="si">:</span><span class="s2">^</span><span class="si">{</span><span class="n">max_shape_width</span><span class="si">}}</span><span class="s2">|&quot;</span>
+        <span class="p">)</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="s1">&#39;-&#39;</span><span class="o">*</span><span class="p">(</span><span class="n">max_name_width</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">max_shape_width</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">24</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
         <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">tensor_name_list</span><span class="p">:</span>
             <span class="n">item</span> <span class="o">=</span> <span class="n">tid</span><span class="p">[</span><span class="n">name</span><span class="p">]</span>
-            <span class="n">info</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">name</span><span class="si">:</span><span class="s2">&lt;</span><span class="si">{</span><span class="n">mwn</span><span class="si">}}</span><span class="s2">|</span><span class="si">{</span><span class="n">item</span><span class="p">[</span><span class="s1">&#39;mode&#39;</span><span class="p">]</span><span class="si">:</span><span class="s2">^3s</span><span class="si">}</span><span class="s2">|</span><span class="si">{</span><span class="n">item</span><span class="p">[</span><span class="s1">&#39;location&#39;</span><span class="p">]</span><span class="si">:</span><span class="s2">^8s</span><span class="si">}</span><span class="s2">|</span><span class="si">{</span><span class="n">item</span><span class="p">[</span><span class="s1">&#39;data_type&#39;</span><span class="p">]</span><span class="si">:</span><span class="s2">^8s</span><span class="si">}</span><span class="s2">|&quot;</span>
-            <span class="n">info</span> <span class="o">+=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">item</span><span class="p">[</span><span class="s1">&#39;build_shape&#39;</span><span class="p">]</span><span class="si">:</span><span class="s2">^</span><span class="si">{</span><span class="n">mws</span><span class="si">}}</span><span class="s2">|&quot;</span>
+            <span class="n">info</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">name</span><span class="si">:</span><span class="s2">&lt;</span><span class="si">{</span><span class="n">max_name_width</span><span class="si">}}</span><span class="s2">|</span><span class="si">{</span><span class="n">item</span><span class="p">[</span><span class="s1">&#39;mode&#39;</span><span class="p">]</span><span class="si">:</span><span class="s2">^3s</span><span class="si">}</span><span class="s2">|</span><span class="si">{</span><span class="n">item</span><span class="p">[</span><span class="s1">&#39;location&#39;</span><span class="p">]</span><span class="si">:</span><span class="s2">^8s</span><span class="si">}</span><span class="s2">|</span><span class="si">{</span><span class="n">item</span><span class="p">[</span><span class="s1">&#39;data_type&#39;</span><span class="p">]</span><span class="si">:</span><span class="s2">^8s</span><span class="si">}</span><span class="s2">|&quot;</span>
+            <span class="n">info</span> <span class="o">+=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">item</span><span class="p">[</span><span class="s1">&#39;build_shape&#39;</span><span class="p">]</span><span class="si">:</span><span class="s2">^</span><span class="si">{</span><span class="n">max_shape_width</span><span class="si">}}</span><span class="s2">|&quot;</span>
             <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="n">info</span><span class="p">)</span>
-        <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="s1">&#39;=&#39;</span><span class="o">*</span><span class="p">(</span><span class="n">mwn</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">mws</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">24</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="s1">&#39;=&#39;</span><span class="o">*</span><span class="p">(</span><span class="n">max_name_width</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">max_shape_width</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">24</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
         <span class="c1"># Print information of optimization profile</span>
         <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">&quot;Information of optimization profile.&quot;</span><span class="p">)</span>
         <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n_op</span><span class="p">):</span>
             <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Optimization Profile </span><span class="si">{</span><span class="n">k</span><span class="si">}</span><span class="s2">:&quot;</span><span class="p">)</span>
-            <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="s1">&#39;=&#39;</span><span class="o">*</span><span class="p">(</span><span class="n">mwn</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">mws</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">3</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">4</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="s1">&#39;=&#39;</span><span class="o">*</span><span class="p">(</span><span class="n">max_name_width</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">max_shape_width</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">3</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">4</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
             <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="s1">&#39;Name&#39;</span><span class="si">:</span><span class="s2">^</span><span class="si">{</span><span class="n">mwn</span><span class="si">}}</span><span class="s2">|</span><span class="si">{</span><span class="s1">&#39;Min&#39;</span><span class="si">:</span><span class="s2">^</span><span class="si">{</span><span class="n">mws</span><span class="si">}}</span><span class="s2">|</span><span class="si">{</span><span class="s1">&#39;Opt&#39;</span><span class="si">:</span><span class="s2">^</span><span class="si">{</span><span class="n">mws</span><span class="si">}}</span><span class="s2">|</span><span class="si">{</span><span class="s1">&#39;Max&#39;</span><span class="si">:</span><span class="s2">^</span><span class="si">{</span><span class="n">mws</span><span class="si">}}</span><span class="s2">|&quot;</span>
+                <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="s1">&#39;Name&#39;</span><span class="si">:</span><span class="s2">^</span><span class="si">{</span><span class="n">max_name_width</span><span class="si">}}</span><span class="s2">|</span><span class="si">{</span><span class="s1">&#39;Min&#39;</span><span class="si">:</span><span class="s2">^</span><span class="si">{</span><span class="n">max_shape_width</span><span class="si">}}</span><span class="s2">|</span><span class="si">{</span><span class="s1">&#39;Opt&#39;</span><span class="si">:</span><span class="s2">^</span><span class="si">{</span><span class="n">max_shape_width</span><span class="si">}}</span><span class="s2">|</span><span class="si">{</span><span class="s1">&#39;Max&#39;</span><span class="si">:</span><span class="s2">^</span><span class="si">{</span><span class="n">max_shape_width</span><span class="si">}}</span><span class="s2">|&quot;</span>
             <span class="p">)</span>
-            <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="s1">&#39;-&#39;</span><span class="o">*</span><span class="p">(</span><span class="n">mwn</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">mws</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">3</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">4</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="s1">&#39;-&#39;</span><span class="o">*</span><span class="p">(</span><span class="n">max_name_width</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">max_shape_width</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">3</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">4</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
             <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">tensor_name_list</span><span class="p">:</span>
                 <span class="n">item</span> <span class="o">=</span> <span class="n">tid</span><span class="p">[</span><span class="n">name</span><span class="p">]</span>
-                <span class="n">info</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">name</span><span class="si">:</span><span class="s2">&lt;</span><span class="si">{</span><span class="n">mwn</span><span class="si">}}</span><span class="s2">|&quot;</span>
-                <span class="n">info</span> <span class="o">+=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">item</span><span class="p">[</span><span class="s1">&#39;profile_list&#39;</span><span class="p">][</span><span class="n">k</span><span class="p">][</span><span class="mi">0</span><span class="p">])</span><span class="si">:</span><span class="s2">^</span><span class="si">{</span><span class="n">mws</span><span class="si">}}</span><span class="s2">|&quot;</span>
-                <span class="n">info</span> <span class="o">+=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">item</span><span class="p">[</span><span class="s1">&#39;profile_list&#39;</span><span class="p">][</span><span class="n">k</span><span class="p">][</span><span class="mi">1</span><span class="p">])</span><span class="si">:</span><span class="s2">^</span><span class="si">{</span><span class="n">mws</span><span class="si">}}</span><span class="s2">|&quot;</span>
-                <span class="n">info</span> <span class="o">+=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">item</span><span class="p">[</span><span class="s1">&#39;profile_list&#39;</span><span class="p">][</span><span class="n">k</span><span class="p">][</span><span class="mi">2</span><span class="p">])</span><span class="si">:</span><span class="s2">^</span><span class="si">{</span><span class="n">mws</span><span class="si">}}</span><span class="s2">|&quot;</span>
+                <span class="n">info</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">name</span><span class="si">:</span><span class="s2">&lt;</span><span class="si">{</span><span class="n">max_name_width</span><span class="si">}}</span><span class="s2">|&quot;</span>
+                <span class="n">info</span> <span class="o">+=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">item</span><span class="p">[</span><span class="s1">&#39;profile_list&#39;</span><span class="p">][</span><span class="n">k</span><span class="p">][</span><span class="mi">0</span><span class="p">])</span><span class="si">:</span><span class="s2">^</span><span class="si">{</span><span class="n">max_shape_width</span><span class="si">}}</span><span class="s2">|&quot;</span>
+                <span class="n">info</span> <span class="o">+=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">item</span><span class="p">[</span><span class="s1">&#39;profile_list&#39;</span><span class="p">][</span><span class="n">k</span><span class="p">][</span><span class="mi">1</span><span class="p">])</span><span class="si">:</span><span class="s2">^</span><span class="si">{</span><span class="n">max_shape_width</span><span class="si">}}</span><span class="s2">|&quot;</span>
+                <span class="n">info</span> <span class="o">+=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">item</span><span class="p">[</span><span class="s1">&#39;profile_list&#39;</span><span class="p">][</span><span class="n">k</span><span class="p">][</span><span class="mi">2</span><span class="p">])</span><span class="si">:</span><span class="s2">^</span><span class="si">{</span><span class="n">max_shape_width</span><span class="si">}}</span><span class="s2">|&quot;</span>
                 <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="n">info</span><span class="p">)</span>
-            <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="s1">&#39;=&#39;</span><span class="o">*</span><span class="p">(</span><span class="n">mwn</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">mws</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">3</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">4</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="s1">&#39;=&#39;</span><span class="o">*</span><span class="p">(</span><span class="n">max_name_width</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">max_shape_width</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">3</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">4</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+    <span class="k">def</span> <span class="nf">print_context_info</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">context</span><span class="p">,</span> <span class="n">context_index</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">n_io</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">engine</span><span class="o">.</span><span class="n">num_io_tensors</span>
+        <span class="n">max_name_width</span> <span class="o">=</span> <span class="mi">0</span>  <span class="c1"># Maximum Width of tensor Name</span>
+        <span class="n">max_shape_width</span> <span class="o">=</span> <span class="mi">0</span>  <span class="c1"># Maximum Width of tensor Shape</span>
+        <span class="n">tensorInfo</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n_io</span><span class="p">):</span>
+            <span class="n">name</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">engine</span><span class="o">.</span><span class="n">get_tensor_name</span><span class="p">(</span><span class="n">i</span><span class="p">)</span>
+            <span class="n">b_input</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">engine</span><span class="o">.</span><span class="n">get_tensor_mode</span><span class="p">(</span>
+                <span class="n">name</span><span class="p">)</span> <span class="o">==</span> <span class="n">trt</span><span class="o">.</span><span class="n">TensorIOMode</span><span class="o">.</span><span class="n">INPUT</span>
+            <span class="n">shape</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">engine</span><span class="o">.</span><span class="n">get_tensor_shape</span><span class="p">(</span><span class="n">name</span><span class="p">))</span>
+            <span class="n">tensorInfo</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="p">[</span><span class="n">name</span><span class="p">,</span> <span class="n">b_input</span><span class="p">,</span> <span class="n">shape</span><span class="p">]</span>
+            <span class="n">max_name_width</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">max_name_width</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">name</span><span class="p">))</span>
+            <span class="n">max_shape_width</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">max_shape_width</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">shape</span><span class="p">))</span>
+            <span class="c1"># Shape input tensor is not used in TRT-LLM yet</span>
+
+        <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Information of context input / output.&quot;</span><span class="p">)</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Using Optimization Profile: </span><span class="si">{</span><span class="n">context_index</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="s1">&#39;=&#39;</span><span class="o">*</span><span class="p">(</span><span class="n">max_name_width</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">max_shape_width</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">6</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="s1">&#39;Name&#39;</span><span class="si">:</span><span class="s2">^</span><span class="si">{</span><span class="n">max_name_width</span><span class="si">}}</span><span class="s2">|I/O|</span><span class="si">{</span><span class="s1">&#39;Shape&#39;</span><span class="si">:</span><span class="s2">^</span><span class="si">{</span><span class="n">max_shape_width</span><span class="si">}}</span><span class="s2">|&quot;</span><span class="p">)</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="s1">&#39;-&#39;</span><span class="o">*</span><span class="p">(</span><span class="n">max_name_width</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">max_shape_width</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">6</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n_io</span><span class="p">):</span>
+            <span class="n">name</span><span class="p">,</span> <span class="n">b_input</span><span class="p">,</span> <span class="n">shape</span> <span class="o">=</span> <span class="n">tensorInfo</span><span class="p">[</span><span class="n">i</span><span class="p">]</span>
+            <span class="n">info</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">name</span><span class="si">:</span><span class="s2">&lt;</span><span class="si">{</span><span class="n">max_name_width</span><span class="si">}}</span><span class="s2">|</span><span class="si">{</span><span class="s1">&#39;I&#39;</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">b_input</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="s1">&#39;O&#39;</span><span class="si">:</span><span class="s2">^3s</span><span class="si">}</span><span class="s2">|</span><span class="si">{</span><span class="n">shape</span><span class="si">:</span><span class="s2">^</span><span class="si">{</span><span class="n">max_shape_width</span><span class="si">}}</span><span class="s2">|&quot;</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="n">info</span><span class="p">)</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="s1">&#39;=&#39;</span><span class="o">*</span><span class="p">(</span><span class="n">max_name_width</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">max_shape_width</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">6</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
 
     <span class="k">def</span> <span class="nf">_set_shape</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">context</span><span class="p">:</span> <span class="n">trt</span><span class="o">.</span><span class="n">IExecutionContext</span><span class="p">,</span>
                    <span class="n">shape_dict</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]):</span>
@@ -745,6 +775,7 @@
     <span class="n">num_kv_heads</span><span class="p">:</span> <span class="nb">int</span>
     <span class="n">hidden_size</span><span class="p">:</span> <span class="nb">int</span>
     <span class="n">gpt_attention_plugin</span><span class="p">:</span> <span class="nb">bool</span>
+    <span class="n">gemm_allreduce_plugin</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">remove_input_padding</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="n">model_name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span>
     <span class="n">kv_cache_type</span><span class="p">:</span> <span class="n">KVCacheType</span> <span class="o">=</span> <span class="n">KVCacheType</span><span class="o">.</span><span class="n">CONTINUOUS</span>
@@ -752,7 +783,7 @@
     <span class="n">head_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">has_position_embedding</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="n">has_token_type_embedding</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
-    <span class="n">tokens_per_block</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">64</span>
+    <span class="n">tokens_per_block</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">32</span>
     <span class="n">max_prompt_embedding_table_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="n">quant_mode</span><span class="p">:</span> <span class="n">QuantMode</span> <span class="o">=</span> <span class="n">QuantMode</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
     <span class="n">gather_context_logits</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
@@ -826,6 +857,7 @@
     <span class="n">output_log_probs</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
     <span class="n">no_repeat_ngram_size</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                                                            <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
+    <span class="n">min_p</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="nb">float</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="mf">0.0</span><span class="p">)</span>
 
 <div class="viewcode-block" id="SamplingConfig.update">
 <a class="viewcode-back" href="../../../python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.SamplingConfig.update">[docs]</a>
@@ -899,6 +931,19 @@
         <span class="c1"># this is useful when allocating a big KV cache tensor at the beginning and incremental seq length dim of TRT engine&#39;s input tensor</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_shape</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_torch_tensor</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="c1"># Used when pointer specified</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_data_ptr</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_dtype</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span> <span class="nf">from_pointer</span><span class="p">(</span><span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">pointer</span><span class="p">,</span> <span class="n">shape</span><span class="p">,</span>
+                     <span class="n">str_dtype</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;RuntimeTensor&#39;</span><span class="p">:</span>
+        <span class="n">t</span> <span class="o">=</span> <span class="n">RuntimeTensor</span><span class="p">()</span>
+        <span class="n">t</span><span class="o">.</span><span class="n">_name</span> <span class="o">=</span> <span class="n">name</span>
+        <span class="n">t</span><span class="o">.</span><span class="n">_data_ptr</span> <span class="o">=</span> <span class="n">pointer</span>
+        <span class="n">t</span><span class="o">.</span><span class="n">_shape</span> <span class="o">=</span> <span class="n">shape</span>
+        <span class="n">t</span><span class="o">.</span><span class="n">_dtype</span> <span class="o">=</span> <span class="n">str_dtype_to_torch</span><span class="p">(</span><span class="n">str_dtype</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">t</span>
 
     <span class="nd">@staticmethod</span>
     <span class="k">def</span> <span class="nf">from_torch</span><span class="p">(</span>
@@ -910,6 +955,8 @@
         <span class="n">t</span><span class="o">.</span><span class="n">_name</span> <span class="o">=</span> <span class="n">name</span>
         <span class="c1"># need to hold the torch tensor for memory life time</span>
         <span class="n">t</span><span class="o">.</span><span class="n">_torch_tensor</span> <span class="o">=</span> <span class="n">data</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+        <span class="n">t</span><span class="o">.</span><span class="n">_dtype</span> <span class="o">=</span> <span class="n">t</span><span class="o">.</span><span class="n">_torch_tensor</span><span class="o">.</span><span class="n">dtype</span>
+        <span class="n">t</span><span class="o">.</span><span class="n">_data_ptr</span> <span class="o">=</span> <span class="n">t</span><span class="o">.</span><span class="n">_torch_tensor</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">()</span>
         <span class="n">torch_shape</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">data</span><span class="o">.</span><span class="n">size</span><span class="p">())</span>
         <span class="k">if</span> <span class="n">override_shape</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">t</span><span class="o">.</span><span class="n">_shape</span> <span class="o">=</span> <span class="n">override_shape</span>
@@ -927,6 +974,10 @@
         <span class="k">return</span> <span class="n">t</span>
 
     <span class="k">def</span> <span class="nf">to_torch</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_torch_tensor</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+                <span class="s1">&#39;RuntimeTensor cannot be converted to torch tensor as constructed from pointer&#39;</span>
+            <span class="p">)</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_torch_tensor</span>
 
     <span class="nd">@property</span>
@@ -935,7 +986,7 @@
 
     <span class="nd">@property</span>
     <span class="k">def</span> <span class="nf">data</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_torch_tensor</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">()</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_data_ptr</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span> <span class="nf">name</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
@@ -943,7 +994,7 @@
 
     <span class="nd">@property</span>
     <span class="k">def</span> <span class="nf">dtype</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span><span class="p">:</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_torch_tensor</span><span class="o">.</span><span class="n">dtype</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_dtype</span>
 
 
 <div class="viewcode-block" id="GenerationSession">
@@ -1061,15 +1112,26 @@
                 <span class="bp">self</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">vocab_size_padded</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">pp_size</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">decoder_logits_dtype</span><span class="p">)</span>
 
+        <span class="n">expected_tensor_names</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">ipc_buffers</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">all_reduce_workspace</span> <span class="o">=</span> <span class="n">CustomAllReduceHelper</span><span class="o">.</span><span class="n">allocate_workspace</span><span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="p">,</span>
                 <span class="n">CustomAllReduceHelper</span><span class="o">.</span><span class="n">max_workspace_size_auto</span><span class="p">(</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">))</span>
 
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_gemm_allreduce_plugin</span><span class="p">:</span>
+                <span class="c1"># XXX (xsimmons): this is a bit hacky as it assumes</span>
+                <span class="c1"># 2x RowLinear layers per attention block.</span>
+                <span class="c1"># This will be fixed soon when I remove coupling between model</span>
+                <span class="c1"># and runtime.</span>
+                <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">num_attn_layers</span> <span class="o">*</span> <span class="mi">2</span><span class="p">):</span>
+                    <span class="n">expected_tensor_names</span> <span class="o">+=</span> <span class="p">[</span>
+                        <span class="sa">f</span><span class="s1">&#39;gemm_allreduce_uc_out_</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">,</span>
+                        <span class="sa">f</span><span class="s1">&#39;gemm_allreduce_mc_out_</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s1">&#39;</span>
+                    <span class="p">]</span>
+
         <span class="bp">self</span><span class="o">.</span><span class="n">gather_tree</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">tensorrt_llm</span><span class="o">.</span><span class="n">gather_tree</span>
 
-        <span class="n">expected_tensor_names</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_first_pp_rank</span><span class="p">():</span>
             <span class="n">expected_tensor_names</span> <span class="o">+=</span> <span class="p">[</span><span class="s1">&#39;input_ids&#39;</span><span class="p">]</span>
         <span class="k">else</span><span class="p">:</span>
@@ -1241,6 +1303,14 @@
             <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Debug tensors found: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">debug_tensors</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
             <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Debug tensors to save: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">debug_tensors_to_save</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
 
+    <span class="k">def</span> <span class="fm">__del__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_gemm_allreduce_plugin</span><span class="p">:</span>
+                <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">gemm_allreduce_output_handle</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+                <span class="n">ipc_nvls_free</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">gemm_allreduce_output_handle</span><span class="p">)</span>
+        <span class="k">except</span> <span class="ne">TypeError</span><span class="p">:</span>
+            <span class="k">pass</span>
+
     <span class="nd">@property</span>
     <span class="k">def</span> <span class="nf">context_mem_size</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">runtime</span><span class="o">.</span><span class="n">context_mem_size</span>
@@ -1269,6 +1339,7 @@
 
     <span class="nd">@property</span>
     <span class="k">def</span> <span class="nf">hidden_size</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="c1"># For linear layer in attention block</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_model_config</span><span class="o">.</span><span class="n">hidden_size</span>
 
     <span class="nd">@property</span>
@@ -1383,6 +1454,14 @@
     <span class="nd">@property</span>
     <span class="k">def</span> <span class="nf">use_lora_plugin</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_model_config</span><span class="o">.</span><span class="n">lora_plugin</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span> <span class="nf">use_gemm_allreduce_plugin</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">return</span> <span class="nb">bool</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_model_config</span><span class="o">.</span><span class="n">gemm_allreduce_plugin</span><span class="p">)</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span> <span class="nf">gemm_allreduce_plugin</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_model_config</span><span class="o">.</span><span class="n">gemm_allreduce_plugin</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span> <span class="nf">is_medusa_mode</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
@@ -1598,16 +1677,41 @@
         <span class="k">else</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">no_repeat_ngram_size</span> <span class="o">=</span> <span class="kc">None</span>
 
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">scfg</span><span class="o">.</span><span class="n">min_p</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">):</span>
+            <span class="k">assert</span> <span class="n">scfg</span><span class="o">.</span><span class="n">min_p</span><span class="o">.</span><span class="n">dtype</span> <span class="o">==</span> <span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;scfg.min_p.dtype (</span><span class="si">{</span><span class="n">scfg</span><span class="o">.</span><span class="n">min_p</span><span class="o">.</span><span class="n">dtype</span><span class="si">}</span><span class="s2">) must be torch.float32&quot;</span>
+            <span class="k">assert</span> <span class="n">scfg</span><span class="o">.</span><span class="n">min_p</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span>
+                <span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="n">batch_size</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;scfg.min_p.shape[0] (</span><span class="si">{</span><span class="n">scfg</span><span class="o">.</span><span class="n">min_p</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="si">}</span><span class="s2">) must equal to batch_size (</span><span class="si">{</span><span class="n">batch_size</span><span class="si">}</span><span class="s2">)&quot;</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">min_p</span> <span class="o">=</span> <span class="n">scfg</span><span class="o">.</span><span class="n">min_p</span>
+        <span class="k">elif</span> <span class="n">scfg</span><span class="o">.</span><span class="n">min_p</span> <span class="o">==</span> <span class="mf">1.0</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">min_p</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">min_p</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">full</span><span class="p">([</span><span class="n">batch_size</span><span class="p">],</span>
+                                    <span class="n">scfg</span><span class="o">.</span><span class="n">min_p</span><span class="p">,</span>
+                                    <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_last_pp_rank</span><span class="p">():</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">dynamic_decoder</span><span class="o">.</span><span class="n">setup</span><span class="p">(</span>
-                <span class="n">batch_size</span><span class="p">,</span> <span class="n">scfg</span><span class="o">.</span><span class="n">num_beams</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">top_k</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">top_p</span><span class="p">,</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">temperature</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">repetition_penalty</span><span class="p">,</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">presence_penalty</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">frequency_penalty</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">min_length</span><span class="p">,</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">host_length_penalty</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">host_early_stopping</span><span class="p">,</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">beam_search_diversity_rate</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">random_seed</span><span class="p">,</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">top_p_decay</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">top_p_min</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">top_p_reset_ids</span><span class="p">,</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">no_repeat_ngram_size</span><span class="p">,</span> <span class="n">scfg</span><span class="o">.</span><span class="n">output_log_probs</span><span class="p">,</span>
-                <span class="n">scfg</span><span class="o">.</span><span class="n">num_beams</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="ow">or</span> <span class="n">scfg</span><span class="o">.</span><span class="n">output_cum_log_probs</span><span class="p">)</span>
+                <span class="n">batch_size</span><span class="p">,</span>
+                <span class="n">scfg</span><span class="o">.</span><span class="n">num_beams</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">top_k</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">top_p</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">temperature</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">repetition_penalty</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">presence_penalty</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">frequency_penalty</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">min_length</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">host_length_penalty</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">host_early_stopping</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">beam_search_diversity_rate</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">random_seed</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">top_p_decay</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">top_p_min</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">top_p_reset_ids</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">no_repeat_ngram_size</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">min_p</span><span class="p">,</span>
+                <span class="n">scfg</span><span class="o">.</span><span class="n">output_log_probs</span><span class="p">,</span>
+                <span class="n">scfg</span><span class="o">.</span><span class="n">num_beams</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="ow">or</span> <span class="n">scfg</span><span class="o">.</span><span class="n">output_cum_log_probs</span><span class="p">,</span>
+            <span class="p">)</span>
 
         <span class="k">assert</span> <span class="n">scfg</span><span class="o">.</span><span class="n">end_id</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;end_id cannot be none&quot;</span>
         <span class="k">assert</span> <span class="n">scfg</span><span class="o">.</span><span class="n">pad_id</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s1">&#39;pad_id cannot be none&#39;</span>
@@ -2034,6 +2138,7 @@
                         <span class="n">kv_cache_type</span><span class="p">,</span> <span class="n">num_kv_heads_per_cross_attn_layer</span><span class="p">)</span>
 
             <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">has_attn_layers</span><span class="p">:</span>
+
                 <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">first_layer</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">last_layer</span><span class="p">):</span>
                     <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">layer_types</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">==</span> <span class="s1">&#39;attention&#39;</span><span class="p">:</span>
                         <span class="n">cache_shape</span> <span class="o">=</span> <span class="p">(</span>
@@ -2144,6 +2249,18 @@
                     <span class="bp">self</span><span class="o">.</span><span class="n">_model_config</span><span class="o">.</span><span class="n">num_layers</span><span class="p">,</span>
                 <span class="p">))</span>
 
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_gemm_allreduce_plugin</span><span class="p">:</span>
+            <span class="n">max_num_tokens</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">batch_size</span> <span class="o">*</span> <span class="n">beam_width</span><span class="p">,</span>
+                                 <span class="n">batch_size</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_seq_length</span><span class="p">)</span>
+            <span class="n">M</span> <span class="o">=</span> <span class="n">max_num_tokens</span>
+            <span class="n">N</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">gemm_allreduce_output_size</span> <span class="o">=</span> <span class="n">M</span> <span class="o">*</span> <span class="n">N</span>
+            <span class="n">itemsize</span> <span class="o">=</span> <span class="n">str_dtype_to_torch</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">gemm_allreduce_plugin</span><span class="p">)</span><span class="o">.</span><span class="n">itemsize</span>
+            <span class="n">alloc_bytes</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">gemm_allreduce_output_size</span> <span class="o">*</span> <span class="n">itemsize</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">gemm_allreduce_output_handle</span> <span class="o">=</span> <span class="n">ipc_nvls_allocate</span><span class="p">(</span>
+                <span class="n">alloc_bytes</span><span class="p">,</span> <span class="nb">set</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_group</span><span class="p">))</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s1">&#39;Allocated NVLS IPC memory: </span><span class="si">{</span><span class="n">alloc_bytes</span><span class="si">}</span><span class="s1"> bytes&#39;</span><span class="p">)</span>
+
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_medusa_mode</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">buffer</span><span class="p">[</span>
                 <span class="s1">&#39;spec_decoding_packed_mask&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">spec_decoding_packed_mask</span>
@@ -2222,6 +2339,12 @@
 
         <span class="k">def</span> <span class="nf">sym</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">name</span><span class="p">):</span>
             <span class="k">return</span> <span class="n">RuntimeTensor</span><span class="o">.</span><span class="n">from_torch</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">x</span><span class="p">)</span>
+
+        <span class="k">def</span> <span class="nf">add_tensor_from_pointer</span><span class="p">(</span><span class="n">pointer</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">shape</span><span class="p">,</span> <span class="n">str_dtype</span><span class="p">):</span>
+            <span class="k">return</span> <span class="n">tensors</span><span class="o">.</span><span class="n">update</span><span class="p">({</span>
+                <span class="n">name</span><span class="p">:</span>
+                <span class="n">RuntimeTensor</span><span class="o">.</span><span class="n">from_pointer</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">pointer</span><span class="p">,</span> <span class="n">shape</span><span class="p">,</span> <span class="n">str_dtype</span><span class="p">)</span>
+            <span class="p">})</span>
 
         <span class="k">def</span> <span class="nf">add_tensor</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">name</span><span class="p">):</span>
             <span class="k">return</span> <span class="n">tensors</span><span class="o">.</span><span class="n">update</span><span class="p">({</span><span class="n">name</span><span class="p">:</span> <span class="n">sym</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">name</span><span class="p">)})</span>
@@ -2485,6 +2608,26 @@
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
             <span class="n">add_tensor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">all_reduce_workspace</span><span class="p">,</span> <span class="s1">&#39;all_reduce_workspace&#39;</span><span class="p">)</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_gemm_allreduce_plugin</span><span class="p">:</span>
+                <span class="c1"># bind pointers to symbolic tensors</span>
+                <span class="n">idx</span> <span class="o">=</span> <span class="mi">0</span>
+                <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">num_attn_layers</span><span class="p">):</span>
+                    <span class="c1"># XXX (xsimmons): this is a bit hacky as it assumes</span>
+                    <span class="c1"># 2x RowLinear layers per attention block.</span>
+                    <span class="c1"># This will be fixed soon when I remove coupling between model</span>
+                    <span class="c1"># and runtime.</span>
+                    <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">2</span><span class="p">):</span>
+                        <span class="n">add_tensor_from_pointer</span><span class="p">(</span>
+                            <span class="bp">self</span><span class="o">.</span><span class="n">gemm_allreduce_output_handle</span><span class="o">.</span><span class="n">uc_ptr</span><span class="p">,</span>
+                            <span class="sa">f</span><span class="s1">&#39;gemm_allreduce_uc_out_</span><span class="si">{</span><span class="n">idx</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">,</span>
+                            <span class="n">shape</span><span class="o">=</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">gemm_allreduce_output_size</span><span class="p">),</span>
+                            <span class="n">str_dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">gemm_allreduce_plugin</span><span class="p">)</span>
+                        <span class="n">add_tensor_from_pointer</span><span class="p">(</span>
+                            <span class="bp">self</span><span class="o">.</span><span class="n">gemm_allreduce_output_handle</span><span class="o">.</span><span class="n">mc_ptr</span><span class="p">,</span>
+                            <span class="sa">f</span><span class="s1">&#39;gemm_allreduce_mc_out_</span><span class="si">{</span><span class="n">idx</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">,</span>
+                            <span class="n">shape</span><span class="o">=</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">gemm_allreduce_output_size</span><span class="p">),</span>
+                            <span class="n">str_dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">gemm_allreduce_plugin</span><span class="p">)</span>
+                        <span class="n">idx</span> <span class="o">+=</span> <span class="mi">1</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_lora_plugin</span><span class="p">:</span>
             <span class="k">for</span> <span class="n">idx</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">num_layers</span><span class="p">):</span>
@@ -2539,6 +2682,12 @@
     <span class="p">):</span>
         <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">nvtx</span><span class="o">.</span><span class="n">range_push</span><span class="p">(</span><span class="s2">&quot;_get_next_step_shape_buffer&quot;</span><span class="p">)</span>
         <span class="n">tensors</span> <span class="o">=</span> <span class="p">{}</span>  <span class="c1"># Dict[str, RuntimeTensor]</span>
+
+        <span class="k">def</span> <span class="nf">add_tensor_from_pointer</span><span class="p">(</span><span class="n">pointer</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">shape</span><span class="p">,</span> <span class="n">str_dtype</span><span class="p">):</span>
+            <span class="k">return</span> <span class="n">tensors</span><span class="o">.</span><span class="n">update</span><span class="p">({</span>
+                <span class="n">name</span><span class="p">:</span>
+                <span class="n">RuntimeTensor</span><span class="o">.</span><span class="n">from_pointer</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">pointer</span><span class="p">,</span> <span class="n">shape</span><span class="p">,</span> <span class="n">str_dtype</span><span class="p">)</span>
+            <span class="p">})</span>
 
         <span class="k">def</span> <span class="nf">sym</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">name</span><span class="p">):</span>
             <span class="k">return</span> <span class="n">RuntimeTensor</span><span class="o">.</span><span class="n">from_torch</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">x</span><span class="p">)</span>
@@ -2825,6 +2974,27 @@
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
             <span class="n">add_tensor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">all_reduce_workspace</span><span class="p">,</span> <span class="s1">&#39;all_reduce_workspace&#39;</span><span class="p">)</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_gemm_allreduce_plugin</span><span class="p">:</span>
+                <span class="c1"># bind pointers to symbolic tensors</span>
+                <span class="n">idx</span> <span class="o">=</span> <span class="mi">0</span>
+                <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">num_attn_layers</span><span class="p">):</span>
+                    <span class="c1"># XXX (xsimmons): this is very hacky as it makes</span>
+                    <span class="c1"># an assumption about having 2x RowLinear layers</span>
+                    <span class="c1"># per attention block. The design doesn&#39;t provide</span>
+                    <span class="c1"># an way to determine which layers use RowLinear</span>
+                    <span class="c1"># without a lot of surgery</span>
+                    <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">2</span><span class="p">):</span>
+                        <span class="n">add_tensor_from_pointer</span><span class="p">(</span>
+                            <span class="bp">self</span><span class="o">.</span><span class="n">gemm_allreduce_output_handle</span><span class="o">.</span><span class="n">uc_ptr</span><span class="p">,</span>
+                            <span class="sa">f</span><span class="s1">&#39;gemm_allreduce_uc_out_</span><span class="si">{</span><span class="n">idx</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">,</span>
+                            <span class="n">shape</span><span class="o">=</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">gemm_allreduce_output_size</span><span class="p">),</span>
+                            <span class="n">str_dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">gemm_allreduce_plugin</span><span class="p">)</span>
+                        <span class="n">add_tensor_from_pointer</span><span class="p">(</span>
+                            <span class="bp">self</span><span class="o">.</span><span class="n">gemm_allreduce_output_handle</span><span class="o">.</span><span class="n">mc_ptr</span><span class="p">,</span>
+                            <span class="sa">f</span><span class="s1">&#39;gemm_allreduce_mc_out_</span><span class="si">{</span><span class="n">idx</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">,</span>
+                            <span class="n">shape</span><span class="o">=</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">gemm_allreduce_output_size</span><span class="p">),</span>
+                            <span class="n">str_dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">gemm_allreduce_plugin</span><span class="p">)</span>
+                        <span class="n">idx</span> <span class="o">+=</span> <span class="mi">1</span>
 
         <span class="c1"># Since we are using a ping-pong context design and the lora weight remains constant within the same request,</span>
         <span class="c1"># it is only necessary to set the lora weight for the first two steps.</span>
@@ -3519,6 +3689,7 @@
         <span class="n">encoder_input_lengths</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
         <span class="n">stopping_criteria</span><span class="p">:</span> <span class="n">StoppingCriteria</span><span class="p">,</span>
         <span class="n">logits_processor</span><span class="p">:</span> <span class="n">LogitsProcessor</span><span class="p">,</span>
+        <span class="n">output_generation_logits</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
         <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">debug_mode</span><span class="p">:</span>
@@ -3702,7 +3873,7 @@
 
         <span class="n">generation_logits</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_last_pp_rank</span><span class="p">():</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">gather_generation_logits</span><span class="p">:</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">gather_generation_logits</span> <span class="ow">or</span> <span class="n">output_generation_logits</span><span class="p">:</span>
                 <span class="n">generation_logits</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">buffer</span><span class="p">[</span><span class="s1">&#39;logits&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
 
         <span class="c1"># Initialize sequence_lengths (no paddings) for the generation phase.</span>
@@ -3825,6 +3996,10 @@
             <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">nvtx</span><span class="o">.</span><span class="n">range_push</span><span class="p">(</span><span class="s2">&quot;_set_tensors&quot;</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">runtime</span><span class="o">.</span><span class="n">_set_tensors</span><span class="p">(</span><span class="n">next_context</span><span class="p">,</span> <span class="n">next_step_tensors</span><span class="p">)</span>
             <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">nvtx</span><span class="o">.</span><span class="n">range_pop</span><span class="p">()</span>
+
+            <span class="k">if</span> <span class="n">logger</span><span class="o">.</span><span class="n">level</span> <span class="o">==</span> <span class="s2">&quot;verbose&quot;</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">runtime</span><span class="o">.</span><span class="n">print_context_info</span><span class="p">(</span>
+                    <span class="n">next_context</span><span class="p">,</span> <span class="nb">int</span><span class="p">(</span><span class="n">next_context</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">runtime</span><span class="o">.</span><span class="n">context_1</span><span class="p">))</span>
 
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">cuda_graph_mode</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_capture_cuda_graph_and_instantiate</span><span class="p">(</span>
@@ -3985,6 +4160,7 @@
                        <span class="n">stop_words_data</span><span class="p">,</span>
                        <span class="n">bad_words_data</span><span class="p">,</span>
                        <span class="n">output_sequence_lengths</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+                       <span class="n">output_generation_logits</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
                        <span class="n">return_dict</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
                        <span class="n">encoder_output</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                        <span class="n">encoder_input_lengths</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -4013,7 +4189,7 @@
                         <span class="p">[</span><span class="n">batch_size</span><span class="p">,</span> <span class="n">beam_width</span><span class="p">])</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">gather_context_logits</span><span class="p">:</span>
                 <span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;context_logits&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">outputs_context_logits</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">gather_generation_logits</span><span class="p">:</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">gather_generation_logits</span> <span class="ow">or</span> <span class="n">output_generation_logits</span><span class="p">:</span>
                 <span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;generation_logits&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">outputs_generation_logits</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_medusa_mode</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_redrafter_mode</span><span class="p">:</span>
                 <span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;steps_to_finish&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">num_steps</span>
@@ -4088,6 +4264,7 @@
                 <span class="n">encoder_input_lengths</span><span class="o">=</span><span class="n">encoder_input_lengths</span><span class="p">,</span>
                 <span class="n">stopping_criteria</span><span class="o">=</span><span class="n">stopping_criteria</span><span class="p">,</span>
                 <span class="n">logits_processor</span><span class="o">=</span><span class="n">logits_processor</span><span class="p">,</span>
+                <span class="n">output_generation_logits</span><span class="o">=</span><span class="n">output_generation_logits</span><span class="p">,</span>
                 <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
             <span class="p">)</span>
             <span class="k">if</span> <span class="n">step</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
@@ -4099,7 +4276,7 @@
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_last_pp_rank</span><span class="p">():</span>
                 <span class="k">if</span> <span class="n">step</span> <span class="o">==</span> <span class="mi">0</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">gather_context_logits</span><span class="p">:</span>
                     <span class="n">outputs_context_logits</span> <span class="o">=</span> <span class="n">context_logits</span>
-                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">gather_generation_logits</span><span class="p">:</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">gather_generation_logits</span> <span class="ow">or</span> <span class="n">output_generation_logits</span><span class="p">:</span>
                     <span class="n">outputs_generation_logits</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">generation_logits</span><span class="p">)</span>
 
             <span class="k">if</span> <span class="n">should_stop</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">should_stop</span><span class="o">.</span><span class="n">item</span><span class="p">():</span>
@@ -4123,7 +4300,7 @@
                     <span class="n">outputs</span> <span class="o">=</span> <span class="p">{}</span>
                     <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">gather_context_logits</span><span class="p">:</span>
                         <span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;context_logits&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">outputs_context_logits</span>
-                    <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">gather_generation_logits</span><span class="p">:</span>
+                    <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">gather_generation_logits</span> <span class="ow">or</span> <span class="n">output_generation_logits</span><span class="p">:</span>
                         <span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;generation_logits&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">outputs_generation_logits</span>
                     <span class="k">return</span> <span class="n">outputs</span>
                 <span class="k">else</span><span class="p">:</span>
@@ -4144,7 +4321,7 @@
             <span class="n">outputs</span> <span class="o">=</span> <span class="p">{}</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">gather_context_logits</span><span class="p">:</span>
                 <span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;context_logits&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">outputs_context_logits</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">gather_generation_logits</span><span class="p">:</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">gather_generation_logits</span> <span class="ow">or</span> <span class="n">output_generation_logits</span><span class="p">:</span>
                 <span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;generation_logits&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">outputs_generation_logits</span>
             <span class="k">return</span> <span class="n">outputs</span>
         <span class="k">else</span><span class="p">:</span>
@@ -4173,6 +4350,7 @@
                       <span class="n">stop_words_data</span><span class="p">,</span>
                       <span class="n">bad_words_data</span><span class="p">,</span>
                       <span class="n">output_sequence_lengths</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+                      <span class="n">output_generation_logits</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
                       <span class="n">return_dict</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
                       <span class="n">encoder_output</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                       <span class="n">encoder_input_lengths</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -4241,6 +4419,7 @@
                 <span class="n">encoder_input_lengths</span><span class="o">=</span><span class="n">encoder_input_lengths</span><span class="p">,</span>
                 <span class="n">stopping_criteria</span><span class="o">=</span><span class="n">stopping_criteria</span><span class="p">,</span>
                 <span class="n">logits_processor</span><span class="o">=</span><span class="n">logits_processor</span><span class="p">,</span>
+                <span class="n">output_generation_logits</span><span class="o">=</span><span class="n">output_generation_logits</span><span class="p">,</span>
             <span class="p">)</span>
             <span class="k">if</span> <span class="n">step</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
                 <span class="n">outputs_context_logits</span> <span class="o">=</span> <span class="n">context_logits</span>
@@ -4305,6 +4484,7 @@
                <span class="n">bad_words_list</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                <span class="n">streaming</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
                <span class="n">output_sequence_lengths</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+               <span class="n">output_generation_logits</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
                <span class="n">return_dict</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
                <span class="n">encoder_output</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                <span class="n">encoder_input_lengths</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -4514,6 +4694,7 @@
                 <span class="n">prompt_vocab_size</span><span class="o">=</span><span class="n">prompt_vocab_size</span><span class="p">,</span>
                 <span class="n">ite</span><span class="o">=</span><span class="n">ite</span><span class="p">,</span>
                 <span class="n">sequence_limit_lengths</span><span class="o">=</span><span class="n">sequence_limit_lengths</span><span class="p">,</span>
+                <span class="n">output_generation_logits</span><span class="o">=</span><span class="n">output_generation_logits</span><span class="p">,</span>
                 <span class="n">stop_words_data</span><span class="o">=</span><span class="n">stop_words_data</span><span class="p">,</span>
                 <span class="n">bad_words_data</span><span class="o">=</span><span class="n">bad_words_data</span><span class="p">,</span>
                 <span class="n">output_sequence_lengths</span><span class="o">=</span><span class="n">output_sequence_lengths</span><span class="p">,</span>
@@ -4545,6 +4726,7 @@
                 <span class="n">stop_words_data</span><span class="o">=</span><span class="n">stop_words_data</span><span class="p">,</span>
                 <span class="n">bad_words_data</span><span class="o">=</span><span class="n">bad_words_data</span><span class="p">,</span>
                 <span class="n">output_sequence_lengths</span><span class="o">=</span><span class="n">output_sequence_lengths</span><span class="p">,</span>
+                <span class="n">output_generation_logits</span><span class="o">=</span><span class="n">output_generation_logits</span><span class="p">,</span>
                 <span class="n">return_dict</span><span class="o">=</span><span class="n">return_dict</span><span class="p">,</span>
                 <span class="n">encoder_output</span><span class="o">=</span><span class="n">encoder_output</span><span class="p">,</span>
                 <span class="n">encoder_input_lengths</span><span class="o">=</span><span class="n">encoder_input_lengths</span><span class="p">,</span>
@@ -4805,7 +4987,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fa258106300>
+<jinja2.runtime.BlockReference object at 0x7f9b7a391610>
 
 <div class="footer">
     <p>

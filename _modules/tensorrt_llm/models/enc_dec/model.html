@@ -14,7 +14,7 @@
       <script src="../../../../_static/jquery.js?v=5d32c60e"></script>
       <script src="../../../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
       <script src="../../../../_static/documentation_options.js?v=5929fcd5"></script>
-      <script src="../../../../_static/doctools.js?v=9a2dae69"></script>
+      <script src="../../../../_static/doctools.js?v=9bcbadda"></script>
       <script src="../../../../_static/sphinx_highlight.js?v=dc90522c"></script>
       <script src="../../../../_static/clipboard.min.js?v=a7894cd8"></script>
       <script src="../../../../_static/copybutton.js?v=65e89d2a"></script>
@@ -203,6 +203,7 @@
 <span class="kn">from</span> <span class="nn">tensorrt_llm.module</span> <span class="kn">import</span> <span class="n">Module</span><span class="p">,</span> <span class="n">ModuleList</span>
 <span class="kn">from</span> <span class="nn">tensorrt_llm.parameter</span> <span class="kn">import</span> <span class="n">Parameter</span>
 <span class="kn">from</span> <span class="nn">tensorrt_llm.plugin.plugin</span> <span class="kn">import</span> <span class="n">current_all_reduce_helper</span>
+<span class="kn">from</span> <span class="nn">tensorrt_llm.quantization</span> <span class="kn">import</span> <span class="n">QuantMode</span>
 
 <span class="n">layernorm_map</span> <span class="o">=</span> <span class="p">{</span>
     <span class="n">LayerNormType</span><span class="o">.</span><span class="n">LayerNorm</span><span class="p">:</span> <span class="n">LayerNorm</span><span class="p">,</span>
@@ -217,7 +218,7 @@
 <span class="p">}</span>
 
 
-<span class="k">class</span> <span class="nc">EncDecEmbedding</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
+<span class="k">class</span> <span class="nc">EncDecTransformer</span><span class="p">(</span><span class="n">Module</span><span class="p">):</span>
 
     <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">vocab_size</span><span class="p">,</span>
@@ -232,26 +233,19 @@
                  <span class="n">dtype</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                  <span class="n">use_parallel_embedding</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                  <span class="n">embedding_sharding_dim</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
-                 <span class="n">mapping</span><span class="o">=</span><span class="n">Mapping</span><span class="p">()):</span>
+                 <span class="n">mapping</span><span class="o">=</span><span class="n">Mapping</span><span class="p">(),</span>
+                 <span class="n">has_model_final_layernorm</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                 <span class="n">norm_epsilon</span><span class="o">=</span><span class="mf">1e-05</span><span class="p">,</span>
+                 <span class="n">is_decoder</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">layernorm_type</span> <span class="o">=</span> <span class="n">layernorm_type</span>
         <span class="n">ln_type</span> <span class="o">=</span> <span class="n">layernorm_map</span><span class="p">[</span><span class="n">layernorm_type</span><span class="p">]</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span> <span class="o">=</span> <span class="n">mapping</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">vocab_embedding</span> <span class="o">=</span> <span class="n">Embedding</span><span class="p">(</span>
-            <span class="n">vocab_size</span><span class="p">,</span>
-            <span class="n">hidden_size</span><span class="p">,</span>
-            <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
-            <span class="n">tp_size</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="k">if</span> <span class="n">use_parallel_embedding</span> <span class="k">else</span> <span class="mi">1</span><span class="p">,</span>
-            <span class="n">tp_group</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_group</span> <span class="k">if</span> <span class="n">use_parallel_embedding</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
-            <span class="n">sharding_dim</span><span class="o">=</span><span class="n">embedding_sharding_dim</span><span class="p">,</span>
-            <span class="n">tp_rank</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_rank</span><span class="p">)</span>
-
-        <span class="bp">self</span><span class="o">.</span><span class="n">position_embedding</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">max_position_embeddings</span> <span class="o">=</span> <span class="n">max_position_embeddings</span>
-        <span class="k">if</span> <span class="n">has_position_embedding</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">position_embedding</span> <span class="o">=</span> <span class="n">Embedding</span><span class="p">(</span>
-                <span class="n">max_position_embeddings</span><span class="p">,</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_first_pp_rank</span><span class="p">():</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">vocab_embedding</span> <span class="o">=</span> <span class="n">Embedding</span><span class="p">(</span>
+                <span class="n">vocab_size</span><span class="p">,</span>
                 <span class="n">hidden_size</span><span class="p">,</span>
                 <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
                 <span class="n">tp_size</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="k">if</span> <span class="n">use_parallel_embedding</span> <span class="k">else</span> <span class="mi">1</span><span class="p">,</span>
@@ -259,39 +253,65 @@
                 <span class="n">sharding_dim</span><span class="o">=</span><span class="n">embedding_sharding_dim</span><span class="p">,</span>
                 <span class="n">tp_rank</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_rank</span><span class="p">)</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">token_type_embedding</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="k">if</span> <span class="n">type_vocab_size</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">token_type_embedding</span> <span class="o">=</span> <span class="n">Embedding</span><span class="p">(</span>
-                <span class="n">type_vocab_size</span><span class="p">,</span>
-                <span class="n">hidden_size</span><span class="p">,</span>
-                <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
-                <span class="n">tp_size</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="k">if</span> <span class="n">use_parallel_embedding</span> <span class="k">else</span> <span class="mi">1</span><span class="p">,</span>
-                <span class="n">tp_group</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_group</span> <span class="k">if</span> <span class="n">use_parallel_embedding</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
-                <span class="n">sharding_dim</span><span class="o">=</span><span class="n">embedding_sharding_dim</span><span class="p">,</span>
-                <span class="n">tp_rank</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_rank</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">position_embedding</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">max_position_embeddings</span> <span class="o">=</span> <span class="n">max_position_embeddings</span>
+            <span class="k">if</span> <span class="n">has_position_embedding</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">position_embedding</span> <span class="o">=</span> <span class="n">Embedding</span><span class="p">(</span>
+                    <span class="n">max_position_embeddings</span><span class="p">,</span>
+                    <span class="n">hidden_size</span><span class="p">,</span>
+                    <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+                    <span class="n">tp_size</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="k">if</span> <span class="n">use_parallel_embedding</span> <span class="k">else</span> <span class="mi">1</span><span class="p">,</span>
+                    <span class="n">tp_group</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_group</span>
+                    <span class="k">if</span> <span class="n">use_parallel_embedding</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
+                    <span class="n">sharding_dim</span><span class="o">=</span><span class="n">embedding_sharding_dim</span><span class="p">,</span>
+                    <span class="n">tp_rank</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_rank</span><span class="p">)</span>
 
-        <span class="c1"># e.g. BART true, T5 false</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">embedding_layernorm</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="k">if</span> <span class="n">has_embedding_layernorm</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">embedding_layernorm</span> <span class="o">=</span> <span class="n">ln_type</span><span class="p">(</span><span class="n">normalized_shape</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
-                                               <span class="n">eps</span><span class="o">=</span><span class="n">layernorm_eps</span><span class="p">,</span>
-                                               <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">token_type_embedding</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="k">if</span> <span class="n">type_vocab_size</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">token_type_embedding</span> <span class="o">=</span> <span class="n">Embedding</span><span class="p">(</span>
+                    <span class="n">type_vocab_size</span><span class="p">,</span>
+                    <span class="n">hidden_size</span><span class="p">,</span>
+                    <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+                    <span class="n">tp_size</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span> <span class="k">if</span> <span class="n">use_parallel_embedding</span> <span class="k">else</span> <span class="mi">1</span><span class="p">,</span>
+                    <span class="n">tp_group</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_group</span>
+                    <span class="k">if</span> <span class="n">use_parallel_embedding</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
+                    <span class="n">sharding_dim</span><span class="o">=</span><span class="n">embedding_sharding_dim</span><span class="p">,</span>
+                    <span class="n">tp_rank</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_rank</span><span class="p">)</span>
 
-        <span class="c1"># e.g. BART true, T5 false</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">embedding_scale</span> <span class="o">=</span> <span class="mf">1.0</span>
-        <span class="k">if</span> <span class="n">has_embedding_scale</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">embedding_scale</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">sqrt</span><span class="p">(</span><span class="n">hidden_size</span><span class="p">)</span>
+            <span class="c1"># e.g. BART true, T5 false</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">ln_embed</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="k">if</span> <span class="n">has_embedding_layernorm</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">ln_embed</span> <span class="o">=</span> <span class="n">ln_type</span><span class="p">(</span><span class="n">normalized_shape</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
+                                        <span class="n">eps</span><span class="o">=</span><span class="n">layernorm_eps</span><span class="p">,</span>
+                                        <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
 
-        <span class="c1"># Note: embedding offset in BART is not considered as a standard. For the specific case,</span>
-        <span class="c1"># we just need to shrink its position embedding table by [offset:] during weight loading</span>
+            <span class="c1"># e.g. BART true, T5 false</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">embedding_scale</span> <span class="o">=</span> <span class="mf">1.0</span>
+            <span class="k">if</span> <span class="n">has_embedding_scale</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">embedding_scale</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">sqrt</span><span class="p">(</span><span class="n">hidden_size</span><span class="p">)</span>
 
-    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
-                <span class="n">input_ids</span><span class="p">,</span>
-                <span class="n">position_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">token_type_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">prompt_embedding_table</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">prompt_tasks</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-                <span class="n">prompt_vocab_size</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+            <span class="c1"># Note: embedding offset in BART is not considered as a standard. For the specific case,</span>
+            <span class="c1"># we just need to shrink its position embedding table by [offset:] during weight loading</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">layers</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">is_decoder</span> <span class="o">=</span> <span class="n">is_decoder</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">has_model_final_layernorm</span> <span class="o">=</span> <span class="n">has_model_final_layernorm</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_last_pp_rank</span><span class="p">():</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">has_model_final_layernorm</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">ln_f</span> <span class="o">=</span> <span class="n">ln_type</span><span class="p">(</span><span class="n">normalized_shape</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
+                                    <span class="n">eps</span><span class="o">=</span><span class="n">norm_epsilon</span><span class="p">,</span>
+                                    <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+
+    <span class="k">def</span> <span class="nf">assign_layers</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">layers</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">layers</span> <span class="o">=</span> <span class="n">layers</span>
+
+    <span class="k">def</span> <span class="nf">embedding</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                  <span class="n">input_ids</span><span class="p">,</span>
+                  <span class="n">position_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                  <span class="n">token_type_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                  <span class="n">prompt_embedding_table</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                  <span class="n">prompt_tasks</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                  <span class="n">prompt_vocab_size</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
         <span class="c1"># position_ids and token_type_ids are provided inputs</span>
         <span class="c1"># and should not be formulated deterministically</span>
 
@@ -308,8 +328,8 @@
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">token_type_embedding</span><span class="p">:</span>
             <span class="n">x</span> <span class="o">=</span> <span class="n">x</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">token_type_embedding</span><span class="p">(</span><span class="n">token_type_ids</span><span class="p">)</span>
 
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">embedding_layernorm</span><span class="p">:</span>
-            <span class="n">x</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">embedding_layernorm</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">ln_embed</span><span class="p">:</span>
+            <span class="n">x</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">ln_embed</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
 
         <span class="k">return</span> <span class="n">x</span>
 
@@ -337,7 +357,8 @@
                  <span class="n">relative_attention</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                  <span class="n">max_distance</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
                  <span class="n">num_buckets</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
-                 <span class="n">fp16_clamping</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
+                 <span class="n">fp16_clamping</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                 <span class="n">quant_mode</span><span class="o">=</span><span class="n">QuantMode</span><span class="p">(</span><span class="mi">0</span><span class="p">)):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
 
         <span class="c1"># e.g. BART regular, T5 RMS</span>
@@ -362,7 +383,8 @@
             <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
             <span class="n">relative_attention</span><span class="o">=</span><span class="n">relative_attention</span><span class="p">,</span>
             <span class="n">max_distance</span><span class="o">=</span><span class="n">max_distance</span><span class="p">,</span>
-            <span class="n">num_buckets</span><span class="o">=</span><span class="n">num_buckets</span><span class="p">)</span>
+            <span class="n">num_buckets</span><span class="o">=</span><span class="n">num_buckets</span><span class="p">,</span>
+            <span class="n">quant_mode</span><span class="o">=</span><span class="n">quant_mode</span><span class="p">)</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">attention_layernorm</span> <span class="o">=</span> <span class="n">ln_type</span><span class="p">(</span><span class="n">normalized_shape</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
                                            <span class="n">eps</span><span class="o">=</span><span class="n">layernorm_eps</span><span class="p">,</span>
@@ -379,6 +401,7 @@
             <span class="n">tp_group</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_group</span><span class="p">,</span>
             <span class="n">tp_size</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
             <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+            <span class="n">quant_mode</span><span class="o">=</span><span class="n">quant_mode</span><span class="p">,</span>
         <span class="p">)</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">mlp_layernorm</span> <span class="o">=</span> <span class="n">ln_type</span><span class="p">(</span><span class="n">normalized_shape</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
@@ -473,7 +496,8 @@
                  <span class="n">num_buckets</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
                  <span class="n">fp16_clamping</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                  <span class="n">skip_cross_kv</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                 <span class="n">use_implicit_relative_attention</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
+                 <span class="n">use_implicit_relative_attention</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                 <span class="n">quant_mode</span><span class="o">=</span><span class="n">QuantMode</span><span class="p">(</span><span class="mi">0</span><span class="p">)):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
 
         <span class="c1"># e.g. BART regular, T5 RMS</span>
@@ -504,7 +528,8 @@
             <span class="n">num_buckets</span><span class="o">=</span><span class="n">num_buckets</span><span class="p">,</span>
             <span class="n">position_embedding_type</span><span class="o">=</span><span class="n">PositionEmbeddingType</span><span class="o">.</span><span class="n">relative</span>
             <span class="k">if</span> <span class="n">relative_attention</span> <span class="k">else</span> <span class="n">PositionEmbeddingType</span><span class="o">.</span><span class="n">learned_absolute</span><span class="p">,</span>
-            <span class="n">use_implicit_relative_attention</span><span class="o">=</span><span class="n">use_implicit_relative_attention</span><span class="p">)</span>
+            <span class="n">use_implicit_relative_attention</span><span class="o">=</span><span class="n">use_implicit_relative_attention</span><span class="p">,</span>
+            <span class="n">quant_mode</span><span class="o">=</span><span class="n">quant_mode</span><span class="p">)</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">self_attention_layernorm</span> <span class="o">=</span> <span class="n">ln_type</span><span class="p">(</span><span class="n">normalized_shape</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
                                                 <span class="n">eps</span><span class="o">=</span><span class="n">layernorm_eps</span><span class="p">,</span>
@@ -537,7 +562,8 @@
             <span class="n">max_distance</span><span class="o">=</span><span class="n">max_distance</span><span class="p">,</span>
             <span class="n">num_buckets</span><span class="o">=</span><span class="n">num_buckets</span><span class="p">,</span>
             <span class="n">position_embedding_type</span><span class="o">=</span><span class="n">PositionEmbeddingType</span><span class="o">.</span><span class="n">learned_absolute</span><span class="p">,</span>
-            <span class="n">skip_cross_kv</span><span class="o">=</span><span class="n">skip_cross_kv</span><span class="p">)</span>
+            <span class="n">skip_cross_kv</span><span class="o">=</span><span class="n">skip_cross_kv</span><span class="p">,</span>
+            <span class="n">quant_mode</span><span class="o">=</span><span class="n">quant_mode</span><span class="p">)</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">cross_attention_layernorm</span> <span class="o">=</span> <span class="n">ln_type</span><span class="p">(</span><span class="n">normalized_shape</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
                                                  <span class="n">eps</span><span class="o">=</span><span class="n">layernorm_eps</span><span class="p">,</span>
@@ -554,6 +580,7 @@
             <span class="n">tp_group</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_group</span><span class="p">,</span>
             <span class="n">tp_size</span><span class="o">=</span><span class="n">mapping</span><span class="o">.</span><span class="n">tp_size</span><span class="p">,</span>
             <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+            <span class="n">quant_mode</span><span class="o">=</span><span class="n">quant_mode</span><span class="p">,</span>
         <span class="p">)</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">mlp_layernorm</span> <span class="o">=</span> <span class="n">ln_type</span><span class="p">(</span><span class="n">normalized_shape</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
@@ -682,7 +709,6 @@
 
         <span class="c1"># e.g. BART regular, T5 RMS</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">layernorm_type</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">layernorm_type</span>
-        <span class="n">ln_type</span> <span class="o">=</span> <span class="n">layernorm_map</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">layernorm_type</span><span class="p">]</span>
 
         <span class="c1"># e.g. BART true, T5 false</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">has_attention_qkvo_bias</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">has_attention_qkvo_bias</span>
@@ -709,23 +735,25 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">mlp_type</span> <span class="o">=</span> <span class="n">MLPType</span><span class="o">.</span><span class="n">MLP</span> <span class="k">if</span> <span class="ow">not</span> <span class="nb">hasattr</span><span class="p">(</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="s2">&quot;mlp_type&quot;</span><span class="p">)</span> <span class="k">else</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">mlp_type</span>
 
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_first_pp_rank</span><span class="p">():</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">embedding</span> <span class="o">=</span> <span class="n">EncDecEmbedding</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
-                <span class="n">max_position_embeddings</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">,</span>
-                <span class="n">has_position_embedding</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">has_position_embedding</span><span class="p">,</span>
-                <span class="n">type_vocab_size</span><span class="o">=</span><span class="n">type_vocab_size</span><span class="p">,</span>
-                <span class="n">has_embedding_layernorm</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">has_embedding_layernorm</span><span class="p">,</span>
-                <span class="n">has_embedding_scale</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">has_embedding_scale</span><span class="p">,</span>
-                <span class="n">layernorm_eps</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">norm_epsilon</span><span class="p">,</span>
-                <span class="n">layernorm_type</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">layernorm_type</span><span class="p">,</span>
-                <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
-                <span class="n">use_parallel_embedding</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">use_parallel_embedding</span><span class="p">,</span>
-                <span class="n">embedding_sharding_dim</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">embedding_sharding_dim</span><span class="p">,</span>
-                <span class="n">mapping</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">transformer</span> <span class="o">=</span> <span class="n">EncDecTransformer</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+            <span class="n">max_position_embeddings</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">,</span>
+            <span class="n">has_position_embedding</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">has_position_embedding</span><span class="p">,</span>
+            <span class="n">type_vocab_size</span><span class="o">=</span><span class="n">type_vocab_size</span><span class="p">,</span>
+            <span class="n">has_embedding_layernorm</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">has_embedding_layernorm</span><span class="p">,</span>
+            <span class="n">has_embedding_scale</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">has_embedding_scale</span><span class="p">,</span>
+            <span class="n">layernorm_eps</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">norm_epsilon</span><span class="p">,</span>
+            <span class="n">layernorm_type</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">layernorm_type</span><span class="p">,</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
+            <span class="n">use_parallel_embedding</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">use_parallel_embedding</span><span class="p">,</span>
+            <span class="n">embedding_sharding_dim</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">embedding_sharding_dim</span><span class="p">,</span>
+            <span class="n">mapping</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="p">,</span>
+            <span class="n">has_model_final_layernorm</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">has_model_final_layernorm</span><span class="p">,</span>
+            <span class="n">norm_epsilon</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">norm_epsilon</span><span class="p">,</span>
+            <span class="n">is_decoder</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">encoder_layers</span> <span class="o">=</span> <span class="n">ModuleList</span><span class="p">([</span>
+        <span class="n">encoder_layers</span> <span class="o">=</span> <span class="n">ModuleList</span><span class="p">([</span>
             <span class="n">EncoderLayer</span><span class="p">(</span>
                 <span class="n">hidden_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
                 <span class="n">ffn_hidden_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">intermediate_size</span><span class="p">,</span>
@@ -749,16 +777,11 @@
                 <span class="n">relative_attention</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">relative_attention</span><span class="p">,</span>
                 <span class="n">max_distance</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">max_distance</span><span class="p">,</span>
                 <span class="n">num_buckets</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">num_buckets</span><span class="p">,</span>
-                <span class="n">fp16_clamping</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">fp16_clamping</span><span class="p">)</span>
+                <span class="n">fp16_clamping</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">fp16_clamping</span><span class="p">,</span>
+                <span class="n">quant_mode</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">quant_mode</span><span class="p">)</span>
             <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">pp_layers</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">total_num_layers</span><span class="p">)</span>
         <span class="p">])</span>
-
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_last_pp_rank</span><span class="p">():</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">has_model_final_layernorm</span><span class="p">:</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">final_layernorm</span> <span class="o">=</span> <span class="n">ln_type</span><span class="p">(</span>
-                    <span class="n">normalized_shape</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
-                    <span class="n">eps</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">norm_epsilon</span><span class="p">,</span>
-                    <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">transformer</span><span class="o">.</span><span class="n">assign_layers</span><span class="p">(</span><span class="n">encoder_layers</span><span class="p">)</span>
 
 <div class="viewcode-block" id="EncoderModel.check_config">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.EncoderModel.check_config">[docs]</a>
@@ -809,14 +832,15 @@
                 <span class="n">prompt_embedding_table</span><span class="p">,</span> <span class="n">prompt_tasks</span><span class="p">,</span> <span class="n">prompt_vocab_size</span>
             <span class="p">]</span> <span class="k">if</span> <span class="n">prompt_embedding_table</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="p">[]</span>
 
-            <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">embedding</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="n">position_ids</span><span class="p">,</span>
-                                           <span class="n">token_type_ids</span><span class="p">,</span> <span class="o">*</span><span class="n">ptuning_args</span><span class="p">)</span>
+            <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">transformer</span><span class="o">.</span><span class="n">embedding</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="n">position_ids</span><span class="p">,</span>
+                                                       <span class="n">token_type_ids</span><span class="p">,</span>
+                                                       <span class="o">*</span><span class="n">ptuning_args</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">register_network_output</span><span class="p">(</span><span class="s1">&#39;embedding_layer_output&#39;</span><span class="p">,</span>
                                          <span class="n">hidden_states</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">recv</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">prev_pp_rank</span><span class="p">())</span>
 
-        <span class="k">for</span> <span class="n">layer_idx</span><span class="p">,</span> <span class="n">encoder_layer</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">encoder_layers</span><span class="p">):</span>
+        <span class="k">for</span> <span class="n">layer_idx</span><span class="p">,</span> <span class="n">encoder_layer</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">transformer</span><span class="o">.</span><span class="n">layers</span><span class="p">):</span>
             <span class="n">lora_layer_params</span> <span class="o">=</span> <span class="kc">None</span>
             <span class="k">if</span> <span class="n">lora_params</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">lora_params</span><span class="o">.</span><span class="n">lora_ranks</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="n">lora_layer_params</span> <span class="o">=</span> <span class="n">lora_params</span><span class="o">.</span><span class="n">get_layer_params</span><span class="p">(</span><span class="n">layer_idx</span><span class="p">)</span>
@@ -828,7 +852,7 @@
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_last_pp_rank</span><span class="p">():</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">has_model_final_layernorm</span><span class="p">:</span>
-                <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">final_layernorm</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+                <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">transformer</span><span class="o">.</span><span class="n">ln_f</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
             <span class="n">hidden_states</span><span class="o">.</span><span class="n">mark_output</span><span class="p">(</span><span class="s1">&#39;encoder_output&#39;</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_dtype</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">send</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">next_pp_rank</span><span class="p">())</span>
@@ -1027,9 +1051,9 @@
                     <span class="n">lora_weight_pointer</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
                         <span class="n">name</span><span class="o">=</span><span class="sa">f</span><span class="s1">&#39;</span><span class="si">{</span><span class="n">lora_module</span><span class="si">}</span><span class="s1">_lora_weights_pointers_</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">,</span>
                         <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int64</span><span class="p">,</span>
-                        <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">],</span>
+                        <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">3</span><span class="p">],</span>
                         <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;batch_size&#39;</span><span class="p">,</span> <span class="p">[</span><span class="n">bs_range</span><span class="p">]),</span>
-                                               <span class="p">(</span><span class="s1">&#39;in_out&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">2</span><span class="p">])]))</span>
+                                               <span class="p">(</span><span class="s1">&#39;in_out_scales&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">3</span><span class="p">])]))</span>
                     <span class="n">lora_weight_pointer_dict</span><span class="o">.</span><span class="n">update</span><span class="p">({</span>
                         <span class="sa">f</span><span class="s1">&#39;</span><span class="si">{</span><span class="n">lora_module</span><span class="si">}</span><span class="s1">_lora_weights_pointers&#39;</span><span class="p">:</span>
                         <span class="n">lora_weight_pointer</span>
@@ -1094,8 +1118,8 @@
 <div class="viewcode-block" id="EncoderModel.use_prompt_tuning">
 <a class="viewcode-back" href="../../../../python-api/tensorrt_llm.models.html#tensorrt_llm.models.EncoderModel.use_prompt_tuning">[docs]</a>
     <span class="k">def</span> <span class="nf">use_prompt_tuning</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-        <span class="n">embedding</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">embedding</span><span class="o">.</span><span class="n">vocab_embedding</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">embedding</span><span class="o">.</span><span class="n">vocab_embedding</span> <span class="o">=</span> <span class="n">PromptTuningEmbedding</span><span class="p">(</span>
+        <span class="n">embedding</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">transformer</span><span class="o">.</span><span class="n">vocab_embedding</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">transformer</span><span class="o">.</span><span class="n">vocab_embedding</span> <span class="o">=</span> <span class="n">PromptTuningEmbedding</span><span class="p">(</span>
             <span class="n">num_embeddings</span><span class="o">=</span><span class="n">embedding</span><span class="o">.</span><span class="n">num_embeddings</span><span class="p">,</span>
             <span class="n">embedding_dim</span><span class="o">=</span><span class="n">embedding</span><span class="o">.</span><span class="n">embedding_dim</span><span class="p">,</span>
             <span class="n">dtype</span><span class="o">=</span><span class="n">embedding</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
@@ -1104,7 +1128,7 @@
             <span class="n">sharding_dim</span><span class="o">=</span><span class="n">embedding</span><span class="o">.</span><span class="n">sharding_dim</span><span class="p">,</span>
             <span class="n">tp_rank</span><span class="o">=</span><span class="n">embedding</span><span class="o">.</span><span class="n">tp_rank</span><span class="p">)</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">embedding</span><span class="o">.</span><span class="n">vocab_embedding</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">value</span> <span class="o">=</span> <span class="n">embedding</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">raw_value</span></div>
+        <span class="bp">self</span><span class="o">.</span><span class="n">transformer</span><span class="o">.</span><span class="n">vocab_embedding</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">value</span> <span class="o">=</span> <span class="n">embedding</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">raw_value</span></div>
 
 
 <div class="viewcode-block" id="EncoderModel.precompute_relative_attention_bias">
@@ -1132,7 +1156,6 @@
 
         <span class="c1"># e.g. BART regular, T5 RMS</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">layernorm_type</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">layernorm_type</span>
-        <span class="n">ln_type</span> <span class="o">=</span> <span class="n">layernorm_map</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">layernorm_type</span><span class="p">]</span>
 
         <span class="c1"># e.g. BART true, T5 false</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">has_attention_qkvo_bias</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">has_attention_qkvo_bias</span>
@@ -1179,24 +1202,26 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">use_implicit_relative_attention</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">use_implicit_relative_attention</span> <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="s2">&quot;use_implicit_relative_attention&quot;</span><span class="p">)</span> <span class="k">else</span> <span class="kc">False</span>
 
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_first_pp_rank</span><span class="p">():</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">embedding</span> <span class="o">=</span> <span class="n">EncDecEmbedding</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
-                <span class="n">max_position_embeddings</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">,</span>
-                <span class="n">has_position_embedding</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">has_position_embedding</span><span class="p">,</span>
-                <span class="n">type_vocab_size</span><span class="o">=</span><span class="n">type_vocab_size</span><span class="p">,</span>
-                <span class="n">has_embedding_layernorm</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">has_embedding_layernorm</span><span class="p">,</span>
-                <span class="n">has_embedding_scale</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">has_embedding_scale</span><span class="p">,</span>
-                <span class="n">layernorm_eps</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">norm_epsilon</span><span class="p">,</span>
-                <span class="n">layernorm_type</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">layernorm_type</span><span class="p">,</span>
-                <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_dtype</span><span class="p">,</span>
-                <span class="n">use_parallel_embedding</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">use_parallel_embedding</span><span class="p">,</span>
-                <span class="n">embedding_sharding_dim</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">embedding_sharding_dim</span><span class="p">,</span>
-                <span class="n">mapping</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">transformer</span> <span class="o">=</span> <span class="n">EncDecTransformer</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+            <span class="n">max_position_embeddings</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">,</span>
+            <span class="n">has_position_embedding</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">has_position_embedding</span><span class="p">,</span>
+            <span class="n">type_vocab_size</span><span class="o">=</span><span class="n">type_vocab_size</span><span class="p">,</span>
+            <span class="n">has_embedding_layernorm</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">has_embedding_layernorm</span><span class="p">,</span>
+            <span class="n">has_embedding_scale</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">has_embedding_scale</span><span class="p">,</span>
+            <span class="n">layernorm_eps</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">norm_epsilon</span><span class="p">,</span>
+            <span class="n">layernorm_type</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">layernorm_type</span><span class="p">,</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_dtype</span><span class="p">,</span>
+            <span class="n">use_parallel_embedding</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">use_parallel_embedding</span><span class="p">,</span>
+            <span class="n">embedding_sharding_dim</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">embedding_sharding_dim</span><span class="p">,</span>
+            <span class="n">mapping</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="p">,</span>
+            <span class="n">has_model_final_layernorm</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">has_model_final_layernorm</span><span class="p">,</span>
+            <span class="n">norm_epsilon</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">norm_epsilon</span><span class="p">,</span>
+            <span class="n">is_decoder</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 
         <span class="n">layers_range</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">pp_layers</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">total_num_layers</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">decoder_layers</span> <span class="o">=</span> <span class="n">ModuleList</span><span class="p">([</span>
+        <span class="n">decoder_layers</span> <span class="o">=</span> <span class="n">ModuleList</span><span class="p">([</span>
             <span class="n">DecoderLayer</span><span class="p">(</span>
                 <span class="n">local_layer_idx</span><span class="o">=</span><span class="n">layer_idx</span> <span class="o">-</span> <span class="n">layers_range</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span>
                 <span class="n">hidden_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
@@ -1222,16 +1247,12 @@
                 <span class="n">fp16_clamping</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">fp16_clamping</span><span class="p">,</span>
                 <span class="n">skip_cross_kv</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">skip_cross_kv</span><span class="p">,</span>
                 <span class="n">use_implicit_relative_attention</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span>
-                <span class="n">use_implicit_relative_attention</span><span class="p">)</span> <span class="k">for</span> <span class="n">layer_idx</span> <span class="ow">in</span> <span class="n">layers_range</span>
+                <span class="n">use_implicit_relative_attention</span><span class="p">,</span>
+                <span class="n">quant_mode</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">quant_mode</span><span class="p">)</span> <span class="k">for</span> <span class="n">layer_idx</span> <span class="ow">in</span> <span class="n">layers_range</span>
         <span class="p">])</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">transformer</span><span class="o">.</span><span class="n">assign_layers</span><span class="p">(</span><span class="n">decoder_layers</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_last_pp_rank</span><span class="p">():</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">has_model_final_layernorm</span><span class="p">:</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">final_layernorm</span> <span class="o">=</span> <span class="n">ln_type</span><span class="p">(</span>
-                    <span class="n">normalized_shape</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
-                    <span class="n">eps</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">norm_epsilon</span><span class="p">,</span>
-                    <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
-
             <span class="bp">self</span><span class="o">.</span><span class="n">lm_head</span> <span class="o">=</span> <span class="n">ColumnLinear</span><span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span>
@@ -1312,20 +1333,21 @@
 
         <span class="c1"># In PP, layer 0 has ids as inputs, all other layers have hidden_states as inputs</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_first_pp_rank</span><span class="p">():</span>
-            <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">embedding</span><span class="p">(</span><span class="n">decoder_input_ids</span><span class="p">,</span> <span class="n">position_ids</span><span class="p">,</span>
-                                           <span class="n">token_type_ids</span><span class="p">)</span>
+            <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">transformer</span><span class="o">.</span><span class="n">embedding</span><span class="p">(</span><span class="n">decoder_input_ids</span><span class="p">,</span>
+                                                       <span class="n">position_ids</span><span class="p">,</span>
+                                                       <span class="n">token_type_ids</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">register_network_output</span><span class="p">(</span><span class="s1">&#39;embedding_layer_output&#39;</span><span class="p">,</span>
                                          <span class="n">hidden_states</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">recv</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">prev_pp_rank</span><span class="p">())</span>
 
-        <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">fill_none_tensor_list</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">decoder_layers</span><span class="p">))</span>
+        <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">fill_none_tensor_list</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">transformer</span><span class="o">.</span><span class="n">layers</span><span class="p">))</span>
 
         <span class="k">if</span> <span class="n">use_cache</span><span class="p">:</span>
             <span class="n">presents</span> <span class="o">=</span> <span class="p">[]</span>
 
         <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="p">(</span><span class="n">decoder_layer</span><span class="p">,</span> <span class="n">past</span><span class="p">)</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span>
-                <span class="nb">zip</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">decoder_layers</span><span class="p">,</span> <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">past_key_value</span><span class="p">)):</span>
+                <span class="nb">zip</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">transformer</span><span class="o">.</span><span class="n">layers</span><span class="p">,</span> <span class="n">kv_cache_params</span><span class="o">.</span><span class="n">past_key_value</span><span class="p">)):</span>
 
             <span class="n">lora_layer_params</span> <span class="o">=</span> <span class="kc">None</span>
             <span class="k">if</span> <span class="n">lora_params</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">lora_params</span><span class="o">.</span><span class="n">lora_ranks</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
@@ -1376,7 +1398,7 @@
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mapping</span><span class="o">.</span><span class="n">is_last_pp_rank</span><span class="p">():</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">has_model_final_layernorm</span><span class="p">:</span>
-                <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">final_layernorm</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+                <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">transformer</span><span class="o">.</span><span class="n">ln_f</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
 
             <span class="c1"># [bs, seq, hidden_size] or [num_tokens, hidden_size] -&gt; [bs, hidden_size]</span>
             <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">gather_last_token_logits</span><span class="p">(</span>
@@ -1424,7 +1446,6 @@
                        <span class="n">max_seq_len</span><span class="p">,</span>
                        <span class="n">max_encoder_input_len</span><span class="p">,</span>
                        <span class="n">gather_context_logits</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
-                       <span class="n">gather_generation_logits</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
                        <span class="n">lora_target_modules</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                        <span class="n">use_cache</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
                        <span class="o">*</span><span class="n">args</span><span class="p">,</span>
@@ -1802,9 +1823,10 @@
                     <span class="n">lora_weight_pointer</span> <span class="o">=</span> <span class="n">Tensor</span><span class="p">(</span>
                         <span class="n">name</span><span class="o">=</span><span class="sa">f</span><span class="s1">&#39;</span><span class="si">{</span><span class="n">lora_module</span><span class="si">}</span><span class="s1">_lora_weights_pointers_</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">,</span>
                         <span class="n">dtype</span><span class="o">=</span><span class="n">trt</span><span class="o">.</span><span class="n">int64</span><span class="p">,</span>
-                        <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">],</span>
+                        <span class="n">shape</span><span class="o">=</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">3</span><span class="p">],</span>
                         <span class="n">dim_range</span><span class="o">=</span><span class="n">OrderedDict</span><span class="p">([(</span><span class="s1">&#39;batch_size_beam_width&#39;</span><span class="p">,</span>
-                                                <span class="p">[</span><span class="n">bb_range</span><span class="p">]),</span> <span class="p">(</span><span class="s1">&#39;in_out&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">2</span><span class="p">])]))</span>
+                                                <span class="p">[</span><span class="n">bb_range</span><span class="p">]),</span>
+                                               <span class="p">(</span><span class="s1">&#39;in_out_scales&#39;</span><span class="p">,</span> <span class="p">[</span><span class="mi">3</span><span class="p">])]))</span>
                     <span class="n">lora_weight_pointer_dict</span><span class="o">.</span><span class="n">update</span><span class="p">({</span>
                         <span class="sa">f</span><span class="s1">&#39;</span><span class="si">{</span><span class="n">lora_module</span><span class="si">}</span><span class="s1">_lora_weights_pointers&#39;</span><span class="p">:</span>
                         <span class="n">lora_weight_pointer</span>
@@ -2109,7 +2131,7 @@
                 <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">max_distance</span><span class="p">,</span>
             <span class="p">)</span>
             <span class="k">for</span> <span class="n">layer_idx</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">num_layers</span><span class="p">):</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">decoder_layers</span><span class="p">[</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">transformer</span><span class="o">.</span><span class="n">layers</span><span class="p">[</span>
                     <span class="n">layer_idx</span><span class="p">]</span><span class="o">.</span><span class="n">self_attention</span><span class="o">.</span><span class="n">set_rel_attn_table</span><span class="p">(</span>
                         <span class="n">build_config</span><span class="o">.</span><span class="n">max_seq_len</span><span class="p">,</span> <span class="n">rel_attn_precomputed</span><span class="p">)</span></div>
 </div>
@@ -2123,23 +2145,17 @@
     <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">PretrainedConfig</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_dtype</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span>
-        <span class="c1"># Encoder conv needs to run in fp32 on Volta/Turing</span>
-        <span class="n">major</span><span class="p">,</span> <span class="n">minor</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">get_device_capability</span><span class="p">()</span>
-        <span class="k">if</span> <span class="n">major</span> <span class="o">&gt;=</span> <span class="mi">8</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_conv_dtype</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_dtype</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_conv_dtype</span> <span class="o">=</span> <span class="s2">&quot;float32&quot;</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">conv1</span> <span class="o">=</span> <span class="n">Conv1d</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">n_mels</span><span class="p">,</span>
                             <span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
                             <span class="n">kernel_size</span><span class="o">=</span><span class="mi">3</span><span class="p">,</span>
                             <span class="n">padding</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
-                            <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_conv_dtype</span><span class="p">)</span>
+                            <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_dtype</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">conv2</span> <span class="o">=</span> <span class="n">Conv1d</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
                             <span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
                             <span class="n">kernel_size</span><span class="o">=</span><span class="mi">3</span><span class="p">,</span>
                             <span class="n">stride</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span>
                             <span class="n">padding</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
-                            <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_conv_dtype</span><span class="p">)</span>
+                            <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_dtype</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">position_embedding</span> <span class="o">=</span> <span class="n">Embedding</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">,</span>
                                             <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
                                             <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
@@ -2171,9 +2187,8 @@
             <span class="c1"># BXT,D -&gt; 1,BxT,D -&gt; 1,D,BxT</span>
             <span class="n">input_features</span> <span class="o">=</span> <span class="n">unsqueeze</span><span class="p">(</span><span class="n">input_features</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
             <span class="n">input_features</span> <span class="o">=</span> <span class="n">transpose</span><span class="p">(</span><span class="n">input_features</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
-        <span class="c1"># Encoder conv needs to run in fp32 on Volta/Turing</span>
         <span class="n">x_type</span> <span class="o">=</span> <span class="n">input_features</span><span class="o">.</span><span class="n">dtype</span>
-        <span class="n">input_features</span> <span class="o">=</span> <span class="n">cast</span><span class="p">(</span><span class="n">input_features</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_conv_dtype</span><span class="p">)</span>
+        <span class="n">input_features</span> <span class="o">=</span> <span class="n">cast</span><span class="p">(</span><span class="n">input_features</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_dtype</span><span class="p">)</span>
         <span class="n">x</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">conv1</span><span class="p">(</span><span class="n">input_features</span><span class="p">)</span>
         <span class="n">x</span> <span class="o">=</span> <span class="n">gelu</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
         <span class="n">x</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">conv2</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
@@ -2284,7 +2299,7 @@
   <hr/>
 
   <div role="contentinfo">
-<jinja2.runtime.BlockReference object at 0x7fa2584d7b90>
+<jinja2.runtime.BlockReference object at 0x7f9b7cb6f950>
 
 <div class="footer">
     <p>
