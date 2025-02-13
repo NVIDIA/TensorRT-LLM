@@ -19,7 +19,7 @@ StrEnum
 sentencepiece>=0.1.99
 tensorrt~=10.8.0
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-01.html#rel-25-01 uses 2.6.0a0.
-torch>=2.5.1,<=2.6.0a0
+torch>=2.6.0a0,<=2.6.0
 torchvision
 nvidia-modelopt[torch]~=0.23.0
 nvidia-nccl-cu12
@@ -42,5 +42,5 @@ httpx
 setuptools
 ordered-set
 peft
-flashinfer @ git+https://github.com/flashinfer-ai/flashinfer.git@06309c4e
-s2wrapper @ git+https://github.com/bfshi/scaling_on_scales.git@60da2afe
+einops
+flashinfer-python~=0.2.0

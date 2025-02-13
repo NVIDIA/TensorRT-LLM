@@ -2,7 +2,7 @@ from typing import Optional, Type
 
 from ...models.modeling_utils import QuantConfig
 from . import IS_FLASHINFER_AVAIABLE
-from .interface import AttentionBackend, PositionalEmbeddingParams
+from .interface import AttentionBackend, MLAParams, PositionalEmbeddingParams
 from .trtllm import TrtllmAttention
 from .vanilla import VanillaAttention
 
@@ -29,10 +29,31 @@ def create_attention(
         head_dim: int,
         num_kv_heads: Optional[int] = None,
         pos_embd_params: Optional[PositionalEmbeddingParams] = None,
-        quant_config: Optional[QuantConfig] = None):
+        quant_config: Optional[QuantConfig] = None,
+        is_mla_enable: Optional[bool] = False,
+        q_lora_rank: Optional[int] = 0,
+        kv_lora_rank: Optional[int] = 0,
+        qk_rope_head_dim: Optional[int] = 0,
+        qk_nope_head_dim: Optional[int] = 0,
+        v_head_dim: Optional[int] = 0):
+
     attn_cls = get_attention_backend(backend_name)
+    if is_mla_enable:
+        assert attn_cls == TrtllmAttention
+
     if attn_cls == TrtllmAttention:
-        return TrtllmAttention(layer_idx, num_heads, head_dim, num_kv_heads,
-                               pos_embd_params, quant_config)
+        return TrtllmAttention(layer_idx,
+                               num_heads,
+                               head_dim,
+                               num_kv_heads,
+                               pos_embd_params,
+                               quant_config,
+                               is_mla_enable=is_mla_enable,
+                               mla_params=MLAParams(
+                                   q_lora_rank=q_lora_rank,
+                                   kv_lora_rank=kv_lora_rank,
+                                   qk_rope_head_dim=qk_rope_head_dim,
+                                   qk_nope_head_dim=qk_nope_head_dim,
+                                   v_head_dim=v_head_dim))
 
     return attn_cls(layer_idx, num_heads, head_dim, num_kv_heads, quant_config)

@@ -16,7 +16,10 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.bench.build.dataclasses import ModelConfig
 from tensorrt_llm.bench.build.tuning import calc_engine_setting
 
-TUNED_QUANTS = {QuantAlgo.NVFP4, QuantAlgo.FP8, QuantAlgo.NO_QUANT, None}
+TUNED_QUANTS = {
+    QuantAlgo.NVFP4, QuantAlgo.FP8, QuantAlgo.FP8_BLOCK_SCALES,
+    QuantAlgo.NO_QUANT, None
+}
 DEFAULT_MAX_BATCH_SIZE = BuildConfig.max_batch_size
 DEFAULT_MAX_NUM_TOKENS = BuildConfig.max_num_tokens
 

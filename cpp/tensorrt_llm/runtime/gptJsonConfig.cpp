@@ -146,8 +146,8 @@ ModelConfig parseMultimodalConfig(Json const& json, nvinfer1::DataType dataType)
         dataType}; // use dummy values because vision engines of multimodal models does not record this info in config
 }
 
-ModelConfig createModelConfig(
-    Json const& json, bool engineVersionNone, SizeType32 tensorParallelism, nvinfer1::DataType dataType)
+ModelConfig createModelConfig(Json const& json, bool engineVersionNone, SizeType32 tensorParallelism,
+    SizeType32 contextParallelism, nvinfer1::DataType dataType)
 {
     auto const& config = engineVersionNone ? json.at("builder_config") : json.at("pretrained_config");
     auto const multiModalName = parseJsonFieldOptional<std::string>(config, "model_name");
@@ -180,7 +180,8 @@ ModelConfig createModelConfig(
         }
     }
 
-    auto const numHeads = config.at(numHeadsField).template get<SizeType32>() / tensorParallelism;
+    auto const numHeads
+        = config.at(numHeadsField).template get<SizeType32>() / (tensorParallelism * contextParallelism);
     auto const layerStringTypes
         = parseJsonFieldOr<std::vector<std::string>>(config, "layer_types", std::vector<std::string>());
     auto const layerTypes = buildLayerTypes(numLayers, layerStringTypes);
@@ -199,7 +200,9 @@ ModelConfig createModelConfig(
     // TODO:
     // Code crashes when numKvHeads <= 0. Clamping downwards to 1 prevents that, make sure this is best fix.
     auto const numKvHeads
-        = std::max(parseJsonFieldOr(config, numKvHeadsField, numHeads * tensorParallelism) / tensorParallelism, 1);
+        = std::max(parseJsonFieldOr(config, numKvHeadsField, numHeads * tensorParallelism * contextParallelism)
+                / (tensorParallelism * contextParallelism),
+            1);
 
     auto const mlpHiddenSize = parseJsonFieldOptional<SizeType32>(config, mlpHiddenSizeField);
 
@@ -215,8 +218,10 @@ ModelConfig createModelConfig(
     {
         std::transform(numKvHeadsPerAttentionLayer.cbegin(), numKvHeadsPerAttentionLayer.cend(),
             numKvHeadsPerAttentionLayer.begin(),
-            [tensorParallelism](SizeType32 const numKvHeads)
-            { return ((numKvHeads + tensorParallelism - 1) / tensorParallelism); });
+            [tensorParallelism, contextParallelism](SizeType32 const numKvHeads) {
+                return ((numKvHeads + tensorParallelism * contextParallelism - 1)
+                    / (tensorParallelism * contextParallelism));
+            });
         modelConfig.setNumKvHeadsPerLayer(numKvHeadsPerAttentionLayer);
     }
     else
@@ -228,8 +233,10 @@ ModelConfig createModelConfig(
     {
         std::transform(numKvHeadsPerCrossAttentionLayer.cbegin(), numKvHeadsPerCrossAttentionLayer.cend(),
             numKvHeadsPerCrossAttentionLayer.begin(),
-            [tensorParallelism](SizeType32 const numKvHeads)
-            { return ((numKvHeads + tensorParallelism - 1) / tensorParallelism); });
+            [tensorParallelism, contextParallelism](SizeType32 const numKvHeads) {
+                return ((numKvHeads + tensorParallelism * contextParallelism - 1)
+                    / (tensorParallelism * contextParallelism));
+            });
         modelConfig.setNumKvHeadsPerCrossLayer(numKvHeadsPerCrossAttentionLayer);
     }
     else
@@ -487,8 +494,7 @@ GptJsonConfig parseJson(InputType&& input)
         TLLM_THROW("Model data type '%s' not supported", precision.c_str());
     }();
 
-    auto modelConfig = createModelConfig(json, engineVersionNone, tensorParallelism, dataType);
-
+    auto modelConfig = createModelConfig(json, engineVersionNone, tensorParallelism, contextParallelism, dataType);
     modelConfig.setModelName(name);
 
     parseBuilderConfig(modelConfig, builderConfig);

@@ -148,7 +148,7 @@ ITensor::Shape ITensor::squeeze(Shape const& shape, SizeType32 dim)
         dim < shape.nbDims, tc::fmtstr("Invalid index %d, tensor has %d dimensions", dim, shape.nbDims));
     TLLM_CHECK_WITH_INFO(shape.d[dim] == 1, "Can only squeeze dimension of size 1");
 
-    Shape newDims{shape.nbDims - 1};
+    Shape newDims{shape.nbDims - 1, {}};
     std::copy(shape.d, shape.d + dim, newDims.d);
     std::copy(shape.d + dim + 1, shape.d + shape.nbDims, newDims.d + dim);
     return newDims;
@@ -160,7 +160,7 @@ ITensor::Shape ITensor::unsqueeze(Shape const& shape, SizeType32 dim)
     TLLM_CHECK_WITH_INFO(
         0 <= dim && dim <= shape.nbDims, common::fmtstr("Invalid dim %d, tensor has %d dimensions", dim, shape.nbDims));
 
-    Shape newDims{shape.nbDims + 1};
+    Shape newDims{shape.nbDims + 1, {}};
     std::copy(shape.d, shape.d + dim, newDims.d);
     newDims.d[dim] = 1;
     std::copy(shape.d + dim, shape.d + shape.nbDims, newDims.d + dim + 1);

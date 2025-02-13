@@ -752,6 +752,9 @@ class MultimodalModelRunner:
                 _, _, c, h, w = image.shape
                 image = image.repeat(self.args.batch_size, 1, 1, 1, 1)
                 image = image.view(-1, c, h, w)
+        elif self.model_type == "fuyu":
+            while len(image["image_patches"]) < self.args.batch_size:
+                image["image_patches"].append(image["image_patches"][0])
 
         profiler.start("Vision encoder")
         visual_features, visual_atts, model_runner_input = None, None, None
@@ -961,7 +964,14 @@ class MultimodalModelRunner:
                             1] + visual_atts.shape[1]
             else:
                 post_input_ids = None
-                length = pre_input_ids.shape[1] + visual_atts.shape[1]
+                assert pre_input_ids.shape[0] == visual_atts.shape[0]
+                if visual_atts.shape[0] == 1:
+                    length = pre_input_ids.shape[1] + visual_atts.shape[1]
+                else:
+                    length = [
+                        pre_input_ids.shape[1] + visual_atts.shape[1]
+                        for _ in range(visual_atts.shape[0])
+                    ]
 
         if n_prompts_n_images:
             if isinstance(length, int): length = [length]

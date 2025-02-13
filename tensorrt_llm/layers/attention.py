@@ -731,6 +731,7 @@ class Attention(Module):
         skip_attn=None,
     ):
         attention_input = hidden_states
+
         assert isinstance(hidden_states, (Tensor, tuple))
 
         spec_decoding_params = SpecDecodingParams(
@@ -1425,7 +1426,12 @@ class Attention(Module):
                 relative_bias = slice(relative_bias, start, size)
 
             key = key.permute([0, 1, 3, 2])
+            model_type = query.dtype
             with precision('float32'):
+                # FIXME the "with precision('float32') does not really work and lead to nan"
+                # in some cases
+                query = cast(query, 'float32')
+                key = cast(key, 'float32')
                 if norm_before_bmm1:
                     # Apply norm on query earlier to prevent matmul fp16 overflow.
                     query /= (self.q_scaling * self.norm_factor)
@@ -1451,7 +1457,8 @@ class Attention(Module):
                 if self.relative_attention:
                     attention_scores = attention_scores + relative_bias
 
-            attention_probs = softmax(attention_scores, dim=-1)
+                attention_probs = softmax(attention_scores, dim=-1)
+                attention_probs = cast(attention_probs, model_type)
 
             # A dummy reshape WAR for mha fusion
             attention_probs = attention_probs.view(
@@ -2021,14 +2028,13 @@ class DeepseekV2Attention(Attention):
 
         self.kv_a_layernorm = RmsNorm(kv_lora_rank, dtype=dtype, eps=eps)
 
-        self.fused_q_proj = Parameter(
-            shape=(self.num_attention_heads *
-                   (self.kv_lora_rank + self.qk_rope_head_dim),
-                   self.q_lora_rank),
-            dtype=dtype)
         self.kv_b_proj = Parameter(
             shape=(self.num_attention_heads * self.qk_nope_head_dim * 2,
                    self.kv_lora_rank),
+            dtype=dtype)
+        self.k_b_proj_trans = Parameter(
+            shape=(self.num_attention_heads * self.kv_lora_rank,
+                   self.qk_nope_head_dim),
             dtype=dtype)
         self.q_b_proj = Parameter(
             shape=(self.num_attention_heads *
@@ -2042,13 +2048,13 @@ class DeepseekV2Attention(Attention):
                                dtype=dtype,
                                tp_group=tp_group,
                                tp_size=tp_size)
-        set_obj_attrs(self.fused_q_proj, {
-            "weight_loader": self.weight_loader,
-        })
         set_obj_attrs(self.q_b_proj, {
             "weight_loader": self.weight_loader,
         })
         set_obj_attrs(self.kv_b_proj, {
+            "weight_loader": self.weight_loader,
+        })
+        set_obj_attrs(self.k_b_proj_trans, {
             "weight_loader": self.weight_loader,
         })
 
@@ -2074,56 +2080,7 @@ class DeepseekV2Attention(Attention):
             else:
                 return torch.chunk(v, tp_size, dim=dim)[idx].contiguous()
 
-        if tllm_key.find("fused_q_proj") != -1:
-            q_b_proj_weight = weights[0]
-            kv_b_proj_weight = weights[1]
-
-            q_b_proj_weight = q_b_proj_weight.unflatten(
-                0,
-                [
-                    self.num_attention_heads * self.tp_size,
-                    self.qk_nope_head_dim + self.qk_rope_head_dim,
-                ],
-            )
-            kv_b_proj_weight = kv_b_proj_weight.unflatten(
-                0,
-                [
-                    self.num_attention_heads * self.tp_size,
-                    self.qk_nope_head_dim + self.v_head_dim,
-                ],
-            )
-            q_b_proj_weight = split_matrix_tp(
-                q_b_proj_weight,
-                self.tp_size,
-                self.tp_rank,
-                dim=0,
-            )
-
-            kv_b_proj_weight = split_matrix_tp(
-                kv_b_proj_weight,
-                self.tp_size,
-                self.tp_rank,
-                dim=0,
-            )
-            q_nope_weight, q_pe_weight = q_b_proj_weight.split(
-                [self.qk_nope_head_dim, self.qk_rope_head_dim],
-                dim=1,
-            )
-            k_nope_weight, v_weight = kv_b_proj_weight.split(
-                [self.qk_nope_head_dim, self.v_head_dim],
-                dim=1,
-            )
-            fused_q_nope_weight = torch.einsum(
-                'hdq,hdk->hkq',
-                q_nope_weight,
-                k_nope_weight,
-            )
-            weights = torch.cat(
-                [fused_q_nope_weight, q_pe_weight],
-                dim=1,
-            ).flatten(start_dim=0, end_dim=1)
-
-        elif tllm_key.find("q_b_proj") != -1:
+        if tllm_key.find("q_b_proj") != -1:
             q_b_proj_weight = weights.unflatten(
                 0,
                 [
@@ -2170,6 +2127,20 @@ class DeepseekV2Attention(Attention):
                     self.tp_size, self.kv_lora_rank)
             ],
                                    dim=0)
+
+        elif tllm_key.find("k_b_proj_trans") != -1:
+            kv_b_proj = weights.unflatten(0, [
+                self.num_attention_heads * self.tp_size,
+                self.qk_nope_head_dim + self.v_head_dim
+            ])
+            kv_b_proj = split(kv_b_proj, self.tp_size, self.tp_rank, dim=0)
+            k_nope_weight, v_weight = kv_b_proj.split(
+                [self.qk_nope_head_dim, self.v_head_dim],
+                dim=1,
+            )
+            weights = k_nope_weight.transpose(2, 1).reshape(
+                self.num_attention_heads * self.kv_lora_rank,
+                self.qk_nope_head_dim)
 
         return {tllm_key: weights}
 

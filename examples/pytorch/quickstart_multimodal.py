@@ -21,8 +21,14 @@ default_images = [
 
 default_answers = [
     "The image features a stormy ocean with large waves crashing, a gray sky with white clouds, and a dark gray horizon.",
-    "The object is a large rock formation, and the weather condition is sunny with a blue sky and white clouds.",
+    "The object is a large rock formation, and the weather is sunny with a blue sky and white clouds.",
     "The road is busy with multiple cars, including a silver SUV, a blue car, and a green double-decker bus, all driving in the same direction.",
+]
+
+alternative_answers = [
+    'The image features a stormy ocean with large waves crashing, a gray sky with white clouds, and a dark gray horizon.',
+    'The object is a large rock formation, and the weather condition is sunny with a blue sky and white clouds.',
+    'The road is busy with multiple cars, including a silver SUV, a blue car, and a green double-decker bus, all driving in the same direction.'
 ]
 
 
@@ -88,8 +94,10 @@ def main():
 
     if args.check_accuracy:
         for idx in range(len(outputs)):
+            # There can be variance in the generated_text
             assert outputs[idx].outputs[0].text == default_answers[
-                idx], "Wrong answer!"
+                idx] or outputs[idx].outputs[0].text == alternative_answers[
+                    idx], "Wrong answer!"
         print("All answers are correct!")
 
 

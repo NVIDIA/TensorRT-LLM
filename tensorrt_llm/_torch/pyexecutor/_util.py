@@ -11,6 +11,15 @@ from .resource_manager import KVCacheManager, ResourceManager
 from .scheduler import ScheduledRequests
 
 
+def is_mla(config):
+    if hasattr(config, "kv_lora_rank"):
+        assert hasattr(
+            config, "qk_rope_head_dim"
+        ), "both of kv_lora_rank and qk_rope_head_dim are required."
+        return True
+    return False
+
+
 def cal_max_tokens(peak_memory, total_gpu_memory, fraction, model_config,
                    mapping: Mapping):
     mem_per_token = 2
@@ -26,15 +35,27 @@ def cal_max_tokens(peak_memory, total_gpu_memory, fraction, model_config,
         num_key_value_heads = sum(num_key_value_heads) / len(
             num_key_value_heads)
 
-    mem_per_token *= (2 * config.hidden_size * config.num_hidden_layers *
-                      num_key_value_heads / config.num_attention_heads /
-                      mapping.tp_size)
+    mla = is_mla(config)
+    tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
+
+    kv_factor = 2
+    if mla:
+        # MLA has kv_lora_rank and qk_rope_head_dim
+        head_dim = config.kv_lora_rank + config.qk_rope_head_dim
+        # todo: keep this factor be aligned with kvCacheManager
+        kv_factor = 2
+    else:
+        head_dim = (config.hidden_size * num_key_value_heads /
+                    config.num_attention_heads / tp_size)
+
+    mem_per_token *= config.num_hidden_layers * head_dim
+    # K and V
+    mem_per_token *= kv_factor
 
     if fraction is None:
         fraction = 0.9
 
     available_kv_mem = (total_gpu_memory - peak_memory) * fraction
-
     max_tokens = int((available_kv_mem) // mem_per_token)
     max_tokens = max(max_tokens, 0)
     return max_tokens

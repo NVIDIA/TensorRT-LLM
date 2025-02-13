@@ -135,9 +135,9 @@ std::string GPTAttentionPlugin::toString(IdxEntry const& entry) const
         TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(MROPE_POSITION_DELTAS);
         TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(HOST_RUNTIME_PERF_KNOBS);
         TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(HOST_CONTEXT_PROGRESS);
-        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(MLA_FUSED_Q_PROJ_TENSOR);
         TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(MLA_Q_B_PROJ_TENSOR);
         TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(MLA_KV_B_PROJ_TENSOR);
+        TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(MLA_K_B_PROJ_TRANS_TENSOR);
         TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(SKIP_ATTN);
         TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(LOGN_SCALING);
         TLLM_GPT_ATTN_IDX_ENTRY_TO_STRING(ENUM_SIZE);
@@ -192,9 +192,9 @@ bool GPTAttentionPlugin::isEntryUsed(IdxEntry const& entry) const
     case IdxEntry::MROPE_POSITION_DELTAS: return isMRoPE();
     case IdxEntry::HOST_RUNTIME_PERF_KNOBS: return true;
     case IdxEntry::HOST_CONTEXT_PROGRESS: return true;
-    case IdxEntry::MLA_FUSED_Q_PROJ_TENSOR: return mIsMLAEnabled;
     case IdxEntry::MLA_Q_B_PROJ_TENSOR: return mIsMLAEnabled;
     case IdxEntry::MLA_KV_B_PROJ_TENSOR: return mIsMLAEnabled;
+    case IdxEntry::MLA_K_B_PROJ_TRANS_TENSOR: return mIsMLAEnabled;
     case IdxEntry::SKIP_ATTN: return mSkipAttn;
     default: return false;
     }
@@ -726,9 +726,9 @@ mlaParams<T> GPTAttentionPlugin::enqueueMLAPreprocess(int32_t localNbSeq, int32_
 {
     auto const* input = static_cast<T const*>(inputs[getIdx(IdxEntry::QKV_TENSOR)]);
 
-    auto const* fused_q_proj = static_cast<T const*>(inputs[getIdx(IdxEntry::MLA_FUSED_Q_PROJ_TENSOR)]);
     auto const* q_b_proj = static_cast<T const*>(inputs[getIdx(IdxEntry::MLA_Q_B_PROJ_TENSOR)]);
     auto const* kv_b_proj = static_cast<T const*>(inputs[getIdx(IdxEntry::MLA_KV_B_PROJ_TENSOR)]);
+    auto const* k_b_proj_trans = static_cast<T const*>(inputs[getIdx(IdxEntry::MLA_K_B_PROJ_TRANS_TENSOR)]);
     float2 const* cos_sin_cache = static_cast<float2 const*>(inputs[getIdx(IdxEntry::ROTARY_COS_SIN)]);
 
     AttentionOutT* context_buf_ = static_cast<AttentionOutT*>(outputs[0]);
@@ -736,9 +736,9 @@ mlaParams<T> GPTAttentionPlugin::enqueueMLAPreprocess(int32_t localNbSeq, int32_
     mlaParams<T> mla_params;
     mla_params.fused_a_input = input;
     mla_params.context_buf = reinterpret_cast<T*>(context_buf_);
-    mla_params.fused_q_proj = fused_q_proj;
     mla_params.q_b_proj = q_b_proj;
     mla_params.kv_b_proj = kv_b_proj;
+    mla_params.k_b_proj_trans = k_b_proj_trans;
     mla_params.cos_sin_cache = cos_sin_cache;
     mla_params.batch_size = localNbSeq;
     mla_params.acc_q_len = localNbTokens;
@@ -994,7 +994,7 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
 
         auto const cacheElemSize = (mKVCacheQuantMode.hasKvCacheQuant() ? 1 : sizeof(T));
 
-        auto const blockSize = mTokensPerBlock * mNumKVHeads * mHeadSize;
+        auto const blockSize = mTokensPerBlock * mNumKVHeads / mCpSize * mHeadSize;
         auto const bytesPerBlock = blockSize * cacheElemSize;
         auto const layerOffset = mLayerIdxInCachePool * 2 * bytesPerBlock;
 

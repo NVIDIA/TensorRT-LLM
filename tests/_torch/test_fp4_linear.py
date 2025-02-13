@@ -38,6 +38,7 @@ def test_fp4_linear(dtype):
                    bias=False,
                    dtype=dtype,
                    quant_config=qc)
+    l_fp4._create_weights()
 
     assert l_fp4.weight.dtype == fp4_utils.float4_e2m1x2
     assert l_fp4.weight_scale.dtype == fp4_utils.float4_sf_dtype

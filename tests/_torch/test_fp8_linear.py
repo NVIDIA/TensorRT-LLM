@@ -32,6 +32,7 @@ def test_fp8_linear(dtype):
                 bias=False,
                 dtype=dtype,
                 quant_config=qc)
+    l0._create_weights()
     assert l0.weight.dtype == torch.float8_e4m3fn
     l0.load_weights([{
         'weight': w_fp8,

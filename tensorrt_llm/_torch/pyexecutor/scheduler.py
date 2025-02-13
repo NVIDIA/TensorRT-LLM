@@ -155,7 +155,8 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
         super(BindMicroBatchScheduler, self).__init__()
         self.max_batch_size = max_batch_size
         self.max_num_tokens = max_num_tokens
-        self.impl = tb_internal.algorithms.MicroBatchScheduler(ctx_chunk_config)
+        self.impl = tb_internal.algorithms.MicroBatchScheduler(
+            ctx_chunk_config, max_num_tokens)
 
     def schedule(
         self, active_requests: RequestList, inflight_request_ids: set[int]

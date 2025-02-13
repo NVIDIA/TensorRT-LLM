@@ -453,7 +453,7 @@ public:
         SizeType32 maxNumSequences, std::shared_ptr<runtime::CudaStream> stream, bool onboardBlocks,
         CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
-        std::shared_ptr<KVCacheEventManager> eventManager = nullptr);
+        std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enableHashKey = false);
 
     ~BlockManager();
 
@@ -734,6 +734,9 @@ private:
     // Number of blocks that were not reused
     SizeType32 mMissedBlocks;
     std::set<KVCacheBlock::IdType> reusedBlockIds;
+
+    // Whether or not to maintain a hashmap of blocks.
+    bool mEnableHashKey;
 
 private:
     friend class KVCacheManager;

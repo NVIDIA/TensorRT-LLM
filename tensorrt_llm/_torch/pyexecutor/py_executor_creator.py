@@ -6,10 +6,10 @@ from tensorrt_llm._torch.attention_backend.interface import \
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm._torch.pyexecutor.decoder import TorchGreedySearchDecoder
 from tensorrt_llm._torch.pyexecutor.distributed import MPIDist
+from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-from tensorrt_llm._torch.pyexecutor.pytorch_model_engine import \
-    PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
+                                                             MLAKVCacheManager,
                                                              ResourceManager)
 from tensorrt_llm._torch.pyexecutor.scheduler import (BindCapacityScheduler,
                                                       BindMicroBatchScheduler,
@@ -20,16 +20,16 @@ from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ._util import estimate_max_kv_cache_tokens
+from ._util import estimate_max_kv_cache_tokens, is_mla
 
 
 def create_py_executor(executor_config: ExecutorConfig,
                        checkpoint_dir: str = None,
                        engine_dir: str = None):
     if executor_config.pytorch_backend_config is None:
-        pytorch_backend_config = PyTorchConfig()
-    else:
-        pytorch_backend_config = executor_config.pytorch_backend_config
+        executor_config.pytorch_backend_config = PyTorchConfig()
+
+    pytorch_backend_config = executor_config.pytorch_backend_config
 
     if executor_config.mapping is None:
         mapping = Mapping(world_size=tensorrt_llm.mpi_world_size(),
@@ -38,7 +38,6 @@ def create_py_executor(executor_config: ExecutorConfig,
     else:
         mapping = copy.deepcopy(executor_config.mapping)
         mapping.rank = tensorrt_llm.mpi_rank()
-
     if mapping.cp_config.get('cp_type') == 'star_attention':
         assert pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
 
@@ -62,6 +61,7 @@ def create_py_executor(executor_config: ExecutorConfig,
 
     if executor_config.max_num_tokens is None:
         executor_config.max_num_tokens = 8192
+    dist = MPIDist(mapping=mapping)
 
     attn_runtime_features = AttentionRuntimeFeatures(
         chunked_prefill=executor_config.enable_chunked_context,
@@ -76,6 +76,7 @@ def create_py_executor(executor_config: ExecutorConfig,
         max_seq_len=executor_config.max_seq_len,
         mapping=mapping,
         attn_runtime_features=attn_runtime_features,
+        dist=dist,
     )
     # PyTorchModelEngine modifies these fields, update them to executor_config
     max_seq_len = model_engine.max_seq_len + 1 if pytorch_backend_config.enable_overlap_scheduler else model_engine.max_seq_len
@@ -112,19 +113,37 @@ def create_py_executor(executor_config: ExecutorConfig,
     else:
         ctx_chunk_config = None
 
-    kv_cache_manager = KVCacheManager(
-        executor_config.kv_cache_config,
-        tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
-        model_engine.model.config.num_hidden_layers,
-        num_attention_heads,
-        num_key_value_heads,
-        head_dim,
-        executor_config.tokens_per_block,
-        executor_config.max_seq_len,
-        executor_config.max_batch_size,
-        mapping,
-        dtype=kv_cache_dtype,
-    )
+    config = model_engine.model.model_config.pretrained_config
+    if is_mla(config):
+        kv_cache_manager = MLAKVCacheManager(
+            executor_config.kv_cache_config,
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            model_engine.model.config.num_hidden_layers,
+            num_attention_heads,
+            num_key_value_heads,
+            head_dim,
+            executor_config.tokens_per_block,
+            executor_config.max_seq_len,
+            executor_config.max_batch_size,
+            mapping,
+            dtype=kv_cache_dtype,
+            kv_lora_rank=config.kv_lora_rank,
+            qk_rope_head_dim=config.qk_rope_head_dim)
+    else:
+        kv_cache_manager = KVCacheManager(
+            executor_config.kv_cache_config,
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            model_engine.model.config.num_hidden_layers,
+            num_attention_heads,
+            num_key_value_heads,
+            head_dim,
+            executor_config.tokens_per_block,
+            executor_config.max_seq_len,
+            executor_config.max_batch_size,
+            mapping,
+            dtype=kv_cache_dtype,
+        )
+
     # KVCacheManager modifies these fields, update them to executor_config
     executor_config.max_seq_len = kv_cache_manager.max_seq_len
 
@@ -146,15 +165,14 @@ def create_py_executor(executor_config: ExecutorConfig,
     resource_manager.resource_managers.move_to_end("kv_cache_manager",
                                                    last=True)
 
-    capacitor_scheduler = BindCapacityScheduler(
+    capacity_scheduler = BindCapacityScheduler(
         executor_config.max_batch_size, kv_cache_manager.impl,
         executor_config.scheduler_config.capacity_scheduler_policy)
     mb_scheduler = BindMicroBatchScheduler(executor_config.max_batch_size,
                                            executor_config.max_num_tokens,
                                            ctx_chunk_config)
-    scheduler = SimpleScheduler(capacitor_scheduler, mb_scheduler)
+    scheduler = SimpleScheduler(capacity_scheduler, mb_scheduler)
     decoder = TorchGreedySearchDecoder(mapping=mapping)
-    dist = MPIDist(mapping=mapping)
     py_executor = PyExecutor(resource_manager,
                              scheduler,
                              model_engine=model_engine,

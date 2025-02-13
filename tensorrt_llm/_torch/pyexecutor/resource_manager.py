@@ -101,8 +101,9 @@ class KVCacheManager(BaseResourceManager):
         self.num_heads = num_heads
         self.num_layers = num_layers
         self.mapping = mapping
-
         tp_size = mapping.tp_size
+        if mapping.enable_attention_dp:
+            tp_size = 1
 
         if isinstance(num_kv_heads, int):
             self.num_kv_heads_per_layer = [
@@ -122,6 +123,7 @@ class KVCacheManager(BaseResourceManager):
                     self.num_kv_heads_per_layer.append(0)
 
         assert len(self.num_kv_heads_per_layer) > 0
+
         self.is_homongenous = all(val == self.num_kv_heads_per_layer[0]
                                   for val in self.num_kv_heads_per_layer[1:])
 
@@ -300,19 +302,19 @@ class KVCacheManager(BaseResourceManager):
     def free_resources(self, request: LlmRequest):
         self.impl.remove_sequence(request.py_request_id, request)
 
-    def calculate_max_num_blocks(
-        self,
-        kv_cache_config: KvCacheConfigCpp,
-        head_dim: int,
-        tokens_per_block: int,
-        mapping: Mapping,
-        dtype: DataType,
-    ):
+    def calculate_max_num_blocks(self,
+                                 kv_cache_config: KvCacheConfigCpp,
+                                 head_dim: int,
+                                 tokens_per_block: int,
+                                 mapping: Mapping,
+                                 dtype: DataType,
+                                 kv_factor: int = 2):
         free_mem_fraction = (kv_cache_config.free_gpu_memory_fraction
                              if kv_cache_config.free_gpu_memory_fraction
                              is not None else 0.9)
 
-        cache_size_per_token = 2 * sum(self.num_kv_heads_per_layer) * head_dim
+        cache_size_per_token = kv_factor * sum(
+            self.num_kv_heads_per_layer) * head_dim
 
         if dtype == DataType.FP8:
             kv_cache_dtype_bytes = 1
@@ -399,6 +401,59 @@ class KVCacheManager(BaseResourceManager):
         return result.reshape(result.shape[0], 2, self.tokens_per_block,
                               self.num_kv_heads_per_layer[layer_idx],
                               self.head_dim)
+
+
+class MLAKVCacheManager(KVCacheManager):
+
+    def __init__(
+            self,
+            kv_cache_config: KvCacheConfigCpp,
+            kv_cache_type: CacheTypeCpp,
+            num_layers: int,
+            num_heads: int,
+            num_kv_heads: Union[int, List[Optional[int]]],
+            head_dim: int,
+            tokens_per_block: int,
+            # Note that max_seq_len is not necessarily equal to kv_cache_config.num_tokens.
+            # It's derived from the model's BuildConfig for consistency with the C++ backend.
+            max_seq_len: int,
+            max_batch_size: int,
+            mapping: Mapping,
+            dtype: DataType = DataType.HALF,
+            kv_lora_rank: int = None,
+            qk_rope_head_dim: int = None) -> None:
+        assert kv_lora_rank is not None and qk_rope_head_dim is not None, "both of kv_lora_rank and qk_rope_head_dim shall be set together"
+        head_dim = kv_lora_rank + qk_rope_head_dim
+
+        if isinstance(num_kv_heads, int):
+            num_kv_heads = 1
+        else:
+            assert len(num_kv_heads) == self.num_layers
+            num_kv_heads = [1 for _ in range(self.num_layers)]
+
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_rope_head_dim = qk_rope_head_dim
+
+        super().__init__(kv_cache_config, kv_cache_type, num_layers, num_heads,
+                         num_kv_heads, head_dim, tokens_per_block, max_seq_len,
+                         max_batch_size, mapping, dtype)
+
+    def calculate_max_num_blocks(
+        self,
+        kv_cache_config: KvCacheConfigCpp,
+        head_dim: int,
+        tokens_per_block: int,
+        mapping: Mapping,
+        dtype: DataType,
+    ):
+        # dim is
+        kv_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        return super().calculate_max_num_blocks(kv_cache_config,
+                                                kv_head_dim,
+                                                tokens_per_block,
+                                                mapping,
+                                                dtype,
+                                                kv_factor=1)
 
 
 class BaseDraftTokenManager(BaseResourceManager):

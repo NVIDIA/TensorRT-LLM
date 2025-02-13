@@ -2107,6 +2107,7 @@ class FP4Linear(Linear):
         self.scaling_vector_size = 16
         assert self.in_features % self.scaling_vector_size == 0, \
             "Input features must be a multiple of 16 for FP4 GEMM"
+
         self.weight = Parameter(shape=(self.out_features, self.in_features),
                                 dtype=trt.fp4)
         self.weights_block_scaling_factor = Parameter(

@@ -58,7 +58,7 @@ def parse_arguments():
     parser.add_argument('--load_model_on_cpu',
                         default=False,
                         action="store_true",
-                        help='Choose to load HF cpkt into GPU')
+                        help='Choose to load HF cpkt into CPU')
     parser.add_argument(
         '--use_parallel_embedding',
         action="store_true",

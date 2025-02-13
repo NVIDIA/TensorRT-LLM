@@ -2,6 +2,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
+import torch
 
 from tensorrt_llm.builder import PluginConfig
 from tensorrt_llm.llmapi.llm_utils import *
@@ -204,6 +205,16 @@ def test_CachedModelLoader():
     assert engine_dir.exists() and engine_dir.is_dir()
     model_format = ModelLoader.get_model_format(engine_dir)
     assert model_format is _ModelFormatKind.TLLM_ENGINE
+
+
+def test_LlmArgs_default_gpus_per_node():
+    # default
+    llm_args = LlmArgs(llama_model_path)
+    assert llm_args.gpus_per_node == torch.cuda.device_count()
+
+    # set explicitly
+    llm_args = LlmArgs(llama_model_path, gpus_per_node=6)
+    assert llm_args.gpus_per_node == 6
 
 
 if __name__ == '__main__':

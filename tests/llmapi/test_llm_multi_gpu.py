@@ -247,14 +247,28 @@ def test_llama_v2_7b_prompt_adapter_tp2():
 
 
 @skip_single_gpu
-def _test_llm_multi_node(engine_from_checkpoint: tempfile.TemporaryDirectory):
+def test_llm_multi_node(engine_from_checkpoint: tempfile.TemporaryDirectory):
     # TODO[chunweiy]: reactivate this later
     nworkers = 2
     test_case_file = os.path.join(os.path.dirname(__file__), "run_llm.py")
     os.path.join(os.path.dirname(__file__), "launch.py")
     command = f"mpirun --allow-run-as-root -n {nworkers} trtllm-llmapi-launch python3 {test_case_file} --model_dir {engine_from_checkpoint.name} --tp_size {nworkers}"
-    subprocess.run(command, shell=True, check=True,
-                   env=os.environ)  # nosec B603
+    try:
+        result = subprocess.run(command,
+                                shell=True,
+                                check=True,
+                                env=os.environ,
+                                capture_output=True,
+                                text=True)  # nosec B603
+        print("Command output:")
+        print(result.stdout)
+    except subprocess.CalledProcessError as e:
+        print("Command failed with exit code:", e.returncode)
+        print("Error output:")
+        print(e.stderr)
+        print("Standard output:")
+        print(e.stdout)
+        raise e
 
 
 @skip_single_gpu

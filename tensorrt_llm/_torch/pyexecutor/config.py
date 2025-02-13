@@ -41,6 +41,7 @@ class PyTorchConfig:
 
     attn_backend: str = 'TRTLLM'
     kv_cache_dtype: str = "auto"
+    print_iter_log: bool = True
 
     torch_compile_enabled: bool = False
     torch_compile_fullgraph: bool = False

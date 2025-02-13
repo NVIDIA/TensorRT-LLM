@@ -23,6 +23,7 @@
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunner.h"
 #include "tensorrt_llm/kernels/fmhaDispatcher.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
+#include "tensorrt_llm/kernels/internal_cutlass_kernels/include/fp8_blockscale_gemm.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
 #include "tensorrt_llm/kernels/xqaDispatcher.h"
@@ -39,6 +40,9 @@ namespace tensorrt_llm::common::op
 using tensorrt_llm::kernels::RotaryScalingType;
 using tensorrt_llm::kernels::PositionEmbeddingType;
 using tensorrt_llm::kernels::AttentionMaskType;
+
+using Fp8BlockScaleGemmRunnerPtr
+    = std::shared_ptr<tensorrt_llm::kernels::small_m_gemm::CutlassFp8BlockScaleGemmRunnerInterface>;
 
 class AttentionOp
 {
@@ -263,6 +267,12 @@ public:
     bool convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams& xqaParams,
         EnqueueGenerationParams<T> const& generationsParams, bool forConfigurePlugin);
 
+    template <typename T>
+    int ulyssesGenerationPreprocess(int32_t batch_beam, T* mhaInput, T* mhaOutput, T*& input, cudaStream_t stream);
+
+    template <typename T>
+    int ulyssesGenerationPostprocess(int32_t batch_beam, T* mhaInput, T* mhaOutput, void* output, cudaStream_t stream);
+
     bool isRelativePosition() const
     {
         return mPositionEmbeddingType == tensorrt_llm::kernels::PositionEmbeddingType::kRELATIVE;
@@ -332,6 +342,11 @@ public:
         return useCustomMask() && mEnableContextFMHA;
     }
 
+    bool isMLAEnabled() const
+    {
+        return mIsMLAEnabled;
+    }
+
     void reserveSemaphoreArray(int32_t size);
 
     void debugCheckSemaphores(cudaStream_t stream);
@@ -385,6 +400,7 @@ public:
     int32_t mSpecDecodingMaxGenerationLength = 1;
     bool mIsMLAEnabled = false;
     tensorrt_llm::kernels::mlaMetaParams mMLAParams;
+    bool mIsFP8BlockScalingEnabled = false;
     int mCpSize = 1;
     int mCpRank = 0;
     std::set<int32_t> mCpGroup = {};
@@ -409,6 +425,7 @@ public:
     UniqPtrWNullCopy<tensorrt_llm::kernels::FusedMHARunnerV2> mDecoderFMHARunner;
     UniqPtrWNullCopy<tensorrt_llm::kernels::FmhaDispatcher> mFmhaDispatcher;
     UniqPtrWNullCopy<tensorrt_llm::kernels::XqaDispatcher> mXqaDispatcher;
+    Fp8BlockScaleGemmRunnerPtr mGemmRunner;
 
     bool mMultiBlockMode = true;
     bool mEnableXQA = true;

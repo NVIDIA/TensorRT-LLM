@@ -19,8 +19,9 @@ from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
 from ..inputs import PromptInputs, create_input_processor, prompt_inputs
 from ..logger import logger
 from ..sampling_params import SamplingParams
-from .llm_utils import (LLMARGS_DOCSTRING, CachedModelLoader, LlmArgs,
-                        LlmBuildStats, ModelLoader, _ModelRuntimeContext)
+from .llm_utils import (LLMARGS_DOCSTRING, CachedModelLoader,
+                        KvCacheRetentionConfig, LlmArgs, LlmBuildStats,
+                        ModelLoader, _ModelRuntimeContext)
 from .mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                           external_mpi_comm_available)
 from .tokenizer import TokenizerBase, _xgrammar_tokenizer_info
@@ -100,9 +101,9 @@ class LLM:
             logger.error(
                 f"Failed to parse the arguments for the LLM constructor: {e}")
             raise e
-
         if self.args.parallel_config.is_multi_gpu:
-            if get_device_count() < self.args.parallel_config.world_size:
+            if get_device_count(
+            ) < self.args.parallel_config.world_size_per_node:
                 raise RuntimeError(
                     f"Only {get_device_count()} GPUs are available, but {self.args.parallel_config.world_size} are required."
                 )
@@ -160,6 +161,7 @@ class LLM:
         prompt_adapter_request: Optional[Union[
             PromptAdapterRequest, Sequence[PromptAdapterRequest]]] = None,
         queries: Optional[Union[PromptInputs, Sequence[PromptInputs]]] = None,
+        kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None
     ) -> Union[RequestOutput, List[RequestOutput]]:
         """Generate output for the given prompts in the synchronous mode.
         Synchronous generation accepts either single prompt or batched prompts.
@@ -208,12 +210,14 @@ class LLM:
             else:
                 pa_req = prompt_adapter_request
             request_queries = None if queries is None else queries[i]
-            future = self.generate_async(request_inputs,
-                                         queries=request_queries,
-                                         sampling_params=sp,
-                                         lora_request=lora_req,
-                                         prompt_adapter_request=pa_req,
-                                         streaming=False)
+            future = self.generate_async(
+                request_inputs,
+                queries=request_queries,
+                sampling_params=sp,
+                lora_request=lora_req,
+                prompt_adapter_request=pa_req,
+                kv_cache_retention_config=kv_cache_retention_config,
+                streaming=False)
             futures.append(future)
 
         for future in tqdm(futures,
@@ -235,6 +239,7 @@ class LLM:
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         streaming: bool = False,
         queries: Optional[PromptInputs] = None,
+        kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None
     ) -> RequestOutput:
         """Generate output for the given prompt in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -295,7 +300,7 @@ class LLM:
             prompt_adapter_request=prompt_adapter_request,
             streaming=streaming,
             prompt_tuning_config=prompt_tuning_config,
-        )
+            kv_cache_retention_config=kv_cache_retention_config)
         return RequestOutput(result, prompt, self.tokenizer)
 
     def _get_stats(self, timeout=None) -> str:

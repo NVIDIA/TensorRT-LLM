@@ -227,9 +227,9 @@ private:
         MROPE_POSITION_DELTAS,
         HOST_RUNTIME_PERF_KNOBS,
         HOST_CONTEXT_PROGRESS,
-        MLA_FUSED_Q_PROJ_TENSOR,
         MLA_Q_B_PROJ_TENSOR,
         MLA_KV_B_PROJ_TENSOR,
+        MLA_K_B_PROJ_TRANS_TENSOR,
         SKIP_ATTN,
         LOGN_SCALING,
         ENUM_SIZE, // Used to count the number of IdxEntry, must put in last

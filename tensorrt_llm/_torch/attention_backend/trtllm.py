@@ -1,12 +1,14 @@
+import math
 from dataclasses import dataclass
 from typing import Optional
 
 import torch
 
 from tensorrt_llm._torch.attention_backend.interface import (
-    AttentionBackend, AttentionMask, AttentionMetadata,
+    AttentionBackend, AttentionMask, AttentionMetadata, MLAParams,
     PositionalEmbeddingParams, PredefinedAttentionMask, RopeParams)
-from tensorrt_llm.functional import AttentionMaskType
+from tensorrt_llm.functional import (AttentionMaskType, RopeEmbeddingUtils,
+                                     RotaryScalingType)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -50,17 +52,28 @@ class TrtllmAttentionWrapper:
     rotary_embedding_max_positions: int
     rotary_embedding_original_max_positions: int
     use_paged_context_fmha: bool
+    is_mla_enable: Optional[bool]
+    q_b_proj: Optional[torch.Tensor]
+    kv_b_proj: Optional[torch.Tensor]
+    k_b_proj_trans: Optional[torch.Tensor]
+    q_lora_rank: int
+    kv_lora_rank: int
+    qk_rope_head_dim: int
+    qk_nope_head_dim: int
+    v_head_dim: int
     kwargs: dict
 
     def __init__(
-        self,
-        layer_idx: int,
-        num_heads: int,
-        head_size: int,
-        num_kv_heads: Optional[int] = None,
-        pos_embd_params: Optional[PositionalEmbeddingParams] = None,
-        quant_config: Optional[QuantConfig] = None,
-        **kwargs,
+            self,
+            layer_idx: int,
+            num_heads: int,
+            head_size: int,
+            num_kv_heads: Optional[int] = None,
+            pos_embd_params: Optional[PositionalEmbeddingParams] = None,
+            quant_config: Optional[QuantConfig] = None,
+            is_mla_enable: Optional[bool] = False,
+            mla_params: Optional[MLAParams] = MLAParams(),
+            **kwargs,
     ):
         """
         Initialize the attention wrapper.
@@ -78,8 +91,52 @@ class TrtllmAttentionWrapper:
             self.rotary_inv_freq = None
             self.rotary_cos_sin = None
             rope_params = RopeParams()
-        self.rotary_inv_freq, self.rotary_cos_sin = rope_params.create_rope_const_params(
-        )
+
+        self.is_mla_enable = is_mla_enable
+        self.q_lora_rank = mla_params.q_lora_rank
+        self.kv_lora_rank = mla_params.kv_lora_rank
+        self.qk_nope_head_dim = mla_params.qk_nope_head_dim
+        self.qk_rope_head_dim = mla_params.qk_rope_head_dim
+        self.v_head_dim = mla_params.v_head_dim
+
+        if is_mla_enable:
+            self.rotary_embedding_dim = 0
+
+            def yarn_get_mscale(scale=1, mscale=1):
+                if scale <= 1:
+                    return 1.0
+                return 0.1 * mscale * math.log(scale) + 1.0
+
+            mscale_all_dim = rope_params.mscale_all_dim
+            scaling_factor = rope_params.scale
+            if mscale_all_dim:
+                mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
+                self.q_scaling = 1.0 / (mscale * mscale)
+
+            rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_deepseek_attention_plugin(
+                rope_params.max_positions,
+                self.qk_rope_head_dim,
+                rope_params.theta,
+                rope_params.scale,
+                rope_params.original_max_positions,
+                rope_params.beta_fast,
+                rope_params.beta_slow,
+                rope_params.mscale,
+                rope_params.mscale_all_dim,
+            )
+            self.rotary_cos_sin = torch.tensor(rope_cos_sin,
+                                               dtype=torch.float32,
+                                               device="cuda")
+            self.rotary_inv_freq = None
+            self.rotary_embedding_scale_type = RotaryScalingType.none
+            self.rotary_embedding_scale = 1.0
+        else:
+            self.rotary_inv_freq, self.rotary_cos_sin = rope_params.create_rope_const_params(
+            )
+            self.rotary_embedding_dim = rope_params.dim
+            self.rotary_embedding_scale_type = int(rope_params.scale_type)
+            self.rotary_embedding_scale = rope_params.scale
+
         self.layer_idx = layer_idx
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads or num_heads
@@ -88,10 +145,7 @@ class TrtllmAttentionWrapper:
         self.quant_mode = int(quant_config.layer_quant_mode)
         self.position_embedding_type = int(
             pos_embd_params.type) if pos_embd_params is not None else 0
-        self.rotary_embedding_dim = rope_params.dim
         self.rotary_embedding_base = rope_params.theta
-        self.rotary_embedding_scale_type = int(rope_params.scale_type)
-        self.rotary_embedding_scale = rope_params.scale
         self.rotary_embedding_short_m_scale = rope_params.short_m_scale
         self.rotary_embedding_long_m_scale = rope_params.long_m_scale
         self.rotary_embedding_max_positions = rope_params.max_positions
@@ -123,6 +177,13 @@ class TrtllmAttentionWrapper:
         kv_scale_quant_orig: Optional[torch.Tensor] = None,
         out_scale: Optional[torch.Tensor] = None,
         use_paged_context_fmha: bool = False,
+        q_b_proj: Optional[torch.Tensor] = None,
+        kv_b_proj: Optional[torch.Tensor] = None,
+        k_b_proj_trans: Optional[torch.Tensor] = None,
+        q_b_proj_scale: Optional[torch.Tensor] = None,
+        kv_b_proj_scale: Optional[torch.Tensor] = None,
+        k_b_proj_trans_scale: Optional[torch.Tensor] = None,
+        is_fp8_block_scaling_enabled: bool = False,
         **kwargs,
     ):
         """
@@ -171,6 +232,13 @@ class TrtllmAttentionWrapper:
         self.kv_scale_quant_orig = kv_scale_quant_orig
         self.out_scale = out_scale
         self.use_paged_context_fmha = use_paged_context_fmha
+        self.q_b_proj = q_b_proj
+        self.kv_b_proj = kv_b_proj
+        self.k_b_proj_trans = k_b_proj_trans
+        self.q_b_proj_scale = q_b_proj_scale
+        self.kv_b_proj_scale = kv_b_proj_scale
+        self.k_b_proj_trans_scale = k_b_proj_trans_scale
+        self.is_fp8_block_scaling_enabled = is_fp8_block_scaling_enabled
         self.kwargs.update(kwargs)
 
     def run(
@@ -201,33 +269,51 @@ class TrtllmAttentionWrapper:
                 f"unknown arguments {list(self.kwargs.keys())} in attention wrapper"
             )
 
-        if is_fused_qkv:
-            qkv_hidden_size = (self.num_heads +
-                               2 * self.num_kv_heads) * self.head_size
-            assert q.shape[1] == qkv_hidden_size
-        else:
-            q_hidden_size = self.num_heads * self.head_size
-            assert q.shape[1] == q_hidden_size
-            if update_kv_cache:
-                kv_hidden_size = self.num_kv_heads * self.head_size
-                assert k.shape[1] == kv_hidden_size
-                assert v.shape[1] == kv_hidden_size
-        num_tokens = q.shape[0]
-        if k is not None:
-            assert k.shape[0] == num_tokens
-            assert v.shape[0] == num_tokens
-        batch_size = self.sequence_length.shape[0]
-        assert self.host_past_key_value_lengths.shape[0] == batch_size
-        assert self.context_lengths.shape[0] == batch_size
-        assert self.host_context_lengths.shape[0] == batch_size
-        assert self.host_request_types.shape[0] == batch_size
+        if not self.is_mla_enable:
+            if is_fused_qkv:
+                qkv_hidden_size = (self.num_heads +
+                                   2 * self.num_kv_heads) * self.head_size
+                assert q.shape[1] == qkv_hidden_size
+            else:
+                q_hidden_size = self.num_heads * self.head_size
+                assert q.shape[1] == q_hidden_size
+                if update_kv_cache:
+                    kv_hidden_size = self.num_kv_heads * self.head_size
+                    assert k.shape[1] == kv_hidden_size
+                    assert v.shape[1] == kv_hidden_size
+            num_tokens = q.shape[0]
+            if k is not None:
+                assert k.shape[0] == num_tokens
+                assert v.shape[0] == num_tokens
+            batch_size = self.sequence_length.shape[0]
+            assert self.host_past_key_value_lengths.shape[0] == batch_size
+            assert self.context_lengths.shape[0] == batch_size
+            assert self.host_context_lengths.shape[0] == batch_size
+            assert self.host_request_types.shape[0] == batch_size
 
-        if attention_mask == PredefinedAttentionMask.CAUSAL:
-            mask_type = AttentionMaskType.causal
-        elif attention_mask == PredefinedAttentionMask.FULL:
-            mask_type = AttentionMaskType.padding
+            if attention_mask == PredefinedAttentionMask.CAUSAL:
+                mask_type = AttentionMaskType.causal
+            elif attention_mask == PredefinedAttentionMask.FULL:
+                mask_type = AttentionMaskType.padding
+            else:
+                raise ValueError("Unexpected attention mask type")
         else:
-            raise ValueError("Unexpected attention mask type")
+            assert is_fused_qkv
+            qkv_hidden_size = self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim
+            assert q.shape[1] == qkv_hidden_size
+            num_tokens = q.shape[0]
+            batch_size = self.sequence_length.shape[0]
+            assert self.host_past_key_value_lengths.shape[0] == batch_size
+            assert self.context_lengths.shape[0] == batch_size
+            assert self.host_context_lengths.shape[0] == batch_size
+            assert self.host_request_types.shape[0] == batch_size
+
+            if attention_mask == PredefinedAttentionMask.CAUSAL:
+                mask_type = AttentionMaskType.causal
+            elif attention_mask == PredefinedAttentionMask.FULL:
+                mask_type = AttentionMaskType.padding
+            else:
+                raise ValueError("Unexpected attention mask type")
 
         output = torch.ops.trtllm.attention(
             q,
@@ -250,12 +336,19 @@ class TrtllmAttentionWrapper:
             self.out_scale,
             self.rotary_inv_freq,
             self.rotary_cos_sin,
+            self.q_b_proj,
+            self.kv_b_proj,
+            self.k_b_proj_trans,
+            self.q_b_proj_scale,
+            self.kv_b_proj_scale,
+            self.k_b_proj_trans_scale,
             is_fused_qkv,
             update_kv_cache,
             self.layer_idx,
             self.num_heads,
-            self.num_kv_heads,
-            self.head_size,
+            1 if self.is_mla_enable else self.num_kv_heads,
+            self.kv_lora_rank +
+            self.qk_rope_head_dim if self.is_mla_enable else self.head_size,
             self.tokens_per_block,
             self.max_num_requests,
             self.max_context_length,
@@ -274,6 +367,13 @@ class TrtllmAttentionWrapper:
             self.rotary_embedding_max_positions,
             self.rotary_embedding_original_max_positions,
             self.use_paged_context_fmha,
+            self.is_mla_enable,
+            self.q_lora_rank,
+            self.kv_lora_rank,
+            self.qk_nope_head_dim,
+            self.qk_rope_head_dim,
+            self.v_head_dim,
+            self.is_fp8_block_scaling_enabled,
         )
         return output
 
@@ -368,6 +468,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         num_kv_heads: Optional[int] = None,
         pos_embd_params: Optional[PositionalEmbeddingParams] = None,
         quant_config: Optional[QuantConfig] = None,
+        is_mla_enable: Optional[bool] = False,
+        mla_params: Optional[MLAParams] = None,
     ):
         """
         Initialize the backend.
@@ -390,7 +492,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             num_kv_heads,
             pos_embd_params=pos_embd_params,
             quant_config=quant_config,
+            is_mla_enable=is_mla_enable,
+            mla_params=mla_params,
         )
+
+        self.is_mla_enable = is_mla_enable
+        self.mla_params = mla_params
+
         self.kv_cache_scaling_factor = torch.tensor(
             [1.0],
             dtype=torch.float32,
@@ -399,12 +507,15 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.kv_scale_quant_orig = self.kv_cache_scaling_factor
         self.kv_scale_orig_quant = 1.0 / self.kv_scale_quant_orig
         self.has_fp8_qdq = self.has_fp8_kv_cache = self.has_nvfp4 = False
+        self.is_fp8_block_scaling_enabled = False
         if self.quant_config:
             self.has_fp8_qdq = self.quant_config.layer_quant_mode.has_fp8_qdq()
             self.has_nvfp4 = self.quant_config.layer_quant_mode.has_nvfp4()
             self.has_fp8_kv_cache = self.quant_config.layer_quant_mode.has_fp8_kv_cache(
             )
             self.has_nvfp4 = self.quant_config.layer_quant_mode.has_nvfp4()
+            self.is_fp8_block_scaling_enabled = self.quant_config.layer_quant_mode.has_fp8_block_scales(
+            )
 
     def forward(
         self,
@@ -415,24 +526,58 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         out_scale: Optional[torch.Tensor] = None,
         *,
         attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
+        q_b_proj: Optional[torch.Tensor] = None,
+        kv_b_proj: Optional[torch.Tensor] = None,
+        k_b_proj_trans: Optional[torch.Tensor] = None,
+        q_b_proj_scale: Optional[torch.Tensor] = None,
+        kv_b_proj_scale: Optional[torch.Tensor] = None,
+        k_b_proj_trans_scale: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         # This is only for memory estimation for now.
         # NOTE: this method is not accurate while it works for most scenario.
         if metadata is None or metadata.kv_cache_manager is None:
-            num_heads = self.wrapper.num_heads
-            num_kv_heads = self.wrapper.num_kv_heads
-            head_dim = q.shape[-1]
-            q_size = int(head_dim * num_heads / (num_heads + 2 * num_kv_heads))
-            kv_size = int(head_dim * num_kv_heads /
-                          (num_heads + 2 * num_kv_heads))
-            q, k, v = q.split([q_size, kv_size, kv_size], dim=-1)
-            head_dim = int(q_size / num_heads)
-            assert head_dim == self.wrapper.head_size, "given head dim is not equal with head dim in q."
-            q = q.reshape(1, -1, num_heads, head_dim).contiguous()
-            k = k.reshape(1, -1, num_kv_heads, head_dim).contiguous()
-            v = v.reshape(1, -1, num_kv_heads, head_dim).contiguous()
-            return AttentionBackend.dummy_forward(q, k, v)
+            if not self.is_mla_enable:
+                num_heads = self.wrapper.num_heads
+                num_kv_heads = self.wrapper.num_kv_heads
+                head_dim = q.shape[-1]
+                q_size = int(head_dim * num_heads /
+                             (num_heads + 2 * num_kv_heads))
+                kv_size = int(head_dim * num_kv_heads /
+                              (num_heads + 2 * num_kv_heads))
+                q, k, v = q.split([q_size, kv_size, kv_size], dim=-1)
+                head_dim = int(q_size / num_heads)
+                assert head_dim == self.wrapper.head_size, "given head dim is not equal with head dim in q."
+                q = q.reshape(1, -1, num_heads, head_dim).contiguous()
+                k = k.reshape(1, -1, num_kv_heads, head_dim).contiguous()
+                v = v.reshape(1, -1, num_kv_heads, head_dim).contiguous()
+                return AttentionBackend.dummy_forward(q, k, v)
+            else:
+                # now the dummy_forward doesn't support mla, it's not accurate
+                num_heads = self.wrapper.num_heads
+                num_kv_heads = self.wrapper.num_kv_heads
+                head_dim = self.mla_params.qk_nope_head_dim + self.mla_params.qk_rope_head_dim
+                seq_len = int(q.numel() / q.shape[-1])
+                q = torch.randn(1,
+                                seq_len,
+                                num_heads,
+                                head_dim,
+                                dtype=q.dtype,
+                                device=q.device)
+                k = torch.randn(1,
+                                seq_len,
+                                num_kv_heads,
+                                head_dim,
+                                dtype=q.dtype,
+                                device=q.device)
+                v = torch.randn(1,
+                                seq_len,
+                                num_kv_heads,
+                                head_dim,
+                                dtype=q.dtype,
+                                device=q.device)
+                return AttentionBackend.dummy_forward(
+                    q, k, v)[..., :num_kv_heads * self.mla_params.v_head_dim]
 
         assert isinstance(
             metadata,
@@ -476,6 +621,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             kv_scale_quant_orig=self.kv_scale_quant_orig,
             out_scale=out_scale,
             use_paged_context_fmha=use_paged_context_fmha,
+            q_b_proj=q_b_proj,
+            kv_b_proj=kv_b_proj,
+            k_b_proj_trans=k_b_proj_trans,
+            q_b_proj_scale=q_b_proj_scale,
+            kv_b_proj_scale=kv_b_proj_scale,
+            k_b_proj_trans_scale=k_b_proj_trans_scale,
+            is_fp8_block_scaling_enabled=self.is_fp8_block_scaling_enabled,
         )
         out_dtype = None
         if out_scale is not None:

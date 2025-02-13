@@ -59,6 +59,8 @@ public:
     using RequestVector = std::vector<LlmRequestPtr>;
     using PeftTable = std::map<uint64_t, std::vector<runtime::LoraCache::TaskLayerModuleConfig>>;
 
+    virtual ~BasePeftCacheManager() = default;
+
     /**
      * \brief add PEFT weights from llmRequest if any.  This will kickoff background copy tasks.
      * \param[in] llmRequest: the request
@@ -99,6 +101,8 @@ class PeftCacheManager : public BasePeftCacheManager
 public:
     PeftCacheManager(PeftCacheManagerConfig const& config, runtime::ModelConfig const& modelConfig,
         runtime::WorldConfig const& worldConfig, runtime::BufferManager const& bufferManager);
+
+    ~PeftCacheManager() override = default;
 
     void addRequestPeft(std::shared_ptr<LlmRequest> llmRequest, bool tryGpuCache = true) override;
 
@@ -166,6 +170,10 @@ private:
 
 class NoOpPeftCacheManager : public BasePeftCacheManager
 {
+public:
+    ~NoOpPeftCacheManager() override = default;
+
+private:
     void addRequestPeft(std::shared_ptr<LlmRequest> llmRequest, bool tryGpuCache = true) override;
 
     PeftTable ensureBatch(RequestVector const& contextRequests, RequestVector const& generationRequests,

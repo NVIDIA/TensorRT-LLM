@@ -22,6 +22,7 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/tllmException.h"
 #include <algorithm>
+#include <cassert>
 #include <cinttypes>
 #include <cublasLt.h>
 #include <cublas_v2.h>
@@ -729,6 +730,624 @@ __device__ inline void printMatrixDevice(T const* ptr, int nRow, int nCol, int n
     printf("addr=%p, sizeof(T)=%lu, nRow=%d, nStride=%d, sizeInByte=%lu\n", ptr, sizeof(T), nRow, nStride, sizeInByte);
     print_elements(ptr, nRow, nCol, nStride);
 }
+
+#ifndef CUDA_CALL
+#define CUDA_CALL(answer)                                                                                              \
+    {                                                                                                                  \
+        gpuAssert((answer), __FILE__, __LINE__);                                                                       \
+    }
+
+inline void gpuAssert(cudaError_t code, char const* file, int line, bool abort = true)
+{
+    if (code != cudaSuccess)
+    {
+        fprintf(stderr, "CUDA error: %s @ %s:%d\n", cudaGetErrorString(code), file, line);
+        if (abort)
+            exit(code);
+    }
+}
+
+inline void gpuAssert(CUresult code, char const* file, int line, bool abort = true)
+{
+    if (code != CUresult::CUDA_SUCCESS)
+    {
+        char const* buf = "Unknown error";
+        assert(cuGetErrorString(code, &buf) == CUresult::CUDA_SUCCESS);
+        fprintf(stderr, "Driver API error: %s @ %s:%d\n", buf, file, line);
+        if (abort)
+            exit(code);
+    }
+}
+#endif
+
+template <typename T>
+struct UpperType;
+
+template <>
+struct UpperType<int8_t>
+{
+    using Type = int;
+};
+
+template <>
+struct UpperType<uint32_t>
+{
+    using Type = uint32_t;
+};
+
+template <>
+struct UpperType<int>
+{
+    using Type = int;
+};
+
+template <>
+struct UpperType<__nv_bfloat16>
+{
+    using Type = double;
+};
+
+template <>
+struct UpperType<half>
+{
+    using Type = double;
+};
+
+template <>
+struct UpperType<float>
+{
+    using Type = double;
+};
+
+extern "C"
+{
+    __device__ uint32_t __nvvm_get_smem_pointer(void* ptr);
+}
+
+__forceinline__ __device__ void issue_stas(uint32_t dist_barrier_ptr, uint32_t dist_buffer_ptr, uint32_t d0)
+{
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDACC_VER_MAJOR__ >= 12))
+    asm volatile("st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %2, [%1];\n\t"
+                 :
+                 : "r"(dist_buffer_ptr), "r"(dist_barrier_ptr), "r"(d0));
+#endif
+}
+
+__forceinline__ __device__ void issue_stas(uint32_t dist_barrier_ptr, uint32_t dist_buffer_ptr, uint64_t d0)
+{
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDACC_VER_MAJOR__ >= 12))
+    asm volatile("st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.b64 [%0], %2, [%1];\n\t"
+                 :
+                 : "r"(dist_buffer_ptr), "r"(dist_barrier_ptr), "l"(d0));
+#endif
+}
+
+__forceinline__ __device__ void issue_stas(
+    uint32_t dist_barrier_ptr, uint32_t dist_buffer_ptr, uint32_t d0, uint32_t d1)
+{
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDACC_VER_MAJOR__ >= 12))
+    asm volatile("st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v2.b32 [%0], {%2, %3}, [%1];\n\t"
+                 :
+                 : "r"(dist_buffer_ptr), "r"(dist_barrier_ptr), "r"(d0), "r"(d1));
+#endif
+}
+
+__forceinline__ __device__ void issue_stas(
+    uint32_t dist_barrier_ptr, uint32_t dist_buffer_ptr, uint32_t d0, uint32_t d1, uint32_t d2, uint32_t d3)
+{
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDACC_VER_MAJOR__ >= 12))
+    asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%2, %3, %4, %5}, [%1];\n\t"
+                 :
+                 : "r"(dist_buffer_ptr), "r"(dist_barrier_ptr), "r"(d0), "r"(d1), "r"(d2), "r"(d3));
+#endif
+}
+
+inline __device__ uint32_t elect_one_sync()
+{
+    uint32_t pred = 0;
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDACC_VER_MAJOR__ >= 12))
+#if (defined(__CUDA_ARCH_FEAT_SM90_ALL))
+    uint32_t laneid = 0;
+    asm volatile(
+        "\n\
+    {\n\
+        .reg .b32 %rx;\n\
+        .reg .pred %px;\n\
+        elect.sync %rx|%px, %2;\n\
+        @%px mov.s32 %1, 1;\n\
+        mov.s32 %0, %rx;\n\
+    }\n\
+  "
+        : "+r"(laneid), "+r"(pred)
+        : "r"(0xFFFFFFFF));
+#endif
+#endif
+    return pred;
+}
+
+__forceinline__ __device__ uint32_t get_smem_pointer(void const* ptr)
+{
+    return __nvvm_get_smem_pointer(const_cast<void*>(ptr));
+}
+
+__forceinline__ __device__ void bar_create(void* bar_ptr, int init_count)
+{
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
+    unsigned smem_ptr = get_smem_pointer(bar_ptr);
+
+    asm volatile(
+        "{\n\t"
+        "mbarrier.init.shared.b64 [%1], %0; \n\t"
+        "}"
+        :
+        : "r"(init_count), "r"(smem_ptr));
+#endif
+}
+
+struct Arrive_wait
+{
+public:
+    __forceinline__ __device__ Arrive_wait()
+    {
+        bar_base_ = NULL;
+    }
+
+    __forceinline__ __device__ Arrive_wait(uint64_t* bar_base, int id = 0)
+    {
+        bar_base_ = bar_base;
+        id_ = id;
+    }
+
+    __forceinline__ __device__ int bar_peek(int id, unsigned int bar_phase)
+    {
+        uint32_t result32{};
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
+        auto* bar_ptr = bar_base_ + id;
+        unsigned smem_ptr = get_smem_pointer(bar_ptr);
+        asm volatile(
+            "{\n\t"
+            ".reg .pred       P1; \n\t"
+            "mbarrier.try_wait.parity.shared.b64 P1, [%1], %2; \n\t"
+            "selp.b32 %0, 1, 0, P1; \n\t"
+            "}"
+            : "=r"(result32)
+            : "r"(smem_ptr), "r"(bar_phase));
+#endif
+        return result32;
+    }
+
+    __forceinline__ __device__ int bar_peek(int id, unsigned int bar_phase, int pred)
+    {
+        uint32_t result32{};
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
+        auto* bar_ptr = bar_base_ + id;
+        unsigned smem_ptr = get_smem_pointer(bar_ptr);
+        asm volatile(
+            "{\n\t"
+            ".reg .pred       P1; \n\t"
+            ".reg .pred P2;\n\t"
+            "setp.eq.u32 P2, %3, 1;\n\t"
+            "@P2 mbarrier.try_wait.parity.shared.b64 P1, [%1], %2; \n\t"
+            "selp.b32 %0, 1, 0, P1; \n\t"
+            "}"
+            : "=r"(result32)
+            : "r"(smem_ptr), "r"(bar_phase), "r"(pred));
+#endif
+        return result32;
+    }
+
+    __forceinline__ __device__ void bar_wait(int id, unsigned int bar_phase)
+    {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
+        auto* bar_ptr = bar_base_ + id;
+        unsigned smem_ptr = get_smem_pointer(bar_ptr);
+        asm volatile(
+            "{\n\t"
+            ".reg .pred                P1; \n\t"
+            "LAB_WAIT: \n\t"
+            "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 P1, [%0], %1; \n\t"
+            "@P1                       bra.uni DONE; \n\t"
+            "bra.uni                   LAB_WAIT; \n\t"
+            "DONE: \n\t"
+            "}"
+            :
+            : "r"(smem_ptr), "r"(bar_phase));
+#endif
+    }
+
+    __forceinline__ __device__ void bar_arrive_dsmem(int const& id)
+    {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
+        auto* bar_ptr = bar_base_ + id;
+        asm volatile(
+            "{\n\t"
+            "mbarrier.arrive.b64   _, [%0];\n\t"
+            "}"
+            :
+            : "l"(bar_ptr));
+#endif
+    }
+
+    __forceinline__ __device__ void bar_arrive_dsmem(int const& id, uint32_t const& pred)
+    {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
+        asm volatile(
+            "{\n\t"
+            " .reg .pred p;\n\t"
+            " .reg .s64 addr;\n\t"
+            " .reg .b64 tmp;\n\t"
+            "   setp.eq.u32 p, %2, 1;\n\t"
+            "   mul.wide.s32 tmp, %0, 8;\n\t"
+            "   add.s64 addr, tmp, %1;\n\t"
+            "@p mbarrier.arrive.b64   _, [addr];\n\t"
+            "}"
+            :
+            : "r"(id), "l"(bar_base_), "r"(pred));
+#endif
+    }
+
+    // Sets up the base address for arrival with the correct ctaid in cga
+    __forceinline__ __device__ void set_bar_base_dsmem(uint32_t const& cta_id)
+    {
+        bar_base_ = reinterpret_cast<uint64_t*>(
+            (reinterpret_cast<uintptr_t>(bar_base_) & 0xFFFFFFFFF0FFFFFFULL) + (cta_id << 24));
+    }
+
+    __forceinline__ __device__ void bar_arrive_normal(int id, bool flag = true)
+    {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
+        if (flag == true)
+        {
+            uint64_t* bar_ptr = reinterpret_cast<uint64_t*>(bar_base_ + id);
+            unsigned smem_ptr = get_smem_pointer(bar_ptr);
+            asm volatile(
+                "{\n\t"
+                ".reg .b64 state; \n\t"
+                "mbarrier.arrive.shared.b64   state, [%0];\n\t"
+                "}"
+                :
+                : "r"(smem_ptr));
+        }
+#endif
+    }
+
+    __forceinline__ __device__ void bar_arrive_set_transactioncnt(int id, int expected_copy_bytes)
+    {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
+        auto* bar_ptr = bar_base_ + id;
+        unsigned smem_ptr = get_smem_pointer(bar_ptr);
+        asm volatile(
+            "{\n\t"
+            "mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1; \n\t"
+            "}"
+            :
+            : "r"(smem_ptr), "r"(expected_copy_bytes));
+#endif
+    }
+
+    __forceinline__ __device__ void bar_arrive_set_transactioncnt(int id, int expected_copy_bytes, uint32_t pred)
+    {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
+        auto* bar_ptr = bar_base_ + id;
+        unsigned smem_ptr = get_smem_pointer(bar_ptr);
+        asm volatile(
+            "{\n\t"
+            ".reg .pred p;\n\t"
+            "setp.eq.u32 p, %2, 1;\n\t"
+            "@p mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1; \n\t"
+            "}"
+            :
+            : "r"(smem_ptr), "r"(expected_copy_bytes), "r"(pred));
+#endif
+    }
+
+    __forceinline__ __device__ uint64_t* bar_base()
+    {
+        return bar_base_;
+    }
+
+    __forceinline__ __device__ uint64_t* get_bar_addr(int id)
+    {
+        return bar_base_ + id;
+    }
+
+private:
+    // smem barrier base pointer
+    uint64_t* bar_base_;
+    // barrier id
+    int id_;
+};
+
+__forceinline__ __device__ void cga_sync()
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("barrier.cluster.sync;\n" : :);
+#endif
+}
+
+__forceinline__ __device__ void cga_arrive()
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("barrier.cluster.arrive.aligned;\n" : :);
+#endif
+}
+
+__forceinline__ __device__ void cga_wait()
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("barrier.cluster.wait.aligned;\n" : :);
+#endif
+}
+
+inline __device__ void fence_view_async_shared()
+{
+
+    // only compiles on sm90+
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("fence.proxy.async.shared::cta;\n" : :);
+#endif
+}
+
+template <typename T>
+__forceinline__ __device__ T* get_DSMEM_ptr(T* localAddress, uint32_t destCtaId)
+{
+    T* dsmemAddress
+        = reinterpret_cast<T*>(((unsigned long long int) localAddress & 0xFFFFFFFFF0FFFFFFULL) + (destCtaId << 24));
+    return dsmemAddress;
+}
+
+template <typename T>
+__forceinline__ __device__ void write_DSMEM_Address(T* localAddress, uint32_t destCtaId, T val)
+{
+    T* dsmemAddress = get_DSMEM_ptr(localAddress, destCtaId);
+    *dsmemAddress = val;
+}
+
+__forceinline__ __device__ void arrive_barrier(uint64_t* p_barrier, uint32_t arrive_cnt = 1)
+{
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
+    asm volatile("{mbarrier.arrive.shared.b64   _, [%0],%1;\n\t}" : : "l"(p_barrier), "r"(arrive_cnt));
+#endif
+}
+
+__forceinline__ __device__ void arrive_DSMEM_barrier(uint64_t* p_barrier, uint32_t ctaid)
+{
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
+    uint64_t* p_barrier_remote = get_DSMEM_ptr(p_barrier, ctaid);
+    asm volatile("{mbarrier.arrive.b64   _, [%0];\n\t}" : : "l"(p_barrier_remote));
+#endif
+}
+
+__forceinline__ __device__ void arrive_DSMEM_barrier_and_set_tx_cnt(
+    uint64_t* p_barrier, uint32_t ctaid, uint32_t expected_copy_bytes)
+{
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
+    uint32_t p_bar = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(get_DSMEM_ptr(p_barrier, ctaid)));
+    asm volatile("{mbarrier.arrive.expect_tx.b64 _, [%0], %1; \n\t}" ::"r"(p_bar), "r"(expected_copy_bytes));
+#endif
+}
+
+template <bool barSetTxCnt = true>
+__forceinline__ __device__ void stas(uint32_t* p_data, uint64_t* p_barrier, uint32_t ctaid, uint32_t const& wrdat)
+{
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
+    if (barSetTxCnt)
+        arrive_DSMEM_barrier_and_set_tx_cnt(p_barrier, ctaid, sizeof(uint32_t));
+    uint32_t buffer_ptr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(p_data));
+    uint32_t barrier_ptr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(p_barrier));
+
+    uint32_t buffer_ptr_, barrier_ptr_;
+    asm volatile(
+        "{\n\t"
+        "setctarank.shared.u32 %0, %2, %4;\n\t"
+        "setctarank.shared.u32 %1, %3, %4;\n\t"
+        "}"
+        : "=r"(buffer_ptr_), "=r"(barrier_ptr_)
+        : "r"(buffer_ptr), "r"(barrier_ptr), "r"(ctaid));
+    issue_stas(buffer_ptr_, barrier_ptr_, wrdat);
+#endif
+}
+
+template <bool barSetTxCnt = true>
+__forceinline__ __device__ void stas(uint64_t* p_data, uint64_t* p_barrier, uint32_t ctaid, uint64_t const& wrdat)
+{
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
+    if (barSetTxCnt)
+        arrive_DSMEM_barrier_and_set_tx_cnt(p_barrier, ctaid, sizeof(uint64_t));
+    uint32_t buffer_ptr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(p_data));
+    uint32_t barrier_ptr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(p_barrier));
+
+    uint32_t buffer_ptr_, barrier_ptr_;
+    asm volatile(
+        "{\n\t"
+        "setctarank.shared.u32 %0, %2, %4;\n\t"
+        "setctarank.shared.u32 %1, %3, %4;\n\t"
+        "}"
+        : "=r"(buffer_ptr_), "=r"(barrier_ptr_)
+        : "r"(buffer_ptr), "r"(barrier_ptr), "r"(ctaid));
+    issue_stas(buffer_ptr_, barrier_ptr_, wrdat);
+#endif
+}
+
+template <bool barSetTxCnt = true>
+__forceinline__ __device__ void stas(uint64_t* p_data, uint64_t* p_barrier, uint32_t ctaid, const uint32_t wrdat0,
+    const uint32_t wrdat1, const uint32_t wrdat2, const uint32_t wrdat3)
+{
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
+    if (barSetTxCnt)
+        arrive_DSMEM_barrier_and_set_tx_cnt(p_barrier, ctaid, 4 * sizeof(uint32_t));
+    uint32_t buffer_ptr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(p_data));
+    uint32_t barrier_ptr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(p_barrier));
+
+    uint32_t buffer_ptr_, barrier_ptr_;
+    asm volatile(
+        "{\n\t"
+        "setctarank.shared.u32 %0, %2, %4;\n\t"
+        "setctarank.shared.u32 %1, %3, %4;\n\t"
+        "}"
+        : "=r"(buffer_ptr_), "=r"(barrier_ptr_)
+        : "r"(buffer_ptr), "r"(barrier_ptr), "r"(ctaid));
+    issue_stas(buffer_ptr_, barrier_ptr_, wrdat0, wrdat1, wrdat2, wrdat3);
+#endif
+}
+
+template <bool barSetTxCnt = true, bool assumeAligned = true, typename T = void>
+__forceinline__ __device__ void stas(T* p_data, uint64_t* p_barrier, uint32_t ctaid, T const& wrdat)
+{
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
+    static_assert(sizeof(T) % 4 == 0);
+    if (barSetTxCnt)
+        arrive_DSMEM_barrier_and_set_tx_cnt(p_barrier, ctaid, sizeof(T));
+
+    uint32_t buffer_ptr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(p_data));
+    uint32_t barrier_ptr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(p_barrier));
+
+    uint32_t buffer_ptr_, barrier_ptr_;
+    asm volatile(
+        "{\n\t"
+        "setctarank.shared.u32 %0, %2, %4;\n\t"
+        "setctarank.shared.u32 %1, %3, %4;\n\t"
+        "}"
+        : "=r"(buffer_ptr_), "=r"(barrier_ptr_)
+        : "r"(buffer_ptr), "r"(barrier_ptr), "r"(ctaid));
+
+    uint32_t const* p_wrdat_b32 = reinterpret_cast<uint32_t const*>(&wrdat);
+
+    for (uint32_t offset = 0; offset < sizeof(T);)
+    {
+        if constexpr (assumeAligned)
+        {
+            if (offset + 16 <= sizeof(T))
+            {
+                // Use write_async_v4_b32
+                issue_stas(buffer_ptr_ + offset, barrier_ptr_, p_wrdat_b32[offset / 4], p_wrdat_b32[offset / 4 + 1],
+                    p_wrdat_b32[offset / 4 + 2], p_wrdat_b32[offset / 4 + 3]);
+                offset += 16;
+            }
+            else if (offset + 8 <= sizeof(T) && (buffer_ptr + offset) % 8 == 0)
+            {
+                // Use write_async_v2_b32
+                issue_stas(buffer_ptr + offset, barrier_ptr_, p_wrdat_b32[offset / 4], p_wrdat_b32[offset / 4 + 1]);
+                offset += 8;
+            }
+            else
+            {
+                issue_stas(buffer_ptr + offset, barrier_ptr_, p_wrdat_b32[offset / 4]);
+                offset += 4;
+            }
+        }
+        else
+        {
+            issue_stas(buffer_ptr + offset, barrier_ptr_, p_wrdat_b32[offset / 4]);
+            offset += 4;
+        }
+    }
+#endif
+}
+
+struct OrderedMutex
+{
+    uint64_t barriers[2];
+
+    __device__ void init(int tid0, int threads0, int threads1)
+    {
+        if (tid0)
+        {
+            bar_create(&barriers[0], threads0);
+            bar_create(&barriers[1], threads1);
+        }
+    }
+
+    OrderedMutex() = default;
+    OrderedMutex(OrderedMutex const& other) = delete;
+};
+
+class OrderedMutexAccessor
+{
+public:
+    struct State
+    {
+        int phase = 0;
+    };
+
+private:
+    int _phase;
+    int _id;
+    Arrive_wait _barriers;
+
+public:
+    __device__ OrderedMutexAccessor(OrderedMutex& m, int id, State state)
+        : _phase(state.phase)
+        , _id(id)
+        , _barriers(m.barriers)
+    {
+    }
+
+    __device__ void arrive()
+    {
+        _barriers.bar_arrive_normal(_id);
+    }
+
+    __device__ void wait()
+    {
+        _barriers.bar_wait(_id ^ 1, _phase);
+        _phase ^= 1;
+    }
+
+    __device__ State exportState()
+    {
+        return {.phase = _phase};
+    }
+};
+
+template <typename T, T VALUE>
+struct ConstExprWrapper
+{
+    static constexpr T value = VALUE;
+};
+
+template <int VALUE>
+using Int = ConstExprWrapper<int, VALUE>;
+
+template <bool VALUE>
+using Bool = ConstExprWrapper<bool, VALUE>;
+
+template <typename T>
+struct TmaDescType;
+
+template <>
+struct TmaDescType<__nv_bfloat16>
+{
+    static constexpr auto value = CUtensorMapDataType_enum::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
+};
+
+template <>
+struct TmaDescType<float>
+{
+    static constexpr auto value = CUtensorMapDataType_enum::CU_TENSOR_MAP_DATA_TYPE_FLOAT32;
+};
+
+#define DEFINE_MEMBER_CHECKER(member)                                                                                  \
+    template <typename T, typename V = bool>                                                                           \
+    struct has_##member : std::false_type                                                                              \
+    {                                                                                                                  \
+    };                                                                                                                 \
+    template <typename T>                                                                                              \
+    struct has_##member<T,                                                                                             \
+        typename std::enable_if<!std::is_same<decltype(std::declval<T>().member), void>::value, bool>::type>           \
+        : std::true_type                                                                                               \
+    {                                                                                                                  \
+    };
+
+#define HAS_MEMBER(C, member) has_##member<C>::value
+
+DEFINE_MEMBER_CHECKER(output)
+DEFINE_MEMBER_CHECKER(residual)
+DEFINE_MEMBER_CHECKER(bias)
+DEFINE_MEMBER_CHECKER(deq)
+DEFINE_MEMBER_CHECKER(qua)
+DEFINE_MEMBER_CHECKER(high_preciecion_normed_output)
 
 template __device__ void printMatrixDevice(float const* ptr, int nRow, int nCol, int nStride);
 template __device__ void printMatrixDevice(half const* ptr, int nRow, int nCol, int nStride);

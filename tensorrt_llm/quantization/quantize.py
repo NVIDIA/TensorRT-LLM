@@ -40,21 +40,31 @@ def quantize_layers(
     for name, module, parent in model.named_modules_with_parent():
         module_name = name.rsplit('.', 1)[-1]
         is_excluded = False
+
+        # handle exclusion
         for exclude_module in exclude_modules:
             if fnmatch.fnmatchcase(name, exclude_module):
                 is_excluded = True
-                # MOE module will be quantize when initialization.
-                # We need to re-initialize a FP version of MOE module.
-                if isinstance(module, MixtureOfExperts):
-                    init_params = get_init_params(module, MixtureOfExperts)
-                    init_params["quant_mode"] = QuantMode(0)
-                    original_layer = MixtureOfExperts(**init_params)
-                    if parent is not None:
-                        setattr(parent, module_name, original_layer)
-                    else:
-                        model = original_layer
                 break
-        if not is_excluded:
+
+        # MOE module will be quantize when initialization.
+        # We need to handle it specially, we may want to redesign MoE implementation
+        if isinstance(module, MixtureOfExperts):
+            # We need to re-initialize a correct version of MOE module.
+            if is_excluded:
+                quant_mode = QuantMode(0)
+            else:
+                quant_mode = quant_config.quant_mode
+
+            init_params = get_init_params(module, MixtureOfExperts)
+            init_params["quant_mode"] = quant_mode
+
+            original_layer = MixtureOfExperts(**init_params)
+            if parent is not None:
+                setattr(parent, module_name, original_layer)
+            else:
+                model = original_layer
+        elif not is_excluded:
             quant_cls = None
             for cls in quant_map:
                 if isinstance(module, cls):
@@ -546,16 +556,13 @@ def kv_cache_quantize(model):
 
 
 def quantize(model, quant_config: Union[QuantConfig, LayerQuantConfig]):
-    quant_mode = quant_config.layer_quant_mode
 
     for name, module, parent in model.named_modules_with_parent():
+
         if quant_config.quant_algo == QuantAlgo.MIXED_PRECISION:
-            if name in quant_mode.keys():
-                layer_quant_mode = quant_mode[name]
-            else:
-                continue
+            layer_quant_mode = quant_config.layer_quant_mode(name)
         else:
-            layer_quant_mode = quant_mode
+            layer_quant_mode = quant_config.layer_quant_mode
         if layer_quant_mode == QuantMode(0):
             continue
 
@@ -566,9 +573,9 @@ def quantize(model, quant_config: Union[QuantConfig, LayerQuantConfig]):
         elif layer_quant_mode.has_fp8_rowwise():
             module = fp8_rowwise_quantize(module, layer_quant_cfg)
         elif layer_quant_mode.is_qserve_w4a8():
-            model = qserve_quantize(model, quant_config)
+            module = qserve_quantize(module, quant_config)
         elif layer_quant_mode.has_nvfp4():
-            model = fp4_quantize(model, layer_quant_cfg)
+            module = fp4_quantize(module, layer_quant_cfg)
         elif layer_quant_mode.has_act_and_weight_quant():
             module = smooth_quantize(module, layer_quant_cfg)
         elif layer_quant_mode.is_weight_only():

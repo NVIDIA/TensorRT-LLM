@@ -1,4 +1,5 @@
 import asyncio
+from typing import Optional
 
 import click
 from transformers import AutoTokenizer
@@ -50,6 +51,15 @@ from tensorrt_llm.serve import OpenAIServer
               type=int,
               default=1,
               help='Pipeline parallelism size.')
+@click.option("--ep_size",
+              type=int,
+              default=None,
+              help="expert parallelism size")
+@click.option("--gpus_per_node",
+              type=int,
+              default=None,
+              help="Number of GPUs per node. Default to None, and it will be "
+              "detected automatically.")
 @click.option("--kv_cache_free_gpu_memory_fraction",
               type=float,
               default=0.9,
@@ -61,8 +71,9 @@ from tensorrt_llm.serve import OpenAIServer
               help="Flag for HF transformers.")
 def main(model: str, tokenizer: str, host: str, port: int, backend: str,
          max_beam_width: int, max_batch_size: int, max_num_tokens: int,
-         max_seq_len: int, tp_size: int, pp_size: int,
-         kv_cache_free_gpu_memory_fraction: float, trust_remote_code: bool):
+         max_seq_len: int, tp_size: int, pp_size: int, ep_size: Optional[int],
+         gpus_per_node: Optional[int], kv_cache_free_gpu_memory_fraction: float,
+         trust_remote_code: bool):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -80,6 +91,8 @@ def main(model: str, tokenizer: str, host: str, port: int, backend: str,
         tokenizer=tokenizer,
         tensor_parallel_size=tp_size,
         pipeline_parallel_size=pp_size,
+        moe_expert_parallel_size=ep_size,
+        gpus_per_node=gpus_per_node,
         trust_remote_code=trust_remote_code,
         build_config=build_config,
         kv_cache_config=kv_cache_config,

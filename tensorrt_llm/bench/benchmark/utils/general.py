@@ -10,7 +10,7 @@ import yaml
 from torch.cuda import device_count
 
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm._torch.pyexecutor.pytorch_model_engine import \
+from tensorrt_llm._torch.pyexecutor.model_engine import \
     validate_and_set_kv_cache_quant
 from tensorrt_llm.bench.build.build import (get_benchmark_engine_settings,
                                             get_model_config)
@@ -155,6 +155,7 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
         "pp_size": params.get("pp"),
         "tp_size": params.get("tp"),
         "world_size": params.get("pp") * params.get("tp"),
+        "ep_size": params.get("ep"),
         "gpus_per_node": device_count()
     }
 

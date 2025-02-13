@@ -423,20 +423,17 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal,
     // Write the SF to global memory (STG.8).
     if constexpr (UE8M0_SF)
     {
-        // Extract the 8 exponent bits from float32.
-        // float 32bits = 1 sign bit + 8 exponent bits + 23 mantissa bits.
-        uint32_t tmp = reinterpret_cast<uint32_t&>(SFValue) >> 23;
-        fp8SFVal = tmp & 0xff;
-        // Convert back to fp32.
-        reinterpret_cast<uint32_t&>(SFValue) = tmp << 23;
+        __nv_fp8_e8m0 tmp;
+        tmp.__x = __nv_cvt_float_to_e8m0(SFValue, __NV_SATFINITE, cudaRoundPosInf);
+        SFValue = static_cast<float>(tmp);
+        fp8SFVal = tmp.__x;
     }
     else
     {
         // Here SFValue is always positive, so E4M3 is the same as UE4M3.
         __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFValue);
-        reinterpret_cast<__nv_fp8_e4m3&>(fp8SFVal) = tmp;
-        // Convert back to fp32.
-        SFValue = float(tmp);
+        fp8SFVal = tmp.__x;
+        SFValue = static_cast<float>(tmp);
     }
     // Get the output scale.
     // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal))) * reciprocal(SFScaleVal))
@@ -516,20 +513,17 @@ __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type>& vec, float SFScaleVal, 
     // Write the SF to global memory (STG.8).
     if constexpr (UE8M0_SF)
     {
-        // Extract the 8 exponent bits from float32.
-        // float 32bits = 1 sign bit + 8 exponent bits + 23 mantissa bits.
-        uint32_t tmp = reinterpret_cast<uint32_t&>(SFValue) >> 23;
-        fp8SFVal = tmp & 0xff;
-        // Convert back to fp32.
-        reinterpret_cast<uint32_t&>(SFValue) = tmp << 23;
+        __nv_fp8_e8m0 tmp;
+        tmp.__x = __nv_cvt_float_to_e8m0(SFValue, __NV_SATFINITE, cudaRoundPosInf);
+        SFValue = static_cast<float>(tmp);
+        fp8SFVal = tmp.__x;
     }
     else
     {
         // Here SFValue is always positive, so E4M3 is the same as UE4M3.
         __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFValue);
-        reinterpret_cast<__nv_fp8_e4m3&>(fp8SFVal) = tmp;
-        // Convert back to fp32.
-        SFValue = float(tmp);
+        fp8SFVal = tmp.__x;
+        SFValue = static_cast<float>(tmp);
     }
     // Get the output scale.
     // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal))) * reciprocal(SFScaleVal))

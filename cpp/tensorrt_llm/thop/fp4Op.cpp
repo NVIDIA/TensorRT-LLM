@@ -78,7 +78,10 @@ uint8_t floatToE2M1(float value)
     int fp4AbsValue = kE2M1Count - 1;
     for (; fp4AbsValue > 0; --fp4AbsValue)
     {
-        if (kE2M1Array[fp4AbsValue] <= absValue)
+        if (kE2M1Array[fp4AbsValue] < absValue)
+            break;
+        // Tie to even.
+        if (kE2M1Array[fp4AbsValue] == absValue && !(fp4AbsValue & 1))
             break;
     }
     result |= fp4AbsValue;

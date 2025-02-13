@@ -261,7 +261,7 @@ int LoraPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::P
         {
             // loraWeightModulePtrs has 3 pointers for each module: A,B, and an optional DoRA magnitude
             // the current LoRA plugin does not apply DoRA scaling, so the magnitude is ignored
-            RequestType const reqType = static_cast<RequestType const>(reqTypes[reqId]);
+            RequestType const reqType = static_cast<RequestType>(reqTypes[reqId]);
             if (reqType == RequestType::kGENERATION)
             {
                 mExpandLoraWeightPtrs.push_back(reinterpret_cast<void const*>(loraWeightModulePtrs[reqId * 3]));

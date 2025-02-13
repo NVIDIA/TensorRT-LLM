@@ -161,13 +161,13 @@ public:
     [[nodiscard]] virtual TensorPtr getFinishReasons() const = 0;
 
     //! @returns [batchSize, beamWidth], cumulative log probabilities (per beam), on gpu
-    [[nodiscard]] virtual TensorPtr getCumLogProbs() const = 0;
+    [[nodiscard]] virtual TensorPtr getCumLogProbs() const override = 0;
 
     //! @returns [beamWidth], cumulative log probabilities (per beam) for request batchIdx, on gpu
     [[nodiscard]] virtual TensorPtr getCumLogProbs(SizeType32 batchIdx) const = 0;
 
     //! @returns [batchSize, beamWidth, maxSeqLen], log probabilities (per beam), on gpu
-    [[nodiscard]] virtual TensorPtr getLogProbs() const = 0;
+    [[nodiscard]] virtual TensorPtr getLogProbs() const override = 0;
 
     //! @returns [beamWidth, maxSeqLen], cumulative log probabilities (per beam) for request batchIdx, on gpu
     [[nodiscard]] virtual TensorPtr getLogProbs(SizeType32 batchIdx) const = 0;
@@ -195,6 +195,38 @@ public:
 
 protected:
     IGptDecoderBatched() = default;
+
+private:
+    // these methods from base type are overwritten and should not be called
+    void forward(decoder::Output& output, decoder::Input const& input) override
+    {
+        TLLM_THROW("Should not call %s", __PRETTY_FUNCTION__);
+    }
+
+    TensorPtr getGatheredIds() const override
+    {
+        TLLM_THROW("Should not call %s", __PRETTY_FUNCTION__);
+    }
+
+    TensorPtr getIds() const override
+    {
+        TLLM_THROW("Should not call %s", __PRETTY_FUNCTION__);
+    }
+
+    void forwardSync() override
+    {
+        TLLM_THROW("Should not call %s", __PRETTY_FUNCTION__);
+    }
+
+    void forwardAsync(decoder::Output& output, decoder::Input const& input) override
+    {
+        TLLM_THROW("Should not call %s", __PRETTY_FUNCTION__);
+    }
+
+    void finalize(SamplingConfig const& samplingConfig) const override
+    {
+        TLLM_THROW("Should not call %s", __PRETTY_FUNCTION__);
+    }
 };
 
 } // namespace tensorrt_llm::runtime

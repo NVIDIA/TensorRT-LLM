@@ -3,7 +3,7 @@ import time
 import traceback
 from multiprocessing.shared_memory import SharedMemory
 from queue import Queue
-from typing import Any, Optional, Tuple
+from typing import Any, Optional
 
 import torch
 import zmq
@@ -311,7 +311,7 @@ class FusedIpcQueue:
         return obj
 
     @property
-    def address(self) -> Tuple[str, int, bytes]:
+    def address(self) -> str:
         return self.queue.address
 
     def __del__(self):

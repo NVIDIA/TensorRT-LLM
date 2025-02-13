@@ -30,15 +30,21 @@ class GatedMLP(nn.Module):
                  bias: bool,
                  activation: Callable[[torch.Tensor], torch.Tensor] = F.silu,
                  dtype: Optional[torch.dtype] = None,
-                 config: Optional[ModelConfig] = None):
+                 config: Optional[ModelConfig] = None,
+                 use_dp: bool = False):
         super().__init__()
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.activation = activation
 
         config = config or ModelConfig()
-        tp_rank = config.mapping.tp_rank
-        tp_size = config.mapping.tp_size
+        if use_dp:
+            tp_rank = 0
+            tp_size = 1
+        else:
+            tp_rank = config.mapping.tp_rank
+            tp_size = config.mapping.tp_size
+        gpus_per_node = config.mapping.gpus_per_node
 
         self.gate_up_proj = Linear(
             self.hidden_size,
@@ -48,7 +54,8 @@ class GatedMLP(nn.Module):
             parallel_config=ParallelConfig(
                 tensor_parallel_rank=tp_rank,
                 tensor_parallel_size=tp_size,
-                tensor_parallel_mode=TensorParallelMode.COLUMN),
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                gpus_per_node=gpus_per_node),
             weights_loading_config=WeightsLoadingConfig(
                 weight_mode=WeightMode.FUSED_GATE_UP_LINEAR),
             quant_config=config.get_quant_config(),
@@ -61,11 +68,18 @@ class GatedMLP(nn.Module):
             parallel_config=ParallelConfig(
                 tensor_parallel_rank=tp_rank,
                 tensor_parallel_size=tp_size,
-                tensor_parallel_mode=TensorParallelMode.ROW),
+                tensor_parallel_mode=TensorParallelMode.ROW,
+                gpus_per_node=gpus_per_node),
             quant_config=config.get_quant_config(),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _create_weights(self):
+        self.gate_up_proj._create_weights()
+        self.down_proj._create_weights()
+
+    def forward(self,
+                x: torch.Tensor,
+                all_rank_num_tokens=None) -> torch.Tensor:
         if self.activation == F.silu:
             return self.down_proj(swiglu(self.gate_up_proj(x)))
         else:

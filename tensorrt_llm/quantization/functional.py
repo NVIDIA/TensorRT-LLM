@@ -604,6 +604,67 @@ def fp8_rowwise_rms_norm(input: Tensor,
                               layer), _create_tensor(layer.get_output(1), layer)
 
 
+def fused_layernorm(
+        input: Tensor,
+        normalized_shape: Union[int, Tuple[int]],
+        residual: Optional[Tensor] = None,
+        weight: Optional[Tensor] = None,
+        # beta: Optional[Tensor] = None,
+        # bias: Optional[Tensor] = None,
+        scale: Optional[Tensor] = None,
+        eps: float = 1e-05,
+        p_dtype: str = 'float16',
+        need_fp32_output: bool = False) -> Tensor:
+    plg_creator = trt.get_plugin_registry().get_plugin_creator(
+        'FusedLayernorm', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert plg_creator is not None
+    eps = trt.PluginField("eps", np.array(eps, dtype=np.float32),
+                          trt.PluginFieldType.FLOAT32)
+    pf_type = trt.PluginField(
+        "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
+        trt.PluginFieldType.INT32)
+    need_fp32_output_value = need_fp32_output
+    need_fp32_output = trt.PluginField(
+        "need_fp32_output", np.array([int(need_fp32_output_value)], np.int32),
+        trt.PluginFieldType.INT32)
+    need_quantize_value = scale is not None
+    need_quantize = trt.PluginField(
+        "need_quantize", np.array([int(need_quantize_value)], np.int32),
+        trt.PluginFieldType.INT32)
+    pfc = trt.PluginFieldCollection(
+        [eps, need_fp32_output, need_quantize, pf_type])
+    fused_layernorm_plug = plg_creator.create_plugin("fused_layernorm", pfc)
+    normalized_shape = [normalized_shape] if isinstance(
+        normalized_shape, int) else normalized_shape
+    if weight is None:
+        weight = constant(
+            np.ones(normalized_shape, dtype=str_dtype_to_np(p_dtype)))
+    # if beta is None:
+    #     beta = constant(
+    #         np.zeros(normalized_shape, dtype=str_dtype_to_np(p_dtype)))
+    # if bias is None:
+    #     bias = constant(
+    #         np.zeros(normalized_shape, dtype=str_dtype_to_np(p_dtype)))
+    if need_quantize_value:
+        plug_inputs = [
+            input.trt_tensor, residual.trt_tensor, weight.trt_tensor,
+            scale.trt_tensor
+        ]
+    else:
+        plug_inputs = [
+            input.trt_tensor,
+            residual.trt_tensor,
+            weight.trt_tensor,
+        ]
+    layer = default_trtnet().add_plugin_v2(plug_inputs, fused_layernorm_plug)
+    _add_plugin_info(layer, plg_creator, "fused_layernorm", pfc)
+    if not need_quantize_value:
+        return _create_tensor(layer.get_output(0),
+                              layer), _create_tensor(layer.get_output(1), layer)
+    return _create_tensor(layer.get_output(0), layer), _create_tensor(
+        layer.get_output(1), layer), _create_tensor(layer.get_output(2), layer)
+
+
 def quantize(input: Tensor,
              scale_factor: Tensor,
              dtype: str,

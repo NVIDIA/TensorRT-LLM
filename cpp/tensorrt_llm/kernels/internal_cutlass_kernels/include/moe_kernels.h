@@ -19,6 +19,7 @@
 #include "cutlass/gemm/gemm.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/quantization.h"
+#include "tensorrt_llm/kernels/internal_cutlass_kernels/include/fp8_blockscale_gemm.h"
 #include "tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_gemm_kernels.h"
 #include "tensorrt_llm/kernels/lora/lora.h"
 #ifdef ENABLE_FP4
@@ -242,13 +243,27 @@ struct LoraParams
     }
 };
 
+struct BlockScaleParams
+{
+    float const* fc1_scales_ptrs = nullptr;
+    float const* fc2_scales_ptrs = nullptr;
+
+    BlockScaleParams() = default;
+
+    BlockScaleParams(float const* fc1_scales_ptrs, float const* fc2_scales_ptrs)
+        : fc1_scales_ptrs(fc1_scales_ptrs)
+        , fc2_scales_ptrs(fc2_scales_ptrs)
+    {
+    }
+};
+
 class CutlassMoeFCRunnerInterface
 {
 public:
     virtual ~CutlassMoeFCRunnerInterface() = default;
     virtual size_t getWorkspaceSize(int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size,
         int const num_experts, int const k, ActivationType activation_type, MOEExpertScaleNormalizationMode norm_mode,
-        MOEParallelismConfig parallelism_config, bool use_lora) const
+        MOEParallelismConfig parallelism_config, bool use_lora, bool use_fp8_block_scaling)
         = 0;
     virtual void setTactic(std::optional<cutlass_extensions::CutlassGemmConfig> gemm1_config,
         std::optional<cutlass_extensions::CutlassGemmConfig> gemm2_config)
@@ -262,7 +277,7 @@ public:
         bool const* finished, int64_t const active_rows, void* token_topk_unpermuted_scales,
         int* expanded_source_row_to_expanded_dest_row, int* expert_for_source_row, float sparse_mixer_epsilon,
         MOEParallelismConfig parallelism_config, MOEExpertScaleNormalizationMode normalization_mode, bool use_lora,
-        LoraParams& lora_params, cudaStream_t stream)
+        LoraParams& lora_params, bool use_fp8_block_scaling, BlockScaleParams& deepseek_params, cudaStream_t stream)
         = 0;
 
     // Aliases for profiling the gemms
@@ -306,6 +321,7 @@ template <typename T,                   /*The type used for activations*/
     typename Enable = void>
 class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface
 {
+    using BlockScaleGemmRunner = tensorrt_llm::kernels::small_m_gemm::CutlassFp8BlockScaleGemmRunnerInterface;
     using ScaleBiasType = BackBoneType;
     using Self = CutlassMoeFCRunner<T, WeightType, OutputType, BackBoneType>;
 #if defined(ENABLE_FP8)
@@ -343,7 +359,7 @@ public:
 
     size_t getWorkspaceSize(int64_t const num_rows, int64_t const hidden_size, int64_t const fc1_output_size,
         int const num_experts, int const k, ActivationType activation_type, MOEExpertScaleNormalizationMode norm_mode,
-        MOEParallelismConfig parallelism_config, bool use_lora) const override;
+        MOEParallelismConfig parallelism_config, bool use_lora, bool use_fp8_block_scaling) override;
 
     void setTactic(std::optional<cutlass_extensions::CutlassGemmConfig> gemm1_config,
         std::optional<cutlass_extensions::CutlassGemmConfig> gemm2_config) override
@@ -370,7 +386,8 @@ public:
         bool const* finished, int64_t const active_rows, void* token_topk_unpermuted_scales,
         int* expanded_source_row_to_expanded_dest_row, int* expert_for_source_row, float sparse_mixer_epsilon,
         MOEParallelismConfig parallelism_config, MOEExpertScaleNormalizationMode normalization_mode, bool use_lora,
-        LoraParams& lora_params, cudaStream_t stream) override;
+        LoraParams& lora_params, bool use_fp8_block_scaling, BlockScaleParams& deepseek_params,
+        cudaStream_t stream) override;
 
     // We make these GEMM1 & GEMM2 static because they need to be stateless for the profiler to work
     static void gemm1(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>& gemm_runner, T const* const input,
@@ -453,10 +470,11 @@ private:
         cudaStream_t stream);
     std::vector<size_t> getWorkspaceDeviceBufferSizes(int64_t const num_rows, int64_t const hidden_size,
         int64_t const inter_size, int const num_experts, int const num_experts_per_node, int const k,
-        ActivationType activation_type, MOEExpertScaleNormalizationMode norm_mode, bool use_lora) const;
+        ActivationType activation_type, MOEExpertScaleNormalizationMode norm_mode, bool use_lora,
+        bool use_fp8_block_scaling);
     void configureWsPtrs(char* ws_ptr, int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size,
         int const num_experts, int const num_experts_per_node, int const k, ActivationType activation_type,
-        MOEExpertScaleNormalizationMode norm_mode, bool use_lora);
+        MOEExpertScaleNormalizationMode norm_mode, bool use_lora, bool use_fp8_block_scaling);
 
 private:
     bool mayHaveDifferentGEMMOutputType() const
@@ -485,8 +503,26 @@ private:
         int64_t const* num_valid_tokens_ptr, int64_t num_tokens, LoraParams& lora_params, float const* fc2_fp8_quant,
         cudaStream_t stream);
 
+    BlockScaleGemmRunner& getBlockScaleGemmRunner();
+
+    void BlockScaleFC1(T const* const input, T* const output, void* const intermediate_result,
+        int64_t const* const expert_first_token_offset, WeightType const* const fc1_expert_weights,
+        ScaleBiasType const* const fc1_expert_biases, float const* const fc2_fp8_quant, int64_t const num_rows,
+        int64_t const expanded_num_rows, int64_t const hidden_size, int64_t const inter_size,
+        int const num_experts_per_node, ActivationType fc1_activation_type, BlockScaleParams& deepseek_params,
+        cudaStream_t stream);
+
+    void BlockScaleFC2(T const* const input, void* const gemm_output, OutputType* const final_output,
+        int64_t const* const expert_first_token_offset, WeightType const* const fc2_expert_weights,
+        ScaleBiasType const* const fc2_expert_biases, float const* const token_topk_unpermuted_scales,
+        int const* const expanded_source_row_to_expanded_dest_row, int const* const expert_for_source_row,
+        int64_t const* const num_valid_tokens_ptr, int64_t const num_rows, int64_t const expanded_num_rows,
+        int64_t const hidden_size, int64_t const inter_size, int const num_experts_per_node, int64_t const k,
+        BlockScaleParams& deepseek_params, cudaStream_t stream, MOEParallelismConfig parallelism_config);
+
     CubKeyValueSorter sorter_;
     MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType> moe_gemm_runner_;
+    std::unique_ptr<BlockScaleGemmRunner> blockscale_gemm_runner_;
 
     std::optional<cutlass_extensions::CutlassGemmConfig> gemm1_config_;
     std::optional<cutlass_extensions::CutlassGemmConfig> gemm2_config_;
@@ -514,6 +550,7 @@ private:
     ScaleBiasType* lora_fc1_result_{};
     ScaleBiasType* lora_add_bias_{};
     ScaleBiasType* lora_fc2_result_{};
+    char* blockscale_gemm_workspace_;
 
     TmaWarpSpecializedGroupedGemmInput tma_ws_grouped_gemm_input_;
 

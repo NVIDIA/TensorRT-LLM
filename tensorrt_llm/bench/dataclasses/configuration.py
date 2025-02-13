@@ -81,6 +81,10 @@ class RuntimeConfig(BaseModel):
             self.world_config.pp_size,
             "tensor_parallel_size":
             self.world_config.tp_size,
+            "gpus_per_node":
+            self.world_config.gpus_per_node,
+            "moe_expert_parallel_size":
+            self.world_config.ep_size,
             "trust_remote_code":
             True,
             "kv_cache_config":
@@ -166,6 +170,7 @@ class ExecutorWorldConfig(BaseModel):
     world_size: int = 1
     gpus_per_node: int = 8
     leader_mode: bool = False
+    ep_size: Optional[int] = None
 
     @model_validator(mode="after")
     def validate_world_size(self) -> ExecutorWorldConfig:

@@ -1536,7 +1536,7 @@ public:
     {
         TLLM_CHECK_WITH_INFO(
             isContextInitState() || isDisaggGenerationInitState() || isDisaggGenerationTransmissionComplete(),
-            "getContextChunkSize is only possible during the context phase.");
+            "getContextChunkSize is only possible during the context phase or generation init phase.");
         return mContextChunkSize;
     }
 
@@ -1545,7 +1545,9 @@ public:
     /// remaining length.
     void setContextChunkSize(SizeType32 size)
     {
-        TLLM_CHECK_WITH_INFO(isContextInitState(), "setContextChunkSize is only possible during the context phase.");
+        TLLM_CHECK_WITH_INFO(
+            isContextInitState() || isDisaggGenerationInitState() || isDisaggGenerationTransmissionComplete(),
+            "setContextChunkSize is only possible during the context phase or generation init phase.");
         TLLM_CHECK_WITH_INFO(size >= 0, "The chunk size of context (%d) can't be negative.", size);
         mContextChunkSize = std::min(size, getContextRemainingLength());
     }
@@ -1721,10 +1723,12 @@ public:
 
     void updatePerfMetrics(executor::IterationType iter)
     {
+        auto const currentTokenTime = std::chrono::steady_clock::now();
+
         if (!mPerfMetrics.firstIter)
         {
             mPerfMetrics.firstIter = iter;
-            mPerfMetrics.timingMetrics.firstTokenTime = std::chrono::steady_clock::now();
+            mPerfMetrics.timingMetrics.firstTokenTime = currentTokenTime;
         }
 
         mPerfMetrics.iter = iter;
@@ -1732,7 +1736,7 @@ public:
         if (isFinished())
         {
             mPerfMetrics.lastIter = iter;
-            mPerfMetrics.timingMetrics.lastTokenTime = std::chrono::steady_clock::now();
+            mPerfMetrics.timingMetrics.lastTokenTime = currentTokenTime;
         }
     }
 

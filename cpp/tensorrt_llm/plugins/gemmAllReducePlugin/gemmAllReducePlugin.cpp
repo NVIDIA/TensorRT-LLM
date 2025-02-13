@@ -196,12 +196,12 @@ bool GemmAllReducePlugin::supportsFormatCombination(
     TLLM_CHECK_WITH_INFO(pos < 2 + getNbOutputs(), "Unexpected pos: %d", pos);
     auto const& desc = inOut[pos];
 
-    auto typeExists = [&]<int TupleIndex>(DataType dtype) -> bool
+    auto typeExists = [&](DataType dtype, auto idx) -> bool
     {
         for (const auto& [key, value] : mTypedInstantiators)
         {
             // key format: <ActivationType, WeightType, OutputType>
-            if (std::get<TupleIndex>(key) == dtype)
+            if (std::get<decltype(idx)::value>(key) == dtype)
             {
                 return true;
             }
@@ -212,12 +212,12 @@ bool GemmAllReducePlugin::supportsFormatCombination(
     switch (pos)
     {
     case 0: // activation
-        return typeExists.template operator()<0>(desc.type);
+        return typeExists(desc.type, std::integral_constant<size_t, 0>{});
     case 1: // weight
-        return typeExists.template operator()<1>(desc.type);
+        return typeExists(desc.type, std::integral_constant<size_t, 1>{});
     case 2: // output[0]
     case 3: // output[1]
-        return typeExists.template operator()<2>(desc.type);
+        return typeExists(desc.type, std::integral_constant<size_t, 2>{});
     default: return false;
     }
 }

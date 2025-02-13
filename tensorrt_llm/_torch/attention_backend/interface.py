@@ -101,6 +101,8 @@ class AttentionMetadata:
     runtime_features: AttentionRuntimeFeatures = field(
         default_factory=AttentionRuntimeFeatures)
 
+    all_rank_num_tokens: Optional[List[int]] = None
+
     def __post_init__(self) -> None:
         if self.is_cross:
             assert self.cross is None or self.cross is self, "Cross attention metadata should not have sub metadata"
@@ -253,6 +255,10 @@ class RopeParams:
     long_m_scale: float = 1.0
     max_positions: int = 1024
     original_max_positions: int = 1024
+    beta_fast: int = 32
+    beta_slow: int = 1
+    mscale: float = 1.0
+    mscale_all_dim: float = 0.0
 
     @staticmethod
     def from_config(config) -> "RopeParams":
@@ -288,6 +294,10 @@ class RopeParams:
                 "high_freq_factor", 4.0)
             rope_params.original_max_positions = rope_scaling.get(
                 "original_max_position_embeddings", 1024)
+            rope_params.beta_fast = rope_scaling.get("beta_fast", 32)
+            rope_params.beta_slow = rope_scaling.get("beta_slow", 1)
+            rope_params.mscale = rope_scaling.get("mscale", 1.0)
+            rope_params.mscale_all_dim = rope_scaling.get("mscale_all_dim", 0.0)
 
         return rope_params
 
@@ -443,3 +453,12 @@ class AttentionBackend(Generic[TMetadata]):
     def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         num_q_tokens = q.size()[1]
         return torch.empty_like(q).reshape(num_q_tokens, -1)
+
+
+@dataclass(kw_only=True, unsafe_hash=True)
+class MLAParams:
+    q_lora_rank: int = 0
+    kv_lora_rank: int = 0
+    qk_rope_head_dim: int = 0
+    qk_nope_head_dim: int = 0
+    v_head_dim: int = 0

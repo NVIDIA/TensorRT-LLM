@@ -3,11 +3,11 @@ from dataclasses import dataclass
 from typing import List, Optional, Union
 
 import tensorrt_llm
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm._torch.pyexecutor.distributed import *
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm._torch.pyexecutor.pytorch_model_engine import \
-    PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
                                                              ResourceManager)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -41,8 +41,13 @@ class DummyModel(torch.nn.Module):
 
     def __init__(self, dtype: torch.dtype):
         super().__init__()
-        self.config = Config(torch_dtype=dtype)
+        self.model_config = ModelConfig(pretrained_config=Config(
+            torch_dtype=dtype))
         self.recorded_position_ids = None
+
+    @property
+    def config(self):
+        return self.model_config.pretrained_config
 
     def forward(self, *args, **kwargs) -> torch.Tensor:
         input_ids = kwargs["input_ids"]

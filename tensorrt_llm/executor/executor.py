@@ -19,6 +19,7 @@ from tensorrt_llm.logger import logger, set_level
 from .._utils import mpi_world_size
 from ..bindings import executor as tllm
 from ..builder import Engine
+from ..llmapi.llm_utils import KvCacheRetentionConfig
 from ..llmapi.mpi_session import (MpiSession, external_mpi_comm_available,
                                   need_spawn_mpi_workers)
 from ..llmapi.utils import (AsyncQueue, enable_llm_debug,
@@ -95,6 +96,7 @@ class GenerationExecutor(ABC):
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         streaming: bool = False,
         prompt_tuning_config: Optional[list] = None,
+        kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None
     ) -> GenerationResult:
         """Generate output for the given prompt token ids in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -102,13 +104,15 @@ class GenerationExecutor(ABC):
         assert isinstance(prompt_token_ids[0], int)
         assert isinstance(sampling_params, SamplingParams)
         result = self.submit(
-            GenerationRequest(prompt_token_ids,
-                              sampling_params=sampling_params,
-                              query_token_ids=query_token_ids,
-                              lora_request=lora_request,
-                              prompt_adapter_request=prompt_adapter_request,
-                              streaming=streaming,
-                              prompt_tuning_config=prompt_tuning_config))
+            GenerationRequest(
+                prompt_token_ids,
+                sampling_params=sampling_params,
+                query_token_ids=query_token_ids,
+                lora_request=lora_request,
+                prompt_adapter_request=prompt_adapter_request,
+                streaming=streaming,
+                prompt_tuning_config=prompt_tuning_config,
+                kv_cache_retention_config=kv_cache_retention_config))
         return result
 
     def generate(

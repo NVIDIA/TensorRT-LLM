@@ -10,26 +10,26 @@ One of TensorRT-LLM's key features is it's inflight batching scheduler and runti
 
 This section visualizes how TensorRT-LLM schedules requests based on max-batch size and max-num tokens. The example starts out with a newly initialized engine as well as a few unscheduled requests that have come in. For the sake of this example, toy values are set to `max batch size = 4` and `max num tokens = 12`. Each square block represents a token, and its color represents which request it belongs to.
 
-![TRT-LLM Scheduler Visualization 1](../media/TRTLLM_Scheduler_Vis_1.svg)
+![TRT-LLM Scheduler Visualization 1](../../media/TRTLLM_Scheduler_Vis_1.svg)
 
 
 Now the scheduler takes the first two requests, Request 1 and Request 2, and schedules them to execute the context phase. However, it cannot schedule any more requests because the prompts of the first two requests had 5 tokens each, leaving a budget of 2 tokens due to the max num tokens limit. Since all remaining requests have more than 2 prompt tokens none of them can be scheduled (context chunking can help in this situation, see the paged context attention section below). The tokens are marked with a "C" on them to represent that they are prompt tokens that were processed in the context phase.
 
 > Note: The tokens for different requests are shown on different rows simply for visualization purposes and are not representative of actual memory layouts
 
-![TRT-LLM Scheduler Visualization 2](../media/TRTLLM_Scheduler_Vis_2.svg)
+![TRT-LLM Scheduler Visualization 2](../../media/TRTLLM_Scheduler_Vis_2.svg)
 
 Now the engine runs an iteration of execution, completing the context phases for both of the scheduled requests. After it is done, the kv-cache of the prompts for both requests have been created and the first token has been generated. Tokens that were generated are marked with "G(n)" - for example a token marked "G1" represents that it is the first token generated for its request.
 
 TRT-LLM prioritizes scheduling requests in generation phase first so the two generated tokens are queued to be processed in the next iteration. Now, since the two previously scheduled requests have entered generation phase and only take up two tokens out of the max num token budget of 12, the scheduler is able to schedule two additional requests, Request 3 and Request 4. It cannot schedule the last request, Request 5, even though there is space for it in the max num tokens budget because of the max batch size limit of 4.
 
-![TRT-LLM Scheduler Visualization 3](../media/TRTLLM_Scheduler_Vis_3.svg)
+![TRT-LLM Scheduler Visualization 3](../../media/TRTLLM_Scheduler_Vis_3.svg)
 
 After the next iteration of execution, the second tokens for Requests 1 and 2 have been generated, and the first tokens for Request 3 and 4 have been generated. Lets say that G2 that was generated for Request 1 is the stop token, signifying that Request 1 is completed. In this case the scheduler would evict Request 1 before performing another execution iteration and prepare to return it to the user. This eviction puts the state of the engine below the max batch size limit and allows Request 5 to be scheduled.
 
 Another thing to note is that G1 that was generated for Request 2 has been added to the kv-cache for request 2, representing how kv-cache for a request grows as more and more tokens are generated.
 
-![TRT-LLM Scheduler Visualization 4](../media/TRTLLM_Scheduler_Vis_4.svg)
+![TRT-LLM Scheduler Visualization 4](../../media/TRTLLM_Scheduler_Vis_4.svg)
 
 Overall, the max batch size and max num tokens limits play a key part in deciding when requests are actually executed, and tuning them can have significant impacts on throughput numbers as well as how the engine balances previously scheduled requests in generation phase with context phase on new requests
 
@@ -101,7 +101,7 @@ For this particular workload max num tokens of 2048 provides the best performanc
 
 The [visualization](#understanding-the-trt-llm-scheduler) of the TensorRT-LLM scheduler showed that initially Request 3 couldn't be scheduled because it would put the scheduler over the max-num tokens limit. However with context chunking, this is no longer the case, and the first chunk of Request 3 would be able to be scheduled.
 
-![TRT-LLM Scheduler Visualization Chunked Context 1](../media/TRTLLM_Scheduler_Vis_Chunked_Context_1.svg)
+![TRT-LLM Scheduler Visualization Chunked Context 1](../../media/TRTLLM_Scheduler_Vis_Chunked_Context_1.svg)
 
 This is extremely beneficial for several reasons. Firstly it eliminates the possibility of requests with large prompts relative to max num tokens being unable to be scheduled due to other requests that are already in-flight. In production workloads, this can help improve worst case TTFT numbers. Secondly it allows for setting smaller values of max num tokens since you no longer need max num tokens to be at least as large as the longest prompt you want to support. For long-context cases this is extremely important, because setting extremely large values of max-num tokens takes away from memory available to be used as kv-cache. Given that in the worst case scenario chunked context has minimal impact on performance but can significantly benefit it in many scenarios, it's recommended that you always enable it.
 

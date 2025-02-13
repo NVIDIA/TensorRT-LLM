@@ -47,7 +47,7 @@ FtDynamicDecode<T>::FtDynamicDecode(size_t const maxBatchSize, size_t const maxB
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     auto const currentDeviceId = c10::cuda::current_device();
-    auto cudaStreamPtr = std::make_shared<tensorrt_llm::runtime::CudaStream>(stream, currentDeviceId);
+    auto cudaStreamPtr = std::make_shared<tensorrt_llm::runtime::CudaStream>(stream, currentDeviceId, false);
     auto bufferManager = std::make_shared<tensorrt_llm::runtime::BufferManager>(cudaStreamPtr);
 
     mFinishedSum = bufferManager->pinnedPool(

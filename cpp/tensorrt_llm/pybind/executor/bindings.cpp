@@ -220,11 +220,11 @@ void InitBindings(pybind11::module_& m)
             self.getTopPResetIds(), self.getTopPDecay(), self.getSeed(), self.getTemperature(), self.getMinTokens(),
             self.getBeamSearchDiversityRate(), self.getRepetitionPenalty(), self.getPresencePenalty(),
             self.getFrequencyPenalty(), self.getLengthPenalty(), self.getEarlyStopping(), self.getNoRepeatNgramSize(),
-            self.getMinP());
+            self.getNumReturnSequences(), self.getMinP());
     };
     auto samplingConfigSetstate = [](py::tuple const& state)
     {
-        if (state.size() != 17)
+        if (state.size() != 18)
         {
             throw std::runtime_error("Invalid SamplingConfig state!");
         }
@@ -236,7 +236,7 @@ void InitBindings(pybind11::module_& m)
             state[10].cast<std::optional<FloatType>>(), state[11].cast<std::optional<FloatType>>(),
             state[12].cast<std::optional<FloatType>>(), state[13].cast<std::optional<FloatType>>(),
             state[14].cast<std::optional<SizeType32>>(), state[15].cast<std::optional<SizeType32>>(),
-            state[16].cast<std::optional<FloatType>>());
+            state[16].cast<std::optional<SizeType32>>(), state[17].cast<std::optional<FloatType>>());
     };
     py::class_<tle::SamplingConfig>(m, "SamplingConfig")
         // A modified version of constructor to accpect deprecated args randomSeed and minLength
@@ -445,6 +445,20 @@ void InitBindings(pybind11::module_& m)
         .def("calculate_speculative_resource", &tle::LookaheadDecodingConfig::calculateSpeculativeResource)
         .def(py::pickle(lookaheadDecodingConfigGetstate, lookaheadDecodingConfigSetstate));
 
+    auto EagleDecodingConfigGetstate = [](tle::EagleConfig const& self)
+    {
+        return py::make_tuple(self.getEagleChoices(), self.isGreedySampling(), self.getPosteriorThreshold(),
+            self.useDynamicTree(), self.getDynamicTreeMaxTopK());
+    };
+    auto EagleDecodingConfigSetstate = [](py::tuple const& state)
+    {
+        if (state.size() != 5)
+        {
+            throw std::runtime_error("Invalid EagleConfig state!");
+        }
+        return tle::EagleConfig(state[0].cast<tle::EagleChoices>(), state[1].cast<bool>(),
+            state[2].cast<std::optional<float>>(), state[3].cast<bool>(), state[4].cast<std::optional<SizeType32>>());
+    };
     py::class_<tle::EagleConfig>(m, "EagleConfig")
         .def(py::init<std::optional<tle::EagleChoices>, bool, std::optional<float>, bool, std::optional<SizeType32>>(),
             py::arg("eagle_choices") = py::none(), py::arg("greedy_sampling") = true,
@@ -454,7 +468,36 @@ void InitBindings(pybind11::module_& m)
         .def_property_readonly("greedy_sampling", &tle::EagleConfig::isGreedySampling)
         .def_property_readonly("posterior_threshold", &tle::EagleConfig::getPosteriorThreshold)
         .def_property_readonly("use_dynamic_tree", &tle::EagleConfig::useDynamicTree)
-        .def_property_readonly("dynamic_tree_max_topK", &tle::EagleConfig::getDynamicTreeMaxTopK);
+        .def_property_readonly("dynamic_tree_max_topK", &tle::EagleConfig::getDynamicTreeMaxTopK)
+        .def(py::pickle(EagleDecodingConfigGetstate, EagleDecodingConfigSetstate));
+
+    auto TokenRangeRetentionConfigGetstate = [](tle::KvCacheRetentionConfig::TokenRangeRetentionConfig const& self)
+    { return py::make_tuple(self.tokenStart, self.tokenEnd, self.priority, self.durationMs); };
+    auto TokenRangeRetentionConfigSetstate = [](py::tuple const& state)
+    {
+        if (state.size() != 4)
+        {
+            throw std::runtime_error("Invalid state!");
+        }
+        return tle::KvCacheRetentionConfig::TokenRangeRetentionConfig(state[0].cast<SizeType32>(),
+            state[1].cast<std::optional<SizeType32>>(), state[2].cast<tle::RetentionPriority>(),
+            state[3].cast<std::optional<std::chrono::milliseconds>>());
+    };
+    auto kvCacheRetentionConfigGetstate = [](tle::KvCacheRetentionConfig const& self)
+    {
+        return py::make_tuple(
+            self.getTokenRangeRetentionConfigs(), self.getDecodeRetentionPriority(), self.getDecodeDurationMs());
+    };
+    auto kvCacheRetentionConfigSetstate = [](py::tuple const& state)
+    {
+        if (state.size() != 3)
+        {
+            throw std::runtime_error("Invalid state!");
+        }
+        return tle::KvCacheRetentionConfig(
+            state[0].cast<std::vector<tle::KvCacheRetentionConfig::TokenRangeRetentionConfig>>(),
+            state[1].cast<tle::RetentionPriority>(), state[2].cast<std::optional<std::chrono::milliseconds>>());
+    };
 
     auto kvCacheRetentionConfig = py::class_<tle::KvCacheRetentionConfig>(m, "KvCacheRetentionConfig");
 
@@ -466,7 +509,9 @@ void InitBindings(pybind11::module_& m)
         .def_readwrite("token_start", &tle::KvCacheRetentionConfig::TokenRangeRetentionConfig::tokenStart)
         .def_readwrite("token_end", &tle::KvCacheRetentionConfig::TokenRangeRetentionConfig::tokenEnd)
         .def_readwrite("priority", &tle::KvCacheRetentionConfig::TokenRangeRetentionConfig::priority)
-        .def_readwrite("duration_ms", &tle::KvCacheRetentionConfig::TokenRangeRetentionConfig::durationMs);
+        .def_readwrite("duration_ms", &tle::KvCacheRetentionConfig::TokenRangeRetentionConfig::durationMs)
+        .def(py::pickle(TokenRangeRetentionConfigGetstate, TokenRangeRetentionConfigSetstate))
+        .def("__eq__", &tle::KvCacheRetentionConfig::TokenRangeRetentionConfig::operator==);
 
     // There's a circular dependency between the declaration of the TokenRangeRetentionPriority and
     // KvCacheRetentionConfig bindings. Defer definition of the KvCacheRetentionConfig bindings until the
@@ -480,7 +525,9 @@ void InitBindings(pybind11::module_& m)
         .def_property_readonly(
             "token_range_retention_configs", &tle::KvCacheRetentionConfig::getTokenRangeRetentionConfigs)
         .def_property_readonly("decode_retention_priority", &tle::KvCacheRetentionConfig::getDecodeRetentionPriority)
-        .def_property_readonly("decode_duration_ms", &tle::KvCacheRetentionConfig::getDecodeDurationMs);
+        .def_property_readonly("decode_duration_ms", &tle::KvCacheRetentionConfig::getDecodeDurationMs)
+        .def(py::pickle(kvCacheRetentionConfigGetstate, kvCacheRetentionConfigSetstate))
+        .def("__eq__", &tle::KvCacheRetentionConfig::operator==);
 
     py::class_<tle::ContextPhaseParams>(m, "ContextPhaseParams")
         .def(py::init<VecTokens, tle::ContextPhaseParams::RequestIdType>(), py::arg("first_gen_tokens"),
@@ -762,6 +809,34 @@ void InitBindings(pybind11::module_& m)
         .def_readwrite("name", &tle::AdditionalOutput::name)
         .def_readwrite("output", &tle::AdditionalOutput::output);
 
+    auto resultSetstate = [](py::tuple const& state)
+    {
+        if (state.size() != 11)
+        {
+            throw std::runtime_error("Invalid Request state!");
+        }
+        tle::Result result;
+        result.isFinal = state[0].cast<bool>();
+        result.outputTokenIds = state[1].cast<std::vector<VecTokens>>();
+        result.cumLogProbs = state[2].cast<std::optional<std::vector<float>>>();
+        result.logProbs = state[3].cast<std::optional<std::vector<std::vector<float>>>>();
+        result.contextLogits = state[4].cast<std::optional<Tensor>>();
+        result.generationLogits = state[5].cast<std::optional<Tensor>>();
+        result.encoderOutput = state[6].cast<std::optional<Tensor>>();
+        result.finishReasons = state[7].cast<std::vector<tle::FinishReason>>();
+        result.sequenceIndex = state[8].cast<SizeType32>();
+        result.isSequenceFinal = state[9].cast<bool>();
+        result.decodingIter = state[10].cast<SizeType32>();
+        return std::make_unique<tle::Result>(result);
+    };
+
+    auto resultGetstate = [](tle::Result const& self)
+    {
+        return py::make_tuple(self.isFinal, self.outputTokenIds, self.cumLogProbs, self.logProbs, self.contextLogits,
+            self.generationLogits, self.encoderOutput, self.finishReasons, self.sequenceIndex, self.isSequenceFinal,
+            self.decodingIter);
+    };
+
     py::class_<tle::Result>(m, "Result")
         .def(py::init<>())
         .def_readwrite("is_final", &tle::Result::isFinal)
@@ -777,10 +852,22 @@ void InitBindings(pybind11::module_& m)
         .def_readwrite("is_sequence_final", &tle::Result::isSequenceFinal)
         .def_readwrite("decoding_iter", &tle::Result::decodingIter)
         .def_readwrite("context_phase_params", &tle::Result::contextPhaseParams)
-        .def_readwrite("sequence_index", &tle::Result::sequenceIndex)
-        .def_readwrite("is_sequence_final", &tle::Result::isSequenceFinal)
         .def_readwrite("request_perf_metrics", &tle::Result::requestPerfMetrics)
-        .def_readwrite("additional_outputs", &tle::Result::additionalOutputs);
+        .def_readwrite("additional_outputs", &tle::Result::additionalOutputs)
+        .def(py::pickle(resultGetstate, resultSetstate));
+
+    auto responseGetstate = [](tle::Response const& self)
+    { return py::make_tuple(self.getRequestId(), self.getResult(), self.getClientId()); };
+
+    auto responseSetstate = [](py::tuple const& state)
+    {
+        if (state.size() != 3)
+        {
+            throw std::runtime_error("Invalid Request state!");
+        }
+        return std::make_unique<tle::Response>(
+            state[0].cast<SizeType32>(), state[1].cast<tle::Result>(), state[2].cast<SizeType32>());
+    };
 
     py::class_<tle::Response>(m, "Response")
         .def(py::init<IdType, std::string, std::optional<IdType>>(), py::arg("request_id"), py::arg("error_msg"),
@@ -791,7 +878,8 @@ void InitBindings(pybind11::module_& m)
         .def_property_readonly("client_id", &tle::Response::getClientId)
         .def("has_error", &tle::Response::hasError)
         .def_property_readonly("error_msg", &tle::Response::getErrorMsg)
-        .def_property_readonly("result", &tle::Response::getResult);
+        .def_property_readonly("result", &tle::Response::getResult)
+        .def(py::pickle(responseGetstate, responseSetstate));
 
     auto dynamicBatchConfigGetstate = [](tle::DynamicBatchConfig const& self)
     {

@@ -54,10 +54,19 @@ class ModelConfig(Generic[TConfig]):
             with open(quant_config_file) as f:
                 quant_config_dict = json.load(f)
 
-            quant_config.quant_algo = quant_config_dict['quantization'][
-                'quant_algo']
-            quant_config.kv_cache_quant_algo = quant_config_dict[
-                'quantization']['kv_cache_quant_algo']
+            json_quant_configs = quant_config_dict['quantization']
+
+            def _load_json_quant_config(key: str):
+                if key in json_quant_configs:
+                    return json_quant_configs[key]
+                return None
+
+            quant_config.quant_algo = _load_json_quant_config('quant_algo')
+            quant_config.kv_cache_quant_algo = _load_json_quant_config(
+                'kv_cache_quant_algo')
+            quant_config.group_size = _load_json_quant_config('group_size')
+            quant_config.exclude_modules = _load_json_quant_config(
+                'exclude_modules')
 
         return cls(pretrained_config=pretrained_config,
                    quant_config=quant_config,

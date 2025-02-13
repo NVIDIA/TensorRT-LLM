@@ -480,8 +480,8 @@ public:
         mGatedMultiplier = mIsGated ? 2 : 1;
         auto const gated_inter = mInterSize * mGatedMultiplier;
 
-        size_t workspace_size = mMoERunner.getWorkspaceSize(
-            mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK, mActType, mNormMode, {}, mUseLora);
+        size_t workspace_size = mMoERunner.getWorkspaceSize(mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK,
+            mActType, mNormMode, {}, mUseLora, /*use_fp8_block_scaling=*/false);
 
         mWorkspace = allocBuffer<char>(workspace_size);
         size_t const expert_matrix_size = mNumExperts * mHiddenSize * mInterSize;
@@ -714,10 +714,12 @@ public:
     void runMoEPermute(MOEParallelismConfig parallelism_config)
     {
         auto stream = streamPtr->get();
+        BlockScaleParams deepseek_params{};
         mMoERunner.runMoe(mInputTensor, mInputProbabilities, mExpertWeight1, mExpertBias1, mActType, mExpertWeight2,
             mExpertBias2, mQuantParams, mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK, mWorkspace,
             mFinalOutput, nullptr, mTotalTokens, mScaleProbs, mSourceToExpandedMap, mSelectedExpert, 0.01,
-            parallelism_config, mNormMode, mUseLora, mLoraParams, stream);
+            parallelism_config, mNormMode, mUseLora, mLoraParams, /*use_fp8_block_scaling=*/false, deepseek_params,
+            stream);
     }
 
     void runBenchmark(benchmark::State& state);

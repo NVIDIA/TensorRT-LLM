@@ -329,12 +329,14 @@ protected:
         // Calculate the size contributions for all the large buffers to check if the GPU has enough space
         bool const is_gated = tensorrt_llm::isGatedActivation(mActType);
         size_t const num_gemms = 2 + is_gated;
+        bool const useDeepseek = false;
+
         // Expert weights
         size_t const weight_size
             = hidden_size * (hidden_size * 4) * num_experts * sizeof(WeightStorage) * num_gemms / WEIGHT_ELEM_PER_BYTE;
         // Workspace size
-        size_t const workspace_size = this->mMoERunner.getWorkspaceSize(
-            num_tokens, hidden_size, hidden_size * 4, num_experts, k, this->mActType, mNormMode, {}, mUseLora);
+        size_t const workspace_size = this->mMoERunner.getWorkspaceSize(num_tokens, hidden_size, hidden_size * 4,
+            num_experts, k, this->mActType, mNormMode, {}, mUseLora, useDeepseek);
         // The input/output buffers
         size_t const in_out_size = 2 * num_tokens * hidden_size * sizeof(DataType);
 
@@ -378,8 +380,9 @@ protected:
             mTotalTokens += num_tokens;
         }
 
-        size_t workspace_size = mMoERunner.getWorkspaceSize(
-            mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK, mActType, mNormMode, parallelism_config, mUseLora);
+        bool const useDeepseek = false;
+        size_t workspace_size = mMoERunner.getWorkspaceSize(mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK,
+            mActType, mNormMode, parallelism_config, mUseLora, useDeepseek);
 
         auto const stream = mStream->get();
 
@@ -988,11 +991,15 @@ protected:
         }
 
         LoraParams lora_params;
+        BlockScaleParams deepseekParams{};
+        bool const useDeepseek = false;
+
         mMoERunner.setTactic(tactic1, tactic2);
         mMoERunner.runMoe(mInputTensor, mInputProbabilities, weight1_ptr, bias1_ptr, mActType, weight2_ptr, bias2_ptr,
             quant_params, mTotalTokens, mHiddenSize, mInterSize / parallelism_config.tp_size, mNumExperts, mK,
             mWorkspace, mFinalOutput, mFinished, mActiveRows, mScaleProbs, mSourceToExpandedMap, mSelectedExpert,
-            mSparseMixerEpsilon, parallelism_config, mNormMode, mUseLora, lora_params, stream);
+            mSparseMixerEpsilon, parallelism_config, mNormMode, mUseLora, lora_params, useDeepseek, deepseekParams,
+            stream);
 
         check_cuda_error(cudaStreamSynchronize(stream));
     }

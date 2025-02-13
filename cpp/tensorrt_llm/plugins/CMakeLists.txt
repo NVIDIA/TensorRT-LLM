@@ -35,6 +35,7 @@ set(PLUGIN_CU_SOURCES)
 set(PLUGIN_LISTS
     bertAttentionPlugin
     cpSplitPlugin
+    fusedLayernormPlugin
     gptAttentionCommon
     gptAttentionPlugin
     identityPlugin

@@ -24,24 +24,28 @@ from transformers import AutoTokenizer
 from tensorrt_llm.llmapi.tokenizer import _xgrammar_tokenizer_info
 
 
-def generate_xgrammar_tokenizer_info(model_name):
-    resources_dir = Path(__file__).parent.parent.resolve()
+def generate_xgrammar_tokenizer_info(args):
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        str(resources_dir / "models" / model_name))
+    tokenizer = AutoTokenizer.from_pretrained(str(args.model_dir))
     tokenizer_info = _xgrammar_tokenizer_info(tokenizer)
 
-    data_dir = resources_dir / "data" / model_name
-    os.makedirs(data_dir, exist_ok=True)
-    with open(str(data_dir / "xgrammar_tokenizer_info.json"), 'w') as f:
+    os.makedirs(args.output_dir, exist_ok=True)
+    with open(str(args.output_dir / "xgrammar_tokenizer_info.json"), 'w') as f:
         json.dump(tokenizer_info, f)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_name',
-                        type=str,
-                        default='gpt2',
-                        choices=['gpt2', 'llama-7b-hf'])
+    parser.add_argument('--model_dir',
+                        type=Path,
+                        default=None,
+                        required=True,
+                        help="HF model directory")
+    parser.add_argument(
+        '--output_dir',
+        type=Path,
+        default=None,
+        required=True,
+        help="File path to save xgrammar's info. in json format")
     args = parser.parse_args()
-    generate_xgrammar_tokenizer_info(args.model_name)
+    generate_xgrammar_tokenizer_info(args)

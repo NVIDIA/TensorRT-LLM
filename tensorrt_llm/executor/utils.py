@@ -2,6 +2,7 @@ import asyncio
 import concurrent.futures
 import os
 from concurrent.futures import ProcessPoolExecutor
+from queue import Empty, Queue
 from typing import Any, Callable, List, NamedTuple, Optional
 
 import torch
@@ -81,3 +82,46 @@ class ExecutorResponse(NamedTuple):
     error: Optional[str | Exception]
     # The timestamp of the creation of the response. We use this to track the IPC overhead.
     timestamp: Optional[float] = None
+
+
+class IntraProcessQueue:
+    ''' A Queue-like container for IPC within the same process. '''
+
+    def __init__(self):
+        self.queue = Queue()
+
+    def put(self, obj: Any):
+        self.queue.put(obj)
+
+    def get(self, timeout=None) -> Any:
+        return self.queue.get(timeout=timeout)
+
+    def close(self):
+        pass
+
+    def poll(self, timeout=None) -> bool:
+        try:
+            # Try to get an item from the queue without blocking
+            item = self.queue.get(timeout=timeout)
+            # If successful, put the item back to not alter the state
+            self.queue.put(item)
+            return True
+        except Empty:
+            # If the queue is empty, return False
+            return False
+
+
+class WorkerIPCAddrs(NamedTuple):
+    ''' IPC addresses for communication with the worker processes. '''
+    request_queue_addr: str
+    request_error_queue_addr: str
+    result_queue_addr: str
+    stats_queue_addr: str
+
+
+class WorkerQueues(NamedTuple):
+    ''' Queues for communication with the worker processes. '''
+    request_queue: IntraProcessQueue
+    request_error_queue: IntraProcessQueue
+    result_queue: IntraProcessQueue
+    stats_queue: IntraProcessQueue

@@ -24,7 +24,6 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from einops import rearrange
 from huggingface_hub import repo_exists, snapshot_download
 from huggingface_hub.utils import HFValidationError
@@ -44,6 +43,9 @@ from .modeling_multimodal_encoder import (CLIPVisionTower, CLIPVisionTowerS2,
                                           SiglipVisionTower,
                                           SiglipVisionTowerDynamicS2,
                                           SiglipVisionTowerS2)
+from .modeling_multimodal_utils import (merge_chessboard,
+                                        merge_features_for_dynamic_s2,
+                                        split_chessboard)
 from .modeling_utils import ModelConfig, register_auto_model
 
 SENTINEL_TOKEN = "<vila/sentinel>"  # nosec B105
@@ -368,122 +370,6 @@ def process_images(image_files, image_processor, model_config):
     else:
         raise ValueError("The shapes of images in the list are different!")
     return images, block_sizes
-
-
-def merge_chessboard(x, num_split_h, num_split_w):
-    """
-    x: b * n * c or b * h * w * c
-    out: b * c * h * w
-    Assuming x contains num_split**2 sub-squares concatenated along batch dimension, merge the sub-squares back to the original whole square.
-    """
-    B = x.shape[0]
-    if x.dim() == 3:
-        N = x.shape[1]
-        x = rearrange(x, "b (h w) c -> b c h w", h=int(N**0.5), w=int(N**0.5))
-
-    assert B % (num_split_h * num_split_w) == 0
-    b = B // (num_split_h * num_split_w)
-
-    x_merge = torch.cat(
-        [
-            torch.cat([
-                x[(i * num_split_w + j) * b:(i * num_split_w + j + 1) * b]
-                for j in range(num_split_w)
-            ],
-                      dim=-1) for i in range(num_split_h)
-        ],
-        dim=-2,
-    )
-
-    return x_merge
-
-
-def split_chessboard(x, num_split_h, num_split_w):
-    """
-    x: b * c * h * w
-    out: b * c * h * w
-    Deividing x into num_split**2 sub-squares, and concatenate all the sub-squares on the batch dimension
-    """
-    B, C, H, W = x.shape
-    assert H % num_split_h == 0 and W % num_split_w == 0
-    h, w = H // num_split_h, W // num_split_w
-    x_split = torch.cat(
-        [
-            x[:, :, i * h:(i + 1) * h, j * w:(j + 1) * w]
-            for i in range(num_split_h) for j in range(num_split_w)
-        ],
-        dim=0,
-    )
-    return x_split
-
-
-def merge_features_for_dynamic_s2(vision_tower, image_features, block_sizes):
-    scales = vision_tower.scales
-    resize_output_to_scale_idx = vision_tower.resize_output_to_scale_idx
-
-    image_features_each_image = []
-    new_block_sizes = []
-    block_cnt = 0
-    for block_size_each_image in block_sizes:
-        if block_size_each_image is None:
-            cur_features = image_features[block_cnt:block_cnt + 1]
-            cur_features = rearrange(cur_features,
-                                     "1 (h w) c -> 1 c h w",
-                                     h=int(cur_features.shape[1]**0.5))
-            cur_features = cur_features.repeat(1, len(scales), 1, 1)
-            image_features_each_image.append(cur_features)
-            new_block_sizes.append((1, 1))
-            block_cnt += 1
-        else:
-            cur_features_each_scale = []
-            for scale in scales[:-1]:
-                num_blocks_this_scale = (scale // scales[0])**2
-                cur_features_each_scale.append(
-                    merge_chessboard(
-                        image_features[block_cnt:block_cnt +
-                                       num_blocks_this_scale],
-                        num_split_h=scale // scales[0],
-                        num_split_w=scale // scales[0],
-                    ))  # 1 * C * H * W
-                block_cnt += num_blocks_this_scale
-            num_blocks_last_scale = block_size_each_image[
-                0] * block_size_each_image[1]
-            cur_features_each_scale.append(
-                merge_chessboard(
-                    image_features[block_cnt:block_cnt + num_blocks_last_scale],
-                    num_split_h=block_size_each_image[0],
-                    num_split_w=block_size_each_image[1],
-                ))  # 1 * C * H * W
-            block_cnt += num_blocks_last_scale
-
-            # resize and concat features from different scales
-            output_size = cur_features_each_scale[
-                resize_output_to_scale_idx].shape[-2:]
-            cur_features = torch.cat(
-                [
-                    F.interpolate(cur_features_each_scale[i].to(torch.float32),
-                                  size=output_size,
-                                  mode="area").to(
-                                      cur_features_each_scale[i].dtype)
-                    for i in range(len(cur_features_each_scale))
-                ],
-                dim=1,
-            )
-
-            image_features_each_image.append(cur_features)
-
-            if resize_output_to_scale_idx == len(
-                    scales) - 1 or resize_output_to_scale_idx == -1:
-                new_block_sizes.append(block_size_each_image)
-            else:
-                new_block_sizes.append((
-                    scales[resize_output_to_scale_idx] // scales[0],
-                    scales[resize_output_to_scale_idx] // scales[0],
-                ))
-
-    assert block_cnt == len(image_features)
-
-    return image_features_each_image, new_block_sizes
 
 
 """End of vision processing utilities"""

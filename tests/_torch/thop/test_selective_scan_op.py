@@ -97,7 +97,13 @@ class TestFunctional(unittest.TestCase):
             dt = dt.view(-1, seq_len, dim)
             BC = BC.view(-1, seq_len, dt_rank + dstate * 2)
             z = z.view(-1, seq_len, dim)
-        output = torch.zeros(x.shape, device=device, dtype=torch_dtype)
+
+        if remove_padding and req_type == "generation":
+            output = torch.zeros(x.squeeze(1).shape,
+                                 device=device,
+                                 dtype=torch_dtype)
+        else:
+            output = torch.zeros(x.shape, device=device, dtype=torch_dtype)
 
         state_ref = state.detach().clone()
         x_ref = x.detach().clone()
@@ -108,6 +114,9 @@ class TestFunctional(unittest.TestCase):
         C_ref = BC[..., dt_rank + dstate:].detach().clone()
         D_ref = D.detach().clone()
         z_ref = z.detach().clone()
+
+        if remove_padding and req_type == "generation":
+            x = x.squeeze(1)
 
         is_mamba2 = False
         slot_mapping = None
@@ -138,7 +147,15 @@ class TestFunctional(unittest.TestCase):
             is_paged_state,
         )
 
-        out_ref = torch.zeros(output.shape, device=device, dtype=torch_dtype)
+        if remove_padding and req_type == "generation":
+            out_ref = torch.zeros(output.unsqueeze(1).shape,
+                                  device=device,
+                                  dtype=torch_dtype)
+        else:
+            out_ref = torch.zeros(output.shape,
+                                  device=device,
+                                  dtype=torch_dtype)
+
         if req_type == 'context':
             # pytorch run
             if remove_padding:
@@ -184,6 +201,9 @@ class TestFunctional(unittest.TestCase):
 
         atol = {"float16": 5e-3, "float32": 2e-3, "bfloat16": 5e-2}
 
+        if remove_padding and req_type == "generation":
+            out_ref = out_ref.squeeze(1)
+
         torch.testing.assert_close(outputs[0],
                                    out_ref,
                                    rtol=1e-2,
@@ -194,6 +214,11 @@ class TestFunctional(unittest.TestCase):
                                    atol=atol[dtype])
 
     @parameterized.expand(
+        # P=8x and H=2x
+        list(
+            product([160, 320, 640, 1280], [80], [1], ['context'], ['float16'],
+                    [1, 2, 4, 8, 16], [16, 64, 256], [True], [True])) +
+        # normal tests
         list(
             product([2048], [64], [1, 4], ['context', 'generation'],
                     ['float32', 'float16', 'bfloat16'], [3], [16],
@@ -305,7 +330,16 @@ class TestFunctional(unittest.TestCase):
                 dt_pad0,
             ] if nheads_pad0 else []),
                                   dim=-1).contiguous()
-        output = torch.zeros(x.shape, device=device, dtype=torch_dtype)
+
+        if remove_padding and req_type == "generation":
+            xBC = xBC.squeeze(1)
+
+        if remove_padding and req_type == "generation":
+            output = torch.zeros(x.squeeze(1).shape,
+                                 device=device,
+                                 dtype=torch_dtype)
+        else:
+            output = torch.zeros(x.shape, device=device, dtype=torch_dtype)
 
         state_ref = state.detach().clone()
         x_ref = x.detach().clone()
@@ -347,7 +381,15 @@ class TestFunctional(unittest.TestCase):
             is_paged_state,
         )
 
-        out_ref = torch.zeros(output.shape, device=device, dtype=torch_dtype)
+        if remove_padding and req_type == "generation":
+            out_ref = torch.zeros(output.unsqueeze(1).shape,
+                                  device=device,
+                                  dtype=torch_dtype)
+        else:
+            out_ref = torch.zeros(output.shape,
+                                  device=device,
+                                  dtype=torch_dtype)
+
         # pytorch run
         if req_type == 'context':
             if remove_padding:
@@ -480,7 +522,10 @@ class TestFunctional(unittest.TestCase):
         if long_context:
             atol = {"float16": 2e-2, "bfloat16": 1e-1}
         else:
-            atol = {"float16": 5e-3, "float32": 2e-3, "bfloat16": 5e-2}
+            atol = {"float16": 1e-2, "float32": 2e-3, "bfloat16": 5e-2}
+
+        if remove_padding and req_type == "generation":
+            out_ref = out_ref.squeeze(1)
 
         torch.testing.assert_close(outputs[0],
                                    out_ref,

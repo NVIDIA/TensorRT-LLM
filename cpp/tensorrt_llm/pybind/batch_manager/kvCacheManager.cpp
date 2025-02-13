@@ -202,7 +202,7 @@ public:
     }
 
     std::vector<std::vector<std::vector<SizeType32>>> getBatchCacheBlockIds(
-        std::vector<tb::LlmRequest::RequestIdType> const& requestIds) const
+        std::vector<tb::LlmRequest::RequestIdType> const& requestIds) const override
     {
         PYBIND11_OVERLOAD_PURE(std::vector<std::vector<std::vector<SizeType32>>>, tbk::BaseKVCacheManager,
             getBatchCacheBlockIds, requestIds);
@@ -256,6 +256,8 @@ public:
 class PyBasePeftCacheManager : public tb::BasePeftCacheManager
 {
 public:
+    ~PyBasePeftCacheManager() override = default;
+
     void addRequestPeft(tb::BasePeftCacheManager::LlmRequestPtr llmRequest, bool tryGpuCache = true) override
     {
         PYBIND11_OVERLOAD_PURE(void, tb::BasePeftCacheManager, addRequestPeft, llmRequest, tryGpuCache);

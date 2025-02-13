@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import gc
 import json
 import os
@@ -18,13 +19,14 @@ from utils.util import skip_single_gpu
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.executor import (ExecutorBindingsWorker, LoRARequest,
                                    PromptAdapterRequest, RequestError)
-from tensorrt_llm.llmapi import (LLM, BuildCacheConfig, GuidedDecodingParams,
-                                 KvCacheConfig, LookaheadDecodingConfig,
-                                 MedusaDecodingConfig, NoStatsAvailable,
-                                 SamplingParams)
+from tensorrt_llm.llmapi import (LLM, BuildCacheConfig, EagleDecodingConfig,
+                                 GuidedDecodingParams, KvCacheConfig,
+                                 KvCacheRetentionConfig,
+                                 LookaheadDecodingConfig, MedusaDecodingConfig,
+                                 NoStatsAvailable, SamplingParams)
 from tensorrt_llm.llmapi._perf_evaluator import perform_faked_oai_postprocess
-from tensorrt_llm.llmapi.llm_utils import (BuildConfig, QuantAlgo, QuantConfig,
-                                           _ParallelConfig)
+from tensorrt_llm.llmapi.llm_utils import (BuildConfig, LlmArgs, QuantAlgo,
+                                           QuantConfig, _ParallelConfig)
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase, TransformersTokenizer
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 from tensorrt_llm.lora_manager import LoraConfig
@@ -178,6 +180,27 @@ def test_llm_build_config():
         assert build_config1.max_seq_len == build_config.max_seq_len
 
 
+def test_llm_args_invalid_usage():
+    runtime_max_batch_size = 3
+    runtime_max_num_tokens = 2
+
+    # Update build_config with warning msg if runtime arguments are passed.
+    llm_args = LlmArgs.from_kwargs(model='test-model',
+                                   max_batch_size=runtime_max_batch_size,
+                                   max_num_tokens=runtime_max_num_tokens)
+    assert llm_args.build_config.max_batch_size == runtime_max_batch_size
+    assert llm_args.build_config.max_num_tokens == runtime_max_num_tokens
+
+    # Conflict between build_config and runtime_params
+    build_config = BuildConfig(max_batch_size=5, max_num_tokens=7)
+    llm_args = LlmArgs.from_kwargs(model='test-model',
+                                   build_config=build_config,
+                                   max_batch_size=runtime_max_batch_size,
+                                   max_num_tokens=runtime_max_num_tokens)
+    assert llm_args.build_config.max_batch_size == build_config.max_batch_size
+    assert llm_args.build_config.max_num_tokens == build_config.max_num_tokens
+
+
 def test_llm_loading_from_hf():
     sampling_params = SamplingParams(max_tokens=8)
     llm_test_harness(llama_model_path,
@@ -281,6 +304,19 @@ def test_llm_without_tokenizer():
     for output in llm.generate(prompts, sampling_params=sampling_params):
         assert not output.outputs[0].text, \
             "The output should be empty since the tokenizer is missing"
+        print(output)
+
+
+def test_llm_with_kv_cache_retention_config():
+    kv_cache_retention_config = KvCacheRetentionConfig([
+        KvCacheRetentionConfig.TokenRangeRetentionConfig(
+            0, 2, 30, datetime.timedelta(seconds=30))
+    ], 80)
+
+    llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
+
+    for output in llm.generate(
+            prompts, kv_cache_retention_config=kv_cache_retention_config):
         print(output)
 
 
@@ -896,6 +932,45 @@ def test_tinyllama_logits_processor():
     tinyllama_logits_processor_test_harness()
 
 
+class MyBatchedLogitsPostProcessor:
+
+    def __init__(self, biased_word_id):
+        self.biased_word_id = biased_word_id
+
+    def __call__(self, req_ids_batch: List[int],
+                 logits_batch: List[torch.Tensor],
+                 token_ids_batch: List[List[List[int]]], stream_ptr: int,
+                 client_ids_batch: List[Optional[int]]):
+        with torch.cuda.stream(torch.cuda.ExternalStream(stream_ptr)):
+            for logits in logits_batch:
+                logits[:] = float("-inf")
+                logits[..., self.biased_word_id] = 0
+
+
+def tinyllama_logits_processor_batched_test_harness(**llm_kwargs):
+    tokenizer = TransformersTokenizer.from_pretrained(llama_model_path)
+    biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
+    sampling_params = SamplingParams(
+        max_tokens=6,
+        logits_post_processor_name=SamplingParams.BATCHED_POST_PROCESSOR_NAME)
+
+    llm_test_harness(
+        llama_model_path,
+        prompts, ["Z Z Z Z Z Z"],
+        sampling_params=sampling_params,
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+        logits_post_processor_map={
+            SamplingParams.BATCHED_POST_PROCESSOR_NAME:
+            MyBatchedLogitsPostProcessor(biased_word_id)
+        },
+        **llm_kwargs)
+
+
+@force_ampere
+def test_tinyllama_logits_processor_batched():
+    tinyllama_logits_processor_batched_test_harness()
+
+
 def tinyllama_guided_decoding_test_harness(**llm_kwargs):
     prompts = [
         "What is 1+1? Answer formatted in a dict in json format: ",
@@ -1023,6 +1098,90 @@ def test_llm_api_medusa_tp2():
               tensor_parallel_size=2)
 
     outputs = llm.generate(prompts, sampling_params, tensor_parallel_size=2)
+
+    # Print the outputs.
+    for output in outputs:
+        prompt = output.prompt
+        generated_text = output.outputs[0].text
+        print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
+
+
+def test_llm_api_eagle():
+    prompts = [
+        "Hello, my name is",
+        "The president of the United States is",
+        "The capital of France is",
+        "The future of AI is",
+    ]
+    sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
+    build_config = BuildConfig(
+        max_batch_size=1,
+        max_seq_len=1024,
+        max_draft_len=63,
+        speculative_decoding_mode=SpeculativeDecodingMode.EAGLE)
+
+    kv_cache_config = KvCacheConfig(enable_block_reuse=True)
+
+    speculative_config = EagleDecodingConfig(
+        num_eagle_layers=4,
+        max_non_leaves_per_layer=10,
+                            eagle_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
+                                            [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], \
+                                            [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], \
+                                            [0, 0, 0, 0], [0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], \
+                                            [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], \
+                                            [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [0, 0, 0, 1], [1, 6], [0, 7, 0]]
+    )
+    llm = LLM(model=get_model_path("vicuna-7b-v1.3"),
+              speculative_model=get_model_path("EAGLE-Vicuna-7B-v1.3"),
+              build_config=build_config,
+              kv_cache_config=kv_cache_config,
+              speculative_config=speculative_config)
+
+    outputs = llm.generate(prompts, sampling_params)
+
+    # Print the outputs.
+    for output in outputs:
+        prompt = output.prompt
+        generated_text = output.outputs[0].text
+        print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
+
+
+@skip_single_gpu
+def test_llm_api_eagle_tp2():
+    prompts = [
+        "Hello, my name is",
+        "The president of the United States is",
+        "The capital of France is",
+        "The future of AI is",
+    ]
+    sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
+    build_config = BuildConfig(
+        max_batch_size=1,
+        max_seq_len=1024,
+        max_draft_len=63,
+        speculative_decoding_mode=SpeculativeDecodingMode.EAGLE)
+
+    kv_cache_config = KvCacheConfig(enable_block_reuse=True)
+
+    speculative_config = EagleDecodingConfig(
+        num_eagle_layers=4,
+        max_non_leaves_per_layer=10,
+                            eagle_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
+                                            [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], \
+                                            [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], \
+                                            [0, 0, 0, 0], [0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], \
+                                            [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], \
+                                            [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [0, 0, 0, 1], [1, 6], [0, 7, 0]]
+    )
+    llm = LLM(model=get_model_path("vicuna-7b-v1.3"),
+              speculative_model=get_model_path("EAGLE-Vicuna-7B-v1.3"),
+              build_config=build_config,
+              kv_cache_config=kv_cache_config,
+              speculative_config=speculative_config,
+              tensor_parallel_size=2)
+
+    outputs = llm.generate(prompts, sampling_params)
 
     # Print the outputs.
     for output in outputs:

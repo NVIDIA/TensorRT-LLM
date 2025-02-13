@@ -255,9 +255,9 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* qkv_output, T const*
 }
 
 template <typename T, int BLOCK_SIZE, int K_DIM, int ROPE_DIM, typename KVCacheBuffer>
-__global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T const* fuse_buf, KVCacheBuffer kv_cache,
-    float2 const* cos_sin_cache, size_t head_num, int head_size, int c_q, int c_k, int total_s_len, int* seqQOffset,
-    uint32_t* fmha_tile_counter, int32_t const* kv_cache_lengths, int* seqKVOffsets)
+__global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_buf, T const* fuse_buf,
+    KVCacheBuffer kv_cache, float2 const* cos_sin_cache, size_t head_num, int head_size, int c_q, int c_k,
+    int total_s_len, int* seqQOffset, uint32_t* fmha_tile_counter, int32_t const* kv_cache_lengths, int* seqKVOffsets)
 {
 
     // Constants.
@@ -299,51 +299,56 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T const*
         {
             auto batch_idx = global_token_idx;
             bool const valid_token = batch_idx < total_s_len;
-            batch_idx = std::min(batch_idx, total_s_len - 1);
-
-            auto const position_id = kv_cache_lengths[batch_idx] - 1;
-            auto const src_bias = first_half ? head_dim_idx * 2 : (head_dim_idx - HALF_ROTATARY_DIM) * 2;
-            float2 const* rotary_coef_cache_buffer
-                = cos_sin_cache + static_cast<size_t>(ROPE_DIM) * position_id + (head_dim_idx);
-
             VecT data;
-            VecT ref[2];
 
-            if (head_idx == head_num)
+            if (valid_token)
             {
-                auto const src_k_global_offset
-                    = static_cast<size_t>(global_token_idx) * (c_q + c_k + ROPE_DIM) + c_q + c_k;
+                VecT ref[2];
 
-                for (int i = 0; i < 2; ++i)
+                auto const position_id = kv_cache_lengths[batch_idx] - 1;
+                auto const src_bias = first_half ? head_dim_idx * 2 : (head_dim_idx - HALF_ROTATARY_DIM) * 2;
+                float2 const* rotary_coef_cache_buffer
+                    = cos_sin_cache + static_cast<size_t>(ROPE_DIM) * position_id + (head_dim_idx);
+
+                if (head_idx == head_num)
                 {
-                    ref[i]
-                        = *reinterpret_cast<VecT const*>(&fuse_buf[src_k_global_offset + src_bias + i * ELTS_PER_VEC]);
+                    auto const src_k_global_offset
+                        = static_cast<size_t>(global_token_idx) * (c_q + c_k + ROPE_DIM) + c_q + c_k;
+
+                    for (int i = 0; i < 2; ++i)
+                    {
+                        ref[i] = *reinterpret_cast<VecT const*>(
+                            &fuse_buf[src_k_global_offset + src_bias + i * ELTS_PER_VEC]);
+                    }
+                }
+                else
+                {
+                    auto const src_q_global_offset
+                        = static_cast<size_t>(global_token_idx) * head_num * (head_size + ROPE_DIM)
+                        + (head_size + ROPE_DIM) * head_idx + head_size;
+
+                    for (int i = 0; i < 2; ++i)
+                    {
+                        ref[i]
+                            = *reinterpret_cast<VecT const*>(&q_buf[src_q_global_offset + src_bias + i * ELTS_PER_VEC]);
+                    }
+                }
+
+                for (int elt_id = 0; elt_id < ELTS_PER_VEC; elt_id++)
+                {
+                    float2 rotary_coef_cache = rotary_coef_cache_buffer[elt_id];
+                    rotary_coef_cache.y = first_half ? -rotary_coef_cache.y : rotary_coef_cache.y;
+                    auto& data_ = reinterpret_cast<T*>(&data)[elt_id];
+                    auto data_left = first_half ? reinterpret_cast<T*>(&ref)[elt_id * 2]
+                                                : reinterpret_cast<T*>(&ref)[elt_id * 2 + 1];
+                    auto data_right = first_half ? reinterpret_cast<T*>(&ref)[elt_id * 2 + 1]
+                                                 : reinterpret_cast<T*>(&ref)[elt_id * 2];
+                    mla::apply_rotary_embedding_mla(data_, data_left, data_right, rotary_coef_cache);
                 }
             }
-            else
-            {
-                auto const src_q_global_offset = static_cast<size_t>(global_token_idx) * head_num * (c_k + ROPE_DIM)
-                    + (c_k + ROPE_DIM) * head_idx + c_k;
-                for (int i = 0; i < 2; ++i)
-                {
-                    ref[i] = *reinterpret_cast<VecT const*>(
-                        &qkv_output[src_q_global_offset + src_bias + i * ELTS_PER_VEC]);
-                }
-            }
 
-            for (int elt_id = 0; elt_id < ELTS_PER_VEC; elt_id++)
-            {
-                float2 rotary_coef_cache = rotary_coef_cache_buffer[elt_id];
-                rotary_coef_cache.y = first_half ? -rotary_coef_cache.y : rotary_coef_cache.y;
-                auto& data_ = reinterpret_cast<T*>(&data)[elt_id];
-                auto data_left
-                    = first_half ? reinterpret_cast<T*>(&ref)[elt_id * 2] : reinterpret_cast<T*>(&ref)[elt_id * 2 + 1];
-                auto data_right
-                    = first_half ? reinterpret_cast<T*>(&ref)[elt_id * 2 + 1] : reinterpret_cast<T*>(&ref)[elt_id * 2];
-                mla::apply_rotary_embedding_mla(data_, data_left, data_right, rotary_coef_cache);
-            }
-            // do sync
             __syncwarp();
+
             if (valid_token)
             {
                 if (head_idx == head_num)
@@ -451,7 +456,7 @@ void invokeMLARopeGeneration(mlaParams<T>& params, KVCacheBuffer kv_cache_buffer
     dim3 grid(int(tensorrt_llm::common::divUp(params.acc_q_len, 32)), params.head_num + 1 + 8);
     auto head_size = params.meta.qk_nope_head_dim;
     applyMLARopeAndAssignQKVKernelGeneration<T, 256, 512, 64, KVCacheBuffer>
-        <<<grid, 256, 0, stream>>>(params.attention_input_buf, params.fused_a_input, kv_cache_buffer,
+        <<<grid, 256, 0, stream>>>(params.attention_input_buf, params.q_buf, params.fused_a_input, kv_cache_buffer,
             params.cos_sin_cache, params.head_num, head_size, params.meta.q_lora_rank, params.meta.kv_lora_rank,
             params.acc_q_len, params.seqQOffset, params.fmha_tile_counter, params.cache_seq_lens, params.cu_kv_seqlens);
 }

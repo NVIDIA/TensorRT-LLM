@@ -52,9 +52,8 @@ size_t invokeReduceMaxGenerationLengths(void* __restrict__ reduceMaxTempStorage,
 
 // inclusive prefix sum generationLengths and reduce max generationLengths
 void invokeScanReduceGenerationLengths(SizeType32 batchSize, SizeType32 const* __restrict__ generationLengths,
-    void* __restrict__ scanTempStorage, size_t scanTempStorageBytes, SizeType32* __restrict__ scanedGenerationLengths,
-    void* __restrict__ reduceMaxTempStorage, size_t reduceMaxTempStorageBytes, SizeType32* maxGenerationLengths,
-    cudaStream_t stream)
+    void* scanTempStorage, size_t scanTempStorageBytes, SizeType32* __restrict__ scanedGenerationLengths,
+    void* reduceMaxTempStorage, size_t reduceMaxTempStorageBytes, SizeType32* maxGenerationLengths, cudaStream_t stream)
 {
     invokeScanGenerationLengths(
         scanTempStorage, scanTempStorageBytes, generationLengths, scanedGenerationLengths, batchSize, stream);

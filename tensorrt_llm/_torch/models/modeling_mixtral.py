@@ -4,6 +4,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from tensorrt_llm._torch.distributed import ParallelConfig, allgather
 from tensorrt_llm.functional import PositionEmbeddingType
 
 from ..attention_backend import AttentionMetadata
@@ -37,13 +38,15 @@ class MixtralMoE(nn.Module):
                            dtype=config.torch_dtype,
                            quant_config=None)
 
+        reduce_results = True
+
         self.experts = FusedMoE(
             num_experts=self.num_experts,
             top_k=self.top_k,
             hidden_size=self.hidden_dim,
             intermediate_size=self.ffn_dim,
             dtype=config.torch_dtype,
-            reduce_results=True,
+            reduce_results=reduce_results,
             tune_max_num_tokens=config.max_position_embeddings // 4,
             model_config=model_config)
 
@@ -118,6 +121,32 @@ class MixtralDecoderLayer(DecoderLayer):
         self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                                 eps=config.rms_norm_eps,
                                                 dtype=config.torch_dtype)
+        self.enable_attention_dp = model_config.mapping.enable_attention_dp
+        self.parallel_config = ParallelConfig(
+            tensor_parallel_rank=model_config.mapping.tp_rank,
+            tensor_parallel_size=model_config.mapping.tp_size,
+            gpus_per_node=model_config.mapping.gpus_per_node)
+        self.layer_idx = layer_idx
+
+    def all_gather(self, input_tensor, attn_metadata):
+        rank = self.parallel_config.tensor_parallel_rank
+        world_size = self.parallel_config.tensor_parallel_size
+        all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+        max_num_token = max(all_rank_num_tokens)
+        if world_size == 1:
+            return input_tensor, 0, max_num_token
+
+        pad_tensor = torch.nn.functional.pad(
+            input_tensor, (0, 0, 0, max_num_token - input_tensor.shape[0]))
+        outputs = allgather(pad_tensor, self.parallel_config, gather_dim=0)
+        depad_tensors = torch.concat([
+            outputs[i * max_num_token:i * max_num_token +
+                    all_rank_num_tokens[i]] for i in range(world_size)
+        ])
+
+        cur_rank_start = 0 if rank == 0 else sum(all_rank_num_tokens[:rank])
+        cur_rank_end = cur_rank_start + all_rank_num_tokens[rank]
+        return depad_tensors, cur_rank_start, cur_rank_end
 
     def forward(
         self,
@@ -145,7 +174,12 @@ class MixtralDecoderLayer(DecoderLayer):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
+        if self.enable_attention_dp:
+            hidden_states, cur_rank_start, cur_rank_end = self.all_gather(
+                hidden_states, attn_metadata)
         hidden_states, _router_logits = self.block_sparse_moe(hidden_states)
+        if self.enable_attention_dp:
+            hidden_states = hidden_states[cur_rank_start:cur_rank_end]
         return hidden_states, residual
 
 

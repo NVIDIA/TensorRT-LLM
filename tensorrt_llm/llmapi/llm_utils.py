@@ -11,6 +11,7 @@ __all__ = [
     'ExecutorConfig',
     'SchedulerConfig',
     'KvCacheConfig',
+    'KvCacheRetentionConfig',
     'LookaheadDecodingConfig',
     'MedusaDecodingConfig',
     'ContextChunkingPolicy',
@@ -26,6 +27,7 @@ __all__ = [
 
 import copy
 import json
+import math
 import os
 import shutil
 import tempfile
@@ -43,12 +45,15 @@ from transformers import PreTrainedTokenizerBase
 
 from .._utils import mpi_barrier, mpi_broadcast, mpi_rank, release_gc
 from ..auto_parallel import AutoParallelConfig, infer_cluster_config
+# yapf: disable
 from ..bindings.executor import (BatchingType, CapacitySchedulerPolicy,
                                  ContextChunkingPolicy, DecodingConfig,
-                                 DecodingMode, ExecutorConfig,
+                                 DecodingMode, EagleConfig, ExecutorConfig,
                                  ExtendedRuntimePerfKnobConfig, KvCacheConfig,
+                                 KvCacheRetentionConfig,
                                  LookaheadDecodingConfig, PeftCacheConfig,
                                  SchedulerConfig)
+# yapf: enable
 from ..builder import BuildConfig, Engine, EngineConfig, build
 from ..logger import logger
 from ..mapping import Mapping
@@ -74,9 +79,11 @@ class _ParallelConfig:
     tp_size: int = 1
     pp_size: int = 1
     cp_size: int = 1
+    gpus_per_node: int = 8
     moe_tp_size: int = 1
     moe_ep_size: int = 1
     cp_config: dict = field(default_factory=dict)
+    enable_attention_dp: bool = False
     auto_parallel: bool = False
 
     _world_size: int = field(default=1, init=False)
@@ -111,6 +118,12 @@ class _ParallelConfig:
                 "world_size > 1 is only supported in auto parallel mode.")
         return self.tp_size * self.pp_size * self.cp_size
 
+    @property
+    def world_size_per_node(self) -> int:
+        world_size = self.world_size
+        total_nodes = math.ceil(world_size / self.gpus_per_node)
+        return world_size // total_nodes  #TODO is this right?
+
     @world_size.setter
     def world_size(self, world_size: int):
         if self.auto_parallel:
@@ -128,10 +141,12 @@ class _ParallelConfig:
     def to_mapping(self) -> Mapping:
         return Mapping(world_size=self.world_size,
                        rank=mpi_rank(),
+                       gpus_per_node=self.gpus_per_node,
                        tp_size=self.tp_size,
                        pp_size=self.pp_size,
                        cp_size=self.cp_size,
                        cp_config=self.cp_config,
+                       enable_attention_dp=self.enable_attention_dp,
                        moe_tp_size=self.moe_tp_size,
                        moe_ep_size=self.moe_ep_size,
                        auto_parallel=self.auto_parallel)
@@ -211,6 +226,17 @@ class MedusaDecodingConfig:
 
 
 @dataclass
+class EagleDecodingConfig:
+    eagle_choices: Optional[List[List[int]]] = None
+    greedy_sampling: Optional[bool] = True
+    posterior_threshold: Optional[float] = None
+    use_dynamic_tree: Optional[bool] = False
+    dynamic_tree_max_topK: Optional[int] = None
+    num_eagle_layers: Optional[int] = None
+    max_non_leaves_per_layer: Optional[int] = None
+
+
+@dataclass
 class _ModelWrapper:
     model: Union[str, Path]
 
@@ -287,6 +313,8 @@ LLMARGS_DOCSTRING = r"""
 
         context_parallel_size (int): The context parallel size. Defaults to 1.
 
+        gpus_per_node (Optional[int]): The number of GPUs per node. Defaults to None for automatic configure.
+
         load_format (Literal['auto', 'dummy']): The format of the model weights to load.
             * 'auto' will try to load the weights from the provided checkpoint.
             * 'dummy' will initialize the weights with random values, which is mainly for profiling.
@@ -337,6 +365,8 @@ LLMARGS_DOCSTRING = r"""
         moe_tensor_parallel_size (int, optional): The tensor parallel size for MoE models's expert weights.
 
         moe_expert_parallel_size (int, optional): The expert parallel size for MoE models's expert weights.
+
+        enable_attention_dp (bool, optional): Enable attention data parallel. Defaults to False.
 
         fast_build: (bool): Enable features for faster engine building.
             This may cause some performance degradation and is currently incompatible with int8/int4 quantization.
@@ -399,9 +429,13 @@ class LlmArgs:
 
     context_parallel_size: int = 1
 
+    gpus_per_node: Optional[int] = None
+
     moe_tensor_parallel_size: Optional[int] = None
 
     moe_expert_parallel_size: Optional[int] = None
+
+    enable_attention_dp: bool = False
 
     cp_config: Optional[dict] = field(default_factory=dict)
 
@@ -511,6 +545,12 @@ class LlmArgs:
             if self.dtype == 'bfloat16':
                 raise RuntimeError("Pre SM 80 GPUs do not support bfloat16")
 
+        if self.gpus_per_node is None:
+            logger.warning(
+                f"Using default gpus_per_node: {torch.cuda.device_count()}")
+            self.gpus_per_node = torch.cuda.device_count()
+        assert self.gpus_per_node is not None
+
         if self.moe_tensor_parallel_size is None:
             self.moe_tensor_parallel_size = -1
 
@@ -521,8 +561,10 @@ class LlmArgs:
             tp_size=self.tensor_parallel_size,
             pp_size=self.pipeline_parallel_size,
             cp_size=self.context_parallel_size,
+            gpus_per_node=self.gpus_per_node,
             moe_tp_size=self.moe_tensor_parallel_size,
             moe_ep_size=self.moe_expert_parallel_size,
+            enable_attention_dp=self.enable_attention_dp,
             cp_config=self.cp_config,
             auto_parallel=self.auto_parallel)
         if self.parallel_config.auto_parallel:
@@ -622,7 +664,29 @@ class LlmArgs:
 
         self.calib_config = self.calib_config or CalibConfig()
 
-        self.build_config = self.build_config or BuildConfig()
+        # Note: max_batch_size and max_num_tokens in LlmArgs are for runtime,
+        # which will be passed to the C++ Executor API, overwriting the values
+        # from an built engine. In order to set build configuration, it is
+        # recommended to use build_config instead.
+        if self.build_config is not None:
+            if self.max_batch_size and self.build_config.max_batch_size != self.max_batch_size:
+                logger.warning(
+                    f"Conflict detected in LlmArgs build_config.max_batch_size "
+                    f"({self.build_config.max_batch_size}) != max_batch_size ({self.max_batch_size})."
+                    f"The 'max_batch_size' specified in LlmArgs is ignored at "
+                    f"engine build and will override at runtime.")
+            if self.max_num_tokens and self.build_config.max_num_tokens != self.max_num_tokens:
+                logger.warning(
+                    f"Conflict detected in LlmArgs build_config.max_num_tokens "
+                    f"({self.build_config.max_num_tokens}) != max_batch_size ({self.max_num_tokens})."
+                    f"The 'max_num_tokens' specified in LlmArgs is ignored at "
+                    f"engine build and will override at runtime.")
+        else:
+            self.build_config = BuildConfig()
+            if self.max_batch_size:
+                self.build_config.max_batch_size = self.max_batch_size
+            if self.max_num_tokens:
+                self.build_config.max_num_tokens = self.max_num_tokens
 
         # TODO(xiweny): remove the checker when manage weights support all data types
         if self.fast_build and (self.quant_config.quant_algo is QuantAlgo.FP8
@@ -660,6 +724,16 @@ class LlmArgs:
                 self.decoding_config = DecodingConfig(
                     decoding_mode=DecodingMode.Medusa(),
                     medusa_choices=self.speculative_config.medusa_choices)
+            elif isinstance(self.speculative_config, EagleDecodingConfig):
+                eagle_config = EagleConfig(
+                    self.speculative_config.eagle_choices,
+                    self.speculative_config.greedy_sampling,
+                    self.speculative_config.posterior_threshold,
+                    self.speculative_config.use_dynamic_tree,
+                    self.speculative_config.dynamic_tree_max_topK)
+                self.decoding_config = DecodingConfig(
+                    decoding_mode=DecodingMode.Eagle(),
+                    eagle_config=eagle_config)
             else:
                 raise ValueError(f"Speculative config type not recognized")
 
@@ -720,11 +794,13 @@ class LlmArgs:
             raise ValueError(
                 f"cp_size {self.parallel_config.cp_size} is not consistent with the engine's cp_size {mapping.cp_size}"
             )
-        self.parallel_config = _ParallelConfig(tp_size=mapping.tp_size,
-                                               pp_size=mapping.pp_size,
-                                               cp_size=mapping.cp_size,
-                                               moe_tp_size=mapping.moe_tp_size,
-                                               moe_ep_size=mapping.moe_ep_size)
+        self.parallel_config = _ParallelConfig(
+            tp_size=mapping.tp_size,
+            pp_size=mapping.pp_size,
+            cp_size=mapping.cp_size,
+            gpus_per_node=mapping.gpus_per_node,
+            moe_tp_size=mapping.moe_tp_size,
+            moe_ep_size=mapping.moe_ep_size)
 
     def _load_config_from_ckpt(self, ckpt_dir: Path):
         pretrained_config = PretrainedConfig.from_json_file(ckpt_dir /
@@ -735,7 +811,7 @@ class LlmArgs:
         moe_tp_size = pretrained_config.mapping.moe_tp_size
         moe_ep_size = pretrained_config.mapping.moe_ep_size
         world_size = pretrained_config.mapping.world_size
-
+        gpus_per_node = pretrained_config.mapping.gpus_per_node
         # load parallel_config
         if self.parallel_config.tp_size != 1 and self.parallel_config.tp_size != tp_size:
             raise ValueError(
@@ -758,6 +834,7 @@ class LlmArgs:
             self.parallel_config = _ParallelConfig(tp_size=tp_size,
                                                    pp_size=pp_size,
                                                    cp_size=cp_size,
+                                                   gpus_per_node=gpus_per_node,
                                                    moe_tp_size=moe_tp_size,
                                                    moe_ep_size=moe_ep_size)
 
@@ -1286,10 +1363,12 @@ class ModelLoader:
     def _load_model_from_hf(self):
         ''' Load a TRT-LLM model from a HF model. '''
         assert self._model_dir is not None
+
         model_cls = AutoModelForCausalLM.get_trtllm_model_class(
             self._model_dir, self.llm_args.trust_remote_code,
-            hasattr(self.llm_args, "speculative_model")
-            and self.llm_args.speculative_model)
+            self.llm_args.decoding_config.decoding_mode
+            if hasattr(self.llm_args, "speculative_model")
+            and self.llm_args.speculative_model else None)
 
         # Update quant_config if it's ModelOpt quantized ckpt
         user_quant_config = self.llm_args.quant_config
@@ -1372,9 +1451,9 @@ class ModelLoader:
                 True,  # TODO:TRTLLM-195 to enhance the weights loading memory usage and chose best location
                 trust_remote_code=self.llm_args.trust_remote_code,
                 speculative_model=self._speculative_model_dir,
-                medusa_num_heads=self.llm_args.speculative_config.
-                num_medusa_heads if isinstance(self.llm_args.speculative_config,
-                                               MedusaDecodingConfig) else None,
+                speculative_config=self.llm_args.speculative_config
+                if not isinstance(self.llm_args.speculative_config,
+                                  LookaheadDecodingConfig) else None,
                 **self.convert_checkpoint_options,
             )
 

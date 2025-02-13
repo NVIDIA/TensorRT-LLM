@@ -1135,7 +1135,7 @@ class TestFunctional(unittest.TestCase):
                     # position_ids=position_ids_tensor,
                     # q_a_proj=q_a_proj_tensor,
                     # q_a_layernorm=q_a_layernorm_tensor,
-                    fused_q_proj=kv_a_proj_with_mqa_tensor,
+                    k_b_proj_trans=kv_a_proj_with_mqa_tensor,
                     q_b_proj=q_b_proj_tensor,
                     # kv_a_proj_with_mqa=kv_a_proj_with_mqa_tensor,
                     # kv_a_layernorm=kv_a_layernorm_tensor,
