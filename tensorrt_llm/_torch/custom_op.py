@@ -81,6 +81,12 @@ def _register_fake():
         out_scale,
         rotary_inv_freq,
         rotary_cos_sin,
+        q_b_proj,
+        kv_b_proj,
+        k_b_proj_trans,
+        q_b_proj_scale,
+        kv_b_proj_scale,
+        k_b_proj_trans_scale,
         is_fused_qkv,
         update_kv_cache,
         layer_idx,
@@ -105,6 +111,13 @@ def _register_fake():
         rotary_embedding_max_positions,
         rotary_embedding_original_max_positions,
         use_paged_context_fmha,
+        is_mla_enable,
+        q_lora_rank,
+        kv_lora_rank,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        v_head_dim,
+        is_ptp128c_enabled,
     ):
         output_shape = (q.shape[0], num_heads * head_size)
         return q.new_empty(output_shape, dtype=out_dtype or q.dtype)
@@ -112,6 +125,12 @@ def _register_fake():
     @torch.library.register_fake("trtllm::userbuffers_allreduce_finalize")
     def _(input):
         return torch.empty_like(input)
+
+    @torch.library.register_fake("trtllm::fp8_block_scaling_gemm")
+    def _(a, b, a_scale, b_scale):
+        m = a.shape[0]
+        n = b.shape[0]
+        return a.new_empty((m, n))
 
     @torch.library.register_fake(
         "tensorrt_llm::static_quantize_e4m3_per_tensor")

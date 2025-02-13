@@ -5,6 +5,7 @@ import json
 import os
 import re
 from enum import IntFlag, auto
+from fnmatch import fnmatch
 from functools import cached_property
 from pathlib import Path
 from typing import (TYPE_CHECKING, Callable, Dict, Generator, List, Optional,
@@ -208,19 +209,16 @@ class LayerQuantConfig(QuantConfig):
     quant_algo: Optional[QuantConfig] = None
     kv_cache_quant_algo: Optional[QuantConfig] = None
     quantized_layers: Optional[Dict[str, QuantConfig]] = None
-    exclude_modules: Optional[List[str]] = None
 
     def __init__(self,
                  *,
                  quant_algo: Optional[QuantConfig] = None,
                  kv_cache_quant_algo: Optional[QuantConfig] = None,
                  quantized_layers: Optional[Dict[str, QuantConfig]] = None,
-                 exclude_modules: Optional[List[str]] = None,
                  **kwargs):
         self.quant_algo = quant_algo
         self.quantized_layers = quantized_layers
         self.kv_cache_quant_algo = kv_cache_quant_algo
-        self.exclude_modules = exclude_modules
         self.auto_quant_mode = {}
         for name, layer_config in self.quantized_layers.items():
             self.auto_quant_mode.update({
@@ -240,9 +238,14 @@ class LayerQuantConfig(QuantConfig):
         quant_mode_list = list(set(self.auto_quant_mode.values()))
         return QuantModeWrapper(quant_mode_list)
 
-    @property
-    def layer_quant_mode(self) -> Dict[str, QuantMode]:
-        return self.auto_quant_mode
+    #@lru_cache(maxsize=None)
+    def layer_quant_mode(self, layer_name) -> QuantMode:
+
+        for name, quant_mode in self.auto_quant_mode.items():
+            if fnmatch(layer_name, name):
+                return quant_mode
+
+        return QuantMode(0)
 
     @cached_property
     def auto_quant_list(self):
@@ -263,11 +266,15 @@ class LayerQuantConfig(QuantConfig):
         obj = cls(quantized_layers=quantized_layers_dict, **config)
         return obj
 
+    #@lru_cache(maxsize=None)
     def get_quant_cfg(self, module_name):
-        if module_name in self.quantized_layers.keys():
-            return self.quantized_layers[module_name]
-        else:
-            return QuantConfig()
+        quant_res = QuantConfig()
+
+        for name, quant_cfg in self.quantized_layers.items():
+            if fnmatch(module_name, name):
+                quant_res = quant_cfg
+                break
+        return quant_res
 
     def get_modelopt_qformat(self):
         algo_to_modelopt_map = {
@@ -286,10 +293,8 @@ class LayerQuantConfig(QuantConfig):
         output = copy.deepcopy(self.__dict__)
         output.pop('auto_quant_mode', None)
         output.pop('quant_mode', None)
-        output.pop('exclude_modules', None)
         for name, per_layer_config in output['quantized_layers'].items():
             per_layer_config = per_layer_config.to_dict()
-            per_layer_config.pop('exclude_modules')
             output['quantized_layers'][name] = per_layer_config
         return output
 
@@ -456,6 +461,18 @@ class PretrainedConfig:
     def to_layer_quant_config(self, config_file: str):
         with open(config_file) as f:
             config = json.load(f)
+
+        if self.architecture == "MixtralForCausalLM":
+            for layer_name in list(config["quantized_layers"].keys()):
+                quant_cfg = config["quantized_layers"][layer_name]
+                if "mlp.fc" in layer_name or "mlp.proj" in layer_name:
+                    moe_name, _ = layer_name.rsplit('.', 1)
+                    if moe_name not in config["quantized_layers"]:
+                        config["quantized_layers"][moe_name] = quant_cfg
+                    else:
+                        assert quant_cfg == config["quantized_layers"][
+                            moe_name], "MoE module needs to have the same quantization format for non-rounter sub-modules"
+
         self.quantization = LayerQuantConfig.from_dict(config)
 
     @property
@@ -528,6 +545,7 @@ class DecoderLayerList(ModuleList):
                 kwargs['spec_decoding_params'] = spec_decoding_params
             if mrope_params is not None:
                 kwargs['mrope_params'] = mrope_params
+
             if default_net().plugin_config.reduce_fusion:
                 if layer_idx + self.layer_list[0] < self.layer_list[-1]:
                     qkv_activation_scaling_factor = None
@@ -545,6 +563,20 @@ class DecoderLayerList(ModuleList):
                         self[layer_idx + 1].input_layernorm.weight.value,
                         self[layer_idx + 1].input_layernorm.eps,
                         qkv_activation_scaling_factor)
+                else:
+                    kwargs['next_layer_input_layernorm_args'] = None
+            elif default_net().plugin_config.norm_quant_fusion:
+                if layer_idx < self.layer_list[-1] - self.layer_list[0]:
+                    try:
+                        activation_scaling_factor = constant(
+                            self[layer_idx + 1].attention.qkv.
+                            activation_global_scaling_factor.raw_value.copy())
+                    except:
+                        activation_scaling_factor = None
+                    kwargs['next_layer_input_layernorm_args'] = (
+                        self[layer_idx + 1].input_layernorm.weight.value,
+                        self[layer_idx + 1].input_layernorm.eps,
+                        activation_scaling_factor)
                 else:
                     kwargs['next_layer_input_layernorm_args'] = None
 
@@ -1797,11 +1829,12 @@ def preprocess_weights(weights: Dict[str, torch.Tensor],
         if quant_algo != QuantAlgo.MIXED_PRECISION:
             layer_quant_algo = quant_algo
         else:
-            if base_name not in quant_config.quantized_layers.keys():
+            quant_cfg = quant_config.get_quant_cfg(base_name)
+            if not quant_cfg.quant_algo:
                 new_weights.update(layer_weights)
                 continue
-            layer_quant_algo = quant_config.quantized_layers[
-                base_name].quant_algo
+
+            layer_quant_algo = quant_cfg.quant_algo
 
         preprocess_perlayer_weights(layer_weights, model_config,
                                     layer_quant_algo, from_pruned)

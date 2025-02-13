@@ -229,6 +229,7 @@ if args.model_type == 'mllama':
     from tensorrt_llm.runtime.processor_wrapper import MllamaProcessorWrapper
     hf_processor = MllamaProcessorWrapper(hf_processor, logger)
 
+profiler.start('evaluation')
 if args.test_trtllm or args.test_hf:
     for i in range(args.max_ite):
         logger.debug(f"Ite: {i:3d}")
@@ -290,6 +291,10 @@ if args.test_trtllm or args.test_hf:
     # check if the accuracy is above the threshold
     if args.accuracy_threshold is not None and args.test_trtllm:
         assert trtllm_correct / args.max_ite >= args.accuracy_threshold / 100, \
-            f"TRT-LLM's accuracy is below the threshold: {args.accuracy_threshold}%"
+            f"TRT-LLM's accuracy is below the threshold: {args.accuracy_threshold}%."
 else:
     logger.info("Neither enable test_trtllm nor enable test_hf")
+
+profiler.stop('evaluation')
+logger.info(
+    f'Evaluation takes: {profiler.elapsed_time_in_sec("evaluation")} sec')

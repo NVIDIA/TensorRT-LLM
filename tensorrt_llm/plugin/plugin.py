@@ -338,6 +338,14 @@ class PluginConfig(metaclass=PluginConfigMeta):
             "help":
             "Pack different tokens together, which reduces both the amount of computations and memory consumption."
         })
+    _norm_quant_fusion: bool = field(
+        default=False,
+        init=False,
+        metadata={
+            "help":
+            "Fuse the LayerNorm and quantization kernels into a single kernel, "
+            "resulting in improved end-to-end performance."
+        })
     _reduce_fusion: bool = field(
         default=False,
         init=False,
@@ -602,6 +610,7 @@ cli_plugin_args = [
     "multiple_profiles",
     "paged_state",
     "streamingllm",
+    "norm_quant_fusion",
     "reduce_fusion",
     "user_buffer",
     "use_fused_mlp",

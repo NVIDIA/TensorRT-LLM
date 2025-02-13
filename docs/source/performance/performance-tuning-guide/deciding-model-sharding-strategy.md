@@ -11,12 +11,12 @@ Splitting your model weights between multiple GPUs requires them to communicate 
 
 In pipeline parallelism, the model is split into sets of contiguous layers and each GPU houses one of these sets. In this setup, the only required communication is for each GPU to send the outputs of its set to the GPU with the next set.
 
-![Pipeline Parallel Visualization](../media/Pipeline_Parallel_Vis.svg)
+![Pipeline Parallel Visualization](../../media/Pipeline_Parallel_Vis.svg)
 
 
  On the other hand, tensor parallelism takes each layer of the model and splits it between the GPUs. This means that every GPU houses a portion of every layer. However since each layer needs the full outputs of the previous layer as an input, each GPU has to perform the heavier All-Reduce communication operation to share its results with all other GPUs before it can begin processing the next layer. While this seems disadvantageous, because each GPU only holds partial layers, it also performs smaller matrix multiplications, allowing it to compute its outputs quicker.
 
- ![Tensor Parallel Visualization](../media/Tensor_Parallelism_Vis.svg)
+ ![Tensor Parallel Visualization](../../media/Tensor_Parallelism_Vis.svg)
 
 
  Ultimately deciding the best strategy comes down to whether the extra overhead from the All-Reduce operation overshadows the gains from the smaller matrix multiplications. If the interconnects between the GPUs are sufficiently fast, the gains from the reduced computation burden per layer can outweigh the additional communication cost. Consequently, a general rule of thumb is that if your GPUs have fast connections between them like NVLink then tensor parallel is likely a good choice. However if the communication will go over slow connections (across nodes for example) pipeline parallel is likely better. Overall we provide the following guidelines:

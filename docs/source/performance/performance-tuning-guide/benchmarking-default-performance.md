@@ -88,7 +88,7 @@ The README in the examples folder for supported models walks through building en
 
 `python benchmarks/cpp/prepare_dataset.py --stdout --tokenizer /path/to/hf/Llama-3.3-70B-Instruct/ token-norm-dist --input-mean 2048 --output-mean 2048 --input-stdev 0 --output-stdev 0 --num-requests 1000 > synthetic_2048_2048.txt`
 
-`trtllm-bench` can also take in real data, see [`trtllm-bench` documentation](./perf-benchmarking.md) for more details on the required format.
+`trtllm-bench` can also take in real data, see [`trtllm-bench` documentation](../perf-benchmarking.md) for more details on the required format.
 
 ### Running Throughput and Latency Benchmarks
 

@@ -50,6 +50,7 @@ import argparse
 import os
 import random
 import time
+from typing import List
 
 import numpy as np
 import pandas as pd
@@ -194,8 +195,14 @@ def gen_prompt(train_df, subject, k=-1):
 
 
 def evaluate(args, subject, pipeline, dev_df, test_df):
+
     cors = []
     all_probs = []
+    prompts = []
+    labels = []
+    preds = []
+
+    # prepare prompts and labels
     for i in range(test_df.shape[0]):
         if i >= args.max_ite:
             break
@@ -211,10 +218,20 @@ def evaluate(args, subject, pipeline, dev_df, test_df):
             prompt = train_prompt + prompt_end
 
         label = test_df.iloc[i, test_df.shape[1] - 1]
-        pred = pipeline(prompt)
 
+        prompts.append(prompt)
+        labels.append(label)
+
+    # run batch inference
+    bs = args.batch_size
+    for i in range(0, len(prompts), bs):
+        cur_prompts = prompts[i:min(i + bs, len(prompts))]
+        preds.extend(pipeline(cur_prompts))
+
+    # check result
+    for i in range(len(prompts)):
         probs = [0 for _ in get_choices()]
-        cor = pred.strip().startswith(label)
+        cor = preds[i].strip().startswith(labels[i])
         cors.append(cor)
         all_probs.append(probs)
 
@@ -256,29 +273,27 @@ class Pipeline:
                                               top_k=1,
                                               temperature=0.0)
 
-    def __call__(self, prompt):
-        """Process the input prompt and generate a response.
+    def __call__(self, prompts: List):
+        """Process the input prompts and generate responses.
 
         Args:
-            prompt: Input text prompt
+            prompt: Input text prompts
 
         Returns:
-            str: Generated response with special tokens removed
+            str: Generated responses with special tokens removed
         """
         # Encode and prepare input
-        # TODO: batched inference
-        batch = [prompt]
 
         # Generate response
-        batch_outputs = self.model.generate(batch,
+        batch_outputs = self.model.generate(prompts,
                                             self.sampling_params,
                                             use_tqdm=False)
 
         # Extract generated tokens
-        text = batch_outputs[0].outputs[0].text
+        texts = [output.outputs[0].text for output in batch_outputs]
 
         # Decode and return response
-        return text
+        return texts
 
     def check_valid_length(self, prompt):
         """Check if prompt length is valid for model.
@@ -318,6 +333,9 @@ def parse_args():
                         type=int,
                         default=1,
                         help="Tensor Parallel size (only for pytorch backend)")
+    parser.add_argument("--enable_attention_dp",
+                        default=False,
+                        action='store_true')
     parser.add_argument(
         '--attn_backend',
         type=str,
@@ -327,6 +345,9 @@ def parse_args():
     parser.add_argument("--enable_chunked_prefill",
                         action="store_true",
                         help="Exercises the chunked prefill inference feature.")
+    parser.add_argument('--enable_overlap_scheduler',
+                        default=False,
+                        action='store_true')
 
     # MMLU args
     parser.add_argument(
@@ -341,6 +362,7 @@ def parse_args():
     parser.add_argument('--check_accuracy', action='store_true')
     parser.add_argument('--accuracy_threshold', type=float, default=0.3)
     parser.add_argument('--max_ite', type=int, default=10000000)
+    parser.add_argument('--batch_size', type=int, default=32)
     args = parser.parse_args()
 
     return args
@@ -384,14 +406,17 @@ def main():
 
     if args.backend == "pytorch":
         assert args.engine_dir is None, "pytorch backend does not need TRT Engine"
-        config = PyTorchConfig(attn_backend=args.attn_backend)
+        config = PyTorchConfig(
+            attn_backend=args.attn_backend,
+            enable_overlap_scheduler=args.enable_overlap_scheduler)
         model = tensorrt_llm._torch.LLM(
             model=args.hf_model_dir,
             tokenizer=tokenizer,
             tensor_parallel_size=args.tp_size,
             pytorch_backend_config=config,
             enable_chunked_prefill=args.enable_chunked_prefill,
-            build_config=build_config)
+            build_config=build_config,
+            enable_attention_dp=args.enable_attention_dp)
     else:
         model = LLM(model=args.engine_dir or args.hf_model_dir,
                     tokenizer=tokenizer,

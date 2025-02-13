@@ -118,6 +118,12 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="pipeline parallelism size",
 )
 @optgroup.option(
+    "--ep",
+    type=int,
+    default=None,
+    help="expert parallelism size",
+)
+@optgroup.option(
     "--target_input_len",
     default=None,
     type=click.IntRange(min=1),
@@ -258,7 +264,6 @@ def throughput_command(
 
     # Construct the runtime configuration dataclass.
     runtime_config = RuntimeConfig(**exec_settings)
-
     llm = None
     try:
         logger.info("Setting up throughput benchmark.")

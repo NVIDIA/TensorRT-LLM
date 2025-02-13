@@ -36,6 +36,7 @@ class QuantAlgo(StrEnum, metaclass=BaseEnumMeta):
     W4A8_QSERVE_PER_CHANNEL = auto()
     FP8 = auto()
     FP8_PER_CHANNEL_PER_TOKEN = auto()
+    FP8_BLOCK_SCALES = auto()
     INT8 = auto()
     MIXED_PRECISION = auto()
     NVFP4 = auto()
@@ -79,6 +80,8 @@ class QuantMode(IntFlag):
     FP8_QDQ = auto()
     # FP8 rowwise
     FP8_ROWWISE = auto()
+    # FP8 block scales for Deepseek
+    FP8_1x128_128x128 = auto()
     # W4A8 qserve
     W4A8_QSERVE = auto()
     # FP4
@@ -134,6 +137,9 @@ class QuantMode(IntFlag):
     def has_per_token_dynamic_scaling(self):
         return self._any(self.PER_TOKEN)
 
+    def has_fp8_block_scales(self):
+        return self._any(self.FP8_1x128_128x128)
+
     def has_act_static_scaling(self):
         return not self.has_per_token_dynamic_scaling(
         ) and not self.has_fp8_rowwise()
@@ -176,6 +182,7 @@ class QuantMode(IntFlag):
                          | self.INT8_KV_CACHE | self.FP8_KV_CACHE
                          | self.NVFP4_KV_CACHE
                          | self.FP8_QDQ | self.FP8_ROWWISE | self.W4A8_QSERVE
+                         | self.FP8_1x128_128x128
                          | self.NVFP4)
 
     def set_int8_kv_cache(self):
@@ -203,6 +210,7 @@ class QuantMode(IntFlag):
                          use_int8_kv_cache=False,
                          use_fp8_kv_cache=False,
                          use_fp8_qdq=False,
+                         use_fp8_block_scales=False,
                          use_fp8_rowwise=False,
                          use_nvfp4=False,
                          use_w4a8_qserve=False):
@@ -214,12 +222,13 @@ class QuantMode(IntFlag):
                              f"{per_token=}, "
                              f"{per_channel=}, "
                              f"{per_group=}, "
-                             f"{use_int4_weights=}"
-                             f"{use_int8_kv_cache=}"
-                             f"{use_fp8_kv_cache=}"
-                             f"{use_fp8_qdq=}"
-                             f"{use_fp8_rowwise=}"
-                             f"{use_nvfp4=}"
+                             f"{use_int4_weights=}, "
+                             f"{use_int8_kv_cache=}, "
+                             f"{use_fp8_kv_cache=}, "
+                             f"{use_fp8_qdq=}, "
+                             f"{use_fp8_block_scales=}, "
+                             f"{use_fp8_rowwise=}, "
+                             f"{use_nvfp4=}, "
                              f"{use_w4a8_qserve=}")
 
         # We must quantize weights when we quantize activations.
@@ -264,6 +273,9 @@ class QuantMode(IntFlag):
 
         if use_fp8_rowwise:
             mode = mode | QuantMode.FP8_ROWWISE | QuantMode.PER_TOKEN | QuantMode.PER_CHANNEL
+
+        if use_fp8_block_scales:
+            mode = mode | QuantMode.FP8_1x128_128x128
 
         if use_nvfp4:
             mode = mode | QuantMode.NVFP4
@@ -341,6 +353,8 @@ class QuantMode(IntFlag):
             quant_mode = QuantMode.from_description(use_fp8_qdq=True)
         elif quant_algo == QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN:
             quant_mode = QuantMode.from_description(use_fp8_rowwise=True)
+        elif quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
+            quant_mode = QuantMode.from_description(use_fp8_block_scales=True)
         elif quant_algo == QuantAlgo.NVFP4:
             quant_mode = QuantMode.from_description(use_nvfp4=True)
         else:
@@ -371,6 +385,8 @@ class QuantMode(IntFlag):
             self.has_fp8_qdq(),
             'enable_fp8_rowwise':
             self.has_fp8_rowwise(),
+            'enable_fp8_block_scales':
+            self.has_fp8_block_scales(),
             'enable_nvfp4':
             self.has_nvfp4(),
             'fp8_kv_cache':

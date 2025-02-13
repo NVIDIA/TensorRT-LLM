@@ -5,6 +5,7 @@ import gc
 import os
 import queue
 import threading
+import time
 import traceback
 import weakref
 from contextlib import contextmanager
@@ -148,6 +149,7 @@ class PyExecutor:
         self.resource_manager = resource_manager
         self.scheduler = scheduler
         self.model_engine = model_engine
+        self.enable_attention_dp = model_engine.enable_attention_dp
         self.decoder = decoder
         self.dist = dist
 
@@ -155,7 +157,9 @@ class PyExecutor:
         self.enqueue_lock = threading.Lock()
         self.active = True
         self.next_req_id = 1
-
+        self.print_log = model_engine.pytorch_backend_config.print_iter_log
+        self.num_fetch_requests_cur_rank = 0
+        self.num_fetch_requests = 0
         self.shutdown_event = threading.Event()
 
         # response used data
@@ -168,6 +172,9 @@ class PyExecutor:
         # _executor_loop private data
         self.max_num_active_requests = model_engine.get_max_num_sequences()
         self.active_requests = []
+        self.all_ranks_num_active_requests = [
+            0
+        ] * self.dist.world_size if self.enable_attention_dp else []
         self.previous_batch = None
         self.inflight_req_ids = tensorrt_llm.bindings.internal.batch_manager.ReqIdsSet(
         )
@@ -220,21 +227,30 @@ class PyExecutor:
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)
         got_finish_signal = False
+        attn_dp_idle_iter = False
+        iter = 0
         with self._profiler() as profile_step:
             while not got_finish_signal or len(self.active_requests) > 0:
                 profile_step()
-                new_requests = self._fetch_new_requests()
+                t0 = time.time()
+                if self.enable_attention_dp:
+                    new_requests = self._fetch_adp_new_requests()
+                else:
+                    new_requests = self._fetch_new_requests()
                 got_finish_signal = self._merge_requests(
                     new_requests) or got_finish_signal
                 if got_finish_signal and len(self.active_requests) == 0:
                     break
+                attn_dp_idle_iter = ((not got_finish_signal)
+                                     and len(self.active_requests) == 0
+                                     and self.enable_attention_dp)
+                if attn_dp_idle_iter:
+                    self._merge_one_dummy_request()
                 scheduled_batch = self._schedule()
                 assert scheduled_batch.batch_size > 0, (
                     "fail to schedule any pending request, "
                     "probably run out of resource.")
-                # print(
-                #     f'has {len(self.active_requests)} active_request, scheduled {len(scheduled_batch.context_requests)} context requests and {len(scheduled_batch.generation_requests)} generation requests'
-                # )
+
                 self.pause_requests(scheduled_batch.paused_requests)
                 self.resource_manager.prepare_resources(scheduled_batch)
                 batch_outputs = self._forward_step(scheduled_batch)
@@ -242,6 +258,12 @@ class PyExecutor:
                 self._handle_cancelled_requests()
                 self._handle_responses()
                 self.resource_manager.update_resources(scheduled_batch)
+                iter = iter + 1
+                t1 = time.time()
+                if self.print_log and self.dist.rank == 0:
+                    print(
+                        f'iter = {iter}, rank = {self.dist.rank}, currank_total_requests = {self.num_fetch_requests_cur_rank}/{self.num_fetch_requests}, elapsed_time = {t1 - t0}s, states = {self.model_engine.iter_states}'
+                    )
 
         with self.response_cv:
             self.is_shutdown = True
@@ -251,21 +273,35 @@ class PyExecutor:
     def _executor_loop_overlap(self):
         torch.cuda.set_device(self.device_id)
         got_finish_signal = False
+        iter = 0
         with self._profiler() as profile_step:
             while not got_finish_signal or len(self.active_requests) > 0:
                 profile_step()
-                new_requests = self._fetch_new_requests()
+                t0 = time.time()
+                if self.enable_attention_dp:
+                    new_requests = self._fetch_adp_new_requests()
+                else:
+                    new_requests = self._fetch_new_requests()
                 got_finish_signal = self._merge_requests(
                     new_requests) or got_finish_signal
                 if got_finish_signal and len(self.active_requests) == 0:
                     break
+                attn_dp_idle_iter = ((not got_finish_signal)
+                                     and len(self.active_requests) == 0
+                                     and self.enable_attention_dp)
+
+                if attn_dp_idle_iter:
+                    self._merge_one_dummy_request()
                 scheduled_batch = self._schedule()
+
                 assert scheduled_batch.batch_size > 0, (
                     "fail to schedule any pending request, "
                     "probably run out of resource.")
-                # print(
-                #     f'has {len(self.active_requests)} active_request, scheduled {len(scheduled_batch.context_requests)} context requests and {len(scheduled_batch.generation_requests)} generation requests'
-                # )
+                logger.debug(
+                    f'has {len(self.active_requests)} active_request, '
+                    f'scheduled {len(scheduled_batch.context_requests)} context requests and '
+                    f'{len(scheduled_batch.generation_requests)} generation requests'
+                )
 
                 previous_new_tokens_device = None
                 if self.previous_batch is not None:
@@ -277,7 +313,8 @@ class PyExecutor:
 
                 new_tokens_device, new_tokens_host, decoder_event = self._decode_async(
                     batch_outputs)
-
+                if attn_dp_idle_iter:
+                    self._finish_one_dummy_request(scheduled_batch)
                 if self.previous_batch is not None:
                     previous_scheduled_batch, _, previous_new_tokens_host, previous_decoder_event = self.previous_batch
                     self._update_requests(previous_scheduled_batch,
@@ -288,8 +325,25 @@ class PyExecutor:
                     self.resource_manager.update_resources(
                         previous_scheduled_batch)
 
+                # Separate chunked requests so we can handle them in _update_requests w/o relying on the request state.
+                # This is necessary because _forward_step updates the state before _update_requests is executed.
+                scheduled_batch.chunked_requests = [
+                    r for r in scheduled_batch.context_requests
+                    if r.get_context_remaining_length() != 0
+                ]
+                scheduled_batch.context_requests = [
+                    r for r in scheduled_batch.context_requests
+                    if r.get_context_remaining_length() == 0
+                ]
+
                 self.previous_batch = (scheduled_batch, new_tokens_device,
                                        new_tokens_host, decoder_event)
+                iter = iter + 1
+                t1 = time.time()
+                if self.print_log and self.dist.rank == 0:
+                    print(
+                        f'iter = {iter}, rank = {self.dist.rank}, currank_total_requests = {self.num_fetch_requests_cur_rank}/{self.num_fetch_requests}, elapsed_time = {t1 - t0}s, states = {self.model_engine.iter_states}'
+                    )
 
         with self.response_cv:
             self.is_shutdown = True
@@ -308,6 +362,35 @@ class PyExecutor:
         new_requests = self.dist.broadcast(new_requests, root=0)
         return new_requests
 
+    @nvtx_range("_fetch_adp_new_requests")
+    def _fetch_adp_new_requests(self):
+        total_num_active_requests = sum(self.all_ranks_num_active_requests)
+        total_max_num_active_requests = self.dist.world_size * self.max_num_active_requests
+        timeout = None if total_num_active_requests == 0 else datetime.timedelta(
+            0)
+        new_requests = []
+        if self.dist.rank == 0:
+            new_requests = _get_from_request_queue(
+                self.request_queue, timeout,
+                total_max_num_active_requests - total_num_active_requests)
+
+        new_requests = self.dist.broadcast(new_requests, root=0)
+        num_new_requests_all_ranks = len(new_requests)
+        new_requests_cur_rank = []
+        if new_requests != [] and new_requests[0] != None:
+            for idx, request in enumerate(new_requests):
+                if (idx + self.num_fetch_requests
+                    ) % self.dist.world_size == self.dist.rank:
+                    new_requests_cur_rank.append(request)
+
+        self.num_fetch_requests = self.num_fetch_requests + num_new_requests_all_ranks
+        self.num_fetch_requests_cur_rank = self.num_fetch_requests_cur_rank + len(
+            new_requests_cur_rank)
+
+        if len(new_requests) == 1 and new_requests[0] == None:
+            new_requests_cur_rank = new_requests
+        return new_requests_cur_rank
+
     def _merge_tp_requests(self, new_requests: List[ExecutorRequest]):
         got_finish_signal = False
         for request in new_requests:
@@ -318,10 +401,45 @@ class PyExecutor:
             if _is_executor_request(req_item):
                 req_id, exe_req = req_item
                 req = executor_request_to_llm_request(req_id, exe_req)
+                req.is_dummy = False
                 self.active_requests.append(req)
             elif _is_cancel_request(req_item):
                 self.canceled_req_ids.add(req_item)
         return got_finish_signal
+
+    def _merge_one_dummy_request(self):
+        sampling_params = SamplingParams()
+        kwargs = {
+            "request_id":
+            0,
+            "max_new_tokens":
+            1,
+            "input_tokens": [1],
+            "sampling_config":
+            tensorrt_llm.bindings.SamplingConfig(
+                sampling_params._get_sampling_config()),
+            "is_streaming":
+            False,
+        }
+        llm_request = LlmRequest(**kwargs)
+        llm_request.is_dummy = True
+        self.active_requests.append(llm_request)
+
+    def _finish_one_dummy_request(self, scheduled_requests: ScheduledRequests):
+        for req in scheduled_requests.context_requests:
+            if req.is_dummy:
+                req.state = LlmRequestState.GENERATION_COMPLETE
+        if len(self.active_requests) == 1 and self.active_requests[0].is_dummy:
+            self._terminate_request(self.active_requests[0])
+            self.active_requests = []
+
+    def _remove_dummy_request(self, scheduled_requests):
+        for request in scheduled_requests.context_requests:
+            if request.is_dummy:
+                scheduled_requests.context_requests.remove(request)
+        for request in self.active_requests:
+            if request.is_dummy:
+                self.active_requests.remove(request)
 
     def _partition_context(self, ctx_ids_list):
         ctx_ids = torch.tensor(ctx_ids_list).unsqueeze(0)
@@ -419,6 +537,7 @@ class PyExecutor:
                 req.ctx_blocks = ctx_blocks
                 req.ctx_position_blocks = position_blocks
                 req.query_id = query_token_ids
+                req.is_dummy = False
                 self.active_requests.append(req)
             elif _is_cancel_request(req_item):
                 self.canceled_req_ids.add(req_item)
@@ -430,13 +549,14 @@ class PyExecutor:
         if 'cp_type' in cp_config:
             cp_type = cp_config['cp_type']
             if cp_type == 'star_attention':
-                return self._merge_star_attention_requests(new_requests)
+                ret = self._merge_star_attention_requests(new_requests)
             elif cp_type == 'ring_attention':
                 assert False, 'unsupport ring attention now'
             else:
                 assert False, f'unsupport sp type {cp_type}'
         else:
-            return self._merge_tp_requests(new_requests)
+            ret = self._merge_tp_requests(new_requests)
+        return ret
 
     @nvtx_range("_schedule")
     def _schedule(self):
@@ -475,6 +595,8 @@ class PyExecutor:
             request.move_to_next_context_chunk()
             if request.get_context_remaining_length() == 0:
                 request.state = LlmRequestState.GENERATION_IN_PROGRESS
+            if request.is_dummy:
+                request.state = LlmRequestState.GENERATION_COMPLETE
 
     def _update_request_states_star_attention(
             self, scheduled_requests: ScheduledRequests):
@@ -565,6 +687,21 @@ class PyExecutor:
         self.active_requests = left_requests
 
     def _enqueue_responses(self, responses: Dict[int, ExecutorResponse]):
+
+        logger.debug(
+            f'before ag, rank = {self.dist.rank}, responses = {responses}')
+        if self.enable_attention_dp:
+            resonses_list = self.dist.allgather(
+                [responses, len(self.active_requests)])
+            gather_responses = {}
+            gather_active_requests = []
+            for resp, num_active_requests in resonses_list:
+                gather_responses.update(resp)
+                gather_active_requests.append(num_active_requests)
+            self.all_ranks_num_active_requests = gather_active_requests
+            responses = gather_responses
+        logger.debug(
+            f'after ag, rank = {self.dist.rank}, responses = {responses}')
         if self.dist.rank == 0:
             with self.response_cv:
                 for req_id, resp in responses.items():
@@ -579,8 +716,16 @@ class PyExecutor:
         new_responses = {}
         finish_requests = []
         new_active_requests = []
+        logger.debug(
+            f'------before _handle_responses, rank = {self.dist.rank}, output = {self.active_requests}'
+        )
         for request in self.active_requests:
             req_id = request.py_request_id
+            #no responses for dummy request, and finish it
+            if request.is_dummy == True:
+                finish_requests.append(request)
+                continue
+
             response = request.create_response(False, self.dist.rank)
             request_done = False
             if response:

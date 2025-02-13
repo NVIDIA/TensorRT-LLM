@@ -27,6 +27,7 @@ class TensorParallelMode(str, enum.Enum):
 class ParallelConfig:
     tensor_parallel_size: int = 1
     tensor_parallel_rank: int = 0
+    gpus_per_node: int = 8
     tensor_parallel_mode: Optional[TensorParallelMode] = None
     gather_output: bool = False
 
@@ -82,6 +83,7 @@ def allreduce(
         world_size=parallel_config.tensor_parallel_size,
         tp_size=parallel_config.tensor_parallel_size,
         rank=parallel_config.tensor_parallel_rank,
+        gpus_per_node=parallel_config.gpus_per_node,
     )
 
     if all_reduce_params is None:
@@ -155,6 +157,7 @@ def allgather(input: torch.Tensor,
         world_size=parallel_config.tensor_parallel_size,
         tp_size=parallel_config.tensor_parallel_size,
         rank=parallel_config.tensor_parallel_rank,
+        gpus_per_node=parallel_config.gpus_per_node,
     )
 
     output = torch.ops.trtllm.allgather(
@@ -174,6 +177,35 @@ def allgather(input: torch.Tensor,
     return output
 
 
+def reducescatter(input: torch.Tensor,
+                  parallel_config: ParallelConfig,
+                  scatter_dim: int = -1) -> torch.Tensor:
+    if parallel_config.tensor_parallel_size == 1:
+        return input
+
+    mapping = Mapping(
+        world_size=parallel_config.tensor_parallel_size,
+        tp_size=parallel_config.tensor_parallel_size,
+        rank=parallel_config.tensor_parallel_rank,
+    )
+
+    output = torch.ops.trtllm.reducescatter(
+        input,
+        mapping.tp_group,
+    )
+
+    if scatter_dim < 0:
+        scatter_dim += input.ndim
+
+    output = torch.movedim(output, 0, scatter_dim)
+    input_shape = input.size()
+    output = output.reshape(input_shape[:scatter_dim] +
+                            (input_shape[scatter_dim] //
+                             parallel_config.tensor_parallel_size, ) +
+                            input_shape[scatter_dim + 1:])
+    return output
+
+
 class AllReduce(nn.Module):
 
     def __init__(self,
@@ -184,6 +216,7 @@ class AllReduce(nn.Module):
         self.parallel_config = parallel_config
         self.tp_size = self.parallel_config.tensor_parallel_size
         self.tp_rank = self.parallel_config.tensor_parallel_rank
+        self.gpus_per_node = self.parallel_config.gpus_per_node
 
         self.workspace = None
         self.strategy = strategy
@@ -192,6 +225,7 @@ class AllReduce(nn.Module):
                 world_size=self.tp_size,
                 tp_size=self.tp_size,
                 rank=self.tp_rank,
+                gpus_per_node=self.gpus_per_node,
             )
             if self.strategy != AllReduceStrategy.UB:
                 self.workspace = get_allreduce_workspace(mapping)

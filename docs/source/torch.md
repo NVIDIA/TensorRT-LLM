@@ -33,7 +33,7 @@ Or you can try the following commands to get a quantized model by yourself:
 
 ```bash
 git clone https://github.com/NVIDIA/TensorRT-Model-Optimizer.git
-cd TensorRT-Model-Optimizer/llm_ptq
+cd TensorRT-Model-Optimizer/examples/llm_ptq
 scripts/huggingface_example.sh --model <huggingface_model_card> --quant fp8 --export_fmt hf
 ```
 

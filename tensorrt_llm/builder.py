@@ -1044,8 +1044,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
             "Paged Context FMHA is disabled because StreamingLLM is not supported when enabling paged KV context FMHA."
         )
     if build_config.plugin_config.reduce_fusion and (
-            model.config.mapping.tp_size == 1
-            or model.config.mapping.pp_size != 1 or
+            model.config.mapping.tp_size == 1 or
         (model.config.architecture != "LlamaForCausalLM"
          and model.config.architecture != "Gemma2ForCausalLM"
          and model.config.architecture != "MedusaForCausalLM")):
@@ -1054,6 +1053,12 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
     if build_config.plugin_config.user_buffer and not build_config.plugin_config.reduce_fusion:
         logger.warning('Overriding user_buffer to False')
         build_config.plugin_config.user_buffer = False
+    if build_config.plugin_config.norm_quant_fusion and (
+            build_config.plugin_config.reduce_fusion
+            or model.config.architecture != "LlamaForCausalLM"
+            or model.config.quantization.quant_algo != QuantAlgo.NVFP4):
+        logger.warning('Overriding norm_quant_fusion to False')
+        build_config.plugin_config.norm_quant_fusion = False
 
     if model.config.quantization.quant_algo == QuantAlgo.FP8 or \
             model.config.quantization.kv_cache_quant_algo == QuantAlgo.FP8:
@@ -1288,7 +1293,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
         if build_config.speculative_decoding_mode == SpeculativeDecodingMode.LOOKAHEAD_DECODING:
             prepare_input_args[
                 "spec_decoding_is_generation_length_variable"] = True
-        if model.config.architecture == "Qwen2VLForConditionalGeneration":
+        if model.config.architecture == "Qwen2VLForConditionalGeneration" or model.config.architecture == "Qwen2VLModel":
             prepare_input_args[
                 'mrope_rotary_cos_sin_size'] = model.config.max_position_embeddings * model.config.rotary_embedding_dim
         if build_config.speculative_decoding_mode == SpeculativeDecodingMode.EAGLE and not build_config.plugin_config.use_paged_context_fmha:

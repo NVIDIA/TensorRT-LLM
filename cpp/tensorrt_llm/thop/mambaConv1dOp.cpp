@@ -25,8 +25,8 @@ namespace torch_ext
 {
 
 std::tuple<th::Tensor, th::Tensor> mamba_conv1d(th::Tensor const& input, th::Tensor const& conv_weight,
-    th::Tensor const& conv_bias, th::Tensor const& host_request_types, th::Tensor const& last_token_ids,
-    th::Tensor const& past_conv_state, th::optional<th::Tensor> host_context_lengths,
+    th::Tensor const& conv_bias, th::Tensor const& conv_state, th::Tensor const& host_request_types,
+    th::Tensor const& last_token_ids, th::optional<th::Tensor> host_context_lengths,
     th::optional<th::Tensor> slot_mapping, int64_t const dim, int64_t const dconv, int64_t const pre_stride,
     int64_t const post_stride, bool const remove_padding, bool const apply_silu, bool const is_paged_state)
 {
@@ -34,9 +34,9 @@ std::tuple<th::Tensor, th::Tensor> mamba_conv1d(th::Tensor const& input, th::Ten
     // input: [batch_size, seq_len, dim] or [num_tokens, dim] for remove_padding x [float16, float32, bfloat16]
     // conv_weight: [1, dconv, dim] x [float16, float32, bfloat16]
     // conv_bias: [dim] x [float16, float32, bfloat16]
+    // conv_state: [batch_size, dconv-1, dim] x [float16, float32, bfloat16]
     // host_request_types: [batch_size] x [int32]
     // last_token_ids: [batch_size] x [int32]
-    // past_conv_state: [batch_size, dconv-1, dim] x [float16, float32, bfloat16]
     // host_context_lengths: [batch_size] x [int32] for remove_padding
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -62,11 +62,11 @@ std::tuple<th::Tensor, th::Tensor> mamba_conv1d(th::Tensor const& input, th::Ten
     // req_type=1 -> generation (decode)
     auto req_type = host_request_types[0].item<int>();
 
-    int idx = (remove_padding && req_type == 0) ? 1 : 2;
+    int idx = (remove_padding) ? 1 : 2;
     int64_t out_dim = input_sizes[idx] - pre_stride - post_stride;
 
     std::vector<int64_t> out_shape;
-    if (remove_padding && req_type == 0)
+    if (remove_padding)
     {
         out_shape = {input_sizes[0], out_dim};
     }
@@ -76,7 +76,7 @@ std::tuple<th::Tensor, th::Tensor> mamba_conv1d(th::Tensor const& input, th::Ten
     }
 
     auto out = torch::empty(out_shape, input.options());
-    auto state_out = torch::empty_like(past_conv_state);
+    auto state_out = torch::empty_like(conv_state);
 
     params.batch = batch_size;
     params.dim = dim;
@@ -101,13 +101,13 @@ std::tuple<th::Tensor, th::Tensor> mamba_conv1d(th::Tensor const& input, th::Ten
             throw std::invalid_argument("slot_mapping must be provided when paged state is enabled");
         }
 
-        params.state_in_ptr = *reinterpret_cast<void**>(const_cast<void*>(past_conv_state.data_ptr()));
-        params.state_out_ptr = *reinterpret_cast<void**>(const_cast<void*>(past_conv_state.data_ptr()));
+        params.state_in_ptr = *reinterpret_cast<void**>(const_cast<void*>(conv_state.data_ptr()));
+        params.state_out_ptr = *reinterpret_cast<void**>(const_cast<void*>(conv_state.data_ptr()));
         params.state_slot_mapping_ptr = static_cast<int const*>(slot_mapping.value().const_data_ptr());
     }
     else
     {
-        params.state_in_ptr = past_conv_state.data_ptr();
+        params.state_in_ptr = conv_state.data_ptr();
         params.state_out_ptr = state_out.data_ptr();
         params.state_slot_mapping_ptr = nullptr;
     }
@@ -163,7 +163,7 @@ std::tuple<th::Tensor, th::Tensor> mamba_conv1d(th::Tensor const& input, th::Ten
 
     if (is_paged_state)
     {
-        return std::make_tuple(out, past_conv_state);
+        return std::make_tuple(out, conv_state);
     }
     else
     {
@@ -177,8 +177,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "mamba_conv1d(Tensor input, Tensor conv_weight, "
-        "Tensor conv_bias, Tensor host_request_types, "
-        "Tensor last_token_ids, Tensor past_conv_state, "
+        "Tensor conv_bias, Tensor conv_state, "
+        "Tensor host_request_types, Tensor last_token_ids, "
         "Tensor? host_context_lengths, Tensor? slot_mapping, "
         "int dim, int dconv, int pre_stride, int post_stride, "
         "bool remove_padding, bool apply_silu, "

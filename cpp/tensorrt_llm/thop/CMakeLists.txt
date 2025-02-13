@@ -32,12 +32,14 @@ add_library(
   fp4Op.cpp
   fp4Gemm.cpp
   fp4Quantize.cpp
+  fp8BlockScalingGemm.cpp
   gatherTreeOp.cpp
   mambaConv1dOp.cpp
   moeOp.cpp
   ncclCommunicatorOp.cpp
   parallelDecodeKVCacheUpdateOp.cpp
   redrafterCurandOp.cpp
+  reducescatterOp.cpp
   relativeAttentionBiasOp.cpp
   selectiveScanOp.cpp
   userbuffersFinalizeOp.cpp

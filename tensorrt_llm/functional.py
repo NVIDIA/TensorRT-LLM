@@ -4970,9 +4970,9 @@ def gpt_attention(
     qk_nope_head_dim: int = 0,
     qk_rope_head_dim: int = 0,
     v_head_dim: int = 0,
-    fused_q_proj: Optional[Tensor] = None,
     q_b_proj: Optional[Tensor] = None,
     kv_b_proj: Optional[Tensor] = None,
+    k_b_proj_trans: Optional[Tensor] = None,
     skip_attn=None,
     cp_group: List[int] = [0],
     cp_size: int = 1,
@@ -5605,10 +5605,10 @@ def gpt_attention(
         plug_inputs += [host_context_progress]
 
     if is_mla_enabled_flag:
-        assert fused_q_proj is not None
         assert q_b_proj is not None
         assert kv_b_proj is not None
-        plug_inputs += [fused_q_proj, q_b_proj, kv_b_proj]
+        assert k_b_proj_trans is not None
+        plug_inputs += [q_b_proj, kv_b_proj, k_b_proj_trans]
 
     if skip_attn is not None:
         plug_inputs += [skip_attn]

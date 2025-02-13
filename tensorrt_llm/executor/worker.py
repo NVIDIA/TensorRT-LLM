@@ -69,8 +69,14 @@ class ExecutorBindingsWorker(GenerationExecutor):
             executor_config = tllm.ExecutorConfig(1)
 
         if logits_post_processor_map is not None:
+            processor_batched = None
+            if tllm.Request.BATCHED_POST_PROCESSOR_NAME in logits_post_processor_map:
+                processor_batched = logits_post_processor_map.pop(
+                    tllm.Request.BATCHED_POST_PROCESSOR_NAME)
             executor_config.logits_post_processor_config = tllm.LogitsPostProcessorConfig(
-                processor_map=logits_post_processor_map, replicate=False)
+                processor_map=logits_post_processor_map,
+                processor_batched=processor_batched,
+                replicate=False)
 
         def _create_engine():
             if isinstance(engine, Engine):
@@ -200,7 +206,8 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 self.stats_queue.get()
 
             try:
-                self.stats_queue.put(stats.to_json_str())
+                stat = stats.to_json_str()
+                self.stats_queue.put(stat)
             except AsyncQueue.EventLoopShutdownError:
                 # This happens in the last stats loop while the generate workflow is stopped.
                 pass
@@ -212,8 +219,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
     def start(self):
         self.create_stats_queue()
         self.start_awaiter_thread()
-        # TODO: Replace this with a decent get_stats implementation
-        #self.start_stats_thread()
+        self.start_stats_thread()
 
     def _load_lora_adapter(self, lora_request: LoRARequest):
         self._lora_manager.load_from_ckpt(
@@ -283,7 +289,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 prompt_tuning_config=prompt_tuning_config,
                 logits_post_processor_name=request.sampling_params.
                 logits_post_processor_name,
-            )
+                kv_cache_retention_config=request.kv_cache_retention_config)
             if request.query_token_ids is not None:
                 # pytorch star attention workflow
                 # a workaround to avoid public interface update

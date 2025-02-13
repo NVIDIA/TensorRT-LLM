@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/mpiUtils.h"
+#include "tensorrt_llm/runtime/worldConfig.h"
 #include <cuda.h>
 #if defined(__aarch64__) || defined(_M_ARM64)
 #define MNNVL
@@ -65,13 +66,10 @@ struct communicator
     int nvrank, nvsize; // single node comm_intra
     int free_region;
 
-    int launch_mode;
-
     void* gpu_ptrs;
     int sms, threads;
     int use_rr_kernel; // Whether to use RR (or RW) for NVLink-only kernel
     int cga_size;
-    int push, use_ce;
 
     void* mem_ptr[MAX_REGIONS];
     void** peer_ptr[MAX_REGIONS];
@@ -86,13 +84,9 @@ struct communicator
     void* mc_baseptr;
     CUmemGenericAllocationHandle mc_handle;
     size_t mc_offset, mc_maxsize;
-    int use_mc; // 1: use MC if available, 0: override not to use MC
+    int use_mc;                          // 1: use MC if available, 0: override not to use MC
 
-    int ar_nvsize, ar_firstgpu,
-        ar_nvrank; // number of gpus(and first gpu in a group) of gpus per node in reduction subgroup (_splitar init
-                   // used) would be equal to (nvsize,0) for regular comm_create
-    int ar2_nvsize, ar2_firstgpu, ar2_nvrank; // with ar_nvsize as a step
-    int pipe_id; // which allreduce set of groups (pipeline rank in range of 0..pipeline_size)
+    int tp_size, tp_first_rank, tp_rank; // with ar_nvsize as a step
     int sm_arch;
     int oneshot, pdl_launch;
     int oneshot_force_enable_threshold;
@@ -100,18 +94,13 @@ struct communicator
     MPI_Comm comm_world, // clone of MPI_COMM_WORLD
         comm_inter,      // reduction group communicator (subset of the nodes) along GPU rail
         comm_intra;      // full intranode (all ndev GPUS)
-    int ibnvsize; // can be used to fake smaller or larger nvlink domain to use ib instead of nvlink or force MNNVL
 
     int *send_id, *recv_id;
     int mydev;
 };
 typedef struct communicator communicator;
 
-int create_communicator(communicator** comm);
-/*  creates communicator, allocates all internal buffers if necessary */
-
-int create_communicator_grouped(communicator** comm, int pipegpus, int pipenodes);
-int create_communicator_grouped2(communicator** comm, int pipegpus, int pipenodes, int tensorgpus, int tensornodes);
+int create_communicator_grouped2(communicator** comm, tensorrt_llm::runtime::WorldConfig const& world_config);
 /*  creates communicator with
     allreduce1 to happen in datagpus x datanodes groups,
     allreduce2 to happen in tensorgpus x tensor nodes,
@@ -119,11 +108,7 @@ int create_communicator_grouped2(communicator** comm, int pipegpus, int pipenode
             nvlink_size = pipegpus x tensorgpus x datagpus
  */
 
-int pipe_rank(communicator* comm,
-    int step); // helper function to help walk across allreduce1 x allreduce2 groups
-               // data-parallel and tensor-parallel position within data and tensor groups would be preserved
-
-int register_user_buffer_collective(void** gpubuff, size_t bytes, communicator* comm, bool alloc = false);
+int register_user_buffer_collective(void** gpubuff, size_t bytes, communicator* comm);
 /*  returns handler and registers buffers. assumed to be collective i.e. you use same groups and dont mix buffers for
    different operations returns -1 if can't register (too many preregistered regions already) if alloc==true will
    allocate memory and fill the pointers (required for NVL SHARP and NSO/MNNVL)

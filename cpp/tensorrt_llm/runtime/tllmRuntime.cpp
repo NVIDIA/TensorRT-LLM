@@ -713,8 +713,9 @@ void TllmRuntime::setUserBufferTensors(SizeType32 contextIndex, TensorMap& tenso
     }
 }
 
-void TllmRuntime::initializeUserBuffer(SizeType32 tpSize, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
-    SizeType32 maxSequenceLength, SizeType32 hiddenSize, std::optional<SizeType32> maxNumTokens)
+void TllmRuntime::initializeUserBuffer(tensorrt_llm::runtime::WorldConfig const& world_config, SizeType32 maxBatchSize,
+    SizeType32 maxBeamWidth, SizeType32 maxSequenceLength, SizeType32 hiddenSize,
+    std::optional<SizeType32> maxNumTokens)
 {
     auto startsWith = [](std::string const& str, std::string const& prefix) -> bool
     { return str.size() > prefix.size() && str.compare(0, prefix.size(), prefix) == 0; };
@@ -737,13 +738,14 @@ void TllmRuntime::initializeUserBuffer(SizeType32 tpSize, SizeType32 maxBatchSiz
         return;
     }
     // The hidden size returned by ModelConfig is the real hidden size divided by the TP size.
+    auto tpSize = world_config.getTensorParallelism();
     size_t realHiddenSize = hiddenSize * tpSize;
     size_t tokensNum = maxNumTokens.value_or(maxBatchSize * maxBeamWidth * maxSequenceLength);
     TLLM_CHECK(tokensNum > 0);
     size_t elemNum = tokensNum * realHiddenSize;
     TLLM_LOG_INFO("[UserBuffer] MaxBatchSize %d, maxBeamWidth %d, maxSequenceLength %d, maxNumTokens %d, select %lu",
         maxBatchSize, maxBeamWidth, maxSequenceLength, maxNumTokens.has_value() ? maxNumTokens.value() : 0, tokensNum);
-    tensorrt_llm::runtime::ub::ub_initialize(tpSize);
+    tensorrt_llm::runtime::ub::ub_initialize(world_config);
     tensorrt_llm::runtime::ub::ub_allocate(0, elemNum * sizeof(half));
     tensorrt_llm::runtime::ub::ub_allocate(1, elemNum * sizeof(half));
     if (useNVFP4Model)

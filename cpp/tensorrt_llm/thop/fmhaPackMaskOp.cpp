@@ -48,8 +48,7 @@ Tensor pack_fmha_mask_by_type(Tensor actual_q_seqlens, Tensor actual_kv_seqlens,
         {total_aligned_rows, aligned_cols / 32}, torch::dtype(torch::kInt32).device(torch::kCUDA).requires_grad(false));
 
     // Set the parameters for creating packed mask.
-    PackedMaskParams<float> maskParams;
-    memset(&maskParams, 0, sizeof(maskParams));
+    PackedMaskParams<float> maskParams{};
     maskParams.packedMask = get_ptr<uint32_t>(packed_mask);
     maskParams.cuMaskRows = get_ptr<int>(cu_mask_rows);
     maskParams.actualQSeqLens = get_ptr<int>(actual_q_seqlens);
@@ -116,8 +115,7 @@ Tensor pack_fmha_mask_by_input_helper(
         torch::dtype(torch::kInt32).device(torch::kCUDA).requires_grad(false));
 
     // Set the parameters for creating packed mask.
-    PackedMaskParams<T> maskParams;
-    memset(&maskParams, 0, sizeof(maskParams));
+    PackedMaskParams<T> maskParams{};
     maskParams.maskInput = get_ptr<T const>(mask_input);
     // It assumes the mask input shape is [batchSize, maxQSeqLen, maxKvSeqLen] when nullptr is given, otherwise
     // [batchSize, maxQSeqLen] is packed.

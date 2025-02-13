@@ -64,22 +64,22 @@ class TestFunctional(unittest.TestCase):
         test_cases += list(
             product(['gpt2_attention', 'llama_attention', 'gptj_attention'],
                     [ContextFMHAType.disabled], ['float16', 'bfloat16'], [None],
-                    [2], [128], [4], [64], [0], [False], [1, 4], [True, False],
-                    [True, False]))
+                    [None], [2], [128], [4], [64], [0], [False], [1, 4],
+                    [True, False], [True, False]))
 
         # Test cases for input padding
         test_cases += list(
             product(['llama_attention'], [
                 ContextFMHAType.disabled,
                 ContextFMHAType.enabled,
-            ], ['float16', 'bfloat16'], [None], [2], [128], [4], [64], [False],
-                    [False, True], [1], [False], [False]))
+            ], ['float16', 'bfloat16'], [None], [None], [2], [128], [4], [64],
+                    [False], [False, True], [1], [False], [False]))
 
         # Test cases for fused context MHAs
         test_cases += list(
             product(['llama_attention'], [
                 ContextFMHAType.enabled, ContextFMHAType.enabled_with_fp32_acc
-            ], ['float16', 'bfloat16'], [None], [2], [90, 1024], [4],
+            ], ['float16', 'bfloat16'], [None], [None], [2], [90, 1024], [4],
                     [32, 64, 80, 96, 104, 112, 128], [0], [False, True], [1],
                     [False], [False]))
 
@@ -88,55 +88,55 @@ class TestFunctional(unittest.TestCase):
         test_cases += list(
             product(['gptj_attention'], [
                 ContextFMHAType.enabled,
-            ], ['float16', 'bfloat16', 'float32'], [None], [2], [128], [32],
-                    [32, 64, 80, 96, 128], [0], [False], [1], [True, False],
-                    [False]))
+            ], ['float16', 'bfloat16', 'float32'], [None], [None], [2], [128],
+                    [32], [32, 64, 80, 96, 128], [0], [False], [1],
+                    [True, False], [False]))
 
         # Test cases of float32 d=256 case (for testing MMHA key loops).
         test_cases += list(
             product(['gptj_attention'], [
                 ContextFMHAType.enabled,
-            ], ['float32'], [None], [2], [128], [2], [256], [False], [True],
-                    [1], [False], [True, False]))
+            ], ['float32'], [None], [None], [2], [128], [2], [256], [False],
+                    [True], [1], [False], [True, False]))
 
         # # Test cases for the multi-block MMHA.
         # # NOTE: With long in_len=2048, beam_width=4 runs into OOM issue.
         test_cases += list(
             product(['llama_attention'], [
                 ContextFMHAType.enabled, ContextFMHAType.enabled_with_fp32_acc
-            ], ['float16', 'bfloat16'], [None], [2], [2048], [4], [64], [0],
-                    [False], [1], [False], [False]))
+            ], ['float16', 'bfloat16'], [None], [None], [2], [2048], [4], [64],
+                    [0], [False], [1], [False], [False]))
 
         # Test cases for the multi-block MMHA (with large number of blocks per sequence).
         test_cases += list(
             product(['llama_attention'], [
                 ContextFMHAType.enabled, ContextFMHAType.enabled_with_fp32_acc
-            ], ['float16', 'bfloat16', 'float32'], [None], [1], [4096], [1],
-                    [128], [0], [False], [1], [False], [False]))
+            ], ['float16', 'bfloat16', 'float32'], [None], [None], [1], [4096],
+                    [1], [128], [0], [False], [1], [False], [False]))
 
         # Test cases for the 8-bit K/V cache.
         test_cases += list(
             product(['gpt2_attention'], [ContextFMHAType.disabled],
-                    ['float16', 'float32'], ['int8', 'fp8'], [2], [128], [4],
-                    [64], [0], [False], [1, 4], [False], [False]))
+                    ['float16', 'float32'], ['int8', 'fp8'], [None], [2], [128],
+                    [4], [64], [0], [False], [1, 4], [False], [False]))
 
         # test cases for multi-query attention
         test_cases += list(
             product(['gpt_bigcode_attention'], [
                 ContextFMHAType.disabled, ContextFMHAType.enabled,
                 ContextFMHAType.enabled_with_fp32_acc
-            ], ['float16', 'bfloat16'], [None], [2], [128], [4], [64], [1],
-                    [False], [1, 4], [False], [False]))
+            ], ['float16', 'bfloat16'], [None], [None], [2], [128], [4], [64],
+                    [1], [False], [1, 4], [False], [False]))
 
         # test cases for grouped-query attention
         test_cases += list(
             product(['llama_attention'], [ContextFMHAType.disabled],
-                    ['bfloat16', 'float16'], [None], [2], [64], [8], [32],
-                    [2, 4], [False], [1], [False], [False]))
+                    ['bfloat16', 'float16'], [None], [None], [2], [64], [8],
+                    [32], [2, 4], [False], [1], [False], [False]))
         test_cases += list(
             product(['llama_attention'], [ContextFMHAType.enabled], ['float32'],
-                    [None], [1], [165], [32], [128], [4], [False], [1], [False],
-                    [False]))
+                    [None], [None], [1], [165], [32], [128], [4], [False], [1],
+                    [False], [False]))
 
         # test cases for RoPE base and scaling
         test_cases += list(
@@ -144,6 +144,7 @@ class TestFunctional(unittest.TestCase):
                 ['llama_attention'],
                 [ContextFMHAType.disabled],
                 ['bfloat16', 'float32'],
+                [None],
                 [None],
                 [2],
                 [64],
@@ -171,6 +172,7 @@ class TestFunctional(unittest.TestCase):
                 [ContextFMHAType.enabled],
                 ['float32'],
                 [None],
+                [None],
                 [1],
                 [165],
                 [32],
@@ -195,16 +197,16 @@ class TestFunctional(unittest.TestCase):
         # test cases for StreamingLLM
         test_cases += list(
             product(['llama_attention'], [ContextFMHAType.enabled], ['float16'],
-                    [None], [2], [128], [4], [64], [0], [False], [1, 4],
+                    [None], [None], [2], [128], [4], [64], [0], [False], [1, 4],
                     [True, False], [False], [10000.0], [None], [4]))
 
         # test cases for custom mask input.
         test_cases += list(
             product(['llama_attention'], [
                 ContextFMHAType.enabled, ContextFMHAType.enabled_with_fp32_acc
-            ], ['float16', 'bfloat16'], [None], [4], [1056], [4], [32, 64, 128],
-                    [0], [True], [1], [False], [False], [10000.0], [None], [0],
-                    [True]))
+            ], ['float16', 'bfloat16'], [None], [None], [4], [1056], [4],
+                    [32, 64, 128], [0], [True], [1], [False], [False],
+                    [10000.0], [None], [0], [True]))
 
         # add gpu_arch_lists for testing (help reducing workload if there are duplicates).
         test_cases = [("all", ) + case for case in test_cases]
@@ -219,6 +221,7 @@ class TestFunctional(unittest.TestCase):
                 [ContextFMHAType.enabled],
                 ['bfloat16', 'float16'],
                 ['int8'],
+                [None],
                 [2],
                 [165, 544, 2032],
                 [16],
@@ -240,6 +243,7 @@ class TestFunctional(unittest.TestCase):
                 [ContextFMHAType.enabled],
                 ['bfloat16', 'float16'],
                 ['fp8'],
+                [None],
                 [2],
                 [165, 544, 2032],
                 [16],
@@ -262,6 +266,7 @@ class TestFunctional(unittest.TestCase):
                 [ContextFMHAType.disabled],
                 ['float16'],
                 ['float16'],
+                [None],
                 [2],
                 [128],
                 [4],
@@ -279,6 +284,7 @@ class TestFunctional(unittest.TestCase):
                 [ContextFMHAType.disabled],
                 ['float16'],
                 ['fp8'],
+                [None],
                 [2],
                 [128],
                 [4],
@@ -308,6 +314,7 @@ class TestFunctional(unittest.TestCase):
                 ],
                 ['float16', 'bfloat16'],
                 ['fp8', 'int8', None],
+                [None],  # position_embedding_type
                 [2],  # batch_size
                 [165],  # in_len
                 [2, 8, 32],  # num_q_heads
@@ -331,6 +338,7 @@ class TestFunctional(unittest.TestCase):
                 [ContextFMHAType.disabled],
                 ['float16'],
                 ['fp8'],
+                [None],
                 [2],
                 [165],
                 [32],
@@ -345,19 +353,42 @@ class TestFunctional(unittest.TestCase):
                     None,
                 ]))
 
+        test_cases += list(
+            product(
+                ['qwen'],
+                ['all'],
+                ['llama_attention'],
+                [ContextFMHAType.disabled],
+                ['float16'],
+                ['float16', 'fp8'],
+                [PositionEmbeddingType.mrope],
+                [2],
+                [165],
+                [32],
+                [128],
+                [2],
+                [False],
+                [1],
+                [True],
+                [False],
+                [10000.0],  # rope base
+                [  # rope scaling
+                    None,
+                ]))
+
         # Trtllm-gen base tests.
         test_cases += list(
             product(['trtllm_gen'], [100], ['llama_attention'],
                     [ContextFMHAType.enabled], ['float16', 'bfloat16'],
-                    ['fp8', None], [32], [198], [32], [32, 64, 128], [8],
-                    [True], [1], [False, True], [False]))
+                    ['fp8', None], [None], [32], [198], [32], [32, 64, 128],
+                    [8], [True], [1], [False, True], [False]))
 
         # Trtllm-gen multi-block mode.
         test_cases += list(
             product(['trtllm_gen'], [100], ['llama_attention'],
                     [ContextFMHAType.enabled], ['float16', 'bfloat16'],
-                    ['fp8', None], [2], [1783], [32], [32, 64, 128], [8],
-                    [True], [1], [False, True], [False]))
+                    ['fp8', None], [None], [2], [1783], [32], [32, 64, 128],
+                    [8], [True], [1], [False, True], [False]))
 
         return test_cases
 
@@ -369,6 +400,7 @@ class TestFunctional(unittest.TestCase):
                            context_fmha_type,
                            dtype,
                            kv_cache_dtype,
+                           position_embedding_type,
                            batch_size,
                            in_len,
                            num_heads,
@@ -433,9 +465,9 @@ class TestFunctional(unittest.TestCase):
                 host_max_attention_window_sizes, host_sink_token_length,
                 context_lengths, host_context_lengths, cache_indirection,
                 host_request_types, num_heads, hidden_size, num_kv_heads,
-                output, dtype, max_context_length, shape_dict,
-                kv_int8_quant_scale, kv_int8_dequant_scale, configuration,
-                host_runtime_perf_knobs, host_context_progress):
+                output, dtype, position_embedding_type, max_context_length,
+                shape_dict, kv_int8_quant_scale, kv_int8_dequant_scale,
+                configuration, host_runtime_perf_knobs, host_context_progress):
             kv_cache_block_offsets = None
             if paged_kv_cache:
                 kv_cache_block_offsets = host_kv_cache_block_offsets.to('cuda')
@@ -583,12 +615,14 @@ class TestFunctional(unittest.TestCase):
                 rotary_embedding_dim = head_size if attention_type in [
                     'llama_attention', 'gptj_attention'
                 ] else 0
-                if attention_type == 'llama_attention':
-                    position_embedding_type = PositionEmbeddingType.rope_gpt_neox
-                elif attention_type == 'gptj_attention':
-                    position_embedding_type = PositionEmbeddingType.rope_gptj
-                else:
-                    position_embedding_type = PositionEmbeddingType.learned_absolute
+                if position_embedding_type is None:
+                    # If the caller doesn't specify position_embedding_type explicitly, infer it from attention_type.
+                    if attention_type == 'llama_attention':
+                        position_embedding_type = PositionEmbeddingType.rope_gpt_neox
+                    elif attention_type == 'gptj_attention':
+                        position_embedding_type = PositionEmbeddingType.rope_gptj
+                    else:
+                        position_embedding_type = PositionEmbeddingType.learned_absolute
 
                 rope_base = 10000.0
                 rope_scale_type = RotaryScalingType.none
@@ -610,6 +644,12 @@ class TestFunctional(unittest.TestCase):
                 rotary_cos_sin = tensorrt_llm.functional.constant(
                     embed_positions_for_gpt_attention
                 ) if position_embedding_type.is_rope() else None
+
+                mrope_rotary_cos_sin = tensorrt_llm.functional.constant(
+                    embed_positions_for_gpt_attention
+                ) if position_embedding_type.is_mrope() else None
+                mrope_position_deltas = sequence_length_tensor
+
                 outputs = tensorrt_llm.functional.gpt_attention(
                     qkv=qkv,
                     attention_packed_mask=attention_packed_mask_tensor,
@@ -651,6 +691,8 @@ class TestFunctional(unittest.TestCase):
                     host_kv_cache_pool_mapping=host_kv_cache_pool_mapping_tensor,
                     max_context_length=max_context_length,
                     qkv_bias=qkv_bias,
+                    mrope_rotary_cos_sin=mrope_rotary_cos_sin,
+                    mrope_position_deltas=mrope_position_deltas,
                     host_runtime_perf_knobs=host_runtime_perf_knobs_tensor,
                     host_context_progress=host_context_progress_tensor)
 
@@ -1263,8 +1305,8 @@ class TestFunctional(unittest.TestCase):
                     host_max_attention_window_sizes, host_sink_token_length,
                     input_lengths, host_context_lengths, cache_indirection,
                     host_request_types, num_heads, hidden_size, num_kv_heads,
-                    output, dtype, max_context_length, shape_dict,
-                    kv_quant_scale, kv_dequant_scale, configuration,
+                    output, dtype, position_embedding_type, max_context_length,
+                    shape_dict, kv_quant_scale, kv_dequant_scale, configuration,
                     context_host_runtime_perf_knobs, host_context_progress)
                 del session
                 session = None
@@ -1440,8 +1482,8 @@ class TestFunctional(unittest.TestCase):
                     tiled_input_lengths, tiled_host_context_lengths,
                     cache_indirection, tiled_host_request_types, num_heads,
                     hidden_size, num_kv_heads, tiled_output, dtype,
-                    max_context_length, shape_dict, kv_quant_scale,
-                    kv_dequant_scale, configuration,
+                    position_embedding_type, max_context_length, shape_dict,
+                    kv_quant_scale, kv_dequant_scale, configuration,
                     generation_host_runtime_perf_knobs, host_context_progress)
                 del session
                 session = None

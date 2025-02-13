@@ -623,9 +623,9 @@ def prepare_model_tests(model_name: str,
         elif model_name == 'llama':
             script_model_name = 'llama-7b-hf'
         generate_tokenizer_info = [
-            python_exe,
-            str(scripts_dir / "generate_xgrammar_tokenizer_info.py"),
-            f"--model_name={script_model_name}"
+            python_exe, "examples/generate_xgrammar_tokenizer_info.py",
+            f"--model_dir={str(resources_dir / 'models' / script_model_name)}",
+            f"--output_dir={str(resources_dir / 'data' / script_model_name)}"
         ]
         run_command(generate_tokenizer_info,
                     cwd=root_dir,

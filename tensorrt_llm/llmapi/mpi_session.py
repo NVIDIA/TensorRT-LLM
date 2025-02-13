@@ -139,20 +139,38 @@ class MpiCommSession(MpiSession):
 
         self._start_mpi_pool()
 
-    def submit(self, task: Callable[..., T], *args,
-               **kwargs) -> List[Future[T]]:
-        assert self.mpi_pool is not None, 'MPI session not started'
+    def submit(self,
+               task: (...),
+               rank0_extra_kwargs: Optional[dict] = None,
+               *args,
+               **kwargs) -> List[Future]:
+        ''' Submit a task to MPI workers.
 
-        # Trick: The MPICommExecutor excludes rank0 from workers, thus an extra task dispatching to rank0 is needed
+        Args:
+            task: The task to be submitted.
+            rank0_extra_kwargs: Extra keyword arguments for rank0 task.
+            args: Positional arguments for the task.
+            kwargs: Keyword arguments for the task.
+        '''
+        assert self.mpi_pool is not None, 'MPI session not started'
+        # Trick: The MPICommExecutor excludes rank0 from workers, thus an extra
+        # task dispatching to rank0 is needed
+        rank0_extra_kwargs = rank0_extra_kwargs or {}
+
+        rank0_params = kwargs.copy()
+        if rank0_extra_kwargs:
+            rank0_params.update(rank0_extra_kwargs)
+
         worker_futures = [
             self.mpi_pool.submit(task, *args, **kwargs)
             for i in range(self.n_workers - 1)
         ]
-        # A trick to wait for rank0 to be ready, or the collective tasks will hang
-        # TODO[chunweiy]: Remove this trick for reducing normal tasks latencies
-        time.sleep(4)
 
-        rank0_future = self.thread_pool.submit(task, *args, **kwargs)
+        # A trick to wait for rank0 to be ready, or the collective tasks will hang
+        # TODO[chunweiy]: Remove this trick
+        time.sleep(10)
+
+        rank0_future = self.thread_pool.submit(task, *args, **rank0_params)
         return [rank0_future] + worker_futures
 
     def submit_sync(self, task: Callable[..., T], *args, **kwargs) -> List[T]:

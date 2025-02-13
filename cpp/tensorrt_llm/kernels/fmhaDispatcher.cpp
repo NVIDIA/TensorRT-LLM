@@ -44,10 +44,19 @@ FmhaDispatcher::FmhaDispatcher(MHARunnerFixedParams fixedParams)
     : mFixedParams(fixedParams)
     , mUseTllmGen(tensorrt_llm::common::getSMVersion() == 100)
 {
+    if (fixedParams.isDeepseekSpecialized())
+    {
+        mUseTllmGen = false;
+    }
+
     if (mUseTllmGen)
     {
         mTllmGenFMHARunner.reset(
             new TllmGenFmhaRunner(mFixedParams.dataType, mFixedParams.dataTypeKv, mFixedParams.dataTypeOut));
+        if (!isSupported())
+        {
+            TLLM_LOG_WARNING("TRTLLM-GEN does not support the requested kernels.");
+        }
     }
     else
     {

@@ -88,6 +88,10 @@ class TorchGreedySearchDecoder(Decoder):
                                            beam_idx)
             idx += 1
 
+        if hasattr(scheduled_requests, 'chunked_requests'):
+            for request in scheduled_requests.chunked_requests:
+                idx += 1
+
         extend_requests = []
         generation_requests = []
         for request in scheduled_requests.generation_requests:

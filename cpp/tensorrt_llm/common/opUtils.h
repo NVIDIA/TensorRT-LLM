@@ -91,6 +91,12 @@ public:
         : std::unique_ptr<T, Del>::unique_ptr{}
     {
     }
+
+    // copy assignment copies nothing
+    UniqPtrWNullCopy& operator=(UniqPtrWNullCopy const&)
+    {
+        return *this;
+    }
 };
 
 template <typename T>

@@ -564,6 +564,13 @@ public:
     [[nodiscard]] std::vector<RetentionPriorityAndDuration> getPerBlockRetentionPriorityDuration(
         SizeType32 blockSize, SizeType32 seqLen) const;
 
+    bool operator==(KvCacheRetentionConfig const& other) const
+    {
+        return mTokenRangeRetentionConfigs == other.mTokenRangeRetentionConfigs
+            && mDecodeRetentionPriority == other.mDecodeRetentionPriority
+            && mDecodeDurationMs == other.mDecodeDurationMs;
+    }
+
 private:
     /// @brief The token ranges and priority levels to update. Ranges must be non-overlapping. For example [(0, 64),
     /// (100, 128), (70, 80)] is valid, whereas

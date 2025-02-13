@@ -32,7 +32,7 @@ void UserBufferBindings::initBindings(pybind11::module_& m)
         .def_readonly("handle", &tub::UBBuffer::handle)
         .def("invalid", &tub::UBBuffer::invalid);
 
-    m.def("ub_initialize", &tub::ub_initialize);
+    m.def("ub_initialize", [](int tp_size) { tub::ub_initialize(tp_size); });
     m.def("ub_is_initialized", &tub::ub_is_initialized);
     m.def(
         "ub_allocate", [](int idx, size_t bytes) { return reinterpret_cast<intptr_t>(tub::ub_allocate(idx, bytes)); });

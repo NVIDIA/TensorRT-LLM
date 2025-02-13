@@ -252,7 +252,6 @@ std::shared_ptr<MpiRequest> MpiComm::bcastAsync(void* buffer, size_t size, MpiTy
 
 std::shared_ptr<MpiRequest> MpiComm::bcastAsync(runtime::IBuffer& buf, int root) const
 {
-    TLLM_CHECK(buf.getMemoryType() != runtime::MemoryType::kGPU);
     return bcastAsync(buf.data(), buf.getSizeInBytes(), MpiType::kBYTE, root);
 }
 

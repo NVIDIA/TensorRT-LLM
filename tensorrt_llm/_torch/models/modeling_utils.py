@@ -151,17 +151,41 @@ class DecoderModelForCausalLM(nn.Module, Generic[TModel, TConfig]):
         self.model = model
         # TODO(zhenhuanc): Currently lm_head Linear will not accept QuantConfig
         # will considering per layer QuantConfig in the future.
-        self.lm_head = LMHead(
-            vocab_size,
-            hidden_size,
-            dtype=config.pretrained_config.torch_dtype,
-            parallel_config=ParallelConfig(
-                tensor_parallel_rank=config.mapping.tp_rank,
-                tensor_parallel_size=config.mapping.tp_size,
-                tensor_parallel_mode=TensorParallelMode.COLUMN,
-                gather_output=True,
-            ),
-        )
+        if config.mapping.enable_attention_dp:
+            self.lm_head = LMHead(
+                vocab_size,
+                hidden_size,
+                dtype=config.pretrained_config.torch_dtype,
+                parallel_config=ParallelConfig(
+                    tensor_parallel_rank=0,
+                    tensor_parallel_size=1,
+                    tensor_parallel_mode=None,
+                    gather_output=False,
+                ),
+            )
+        else:
+            self.lm_head = LMHead(
+                vocab_size,
+                hidden_size,
+                dtype=config.pretrained_config.torch_dtype,
+                parallel_config=ParallelConfig(
+                    tensor_parallel_rank=config.mapping.tp_rank,
+                    tensor_parallel_size=config.mapping.tp_size,
+                    tensor_parallel_mode=TensorParallelMode.COLUMN,
+                    gather_output=True,
+                    gpus_per_node=config.mapping.gpus_per_node,
+                ),
+            )
+
+        # Exclude modules in QuantConfig.exclude_modules from quantization
+        # It's hard to check for exclude_modules during model.init time,
+        # so instead, split the model.init into three stages:
+        # 1. model.init()
+        # 2. model.update_quant_config()
+        # 3. model.create_weights()
+        self.update_quant_config()
+        self.create_weights()
+
         # use embedding weights in lm_head if tie word embedding is enabled
         if config.pretrained_config.tie_word_embeddings:
             assert self.lm_head.tp_size == self.model.embed_tokens.tp_size, (
@@ -170,6 +194,34 @@ class DecoderModelForCausalLM(nn.Module, Generic[TModel, TConfig]):
                 "lm_head and vocab embedding should use the same TP mode")
             self.lm_head.weight = self.model.embed_tokens.weight
         self.logits_processor = LogitsProcessor()
+
+    def update_quant_config(self):
+        # skip quant for modules in QuantConfig.exclude_modules
+        quant_config = self.model_config.quant_config
+        if quant_config is None:
+            return
+        if quant_config.exclude_modules is not None:
+            exclude_modules = quant_config.exclude_modules
+            for name, module in self.named_modules():
+                for exclude_module in exclude_modules:
+                    if name == exclude_module or (exclude_module.endswith('*')
+                                                  and name.startswith(
+                                                      exclude_module[:-1])):
+                        if getattr(module, "quant_config", None) is not None:
+                            f_reset_quant_config = getattr(
+                                module, "reset_quant_config", None)
+                            if callable(f_reset_quant_config):
+                                module.reset_quant_config()
+                            else:
+                                raise NotImplementedError(
+                                    f"Found {module} in QuantConfig.exclude_modules, but"
+                                    "it doesn't have a `reset_quant_config` method to reset its quant_config."
+                                )
+
+    def create_weights(self):
+        for _, module in self.named_modules():
+            if callable(getattr(module, "_create_weights", None)):
+                module._create_weights()
 
     @property
     def config(self):

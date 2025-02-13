@@ -566,6 +566,8 @@ public:
         return *this;
     }
 
+    using IBuffer::data;
+
     //!
     //! \brief Returns pointer to underlying array.
     //! \details Return nullptr if size == 0 so behavior is consistent with BufferView.

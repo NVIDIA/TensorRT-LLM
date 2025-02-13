@@ -1,6 +1,7 @@
 import transformers
 
 from .modeling_auto import AutoModelForCausalLM
+from .modeling_deepseekv3 import DeepseekV3ForCausalLM
 from .modeling_llama import LlamaForCausalLM
 from .modeling_mixtral import MixtralForCausalLM
 from .modeling_nemotron import NemotronForCausalLM
@@ -12,7 +13,7 @@ from .modeling_vila import VilaModel
 __all__ = [
     "AutoModelForCausalLM", "LlamaForCausalLM", "VilaModel",
     "MixtralForCausalLM", "NVSmallForCausalLM", "Qwen2ForCausalLM",
-    "NemotronForCausalLM", "get_model_architecture"
+    "NemotronForCausalLM", "get_model_architecture", "DeepseekV3ForCausalLM"
 ]
 
 if transformers.__version__ >= "4.45.1":

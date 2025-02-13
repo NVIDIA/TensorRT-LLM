@@ -16,12 +16,15 @@ def test_moe_op_profile(dtype):
     TOP_K = 2
     TP_SIZE = 1
     TP_RANK = 0
+    EP_SIZE = 1
+    EP_RANK = 0
     torch.manual_seed(0)
     w2_weight = torch.randn((NUM_EXPERTS, HIDDEN_SIZE, INTERMEDIATE_SIZE),
                             dtype=dtype).cuda()
 
+    use_fp8_block_scaling = False
     profiler = torch.classes.trtllm.FusedMoeProfiler.get_instance(
-        dtype, dtype, dtype)
+        dtype, dtype, dtype, use_fp8_block_scaling)
 
     # profile
     profiler.run_profile(
@@ -29,17 +32,23 @@ def test_moe_op_profile(dtype):
         TOP_K,
         TP_SIZE,
         TP_RANK,
+        EP_SIZE,
+        EP_RANK,
         [2, 4, 8]  # num_tokens_buckets
     )
 
     # after profile, check beyond bucket range
-    bucket_1_profile_ids = profiler.get_profile_ids(1, w2_weight, TOP_K)
-    bucket_2_profile_ids = profiler.get_profile_ids(2, w2_weight, TOP_K)
+    bucket_1_profile_ids = profiler.get_profile_ids(1, w2_weight, TOP_K,
+                                                    NUM_EXPERTS)
+    bucket_2_profile_ids = profiler.get_profile_ids(2, w2_weight, TOP_K,
+                                                    NUM_EXPERTS)
     assert bucket_1_profile_ids == bucket_2_profile_ids
     assert len(bucket_1_profile_ids) == 2
 
-    bucket_8_profile_ids = profiler.get_profile_ids(8, w2_weight, TOP_K)
-    bucket_16_profile_ids = profiler.get_profile_ids(16, w2_weight, TOP_K)
+    bucket_8_profile_ids = profiler.get_profile_ids(8, w2_weight, TOP_K,
+                                                    NUM_EXPERTS)
+    bucket_16_profile_ids = profiler.get_profile_ids(16, w2_weight, TOP_K,
+                                                     NUM_EXPERTS)
     assert bucket_8_profile_ids == bucket_16_profile_ids
     assert len(bucket_8_profile_ids) == 2
 
@@ -53,6 +62,8 @@ def test_moe_op_run(dtype):
     TOP_K = 2
     TP_SIZE = 1
     TP_RANK = 0
+    EP_SIZE = 1
+    EP_RANK = 0
     torch.manual_seed(0)
     torch.cuda.manual_seed(0)
     x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype).cuda()
@@ -85,20 +96,26 @@ def test_moe_op_run(dtype):
             quant_scales=None,
             tp_size=TP_SIZE,
             tp_rank=TP_RANK,
+            ep_size=EP_SIZE,
+            ep_rank=EP_RANK,
             profile_ids=None,
         )
 
     # run with profile
+    use_fp8_block_scaling = False
     profiler = torch.classes.trtllm.FusedMoeProfiler.get_instance(
-        dtype, dtype, dtype)
+        dtype, dtype, dtype, use_fp8_block_scaling)
     profiler.run_profile(
         w2_weight,
         TOP_K,
         TP_SIZE,
         TP_RANK,
+        EP_SIZE,
+        EP_RANK,
         [2, 4, 8]  # num_tokens_buckets
     )
-    profile_ids = profiler.get_profile_ids(SEQ_LEN, w2_weight, TOP_K)
+    profile_ids = profiler.get_profile_ids(SEQ_LEN, w2_weight, TOP_K,
+                                           NUM_EXPERTS)
     assert len(profile_ids) == 2
     with torch.inference_mode():
         output_with_profile = torch.ops.trtllm.fused_moe(
@@ -111,6 +128,8 @@ def test_moe_op_run(dtype):
             quant_scales=None,
             tp_size=TP_SIZE,
             tp_rank=TP_RANK,
+            ep_size=EP_SIZE,
+            ep_rank=EP_RANK,
             profile_ids=profile_ids,
         )
 

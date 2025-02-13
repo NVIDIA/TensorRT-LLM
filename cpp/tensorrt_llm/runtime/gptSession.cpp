@@ -92,9 +92,8 @@ GptSession::GptSession(Config const& sessionConfig, ModelConfig const& modelConf
         " Please use the executor API instead (cpp/include/tensorrt_llm/executor).");
     if (mWorldConfig.isTensorParallel())
     {
-        mRuntime->initializeUserBuffer(mWorldConfig.getTensorParallelism(), mModelConfig.getMaxBatchSize(),
-            mModelConfig.getMaxBeamWidth(), mModelConfig.getMaxSequenceLen(), mModelConfig.getHiddenSize(),
-            mModelConfig.getMaxNumTokens());
+        mRuntime->initializeUserBuffer(mWorldConfig, mModelConfig.getMaxBatchSize(), mModelConfig.getMaxBeamWidth(),
+            mModelConfig.getMaxSequenceLen(), mModelConfig.getHiddenSize(), mModelConfig.getMaxNumTokens());
     }
     if (mWorldConfig.isPipelineParallel())
     {

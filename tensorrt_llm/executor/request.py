@@ -5,6 +5,7 @@ from typing import List, Optional, Union
 import numpy as np
 import torch
 
+from ..llmapi.llm_utils import KvCacheRetentionConfig
 from ..sampling_params import SamplingParams
 
 __all__ = [
@@ -69,16 +70,17 @@ class PromptAdapterRequest:
 class GenerationRequest:
 
     def __init__(
-        self,
-        prompt_token_ids: Union[torch.Tensor, np.ndarray,
-                                Union[List[int], List[List[int]]]],
-        sampling_params: SamplingParams,
-        query_token_ids: Optional[Union[torch.Tensor, np.ndarray, list]] = None,
-        lora_request: Optional[LoRARequest] = None,
-        prompt_adapter_request: Optional[PromptAdapterRequest] = None,
-        streaming: bool = False,
-        prompt_tuning_config: Optional[list] = None,
-    ):
+            self,
+            prompt_token_ids: Union[torch.Tensor, np.ndarray,
+                                    Union[List[int], List[List[int]]]],
+            sampling_params: SamplingParams,
+            query_token_ids: Optional[Union[torch.Tensor, np.ndarray,
+                                            list]] = None,
+            lora_request: Optional[LoRARequest] = None,
+            prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+            streaming: bool = False,
+            prompt_tuning_config: Optional[list] = None,
+            kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None):
         if isinstance(prompt_token_ids, list):
             self.prompt_token_ids = prompt_token_ids
             self.query_token_ids = query_token_ids
@@ -96,6 +98,7 @@ class GenerationRequest:
         self.prompt_adapter_request = prompt_adapter_request
         self.streaming = streaming
         self.prompt_tuning_config = prompt_tuning_config
+        self.kv_cache_retention_config = kv_cache_retention_config
         self.id: Optional[int] = None
 
     def set_id(self, id):

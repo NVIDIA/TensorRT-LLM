@@ -129,6 +129,17 @@ struct MHARunnerFixedParams
     // The tensor parallel rank (alibi).
     int tpRank = 0;
 
+    bool isDeepseekSpecialized()
+    {
+        if (headSize == 192 && headSizeV == 128)
+            return true;
+
+        if (headSize == 576 && headSizeV == 512)
+            return true;
+
+        return false;
+    }
+
     // Convert to string for debug.
     std::string convertToStrOutput()
     {

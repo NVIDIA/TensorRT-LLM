@@ -139,6 +139,7 @@ MODEL_NAME_PATTERN_MAP = {
     "Bloom": "bloom",
     "ChatGLM": "chatglm",
     "QWen": "qwen",
+    "Qwen2VLForConditionalGeneration": "qwen2_vl",
     "RecurrentGemma": "recurrentgemma",
     "Gemma2": "gemma2",
     "Gemma": "gemma",
@@ -211,6 +212,13 @@ def get_tokenizer(ckpt_path, max_seq_length=2048, model_type=None):
         if model_type and model_type == "qwen":
             # qwen use token id 151643 as pad and eos tokens
             tokenizer.eos_token = tokenizer.convert_ids_to_tokens(151643)
+            tokenizer.pad_token = tokenizer.convert_ids_to_tokens(151643)
+        elif model_type and model_type == "qwen2_vl":
+            # qwen use token id 151643 as pad and 151643 and 151645 as eos tokens
+            tokenizer.eos_token = [
+                tokenizer.convert_ids_to_tokens(151643),
+                tokenizer.convert_ids_to_tokens(151645)
+            ]
             tokenizer.pad_token = tokenizer.convert_ids_to_tokens(151643)
         else:
             tokenizer.pad_token = tokenizer.eos_token
@@ -300,6 +308,9 @@ def get_model(ckpt_path: str,
     elif hf_config.model_type == 'mllama':
         from transformers import MllamaForConditionalGeneration
         model_cls = MllamaForConditionalGeneration
+    elif hf_config.model_type == 'qwen2_vl':
+        from transformers import Qwen2VLForConditionalGeneration
+        model_cls = Qwen2VLForConditionalGeneration
 
     if "vila" in ckpt_path:
         model = _get_vila_model(ckpt_path)
@@ -326,6 +337,11 @@ def get_model(ckpt_path: str,
             trust_remote_code=True)
         if hf_config.model_type in ["llava", "internvl_chat"]:
             model = model.language_model
+        elif hf_config.model_type == "qwen2_vl":
+            #WAR for Qwen2-VL because its lm_head is outside of LLM
+            lm_head = model.lm_head
+            model = model.model
+            model.lm_head = lm_head
 
     model.eval()
 
@@ -772,6 +788,7 @@ def quantize_and_export(*,
 
         if model_type == 'mllama':
             model = model.language_model
+
         export_tensorrt_llm_checkpoint(
             model.hf_model if is_enc_dec else model,
             model_type,
@@ -831,7 +848,7 @@ def quantize_and_export(*,
                     json.dump(tensorrt_llm_config, f, indent=4)
 
             # Workaround for qwen version
-            if model_type == 'qwen':
+            if model_type == 'qwen' or model_type == 'qwen2_vl':
                 with open(f"{export_path}/config.json", "r") as f:
                     tensorrt_llm_config = json.load(f)
                 qwen_config = AutoConfig.from_pretrained(model_dir,

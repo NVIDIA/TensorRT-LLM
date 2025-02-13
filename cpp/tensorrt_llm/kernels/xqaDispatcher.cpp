@@ -149,6 +149,10 @@ bool XqaDispatcher::shouldUse(XQAParams const& params)
             SHOULD_NOT_USE(
                 "Fallback to MMHA as variable attention_window_size is not supported by TRTLLM-GEN kernels.");
         }
+        if ((float(params.num_q_heads) / float(params.num_kv_heads)) > 16)
+        {
+            SHOULD_NOT_USE("Fallback to MMHA as num_q_heads per kv_head > 16 is not supported by TRTLLM-GEN kernels.");
+        }
 
         return true;
     }
@@ -175,11 +179,6 @@ bool XqaDispatcher::isSupported()
         if (mFixedParams.hasAlibi)
         {
             TLLM_LOG_WARNING("TRTLLM-GEN does not support ALiBi.");
-            return false;
-        }
-        if (mFixedParams.cpSize > 1)
-        {
-            TLLM_LOG_WARNING("TRTLLM-GEN does not support CP.");
             return false;
         }
 
@@ -312,9 +311,10 @@ void XqaDispatcher::runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buff
         // Parameters to select kernels.
         tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
         tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
-        // Note that the tileScheduler and multiCtasKvMode will be automatically tuned when launching the kernels.
-        tllmRunnerParams.mTileScheduler = TileScheduler::Static;
         tllmRunnerParams.mMultiCtasKvMode = params.multi_block_mode;
+        // Note that the tileScheduler and multiCtasKvMode will be automatically tuned when using multi_block mode.
+        // Otherwise, always enable the persistent scheduler for better performance.
+        tllmRunnerParams.mTileScheduler = params.multi_block_mode ? TileScheduler::Static : TileScheduler::Persistent;
 
         // Q buffer.
         tllmRunnerParams.qPtr = xqa_q_input_ptr;

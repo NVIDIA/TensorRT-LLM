@@ -196,6 +196,8 @@ class SamplingParams:
     skip_special_tokens: bool = True
     spaces_between_special_tokens: bool = True
 
+    BATCHED_POST_PROCESSOR_NAME = tllme.Request.BATCHED_POST_PROCESSOR_NAME
+
     def __post_init__(self):
         if self.pad_id is None:
             self.pad_id = self.end_id

@@ -4,7 +4,7 @@ import json
 from collections import defaultdict
 from typing import Any, Dict, List, NamedTuple
 
-from tensorrt_llm._torch.pyexecutor.pytorch_model_engine import \
+from tensorrt_llm._torch.pyexecutor.model_engine import \
     validate_and_set_kv_cache_quant
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.statistics import (BenchmarkStatistics,
@@ -252,6 +252,7 @@ def report_statistics(statistics: StatsKeeper,
         "===========================================================\n"
         f"TP Size:\t\t{rt_cfg.world_config.tp_size}\n"
         f"PP Size:\t\t{rt_cfg.world_config.pp_size}\n"
+        f"EP Size:\t\t{rt_cfg.world_config.ep_size}\n"
         f"Max Runtime Batch Size:\t{rt_cfg.settings_config.max_batch_size}\n"
         f"Max Runtime Tokens:\t{rt_cfg.settings_config.max_num_tokens}\n"
         f"Scheduling Policy:\t{rt_cfg.settings_config.scheduler_policy.values[1]}\n"

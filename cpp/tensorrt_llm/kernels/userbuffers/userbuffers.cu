@@ -24,12 +24,22 @@ using namespace tensorrt_llm::runtime::ub;
 #define MAX_THREADS 1024
 #define TIMEOUT 200000000000ull
 
+__forceinline__ __device__ int prev_flag(int flag)
+{
+    return flag > 0 ? (flag - 1) : 2;
+}
+
+__forceinline__ __device__ int next_flag(int flag)
+{
+    return flag < 2 ? (flag + 1) : 0;
+}
+
 __forceinline__ __device__ void multi_gpu_block_barrier(int reduce_id, int volatile* flag)
 {
 #ifdef UB_TIMEOUT_ENABLED
     clock_t s = clock64();
 #endif
-    while (*flag < reduce_id)
+    while (*flag == prev_flag(reduce_id))
     {
 #ifdef UB_TIMEOUT_ENABLED
         if (clock64() - s > 2ull * TIMEOUT)
@@ -59,7 +69,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
         int const blockflagoffset = MAX_NVLINK * 2 * blockIdx.x;
         myptr = (reinterpret_cast<int*>(commbuff[physgpu])) + flagoffset;
         reduceidptr = myptr - MAX_OPS;
-        reduce_id = (*reduceidptr) + 1;
+        reduce_id = next_flag(*reduceidptr);
         flagptr = (reinterpret_cast<int*>(commbuff[targetgpu])) + flagoffset + blockflagoffset;
         myptr += blockflagoffset;
 #if __CUDA_ARCH__ >= 900
@@ -68,7 +78,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
         flagptr[physgpu] = reduce_id;
         userptr[threadIdx.x] = reinterpret_cast<int4*>(commbuff[targetgpu + handleridx]);
         multi_gpu_block_barrier(reduce_id, (int volatile*) &myptr[targetgpu]);
-        reduce_id++;
+        reduce_id = next_flag(reduce_id);
     }
     __syncthreads();
 
@@ -140,7 +150,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
         int const blockflagoffset = MAX_NVLINK * 2 * blockIdx.x;
         myptr = (reinterpret_cast<int*>(commbuff[physgpu])) + flagoffset;
         reduceidptr = myptr - MAX_OPS;
-        reduce_id = (*reduceidptr) + 1;
+        reduce_id = next_flag(*reduceidptr);
         flagptr = (reinterpret_cast<int*>(commbuff[targetgpu])) + flagoffset + blockflagoffset;
         myptr += blockflagoffset;
 #if __CUDA_ARCH__ >= 900
@@ -149,7 +159,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
         flagptr[physgpu] = reduce_id;
         userptr[threadIdx.x] = reinterpret_cast<int4*>(commbuff[targetgpu + handleridx]);
         multi_gpu_block_barrier(reduce_id, (int volatile*) &myptr[targetgpu]);
-        reduce_id++;
+        reduce_id = next_flag(reduce_id);
     }
     __syncthreads();
 
@@ -252,29 +262,49 @@ __device__ __forceinline__ void MULTIMEM_ST2(ValType& val, PtrType ptr)
     asm volatile("multimem.st.global.v2.f32 [%0], {%1,%2};" ::"l"(ptr), "r"(val.x), "r"(val.y) : "memory");
 }
 
-template <typename DType, typename ValType, typename PtrType>
+template <typename DType, bool const DISABLE_FP32_ACC, typename ValType, typename PtrType>
 __device__ __forceinline__ void MULTIMEM_LD(ValType& val, PtrType ptr)
 {
     if constexpr (std::is_same_v<DType, half>)
     {
-        asm("multimem.ld_reduce.global.add.v4.f16x2 {%0,%1,%2,%3}, [%4];"
-            : "=r"(val.x), "=r"(val.y), "=r"(val.z), "=r"(val.w)
-            : "l"(ptr)
-            : "memory");
+        if (!DISABLE_FP32_ACC)
+        {
+            asm("multimem.ld_reduce.global.add.v4.f16x2.acc::f32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(val.x), "=r"(val.y), "=r"(val.z), "=r"(val.w)
+                : "l"(ptr)
+                : "memory");
+        }
+        else
+        {
+            asm("multimem.ld_reduce.global.add.v4.f16x2 {%0,%1,%2,%3}, [%4];"
+                : "=r"(val.x), "=r"(val.y), "=r"(val.z), "=r"(val.w)
+                : "l"(ptr)
+                : "memory");
+        }
     }
 #ifdef ENABLE_BF16
     if constexpr (std::is_same_v<DType, __nv_bfloat16>)
     {
-        asm("multimem.ld_reduce.global.add.v4.bf16x2 {%0,%1,%2,%3}, [%4];"
-            : "=r"(val.x), "=r"(val.y), "=r"(val.z), "=r"(val.w)
-            : "l"(ptr)
-            : "memory");
+        if (!DISABLE_FP32_ACC)
+        {
+            asm("multimem.ld_reduce.global.add.v4.bf16x2.acc::f32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(val.x), "=r"(val.y), "=r"(val.z), "=r"(val.w)
+                : "l"(ptr)
+                : "memory");
+        }
+        else
+        {
+            asm("multimem.ld_reduce.global.add.v4.bf16x2 {%0,%1,%2,%3}, [%4];"
+                : "=r"(val.x), "=r"(val.y), "=r"(val.z), "=r"(val.w)
+                : "l"(ptr)
+                : "memory");
+        }
     }
 #endif
 }
 
 // All MC kernels here
-template <typename DType, int RANKS>
+template <typename DType, int RANKS, bool DISABLE_FP32_ACC>
 __global__ void __launch_bounds__(MAX_THREADS) userbuffers_fp16_sum_inplace_gpu_mc(int const op, int const flagoffset,
     int const firstrank, int const myrank, int const gpustep, size_t const lineoffset, int const numlines,
     void** commbuff, int const handleridx, float4* mc_ptr)
@@ -288,13 +318,13 @@ __global__ void __launch_bounds__(MAX_THREADS) userbuffers_fp16_sum_inplace_gpu_
         int const blockflagoffset = MAX_NVLINK * 2 * blockIdx.x;
         myptr = (reinterpret_cast<int*>(commbuff[physgpu])) + flagoffset;
         reduceidptr = myptr - MAX_OPS;
-        reduce_id = (*reduceidptr) + 1;
+        reduce_id = next_flag(*reduceidptr);
         flagptr = (reinterpret_cast<int*>(commbuff[targetgpu])) + flagoffset + blockflagoffset;
         myptr += blockflagoffset;
 
         flagptr[physgpu] = reduce_id;
         multi_gpu_block_barrier(reduce_id, (int volatile*) &myptr[targetgpu]);
-        reduce_id++;
+        reduce_id = next_flag(reduce_id);
     }
     __syncthreads();
 #define UNROLL_MC 8
@@ -310,7 +340,7 @@ __global__ void __launch_bounds__(MAX_THREADS) userbuffers_fp16_sum_inplace_gpu_
         uint4 val[UNROLL_MC];
 #pragma unroll
         for (int i = 0; i < UNROLL_MC; i++)
-            MULTIMEM_LD<DType>(val[i], mc_ptr + (lineoffset + line + i * loop_step0));
+            MULTIMEM_LD<DType, DISABLE_FP32_ACC>(val[i], mc_ptr + (lineoffset + line + i * loop_step0));
 #pragma unroll
         for (int i = 0; i < UNROLL_MC; i++)
             MULTIMEM_ST(val[i], mc_ptr + (lineoffset + line + i * loop_step0));
@@ -318,7 +348,7 @@ __global__ void __launch_bounds__(MAX_THREADS) userbuffers_fp16_sum_inplace_gpu_
     for (int line = end_aligned; line < end_elem; line += loop_step0)
     {
         uint4 val;
-        MULTIMEM_LD<DType>(val, mc_ptr + (lineoffset + line));
+        MULTIMEM_LD<DType, DISABLE_FP32_ACC>(val, mc_ptr + (lineoffset + line));
         MULTIMEM_ST(val, mc_ptr + (lineoffset + line));
     }
     __syncthreads();
@@ -336,7 +366,7 @@ __global__ void __launch_bounds__(MAX_THREADS) userbuffers_fp16_sum_inplace_gpu_
 } // fp16 inplace reduce kernel (Hopper) MC
 
 #else
-template <typename DType, int RANKS>
+template <typename DType, int RANKS, bool DISABLE_FP32_ACC>
 __global__ void __launch_bounds__(MAX_THREADS) userbuffers_fp16_sum_inplace_gpu_mc(int const op, int const flagoffset,
     int const firstrank, int const myrank, int const gpustep, size_t const lineoffset, int const numlines,
     void** commbuff, int const handleridx, float4* mc_ptr)
@@ -350,8 +380,7 @@ __global__ void __launch_bounds__(MAX_THREADS) userbuffers_fp16_sum_inplace_gpu_
 #define callranks(x)                                                                                                   \
     if (ar_nvsize == x)                                                                                                \
     {                                                                                                                  \
-        int arg1 = op - MAX_OPS,                                                                                       \
-            arg2 = REG0_OFFSET(comm) - (op == userbuffers_allreduceop_nonsharp ? 2 : 1) * REG0_SINGLENODE + MAX_OPS,   \
+        int arg1 = userbuffers_allreduceop_nonsharp2 - MAX_OPS, arg2 = REG0_OFFSET(comm) - REG0_SINGLENODE + MAX_OPS,  \
             arg3 = ar_firstgpu, arg4 = ar_nvrank, arg5 = ar_step;                                                      \
         size_t arg6 = offset / 8;                                                                                      \
         int arg7 = elements / 8;                                                                                       \
@@ -370,8 +399,7 @@ __global__ void __launch_bounds__(MAX_THREADS) userbuffers_fp16_sum_inplace_gpu_
 #define callranksMC(x)                                                                                                 \
     if (ar_nvsize == x)                                                                                                \
     {                                                                                                                  \
-        int arg1 = op - MAX_OPS,                                                                                       \
-            arg2 = REG0_OFFSET(comm) - (op == userbuffers_allreduceop_nonsharp ? 2 : 1) * REG0_SINGLENODE + MAX_OPS,   \
+        int arg1 = userbuffers_allreduceop_nonsharp2 - MAX_OPS, arg2 = REG0_OFFSET(comm) - REG0_SINGLENODE + MAX_OPS,  \
             arg3 = ar_firstgpu, arg4 = ar_nvrank, arg5 = ar_step;                                                      \
         size_t arg6 = offset / 8;                                                                                      \
         int arg7 = elements / 8;                                                                                       \
@@ -382,8 +410,8 @@ __global__ void __launch_bounds__(MAX_THREADS) userbuffers_fp16_sum_inplace_gpu_
             reinterpret_cast<void*>(&arg3), reinterpret_cast<void*>(&arg4), reinterpret_cast<void*>(&arg5),            \
             reinterpret_cast<void*>(&arg6), reinterpret_cast<void*>(&arg7), reinterpret_cast<void*>(&arg8),            \
             reinterpret_cast<void*>(&arg9), reinterpret_cast<void*>(&arg10)};                                          \
-        TLLM_CUDA_CHECK(                                                                                               \
-            cudaLaunchKernelExC(&cfg, (void*) (userbuffers_fp16_sum_inplace_gpu_mc<DType, x>), kernelArgs));           \
+        TLLM_CUDA_CHECK(cudaLaunchKernelExC(                                                                           \
+            &cfg, (void*) (userbuffers_fp16_sum_inplace_gpu_mc<DType, x, DISABLE_FP32_ACC>), kernelArgs));             \
     }
 
 struct LaunchConfig
@@ -529,7 +557,7 @@ __device__ uint32_t cvt_warp_fp16_to_fp4_mc(PackedVec<Type>& vec, float SFScaleV
 #endif
 }
 
-template <typename DType, int UNROLL_NLINES>
+template <typename DType, int UNROLL_NLINES, bool DISABLE_FP32_ACC>
 __global__ void __launch_bounds__(MAX_THREADS)
     userbuffers_fp16_sum_inplace_gpu_mc_rmsnorm_quant_fp4(int const op, int const flagoffset, int const firstrank,
         int const myrank, int const gpustep, size_t const lineoffset, int const numlines, void** commbuff,
@@ -553,13 +581,13 @@ __global__ void __launch_bounds__(MAX_THREADS)
         int const blockflagoffset = MAX_NVLINK * 2 * blockIdx.x;
         myptr = (reinterpret_cast<int*>(commbuff[physgpu])) + flagoffset;
         reduceidptr = myptr - MAX_OPS;
-        reduce_id = (*reduceidptr) + 1;
+        reduce_id = next_flag(*reduceidptr);
         flagptr = (reinterpret_cast<int*>(commbuff[targetgpu])) + flagoffset + blockflagoffset;
         myptr += blockflagoffset;
         cudaGridDependencySynchronize();
         flagptr[physgpu] = reduce_id;
         multi_gpu_block_barrier(reduce_id, (int volatile*) &myptr[targetgpu]);
-        reduce_id++;
+        reduce_id = next_flag(reduce_id);
     }
     __syncthreads();
 
@@ -574,7 +602,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
         DType* x = reinterpret_cast<DType*>(&val[0]);
 #pragma unroll
         for (int i = 0; i < UNROLL_NLINES; i++)
-            MULTIMEM_LD<DType>(val[i], mc_ptr + (lineoffset + line + i * loop_step0));
+            MULTIMEM_LD<DType, DISABLE_FP32_ACC>(val[i], mc_ptr + (lineoffset + line + i * loop_step0));
 
         if (residual_in != nullptr)
         {
@@ -643,7 +671,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
 #endif
 }
 
-template <typename DType, int UNROLL_NLINES>
+template <typename DType, int UNROLL_NLINES, bool DISABLE_FP32_ACC>
 __global__ void __launch_bounds__(MAX_THREADS)
     userbuffers_fp16_sum_inplace_gpu_mc_rmsnorm_quant_fp4_oneshot(int const op, int const flagoffset,
         int const firstrank, int const myrank, int const gpustep, size_t const lineoffset, int const numlines,
@@ -667,7 +695,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
         int const blockflagoffset = MAX_NVLINK * 2 * blockIdx.x;
         myptr = (reinterpret_cast<int*>(commbuff[physgpu])) + flagoffset;
         reduceidptr = myptr - MAX_OPS;
-        reduce_id = (*reduceidptr) + 1;
+        reduce_id = next_flag(*reduceidptr);
         flagptr = (reinterpret_cast<int*>(commbuff[targetgpu])) + flagoffset + blockflagoffset;
         myptr += blockflagoffset;
         cudaGridDependencySynchronize();
@@ -687,7 +715,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
         DType* x = reinterpret_cast<DType*>(&val[0]);
 #pragma unroll
         for (int i = 0; i < UNROLL_NLINES; i++)
-            MULTIMEM_LD<DType>(val[i], mc_ptr + (lineoffset + line + i * loop_step0));
+            MULTIMEM_LD<DType, DISABLE_FP32_ACC>(val[i], mc_ptr + (lineoffset + line + i * loop_step0));
 
         if (residual_in != nullptr)
         {
@@ -744,7 +772,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
 
 #if __CUDA_ARCH__ >= 900
 
-template <typename DType, int UNROLL_NLINES>
+template <typename DType, int UNROLL_NLINES, bool DISABLE_FP32_ACC>
 __global__ void __launch_bounds__(MAX_THREADS) userbuffers_fp16_sum_inplace_gpu_mc_rmsnorm_quant(int const op,
     int const flagoffset, int const firstrank, int const myrank, int const gpustep, size_t const lineoffset,
     int const numlines, void** commbuff, int const handleridx, float4* mc_ptr, DType const* beta, DType const* gamma,
@@ -765,13 +793,13 @@ __global__ void __launch_bounds__(MAX_THREADS) userbuffers_fp16_sum_inplace_gpu_
         int const blockflagoffset = MAX_NVLINK * 2 * blockIdx.x;
         myptr = (reinterpret_cast<int*>(commbuff[physgpu])) + flagoffset;
         reduceidptr = myptr - MAX_OPS;
-        reduce_id = (*reduceidptr) + 1;
+        reduce_id = next_flag(*reduceidptr);
         flagptr = (reinterpret_cast<int*>(commbuff[targetgpu])) + flagoffset + blockflagoffset;
         myptr += blockflagoffset;
         cudaGridDependencySynchronize();
         flagptr[physgpu] = reduce_id;
         multi_gpu_block_barrier(reduce_id, (int volatile*) &myptr[targetgpu]);
-        reduce_id++;
+        reduce_id = next_flag(reduce_id);
     }
     __syncthreads();
 
@@ -786,7 +814,7 @@ __global__ void __launch_bounds__(MAX_THREADS) userbuffers_fp16_sum_inplace_gpu_
         DType* x = reinterpret_cast<DType*>(&val[0]);
 #pragma unroll
         for (int i = 0; i < UNROLL_NLINES; i++)
-            MULTIMEM_LD<DType>(val[i], mc_ptr + (lineoffset + line + i * loop_step0));
+            MULTIMEM_LD<DType, DISABLE_FP32_ACC>(val[i], mc_ptr + (lineoffset + line + i * loop_step0));
 
         if (residual_in != nullptr)
         {
@@ -848,7 +876,7 @@ __global__ void __launch_bounds__(MAX_THREADS) userbuffers_fp16_sum_inplace_gpu_
         *reduceidptr = reduce_id;
 } // quant kernel fp16->fp8 twoshot
 
-template <typename DType, int UNROLL_NLINES>
+template <typename DType, int UNROLL_NLINES, bool DISABLE_FP32_ACC>
 __global__ void __launch_bounds__(MAX_THREADS) userbuffers_fp16_sum_inplace_gpu_mc_rmsnorm_quant_oneshot(int const op,
     int const flagoffset, int const firstrank, int const myrank, int const gpustep, size_t const lineoffset,
     int const numlines, void** commbuff, int const handleridx, float4* mc_ptr, DType const* beta, DType const* gamma,
@@ -869,7 +897,7 @@ __global__ void __launch_bounds__(MAX_THREADS) userbuffers_fp16_sum_inplace_gpu_
         int const blockflagoffset = MAX_NVLINK * 2 * blockIdx.x;
         myptr = (reinterpret_cast<int*>(commbuff[physgpu])) + flagoffset;
         reduceidptr = myptr - MAX_OPS;
-        reduce_id = (*reduceidptr) + 1;
+        reduce_id = next_flag(*reduceidptr);
         flagptr = (reinterpret_cast<int*>(commbuff[targetgpu])) + flagoffset + blockflagoffset;
         myptr += blockflagoffset;
         cudaGridDependencySynchronize();
@@ -889,7 +917,7 @@ __global__ void __launch_bounds__(MAX_THREADS) userbuffers_fp16_sum_inplace_gpu_
         DType* x = reinterpret_cast<DType*>(&val[0]);
 #pragma unroll
         for (int i = 0; i < UNROLL_NLINES; i++)
-            MULTIMEM_LD<DType>(val[i], mc_ptr + (lineoffset + line + i * loop_step0));
+            MULTIMEM_LD<DType, DISABLE_FP32_ACC>(val[i], mc_ptr + (lineoffset + line + i * loop_step0));
 
         if (residual_in != nullptr)
         {
@@ -959,7 +987,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
         int const blockflagoffset = MAX_NVLINK * 2 * blockIdx.x;
         myptr = (reinterpret_cast<int*>(commbuff[physgpu])) + flagoffset;
         reduceidptr = myptr - MAX_OPS;
-        reduce_id = (*reduceidptr) + 1;
+        reduce_id = next_flag(*reduceidptr);
         flagptr = (reinterpret_cast<int*>(commbuff[targetgpu])) + flagoffset + blockflagoffset;
         myptr += blockflagoffset;
     }
@@ -997,7 +1025,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
 } // residual allgather kernel
 
 #else
-template <typename DType, int UNROLL_NLINES>
+template <typename DType, int UNROLL_NLINES, bool DISABLE_FP32_ACC>
 __global__ void __launch_bounds__(MAX_THREADS) userbuffers_fp16_sum_inplace_gpu_mc_rmsnorm_quant(int const op,
     int const flagoffset, int const firstrank, int const myrank, int const gpustep, size_t const lineoffset,
     int const numlines, void** commbuff, int const handleridx, float4* mc_ptr, DType const* beta, DType const* gamma,
@@ -1018,7 +1046,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
     asm volatile("brkpt;\n");
 }
 
-template <typename DType, int UNROLL_NLINES>
+template <typename DType, int UNROLL_NLINES, bool DISABLE_FP32_ACC>
 __global__ void __launch_bounds__(MAX_THREADS) userbuffers_fp16_sum_inplace_gpu_mc_rmsnorm_quant_oneshot(int const op,
     int const flagoffset, int const firstrank, int const myrank, int const gpustep, size_t const lineoffset,
     int const numlines, void** commbuff, int const handleridx, float4* mc_ptr, DType const* beta, DType const* gamma,
@@ -1034,8 +1062,7 @@ __global__ void __launch_bounds__(MAX_THREADS) userbuffers_fp16_sum_inplace_gpu_
 #define callranksMC_RMSNORM_QUANT(x)                                                                                   \
     if (nlines == x)                                                                                                   \
     {                                                                                                                  \
-        int arg1 = op - MAX_OPS,                                                                                       \
-            arg2 = REG0_OFFSET(comm) - (op == userbuffers_allreduceop_nonsharp ? 2 : 1) * REG0_SINGLENODE + MAX_OPS,   \
+        int arg1 = userbuffers_allreduceop_nonsharp2 - MAX_OPS, arg2 = REG0_OFFSET(comm) - REG0_SINGLENODE + MAX_OPS,  \
             arg3 = ar_firstgpu, arg4 = ar_nvrank, arg5 = ar_step;                                                      \
         size_t arg6 = offset / 8 + first_token * hidden_lines;                                                         \
         int arg7 = hidden_lines * my_tokens;                                                                           \
@@ -1059,15 +1086,14 @@ __global__ void __launch_bounds__(MAX_THREADS) userbuffers_fp16_sum_inplace_gpu_
             reinterpret_cast<void*>(&arg12), reinterpret_cast<void*>(&arg13), reinterpret_cast<void*>(&arg14),         \
             reinterpret_cast<void*>(&arg15), reinterpret_cast<void*>(&arg16), reinterpret_cast<void*>(&arg17),         \
             reinterpret_cast<void*>(&arg18), reinterpret_cast<void*>(&arg19), reinterpret_cast<void*>(&arg20)};        \
-        TLLM_CUDA_CHECK(cudaLaunchKernelExC(                                                                           \
-            &cfg, (void*) (userbuffers_fp16_sum_inplace_gpu_mc_rmsnorm_quant<DType, x>), kernelArgs));                 \
+        TLLM_CUDA_CHECK(cudaLaunchKernelExC(&cfg,                                                                      \
+            (void*) (userbuffers_fp16_sum_inplace_gpu_mc_rmsnorm_quant<DType, x, DISABLE_FP32_ACC>), kernelArgs));     \
     }
 
 #define callranksMC_RMSNORM_QUANT_ONESHOT(x)                                                                           \
     if (nlines == x)                                                                                                   \
     {                                                                                                                  \
-        int arg1 = op - MAX_OPS,                                                                                       \
-            arg2 = REG0_OFFSET(comm) - (op == userbuffers_allreduceop_nonsharp ? 2 : 1) * REG0_SINGLENODE + MAX_OPS,   \
+        int arg1 = userbuffers_allreduceop_nonsharp2 - MAX_OPS, arg2 = REG0_OFFSET(comm) - REG0_SINGLENODE + MAX_OPS,  \
             arg3 = ar_firstgpu, arg4 = ar_nvrank, arg5 = ar_step;                                                      \
         size_t arg6 = offset / 8;                                                                                      \
         int arg7 = elements / 8;                                                                                       \
@@ -1091,15 +1117,15 @@ __global__ void __launch_bounds__(MAX_THREADS) userbuffers_fp16_sum_inplace_gpu_
             reinterpret_cast<void*>(&arg12), reinterpret_cast<void*>(&arg13), reinterpret_cast<void*>(&arg14),         \
             reinterpret_cast<void*>(&arg15), reinterpret_cast<void*>(&arg16), reinterpret_cast<void*>(&arg17),         \
             reinterpret_cast<void*>(&arg18), reinterpret_cast<void*>(&arg19), reinterpret_cast<void*>(&arg20)};        \
-        TLLM_CUDA_CHECK(cudaLaunchKernelExC(                                                                           \
-            &cfg, (void*) (userbuffers_fp16_sum_inplace_gpu_mc_rmsnorm_quant_oneshot<DType, x>), kernelArgs));         \
+        TLLM_CUDA_CHECK(cudaLaunchKernelExC(&cfg,                                                                      \
+            (void*) (userbuffers_fp16_sum_inplace_gpu_mc_rmsnorm_quant_oneshot<DType, x, DISABLE_FP32_ACC>),           \
+            kernelArgs));                                                                                              \
     }
 
 #define callranksMC_RMSNORM_QUANT_FP4(x)                                                                               \
     if (nlines == x)                                                                                                   \
     {                                                                                                                  \
-        int arg1 = op - MAX_OPS,                                                                                       \
-            arg2 = REG0_OFFSET(comm) - (op == userbuffers_allreduceop_nonsharp ? 2 : 1) * REG0_SINGLENODE + MAX_OPS,   \
+        int arg1 = userbuffers_allreduceop_nonsharp2 - MAX_OPS, arg2 = REG0_OFFSET(comm) - REG0_SINGLENODE + MAX_OPS,  \
             arg3 = ar_firstgpu, arg4 = ar_nvrank, arg5 = ar_step;                                                      \
         size_t arg6 = offset / 8 + first_token * hidden_lines;                                                         \
         int arg7 = hidden_lines * my_tokens;                                                                           \
@@ -1127,15 +1153,14 @@ __global__ void __launch_bounds__(MAX_THREADS) userbuffers_fp16_sum_inplace_gpu_
             reinterpret_cast<void*>(&arg15), reinterpret_cast<void*>(&arg16), reinterpret_cast<void*>(&arg17),         \
             reinterpret_cast<void*>(&arg18), reinterpret_cast<void*>(&arg19), reinterpret_cast<void*>(&arg20),         \
             reinterpret_cast<void*>(&arg21), reinterpret_cast<void*>(&arg22), reinterpret_cast<void*>(&arg23)};        \
-        TLLM_CUDA_CHECK(cudaLaunchKernelExC(                                                                           \
-            &cfg, (void*) (userbuffers_fp16_sum_inplace_gpu_mc_rmsnorm_quant_fp4<DType, x>), kernelArgs));             \
+        TLLM_CUDA_CHECK(cudaLaunchKernelExC(&cfg,                                                                      \
+            (void*) (userbuffers_fp16_sum_inplace_gpu_mc_rmsnorm_quant_fp4<DType, x, DISABLE_FP32_ACC>), kernelArgs)); \
     }
 
 #define callranksMC_RMSNORM_QUANT_FP4_ONESHOT(x)                                                                       \
     if (nlines == x)                                                                                                   \
     {                                                                                                                  \
-        int arg1 = op - MAX_OPS,                                                                                       \
-            arg2 = REG0_OFFSET(comm) - (op == userbuffers_allreduceop_nonsharp ? 2 : 1) * REG0_SINGLENODE + MAX_OPS,   \
+        int arg1 = userbuffers_allreduceop_nonsharp2 - MAX_OPS, arg2 = REG0_OFFSET(comm) - REG0_SINGLENODE + MAX_OPS,  \
             arg3 = ar_firstgpu, arg4 = ar_nvrank, arg5 = ar_step;                                                      \
         size_t arg6 = offset / 8;                                                                                      \
         int arg7 = elements / 8;                                                                                       \
@@ -1152,8 +1177,8 @@ __global__ void __launch_bounds__(MAX_THREADS) userbuffers_fp16_sum_inplace_gpu_
         void* arg18 = residual_in;                                                                                     \
         void* arg19 = residual_out;                                                                                    \
         int arg20 = 0;                                                                                                 \
-        void* arg21                                                                                                    \
-            = reinterpret_cast<uint8_t*>(comm->ucbase_ptr[scale_handler]) + ar_nvrank * comm->mem_size[scale_handler]; \
+        void* arg21 = reinterpret_cast<uint8_t*>(comm->ucbase_ptr[scale_handler])                                      \
+            + (ar_firstgpu + ar_nvrank) * comm->mem_size[scale_handler];                                               \
         size_t arg22 = scale_offset / 4;                                                                               \
         void* kernelArgs[] = {reinterpret_cast<void*>(&arg1), reinterpret_cast<void*>(&arg2),                          \
             reinterpret_cast<void*>(&arg3), reinterpret_cast<void*>(&arg4), reinterpret_cast<void*>(&arg5),            \
@@ -1163,14 +1188,14 @@ __global__ void __launch_bounds__(MAX_THREADS) userbuffers_fp16_sum_inplace_gpu_
             reinterpret_cast<void*>(&arg15), reinterpret_cast<void*>(&arg16), reinterpret_cast<void*>(&arg17),         \
             reinterpret_cast<void*>(&arg18), reinterpret_cast<void*>(&arg19), reinterpret_cast<void*>(&arg20),         \
             reinterpret_cast<void*>(&arg21), reinterpret_cast<void*>(&arg22)};                                         \
-        TLLM_CUDA_CHECK(cudaLaunchKernelExC(                                                                           \
-            &cfg, (void*) (userbuffers_fp16_sum_inplace_gpu_mc_rmsnorm_quant_fp4_oneshot<DType, x>), kernelArgs));     \
+        TLLM_CUDA_CHECK(cudaLaunchKernelExC(&cfg,                                                                      \
+            (void*) (userbuffers_fp16_sum_inplace_gpu_mc_rmsnorm_quant_fp4_oneshot<DType, x, DISABLE_FP32_ACC>),       \
+            kernelArgs));                                                                                              \
     }
 #define callranksMC_RES_AG(x)                                                                                          \
     if (nlines == x)                                                                                                   \
     {                                                                                                                  \
-        int arg1 = op - MAX_OPS,                                                                                       \
-            arg2 = REG0_OFFSET(comm) - (op == userbuffers_allreduceop_nonsharp ? 2 : 1) * REG0_SINGLENODE + MAX_OPS,   \
+        int arg1 = userbuffers_allreduceop_nonsharp2 - MAX_OPS, arg2 = REG0_OFFSET(comm) - REG0_SINGLENODE + MAX_OPS,  \
             arg3 = ar_firstgpu, arg4 = ar_nvrank, arg5 = ar_step;                                                      \
         size_t arg6 = offset / 8 + first_token * hidden_lines;                                                         \
         int arg7 = hidden_lines * my_tokens;                                                                           \
@@ -1189,16 +1214,16 @@ __global__ void __launch_bounds__(MAX_THREADS) userbuffers_fp16_sum_inplace_gpu_
             &cfg, (void*) (userbuffers_fp16_sum_inplace_gpu_mc_res_allgather<DType, x>), kernelArgs));                 \
     }
 
-template <typename DType>
+template <typename DType, bool DISABLE_FP32_ACC>
 int allreduce2_userbuff_inplace_gpu(int const maxcredit, int const handler, size_t const offset, size_t const elements,
-    int const blocksize, communicator* comm, cudaStream_t stream, int op)
+    int const blocksize, communicator* comm, cudaStream_t stream)
 {
     // schedule GPU kernel only
     // CPU/SHARP part is responsibility of caller
-    int const ar_firstgpu = op == userbuffers_allreduceop_nonsharp ? comm->ar_firstgpu : comm->ar2_firstgpu;
-    int const ar_step = op == userbuffers_allreduceop_nonsharp2 ? 1 : comm->ar2_nvsize;
-    int const ar_nvsize = op == userbuffers_allreduceop_nonsharp ? comm->ar_nvsize : comm->ar2_nvsize;
-    int const ar_nvrank = op == userbuffers_allreduceop_nonsharp ? comm->ar_nvrank : comm->ar2_nvrank;
+    int const ar_firstgpu = comm->tp_first_rank;
+    int const ar_step = 1;
+    int const ar_nvsize = comm->tp_size;
+    int const ar_nvrank = comm->tp_rank;
 
     if (elements < 8)
         return 0;
@@ -1208,7 +1233,7 @@ int allreduce2_userbuff_inplace_gpu(int const maxcredit, int const handler, size
         warps = ar_nvsize;
     LaunchConfig launch_config(comm, sms, warps * 32, stream);
     auto& cfg = launch_config.get();
-    if (op == userbuffers_allreduceop_nonsharp2 && comm->use_mc && (comm->memflags[handler] & UB_MEM_MC_CREATED))
+    if (comm->use_mc && (comm->memflags[handler] & UB_MEM_MC_CREATED))
     {
         callranksMC(2) callranksMC(4) callranksMC(8)
 #ifdef MNNVL
@@ -1226,29 +1251,39 @@ int allreduce2_userbuff_inplace_gpu(int const maxcredit, int const handler, size
     return sms;
 }
 
-template <typename DType>
+template <typename DType, bool DISABLE_FP32_ACC>
 void allreduce_nonsharp_inplace(
-    int const handler, size_t const offset, size_t const elements, communicator* comm, cudaStream_t stream, int op)
+    int const handler, size_t const offset, size_t const elements, communicator* comm, cudaStream_t stream)
 {
     if (elements < 64)
         return;
     int blocksize = elements * 2;
     int maxcredit = 0;
-    int sms = allreduce2_userbuff_inplace_gpu<DType>(maxcredit, handler, offset, elements, blocksize, comm, stream, op);
+    int sms;
+    if (DISABLE_FP32_ACC)
+    {
+        sms = allreduce2_userbuff_inplace_gpu<DType, true>(
+            maxcredit, handler, offset, elements, blocksize, comm, stream);
+    }
+    else
+    {
+        sms = allreduce2_userbuff_inplace_gpu<DType, false>(
+            maxcredit, handler, offset, elements, blocksize, comm, stream);
+    }
 }
 
-template <typename DType>
+template <typename DType, bool DISABLE_FP32_ACC>
 void allreduce2_userbuff_inplace(
     int const handler, size_t const offset, size_t const elements, communicator* comm, cudaStream_t stream)
 {
-    allreduce_nonsharp_inplace<DType>(handler, offset, elements, comm, stream, userbuffers_allreduceop_nonsharp2);
+    allreduce_nonsharp_inplace<DType, DISABLE_FP32_ACC>(handler, offset, elements, comm, stream);
 }
 
 bool use_oneshot_kernel(communicator* comm, size_t elements, int hidden_size)
 {
     TLLM_CHECK(elements % hidden_size == 0);
     int token_num = elements / hidden_size;
-    if (comm->oneshot == 1 && (elements * comm->ar2_nvsize <= 131072))
+    if (comm->oneshot == 1 && (elements * comm->tp_size <= 131072))
     {
         return true;
     }
@@ -1262,18 +1297,15 @@ bool use_oneshot_kernel(communicator* comm, size_t elements, int hidden_size)
     }
 }
 
-template <typename DType>
+template <typename DType, bool DISABLE_FP32_ACC>
 int allreduce2_userbuff_inplace_rmsnorm_quant(int const handler, size_t const offset, int const out_handler,
     size_t const out_offset, size_t const elements, int const hidden_size, void* beta, void* gamma, float eps,
     float* scalefactor, void* residual_in, void* residual_out, communicator* comm, cudaStream_t stream)
 {
-    // schedule GPU kernel only
-    // CPU/SHARP part is not supported yet;
-    int op = userbuffers_allreduceop_nonsharp2;
-    int const ar_firstgpu = op == userbuffers_allreduceop_nonsharp ? comm->ar_firstgpu : comm->ar2_firstgpu;
-    int const ar_step = op == userbuffers_allreduceop_nonsharp2 ? 1 : comm->ar2_nvsize;
-    int const ar_nvsize = op == userbuffers_allreduceop_nonsharp ? comm->ar_nvsize : comm->ar2_nvsize;
-    int const ar_nvrank = op == userbuffers_allreduceop_nonsharp ? comm->ar_nvrank : comm->ar2_nvrank;
+    int const ar_firstgpu = comm->tp_first_rank;
+    int const ar_step = 1;
+    int const ar_nvsize = comm->tp_size;
+    int const ar_nvrank = comm->tp_rank;
 
     if (elements % hidden_size)
         return 0;
@@ -1294,7 +1326,7 @@ int allreduce2_userbuff_inplace_rmsnorm_quant(int const handler, size_t const of
 
     LaunchConfig launch_config(comm, sms, nthreads, stream);
     auto& cfg = launch_config.get();
-    if (op == userbuffers_allreduceop_nonsharp2 && comm->use_mc && (comm->memflags[handler] & UB_MEM_MC_CREATED))
+    if (comm->use_mc && (comm->memflags[handler] & UB_MEM_MC_CREATED))
     {
         if (use_oneshot_kernel(comm, elements, hidden_size))
         {
@@ -1315,19 +1347,16 @@ int allreduce2_userbuff_inplace_rmsnorm_quant(int const handler, size_t const of
     return sms;
 }
 
-template <typename DType>
+template <typename DType, bool DISABLE_FP32_ACC>
 int allreduce2_userbuff_inplace_rmsnorm_quant_fp4(int const handler, size_t const offset, int const out_handler,
     size_t const out_offset, int const scale_handler, size_t const scale_offset, size_t const elements,
     int const hidden_size, void* beta, void* gamma, float eps, float* scalefactor, void* residual_in,
     void* residual_out, communicator* comm, cudaStream_t stream)
 {
-    // schedule GPU kernel only
-    // CPU/SHARP part is not supported yet;
-    int op = userbuffers_allreduceop_nonsharp2;
-    int const ar_firstgpu = op == userbuffers_allreduceop_nonsharp ? comm->ar_firstgpu : comm->ar2_firstgpu;
-    int const ar_step = op == userbuffers_allreduceop_nonsharp2 ? 1 : comm->ar2_nvsize;
-    int const ar_nvsize = op == userbuffers_allreduceop_nonsharp ? comm->ar_nvsize : comm->ar2_nvsize;
-    int const ar_nvrank = op == userbuffers_allreduceop_nonsharp ? comm->ar_nvrank : comm->ar2_nvrank;
+    int const ar_firstgpu = comm->tp_first_rank;
+    int const ar_step = 1;
+    int const ar_nvsize = comm->tp_size;
+    int const ar_nvrank = comm->tp_rank;
 
     if (elements % hidden_size)
         return 0;
@@ -1348,7 +1377,7 @@ int allreduce2_userbuff_inplace_rmsnorm_quant_fp4(int const handler, size_t cons
 
     LaunchConfig launch_config(comm, sms, nthreads, stream);
     auto& cfg = launch_config.get();
-    if (op == userbuffers_allreduceop_nonsharp2 && comm->use_mc && (comm->memflags[handler] & UB_MEM_MC_CREATED))
+    if (comm->use_mc && (comm->memflags[handler] & UB_MEM_MC_CREATED))
     {
         if (use_oneshot_kernel(comm, elements, hidden_size))
         {
@@ -1381,11 +1410,10 @@ int allgather2_userbuff_residual(int const handler, size_t const offset, size_t 
             elements * 2, cudaMemcpyDeviceToDevice, stream));
         return 0;
     }
-    int op = userbuffers_allreduceop_nonsharp2;
-    int const ar_firstgpu = op == userbuffers_allreduceop_nonsharp ? comm->ar_firstgpu : comm->ar2_firstgpu;
-    int const ar_step = op == userbuffers_allreduceop_nonsharp2 ? 1 : comm->ar2_nvsize;
-    int const ar_nvsize = op == userbuffers_allreduceop_nonsharp ? comm->ar_nvsize : comm->ar2_nvsize;
-    int const ar_nvrank = op == userbuffers_allreduceop_nonsharp ? comm->ar_nvrank : comm->ar2_nvrank;
+    int const ar_firstgpu = comm->tp_first_rank;
+    int const ar_step = 1;
+    int const ar_nvsize = comm->tp_size;
+    int const ar_nvrank = comm->tp_rank;
 
     if (elements % hidden_size)
         return 0;
@@ -1405,7 +1433,7 @@ int allgather2_userbuff_residual(int const handler, size_t const offset, size_t 
     }
     LaunchConfig launch_config(comm, sms, nthreads, stream);
     auto& cfg = launch_config.get();
-    if (op == userbuffers_allreduceop_nonsharp2 && comm->use_mc && (comm->memflags[handler] & UB_MEM_MC_CREATED))
+    if (comm->use_mc && (comm->memflags[handler] & UB_MEM_MC_CREATED))
     {
         callranksMC_RES_AG(1) callranksMC_RES_AG(2) callranksMC_RES_AG(3) callranksMC_RES_AG(4)
     }
@@ -1422,11 +1450,31 @@ void allreduce2_userbuff_inplace_impl(int const handler, size_t const offset, si
 {
     switch (dataType)
     {
-    case nvinfer1::DataType::kHALF: allreduce2_userbuff_inplace<half>(handler, offset, elements, comm, stream); break;
+    case nvinfer1::DataType::kHALF:
+    {
+        if (kDISABLE_FP32_ACCUMULATION)
+        {
+            allreduce2_userbuff_inplace<half, true>(handler, offset, elements, comm, stream);
+        }
+        else
+        {
+            allreduce2_userbuff_inplace<half, false>(handler, offset, elements, comm, stream);
+        }
+        break;
+    }
 #ifdef ENABLE_BF16
     case nvinfer1::DataType::kBF16:
-        allreduce2_userbuff_inplace<__nv_bfloat16>(handler, offset, elements, comm, stream);
+    {
+        if (kDISABLE_FP32_ACCUMULATION)
+        {
+            allreduce2_userbuff_inplace<__nv_bfloat16, true>(handler, offset, elements, comm, stream);
+        }
+        else
+        {
+            allreduce2_userbuff_inplace<__nv_bfloat16, false>(handler, offset, elements, comm, stream);
+        }
         break;
+    }
 #endif
     default: TLLM_THROW("Unsupported dataType for allreduce2_userbuff_inplace_impl");
     }
@@ -1458,14 +1506,36 @@ int allreduce2_userbuff_inplace_rmsnorm_quant_impl(int const handler, size_t con
     switch (dataType)
     {
     case nvinfer1::DataType::kHALF:
-        return allreduce2_userbuff_inplace_rmsnorm_quant<half>(handler, offset, out_handler, out_offset, elements,
-            hidden_size, beta, gamma, eps, scalefactor, residual_in, residual_out, comm, stream);
+    {
+        if (kDISABLE_FP32_ACCUMULATION)
+        {
+            return allreduce2_userbuff_inplace_rmsnorm_quant<half, true>(handler, offset, out_handler, out_offset,
+                elements, hidden_size, beta, gamma, eps, scalefactor, residual_in, residual_out, comm, stream);
+        }
+        else
+        {
+            return allreduce2_userbuff_inplace_rmsnorm_quant<half, false>(handler, offset, out_handler, out_offset,
+                elements, hidden_size, beta, gamma, eps, scalefactor, residual_in, residual_out, comm, stream);
+        }
         break;
+    }
 #ifdef ENABLE_BF16
     case nvinfer1::DataType::kBF16:
-        return allreduce2_userbuff_inplace_rmsnorm_quant<__nv_bfloat16>(handler, offset, out_handler, out_offset,
-            elements, hidden_size, beta, gamma, eps, scalefactor, residual_in, residual_out, comm, stream);
+    {
+        if (kDISABLE_FP32_ACCUMULATION)
+        {
+            return allreduce2_userbuff_inplace_rmsnorm_quant<__nv_bfloat16, true>(handler, offset, out_handler,
+                out_offset, elements, hidden_size, beta, gamma, eps, scalefactor, residual_in, residual_out, comm,
+                stream);
+        }
+        else
+        {
+            return allreduce2_userbuff_inplace_rmsnorm_quant<__nv_bfloat16, false>(handler, offset, out_handler,
+                out_offset, elements, hidden_size, beta, gamma, eps, scalefactor, residual_in, residual_out, comm,
+                stream);
+        }
         break;
+    }
 #endif
     default: TLLM_THROW("Unsupported dataType for allreduce2_userbuff_inplace_rmsnorm_quant_impl");
     }
@@ -1479,16 +1549,36 @@ int allreduce2_userbuff_inplace_rmsnorm_quant_fp4_impl(int const handler, size_t
     switch (dataType)
     {
     case nvinfer1::DataType::kHALF:
-        return allreduce2_userbuff_inplace_rmsnorm_quant_fp4<half>(handler, offset, out_handler, out_offset,
-            scale_handler, scale_offset, elements, hidden_size, beta, gamma, eps, scalefactor, residual_in,
-            residual_out, comm, stream);
+        if (kDISABLE_FP32_ACCUMULATION)
+        {
+            return allreduce2_userbuff_inplace_rmsnorm_quant_fp4<half, true>(handler, offset, out_handler, out_offset,
+                scale_handler, scale_offset, elements, hidden_size, beta, gamma, eps, scalefactor, residual_in,
+                residual_out, comm, stream);
+        }
+        else
+        {
+            return allreduce2_userbuff_inplace_rmsnorm_quant_fp4<half, false>(handler, offset, out_handler, out_offset,
+                scale_handler, scale_offset, elements, hidden_size, beta, gamma, eps, scalefactor, residual_in,
+                residual_out, comm, stream);
+        }
         break;
 #ifdef ENABLE_BF16
     case nvinfer1::DataType::kBF16:
-        return allreduce2_userbuff_inplace_rmsnorm_quant_fp4<__nv_bfloat16>(handler, offset, out_handler, out_offset,
-            scale_handler, scale_offset, elements, hidden_size, beta, gamma, eps, scalefactor, residual_in,
-            residual_out, comm, stream);
+    {
+        if (kDISABLE_FP32_ACCUMULATION)
+        {
+            return allreduce2_userbuff_inplace_rmsnorm_quant_fp4<__nv_bfloat16, true>(handler, offset, out_handler,
+                out_offset, scale_handler, scale_offset, elements, hidden_size, beta, gamma, eps, scalefactor,
+                residual_in, residual_out, comm, stream);
+        }
+        else
+        {
+            return allreduce2_userbuff_inplace_rmsnorm_quant_fp4<__nv_bfloat16, false>(handler, offset, out_handler,
+                out_offset, scale_handler, scale_offset, elements, hidden_size, beta, gamma, eps, scalefactor,
+                residual_in, residual_out, comm, stream);
+        }
         break;
+    }
 #endif
     default: TLLM_THROW("Unsupported dataType for allreduce2_userbuff_inplace_rmsnorm_quant_impl");
     }

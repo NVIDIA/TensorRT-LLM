@@ -138,7 +138,7 @@ public:
         const CUfunction func = findIter->second.mDeviceFunction;
 
         // Debug info.
-        TLLM_LOG_DEBUG("Execute function %s \n", kernelMeta.mFuncName);
+        TLLM_LOG_DEBUG("Execute function %s ", kernelMeta.mFuncName);
 
         // Prepare the kernel parameters.
         auto kernelParams = KernelParams::setKernelParams(params, kernelMeta);
@@ -181,10 +181,11 @@ public:
         // Set gridDim.x = numCtasPerSeqQ * numCtasPerSeqKv.
         launch_config.gridDimX = numCtasPerSeqQ * numCtasPerSeqKv;
         TLLM_LOG_DEBUG(
-            "TRTLLM-Gen launch info: numCtasPerSeqQ = %d, numCtasPerSeqKv = %d, maxSeqLenKv = %d, numHeadsQ = %d, "
-            "numHeadsKv = %d, batchSize = %d",
-            numCtasPerSeqQ, numCtasPerSeqKv, params.mMaxSeqLenKv, params.mNumHeadsQ, params.mNumHeadsKv,
-            params.mBatchSize);
+            "TRTLLM-Gen launch info: numCtasPerSeqQ = %d, numCtasPerSeqKv = %d, maxSeqLenQ = %d, maxSeqLenKv = %d, "
+            "numHeadsQ = %d, "
+            "numHeadsKv = %d, batchSize = %d, kernelType = %d",
+            numCtasPerSeqQ, numCtasPerSeqKv, params.mMaxSeqLenQ, params.mMaxSeqLenKv, params.mNumHeadsQ,
+            params.mNumHeadsKv, params.mBatchSize);
 
         CUlaunchAttribute launch_attribute[2];
         launch_attribute[0].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;

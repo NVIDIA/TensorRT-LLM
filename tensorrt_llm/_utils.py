@@ -461,6 +461,10 @@ def mpi_broadcast(obj, root=0):
     return mpi_comm().bcast(obj, root) if ENABLE_MULTI_DEVICE else obj
 
 
+def mpi_allgather(obj):
+    return mpi_comm().allgather(obj) if ENABLE_MULTI_DEVICE else obj
+
+
 def pad_vocab_size(vocab_size, tp_size):
     return int(math.ceil(vocab_size / tp_size) * tp_size)
 

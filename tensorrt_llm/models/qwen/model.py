@@ -70,8 +70,12 @@ class QWenDecoderLayer(Module):
             position_embedding_type=config.position_embedding_type,
             rotary_embedding_base=config.rotary_base,
             rotary_embedding_scaling=config.rotary_scaling,
+            tp_rank=config.mapping.tp_rank,
             tp_group=self.tp_group,
             tp_size=self.tp_size,
+            cp_rank=config.mapping.cp_rank,
+            cp_size=config.mapping.cp_size,
+            cp_group=config.mapping.cp_group,
             quant_mode=config.quant_mode,
             use_logn_scaling=config.use_logn_attn,
             dense_bias=False)
@@ -346,7 +350,6 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                 }
             loader = ModelWeightsLoader(hf_model_dir, custom_dict)
             model = cls(config)
-
             if config.qwen_type == "qwen" and model.config.mapping.has_tp():
 
                 def reshape_qkv(weights):
@@ -443,7 +446,6 @@ class QWenForCausalLM(DecoderModelForCausalLM):
             logger.debug(f"HuggingFace model: {hf_model}")
 
             model = QWenForCausalLM(config)
-
             logger.debug(f"TensorRT-LLM model: {model}")
 
             if quant_config.quant_algo == QuantAlgo.W4A16_GPTQ:

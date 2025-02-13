@@ -118,30 +118,17 @@ void ub_free(void* ptr)
     free(ptr);
 }
 
-int pipe_rank(communicator* comm, int step)
-{
-    int mynode = comm->myrank / comm->nvsize;
-    int mylocal = comm->nvrank;
-    int numlocal = comm->nvsize;
-
-    int newlocal1 = mylocal + step * comm->ar_nvsize * comm->ar2_nvsize;
-    int newlocal = (numlocal + (newlocal1 % numlocal)) % numlocal;
-    int newnode = mynode;
-    return newnode * numlocal + newlocal;
-}
-
-int create_communicator_grouped2(communicator** comm, int pipegpus, int pipenodes, int tensorgpus, int tensornodes)
+int create_communicator_grouped2(communicator** comm, tensorrt_llm::runtime::WorldConfig const& world_config)
 {
     *comm = (communicator*) malloc(sizeof(communicator));
 
     int myrank, nranks, cur_dev, ndev;
     MPI_Comm_dup(MPI_COMM_WORLD, &(*comm)->comm_world);
-    MPI_Comm_rank(MPI_COMM_WORLD, &myrank);
-    MPI_Comm_size(MPI_COMM_WORLD, &nranks);
+    myrank = world_config.getRank();
+    nranks = world_config.getSize();
     (*comm)->nranks = nranks;
     (*comm)->myrank = myrank;
     (*comm)->free_region = 0;
-    (*comm)->launch_mode = LAUNCH_GPU | LAUNCH_CPU;
     (*comm)->pdl_launch = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
 
     cudaDeviceProp device_prop;
@@ -152,8 +139,6 @@ int create_communicator_grouped2(communicator** comm, int pipegpus, int pipenode
     (*comm)->use_rr_kernel = device_prop.major == 8;
     if (getenv("OVERRIDERR"))
         (*comm)->use_rr_kernel = atoi(getenv("OVERRIDERR"));
-    (*comm)->push = device_prop.major != 8;
-    (*comm)->use_ce = getenv("USECE") ? 1 : 0;
     (*comm)->cga_size = getenv("CGASIZE")                     ? atoi(getenv("CGASIZE"))
         : (device_prop.major == 9 && !(*comm)->use_rr_kernel) ? 4
                                                               : 1;
@@ -163,43 +148,38 @@ int create_communicator_grouped2(communicator** comm, int pipegpus, int pipenode
         : UB_FORCE_ENABLE_ONESHOT_TOKEN_NUM_THRESHOLD;
 
     if (ndev > 1)
-    { // all visible devices
-        if (cur_dev != myrank % ndev)
-            printf("%d: device used %d[%d] ,resetting device to %d\n", myrank, cur_dev, ndev, myrank);
-        TLLM_CUDA_CHECK(cudaSetDevice(myrank % ndev));
-        cur_dev = myrank % ndev;
+    {
+        auto device_id = world_config.getDevice();
+        if (cur_dev != device_id)
+        {
+            TLLM_LOG_INFO(
+                "[UserBuffer] rank %d: device used %d[%d] ,resetting device to %d", myrank, cur_dev, ndev, device_id);
+        }
+        TLLM_CUDA_CHECK(cudaSetDevice(device_id));
+        cur_dev = device_id;
     }
     (*comm)->mydev = cur_dev;
     (*comm)->nvrank = myrank;
     (*comm)->nvsize = nranks;
 
-    int divgpus = pipegpus * tensorgpus;
-    int datagpus = nranks / divgpus;
-    (*comm)->ar_nvsize = datagpus;
-    (*comm)->ar_firstgpu = myrank - ((myrank / tensorgpus) % datagpus) * tensorgpus;
-    (*comm)->ar_nvrank = (myrank - (*comm)->ar_firstgpu) / tensorgpus;
-    // ar2 is tensor
-    (*comm)->ar2_nvsize = tensorgpus;
-    (*comm)->ar2_firstgpu = myrank - myrank % tensorgpus;
-    (*comm)->ar2_nvrank = myrank - (*comm)->ar2_firstgpu;
+    (*comm)->tp_size = world_config.getTensorParallelism();
+    (*comm)->tp_rank = world_config.getTensorParallelRank();
+    (*comm)->tp_first_rank = (*comm)->nvrank - (*comm)->tp_rank;
 
-    (*comm)->pipe_id = myrank / (datagpus * tensorgpus);
     MPI_Comm_dup(MPI_COMM_WORLD, &(*comm)->comm_intra);
-
-    (*comm)->ibnvsize = getenv("IBNVSIZE") ? atoi(getenv("IBNVSIZE")) : (*comm)->nvsize;
 
 #define NBUF 1
 
     int nvls_supported = 1;
 
-    if (nvls_supported && (*comm)->sm_arch >= 9 && (*comm)->ar2_nvsize > 1 && !getenv("UB_SKIPMC"))
-    { // multicast init only for TP ops (____2 operations)
+    if (nvls_supported && (*comm)->sm_arch >= 9 && (*comm)->tp_size > 1 && !getenv("UB_SKIPMC"))
+    {
         size_t mc_maxsize = MULTICAST_GB_TOTAL * (1ull << 30);
         (*comm)->mc_offset = 0;
         (*comm)->use_mc = 1;
         size_t gran;
         CUmulticastObjectProp mcProp = {};
-        mcProp.numDevices = (*comm)->ar2_nvsize;
+        mcProp.numDevices = (*comm)->tp_size;
         mcProp.size = (*comm)->mc_maxsize;
 #ifdef MNNVL
         mcProp.handleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
@@ -210,24 +190,23 @@ int create_communicator_grouped2(communicator** comm, int pipegpus, int pipenode
         mc_maxsize = ((mc_maxsize + gran - 1) / gran) * gran;
         mcProp.size = mc_maxsize;
         (*comm)->mc_maxsize = mc_maxsize;
-        if ((*comm)->ar2_nvrank == 0)
+        if ((*comm)->tp_rank == 0)
             CUCHECK(cuMulticastCreate(&(*comm)->mc_handle, &mcProp));
 
 #ifdef MNNVL
         CUmemFabricHandle* exphndl = (CUmemFabricHandle*) malloc(sizeof(CUmemFabricHandle));
         CUmemFabricHandle* tmphndl = (CUmemFabricHandle*) malloc(sizeof(CUmemFabricHandle));
-        if ((*comm)->ar2_nvrank == 0)
+        if ((*comm)->tp_rank == 0)
             CUCHECK(cuMemExportToShareableHandle(
                 static_cast<void*>(tmphndl), (*comm)->mc_handle, CU_MEM_HANDLE_TYPE_FABRIC, 0));
-        for (int grp = 0; grp < (*comm)->ar_nvsize; grp++)
-        { // we do N broadcasts for N TP groups in NVL domain
-            int root = grp * (*comm)->ar2_nvsize;
+        for (int tp_group = 0; tp_group < (*comm)->nvsize / (*comm)->tp_size; ++tp_group)
+        {
+            int root = tp_group * (*comm)->tp_size;
             ub_bcast(tmphndl, sizeof(CUmemFabricHandle), root, (*comm)->comm_intra);
-            // save data if broadcast was from rank 0 in our group
-            if ((*comm)->ar2_firstgpu == root)
+            if ((*comm)->tp_first_rank == root)
                 memcpy(exphndl, tmphndl, sizeof(CUmemFabricHandle));
         }
-        if ((*comm)->ar2_nvrank != 0)
+        if ((*comm)->tp_rank != 0)
             CUCHECK(cuMemImportFromShareableHandle(
                 &(*comm)->mc_handle, reinterpret_cast<void*>(exphndl), CU_MEM_HANDLE_TYPE_FABRIC));
         free(exphndl);
@@ -235,29 +214,29 @@ int create_communicator_grouped2(communicator** comm, int pipegpus, int pipenode
 #else
         int fd;
         volatile uint32_t abortFlag = 0;
-        struct IpcSocketHandle ipcSock = {0};
+        IpcSocketHandle ipcSock{};
         srand(time(NULL));
         uint64_t opId = (uint64_t) (rand()) ^ ((uint64_t) (rand()) << 32);
         ub_bcast(&opId, sizeof(uint64_t), 0, (*comm)->comm_world);
         ipcSocketResult_t ret = ipcSocketSuccess;
-        NCCLCHECK(ipcSocketInit(&ipcSock, (*comm)->ar2_nvrank + (*comm)->ar2_firstgpu, (uint64_t) opId, &abortFlag));
+        NCCLCHECK(ipcSocketInit(&ipcSock, (*comm)->nvrank, (uint64_t) opId, &abortFlag));
         ub_barrier((*comm)->comm_world);
-        if ((*comm)->ar2_nvrank == 0)
+        if ((*comm)->tp_rank == 0)
         {
             CUCHECK(cuMemExportToShareableHandle(
                 &fd, (*comm)->mc_handle, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0 /*flags*/));
-            for (int p = 1; p < (*comm)->ar2_nvsize; p++)
+            for (int p = 1; p < (*comm)->tp_size; p++)
             {
                 ub_barrier((*comm)->comm_intra);
-                NCCLCHECKGOTO(ipcSocketSendFd(&ipcSock, fd, p + (*comm)->ar2_firstgpu, (uint64_t) opId), ret, error);
+                NCCLCHECKGOTO(ipcSocketSendFd(&ipcSock, fd, p + (*comm)->tp_first_rank, (uint64_t) opId), ret, error);
             }
         }
         else
         {
-            for (int i = 0; i < (*comm)->ar2_nvrank; i++)
+            for (int i = 0; i < (*comm)->tp_rank; i++)
                 ub_barrier((*comm)->comm_intra);
             NCCLCHECKGOTO(ipcSocketRecvFd(&ipcSock, &fd), ret, error);
-            for (int i = 0; i < (*comm)->ar2_nvsize - (*comm)->ar2_nvrank - 1; i++)
+            for (int i = 0; i < (*comm)->tp_size - (*comm)->tp_rank - 1; i++)
                 ub_barrier((*comm)->comm_intra);
             CUCHECK(cuMemImportFromShareableHandle(&(*comm)->mc_handle,
                 reinterpret_cast<void*>(static_cast<uintptr_t>(fd)), CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR));
@@ -280,21 +259,23 @@ int create_communicator_grouped2(communicator** comm, int pipegpus, int pipenode
 
         (*comm)->mc_baseptr = reinterpret_cast<void*>(mc_va);
         ub_barrier((*comm)->comm_world);
-        if (!(*comm)->myrank)
-            printf("MC initialized successfully, window size = %ld\n", mc_maxsize);
+        if ((*comm)->tp_rank == 0)
+        {
+            TLLM_LOG_INFO(
+                "[UserBuffer] rank %d, MC initialized successfully, window size = %ld", (*comm)->nvrank, mc_maxsize);
+        }
     }
     else
     {
-        if (!(*comm)->myrank)
-            printf("MC NOT initialized and used\n");
+        if ((*comm)->tp_rank == 0)
+            TLLM_LOG_WARNING("[UserBuffer] rank %d, MC NOT initialized and used", (*comm)->nvrank);
         (*comm)->mc_maxsize = 0;
         (*comm)->mc_offset = 0;
         (*comm)->use_mc = 0;
     }
 
 #define LOCALSIZE 4 * (REG0_OFFSET(*comm) + REG0_FLAGS + REG0_COMMBUFFER * NBUF)
-    // peer pointers + op flags + comm buffer
-    register_user_buffer_collective(&((*comm)->gpu_ptrs), LOCALSIZE, *comm, true); // will use handler 0
+    register_user_buffer_collective(&((*comm)->gpu_ptrs), LOCALSIZE, *comm); // will use handler 0
 
     TLLM_CUDA_CHECK(cudaMalloc(&(*comm)->send_id, (*comm)->nranks * sizeof(int)));
     TLLM_CUDA_CHECK(cudaMalloc(&(*comm)->recv_id, MAX_REGIONS * (*comm)->nranks * sizeof(int)));
@@ -306,23 +287,12 @@ int create_communicator_grouped2(communicator** comm, int pipegpus, int pipenode
     return 0;
 }
 
-int create_communicator_grouped(communicator** comm, int pipegpus, int pipenodes)
-{
-    return create_communicator_grouped2(comm, pipegpus, pipenodes, 1, 1);
-}
-
-int create_communicator(communicator** comm)
-{
-    return create_communicator_grouped2(comm, 1, 1, 1, 1);
-}
-
 void destroy_communicator(communicator* comm)
 {
-    MPI_Comm_free(&comm->comm_intra);
-    MPI_Comm_free(&comm->comm_world);
+    // WIP
 }
 
-int register_user_buffer_collective(void** gpubuff, size_t bytes, communicator* comm, bool alloc)
+int register_user_buffer_collective(void** gpubuff, size_t bytes, communicator* comm)
 {
     if (comm->free_region > MAX_REGIONS)
         return -1;
@@ -331,157 +301,124 @@ int register_user_buffer_collective(void** gpubuff, size_t bytes, communicator* 
     size_t aligned_size = bytes;
     comm->memflags[hndl] = 0;
 
-    if (alloc)
+    int nranks = comm->nvsize;
+    int myrank = comm->nvrank;
+    void** remptrs = (void**) malloc(nranks * sizeof(void*));
+
+    CUmemAllocationProp prop = {};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = comm->mydev;
+#ifdef MNNVL
+    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
+#else
+    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+#endif
+    size_t granularity = 0;
+    CUCHECK(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+    aligned_size = (bytes + granularity - 1) / granularity * granularity;
+
+    if (comm->use_mc)
     {
-        int nranks = comm->nvsize; // total GPUs in NVLINK domain
-        int myrank = comm->nvrank;
-        void** remptrs = (void**) malloc(nranks * sizeof(void*));
-
-        CUmemAllocationProp prop = {};
-        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        prop.location.id = comm->mydev;
-#ifdef MNNVL
-        prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
-#else
-        prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
-#endif
-        size_t granularity = 0;
-        CUCHECK(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
-        // MPI_Allreduce MAX of granularity check
-        aligned_size = (bytes + granularity - 1) / granularity * granularity;
-
-        if (comm->use_mc)
-        {
-            CUmulticastObjectProp mcProp = {};
-            mcProp.numDevices = nranks;
-            mcProp.size = aligned_size;
-            mcProp.handleTypes = prop.requestedHandleTypes;
-            CUCHECK(cuMulticastGetGranularity(&granularity, &mcProp, CU_MULTICAST_GRANULARITY_MINIMUM));
-            aligned_size = (aligned_size + granularity - 1) / granularity * granularity;
-        }
-
-        prop.location.id = comm->mydev;
-        prop.allocFlags.gpuDirectRDMACapable = 1;
-
-        comm->uchandles[hndl] = (CUmemGenericAllocationHandle*) malloc(nranks * sizeof(CUmemGenericAllocationHandle));
-        CUCHECK(cuMemCreate(&(comm->uchandles[hndl][myrank]), aligned_size, &prop, 0));
-
-#ifdef MNNVL
-        CUmemFabricHandle* exphndl;
-        CUmemFabricHandle myhndl;
-        CUCHECK(cuMemExportToShareableHandle(&myhndl, comm->uchandles[hndl][myrank], CU_MEM_HANDLE_TYPE_FABRIC, 0));
-        ub_alloc_copy_allgather((void**) &exphndl, sizeof(CUmemFabricHandle), (void*) &myhndl, comm->comm_intra);
-        for (int p = 0; p < nranks; p++)
-            if (p != myrank)
-                CUCHECK(cuMemImportFromShareableHandle(
-                    &comm->uchandles[hndl][p], reinterpret_cast<void*>(&exphndl[p]), CU_MEM_HANDLE_TYPE_FABRIC));
-        ub_free(exphndl);
-#else
-        int* peerfd = (int*) malloc(nranks * sizeof(int));
-        CUCHECK(cuMemExportToShareableHandle(
-            &peerfd[myrank], comm->uchandles[hndl][myrank], CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0 /*flags*/));
-
-        volatile uint32_t abortFlag = 0;
-        struct IpcSocketHandle ipcSock = {0};
-        uint64_t opId = (uint64_t) (rand()) ^ ((uint64_t) (rand()) << 32);
-        ub_bcast(&opId, sizeof(uint64_t), 0, comm->comm_world);
-        ipcSocketResult_t ret = ipcSocketSuccess;
-
-        NCCLCHECK(ipcSocketInit(&ipcSock, myrank, (uint64_t) opId, &abortFlag));
-        for (int p = 1; p < nranks; p++)
-        {
-            ub_barrier(comm->comm_intra);
-            NCCLCHECKGOTO(
-                ipcSocketSendFd(&ipcSock, peerfd[myrank], (myrank + p) % nranks, (uint64_t) opId), ret, error);
-            NCCLCHECKGOTO(ipcSocketRecvFd(&ipcSock, &peerfd[(myrank + nranks - p) % nranks]), ret, error);
-        }
-    error:
-        NCCLCHECK(ipcSocketClose(&ipcSock));
-
-        for (int p = 0; p < nranks; p++)
-        {
-            if (p != myrank)
-                CUCHECK(cuMemImportFromShareableHandle(&comm->uchandles[hndl][p],
-                    reinterpret_cast<void*>(static_cast<uintptr_t>(peerfd[p])),
-                    CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR));
-            close(peerfd[p]);
-        }
-        free(peerfd);
-#endif
-        CUdeviceptr ptr;
-        CUCHECK(cuMemAddressReserve(&ptr, aligned_size * nranks, 0, 0, 0));
-        comm->ucbase_ptr[hndl] = reinterpret_cast<void*>(ptr);
-        CUmemAccessDesc accessDesc = {};
-        accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-        accessDesc.location.id = comm->mydev;
-
-        for (int i = 0; i < nranks; i++)
-        {
-            CUCHECK(cuMemMap(ptr + (aligned_size * i), aligned_size, 0, comm->uchandles[hndl][i], 0));
-            remptrs[i] = reinterpret_cast<void*>(ptr + (aligned_size * i));
-            if (i == comm->nvrank)
-            {
-                if (hndl)
-                    *gpubuff = remptrs[i];
-                else
-                    comm->gpu_ptrs = remptrs[i];
-            }
-            comm->peer_ptr[hndl][i] = remptrs[i];
-        }
-        CUCHECK(cuMemSetAccess(ptr, aligned_size * nranks, &accessDesc, 1));
-
-        if (hndl == 0)
-            TLLM_CUDA_CHECK(cudaMemset(comm->gpu_ptrs, 0, aligned_size));
-        TLLM_CUDA_CHECK(cudaMemcpy(((char*) (comm->gpu_ptrs)) + (hndl * nranks * sizeof(void*)), remptrs,
-            nranks * sizeof(void*), cudaMemcpyHostToDevice));
-        free(remptrs);
-
-        comm->memflags[hndl] = UB_MEM_ALLOCATED;
-        if (!getenv("UB_SKIPUCPTR"))
-            comm->memflags[hndl] |= UB_MEM_UC_CONTIG;
-
-        if (comm->use_mc && comm->mc_maxsize >= comm->mc_offset + aligned_size)
-        {
-            CUCHECK(cuMulticastBindMem(
-                comm->mc_handle, comm->mc_offset, comm->uchandles[hndl][myrank], 0 /*memOffset*/, aligned_size, 0));
-            comm->memflags[hndl] |= UB_MEM_MC_CREATED;
-            comm->mc_ptr[hndl] = reinterpret_cast<uint8_t*>(comm->mc_baseptr) + comm->mc_offset;
-            comm->mc_offset += aligned_size;
-        }
-        else if (!comm->myrank)
-            printf(
-                "UB: warning region %d size %ld MB registered without MC access\n", hndl, aligned_size / 1024 / 1024);
+        CUmulticastObjectProp mcProp = {};
+        mcProp.numDevices = comm->tp_size;
+        mcProp.size = aligned_size;
+        mcProp.handleTypes = prop.requestedHandleTypes;
+        CUCHECK(cuMulticastGetGranularity(&granularity, &mcProp, CU_MULTICAST_GRANULARITY_MINIMUM));
+        aligned_size = (aligned_size + granularity - 1) / granularity * granularity;
     }
-    else
-    {
-        if (!comm->myrank)
-            printf("UB: warning region %d size %ld MB allocated using cudaMalloc - deprecated(no MC available)\n", hndl,
-                aligned_size / 1024 / 1024);
+
+    prop.location.id = comm->mydev;
+    prop.allocFlags.gpuDirectRDMACapable = 1;
+
+    comm->uchandles[hndl] = (CUmemGenericAllocationHandle*) malloc(nranks * sizeof(CUmemGenericAllocationHandle));
+    CUCHECK(cuMemCreate(&(comm->uchandles[hndl][myrank]), aligned_size, &prop, 0));
+
 #ifdef MNNVL
-        exit(1);
+    CUmemFabricHandle* exphndl;
+    CUmemFabricHandle myhndl;
+    CUCHECK(cuMemExportToShareableHandle(&myhndl, comm->uchandles[hndl][myrank], CU_MEM_HANDLE_TYPE_FABRIC, 0));
+    ub_alloc_copy_allgather((void**) &exphndl, sizeof(CUmemFabricHandle), (void*) &myhndl, comm->comm_intra);
+    for (int p = 0; p < nranks; p++)
+        if (p != myrank)
+            CUCHECK(cuMemImportFromShareableHandle(
+                &comm->uchandles[hndl][p], reinterpret_cast<void*>(&exphndl[p]), CU_MEM_HANDLE_TYPE_FABRIC));
+    ub_free(exphndl);
+#else
+    int* peerfd = (int*) malloc(nranks * sizeof(int));
+    CUCHECK(cuMemExportToShareableHandle(
+        &peerfd[myrank], comm->uchandles[hndl][myrank], CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0 /*flags*/));
+
+    volatile uint32_t abortFlag = 0;
+    IpcSocketHandle ipcSock{};
+    uint64_t opId = (uint64_t) (rand()) ^ ((uint64_t) (rand()) << 32);
+    ub_bcast(&opId, sizeof(uint64_t), 0, comm->comm_world);
+    ipcSocketResult_t ret = ipcSocketSuccess;
+
+    NCCLCHECK(ipcSocketInit(&ipcSock, myrank, (uint64_t) opId, &abortFlag));
+    for (int p = 1; p < nranks; p++)
+    {
+        ub_barrier(comm->comm_intra);
+        NCCLCHECKGOTO(ipcSocketSendFd(&ipcSock, peerfd[myrank], (myrank + p) % nranks, (uint64_t) opId), ret, error);
+        NCCLCHECKGOTO(ipcSocketRecvFd(&ipcSock, &peerfd[(myrank + nranks - p) % nranks]), ret, error);
+    }
+error:
+    NCCLCHECK(ipcSocketClose(&ipcSock));
+
+    for (int p = 0; p < nranks; p++)
+    {
+        if (p != myrank)
+            CUCHECK(cuMemImportFromShareableHandle(&comm->uchandles[hndl][p],
+                reinterpret_cast<void*>(static_cast<uintptr_t>(peerfd[p])), CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR));
+        close(peerfd[p]);
+    }
+    free(peerfd);
 #endif
-        // legacy/deprecated code for cudaMalloc user-allocated memory: might even print a warning about it
-        assert(comm->nvsize <= 8); // FIXME check its single node
-        cudaIpcMemHandle_t* memhndl;
-        cudaIpcMemHandle_t myhndl;
-        TLLM_CUDA_CHECK(cudaIpcGetMemHandle(&myhndl, *gpubuff));
-        ub_alloc_copy_allgather((void**) &memhndl, sizeof(cudaIpcMemHandle_t), (void*) &myhndl, comm->comm_intra);
+    CUdeviceptr ptr;
+    CUCHECK(cuMemAddressReserve(&ptr, aligned_size * nranks, 0, 0, 0));
+    comm->ucbase_ptr[hndl] = reinterpret_cast<void*>(ptr);
+    CUmemAccessDesc accessDesc = {};
+    accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    accessDesc.location.id = comm->mydev;
 
-        for (int i = 0; i < comm->nvsize; i++)
-            if (i != comm->nvrank)
-                TLLM_CUDA_CHECK(cudaIpcOpenMemHandle(
-                    (void**) &(comm->peer_ptr[hndl][i]), memhndl[i], cudaIpcMemLazyEnablePeerAccess));
-        comm->peer_ptr[hndl][comm->nvrank] = *gpubuff;
-        TLLM_CUDA_CHECK(cudaDeviceSynchronize());
+    for (int i = 0; i < nranks; i++)
+    {
+        CUCHECK(cuMemMap(ptr + (aligned_size * i), aligned_size, 0, comm->uchandles[hndl][i], 0));
+        remptrs[i] = reinterpret_cast<void*>(ptr + (aligned_size * i));
+        if (i == comm->nvrank)
+        {
+            if (hndl)
+                *gpubuff = remptrs[i];
+            else
+                comm->gpu_ptrs = remptrs[i];
+        }
+        comm->peer_ptr[hndl][i] = remptrs[i];
+    }
+    CUCHECK(cuMemSetAccess(ptr, aligned_size * nranks, &accessDesc, 1));
 
-        TLLM_CUDA_CHECK(cudaMemcpy((char*) (comm->gpu_ptrs) + (hndl * comm->nvsize * sizeof(void*)),
-            comm->peer_ptr[hndl], comm->nvsize * sizeof(void*), cudaMemcpyHostToDevice));
+    if (hndl == 0)
+        TLLM_CUDA_CHECK(cudaMemset(comm->gpu_ptrs, 0, aligned_size));
+    TLLM_CUDA_CHECK(cudaMemcpy(((char*) (comm->gpu_ptrs)) + (hndl * nranks * sizeof(void*)), remptrs,
+        nranks * sizeof(void*), cudaMemcpyHostToDevice));
+    free(remptrs);
 
-        TLLM_CUDA_CHECK(cudaDeviceSynchronize());
+    comm->memflags[hndl] = UB_MEM_ALLOCATED;
+    if (!getenv("UB_SKIPUCPTR"))
+        comm->memflags[hndl] |= UB_MEM_UC_CONTIG;
 
-        ub_free(memhndl);
+    if (comm->use_mc && comm->mc_maxsize >= comm->mc_offset + aligned_size)
+    {
+        CUCHECK(cuMulticastBindMem(
+            comm->mc_handle, comm->mc_offset, comm->uchandles[hndl][myrank], 0 /*memOffset*/, aligned_size, 0));
+        comm->memflags[hndl] |= UB_MEM_MC_CREATED;
+        comm->mc_ptr[hndl] = reinterpret_cast<uint8_t*>(comm->mc_baseptr) + comm->mc_offset;
+        comm->mc_offset += aligned_size;
+    }
+    else if (comm->myrank == 0)
+    {
+        TLLM_LOG_WARNING("[UserBuffer] warning region %d size %ld MB registered without MC access", hndl,
+            aligned_size / 1024 / 1024);
     }
     comm->mem_size[hndl] = aligned_size;
     comm->mem_ptr[hndl] = *gpubuff;

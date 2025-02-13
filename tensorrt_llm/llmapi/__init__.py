@@ -3,7 +3,8 @@ from ..sampling_params import GuidedDecodingParams, SamplingParams
 from .build_cache import BuildCacheConfig
 from .llm import LLM, RequestOutput
 from .llm_utils import (BuildConfig, CalibConfig, CapacitySchedulerPolicy,
-                        KvCacheConfig, LookaheadDecodingConfig,
+                        EagleDecodingConfig, KvCacheConfig,
+                        KvCacheRetentionConfig, LookaheadDecodingConfig,
                         MedusaDecodingConfig, QuantAlgo, QuantConfig,
                         SchedulerConfig)
 
@@ -13,8 +14,10 @@ __all__ = [
     'GuidedDecodingParams',
     'SamplingParams',
     'KvCacheConfig',
+    'KvCacheRetentionConfig',
     'LookaheadDecodingConfig',
     'MedusaDecodingConfig',
+    'EagleDecodingConfig',
     'SchedulerConfig',
     'CapacitySchedulerPolicy',
     'BuildConfig',

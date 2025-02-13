@@ -180,8 +180,12 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
     bool const isGMMAKernel = (cubinObj->getKernelType() == XQAKernelType::kHOPPER_WARP_SPECIALIZED);
     TLLM_CHECK_DEBUG(isGMMAKernel == jit::supportConfigQGMMA(xqaParams, mSM, false));
     // @fixme: also embed these compile-time flags in cubin directly
-    bool const xqaUseInputKV = isGMMAKernel;
-    bool const xqaUseRoPE = xqaUseInputKV
+    // Whether RoPE is fused into the XQA kernel.
+    //  * If applyRoPEInXqaKernel is true, XQA kernel applies RoPE AND performs SDPA.
+    //  * If applyRoPEInXqaKernel is false, a separate kernel applies RoPE (see invokeQKVPreprocessing), then XQA kernel
+    //  performs SDPA.
+    //    In this case, xqa_q_input_ptr (see below) serves as the scratch space to store intermediate RoPE output.
+    bool const applyRoPEInXqaKernel = isGMMAKernel
         && tensorrt_llm::common::contains({PositionEmbeddingType::kLONG_ROPE, PositionEmbeddingType::kROPE_GPT_NEOX,
                                               PositionEmbeddingType::kROPE_GPTJ},
             xqaParams.position_embedding_type);
@@ -208,10 +212,9 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         launchParams.output = inputScratch;
     }
 
-    // IDEA: Store rotary_processed Q buffer to scratch buffer.
     // NOTE: MHA kernels should read kv cache that has already been appended with new tokens' kv cache.
-    void* xqa_q_input_ptr = (xqaUseInputKV ? nullptr : inputScratch);
-    if (!xqaUseInputKV)
+    void* xqa_q_input_ptr = (applyRoPEInXqaKernel ? nullptr : inputScratch);
+    if (!applyRoPEInXqaKernel)
     {
         // Build cu_seqlens, padding_offset, and rotary inv freq tensors
         BuildDecoderInfoParams<T> decoder_params;
@@ -244,7 +247,7 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         }
         sync_check_cuda_error();
 
-        QKVPreprocessingParams<T, KVCacheBuffer> preprocessingParms{static_cast<T*>(const_cast<void*>(xqaParams.qkv)),
+        QKVPreprocessingParams<T, KVCacheBuffer> preprocessingParams{static_cast<T*>(const_cast<void*>(xqaParams.qkv)),
             nullptr, nullptr, static_cast<T*>(xqa_q_input_ptr), kv_cache_buffer,
             /* kv_cache_block_scales_buffer */ KVCacheBuffer{}, static_cast<T const*>(xqaParams.qkv_bias),
             xqaParams.logn_scaling_ptr, launchParams.tokens_info, xqaParams.spec_decoding_generation_lengths,
@@ -262,7 +265,7 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
             xqaParams.position_shift_enabled, cache_type, true, false, /* generation_phase */ true,
             multiprocessor_count, xqaParams.rotary_vision_start, xqaParams.rotary_vision_length};
 
-        invokeQKVPreprocessing<T, KVCacheBuffer>(preprocessingParms, stream);
+        invokeQKVPreprocessing<T, KVCacheBuffer>(preprocessingParams, stream);
         sync_check_cuda_error();
     }
 
@@ -290,10 +293,9 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
     {
         appendParam(&launchParams.rcpOutScale);
     }
-    appendParam(xqaUseInputKV ? &launchParams.qkv : const_cast<void const**>(&xqa_q_input_ptr));
-    if (xqaUseRoPE)
+    appendParam(applyRoPEInXqaKernel ? &launchParams.qkv : const_cast<void const**>(&xqa_q_input_ptr));
+    if (applyRoPEInXqaKernel)
     {
-        TLLM_CHECK_DEBUG(xqaUseInputKV);
         appendParam(&launchParams.ropeCosSin);
     }
     appendParam(&launchParams.kvCacheParams);

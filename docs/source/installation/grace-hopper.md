@@ -5,7 +5,7 @@
 1. Install TensorRT-LLM (tested on Ubuntu 24.04).
 
     ```bash
-    pip3 install torch==2.5.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+    pip3 install torch==2.6.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 
     sudo apt-get -y install libopenmpi-dev && pip3 install --upgrade setuptools && pip3 install tensorrt_llm
     ```

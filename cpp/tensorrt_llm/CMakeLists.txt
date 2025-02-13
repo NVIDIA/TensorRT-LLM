@@ -369,6 +369,7 @@ set(TRTLLM_LINK_LIBS
     decoder_attention_src
     trtllm_gen_fmha
     selective_scan_src
+    ws_layernorm_src
     fpA_intB_gemm_src
     # moe_gemm_src
     fb_gemm_src
