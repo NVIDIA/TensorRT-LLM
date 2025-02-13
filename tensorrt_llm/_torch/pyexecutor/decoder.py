@@ -20,7 +20,7 @@ from tensorrt_llm.bindings.internal.runtime import (BufferManager, CudaStream,
                                                     SpeculativeDecodingMode)
 from tensorrt_llm.mapping import Mapping
 
-from .llm_request import LlmRequest, LlmRequestState
+from .llm_request import LlmRequest, LlmRequestState, LogProbs
 from .scheduler import ScheduledRequests
 
 
@@ -29,6 +29,9 @@ class DecoderState:
     scheduled_requests: ScheduledRequests
 
     logits: torch.Tensor = None
+
+    # Set when decode_async() has evaluated these to avoid computing again in update_requests()
+    log_probs: list[LogProbs] | None = None
 
     new_tensors_device: dict[str, torch.Tensor] = None
     new_tensors_host: dict[str, torch.Tensor] = None
@@ -72,9 +75,11 @@ class EarlyStopDecoder(Decoder):
         assert (not scheduled_requests.generation_requests)
         for idx, request in enumerate(scheduled_requests.context_requests):
             request.state = LlmRequestState.GENERATION_COMPLETE
-            #NOTE: This is a hack: set finish reason manually and set the beam 0
+            # NOTE: This is a hack: set finish reason manually and set the beam 0
             request.set_finished_reason(FinishReason.LENGTH, 0)
-            request.context_logits = decoder_state.logits[idx]
+            # Add vocab_size axis to be compatible with LogitsStorage.
+            request.py_result.append_context_logits(
+                decoder_state.logits[idx].unsqueeze(-1))
 
 
 def top_k_sampling_batch(logits, top_k=50):
@@ -164,10 +169,7 @@ def decode_single_request(request: LlmRequest, logits):
             logits, request.sampling_config.top_k[0])
     else:
         next_tokens, log_probs = greedy_search_sampling_batch(logits)
-    # TODO: enable these lines when log_probs is needed
-    # request.log_probs_async = log_probs
-    # request.set_cum_log_prob(request.cum_log_probs[0] + log_probs[0].item(), 0)
-    return next_tokens
+    return next_tokens, log_probs
 
 
 class TorchDecoder(Decoder):
@@ -230,6 +232,7 @@ class TorchDecoder(Decoder):
             decoder_state.decoder_event.synchronize()
         new_tokens_list = decoder_state.new_tensors_host[
             "new_tokens_host"].tolist()
+        logits = decoder_state.logits
 
         request_idx = 0
         logits_idx = 0
@@ -247,6 +250,16 @@ class TorchDecoder(Decoder):
                 num_tokens = request.add_new_token(new_token, beam_idx)
                 self._handle_stop_criteria(request, new_token, num_tokens,
                                            beam_idx)
+
+                request.py_result.append_generation_logits(
+                    logits[logits_idx].unsqueeze(0))
+                if decoder_state.log_probs:
+                    request.py_result.append_log_probs(
+                        decoder_state.log_probs[request_idx])
+                elif request.py_return_log_probs:
+                    _, log_probs = greedy_search_sampling_batch(
+                        logits[logits_idx].unsqueeze(0))
+                    request.py_result.append_log_probs([log_probs.tolist()])
 
             logits_idx += 1
             request_idx += 1
@@ -290,6 +303,15 @@ class TorchDecoder(Decoder):
                 request.py_num_accepted_draft_tokens = accepted_tokens - 1
                 request.py_rewind_len = request.py_draft_pages_allocated - request.py_num_accepted_draft_tokens
 
+            request.py_result.append_generation_logits(
+                logits[logits_idx:logits_idx + accepted_tokens])
+            if decoder_state.log_probs:
+                request.py_result.append_log_probs(
+                    decoder_state.log_probs[request_idx])
+            elif request.py_return_log_probs:
+                _, log_probs = greedy_search_sampling_batch(
+                    logits[logits_idx:logits_idx + accepted_tokens])
+                request.py_result.append_log_probs([log_probs.tolist()])
             request_idx += 1
             logits_idx += total_tokens
 
@@ -308,9 +330,13 @@ class TorchDecoder(Decoder):
         idx = 0
 
         for request in scheduled_requests.context_requests:
+            assert not request.py_return_context_logits, "Return context logits not supported"
             token_logits = logits[idx:idx + 1, :]
-            new_token = decode_single_request(request, token_logits)
+            new_token, log_probs = decode_single_request(request, token_logits)
             new_tokens_device_array.append(new_token)
+            log_probs = [log_probs.tolist()
+                         ] if request.py_return_log_probs else None
+            state.log_probs.append(log_probs)  # Currently always beam_width=1
             idx += 1
 
         for request in scheduled_requests.generation_requests:
@@ -318,8 +344,11 @@ class TorchDecoder(Decoder):
                 continue
             assert request.py_draft_tokens is None, "Speculative decoding not supported in SeparateDecoder."
             token_logits = logits[idx:idx + 1, :]
-            new_token = decode_single_request(request, token_logits)
+            new_token, log_probs = decode_single_request(request, token_logits)
             new_tokens_device_array.append(new_token)
+            log_probs = [log_probs.tolist()
+                         ] if request.py_return_log_probs else None
+            state.log_probs.append(log_probs)  # Currently always beam_width=1
             idx += 1
 
         new_tokens_device = torch.cat(new_tokens_device_array)
@@ -361,7 +390,14 @@ class TorchStarAttentionDecoder(TorchDecoder):
 
         output_token_idx = request.output_token_idx
         new_token = new_tokens_list[output_token_idx]
+
         num_tokens = request.add_new_token(new_token, beam_idx)
+        current_logits = logits[output_token_idx].unsqueeze(0)
+        request.py_result.append_generation_logits(current_logits)
+        if request.py_return_log_probs:
+            _, log_probs = greedy_search_sampling_batch(current_logits)
+            request.py_result.append_log_probs([log_probs.tolist()])
+
         self._handle_stop_criteria(request, new_token, num_tokens, beam_idx)
 
     def update_requests(self, decoder_state: DecoderState):

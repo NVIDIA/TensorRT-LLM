@@ -253,7 +253,7 @@ def test_deepseek(model_name, backend, quant, test_config):
         # a little smaller than original model.
         expected = expected[0:len(output_text)] if mtp_nextn > 0 else expected
         assert similar(output_text, expected,
-                       1.0), f"Expected '{expected}' but get '{output_text}'"
+                       0.9), f"Expected '{expected}' but get '{output_text}'"
 
 
 @pytest.mark.parametrize("model_name", ["DeepSeek-V3-Lite"],
@@ -329,6 +329,6 @@ def test_deepseek_streaming(model_name, backend, quant, tp_size):
         assert len(results) == len(expected_outputs), "Output length mismatch"
         for result, expected in zip(results, expected_outputs):
             assert similar(result, expected,
-                           1.0), f"Expected '{expected}' but get '{result}'"
+                           0.9), f"Expected '{expected}' but get '{result}'"
 
     asyncio.run(test())

@@ -158,3 +158,9 @@ class WorkerCommIpcAddrs(NamedTuple):
     result_queue_addr: str
     stats_queue_addr: str
     kv_cache_events_queue_addr: str
+
+
+def is_llm_response(instance):
+    from tensorrt_llm._torch.pyexecutor.llm_request import \
+        LlmResponse as PyLlmResponse
+    return isinstance(instance, (tllm.Response, PyLlmResponse))
