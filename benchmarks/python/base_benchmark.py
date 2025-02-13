@@ -14,7 +14,6 @@
 # limitations under the License.
 import json
 import os
-import subprocess
 import time
 from collections import OrderedDict
 
@@ -26,10 +25,8 @@ from tensorrt_llm.quantization import QuantMode
 
 
 def get_compute_cap():
-    output = subprocess.check_output(
-        ['nvidia-smi', "--query-gpu=compute_cap", "--format=csv"])
-    _, csv_value, *_ = output.splitlines()
-    return str(int(float(csv_value) * 10))
+    cap = torch.cuda.get_device_capability()
+    return str(cap[0] * 10 + cap[1])
 
 
 def get_csv_filename(model, dtype, tp_size, **kwargs):
