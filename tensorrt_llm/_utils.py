@@ -388,7 +388,7 @@ _torch_dtype_to_np_typestr_dict = {
     torch.int64: "<i8",
     torch.int32: "<i4",
     torch.int8: "|i1",
-    torch.float8_e4m3fn: "<f1",
+    torch.float8_e4m3fn: "|i1",
     torch.qint8: "|u1",
     torch.bool: "|b1",
     torch.bfloat16: "<f2",
@@ -732,4 +732,10 @@ def convert_to_torch_tensor(
     if isinstance(tensor, torch.Tensor):
         return tensor
 
-    return torch.as_tensor(tensor).view(tensor.dtype)
+    old_ptr = tensor.data_ptr()
+    new_tensor = torch.as_tensor(tensor).view(tensor.dtype)
+    new_ptr = new_tensor.data_ptr()
+    if old_ptr != new_ptr:
+        raise RuntimeError(
+            "Data pointer mismatch after converting to torch.Tensor")
+    return new_tensor

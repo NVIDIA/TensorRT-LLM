@@ -429,11 +429,8 @@ public:
 
         if (req.getOutputConfig().additionalModelOutputs.has_value())
         {
-            auto const additionalModelOutputs
-                = req.getOutputConfig()
-                      .additionalModelOutputs.value(); // Explicit copy is needed. Something shady is going on,
-                                                       // somewhere, which makes it behave unpredictably without it.
-                                                       // Separate investigation needed.
+            auto const& outputConfig = req.getOutputConfig();
+            auto const& additionalModelOutputs = outputConfig.additionalModelOutputs.value();
             for (auto const& modelOutput : additionalModelOutputs)
             {
                 if (modelOutput.gatherContext)
@@ -1050,6 +1047,8 @@ public:
 
     void setPrepopulatedPromptLen(SizeType32 prepopulatedPromptLen, SizeType32 kvTokensPerBlock)
     {
+        TLLM_LOG_DEBUG("Setting pre-populated prompt length for request %lu to %i.", mRequestId, prepopulatedPromptLen);
+
         auto const promptLen = getPromptLen();
         TLLM_CHECK(prepopulatedPromptLen < promptLen);
         mPrepopulatedPromptLen = prepopulatedPromptLen;
@@ -1753,10 +1752,9 @@ public:
     std::optional<RequestIdType> mClientId;
     // Position of mask token in GLM model inputs
     SizeType32 mMaskPosition{0};
-
-protected:
     LlmRequestState mState;
 
+protected:
     bool mIsStreaming;
 
     // A list of tokens generated at the current step.
@@ -2144,7 +2142,8 @@ public:
     std::optional<executor::Response> createResponse(bool useFastLogits = false, int32_t mpiWorldRank = 0);
 
     void validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen,
-        std::optional<SizeType32> maxEncoderInputLen = std::nullopt, bool enableKVCacheReuse = false);
+        std::optional<SizeType32> maxEncoderInputLen = std::nullopt, bool enableKVCacheReuse = false,
+        bool gatherContextOutputs = false);
 
     std::shared_ptr<LlmRequest> createChildRequest(RequestIdType requestId);
 

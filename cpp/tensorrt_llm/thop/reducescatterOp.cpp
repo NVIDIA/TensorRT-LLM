@@ -15,20 +15,20 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 #include <NvInferRuntime.h>
 #include <c10/cuda/CUDAStream.h>
-#include <cassert>
-#include <set>
-#include <string>
 #include <torch/extension.h>
-#include <vector>
 #if ENABLE_MULTI_DEVICE
 #include <nccl.h>
 #endif // ENABLE_MULTI_DEVICE
+
+#include <cassert>
+#include <set>
+#include <vector>
 
 namespace torch_ext
 {
@@ -56,13 +56,13 @@ public:
         return 0;
     }
 
-    torch::Tensor run(torch::Tensor input) noexcept
+    torch::Tensor run(torch::Tensor const& input) noexcept
     {
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
         std::vector<int64_t> outputShape = input.sizes().vec();
         outputShape[0] = outputShape[0] / mGroup.size();
         auto output = torch::empty(outputShape, input.options());
-        size_t size = output.numel();
+        size_t const size = output.numel();
         TLLM_CHECK_WITH_INFO(mNcclComm.get() != nullptr, "mNcclComm should be initialized before used");
         NCCLCHECK(ncclReduceScatter(
             input.data_ptr(), output.mutable_data_ptr(), size, (*getDtypeMap())[mType], ncclSum, *mNcclComm, stream));
@@ -79,7 +79,7 @@ private:
 
 #endif // ENABLE_MULTI_DEVICE
 
-torch::Tensor reducescatter(torch::Tensor input, torch::List<int64_t> group_)
+extern torch::Tensor reducescatter(torch::Tensor input, torch::List<int64_t> group_)
 {
 #if ENABLE_MULTI_DEVICE
     auto const type = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());

@@ -246,13 +246,7 @@ def test_llama_v2_7b_prompt_adapter_tp2():
         tensor_parallel_size=2, kv_cache_config=global_kv_cache_config_no_reuse)
 
 
-@skip_single_gpu
-def test_llm_multi_node(engine_from_checkpoint: tempfile.TemporaryDirectory):
-    # TODO[chunweiy]: reactivate this later
-    nworkers = 2
-    test_case_file = os.path.join(os.path.dirname(__file__), "run_llm.py")
-    os.path.join(os.path.dirname(__file__), "launch.py")
-    command = f"mpirun --allow-run-as-root -n {nworkers} trtllm-llmapi-launch python3 {test_case_file} --model_dir {engine_from_checkpoint.name} --tp_size {nworkers}"
+def run_command(command: str):
     try:
         result = subprocess.run(command,
                                 shell=True,
@@ -269,6 +263,33 @@ def test_llm_multi_node(engine_from_checkpoint: tempfile.TemporaryDirectory):
         print("Standard output:")
         print(e.stdout)
         raise e
+
+
+@skip_single_gpu
+def test_llm_multi_node(engine_from_checkpoint: tempfile.TemporaryDirectory):
+    pytest.skip("https://nvbugs/5114619")
+    # TODO[chunweiy]: reactivate this later
+    nworkers = 2
+    test_case_file = os.path.join(os.path.dirname(__file__), "run_llm.py")
+    os.path.join(os.path.dirname(__file__), "launch.py")
+    command = f"mpirun --allow-run-as-root -n {nworkers} trtllm-llmapi-launch python3 {test_case_file} --model_dir {engine_from_checkpoint.name} --tp_size {nworkers}"
+    print(f"Command: {command}")
+
+    run_command(command)
+
+
+@skip_single_gpu
+def test_llm_multi_node_with_postproc():
+    pytest.skip("https://nvbugs/5114619")
+    # TODO[chunweiy]: reactivate this later
+    nworkers = 2
+    test_case_file = os.path.join(os.path.dirname(__file__),
+                                  "run_llm_with_postproc.py")
+    os.path.join(os.path.dirname(__file__), "launch.py")
+    command = f"mpirun --allow-run-as-root -n {nworkers} trtllm-llmapi-launch python3 {test_case_file} --model_dir {llama_model_path} --tp_size {nworkers}"
+    print(f"Command: {command}")
+
+    run_command(command)
 
 
 @skip_single_gpu

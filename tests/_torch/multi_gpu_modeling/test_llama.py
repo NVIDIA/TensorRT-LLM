@@ -30,7 +30,7 @@ def similar(a, b, threshold=0.9):
 @pytest.mark.parametrize("tp_size", [1, 4], ids=["tp1", "tp4"])
 @pytest.mark.parametrize("torch_compile", [True, False],
                          ids=["torch_compile", "eager"])
-def test_model(model_name, quant, tp_size, torch_compile):
+def test_llama(model_name, quant, tp_size, torch_compile):
     quant_configs = {
         "bf16":
         QuantConfig(),
@@ -56,6 +56,8 @@ def test_model(model_name, quant, tp_size, torch_compile):
     # 16GB weight + 8GB KV cache + 8GB cache_indirection (TRT engine only) = 32GB
     if not is_fp8 and get_total_gpu_memory(0) < 32 * 1024**3:
         pytest.skip("Not enough GPU memory to run BF16 model")
+    if torch_compile and tp_size > 1:
+        pytest.skip("https://nvbugspro.nvidia.com/bug/5114651")
 
     prompts = [
         "The president of the United States is",

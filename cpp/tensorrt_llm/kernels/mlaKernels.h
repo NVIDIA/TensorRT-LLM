@@ -27,17 +27,22 @@ namespace tensorrt_llm
 namespace kernels
 {
 
-struct mlaMetaParams
+struct MlaMetaParams
 {
     int32_t q_lora_rank = 0;
     int32_t kv_lora_rank = 0;
     int32_t qk_nope_head_dim = 0;
     int32_t qk_rope_head_dim = 0;
     int32_t v_head_dim = 0;
+
+    auto data() const
+    {
+        return std::make_tuple(q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim);
+    }
 };
 
 template <typename T>
-struct mlaParams
+struct MlaParams
 {
     T const* fused_a_input;  // [b, s, c_q + c_k + r]
     T* attention_input_buf;  // [b, s, 3, h, d_h + r]
@@ -60,14 +65,14 @@ struct mlaParams
     int32_t max_input_seq_len;
     int* cu_q_seqlens;
     int* cu_kv_seqlens;
-    mlaMetaParams meta;
+    MlaMetaParams meta;
 };
 
 template <typename T, typename KVCacheBuffer>
-void invokeMLARopeContext(mlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream);
+void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream);
 
 template <typename T, typename KVCacheBuffer>
-void invokeMLARopeGeneration(mlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream);
+void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm

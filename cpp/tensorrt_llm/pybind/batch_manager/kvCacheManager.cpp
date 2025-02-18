@@ -316,7 +316,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
 
     py::classh<tbk::BaseKVCacheManager, PyKvCacheManager>(m, "BaseKVCacheManager")
         .def_static("calculate_max_num_blocks", &tbk::BaseKVCacheManager::calculateMaxNumBlocks, py::arg("config"),
-            py::arg("dtype"), py::arg("model_config"), py::arg("world_config"), py::arg("buffer_manager"))
+            py::arg("dtype"), py::arg("model_config"), py::arg("world_config"), py::arg("buffer_manager"),
+            py::arg("kvFactor"))
         .def("allocate_pools", &BaseKVCacheManager::allocatePools)
         .def("release_pools", &BaseKVCacheManager::releasePools)
         .def("start_scheduling", &BaseKVCacheManager::startScheduling)
@@ -401,7 +402,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
 
     py::enum_<tbk::CacheType>(m, "CacheType")
         .value("SELF", tbk::CacheType::kSELF)
-        .value("CROSS", tbk::CacheType::kCROSS);
+        .value("CROSS", tbk::CacheType::kCROSS)
+        .value("SELFKONLY", tbk::CacheType::kSELFKONLY);
 
     py::classh<tbk::KVCacheManager, tbk::BaseKVCacheManager>(m, "KVCacheManager")
         .def(py::init<std::vector<SizeType32> const&, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32,

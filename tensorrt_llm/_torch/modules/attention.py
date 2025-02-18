@@ -76,6 +76,7 @@ class Attention(nn.Module):
             weights_loading_config=WeightsLoadingConfig(
                 weight_mode=WeightMode.FUSED_QKV_LINEAR),
             quant_config=config.get_quant_config(),
+            skip_create_weights=config.skip_create_weights,
         )
         self.o_proj = Linear(
             self.hidden_size,
@@ -88,6 +89,7 @@ class Attention(nn.Module):
                 tensor_parallel_mode=TensorParallelMode.ROW,
                 gpus_per_node=gpus_per_node),
             quant_config=config.get_quant_config(),
+            skip_create_weights=config.skip_create_weights,
         )
 
         self.attn = create_attention(
@@ -219,22 +221,25 @@ class MLA(nn.Module):
         rms_norm_eps = config.pretrained_config.rms_norm_eps
 
         if not self.is_lite:
-            self.fused_a = Linear(hidden_size,
-                                  self.q_lora_rank + self.kv_lora_rank +
-                                  self.qk_rope_head_dim,
-                                  bias=bias,
-                                  dtype=dtype,
-                                  quant_config=config.get_quant_config())
+            self.fused_a = Linear(
+                hidden_size,
+                self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
+                bias=bias,
+                dtype=dtype,
+                quant_config=config.get_quant_config(),
+                skip_create_weights=config.skip_create_weights)
 
             self.q_a_layernorm = RMSNorm(hidden_size=self.q_lora_rank,
                                          eps=rms_norm_eps,
                                          dtype=dtype)
         else:
-            self.fused_a = Linear(hidden_size,
-                                  self.kv_lora_rank + self.qk_rope_head_dim,
-                                  bias=bias,
-                                  dtype=dtype,
-                                  quant_config=config.get_quant_config())
+            self.fused_a = Linear(
+                hidden_size,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+                bias=bias,
+                dtype=dtype,
+                quant_config=config.get_quant_config(),
+                skip_create_weights=config.skip_create_weights)
         self.kv_a_layernorm = RMSNorm(hidden_size=kv_lora_rank,
                                       dtype=dtype,
                                       eps=rms_norm_eps)
@@ -297,6 +302,7 @@ class MLA(nn.Module):
                 tensor_parallel_mode=TensorParallelMode.ROW,
                 gpus_per_node=gpus_per_node),
             quant_config=config.get_quant_config(),
+            skip_create_weights=config.skip_create_weights,
         )
 
         self.attn = create_attention(config.attn_backend,

@@ -24,7 +24,7 @@ from .._utils import is_same_dtype, str_dtype_to_torch, trt_dtype_to_torch
 from ..functional import (ACT2FN, AllReduceFusionOp, AllReduceParams,
                           AttentionMaskType, PositionEmbeddingType,
                           RotaryScalingType, Tensor, allgather, allreduce, cast,
-                          concat, constant, div, embedding,
+                          concat, constant, div, embedding, gemm_allreduce,
                           generate_alibi_slopes, gpt_attention, matmul, mul,
                           shape, slice, softmax, split, where)
 from ..layers import MropeParams, SpecDecodingParams
@@ -44,7 +44,7 @@ from .functional import (
     weight_only_groupwise_quant_matmul, weight_only_quant_matmul,
     qserve_gemm_per_group, qserve_gemm_per_channel)
 # isort: on
-from .mode import QuantMode
+from .mode import GroupwiseQuantAlgo, QuantMode
 
 
 class Quantize(Module):
@@ -939,6 +939,8 @@ def unpack_int32_into_int8(w_packed):
                              dtype=torch.int8)
     w_unpacked[:, ::2] = w_packed_int4x2 % 16
     w_unpacked[:, 1::2] = w_packed_int4x2 // 16
+    w_unpacked = w_unpacked.view(-1, 8)[:, [0, 4, 1, 5, 2, 6, 3, 7]].view(
+        w_unpacked.shape)
     return w_unpacked.contiguous()
 
 
@@ -981,17 +983,11 @@ class WeightOnlyGroupwiseQuantLinear(Linear):
                          is_qkv=is_qkv,
                          prefer_managed_weight=prefer_managed_weight)
 
-        # Flags for indicating whether the corresponding inputs are applied in quant_algo
-        BIAS = 1
-        ZERO = 2
-        PRE_QUANT_SCALE = 4
-        W4A8_AWQ = 8
-        INT8_WEIGHT = 16
-
-        self.quant_algo = (use_int8_weight * INT8_WEIGHT +
-                           use_w4a8_awq * W4A8_AWQ +
-                           pre_quant_scale * PRE_QUANT_SCALE + zero * ZERO +
-                           bias * BIAS)
+        self.quant_algo = (
+            use_int8_weight * GroupwiseQuantAlgo.INT8_WEIGHT +
+            use_w4a8_awq * GroupwiseQuantAlgo.W4A8_ALPHA +
+            pre_quant_scale * GroupwiseQuantAlgo.PRE_QUANT_SCALE +
+            zero * GroupwiseQuantAlgo.ZERO + bias * GroupwiseQuantAlgo.BIAS)
         self.group_size = group_size
         # packed in FP16 format (INT4*4 -> FP16, INT8*2 -> FP16)
         pack_ratio = 2 if use_int8_weight else 4
@@ -1104,17 +1100,11 @@ class WeightOnlyGroupwiseQuantRowLinear(RowLinear):
                          tp_size=tp_size,
                          prefer_managed_weight=prefer_managed_weight)
 
-        # Flags for indicating whether the corresponding inputs are applied in quant_algo
-        BIAS = 1
-        ZERO = 2
-        PRE_QUANT_SCALE = 4
-        W4A8_AWQ = 8
-        INT8_WEIGHT = 16
-
-        self.quant_algo = (use_int8_weight * INT8_WEIGHT +
-                           use_w4a8_awq * W4A8_AWQ +
-                           pre_quant_scale * PRE_QUANT_SCALE + zero * ZERO +
-                           bias * BIAS)
+        self.quant_algo = (
+            use_int8_weight * GroupwiseQuantAlgo.INT8_WEIGHT +
+            use_w4a8_awq * GroupwiseQuantAlgo.W4A8_ALPHA +
+            pre_quant_scale * GroupwiseQuantAlgo.PRE_QUANT_SCALE +
+            zero * GroupwiseQuantAlgo.ZERO + bias * GroupwiseQuantAlgo.BIAS)
         self.group_size = group_size
         # packed in FP16 format (INT4*4 -> FP16, INT8*2 -> FP16)
         pack_ratio = 2 if use_int8_weight else 4
@@ -2314,33 +2304,49 @@ class FP4RowLinear(RowLinear):
                                    new_scale_factor.dtype)
                 fp4_x, act_per_block_scale = dynamic_quantize(
                     x, self.activation_global_scaling_factor.value)
-        if default_net().plugin_config.gemm_plugin == "nvfp4":
-            x = fp4_gemm(fp4_x, act_per_block_scale, self.weight.value,
-                         self.weights_block_scaling_factor_interleaved.value,
-                         self.alpha.value, self.dtype)
-        else:
-            quant_w = self.weight.value
-            scale_w = self.weights_block_scaling_factor.value
-            dequant_x = block_double_dequantize(
-                fp4_x, act_per_block_scale,
-                self.activation_global_scaling_factor.value, trt.float16)
-            dequant_w = block_double_dequantize(
-                quant_w, scale_w, self.weights_global_scaling_factor.value,
-                trt.float16)
-            x = matmul(dequant_x, dequant_w, transb=True).cast(self.dtype)
 
-        if self.tp_size > 1 and self.tp_group is not None:
-            need_bias = self.bias is not None
-            fuse_bias_into_all_reduce = need_bias and (
-                all_reduce_params
-                is not None) and (all_reduce_params.fusion_op
-                                  == AllReduceFusionOp.RESIDUAL_RMS_NORM)
-            if fuse_bias_into_all_reduce:
-                all_reduce_params.bias = self.bias.value
-            x = allreduce(x, self.tp_group, all_reduce_params=all_reduce_params)
-            if need_bias and not fuse_bias_into_all_reduce:
-                x = x + self.bias.value
-            return x
+        if default_net().plugin_config.gemm_allreduce_plugin:
+            x = gemm_allreduce(
+                a=fp4_x,
+                b=self.weight.value,
+                a_sf=act_per_block_scale,
+                b_sf=self.weights_block_scaling_factor_interleaved.value,
+                transa=False,  # row-major
+                transb=True,  # col-major
+                alpha=self.alpha.value,
+                group=self.tp_group,  # ranks participating
+                fp8_inputs_override=False)
+        else:
+            if default_net().plugin_config.gemm_plugin == "nvfp4":
+                x = fp4_gemm(
+                    fp4_x, act_per_block_scale, self.weight.value,
+                    self.weights_block_scaling_factor_interleaved.value,
+                    self.alpha.value, self.dtype)
+            else:
+                quant_w = self.weight.value
+                scale_w = self.weights_block_scaling_factor.value
+                dequant_x = block_double_dequantize(
+                    fp4_x, act_per_block_scale,
+                    self.activation_global_scaling_factor.value, trt.float16)
+                dequant_w = block_double_dequantize(
+                    quant_w, scale_w, self.weights_global_scaling_factor.value,
+                    trt.float16)
+                x = matmul(dequant_x, dequant_w, transb=True).cast(self.dtype)
+
+            if self.tp_size > 1 and self.tp_group is not None:
+                need_bias = self.bias is not None
+                fuse_bias_into_all_reduce = need_bias and (
+                    all_reduce_params
+                    is not None) and (all_reduce_params.fusion_op
+                                      == AllReduceFusionOp.RESIDUAL_RMS_NORM)
+                if fuse_bias_into_all_reduce:
+                    all_reduce_params.bias = self.bias.value
+                x = allreduce(x,
+                              self.tp_group,
+                              all_reduce_params=all_reduce_params)
+                if need_bias and not fuse_bias_into_all_reduce:
+                    x = x + self.bias.value
+                return x
 
         if self.bias is not None:
             x = x + self.bias.value

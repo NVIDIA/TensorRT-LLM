@@ -15,20 +15,20 @@
  */
 #include "tllmRuntime.h"
 #include "common.h"
-#include "nlohmann/json.hpp"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/common/safetensors.h"
 #include "tensorrt_llm/executor/tensor.h"
 #include "tensorrt_llm/kernels/userbuffers/ub_interface.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tllmLogger.h"
 
+#include "nlohmann/json.hpp"
 #include <NvInferRuntime.h>
+
 #include <algorithm>
 #include <cstddef>
-#include <iterator>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -203,10 +203,13 @@ void assessLikelihoodOfRuntimeAllocation(
         }
         numWarnings++;
     }
-    TLLM_LOG_WARNING(
-        "There were a total of %i layers with type 'allocate'. Some warnings might have been silenced to keep the "
-        "output concise.",
-        numWarnings);
+    if (numWarnings > 0)
+    {
+        TLLM_LOG_WARNING(
+            "There were a total of %i layers with type 'allocate'. Some warnings might have been silenced to keep the "
+            "output concise.",
+            numWarnings);
+    }
 }
 } // namespace
 
@@ -319,7 +322,7 @@ void TllmRuntime::printEngineInfo()
     std::vector<std::vector<std::vector<nvinfer1::Dims64>>> profileInfo(nIO); // Tensor Optimization Profile Vector
     for (int i = 0; i < nIO; ++i)
     {
-        std::string name{tensorNameList[i]};
+        auto const& name = tensorNameList[i];
         char const* nameC{name.c_str()}; // name of C-style
         maxNameWidth = std::max(maxNameWidth, name.size());
         tensorInfo[i]["mode"] = mEngine->getTensorIOMode(nameC) == nvinfer1::TensorIOMode::kINPUT ? "I" : "O";
@@ -375,7 +378,7 @@ void TllmRuntime::printEngineInfo()
         {
             for (int i = 0; i < nIO; ++i)
             {
-                std::string name = tensorNameList[i];
+                auto const& name = tensorNameList[i];
                 char const* nameC = name.c_str();
                 if (tensorInfo[i]["mode"] == "I")
                 {
@@ -462,9 +465,9 @@ void TllmRuntime::printContextInfo(SizeType32 contextIndex)
     std::vector<std::tuple<std::string, bool, std::string>> tensorInfo(nIO);
     for (int i = 0; i < nIO; ++i)
     {
-        std::string name = std::string(mEngine->getIOTensorName(i));
-        bool isInput = mEngine->getTensorIOMode(name.c_str()) == nvinfer1::TensorIOMode::kINPUT;
-        std::string shape = shapeToString(context.getTensorShape(name.c_str()));
+        auto const name = std::string(mEngine->getIOTensorName(i));
+        bool const isInput = mEngine->getTensorIOMode(name.c_str()) == nvinfer1::TensorIOMode::kINPUT;
+        auto const shape = shapeToString(context.getTensorShape(name.c_str()));
         tensorInfo[i] = std::make_tuple(name, isInput, shape);
         maxNameWidth = std::max(maxNameWidth, name.size());
         maxShapeWidth = std::max(maxShapeWidth, shape.size());
@@ -679,7 +682,7 @@ void TllmRuntime::setUserBufferTensors(SizeType32 contextIndex, TensorMap& tenso
 {
     auto startsWith = [](std::string const& str, std::string const& prefix) -> bool
     { return str.size() > prefix.size() && str.compare(0, prefix.size(), prefix) == 0; };
-    std::string prefix(tensorrt_llm::runtime::ub::tensor_prefix);
+    std::string const prefix(tensorrt_llm::runtime::ub::tensor_prefix);
     auto& context = getContext(contextIndex);
     for (auto const& name : mOutputTensorNames)
     {
@@ -719,7 +722,7 @@ void TllmRuntime::initializeUserBuffer(tensorrt_llm::runtime::WorldConfig const&
 {
     auto startsWith = [](std::string const& str, std::string const& prefix) -> bool
     { return str.size() > prefix.size() && str.compare(0, prefix.size(), prefix) == 0; };
-    std::string prefix(tensorrt_llm::runtime::ub::tensor_prefix);
+    std::string const prefix(tensorrt_llm::runtime::ub::tensor_prefix);
     bool useNVFP4Model = false;
     for (auto const& name : mOutputTensorNames)
     {
@@ -738,11 +741,11 @@ void TllmRuntime::initializeUserBuffer(tensorrt_llm::runtime::WorldConfig const&
         return;
     }
     // The hidden size returned by ModelConfig is the real hidden size divided by the TP size.
-    auto tpSize = world_config.getTensorParallelism();
-    size_t realHiddenSize = hiddenSize * tpSize;
-    size_t tokensNum = maxNumTokens.value_or(maxBatchSize * maxBeamWidth * maxSequenceLength);
+    auto const tpSize = world_config.getTensorParallelism();
+    size_t const realHiddenSize = hiddenSize * tpSize;
+    size_t const tokensNum = maxNumTokens.value_or(maxBatchSize * maxBeamWidth * maxSequenceLength);
     TLLM_CHECK(tokensNum > 0);
-    size_t elemNum = tokensNum * realHiddenSize;
+    size_t const elemNum = tokensNum * realHiddenSize;
     TLLM_LOG_INFO("[UserBuffer] MaxBatchSize %d, maxBeamWidth %d, maxSequenceLength %d, maxNumTokens %d, select %lu",
         maxBatchSize, maxBeamWidth, maxSequenceLength, maxNumTokens.has_value() ? maxNumTokens.value() : 0, tokensNum);
     tensorrt_llm::runtime::ub::ub_initialize(world_config);

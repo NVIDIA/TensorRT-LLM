@@ -184,6 +184,7 @@ class CompletionRequest(OpenAIBaseModel):
             include_stop_str_in_output=self.include_stop_str_in_output,
             add_special_tokens=self.add_special_tokens,
             min_p=self.min_p,
+            ignore_eos=self.ignore_eos,
         )
         if self.top_p_min > 0:
             sampling_params.top_p_min = self.top_p_min
@@ -488,6 +489,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             return_log_probs=self.logprobs,
             add_special_tokens=self.add_special_tokens,
             min_p=self.min_p,
+            ignore_eos=self.ignore_eos,
         )
         if self.top_p_min > 0:
             sampling_params.top_p_min = self.top_p_min

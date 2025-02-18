@@ -26,7 +26,6 @@
 #include "tensorrt_llm/batch_manager/BatchManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheConfig.h"
 #include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
-#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/pybind/batch_manager/algorithms.h"
 #include "tensorrt_llm/pybind/batch_manager/bindings.h"
@@ -42,6 +41,7 @@
 #include "tensorrt_llm/runtime/ipcUtils.h"
 #include "tensorrt_llm/runtime/memoryCounters.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 namespace py = pybind11;
 namespace tb = tensorrt_llm::batch_manager;
@@ -459,7 +459,9 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def(py::init<>())
         .def_readwrite("uc_ptr", &tr::IpcNvlsHandle::uc_ptr)
         .def_readwrite("mc_ptr", &tr::IpcNvlsHandle::mc_ptr)
-        .def_readwrite("size", &tr::IpcNvlsHandle::size);
+        .def_readwrite("size", &tr::IpcNvlsHandle::size)
+        .def("get_ipc_ptrs",
+            [](tr::IpcNvlsHandle& self) { return reinterpret_cast<uintptr_t>(self.ipc_uc_ptrs.data()); });
 
     m.def("ipc_nvls_allocate", &tr::ipcNvlsAllocate);
     m.def("ipc_nvls_free", &tr::ipcNvlsFree);

@@ -16,7 +16,7 @@
  */
 #pragma once
 
-#include "tensorrt_llm/kernels/cutlass_kernels/allreduce_gemm/allreduce_gemm_runner.h"
+#include "tensorrt_llm/kernels/internal_cutlass_kernels/include/allreduce_gemm_runner.h"
 #include "tensorrt_llm/plugins/common/gemmPluginProfiler.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 

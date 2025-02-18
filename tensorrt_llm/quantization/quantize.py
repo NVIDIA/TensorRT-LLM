@@ -58,6 +58,8 @@ def quantize_layers(
 
             init_params = get_init_params(module, MixtureOfExperts)
             init_params["quant_mode"] = quant_mode
+            if preprocess_init_params is not None:
+                preprocess_init_params(init_params, name, module)
 
             original_layer = MixtureOfExperts(**init_params)
             if parent is not None:
@@ -138,6 +140,7 @@ def weight_only_groupwise_quantize(model,
     quant_map = {
         ColumnLinear: WeightOnlyGroupwiseQuantColumnLinear,
         RowLinear: WeightOnlyGroupwiseQuantRowLinear,
+        MixtureOfExperts: MixtureOfExperts,
     }
 
     def preprocess_init_params(init_params, name, module):
@@ -148,7 +151,8 @@ def weight_only_groupwise_quantize(model,
             "use_w4a8_awq"] = quant_config.quant_algo == QuantAlgo.W4A8_AWQ
         init_params[
             "use_int8_weight"] = quant_config.quant_algo == QuantAlgo.W8A16_GPTQ
-        init_params["tp_rank"] = model_cfg.mapping.tp_rank
+        if not isinstance(module, MixtureOfExperts):
+            init_params["tp_rank"] = model_cfg.mapping.tp_rank
 
     model = quantize_layers(
         model,

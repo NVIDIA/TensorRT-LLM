@@ -315,11 +315,12 @@ class ExecutorBindingsWorker(GenerationExecutor):
         )
         if request.id is None:
             request.set_id(client_id)
-        self._enqueue_request(request)
 
         result = GenerationResult(
             request, background_error_handler=self._handle_background_error)
         self._results[client_id] = result
+
+        self._enqueue_request(request)
 
         self._handle_background_error()
 

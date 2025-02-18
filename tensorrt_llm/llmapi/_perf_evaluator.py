@@ -451,10 +451,12 @@ class LLMPerfEvaluator:
         @log_sparse(stack_depth=3)
         def run_main():
             global_tracer().log_instant("profile.start")
+            torch.cuda.profiler.start()
             self.start = time.perf_counter()
             with tqdm.tqdm(total=len(self.samples)) as pbar:
                 asyncio.run(run_lanes(pbar))
             self.end = time.perf_counter()
+            torch.cuda.profiler.stop()
             global_tracer().log_instant("profile.end")
 
         run_main()

@@ -29,6 +29,7 @@ enum class CacheType
 {
     kSELF = 0,
     kCROSS = 1,
+    kSELFKONLY = 2,
 };
 
 //! @brief Encapsulates parameters to configure paged KV cache.

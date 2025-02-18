@@ -25,6 +25,8 @@ init_ubuntu() {
     ccache \
     gdb \
     git-lfs \
+    clang \
+    lld \
     libffi-dev \
     python3-dev \
     python3-pip \
@@ -55,15 +57,17 @@ install_python_rockylinux() {
   dnf makecache --refresh
   dnf install \
     epel-release \
-	  curl \
-	  make \
-	  gcc \
-	  openssl-devel \
-	  bzip2-devel \
-	  libffi-devel \
-	  zlib-devel \
-	  xz-devel \
-	  -y
+    curl \
+    make \
+    gcc \
+    openssl-devel \
+    bzip2-devel \
+    llvm-toolset \
+    lld \
+    libffi-devel \
+    zlib-devel \
+    xz-devel \
+    -y
   curl -L ${PYTHON_URL} | tar -zx -C /tmp
   cd /tmp/Python-${PYTHON_VERSION}
   bash -c "./configure --enable-shared --prefix=/opt/python/${PYTHON_VERSION} --enable-ipv6 \

@@ -99,7 +99,7 @@ int32_t DoraPlugin::getOutputDataTypes(
     try
     {
         TLLM_CHECK(nbOutputs == 1);
-        TLLM_CHECK(nbInputs == 2 + mOutHiddenSizes.size() + (mRemoveInputPadding ? 1 : 0));
+        TLLM_CHECK(nbInputs == 2 + static_cast<int32_t>(mOutHiddenSizes.size()) + (mRemoveInputPadding ? 1 : 0));
         TLLM_CHECK(inputTypes[IdxEntry::kINPUT_TENSOR] == mType);
         // output has the same dtype as the input, the plugin just applies scaling
         outputTypes[0] = inputTypes[IdxEntry::kINPUT_TENSOR];
@@ -118,10 +118,10 @@ int32_t DoraPlugin::getOutputShapes(DimsExprs const* inputs, int32_t nbInputs, D
     {
         TLLM_CHECK(nbOutputs == 1);
         TLLM_CHECK(nbShapeInputs == 0);
-        TLLM_CHECK(nbInputs == 2 + mOutHiddenSizes.size() + (mRemoveInputPadding ? 1 : 0));
+        TLLM_CHECK(nbInputs == 2 + static_cast<int32_t>(mOutHiddenSizes.size()) + (mRemoveInputPadding ? 1 : 0));
 
         auto const inputTensorDims = inputs[IdxEntry::kINPUT_TENSOR];
-        TLLM_CHECK(inputTensorDims.nbDims == mRemoveInputPadding ? 2 : 3);
+        TLLM_CHECK(inputTensorDims.nbDims == (mRemoveInputPadding ? 2 : 3));
 
         auto const lastDim = inputTensorDims.d[inputTensorDims.nbDims - 1];
         TLLM_CHECK(lastDim->isConstant());
@@ -143,7 +143,7 @@ int32_t DoraPlugin::getOutputShapes(DimsExprs const* inputs, int32_t nbInputs, D
 bool DoraPlugin::supportsFormatCombination(
     int32_t pos, nvinfer1::DynamicPluginTensorDesc const* inOut, int nbInputs, int nbOutputs) noexcept
 {
-    auto const numModules = mOutHiddenSizes.size();
+    auto const numModules = static_cast<int32_t>(mOutHiddenSizes.size());
     if (nbInputs != 2 + numModules + (mRemoveInputPadding ? 1 : 0))
     {
         return false;
@@ -232,7 +232,7 @@ int32_t DoraPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer
         return 0;
     }
 
-    auto const numModules = mOutHiddenSizes.size();
+    auto const numModules = static_cast<int32_t>(mOutHiddenSizes.size());
     auto const numReqs = inputDesc[IdxEntry::kHOST_REQUEST_TYPES].dims.d[0];
 
     auto const inputTensorDesc = inputDesc[IdxEntry::kINPUT_TENSOR];
@@ -346,8 +346,8 @@ nvinfer1::IPluginV3* DoraPluginCreator::createPlugin(
     char const* name, nvinfer1::PluginFieldCollection const* fc, nvinfer1::TensorRTPhase phase) noexcept
 {
     PluginField const* fields = fc->fields;
-    nvinfer1::DataType type;
-    bool removeInputPadding;
+    nvinfer1::DataType type{};
+    bool removeInputPadding{};
     std::vector<int32_t> outHiddenSizes;
 
     // Read configurations from each field

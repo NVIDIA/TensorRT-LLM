@@ -5,18 +5,14 @@ from importlib.util import find_spec
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Union
 
-import yaml
 from pydantic import (BaseModel, Field, PositiveFloat, field_validator,
                       model_validator)
 
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.bench.dataclasses.enums import IFBSchedulingPolicy
-from tensorrt_llm.builder import BuildConfig
-from tensorrt_llm.llmapi.llm_utils import BuildCacheConfig, CalibConfig
-from tensorrt_llm.logger import logger
-from tensorrt_llm.models.modeling_utils import (QuantConfig,
-                                                SpeculativeDecodingMode)
+from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_options
+from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 
 SPECULATIVE_MAP = {
     SpeculativeDecodingMode.NONE: lambda *args: None,
@@ -35,37 +31,6 @@ class RuntimeConfig(BaseModel):
     performance_options: PerformanceOptions
     backend: Literal["pytorch", None] = None
     extra_llm_api_options: Optional[str] = None
-
-    def _update_with_extra_options(self, llm_args: Dict) -> Dict:
-        if self.extra_llm_api_options is not None:
-            with open(self.extra_llm_api_options, 'r') as f:
-                llm_args_dict = yaml.safe_load(f)
-
-            field_mapping = {
-                "quant_config": QuantConfig,
-                "calib_config": CalibConfig,
-                "build_config": BuildConfig,
-                "kv_cache_config": trtllm.KvCacheConfig,
-                "decoding_config": trtllm.DecodingConfig,
-                "enable_build_cache": BuildCacheConfig,
-                "peft_cache_config": trtllm.PeftCacheConfig,
-                "scheduler_config": trtllm.SchedulerConfig,
-                "speculative_config": trtllm.LookaheadDecodingConfig,
-                "batching_type": trtllm.BatchingType,
-                "extended_runtime_perf_knob_config":
-                trtllm.ExtendedRuntimePerfKnobConfig,
-                "pytorch_backend_config": PyTorchConfig,
-            }
-            for field, field_type in field_mapping.items():
-                if field in llm_args_dict:
-                    llm_args_dict[field] = field_type(**llm_args_dict[field])
-                    logger.warning(
-                        f"Overriding {field} because it's specified in {self.extra_llm_api_options}."
-                    )
-
-            llm_args = llm_args | llm_args_dict
-
-        return llm_args
 
     def get_llm_args(self) -> Dict:
         model = self.engine_dir or self.model_path or self.model
@@ -107,7 +72,8 @@ class RuntimeConfig(BaseModel):
             llm_args["pytorch_backend_config"] = \
                 self.performance_options.get_pytorch_perf_config()
 
-        return self._update_with_extra_options(llm_args)
+        return update_llm_args_with_extra_options(llm_args,
+                                                  self.extra_llm_api_options)
 
     @model_validator(mode="after")
     def validate_full_config(self) -> RuntimeConfig:

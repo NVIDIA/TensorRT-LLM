@@ -402,6 +402,9 @@ class KVCacheManager(BaseResourceManager):
                               self.num_kv_heads_per_layer[layer_idx],
                               self.head_dim)
 
+    def get_kv_cache_stats(self):
+        return self.impl.get_kv_cache_stats()
+
 
 class MLAKVCacheManager(KVCacheManager):
 

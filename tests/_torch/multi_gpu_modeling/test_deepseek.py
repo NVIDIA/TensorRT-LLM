@@ -27,11 +27,11 @@ def similar(a, b, threshold=0.9):
 
 @pytest.mark.parametrize("model_name", ["DeepSeek-V3-Lite"],
                          ids=["deepseekv3_lite"])
-@pytest.mark.parametrize("quant", ["bf16", "fp4"])
+@pytest.mark.parametrize("quant", ["bf16", "fp4", "fp8"])
 @pytest.mark.parametrize("tp_size", [1, 2], ids=["tp1", "tp2"])
 @pytest.mark.parametrize("enable_dp", [True, False],
                          ids=["enable_dp", "disable_dp"])
-def test_model(model_name, quant, tp_size, enable_dp):
+def test_deepseek(model_name, quant, tp_size, enable_dp):
     model_path = {
         "bf16": "bf16",
         "fp8": "fp8",
@@ -46,7 +46,7 @@ def test_model(model_name, quant, tp_size, enable_dp):
         pytest.skip(f"Not enough GPUs available, need {tp_size} "
                     f"but only have {torch.cuda.device_count()}")
 
-    if is_fp8 and getSMVersion() < 90:
+    if is_fp8 and getSMVersion() != 90:
         pytest.skip(f"FP8 is not supported in this SM version {getSMVersion()}")
 
     if is_fp4 and getSMVersion() < 100:
@@ -97,8 +97,3 @@ def test_model(model_name, quant, tp_size, enable_dp):
         assert similar(
             output_text,
             expected), f"Expected '{expected}' but get '{output_text}'"
-
-
-if __name__ == '__main__':
-    test_model("DeepSeek-V3-Lite", "bf16", 1, enable_dp=False)
-    test_model("DeepSeek-V3-Lite", "fp4", 1, enable_dp=True)

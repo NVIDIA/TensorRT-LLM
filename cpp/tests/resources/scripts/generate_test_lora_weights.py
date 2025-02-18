@@ -239,7 +239,6 @@ def main():
                                         is_dora=is_dora)
 
                     out_path = output_dir / f'cache_pages_rank{rank}{suffix}.npy'
-                    print(f"{page_block.shape=}")
                     np.save(out_path, page_block)
 
             config_file_name = Path(args.config_file_name).stem

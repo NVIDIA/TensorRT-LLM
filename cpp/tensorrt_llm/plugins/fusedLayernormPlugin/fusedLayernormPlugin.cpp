@@ -16,6 +16,7 @@
  */
 #include "fusedLayernormPlugin.h"
 #include "pluginUtils.h"
+#include "tensorrt_llm/common/assert.h"
 
 using namespace nvinfer1;
 using namespace tensorrt_llm::kernels;
@@ -291,7 +292,7 @@ void FusedLayernormPlugin::serialize(void* buffer) const noexcept
     write(d, mNeedFP32Output);
     write(d, mNeedQuantize);
     write(d, mType);
-    assert(d == a + getSerializationSize());
+    TLLM_CHECK(d == a + getSerializationSize());
 }
 
 void FusedLayernormPlugin::destroy() noexcept
@@ -306,10 +307,10 @@ FusedLayernormPluginCreator::FusedLayernormPluginCreator()
 {
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
-    mPluginAttributes.emplace_back(PluginField("eps", nullptr, PluginFieldType::kFLOAT32, 1e-5f));
-    mPluginAttributes.emplace_back(PluginField("need_fp32_output", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("need_quantize", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("eps", nullptr, PluginFieldType::kFLOAT32));
+    mPluginAttributes.emplace_back(PluginField("need_fp32_output", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("need_quantize", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }
@@ -332,10 +333,10 @@ PluginFieldCollection const* FusedLayernormPluginCreator::getFieldNames() noexce
 IPluginV2* FusedLayernormPluginCreator::createPlugin(char const* name, PluginFieldCollection const* fc) noexcept
 {
     PluginField const* fields = fc->fields;
-    float eps;
-    nvinfer1::DataType type;
-    bool needFP32Output;
-    bool needQuantize;
+    float eps{};
+    nvinfer1::DataType type{};
+    bool needFP32Output{};
+    bool needQuantize{};
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
     {

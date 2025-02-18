@@ -174,6 +174,8 @@ struct TllmGenFmhaRunnerParams
     int32_t const* firstSparseMaskOffsetsKvPtr;
     // The counter for the multiCtasKv mode.
     int32_t* multiCtasKvCounterPtr;
+    // The sequence length buffer for K/V.
+    int const* seqLensKvPtr;
     // The cumulative sequence length buffer for Q and K/V
     int const* cumSeqLensQPtr;
     int const* cumSeqLensKvPtr;

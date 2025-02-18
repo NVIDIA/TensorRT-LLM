@@ -15,19 +15,18 @@
  */
 
 #pragma once
-#include "tensorrt_llm/runtime/iBuffer.h"
+
 #include "tensorrt_llm/runtime/iTensor.h"
-#include "torch/csrc/cuda/Stream.h"
-#include "torch/extension.h"
+
 #include <ATen/cuda/CUDAContext.h>
-#include <cstdio>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include <iostream>
-#include <nvToolsExt.h>
+#include <nvtx3/nvToolsExt.h>
 #include <torch/custom_class.h>
+#include <torch/extension.h>
 #include <torch/script.h>
-#include <vector>
+
+#include <cstdio>
 
 #define CHECK_TYPE(x, st) TORCH_CHECK(x.scalar_type() == st, "Inconsistency of Tensor type: " #x)
 #define CHECK_TH_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")

@@ -31,8 +31,15 @@ namespace tensorrt_llm::kernels::cutlass_kernels
 {
 enum GemmAllReduceImpl
 {
-    NVLS_1SHOT,
-    NVLS_2SHOT
+    kNVLS_2SHOT
+};
+
+// Specifies whether to use SM or switch for allreduce.
+// SM is more efficient for GPUs=2 and switch for GPUs>2.
+enum ReduceLocationType
+{
+    kSM,
+    kSWITCH
 };
 
 // Decouples IPluginResource from the GemmAllReduce runner interface.
@@ -54,19 +61,49 @@ public:
     {
         GemmAllReduceImpl impl;
         MainloopScheduleType schedule;
+        ReduceLocationType reduce_location;
         TileShape tile_shape;
         ClusterShape cluster_shape;
+        int MMA_SMs;
+        bool transposed;
 
-        std::string str() const
+        [[nodiscard]] std::string str() const
         {
+            auto get_impl_name = [&]()
+            {
+                switch (impl)
+                {
+                case GemmAllReduceImpl::kNVLS_2SHOT: return "2shot";
+                }
+                return "";
+            };
+
+            auto get_reduction_name = [&]()
+            {
+                switch (reduce_location)
+                {
+                case ReduceLocationType::kSM: return "SM";
+                case ReduceLocationType::kSWITCH: return "Switch";
+                }
+                return "";
+            };
+
             std::stringstream ss;
             ss << "LaunchConfig(";
-            ss << (impl == GemmAllReduceImpl::NVLS_1SHOT ? "1shot" : "2shot");
+            ss << get_impl_name();
             ss << ", Schedule_" << get_mainloop_schedule_name(schedule);
+            ss << ", Reduction_" << get_reduction_name();
             ss << ", TileShape_" << get_tile_shape_name(tile_shape);
             ss << ", ClusterShape_" << get_cluster_shape_name(cluster_shape);
+            ss << ", MmaSms_" << MMA_SMs;
             ss << ")";
             return ss.str();
+        }
+
+        bool operator<(LaunchConfig const& other) const
+        {
+            return std::tie(impl, schedule, reduce_location, tile_shape, cluster_shape, MMA_SMs) < std::tie(other.impl,
+                       other.schedule, other.reduce_location, other.tile_shape, other.cluster_shape, other.MMA_SMs);
         }
     };
 
@@ -77,55 +114,69 @@ public:
     {
         // current iteration
         std::tuple<int, int, int, int> problem_size;
-        void* A = nullptr;
-        void* B = nullptr;
-        void* C = nullptr;
+        void const* A = nullptr;
+        void const* B = nullptr;
+        void const* C = nullptr;
         void* D = nullptr;
-        void* D_mc = nullptr; // NVLS
+        void* D_mc = nullptr;   // required for NVLink Sharp
+        void** D_ipc = nullptr; // required if NOT using NVLink Sharp
+        void const* A_scale = nullptr;
+        void const* B_scale = nullptr;
         float alpha = 1.f;
         float beta = 0.f;
+        float const* alpha_ptr = nullptr;
         PersistentWorkspaceInterface* workspace = nullptr;
         int rank;
         std::set<int> ranks;
         LaunchConfig launch_config;
-        // next iteration
-        void* D_next = nullptr;
-
-        ProblemArgs()
-            : launch_config({GemmAllReduceImpl::NVLS_2SHOT, MainloopScheduleType::PINGPONG,
-                TileShape::TileShape_128x128x128, ClusterShape::ClusterShape_1x1x1})
-        {
-        }
 
         ProblemArgs& argA(void const* A)
         {
-            this->A = const_cast<void*>(A);
+            this->A = A;
             return *this;
         }
 
         ProblemArgs& argB(void const* B)
         {
-            this->B = const_cast<void*>(B);
+            this->B = B;
             return *this;
         }
 
         ProblemArgs& argC(void const* C)
         {
-            this->C = const_cast<void*>(C);
+            this->C = C;
             return *this;
         }
 
-        ProblemArgs& argD(void* D, void* D_mc = nullptr, void* D_next = nullptr)
+        ProblemArgs& argD(void* D, void* D_mc = nullptr, void** D_ipc = nullptr)
         {
             this->D = D;
             this->D_mc = D_mc;
-            this->D_next = D_next;
+            this->D_ipc = D_ipc;
+            return *this;
+        }
+
+        ProblemArgs& argAScale(void const* A_scale)
+        {
+            this->A_scale = A_scale;
+            return *this;
+        }
+
+        ProblemArgs& argBScale(void const* B_scale)
+        {
+            this->B_scale = B_scale;
             return *this;
         }
 
         ProblemArgs& argAlpha(float alpha)
         {
             this->alpha = alpha;
+            return *this;
+        }
+
+        ProblemArgs& argAlphaPtr(float const* alpha_ptr)
+        {
+            this->alpha_ptr = alpha_ptr;
             return *this;
         }
 
@@ -173,14 +224,16 @@ public:
     };
 };
 
-template <typename ElementA_, typename ElementB_, typename ElementC_, typename ElementD_, typename LayoutA_,
-    typename LayoutB_, typename LayoutC_, typename LayoutD_>
+template <typename ElementA_, typename ElementB_, typename ElementC_, typename ElementD_, typename ElementSFA_,
+    typename ElementSFB_, typename LayoutA_, typename LayoutB_, typename LayoutC_, typename LayoutD_>
 struct GemmTypes
 {
     using ElementA = ElementA_;
     using ElementB = ElementB_;
     using ElementC = ElementC_;
     using ElementD = ElementD_;
+    using ElementSFA = ElementSFA_;
+    using ElementSFB = ElementSFB_;
     using LayoutA = LayoutA_;
     using LayoutB = LayoutB_;
     using LayoutC = LayoutC_;
@@ -207,7 +260,7 @@ public:
 private:
     ProblemArgs swapAB(ProblemArgs const& problem) const;
 
-    using KeyType = std::tuple<GemmAllReduceImpl, MainloopScheduleType, TileShape, ClusterShape>;
+    using KeyType = GemmAllReduceImplInterface::LaunchConfig;
     using ValueType = std::shared_ptr<GemmAllReduceImplInterface>;
 
     std::map<KeyType, ValueType> mGemmRegistry;

@@ -28,8 +28,8 @@ from .postproc_worker import PostprocWorker, PostprocWorkerConfig
 from .request import GenerationRequest
 from .result import GenerationResult
 from .utils import (BATCH_RESP_IN_AWAIT, IntraProcessQueue,
-                    ProcessPoolExecutorSession, RequestError, WorkerIPCAddrs,
-                    WorkerQueues)
+                    ProcessPoolExecutorSession, RequestError,
+                    WorkerCommIpcAddrs, WorkerCommQueues)
 from .worker import ExecutorBindingsWorker
 
 __all__ = [
@@ -83,9 +83,6 @@ class ExecutorBindingsProxy(GenerationExecutor):
 
         intra_node = isinstance(self.mpi_session,
                                 (MpiPoolSession, ProcessPoolExecutorSession))
-        if (not intra_node) and postproc_worker_config.enabled:
-            raise NotImplementedError(
-                "Postprocess parallel is not supported in inter-node mode")
 
         self.workers_kwargs = dict(
             **workers_kwargs,
@@ -101,7 +98,8 @@ class ExecutorBindingsProxy(GenerationExecutor):
 
         self._start_executor_workers()
 
-    def _setup_queues(self, intra_node: bool) -> WorkerIPCAddrs | WorkerQueues:
+    def _setup_queues(
+            self, intra_node: bool) -> WorkerCommIpcAddrs | WorkerCommQueues:
         # For intra-node communication, we use IPC queues. While for inter-node
         # communication, we use Queue instead as the MPI process is the Python
         # main process in rank 0.
@@ -127,7 +125,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
             self.mp_stats_queue = FusedIpcQueue(is_server=True,
                                                 fuse_message=False,
                                                 name="proxy_stats_queue")
-            return WorkerIPCAddrs(
+            return WorkerCommIpcAddrs(
                 request_queue_addr=self.request_queue.address,
                 request_error_queue_addr=self.request_error_queue.address,
                 result_queue_addr=self.result_queue.address,
@@ -136,15 +134,33 @@ class ExecutorBindingsProxy(GenerationExecutor):
         else:
             self.request_queue = IntraProcessQueue()
             self.request_error_queue = IntraProcessQueue()
-            self.result_queue = IntraProcessQueue()
             self.mp_stats_queue = IntraProcessQueue()
 
-            return WorkerQueues(
-                request_queue=self.request_queue,
-                request_error_queue=self.request_error_queue,
-                result_queue=self.result_queue,
-                stats_queue=self.mp_stats_queue,
-            )
+            if self.enable_postprocess_parallel:
+                self.result_queue = FusedIpcQueue(
+                    is_server=True,
+                    fuse_message=False,
+                    socket_type=zmq.PULL
+                    if self.enable_postprocess_parallel else zmq.PAIR,
+                    name="proxy_result_queue")
+
+                res = WorkerCommQueues(
+                    request_queue=self.request_queue,
+                    request_error_queue=self.request_error_queue,
+                    result_queue=self.result_queue.address,
+                    stats_queue=self.mp_stats_queue,
+                )
+
+            else:
+                self.result_queue = IntraProcessQueue()
+                res = WorkerCommQueues(
+                    request_queue=self.request_queue,
+                    request_error_queue=self.request_error_queue,
+                    result_queue=self.result_queue,
+                    stats_queue=self.mp_stats_queue,
+                )
+
+            return res
 
     @print_traceback_on_error
     @staticmethod
@@ -162,7 +178,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
     @staticmethod
     def workers_main(
             engine: Path | Engine,
-            worker_queues: WorkerIPCAddrs | WorkerQueues,
+            worker_queues: WorkerCommIpcAddrs | WorkerCommQueues,
             log_level: str,
             executor_config: Optional[tllm.ExecutorConfig] = None,
             logits_post_processor_map: Optional[Dict[str, Callable]] = None,
@@ -204,7 +220,8 @@ class ExecutorBindingsProxy(GenerationExecutor):
         if is_leader:
             # Only set the log level for the leader process, the other processes will inherit the log level from "TLLM_LOG_LEVEL" environment variable
             logger.set_level(log_level)
-            if isinstance(worker_queues, WorkerIPCAddrs):
+            if isinstance(worker_queues,
+                          WorkerCommIpcAddrs):  # intra-process mode
                 request_queue = IpcQueue(worker_queues.request_queue_addr,
                                          is_server=False,
                                          name="worker_request_queue")
@@ -212,26 +229,6 @@ class ExecutorBindingsProxy(GenerationExecutor):
                     worker_queues.request_error_queue_addr,
                     is_server=False,
                     name="worker_request_error_queue")
-
-                if postproc_worker_config.enabled:
-                    # IPC queues for sending inputs to the postprocess parallel
-                    # processes, each one is a PAIR zmq socket
-                    result_queues = [
-                        FusedIpcQueue(is_server=True,
-                                      fuse_message=True,
-                                      name=f"postprocess_{i}_feedin_queue")
-                        for i in range(
-                            postproc_worker_config.num_postprocess_workers)
-                    ]
-                else:
-                    # IPC queue for sending results back to the proxy, and let the
-                    # Proxy process to handle the postprocess
-                    result_queue = FusedIpcQueue(
-                        worker_queues.result_queue_addr,
-                        is_server=False,
-                        fuse_message=not BATCH_RESP_IN_AWAIT,
-                        name="worker_result_queue")
-
                 mp_stats_queue = FusedIpcQueue(worker_queues.stats_queue_addr,
                                                is_server=False,
                                                fuse_message=False,
@@ -239,12 +236,28 @@ class ExecutorBindingsProxy(GenerationExecutor):
             else:
                 request_queue = worker_queues.request_queue
                 request_error_queue = worker_queues.request_error_queue
-                if postproc_worker_config.enabled:
-                    raise NotImplementedError("Postprocess parallel is not "
-                                              "supported in intra-node mode")
+                mp_stats_queue = worker_queues.stats_queue
+
+            if postproc_worker_config.enabled:
+                # IPC queues for sending inputs to the postprocess parallel
+                # processes, each one is a PAIR zmq socket
+                result_queues = [
+                    FusedIpcQueue(is_server=True,
+                                  fuse_message=True,
+                                  name=f"postprocess_{i}_feedin_queue") for i in
+                    range(postproc_worker_config.num_postprocess_workers)
+                ]
+            else:
+                if isinstance(worker_queues, WorkerCommIpcAddrs):
+                    # IPC queue for sending results back to the proxy, and let the
+                    # Proxy process to handle the postprocess
+                    result_queue = FusedIpcQueue(
+                        worker_queues.result_queue_addr,
+                        is_server=False,
+                        fuse_message=not BATCH_RESP_IN_AWAIT,
+                        name="worker_result_queue")
                 else:
                     result_queue = worker_queues.result_queue
-                mp_stats_queue = worker_queues.stats_queue
 
         def notify_proxy_threads_to_quit():
             # Signal the dispatcher thread in the proxy to quit
@@ -257,6 +270,10 @@ class ExecutorBindingsProxy(GenerationExecutor):
             # Signal the stats thread in the proxy to quit
             mp_stats_queue.put(None)
 
+        proxy_result_queue: str = worker_queues.result_queue if isinstance(
+            worker_queues,
+            WorkerCommQueues) else worker_queues.result_queue_addr
+
         postprocess_worker_futures = []
         if is_leader and postproc_worker_config.enabled:
             print_colored_debug(f"initiate postprocess workers...", "yellow")
@@ -264,11 +281,12 @@ class ExecutorBindingsProxy(GenerationExecutor):
             assert postproc_worker_config.postprocess_tokenizer_dir is not None
             postprocess_worker_pool = ProcessPoolExecutor(
                 max_workers=postproc_worker_config.num_postprocess_workers)
+            assert isinstance(proxy_result_queue, str)
             for i in range(postproc_worker_config.num_postprocess_workers):
                 fut = postprocess_worker_pool.submit(
                     ExecutorBindingsProxy.postprocess_workers_main,
                     result_queues[i].address,
-                    worker_queues.result_queue_addr,
+                    proxy_result_queue,
                     postproc_worker_config.postprocess_tokenizer_dir,
                     PostprocWorker.default_record_creator,
                     result_handler=postproc_worker_config.
@@ -440,7 +458,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
 
         rank0_extra_kwargs = {}
         if worker_queues := self.workers_kwargs["worker_queues"]:
-            if isinstance(worker_queues, WorkerQueues):
+            if isinstance(worker_queues, WorkerCommQueues):
                 rank0_extra_kwargs = {"worker_queues": worker_queues}
                 self.workers_kwargs["worker_queues"] = None
         self.mpi_futures = self.mpi_session.submit(

@@ -2429,7 +2429,7 @@ def masked_scatter(input: Tensor, mask: Tensor, source: Tensor) -> Tensor:
     '''
     Add the masked_scatter base on PyTorch definition.
 
-    See https://pytorch.org/docs/stable/generated/torch.Tensor.masked_scatter_.html#torch.Tensor.masked_scatter_ for a
+    See https://pytorch.org/docs/stable/generated/torch.Tensor.masked_scatter_.html#torch-tensor-masked-scatter for a
     description of that function.
 
     Parameters:
@@ -3354,7 +3354,7 @@ def softplus(input: Tensor, beta: float, threshold: float) -> Tensor:
     '''
     Add the softplus activation base on PyTorch definition.
 
-    See https://pytorch.org/docs/stable/generated/torch.nn.functional.softplus.html for a
+    See https://pytorch.org/docs/stable/generated/torch.nn.functional.softplus.html#torch-nn-functional-softplus for a
     description of that function.
 
     Parameters:
@@ -4148,9 +4148,11 @@ def gemm_allreduce(a: Tensor,
                    group: List[int],
                    transa: bool = False,
                    transb: bool = False,
-                   alpha: Optional[np.ndarray] = None,
+                   alpha: Optional[Union[np.ndarray, Tensor]] = None,
                    output_dtype: Optional[trt.DataType] = None,
-                   fp8_inputs_override: bool = False):
+                   fp8_inputs_override: bool = False,
+                   a_sf: Optional[Tensor] = None,
+                   b_sf: Optional[Tensor] = None):
     '''
     Add an operation that performs fused GEMM+AllReduce.
 
@@ -4159,6 +4161,10 @@ def gemm_allreduce(a: Tensor,
             Input tensor A
         b: Tensor
             Input tensor B
+        a_sf: Optional[Tensor]
+            Input tensor for scaling input A
+        b_sf: Optional[Tensor]
+            Input tensor for scaling input B
         group: List[int]
             Ranks participating in collective
         transa: bool
@@ -4200,9 +4206,13 @@ def gemm_allreduce(a: Tensor,
     if output_dtype == None:
         output_dtype = str_dtype_to_trt(
             default_net().plugin_config.gemm_allreduce_plugin)
-    assert output_dtype in [trt.float16, trt.bfloat16
-                            ]  # TODO(xsimmons): expand support for other types
-    alpha = alpha if alpha else np.array(1.0, dtype=np.float32)
+    assert output_dtype in [trt.float16, trt.bfloat16]
+
+    alpha_is_tensor = isinstance(alpha, Tensor)
+    if alpha is None or alpha_is_tensor:
+        alpha_value = np.array(1.0, dtype=np.float32)
+    else:
+        alpha_value = alpha
 
     plugin_creator = trt.get_plugin_registry().get_plugin_creator(
         'GemmAllReduce', '1', TRT_LLM_PLUGIN_NAMESPACE)
@@ -4212,33 +4222,52 @@ def gemm_allreduce(a: Tensor,
     trt_type_b = trt.fp8 if fp8_inputs_override else b.dtype
 
     # create plugin fields
-    field_type_a = trt.PluginField('type_a',
-                                   np.array([int(trt_type_a)], np.int32),
-                                   trt.PluginFieldType.INT32)
-    field_type_b = trt.PluginField('type_b',
-                                   np.array([int(trt_type_b)], np.int32),
-                                   trt.PluginFieldType.INT32)
-    field_type_d = trt.PluginField('type_d',
-                                   np.array([int(output_dtype)], np.int32),
-                                   trt.PluginFieldType.INT32)
-    field_transa = trt.PluginField('transa', np.array(transa, dtype=np.int32),
-                                   trt.PluginFieldType.INT32)
-    field_transb = trt.PluginField('transb', np.array(transb, dtype=np.int32),
-                                   trt.PluginFieldType.INT32)
-    field_alpha = trt.PluginField('alpha', alpha.flatten(),
-                                  trt.PluginFieldType.FLOAT32)
-    field_group = trt.PluginField('group', np.array(group, dtype=np.int32),
-                                  trt.PluginFieldType.INT32)
+    field_list = []
+    field_list.append(
+        trt.PluginField('type_a', np.array([int(trt_type_a)], np.int32),
+                        trt.PluginFieldType.INT32))
+    field_list.append(
+        trt.PluginField('type_b', np.array([int(trt_type_b)], np.int32),
+                        trt.PluginFieldType.INT32))
+    field_list.append(
+        trt.PluginField('type_d', np.array([int(output_dtype)], np.int32),
+                        trt.PluginFieldType.INT32))
+    field_list.append(
+        trt.PluginField('transa', np.array(transa, dtype=np.int32),
+                        trt.PluginFieldType.INT32))
+    field_list.append(
+        trt.PluginField('transb', np.array(transb, dtype=np.int32),
+                        trt.PluginFieldType.INT32))
+    field_list.append(
+        trt.PluginField('group', np.array(group, dtype=np.int32),
+                        trt.PluginFieldType.INT32))
+    field_list.append(
+        trt.PluginField('has_sfa', np.array([int(a_sf is not None)], np.int8),
+                        trt.PluginFieldType.INT8))
+    field_list.append(
+        trt.PluginField('has_sfb', np.array([int(b_sf is not None)], np.int8),
+                        trt.PluginFieldType.INT8))
+    field_list.append(
+        trt.PluginField('alpha_is_ptr', np.array([int(alpha_is_tensor)],
+                                                 np.int8),
+                        trt.PluginFieldType.INT8))
+    field_list.append(
+        trt.PluginField('alpha', alpha_value.flatten(),
+                        trt.PluginFieldType.FLOAT32))
 
     # create plugin
-    fields = trt.PluginFieldCollection([
-        field_type_a, field_type_b, field_type_d, field_transa, field_transb,
-        field_alpha, field_group
-    ])
+    fields = trt.PluginFieldCollection(field_list)
     plugin = plugin_creator.create_plugin("gemm_allreduce", fields)
     # define symbolic input tensors.
     # note this does NOT allocate memory.
     inputs = [a.trt_tensor, b.trt_tensor]
+    if a_sf is not None:
+        inputs += [a_sf.trt_tensor]
+    if b_sf is not None:
+        inputs += [b_sf.trt_tensor]
+    if alpha_is_tensor:
+        inputs += [alpha.trt_tensor]
+
     layer = default_trtnet().add_plugin_v2(inputs, plugin)
     _add_plugin_info(layer, plugin_creator, "gemm_allreduce", fields)
     # define symbolic output tensors
@@ -4246,12 +4275,15 @@ def gemm_allreduce(a: Tensor,
     # one has unicast address and other has multicast address
     uc_output = _create_tensor(layer.get_output(0), layer)
     mc_output = _create_tensor(layer.get_output(1), layer)
+    ipc_output = _create_tensor(layer.get_output(2), layer)
     assert uc_output is not None
     assert mc_output is not None
+    assert ipc_output is not None
     # mark outputs so that we can bind our own allocated memory in runtime
     # (see generation.py)
     uc_output.mark_output(f'gemm_allreduce_uc_out_{gemm_allreduce.layer_idx}')
     mc_output.mark_output(f'gemm_allreduce_mc_out_{gemm_allreduce.layer_idx}')
+    ipc_output.mark_output(f'gemm_allreduce_ipc_out_{gemm_allreduce.layer_idx}')
     gemm_allreduce.layer_idx += 1
 
     return uc_output

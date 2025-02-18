@@ -1,8 +1,10 @@
 import os
 import sys
+import tempfile
 
 import openai
 import pytest
+import yaml
 from openai_server import RemoteOpenAIServer
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -17,18 +19,53 @@ def model_name():
     return "llama-models-v3/llama-v3-8b-instruct-hf"
 
 
-@pytest.fixture(scope="module", params=[None, 'pytorch'])
+@pytest.fixture(scope="module",
+                params=[None, 'pytorch'],
+                ids=["trt", "pytorch"])
 def backend(request):
     return request.param
 
 
+@pytest.fixture(scope="module",
+                params=[True, False],
+                ids=["extra_options", "no_extra_options"])
+def extra_llm_api_options(request):
+    return request.param
+
+
 @pytest.fixture(scope="module")
-def server(model_name: str, backend: str):
+def temp_extra_llm_api_options_file(request):
+    temp_dir = tempfile.gettempdir()
+    temp_file_path = os.path.join(temp_dir, "extra_llm_api_options.yaml")
+    try:
+        extra_llm_api_options_dict = {
+            "enable_chunked_prefill": False,
+            "kv_cache_config": {
+                "enable_block_reuse": False,
+                "max_tokens": 40000
+            }
+        }
+
+        with open(temp_file_path, 'w') as f:
+            yaml.dump(extra_llm_api_options_dict, f)
+
+        yield temp_file_path
+    finally:
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+
+
+@pytest.fixture(scope="module")
+def server(model_name: str, backend: str, extra_llm_api_options: bool,
+           temp_extra_llm_api_options_file: str):
     model_path = get_model_path(model_name)
     args = ["--tp_size", "2", "--max_beam_width", "1"]
     if backend is not None:
         args.append("--backend")
         args.append(backend)
+    if extra_llm_api_options:
+        args.append("--extra_llm_api_options")
+        args.append(temp_extra_llm_api_options_file)
     with RemoteOpenAIServer(model_path, args) as remote_server:
         yield remote_server
 

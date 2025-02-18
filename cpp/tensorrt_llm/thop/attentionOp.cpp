@@ -26,25 +26,29 @@
 #include <torch/extension.h>
 #include <unordered_set>
 
-using tensorrt_llm::common::op::AttentionOp;
-using tensorrt_llm::common::op::TupleHash;
-using tensorrt_llm::kernels::KVBlockArray;
-using tensorrt_llm::runtime::RequestType;
-using tensorrt_llm::kernels::mlaParams;
-
 namespace torch_ext
 {
+using tensorrt_llm::common::op::AttentionOp;
+using tensorrt_llm::common::op::hash;
+using tensorrt_llm::runtime::RequestType;
 
 namespace trtllm::attention
 {
+using tensorrt_llm::kernels::KVBlockArray;
+using tensorrt_llm::kernels::MlaParams;
 
 class RunnerBase
 {
 public:
-    int64_t beam_width;
-    int64_t max_num_requests;
-    int64_t attention_window_size;
-    int64_t sink_token_length;
+    int32_t beam_width;
+    int32_t max_num_requests;
+    int32_t attention_window_size;
+    int32_t sink_token_length;
+
+    auto data() const
+    {
+        return std::make_tuple(beam_width, max_num_requests, attention_window_size, sink_token_length);
+    };
 
     virtual ~RunnerBase() = default;
     virtual void prepare(AttentionOp& op) const = 0;
@@ -73,11 +77,11 @@ public:
     void prepare(AttentionOp& op) const override
     {
         AttentionOp::EnqueueGenerationParams<T> enqueueParams;
-        enqueueParams.beam_width = beam_width;
-        enqueueParams.max_attention_window = attention_window_size;
+        enqueueParams.max_attention_window_size = attention_window_size;
         enqueueParams.cyclic_attention_window_size = attention_window_size;
         enqueueParams.max_cyclic_attention_window_size = attention_window_size;
         enqueueParams.sink_token_length = sink_token_length;
+        enqueueParams.beam_width = beam_width;
         enqueueParams.num_requests = max_num_requests;
 
         op.prepareEnqueueGeneration<T, KVBlockArray>(enqueueParams);
@@ -109,7 +113,7 @@ public:
             attention_input_workspace_size = tensorrt_llm::common::calculateTotalWorkspaceSize(workspaces, 1);
             if (op.mIsFP8BlockScalingEnabled)
             {
-                size_t act_quant_size = op.mGemmRunner->getActWorkspaceSize(num_tokens,
+                size_t act_quant_size = op.gemmRunner()->getActWorkspaceSize(num_tokens,
                     op.mMLAParams.qk_nope_head_dim + op.mMLAParams.kv_lora_rank + op.mMLAParams.qk_rope_head_dim);
                 size_t workspaces[2];
                 workspaces[0] = act_quant_size;
@@ -153,7 +157,7 @@ public:
         }
 
         void* workspace_ptr = workspace.data_ptr();
-        [[maybe_unused]] mlaParams<T> mla_params;
+        [[maybe_unused]] MlaParams<T> mla_params;
         if (op.isMLAEnabled())
         {
             // In MLA, attention_input will be the ptr of workspace
@@ -191,12 +195,12 @@ public:
             attention_input = attention_input_qkv;
         }
 
-        int const* q_seq_lengths = context_lengths.slice(0, seq_offset).data_ptr<int>();
-        int const* kv_seq_lengths = sequence_length.slice(0, seq_offset).data_ptr<int>();
+        int const* context_lengths_ptr = context_lengths.slice(0, seq_offset).data_ptr<int>();
+        int const* sequence_lengths_ptr = sequence_length.slice(0, seq_offset).data_ptr<int>();
         // Note we still need context length during generation for MMHA optimization.
         int32_t const max_context_q_len
             = host_context_lengths.slice(0, seq_offset, seq_offset + num_seqs).max().item<int32_t>();
-        int32_t const max_past_kv_len
+        int32_t const max_past_kv_length
             = host_past_key_value_lengths.slice(0, seq_offset, seq_offset + num_seqs).max().item<int32_t>();
 
         // Commonly, cyclic_attention_window_size, and max_attention_window_size will be the same
@@ -222,7 +226,8 @@ public:
         auto const cache_elem_size = (op.mKVCacheQuantMode.hasKvCacheQuant() ? 1 : sizeof(T));
         auto const block_size = op.mTokensPerBlock * op.mNumKVHeads * op.mHeadSize;
         auto const bytes_per_block = block_size * cache_elem_size;
-        auto const intra_pool_offset = op.mLayerIdxInCachePool * 2 * bytes_per_block;
+        int32_t const kv_factor = op.isMLAEnabled() ? 1 : 2;
+        auto const intra_pool_offset = op.mLayerIdxInCachePool * kv_factor * bytes_per_block;
 
         void* host_primary_pool_pointer = reinterpret_cast<void*>(
             reinterpret_cast<char*>(host_kv_cache_pool_pointers.index({pool_index, 0}).item<int64_t>())
@@ -240,38 +245,39 @@ public:
         }
         float const* out_scale_ptr = op.mFP8ContextFMHA ? out_scale.value().data_ptr<float>() : nullptr;
 
+        AttentionOp::EnqueueParams<T> common_enqueue_params;
+        common_enqueue_params.attention_input = attention_input;
+        common_enqueue_params.rotary_inv_freq = rotary_inv_freq_ptr;
+        common_enqueue_params.rotary_cos_sin = rotary_cos_sin_ptr;
+        common_enqueue_params.max_past_kv_length = max_past_kv_length;
+        common_enqueue_params.max_attention_window_size = max_attention_window_size;
+        common_enqueue_params.cyclic_attention_window_size = cyclic_attention_window_size;
+        common_enqueue_params.max_cyclic_attention_window_size = cyclic_attention_window_size;
+        common_enqueue_params.can_use_one_more_block = can_use_one_more_block;
+        common_enqueue_params.sink_token_length = sink_token_length;
+        common_enqueue_params.kv_scale_orig_quant = kv_scale_orig_quant_ptr;
+        common_enqueue_params.kv_scale_quant_orig = kv_scale_quant_orig_ptr;
+        common_enqueue_params.attention_output_orig_quant = out_scale_ptr;
+        common_enqueue_params.context_buf = context_buf;
+        common_enqueue_params.block_offsets = block_offsets;
+        common_enqueue_params.host_primary_pool_pointer = host_primary_pool_pointer;
+        common_enqueue_params.host_secondary_pool_pointer = host_secondary_pool_pointer;
+        common_enqueue_params.num_tokens = num_tokens;
+        common_enqueue_params.max_blocks_per_sequence = max_blocks_per_sequence;
+        common_enqueue_params.sequence_lengths = sequence_lengths_ptr;
+        common_enqueue_params.context_lengths = context_lengths_ptr;
+        common_enqueue_params.host_context_lengths = host_context_lengths.data_ptr<int32_t>();
+        common_enqueue_params.workspace = workspace_ptr;
+
         if (is_context) // context stage
         {
-            AttentionOp::EnqueueContextParams<T> enqueue_params;
-            enqueue_params.attention_input = attention_input;
-            enqueue_params.rotary_inv_freq = rotary_inv_freq_ptr;
-            enqueue_params.rotary_cos_sin = rotary_cos_sin_ptr;
-            enqueue_params.input_seq_length = max_context_q_len;
-            enqueue_params.max_past_kv_len = max_past_kv_len;
-            enqueue_params.max_attention_window = max_attention_window_size;
-            enqueue_params.cyclic_attention_window_size = cyclic_attention_window_size;
-            enqueue_params.max_cyclic_attention_window_size = cyclic_attention_window_size;
-            enqueue_params.can_use_one_more_block = can_use_one_more_block;
-            enqueue_params.sink_token_length = sink_token_length;
-            enqueue_params.q_seq_lengths = q_seq_lengths;
-            enqueue_params.kv_seq_lengths = kv_seq_lengths;
-            enqueue_params.context_buf = context_buf;
-            enqueue_params.block_offsets = block_offsets;
+            common_enqueue_params.input_seq_length = max_context_q_len;
+            AttentionOp::EnqueueContextParams<T> enqueue_params{common_enqueue_params};
             enqueue_params.host_block_offsets = host_block_offsets;
-            enqueue_params.host_primary_pool_pointer = host_primary_pool_pointer;
-            enqueue_params.host_secondary_pool_pointer = host_secondary_pool_pointer;
             enqueue_params.batch_size = num_seqs;
-            enqueue_params.num_tokens = num_tokens;
-            enqueue_params.max_blocks_per_sequence = max_blocks_per_sequence;
-            enqueue_params.host_context_lengths = host_context_lengths.data_ptr<int32_t>();
-            enqueue_params.workspace = workspace_ptr;
-            enqueue_params.kv_scale_orig_quant = kv_scale_orig_quant_ptr;
-            enqueue_params.kv_scale_quant_orig = kv_scale_quant_orig_ptr;
-            enqueue_params.attention_output_orig_quant = out_scale_ptr;
-
             if (op.isMLAEnabled())
             {
-                mla_params.cache_seq_lens = kv_seq_lengths;
+                mla_params.cache_seq_lens = sequence_lengths_ptr;
                 mla_params.max_input_seq_len = max_context_q_len;
                 op.mlaPreContext<T>(mla_params, stream);
                 enqueue_params.mla_param = &mla_params;
@@ -289,40 +295,18 @@ public:
                 "seq_len should be same for all generation requests, num_tokens=%d, num_seqs=%d", num_tokens, num_seqs);
             int32_t const input_seq_length = num_tokens / num_seqs;
 
-            AttentionOp::EnqueueGenerationParams<T> enqueue_params;
-            enqueue_params.attention_input = attention_input;
-            enqueue_params.rotary_inv_freq = rotary_inv_freq_ptr;
-            enqueue_params.rotary_cos_sin = rotary_cos_sin_ptr;
-            enqueue_params.input_seq_length = input_seq_length;
-            enqueue_params.sequence_lengths = kv_seq_lengths;
-            enqueue_params.max_past_kv_length = max_past_kv_len;
+            common_enqueue_params.input_seq_length = input_seq_length;
+            AttentionOp::EnqueueGenerationParams<T> enqueue_params{common_enqueue_params};
             enqueue_params.beam_width = beam_width;
-            enqueue_params.context_lengths = q_seq_lengths;
-            enqueue_params.context_buf = context_buf;
-            enqueue_params.block_offsets = block_offsets;
-            enqueue_params.host_primary_pool_pointer = host_primary_pool_pointer;
-            enqueue_params.host_secondary_pool_pointer = host_secondary_pool_pointer;
-            enqueue_params.max_attention_window = max_attention_window_size;
-            enqueue_params.cyclic_attention_window_size = cyclic_attention_window_size;
-            enqueue_params.max_cyclic_attention_window_size = cyclic_attention_window_size;
-            enqueue_params.can_use_one_more_block = can_use_one_more_block;
-            enqueue_params.sink_token_length = sink_token_length;
             enqueue_params.num_requests = num_requests;
-            enqueue_params.max_blocks_per_sequence = max_blocks_per_sequence;
             enqueue_params.cache_indir = beam_width == 1 ? nullptr : cache_indirection.value().data_ptr<int32_t>();
-            enqueue_params.semaphores = op.mMultiBlockSemaphores.get();
-            enqueue_params.workspace = workspace_ptr;
+            enqueue_params.semaphores = op.multiBlockSemaphores();
             enqueue_params.host_past_key_value_lengths = host_past_key_value_lengths.data_ptr<int32_t>();
-            enqueue_params.host_context_lengths = host_context_lengths.data_ptr<int32_t>();
-            enqueue_params.total_num_input_tokens = num_tokens;
-            enqueue_params.kv_scale_orig_quant = kv_scale_orig_quant_ptr;
-            enqueue_params.kv_scale_quant_orig = kv_scale_quant_orig_ptr;
-            enqueue_params.attention_output_orig_quant = out_scale_ptr;
 
             // Current mlaGeneration will using fmha to do attention, so we don't go into enqueueGeneration
             if (op.isMLAEnabled())
             {
-                mla_params.cache_seq_lens = kv_seq_lengths;
+                mla_params.cache_seq_lens = sequence_lengths_ptr;
                 op.mlaGeneration<T>(mla_params, enqueue_params, stream);
             }
             else
@@ -436,15 +420,43 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
     runner->attention_window_size = attention_window_size;
     runner->sink_token_length = sink_token_length;
 
-    auto cache_key = std::make_tuple(dtype, out_dtype, layer_idx, num_heads, num_kv_heads, head_size, mask_type,
-        quant_mode, tokens_per_block, max_context_length, position_embedding_type, rotary_embedding_dim,
-        rotary_embedding_base, rotary_embedding_scale_type, rotary_embedding_scale, rotary_embedding_short_m_scale,
-        rotary_embedding_long_m_scale, rotary_embedding_max_positions, rotary_embedding_original_max_positions,
-        beam_width, max_num_requests, attention_window_size, sink_token_length, use_paged_context_fmha,
-        is_fp8_block_scaling_enabled);
+    auto op = std::make_shared<AttentionOp>();
+    op->mType = dtype;
+    op->mFMHAForceFP32Acc = dtype == nvinfer1::DataType::kBF16;
+    op->mFP8ContextFMHA = is_fp8_out;
+    op->mLayerIdx = layer_idx;
+    op->mNumHeads = num_heads;
+    op->mNumKVHeads = num_kv_heads;
+    op->mHeadSize = head_size;
+    op->mMaskType = static_cast<tensorrt_llm::kernels::AttentionMaskType>(int32_t(mask_type));
+    op->mKVCacheQuantMode = tensorrt_llm::common::QuantMode(uint32_t(quant_mode));
+    op->mTokensPerBlock = tokens_per_block;
+    op->mMaxContextLength = max_context_length;
+    op->mPositionEmbeddingType
+        = static_cast<tensorrt_llm::kernels::PositionEmbeddingType>(int8_t(position_embedding_type));
+    op->mRotaryEmbeddingDim = rotary_embedding_dim;
+    op->mRotaryEmbeddingBase = rotary_embedding_base;
+    op->mRotaryEmbeddingScaleType
+        = static_cast<tensorrt_llm::kernels::RotaryScalingType>(int8_t(rotary_embedding_scale_type));
+    op->mRotaryEmbeddingScale = rotary_embedding_scale;
+    op->mRotaryEmbeddingShortMscale = rotary_embedding_short_m_scale;
+    op->mRotaryEmbeddingLongMscale = rotary_embedding_long_m_scale;
+    op->mRotaryEmbeddingMaxPositions = rotary_embedding_max_positions;
+    op->mRotaryEmbeddingOriginalMaxPositions = rotary_embedding_original_max_positions;
+    op->mPagedContextFMHA = use_paged_context_fmha;
+    op->mIsFP8BlockScalingEnabled = is_fp8_block_scaling_enabled;
+
+    if (is_mla_enable.has_value() && is_mla_enable.value())
+    {
+        op->mIsMLAEnabled = true;
+        op->mMLAParams = {static_cast<int>(q_lora_rank.value()), static_cast<int>(kv_lora_rank.value()),
+            static_cast<int>(qk_nope_head_dim.value()), static_cast<int>(qk_rope_head_dim.value()),
+            static_cast<int>(v_head_dim.value())};
+    }
+
+    auto cache_key = std::make_tuple(op->data(), runner->data());
     using CacheKey = decltype(cache_key);
-    static std::unordered_map<CacheKey, std::shared_ptr<AttentionOp>, TupleHash<CacheKey>> op_cache;
-    std::shared_ptr<AttentionOp> op;
+    static std::unordered_map<CacheKey, std::shared_ptr<AttentionOp>, hash<CacheKey>> op_cache;
     if (auto it = op_cache.find(cache_key); it != op_cache.end())
     {
         TLLM_LOG_TRACE("Attention op for layer %d is cached", layer_idx);
@@ -452,46 +464,10 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
     }
     else
     {
-        TLLM_LOG_TRACE("Creating new attention op for layer %d", layer_idx);
-        op = std::make_shared<AttentionOp>();
-
-        op->mType = dtype;
-        op->mFMHAForceFP32Acc = dtype == nvinfer1::DataType::kBF16;
-        op->mFP8ContextFMHA = is_fp8_out;
-        op->mLayerIdx = layer_idx;
-        op->mNumHeads = num_heads;
-        op->mNumKVHeads = num_kv_heads;
-        op->mHeadSize = head_size;
-        op->mMaskType = static_cast<tensorrt_llm::kernels::AttentionMaskType>(int32_t(mask_type));
-        op->mKVCacheQuantMode = tensorrt_llm::common::QuantMode(uint32_t(quant_mode));
-        op->mTokensPerBlock = tokens_per_block;
-        op->mMaxContextLength = max_context_length;
-        op->mPositionEmbeddingType
-            = static_cast<tensorrt_llm::kernels::PositionEmbeddingType>(int8_t(position_embedding_type));
-        op->mRotaryEmbeddingDim = rotary_embedding_dim;
-        op->mRotaryEmbeddingBase = rotary_embedding_base;
-        op->mRotaryEmbeddingScaleType
-            = static_cast<tensorrt_llm::kernels::RotaryScalingType>(int8_t(rotary_embedding_scale_type));
-        op->mRotaryEmbeddingScale = rotary_embedding_scale;
-        op->mRotaryEmbeddingShortMscale = rotary_embedding_short_m_scale;
-        op->mRotaryEmbeddingLongMscale = rotary_embedding_long_m_scale;
-        op->mRotaryEmbeddingMaxPositions = rotary_embedding_max_positions;
-        op->mRotaryEmbeddingOriginalMaxPositions = rotary_embedding_original_max_positions;
-        op->mPagedContextFMHA = use_paged_context_fmha;
-
-        op->mIsFP8BlockScalingEnabled = is_fp8_block_scaling_enabled;
-
-        if (is_mla_enable.has_value() && is_mla_enable.value())
-        {
-            op->mIsMLAEnabled = true;
-            op->mMLAParams = {static_cast<int>(q_lora_rank.value()), static_cast<int>(kv_lora_rank.value()),
-                static_cast<int>(qk_nope_head_dim.value()), static_cast<int>(qk_rope_head_dim.value()),
-                static_cast<int>(v_head_dim.value())};
-        }
+        TLLM_LOG_TRACE(
+            "Preparing new attention op for layer %d with cache key: %s", layer_idx, to_string(cache_key).c_str());
         op->initialize();
-
         runner->prepare(*op);
-
         op_cache[cache_key] = op;
     }
 

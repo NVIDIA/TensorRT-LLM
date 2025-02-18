@@ -107,11 +107,11 @@ class IntraProcessQueue:
             self.queue.put(item)
             return True
         except Empty:
-            # If the queue is empty, return False
+            # If the queue thread is empty, return False
             return False
 
 
-class WorkerIPCAddrs(NamedTuple):
+class WorkerCommIpcAddrs(NamedTuple):
     ''' IPC addresses for communication with the worker processes. '''
     request_queue_addr: str
     request_error_queue_addr: str
@@ -119,9 +119,10 @@ class WorkerIPCAddrs(NamedTuple):
     stats_queue_addr: str
 
 
-class WorkerQueues(NamedTuple):
-    ''' Queues for communication with the worker processes. '''
+class WorkerCommQueues(NamedTuple):
+    ''' Queues for communication with the worker in the same process. '''
     request_queue: IntraProcessQueue
     request_error_queue: IntraProcessQueue
-    result_queue: IntraProcessQueue
+    # result_queue could be an IPC address when postproc worker is enabled.
+    result_queue: IntraProcessQueue | str
     stats_queue: IntraProcessQueue

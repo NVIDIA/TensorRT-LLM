@@ -81,7 +81,7 @@ public:
     static std::string FP16_GPT_ATTENTION_PACKED_DIR();
     static std::string FP16_GPT_ATTENTION_PACKED_PAGED_DIR();
     static std::string FP16_GPT_LORA_DIR();
-    static std::string FP16_GPT_ATTENTION_PACKED_PAGED_RETURN_ACCEPTED_TOKENS_LOGITS_DIR();
+    static std::string FP16_GPT_ATTENTION_PACKED_PAGED_DRAFT_TOKENS_DIR();
     static std::string FP16_GPT_ATTENTION_PACKED_PAGED_GATHER_DIR();
     static std::string FP16_PLUGIN_PACKED_PAGED_RESULT_FILE();
     static std::string FP16_PLUGIN_PACKED_PAGED_LONG_RESULT_FILE();
@@ -291,7 +291,7 @@ std::vector<TLogits> randomLogits(runtime::SizeType32 vocabSize, TEngine* engine
 }
 
 std::vector<tensorrt_llm::executor::TokenIdType> createConsecutiveTokenSequence(
-    tensorrt_llm::runtime::SizeType32 length, tensorrt_llm::runtime::TokenIdType vocabLength);
+    tr::SizeType32 length, tr::SizeType32 vocabSize, tr::TokenIdType firstTokenId);
 
 /**
  * GPU timer for recording the elapsed time across kernel(s) launched in GPU stream

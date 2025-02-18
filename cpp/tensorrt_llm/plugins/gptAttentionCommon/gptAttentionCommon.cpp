@@ -16,26 +16,16 @@
  */
 #include "gptAttentionCommon.h"
 #include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/dataType.h"
-#include "tensorrt_llm/common/envUtils.h"
-#include "tensorrt_llm/common/memoryUtils.h"
-#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunner.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
-#include "tensorrt_llm/plugins/common/checkMacrosPlugin.h"
-#include "tensorrt_llm/runtime/iBuffer.h"
-#include "tensorrt_llm/runtime/utils/debugUtils.h"
 #include <NvInferRuntimePlugin.h>
-#include <algorithm>
 #include <cstdint>
-#include <type_traits>
 
 using namespace nvinfer1;
 using namespace tensorrt_llm::kernels;
 namespace tc = tensorrt_llm::common;
 using tensorrt_llm::plugins::GPTAttentionPluginCreatorCommon;
 using tensorrt_llm::plugins::GPTAttentionPluginCommon;
-using tensorrt_llm::common::op::AttentionOp;
 
 GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads, int vision_start, int vision_length,
     int num_kv_heads, int layer_idx_in_cache_pool, int head_size, int unidirectional, float q_scaling,
@@ -196,7 +186,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(void const* data, size_t leng
         "caused by using different TensorRT-LLM version to build "
         "engine and run engine.",
         (int) length, (int) (d - a));
-    TLLM_CHECK_WITH_INFO((mSM >= 80) || (mType != nvinfer1::DataType::kBF16),
+    TLLM_CHECK_WITH_INFO((smVersion() >= 80) || (mType != nvinfer1::DataType::kBF16),
         "Unsupported data type, pre SM 80 GPUs do not support bfloat16");
 }
 
@@ -315,63 +305,67 @@ GPTAttentionPluginCreatorCommon::GPTAttentionPluginCreatorCommon()
 {
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
-    mPluginAttributes.emplace_back(PluginField("num_heads", nullptr, PluginFieldType::kINT32, -1));
-    mPluginAttributes.emplace_back(PluginField("vision_start", nullptr, PluginFieldType::kINT32, -1));
-    mPluginAttributes.emplace_back(PluginField("vision_length", nullptr, PluginFieldType::kINT32, -1));
-    mPluginAttributes.emplace_back(PluginField("num_kv_heads", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("head_size", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("unidirectional", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("q_scaling", nullptr, PluginFieldType::kFLOAT32, 1.0));
+    mPluginAttributes.emplace_back(PluginField("layer_idx", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("num_heads", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("vision_start", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("vision_length", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("num_kv_heads", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("layer_idx_in_cache_pool", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("head_size", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("unidirectional", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("q_scaling", nullptr, PluginFieldType::kFLOAT32));
+    mPluginAttributes.emplace_back(PluginField("attn_logit_softcapping_scale", nullptr, PluginFieldType::kFLOAT32));
+    mPluginAttributes.emplace_back(PluginField("position_embedding_type", nullptr, PluginFieldType::kINT8));
+    mPluginAttributes.emplace_back(PluginField("rotary_embedding_dim", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("rotary_embedding_base", nullptr, PluginFieldType::kFLOAT32));
+    mPluginAttributes.emplace_back(PluginField("rotary_embedding_scale_type", nullptr, PluginFieldType::kINT8));
+    mPluginAttributes.emplace_back(PluginField("rotary_embedding_scale", nullptr, PluginFieldType::kFLOAT32));
+    mPluginAttributes.emplace_back(PluginField("rotary_embedding_short_m_scale", nullptr, PluginFieldType::kFLOAT32));
+    mPluginAttributes.emplace_back(PluginField("rotary_embedding_long_m_scale", nullptr, PluginFieldType::kFLOAT32));
+    mPluginAttributes.emplace_back(PluginField("rotary_embedding_max_positions", nullptr, PluginFieldType::kINT32));
     mPluginAttributes.emplace_back(
-        PluginField("attn_logit_softcapping_scale", nullptr, PluginFieldType::kFLOAT32, 0.0));
-    mPluginAttributes.emplace_back(PluginField("position_embedding_type", nullptr, PluginFieldType::kINT8, 0));
-    mPluginAttributes.emplace_back(PluginField("rotary_embedding_dim", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("rotary_embedding_base", nullptr, PluginFieldType::kFLOAT32, 0));
-    mPluginAttributes.emplace_back(PluginField("rotary_embedding_scale_type", nullptr, PluginFieldType::kINT8, 0));
-    mPluginAttributes.emplace_back(PluginField("rotary_embedding_scale", nullptr, PluginFieldType::kFLOAT32, 0));
+        PluginField("rotary_embedding_original_max_positions", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("tp_size", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("tp_rank", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("unfuse_qkv_gemm", nullptr, PluginFieldType::kINT8));
+    mPluginAttributes.emplace_back(PluginField("use_logn_scaling", nullptr, PluginFieldType::kINT8));
+    mPluginAttributes.emplace_back(PluginField("context_fmha_type", nullptr, PluginFieldType::kINT8));
+    mPluginAttributes.emplace_back(PluginField("kv_cache_quant_mode", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("remove_input_padding", nullptr, PluginFieldType::kINT8));
+    mPluginAttributes.emplace_back(PluginField("mask_type", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("block_sparse_block_size", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("block_sparse_homo_head_pattern", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("block_sparse_num_local_blocks", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("block_sparse_vertical_stride", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("paged_kv_cache", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("tokens_per_block", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("max_context_length", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("qkv_bias_enabled", nullptr, PluginFieldType::kINT8));
+    mPluginAttributes.emplace_back(PluginField("do_cross_attention", nullptr, PluginFieldType::kINT8));
+    mPluginAttributes.emplace_back(PluginField("max_distance", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("pos_shift_enabled", nullptr, PluginFieldType::kINT8));
+    mPluginAttributes.emplace_back(PluginField("dense_context_fmha", nullptr, PluginFieldType::kINT8));
+    mPluginAttributes.emplace_back(PluginField("use_paged_context_fmha", nullptr, PluginFieldType::kINT8));
+    mPluginAttributes.emplace_back(PluginField("use_fp8_context_fmha", nullptr, PluginFieldType::kINT8));
+    mPluginAttributes.emplace_back(PluginField("has_full_attention_mask", nullptr, PluginFieldType::kINT8));
+    mPluginAttributes.emplace_back(PluginField("use_cache", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("is_spec_decoding_enabled", nullptr, PluginFieldType::kINT8));
     mPluginAttributes.emplace_back(
-        PluginField("rotary_embedding_short_m_scale", nullptr, PluginFieldType::kFLOAT32, 1.0));
+        PluginField("spec_decoding_is_generation_length_variable", nullptr, PluginFieldType::kINT8));
     mPluginAttributes.emplace_back(
-        PluginField("rotary_embedding_long_m_scale", nullptr, PluginFieldType::kFLOAT32, 1.0));
-    mPluginAttributes.emplace_back(PluginField("rotary_embedding_max_positions", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(
-        PluginField("rotary_embedding_original_max_positions", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("tp_size", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("tp_rank", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("unfuse_qkv_gemm", nullptr, PluginFieldType::kINT8, 0));
-    mPluginAttributes.emplace_back(PluginField("context_fmha_type", nullptr, PluginFieldType::kINT8, 0));
-    mPluginAttributes.emplace_back(PluginField("kv_cache_quant_mode", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("remove_input_padding", nullptr, PluginFieldType::kINT8, 0));
-    mPluginAttributes.emplace_back(PluginField("mask_type", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("paged_kv_cache", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("tokens_per_block", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("max_context_length", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("qkv_bias_enabled", nullptr, PluginFieldType::kINT8, 0));
-    mPluginAttributes.emplace_back(PluginField("do_cross_attention", nullptr, PluginFieldType::kINT8, 0));
-    mPluginAttributes.emplace_back(PluginField("max_distance", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("pos_shift_enabled", nullptr, PluginFieldType::kINT8, 0));
-    mPluginAttributes.emplace_back(PluginField("dense_context_fmha", nullptr, PluginFieldType::kINT8, 0));
-    mPluginAttributes.emplace_back(PluginField("use_paged_context_fmha", nullptr, PluginFieldType::kINT8, 0));
-    mPluginAttributes.emplace_back(PluginField("use_fp8_context_fmha", nullptr, PluginFieldType::kINT8, 0));
-    mPluginAttributes.emplace_back(PluginField("has_full_attention_mask", nullptr, PluginFieldType::kINT8, 0));
-    mPluginAttributes.emplace_back(PluginField("use_cache", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("is_spec_decoding_enabled", nullptr, PluginFieldType::kINT8, 0));
-    mPluginAttributes.emplace_back(
-        PluginField("spec_decoding_is_generation_length_variable", nullptr, PluginFieldType::kINT8, 0));
-    mPluginAttributes.emplace_back(
-        PluginField("spec_decoding_max_generation_length", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("is_mla_enabled", nullptr, PluginFieldType::kINT8, 0));
-    mPluginAttributes.emplace_back(PluginField("q_lora_rank", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("kv_lora_rank", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("qk_nope_head_dim", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("qk_rope_head_dim", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("v_head_dim", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("fuse_fp4_quant", nullptr, PluginFieldType::kINT8, 0));
-    mPluginAttributes.emplace_back(PluginField("skip_attn", nullptr, PluginFieldType::kINT8, 0));
-    mPluginAttributes.emplace_back(PluginField("cp_size", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("cp_rank", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("cp_group", nullptr, PluginFieldType::kINT32, 1));
+        PluginField("spec_decoding_max_generation_length", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("is_mla_enabled", nullptr, PluginFieldType::kINT8));
+    mPluginAttributes.emplace_back(PluginField("q_lora_rank", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("kv_lora_rank", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("qk_nope_head_dim", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("qk_rope_head_dim", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("v_head_dim", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("fuse_fp4_quant", nullptr, PluginFieldType::kINT8));
+    mPluginAttributes.emplace_back(PluginField("skip_attn", nullptr, PluginFieldType::kINT8));
+    mPluginAttributes.emplace_back(PluginField("cp_size", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("cp_rank", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("cp_group", nullptr, PluginFieldType::kINT32));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }

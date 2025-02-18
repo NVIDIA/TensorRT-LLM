@@ -234,7 +234,7 @@ class LLaMADecoderLayer(Module):
             if default_net().plugin_config.reduce_fusion:
                 hidden_states, residual = attention_output
             elif default_net().plugin_config.norm_quant_fusion:
-                hidden_states, residual, act_per_block_scale = fused_layernorm(
+                hidden_states, residual_attn, act_per_block_scale = fused_layernorm(
                     input=attention_output,
                     normalized_shape=self.config.hidden_size,
                     residual=residual,
@@ -246,8 +246,8 @@ class LLaMADecoderLayer(Module):
                     eps=self.post_layernorm.eps,
                     p_dtype=self.config.dtype)
 
-                hidden_states, residual = (hidden_states,
-                                           act_per_block_scale), residual
+                hidden_states, residual_attn = (
+                    hidden_states, act_per_block_scale), residual_attn
                 assert isinstance(hidden_states, tuple)
             else:
                 hidden_states = residual + attention_output * self.config.residual_multiplier
@@ -260,7 +260,7 @@ class LLaMADecoderLayer(Module):
                     lora_layer_params=lora_layer_params,
                     all_reduce_params=AllReduceParams(
                         fusion_op=reduce_fusion_op,
-                        residual=residual,
+                        residual=residual_attn,
                         norm_weight=next_layer_input_layernorm_args[0],
                         scale=next_layer_input_layernorm_args[2],
                         eps=next_layer_input_layernorm_args[1]))
@@ -268,7 +268,7 @@ class LLaMADecoderLayer(Module):
                     hidden_states, residual, act_per_block_scale = fused_layernorm(
                         input=hidden_states,
                         normalized_shape=self.config.hidden_size,
-                        residual=residual,
+                        residual=residual_attn,
                         weight=next_layer_input_layernorm_args[0],
                         scale=div(1, next_layer_input_layernorm_args[2])
                         if next_layer_input_layernorm_args[2] else None,

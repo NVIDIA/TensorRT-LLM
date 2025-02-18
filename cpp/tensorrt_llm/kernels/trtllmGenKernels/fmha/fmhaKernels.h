@@ -137,9 +137,6 @@ public:
         auto const& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
         const CUfunction func = findIter->second.mDeviceFunction;
 
-        // Debug info.
-        TLLM_LOG_DEBUG("Execute function %s ", kernelMeta.mFuncName);
-
         // Prepare the kernel parameters.
         auto kernelParams = KernelParams::setKernelParams(params, kernelMeta);
 
@@ -161,7 +158,7 @@ public:
         if (params.mMultiCtasKvMode)
         {
             // The maximum number Ctas per Kv sequence, which makes sure that each CtaKv has work to do.
-            int const maxNumCtasPerSeqKv = params.mMaxSeqLenKv / (/* minNumSteps */ 2 * kernelMeta.mStepKv);
+            int const maxNumCtasPerSeqKv = (params.mMaxSeqLenKv + kernelMeta.mStepKv - 1) / kernelMeta.mStepKv;
             // Compute numCtasPerSeqKv.
             numCtasPerSeqKv = std::min(maxNumCtasPerSeqKv,
                 int32_t(params.mMaxNumCtas / (numCtasPerSeqQ * launch_config.gridDimY * launch_config.gridDimZ)));
@@ -181,11 +178,12 @@ public:
         // Set gridDim.x = numCtasPerSeqQ * numCtasPerSeqKv.
         launch_config.gridDimX = numCtasPerSeqQ * numCtasPerSeqKv;
         TLLM_LOG_DEBUG(
-            "TRTLLM-Gen launch info: numCtasPerSeqQ = %d, numCtasPerSeqKv = %d, maxSeqLenQ = %d, maxSeqLenKv = %d, "
+            "TRTLLM-Gen launch info: kernelName = %s, numCtasPerSeqQ = %d, numCtasPerSeqKv = %d, maxSeqLenQ = %d, "
+            "maxSeqLenKv = %d, "
             "numHeadsQ = %d, "
             "numHeadsKv = %d, batchSize = %d, kernelType = %d",
-            numCtasPerSeqQ, numCtasPerSeqKv, params.mMaxSeqLenQ, params.mMaxSeqLenKv, params.mNumHeadsQ,
-            params.mNumHeadsKv, params.mBatchSize);
+            kernelMeta.mFuncName, numCtasPerSeqQ, numCtasPerSeqKv, params.mMaxSeqLenQ, params.mMaxSeqLenKv,
+            params.mNumHeadsQ, params.mNumHeadsKv, params.mBatchSize, static_cast<int>(params.mKernelType));
 
         CUlaunchAttribute launch_attribute[2];
         launch_attribute[0].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;

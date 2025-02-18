@@ -233,12 +233,6 @@ class MllamaForConditionalGeneration(nn.Module):
             bias=True,
             dtype=config.pretrained_config.vision_config.torch_dtype)
         self.logits_processor = LogitsProcessor()
-        self.create_weights()
-
-    def create_weights(self):
-        for _, module in self.named_modules():
-            if callable(getattr(module, "_create_weights", None)):
-                module._create_weights()
 
     @torch.inference_mode()
     def forward(

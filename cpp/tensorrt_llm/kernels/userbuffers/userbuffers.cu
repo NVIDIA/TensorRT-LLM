@@ -977,7 +977,6 @@ __global__ void __launch_bounds__(MAX_THREADS)
         int const handleridx, float4* mc_ptr, int const RANKS, uint4* residual_in, int res_offset)
 {
     cudaTriggerProgrammaticLaunchCompletion();
-    cudaGridDependencySynchronize();
     int *flagptr, physgpu, targetgpu, *myptr;
     int *reduceidptr, reduce_id;
     if (threadIdx.x < RANKS)
@@ -990,6 +989,10 @@ __global__ void __launch_bounds__(MAX_THREADS)
         reduce_id = next_flag(*reduceidptr);
         flagptr = (reinterpret_cast<int*>(commbuff[targetgpu])) + flagoffset + blockflagoffset;
         myptr += blockflagoffset;
+        cudaGridDependencySynchronize();
+        flagptr[physgpu] = reduce_id;
+        multi_gpu_block_barrier(reduce_id, (int volatile*) &myptr[targetgpu]);
+        reduce_id = next_flag(reduce_id);
     }
     __syncthreads();
 

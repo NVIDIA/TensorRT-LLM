@@ -342,7 +342,9 @@ get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR} PATH)
 set(3RDPARTY_DIR ${TRT_LLM_ROOT_DIR}/3rdparty)
 add_subdirectory(${3RDPARTY_DIR}/pybind11 ${CMAKE_CURRENT_BINARY_DIR}/pybind11)
 
+# include as system to suppress warnings
 include_directories(
+  SYSTEM
   ${CUDAToolkit_INCLUDE_DIRS}
   ${CUDNN_ROOT_DIR}/include
   ${NCCL_INCLUDE_DIR}

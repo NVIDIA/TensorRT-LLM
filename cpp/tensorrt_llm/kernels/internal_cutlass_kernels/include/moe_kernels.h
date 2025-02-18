@@ -175,10 +175,26 @@ struct QuantParams
         GemmInputs fc2;
     } fp4;
 
+    // GPTQ/AWQ quantization params
+    struct GroupwiseInputs
+    {
+        struct GroupwiseGemmInputs
+        {
+            void const* act_scales = nullptr;
+            void const* weight_scales = nullptr;
+            void const* weight_zeros = nullptr;
+            float const* alpha = nullptr;
+        };
+
+        int group_size = -1;
+        GroupwiseGemmInputs fc1;
+        GroupwiseGemmInputs fc2;
+    } groupwise;
+
     static QuantParams FP8(float const* dequant_fc1, float const* quant_fc2, float const* dequant_fc2,
         float const* quant_final = nullptr, float const* dequant_input = nullptr)
     {
-        return QuantParams{{}, {dequant_fc1, quant_fc2, dequant_fc2, quant_final, dequant_input}, {}};
+        return QuantParams{{}, {dequant_fc1, quant_fc2, dequant_fc2, quant_final, dequant_input}, {}, {}};
     }
 
     static QuantParams FP4(float const* fc1_act_global_scale,
@@ -189,12 +205,23 @@ struct QuantParams
     {
         return QuantParams{{}, {},
             {{fc1_act_global_scale, fc1_weight_block_scale, fc1_global_scale},
-                {fc2_act_global_scale, fc2_weight_block_scale, fc2_global_scale}}};
+                {fc2_act_global_scale, fc2_weight_block_scale, fc2_global_scale}},
+            {}};
     }
 
     static QuantParams Int(void const* fc1_weight_scales, void const* fc2_weight_scales)
     {
-        return QuantParams{{fc1_weight_scales, fc2_weight_scales}, {}, {}};
+        return QuantParams{{fc1_weight_scales, fc2_weight_scales}, {}, {}, {}};
+    }
+
+    static QuantParams GroupWise(int group_size, void const* fc1_weight_scales, void const* fc2_weight_scales,
+        void const* fc1_activation_scales = nullptr, void const* fc2_activation_scales = nullptr,
+        void const* fc1_weight_zeros = nullptr, void const* fc2_weight_zeros = nullptr,
+        float const* fc1_alpha = nullptr, float const* fc2_alpha = nullptr)
+    {
+        return QuantParams{{}, {}, {},
+            {group_size, {fc1_activation_scales, fc1_weight_scales, fc1_weight_zeros, fc1_alpha},
+                {fc2_activation_scales, fc2_weight_scales, fc2_weight_zeros, fc2_alpha}}};
     }
 };
 
@@ -263,7 +290,7 @@ public:
     virtual ~CutlassMoeFCRunnerInterface() = default;
     virtual size_t getWorkspaceSize(int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size,
         int const num_experts, int const k, ActivationType activation_type, MOEExpertScaleNormalizationMode norm_mode,
-        MOEParallelismConfig parallelism_config, bool use_lora, bool use_fp8_block_scaling)
+        MOEParallelismConfig parallelism_config, bool use_lora, bool use_fp8_block_scaling, bool use_awq)
         = 0;
     virtual void setTactic(std::optional<cutlass_extensions::CutlassGemmConfig> gemm1_config,
         std::optional<cutlass_extensions::CutlassGemmConfig> gemm2_config)
@@ -325,11 +352,15 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface
     using ScaleBiasType = BackBoneType;
     using Self = CutlassMoeFCRunner<T, WeightType, OutputType, BackBoneType>;
 #if defined(ENABLE_FP8)
-    static constexpr bool use_fp8 = std::is_same<T, __nv_fp8_e4m3>::value || std::is_same<T, __nv_fp8_e5m2>::value;
+    static constexpr bool use_fp8 = (std::is_same<T, __nv_fp8_e4m3>::value || std::is_same<T, __nv_fp8_e5m2>::value)
+        && !std::is_same_v<WeightType, cutlass::uint4b_t>;
+    static constexpr bool use_w4afp8
+        = std::is_same_v<WeightType, cutlass::uint4b_t> && std::is_same_v<T, __nv_fp8_e4m3>;
     static_assert(!std::is_same_v<BackBoneType, __nv_fp8_e4m3>, "Current logic requires backbone type to be >=16-bits");
     static_assert(!std::is_same_v<OutputType, __nv_fp8_e4m3>, "Current logic requires output type to be >=16-bits");
 #else
     static constexpr bool use_fp8 = false;
+    static constexpr bool use_w4afp8 = false;
 #endif
 #if defined(ENABLE_FP4)
     static constexpr bool use_fp4 = std::is_same<T, __nv_fp4_e2m1>::value;
@@ -343,7 +374,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface
     using UnfusedGemmOutputType = BackBoneType;
 
     // For FP4 we do the quantization for activations on the fly, so we should take inputs in the back bone type
-    using InputActivationsType = std::conditional_t<use_fp4, BackBoneType, T>;
+    using InputActivationsType = std::conditional_t<(use_fp4 || use_w4afp8), BackBoneType, T>;
 
     // We introduce this as a separate parameter, so that if we ever remove the above condition we can decouple
     // BackBoneType and OutputType easily. For now these are required to be equivalent
@@ -359,7 +390,7 @@ public:
 
     size_t getWorkspaceSize(int64_t const num_rows, int64_t const hidden_size, int64_t const fc1_output_size,
         int const num_experts, int const k, ActivationType activation_type, MOEExpertScaleNormalizationMode norm_mode,
-        MOEParallelismConfig parallelism_config, bool use_lora, bool use_fp8_block_scaling) override;
+        MOEParallelismConfig parallelism_config, bool use_lora, bool use_fp8_block_scaling, bool use_awq) override;
 
     void setTactic(std::optional<cutlass_extensions::CutlassGemmConfig> gemm1_config,
         std::optional<cutlass_extensions::CutlassGemmConfig> gemm2_config) override
@@ -471,10 +502,10 @@ private:
     std::vector<size_t> getWorkspaceDeviceBufferSizes(int64_t const num_rows, int64_t const hidden_size,
         int64_t const inter_size, int const num_experts, int const num_experts_per_node, int const k,
         ActivationType activation_type, MOEExpertScaleNormalizationMode norm_mode, bool use_lora,
-        bool use_fp8_block_scaling);
+        bool use_fp8_block_scaling, bool use_awq);
     void configureWsPtrs(char* ws_ptr, int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size,
         int const num_experts, int const num_experts_per_node, int const k, ActivationType activation_type,
-        MOEExpertScaleNormalizationMode norm_mode, bool use_lora, bool use_fp8_block_scaling);
+        MOEExpertScaleNormalizationMode norm_mode, bool use_lora, bool use_fp8_block_scaling, bool use_awq);
 
 private:
     bool mayHaveDifferentGEMMOutputType() const
@@ -520,6 +551,9 @@ private:
         int64_t const hidden_size, int64_t const inter_size, int const num_experts_per_node, int64_t const k,
         BlockScaleParams& deepseek_params, cudaStream_t stream, MOEParallelismConfig parallelism_config);
 
+    T const* applyPrequantScale(void* smoothed_act, void const* permuted_data, void const* prequant_scales,
+        int64_t const expanded_num_rows, int64_t const seq_len, bool const use_awq, cudaStream_t stream);
+
     CubKeyValueSorter sorter_;
     MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType> moe_gemm_runner_;
     std::unique_ptr<BlockScaleGemmRunner> blockscale_gemm_runner_;
@@ -550,6 +584,7 @@ private:
     ScaleBiasType* lora_fc1_result_{};
     ScaleBiasType* lora_add_bias_{};
     ScaleBiasType* lora_fc2_result_{};
+    void* smoothed_act_{};
     char* blockscale_gemm_workspace_;
 
     TmaWarpSpecializedGroupedGemmInput tma_ws_grouped_gemm_input_;
@@ -585,7 +620,7 @@ public:
 
     void init(CutlassMoeFCRunnerInterface& runner, GemmToProfile gemm_to_profile, nvinfer1::DataType dtype,
         nvinfer1::DataType wtype, nvinfer1::DataType otype, int num_experts, int k, int64_t hidden_size,
-        int64_t inter_size, ActivationType activation_type, bool bias, bool use_lora,
+        int64_t inter_size, int64_t group_size, ActivationType activation_type, bool bias, bool use_lora,
         MOEParallelismConfig parallelism_config)
     {
         mInterface = &runner;
@@ -598,6 +633,7 @@ public:
         mK = k;
         mExpertHiddenSize = hidden_size;
         mExpertInterSize = inter_size;
+        mGroupSize = group_size;
         mActivationType = activation_type;
         mBias = bias;
         mUseLora = false;
@@ -625,6 +661,7 @@ public:
     int64_t mK{};
     int64_t mExpertHiddenSize{};
     int64_t mExpertInterSize{};
+    int64_t mGroupSize{};
     ActivationType mActivationType{};
     MOEParallelismConfig mParallelismConfig{};
 

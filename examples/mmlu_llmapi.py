@@ -329,6 +329,9 @@ def parse_args():
                         choices=["pytorch", "tensorrt"],
                         default="pytorch",
                         help="Choose the backend to run the model")
+    parser.add_argument('--torch_compile',
+                        action="store_true",
+                        help="Enable torch compile for pytorch backend")
     parser.add_argument("--tp_size",
                         type=int,
                         default=1,
@@ -408,7 +411,8 @@ def main():
         assert args.engine_dir is None, "pytorch backend does not need TRT Engine"
         config = PyTorchConfig(
             attn_backend=args.attn_backend,
-            enable_overlap_scheduler=args.enable_overlap_scheduler)
+            enable_overlap_scheduler=args.enable_overlap_scheduler,
+            torch_compile_enabled=args.torch_compile)
         model = tensorrt_llm._torch.LLM(
             model=args.hf_model_dir,
             tokenizer=tokenizer,

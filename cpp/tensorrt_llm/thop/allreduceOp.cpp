@@ -17,11 +17,11 @@
 
 #include "tensorrt_llm/common/customAllReduceUtils.h"
 #include "tensorrt_llm/common/dataType.h"
-#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/kernels/userbuffers/ub_interface.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include <nvml.h>
 #include <torch/extension.h>

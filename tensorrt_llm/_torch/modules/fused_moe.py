@@ -3,7 +3,6 @@ from typing import Dict, List, NamedTuple, Optional
 import torch
 from torch import nn
 
-from ...models.modeling_utils import QuantConfig
 from ...quantization.utils.fp4_utils import float4_sf_dtype
 from ..model_config import ModelConfig
 from .linear import ParallelConfig, TensorParallelMode, load_weight_shard
@@ -84,7 +83,7 @@ class FusedMoE(nn.Module):
 
         self.dtype = dtype
         self.reduce_results = reduce_results
-        # could be modified later by reset_quant_config
+        # could be modified later
         self.quant_config = model_config.quant_config
 
         self.tp_rank = model_config.mapping.moe_tp_rank
@@ -114,17 +113,10 @@ class FusedMoE(nn.Module):
 
         self.normalization_mode = normalization_mode
         self._weights_created = False
+        if not model_config.skip_create_weights:
+            self.create_weights()
 
-    def reset_quant_config(self, quant_config: Optional[QuantConfig] = None):
-        """
-        This method can be used to reset the quant_config to None
-        according to the `exclude_modules` list in QuantConfig,
-        or a different mode to potentially allow for mixed quantization.
-        """
-        assert not self._weights_created, "Weight can't be created before calling FusedMoE.reset_quant_config"
-        self.quant_config = quant_config
-
-    def _create_weights(self):
+    def create_weights(self):
         if self._weights_created:
             return
         device = torch.device('cuda')
@@ -346,9 +338,7 @@ class FusedMoE(nn.Module):
         return final_hidden_states
 
     def load_weights(self, weights: List[Dict]):
-        if not self._weights_created:
-            self._create_weights()
-
+        assert self._weights_created
         assert len(weights) == 1
         weights = weights[0]
 
@@ -405,7 +395,7 @@ class FusedMoE(nn.Module):
             load_weight_shard(weights[f"{expert_id}.w2.weight_scale_inv"],
                               self.tp_size, self.tp_rank,
                               TensorParallelMode.ROW)
-            for expert_id in range(self.num_experts)
+            for expert_id in range(self.expert_start, self.expert_end)
         ]
 
         w2_scales = torch.stack(all_w2_scales)
@@ -415,14 +405,14 @@ class FusedMoE(nn.Module):
             load_weight_shard(weights[f"{expert_id}.w3.weight_scale_inv"],
                               self.tp_size, self.tp_rank,
                               TensorParallelMode.COLUMN)
-            for expert_id in range(self.num_experts)
+            for expert_id in range(self.expert_start, self.expert_end)
         ]
 
         all_w1_scales = [
             load_weight_shard(weights[f"{expert_id}.w1.weight_scale_inv"],
                               self.tp_size, self.tp_rank,
                               TensorParallelMode.COLUMN)
-            for expert_id in range(self.num_experts)
+            for expert_id in range(self.expert_start, self.expert_end)
         ]
 
         w3_w1_scales = torch.cat(

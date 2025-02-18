@@ -16,6 +16,7 @@
  */
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/kernels/userbuffers/ub_interface.h"
 #include "tensorrt_llm/plugins/common/plugin.h"
 #include "tensorrt_llm/plugins/gemmPlugin/gemmPlugin.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
@@ -188,11 +189,27 @@ Tensor& cublas_scaled_mm_out(Tensor const& mat_a, Tensor const& mat_b, Tensor co
 }
 
 Tensor cublas_scaled_mm(Tensor const& mat_a, Tensor const& mat_b, Tensor const& scale_a, Tensor const& scale_b,
-    std::optional<at::Tensor> const& bias, std::optional<c10::ScalarType> out_dtype)
+    std::optional<at::Tensor> const& bias, std::optional<c10::ScalarType> out_dtype, int64_t userbuffers_id)
 {
     TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2);
     auto const out_dtype_ = out_dtype.value_or(mat_a.scalar_type());
-    Tensor out = at::empty({mat_a.sizes()[0], mat_b.sizes()[1]}, mat_a.options().dtype(out_dtype_));
+
+    std::vector<int64_t> output_size = {mat_a.sizes()[0], mat_b.sizes()[1]};
+    std::vector<int64_t> output_strides = {mat_b.sizes()[1], 1};
+
+    Tensor out;
+    if (userbuffers_id >= 0)
+    {
+        TLLM_CHECK_WITH_INFO(tensorrt_llm::runtime::ub::ub_is_initialized(), "UserBuffer has not been initialized!");
+        auto ub_buffer0 = tensorrt_llm::runtime::ub::ub_get(userbuffers_id);
+        out = torch::from_blob(
+            ub_buffer0.addr, output_size, output_strides, torch::dtype(out_dtype_).device(torch::kCUDA));
+    }
+    else
+    {
+        out = at::empty(output_size, mat_a.options().dtype(out_dtype_));
+    }
+
     return cublas_scaled_mm_out(mat_a, mat_b, scale_a, scale_b, bias, out_dtype, out);
 }
 
@@ -202,7 +219,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "cublas_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scale_a, Tensor scale_b, Tensor? bias,"
-        " ScalarType? out_dtype) -> (Tensor out)");
+        " ScalarType? out_dtype, int userbuffers_id) -> (Tensor out)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

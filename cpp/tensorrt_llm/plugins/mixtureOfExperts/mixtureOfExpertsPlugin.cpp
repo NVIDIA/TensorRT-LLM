@@ -41,16 +41,18 @@ nvinfer1::PluginFieldCollection MixtureOfExpertsPluginCreator::mFC{};
 std::vector<nvinfer1::PluginField> MixtureOfExpertsPluginCreator::mPluginAttributes;
 
 MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(bool remove_input_padding, int number_of_experts, int top_k,
-    int expert_hidden_size, int expert_inter_size, tensorrt_llm::ActivationType activation_type,
-    nvinfer1::DataType type, nvinfer1::DataType weight_type, nvinfer1::DataType output_type, QuantMode quant_mode,
-    bool use_finished, bool use_bias, int tp_size, int tp_rank, int ep_size, int ep_rank,
-    MOEExpertScaleNormalizationMode normalization_mode, float sparse_mixer_epsilon, bool force_determinism,
-    int side_stream_id, MixtureOfExpertsPluginProfilerPtr gemm_profiler_ptr, bool use_lora,
+    int expert_hidden_size, int expert_inter_size, int groupwise_quant_algo, int group_size,
+    tensorrt_llm::ActivationType activation_type, nvinfer1::DataType type, nvinfer1::DataType weight_type,
+    nvinfer1::DataType output_type, QuantMode quant_mode, bool use_finished, bool use_bias, int tp_size, int tp_rank,
+    int ep_size, int ep_rank, MOEExpertScaleNormalizationMode normalization_mode, float sparse_mixer_epsilon,
+    bool force_determinism, int side_stream_id, MixtureOfExpertsPluginProfilerPtr gemm_profiler_ptr, bool use_lora,
     nvinfer1::DataType lora_type, LoraPluginProfilerPtr lora_profiler, int max_low_rank)
     : mNumExperts(number_of_experts)
     , mK(top_k)
     , mExpertHiddenSize(expert_hidden_size)
     , mExpertInterSize(expert_inter_size)
+    , mGroupwiseQuantAlgo(groupwise_quant_algo)
+    , mGroupSize(group_size)
     , mActivationType(activation_type)
     , mType(type)
     , mWeightType(weight_type)
@@ -79,6 +81,8 @@ tensorrt_llm::plugins::MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(MixtureOfE
     , mK(other.mK)
     , mExpertHiddenSize(other.mExpertHiddenSize)
     , mExpertInterSize(other.mExpertInterSize)
+    , mGroupwiseQuantAlgo(other.mGroupwiseQuantAlgo)
+    , mGroupSize(other.mGroupSize)
     , mActivationType(other.mActivationType)
     , mType(other.mType)
     , mWeightType(other.mWeightType)
@@ -113,11 +117,12 @@ tensorrt_llm::plugins::MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(MixtureOfE
 size_t MixtureOfExpertsPlugin::getSerializationSize() const noexcept
 {
     size_t size = sizeof(mRemoveInputPadding) + sizeof(mNumExperts) + sizeof(mK) + sizeof(mExpertHiddenSize)
-        + sizeof(mExpertInterSize) + sizeof(mActivationType) + sizeof(mType) + sizeof(mWeightType) + sizeof(mOutputType)
-        + sizeof(QuantMode::BaseType) + sizeof(mUseFinished) + sizeof(mUseBias) + sizeof(mParallelismConfig)
-        + sizeof(mNormalizationMode) + sizeof(mSparseMixerEpsilon) + sizeof(mDims) + sizeof(mUseDeterministicKernels)
-        + sizeof(mSideStreamId) + mGemmProfiler->getSerializationSize(mGemmId1)
-        + mGemmProfiler->getSerializationSize(mGemmId2) + sizeof(mUseLora) + sizeof(mLoraType) + sizeof(mMaxLowRank);
+        + sizeof(mExpertInterSize) + sizeof(mGroupwiseQuantAlgo) + sizeof(mGroupSize) + sizeof(mActivationType)
+        + sizeof(mType) + sizeof(mWeightType) + sizeof(mOutputType) + sizeof(QuantMode::BaseType) + sizeof(mUseFinished)
+        + sizeof(mUseBias) + sizeof(mParallelismConfig) + sizeof(mNormalizationMode) + sizeof(mSparseMixerEpsilon)
+        + sizeof(mDims) + sizeof(mUseDeterministicKernels) + sizeof(mSideStreamId)
+        + mGemmProfiler->getSerializationSize(mGemmId1) + mGemmProfiler->getSerializationSize(mGemmId2)
+        + sizeof(mUseLora) + sizeof(mLoraType) + sizeof(mMaxLowRank);
 
     if (hasLora())
     {
@@ -140,6 +145,8 @@ MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(void const* data, size_t length,
     read(d, mK);
     read(d, mExpertHiddenSize);
     read(d, mExpertInterSize);
+    read(d, mGroupwiseQuantAlgo);
+    read(d, mGroupSize);
     read(d, mActivationType);
     read(d, mType);
     read(d, mWeightType);
@@ -187,6 +194,8 @@ void MixtureOfExpertsPlugin::serialize(void* buffer) const noexcept
     write(d, mK);
     write(d, mExpertHiddenSize);
     write(d, mExpertInterSize);
+    write(d, mGroupwiseQuantAlgo);
+    write(d, mGroupSize);
     write(d, mActivationType);
     write(d, mType);
     write(d, mWeightType);
@@ -248,6 +257,12 @@ void MixtureOfExpertsPlugin::init()
     {
         mMOERunner = std::make_unique<CutlassMoeFCRunner<half, cutlass::uint4b_t>>();
     }
+#ifdef ENABLE_FP8
+    else if (mType == DataType::kFP8 && mWeightType == DataType::kINT4 && mOutputType == DataType::kHALF)
+    {
+        mMOERunner = std::make_unique<CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, half>>();
+    }
+#endif
 #ifdef ENABLE_BF16
     else if (mType == DataType::kBF16 && mWeightType == DataType::kBF16)
     {
@@ -261,6 +276,12 @@ void MixtureOfExpertsPlugin::init()
     {
         mMOERunner = std::make_unique<CutlassMoeFCRunner<__nv_bfloat16, cutlass::uint4b_t>>();
     }
+#ifdef ENABLE_FP8
+    else if (mType == DataType::kFP8 && mWeightType == DataType::kINT4 && mOutputType == DataType::kBF16)
+    {
+        mMOERunner = std::make_unique<CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, __nv_bfloat16>>();
+    }
+#endif
 #endif
 
     // Templated lambda for picking the right output type for fp8/fp4
@@ -311,10 +332,10 @@ void MixtureOfExpertsPlugin::init()
 
     mMOERunner->use_deterministic_hopper_reduce_ = mK > 2 && mUseDeterministicKernels;
 
-    mGemmId1 = GemmIDMoe{1, mNumExperts, mK, mParallelismConfig, mExpertHiddenSize, mExpertInterSize, mActivationType,
-        mType, mWeightType, mQuantMode, mMOERunner->use_deterministic_hopper_reduce_};
-    mGemmId2 = GemmIDMoe{2, mNumExperts, mK, mParallelismConfig, mExpertHiddenSize, mExpertInterSize, mActivationType,
-        mType, mWeightType, mQuantMode, mMOERunner->use_deterministic_hopper_reduce_};
+    mGemmId1 = GemmIDMoe{1, mNumExperts, mK, mParallelismConfig, mExpertHiddenSize, mExpertInterSize, mGroupSize,
+        mActivationType, mType, mWeightType, mQuantMode, mMOERunner->use_deterministic_hopper_reduce_};
+    mGemmId2 = GemmIDMoe{2, mNumExperts, mK, mParallelismConfig, mExpertHiddenSize, mExpertInterSize, mGroupSize,
+        mActivationType, mType, mWeightType, mQuantMode, mMOERunner->use_deterministic_hopper_reduce_};
     mGemmProfiler->setMaxProfileM(16384 * mNumExperts / mK);
 
     if (hasLora())
@@ -369,9 +390,16 @@ bool MixtureOfExpertsPlugin::supportsFormatCombination(
 
     if (pos == getExpertWeights1Index() || pos == getExpertWeights2Index())
     {
-        auto normalized_weight_type
-            = mWeightType == nvinfer1::DataType::kINT4 ? nvinfer1::DataType::kINT8 : mWeightType;
-        return inOut[pos].type == normalized_weight_type;
+        if (mGroupwiseQuantAlgo == 0)
+        {
+            auto normalized_weight_type
+                = mWeightType == nvinfer1::DataType::kINT4 ? nvinfer1::DataType::kINT8 : mWeightType;
+            return inOut[pos].type == normalized_weight_type;
+        }
+        else
+        {
+            return inOut[pos].type == mOutputType;
+        }
     }
     else if (pos == getFinishedTensorIndex() && hasFinishedTensor())
     {
@@ -417,6 +445,20 @@ bool MixtureOfExpertsPlugin::supportsFormatCombination(
     {
         return inOut[pos].type == nvinfer1::DataType::kFLOAT;
     }
+    else if (hasExpertWeightQuantZeros() && getExpertIntQuantZeros1Index() <= pos
+        && pos <= getExpertIntQuantZeros2Index())
+    {
+        return inOut[pos].type == mOutputType;
+    }
+    else if (hasExpertPrequantScales() && getExpertPrequantScales1Index() <= pos
+        && pos <= getExpertPrequantScales2Index())
+    {
+        return inOut[pos].type == mOutputType;
+    }
+    else if (hasGroupwiseFp8Alpha() && getExpertFp8Alpha1Index() <= pos && pos <= getExpertFp8Alpha2Index())
+    {
+        return inOut[pos].type == DataType::kFLOAT;
+    }
     else if (hasLora() && pos == getHostRequestTypeIndex())
     {
         return inOut[pos].type == nvinfer1::DataType::kINT32;
@@ -441,7 +483,7 @@ bool MixtureOfExpertsPlugin::supportsFormatCombination(
     {
         return inOut[pos].type == nvinfer1::DataType::kINT32;
     }
-    else if (hasFP4QuantScales() && pos == getInputTensorIndex())
+    else if ((hasFP4QuantScales() || hasGroupwiseFp8Alpha()) && pos == getInputTensorIndex())
     {
         return inOut[pos].type == mOutputType;
     }
@@ -486,10 +528,10 @@ void MixtureOfExpertsPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc c
     {
         mDims = {minM, maxM, maxN, maxK};
     }
-    mGemmId1 = GemmIDMoe{1, mNumExperts, mK, mParallelismConfig, mExpertHiddenSize, mExpertInterSize, mActivationType,
-        mType, mWeightType, mQuantMode};
-    mGemmId2 = GemmIDMoe{2, mNumExperts, mK, mParallelismConfig, mExpertHiddenSize, mExpertInterSize, mActivationType,
-        mType, mWeightType, mQuantMode};
+    mGemmId1 = GemmIDMoe{1, mNumExperts, mK, mParallelismConfig, mExpertHiddenSize, mExpertInterSize, mGroupSize,
+        mActivationType, mType, mWeightType, mQuantMode};
+    mGemmId2 = GemmIDMoe{2, mNumExperts, mK, mParallelismConfig, mExpertHiddenSize, mExpertInterSize, mGroupSize,
+        mActivationType, mType, mWeightType, mQuantMode};
 
     if (hasLora())
     {
@@ -501,9 +543,9 @@ void MixtureOfExpertsPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc c
 
 auto MixtureOfExpertsPlugin::setupWorkspace(void* base_ptr, int64_t num_tokens, int num_reqs) const -> WorkspaceInfo
 {
-    size_t moe_workspace_size
-        = mMOERunner->getWorkspaceSize(num_tokens, mExpertHiddenSize, mExpertInterSize, mNumExperts, mK,
-            mActivationType, mNormalizationMode, mParallelismConfig, hasLora(), /*use_fp8_block_scaling=*/false);
+    size_t moe_workspace_size = mMOERunner->getWorkspaceSize(num_tokens, mExpertHiddenSize, mExpertInterSize,
+        mNumExperts, mK, mActivationType, mNormalizationMode, mParallelismConfig, hasLora(),
+        /*use_fp8_block_scaling=*/false, hasExpertPrequantScales());
 
     // Output of post-softmax routing probabilities
     size_t scale_probabilities_size = num_tokens * mNumExperts * sizeof(float);
@@ -582,7 +624,7 @@ MOEParallelismConfig MixtureOfExpertsPlugin::getParallelismConfig() const
 
 QuantParams tensorrt_llm::plugins::MixtureOfExpertsPlugin::getQuantParams(nvinfer1::PluginTensorDesc const* inputDesc,
     void const* const* inputs, int scale_1_idx, int scale_2_idx, int scale_3_idx, int scale_4_idx, int scale_5_idx,
-    int scale_6_idx) const
+    int scale_6_idx, int scale_7_idx, int scale_8_idx) const
 {
     void const* scale_1 = scale_1_idx >= 0 ? inputs[scale_1_idx] : nullptr;
     void const* scale_2 = scale_2_idx >= 0 ? inputs[scale_2_idx] : nullptr;
@@ -590,6 +632,8 @@ QuantParams tensorrt_llm::plugins::MixtureOfExpertsPlugin::getQuantParams(nvinfe
     void const* scale_4 = scale_4_idx >= 0 ? inputs[scale_4_idx] : nullptr;
     void const* scale_5 = scale_5_idx >= 0 ? inputs[scale_5_idx] : nullptr;
     void const* scale_6 = scale_6_idx >= 0 ? inputs[scale_6_idx] : nullptr;
+    void const* scale_7 = scale_7_idx >= 0 ? inputs[scale_7_idx] : nullptr;
+    void const* scale_8 = scale_8_idx >= 0 ? inputs[scale_8_idx] : nullptr;
     nvinfer1::PluginTensorDesc const* desc_1 = scale_1_idx >= 0 ? &inputDesc[scale_1_idx] : nullptr;
     nvinfer1::PluginTensorDesc const* desc_2 = scale_2_idx >= 0 ? &inputDesc[scale_2_idx] : nullptr;
     nvinfer1::PluginTensorDesc const* desc_3 = scale_3_idx >= 0 ? &inputDesc[scale_3_idx] : nullptr;
@@ -601,14 +645,29 @@ QuantParams tensorrt_llm::plugins::MixtureOfExpertsPlugin::getQuantParams(nvinfe
     if (hasExpertIntQuantScales())
     {
         TLLM_CHECK(scale_1 && scale_2);
-        TLLM_CHECK(!scale_3 && !scale_4 && !scale_5 && !scale_6);
-        TLLM_CHECK(desc_1->dims.nbDims == 2);
-        TLLM_CHECK(desc_2->dims.nbDims == 2);
-        TLLM_CHECK_WITH_INFO(desc_1->dims.d[0] == experts_per_node, "Incorrect number of experts in int quant scale");
-        TLLM_CHECK(desc_1->dims.d[1] == gated_inter_size);
-        TLLM_CHECK_WITH_INFO(desc_2->dims.d[0] == experts_per_node, "Incorrect number of experts in int quant scale");
-        TLLM_CHECK(desc_2->dims.d[1] == mExpertHiddenSize);
-        return QuantParams::Int(scale_1, scale_2);
+        if (!hasGroupwiseIntQuantScales())
+        {
+            TLLM_CHECK(!scale_3 && !scale_4 && !scale_5 && !scale_6);
+            TLLM_CHECK(desc_1->dims.nbDims == 2);
+            TLLM_CHECK(desc_2->dims.nbDims == 2);
+            TLLM_CHECK_WITH_INFO(
+                desc_1->dims.d[0] == experts_per_node, "Incorrect number of experts in int quant scale");
+            TLLM_CHECK(desc_1->dims.d[1] == gated_inter_size);
+            TLLM_CHECK_WITH_INFO(
+                desc_2->dims.d[0] == experts_per_node, "Incorrect number of experts in int quant scale");
+            TLLM_CHECK(desc_2->dims.d[1] == mExpertHiddenSize);
+            return QuantParams::Int(scale_1, scale_2);
+        }
+        else
+        {
+            TLLM_CHECK(desc_1->dims.nbDims == 3);
+            TLLM_CHECK(desc_2->dims.nbDims == 3);
+            TLLM_CHECK((scale_3 && scale_4) || !hasExpertPrequantScales());
+            TLLM_CHECK((scale_5 && scale_6) || !hasExpertWeightQuantZeros());
+            TLLM_CHECK((scale_7 && scale_8) || !hasGroupwiseFp8Alpha());
+            return QuantParams::GroupWise(mGroupSize, scale_1, scale_2, scale_3, scale_4, scale_5, scale_6,
+                static_cast<float const*>(scale_7), static_cast<float const*>(scale_8));
+        }
     }
     else if (hasExpertFp8QuantScales())
     {
@@ -835,8 +894,21 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     QuantParams quant_params{};
     if (hasExpertIntQuantScales())
     {
-        quant_params
-            = getQuantParams(inputDesc, inputs, getExpertIntQuantScale1Index(), getExpertIntQuantScale2Index());
+        if (mGroupSize > 0)
+        {
+            quant_params = getQuantParams(inputDesc, inputs, getExpertIntQuantScale1Index(),
+                getExpertIntQuantScale2Index(), hasExpertPrequantScales() ? getExpertPrequantScales1Index() : -1,
+                hasExpertPrequantScales() ? getExpertPrequantScales2Index() : -1,
+                hasExpertWeightQuantZeros() ? getExpertIntQuantZeros1Index() : -1,
+                hasExpertWeightQuantZeros() ? getExpertIntQuantZeros2Index() : -1,
+                hasGroupwiseFp8Alpha() ? getExpertFp8Alpha1Index() : -1,
+                hasGroupwiseFp8Alpha() ? getExpertFp8Alpha2Index() : -1);
+        }
+        else
+        {
+            quant_params
+                = getQuantParams(inputDesc, inputs, getExpertIntQuantScale1Index(), getExpertIntQuantScale2Index());
+        }
     }
     else if (hasExpertFp8QuantScales())
     {
@@ -942,8 +1014,8 @@ int MixtureOfExpertsPlugin::initialize() noexcept
         mLoraImpl1->setGemmConfig();
         mLoraImpl2->setGemmConfig();
 
-        mLoraProfiler->profileTactics(mLoraImpl1->mCublasWrapper, mType, mDims, mLoraGemmId1);
-        mLoraProfiler->profileTactics(mLoraImpl2->mCublasWrapper, mType, mDims, mLoraGemmId2);
+        mLoraProfiler->profileTactics(mLoraImpl1->getCublasWrapper(), mType, mDims, mLoraGemmId1);
+        mLoraProfiler->profileTactics(mLoraImpl2->getCublasWrapper(), mType, mDims, mLoraGemmId2);
     }
     return 0;
 }
@@ -999,34 +1071,29 @@ MixtureOfExpertsPluginCreator::MixtureOfExpertsPluginCreator()
 {
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
-    mPluginAttributes.emplace_back(nvinfer1::PluginField("remove_input_padding", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(nvinfer1::PluginField("number_of_experts", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(nvinfer1::PluginField("top_k", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(nvinfer1::PluginField("expert_hidden_size", nullptr, PluginFieldType::kINT32, 128));
-    mPluginAttributes.emplace_back(
-        nvinfer1::PluginField("expert_inter_size", nullptr, PluginFieldType::kINT32, 128 * 4));
-    mPluginAttributes.emplace_back(nvinfer1::PluginField(
-        "activation_type", nullptr, PluginFieldType::kINT32, static_cast<int>(tensorrt_llm::ActivationType::Identity)));
-    mPluginAttributes.emplace_back(
-        nvinfer1::PluginField("type_id", nullptr, PluginFieldType::kINT32, static_cast<int>(DataType::kHALF)));
-    mPluginAttributes.emplace_back(
-        nvinfer1::PluginField("weight_type_id", nullptr, PluginFieldType::kINT32, static_cast<int>(DataType::kHALF)));
-    mPluginAttributes.emplace_back(
-        nvinfer1::PluginField("quant_mode", nullptr, PluginFieldType::kINT32, static_cast<int>(DataType::kHALF)));
-    mPluginAttributes.emplace_back(nvinfer1::PluginField("use_finished", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(nvinfer1::PluginField("use_bias", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(nvinfer1::PluginField("tp_size", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(nvinfer1::PluginField("tp_rank", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(nvinfer1::PluginField("ep_size", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(nvinfer1::PluginField("ep_rank", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(nvinfer1::PluginField("normalization_mode", nullptr, PluginFieldType::kINT32,
-        static_cast<int>(MOEExpertScaleNormalizationMode::NONE)));
-    mPluginAttributes.emplace_back(
-        nvinfer1::PluginField("sparse_mixer_epsilon", nullptr, PluginFieldType::kFLOAT32, 0));
-    mPluginAttributes.emplace_back(nvinfer1::PluginField("side_stream_id", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(nvinfer1::PluginField("use_lora", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(nvinfer1::PluginField("lora_type_id", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(nvinfer1::PluginField("max_low_rank", nullptr, PluginFieldType::kINT32, 0));
+    mPluginAttributes.emplace_back(nvinfer1::PluginField("remove_input_padding", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(nvinfer1::PluginField("number_of_experts", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(nvinfer1::PluginField("top_k", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(nvinfer1::PluginField("expert_hidden_size", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(nvinfer1::PluginField("expert_inter_size", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(nvinfer1::PluginField("groupwise_quant_algo", nullptr, PluginFieldType::kINT32, 0));
+    mPluginAttributes.emplace_back(nvinfer1::PluginField("group_size", nullptr, PluginFieldType::kINT32, -1));
+    mPluginAttributes.emplace_back(nvinfer1::PluginField("activation_type", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(nvinfer1::PluginField("type_id", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(nvinfer1::PluginField("weight_type_id", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(nvinfer1::PluginField("quant_mode", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(nvinfer1::PluginField("use_finished", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(nvinfer1::PluginField("use_bias", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(nvinfer1::PluginField("tp_size", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(nvinfer1::PluginField("tp_rank", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(nvinfer1::PluginField("ep_size", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(nvinfer1::PluginField("ep_rank", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(nvinfer1::PluginField("normalization_mode", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(nvinfer1::PluginField("sparse_mixer_epsilon", nullptr, PluginFieldType::kFLOAT32));
+    mPluginAttributes.emplace_back(nvinfer1::PluginField("side_stream_id", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(nvinfer1::PluginField("use_lora", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(nvinfer1::PluginField("lora_type_id", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(nvinfer1::PluginField("max_low_rank", nullptr, PluginFieldType::kINT32));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }
@@ -1040,6 +1107,8 @@ IPluginV2* MixtureOfExpertsPluginCreator::createPlugin(
     int mK{};
     int mExpertHiddenSize{};
     int mExpertInterSize{};
+    int mGroupwiseQuantAlgo{};
+    int mGroupSize{};
     int mActivationType{};
     int mType{};
     int mWeightType{};
@@ -1075,6 +1144,8 @@ IPluginV2* MixtureOfExpertsPluginCreator::createPlugin(
         MapPair{"top_k", std::ref(mK)},
         MapPair{"expert_hidden_size", std::ref(mExpertHiddenSize)},
         MapPair{"expert_inter_size", std::ref(mExpertInterSize)},
+        MapPair{"groupwise_quant_algo", std::ref(mGroupwiseQuantAlgo)},
+        MapPair{"group_size", std::ref(mGroupSize)},
         MapPair{"activation_type", std::ref(mActivationType)},
         MapPair{"type_id", std::ref(mType)},
         MapPair{"weight_type_id", std::ref(mWeightType)},
@@ -1147,7 +1218,7 @@ IPluginV2* MixtureOfExpertsPluginCreator::createPlugin(
         auto loraProfiler = loraPluginProfileManager.createGemmPluginProfiler(/* inference */ false, /* skip */ true);
         auto* obj = new MixtureOfExpertsPlugin(
             // Constructor parameters
-            mRemoveInputPadding, mNumExperts, mK, mExpertHiddenSize, mExpertInterSize,
+            mRemoveInputPadding, mNumExperts, mK, mExpertHiddenSize, mExpertInterSize, mGroupwiseQuantAlgo, mGroupSize,
             static_cast<tensorrt_llm::ActivationType>(mActivationType), static_cast<nvinfer1::DataType>(mType),
             static_cast<nvinfer1::DataType>(mWeightType), static_cast<nvinfer1::DataType>(mOutputType),
             QuantMode(mQuantMode), mUseFinished != 0, mUseBias != 0, mTPSize, mTPRank, mEPSize, mEPRank,
@@ -1234,6 +1305,6 @@ void MixtureOfExpertsGemmProfiler::checkInit()
     init_backend = true;
     auto& plugin = *mRunner;
     backend.init(*plugin.mMOERunner, backend.mGemmToProfile, plugin.mType, plugin.mWeightType, plugin.mOutputType,
-        plugin.mNumExperts, plugin.mK, plugin.mExpertHiddenSize, plugin.mExpertInterSize, plugin.mActivationType,
-        plugin.hasBias(), plugin.hasLora(), plugin.getParallelismConfig());
+        plugin.mNumExperts, plugin.mK, plugin.mExpertHiddenSize, plugin.mExpertInterSize, plugin.mGroupSize,
+        plugin.mActivationType, plugin.hasBias(), plugin.hasLora(), plugin.getParallelismConfig());
 }

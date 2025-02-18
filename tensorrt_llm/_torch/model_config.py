@@ -18,6 +18,7 @@ class ModelConfig(Generic[TConfig]):
     quant_config: QuantConfig = field(default_factory=QuantConfig)
     # TODO(qijun): support per linear layer quantization
     quant_config_dict: Optional[Dict[str, QuantConfig]] = None
+    skip_create_weights: bool = False
 
     attn_backend: str = 'TRTLLM'
 

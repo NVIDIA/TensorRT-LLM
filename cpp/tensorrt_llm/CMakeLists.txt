@@ -359,6 +359,7 @@ else()
 endif()
 
 set(TRTLLM_LINK_LIBS
+    ${CUDA_DRV_LIB}
     ${CUBLAS_LIB}
     ${CUBLASLT_LIB}
     ${CMAKE_DL_LIBS}
@@ -368,6 +369,7 @@ set(TRTLLM_LINK_LIBS
     context_attention_src
     decoder_attention_src
     trtllm_gen_fmha
+    trtllm_gen_blockscale_gemm
     selective_scan_src
     ws_layernorm_src
     fpA_intB_gemm_src

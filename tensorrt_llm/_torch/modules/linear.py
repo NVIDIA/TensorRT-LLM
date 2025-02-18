@@ -135,14 +135,16 @@ class Linear(nn.Module):
                  dtype: torch.dtype = None,
                  parallel_config: Optional[ParallelConfig] = None,
                  quant_config: Optional[QuantConfig] = None,
-                 weights_loading_config: Optional[WeightsLoadingConfig] = None):
+                 weights_loading_config: Optional[WeightsLoadingConfig] = None,
+                 is_expert: bool = False,
+                 skip_create_weights: bool = False):
         from tensorrt_llm._torch.distributed import AllReduce
 
         super().__init__()
         self.has_bias = bias
         self.dtype = dtype
         self.parallel_config = parallel_config or ParallelConfig()
-        # could be modified later by reset_quant_config
+        # could be modified later
         self.quant_config = quant_config
         self.weights_loading_config = weights_loading_config or WeightsLoadingConfig(
         )
@@ -173,17 +175,12 @@ class Linear(nn.Module):
 
         self.all_reduce = AllReduce(self.parallel_config)
         self._weights_created = False
+        self.is_expert = is_expert
 
-    def reset_quant_config(self, quant_config: Optional[QuantConfig] = None):
-        """
-        This method can be used to reset the quant_config to None
-        according to the `exclude_modules` list in QuantConfig,
-        or a different mode to potentially allow for mixed quantization.
-        """
-        assert not self._weights_created, "Weight can't be created before calling Linear.reset_quant_config"
-        self.quant_config = quant_config
+        if not skip_create_weights:
+            self.create_weights()
 
-    def _create_weights(self):
+    def create_weights(self):
         if self._weights_created:
             return
         device = torch.device('cuda')
@@ -304,12 +301,16 @@ class Linear(nn.Module):
                     scale_b=self.weight_scale,
                     bias=bias,
                     out_dtype=self.dtype or input.dtype,
+                    userbuffers_id=-1,
                 )
             elif self.has_fp8_block_scales:
                 assert input.dtype == torch.bfloat16
 
+                act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize(
+                    input)
+
                 output = torch.ops.trtllm.fp8_block_scaling_gemm(
-                    input, self.weight, None, self.weight_scale)
+                    act_input_fp8, self.weight, act_input_sf, self.weight_scale)
 
             elif self.has_nv_fp4:
                 m = math.prod(input.shape[:-1])
@@ -344,21 +345,24 @@ class Linear(nn.Module):
 
         if self.tp_mode == TensorParallelMode.ROW:
             bias = None if (self.tp_rank > 0) else self.bias
-            if self.tp_size > 1:
-                fuse_bias_into_all_reduce = (
-                    bias is not None and all_reduce_params is not None
-                    and (all_reduce_params.fusion_op
-                         == AllReduceFusionOp.RESIDUAL_RMS_NORM))
-                if fuse_bias_into_all_reduce:
-                    all_reduce_params.bias = bias
-                    bias = None
+            if not self.is_expert:
+                if self.tp_size > 1:
+                    fuse_bias_into_all_reduce = (
+                        bias is not None and all_reduce_params is not None
+                        and (all_reduce_params.fusion_op
+                             == AllReduceFusionOp.RESIDUAL_RMS_NORM))
+                    if fuse_bias_into_all_reduce:
+                        all_reduce_params.bias = bias
+                        bias = None
+                else:
+                    assert all_reduce_params is None, "Cannot fuse norm/residual/bias ops into allreduce op since we do not call allreduce op when tp_size is 1."
+                output = self.apply_linear(input, self.weight, bias)
+                output = self.all_reduce(
+                    output,
+                    all_reduce_params=all_reduce_params,
+                )
             else:
-                assert all_reduce_params is None, "Cannot fuse norm/residual/bias ops into allreduce op since we do not call allreduce op when tp_size is 1."
-            output = self.apply_linear(input, self.weight, bias)
-            output = self.all_reduce(
-                output,
-                all_reduce_params=all_reduce_params,
-            )
+                output = self.apply_linear(input, self.weight, bias)
         elif self.tp_mode == TensorParallelMode.COLUMN:
             output = self.apply_linear(input, self.weight, self.bias)
             if self.parallel_config.gather_output:
@@ -369,8 +373,7 @@ class Linear(nn.Module):
         return output
 
     def load_weights(self, weights: List[Dict]):
-        if not self._weights_created:
-            self._create_weights()
+        assert self._weights_created
 
         def copy(dst: Parameter, src: torch.Tensor):
             assert dst.dtype == src.dtype, f"Incompatible dtype. dst: {dst.dtype}, src: {src.dtype}"

@@ -930,17 +930,6 @@ class GenerationSession(object):
                 CustomAllReduceHelper.max_workspace_size_auto(
                     self.mapping.tp_size))
 
-            if self.use_gemm_allreduce_plugin:
-                # XXX (xsimmons): this is a bit hacky as it assumes
-                # 2x RowLinear layers per attention block.
-                # This will be fixed soon when I remove coupling between model
-                # and runtime.
-                for i in range(self.num_attn_layers * 2):
-                    expected_tensor_names += [
-                        f'gemm_allreduce_uc_out_{i}',
-                        f'gemm_allreduce_mc_out_{i}'
-                    ]
-
         self.gather_tree = torch.ops.tensorrt_llm.gather_tree
 
         if self.mapping.is_first_pp_rank():
@@ -1090,7 +1079,8 @@ class GenerationSession(object):
             for i in range(self.runtime.engine.num_io_tensors)
         ]
         for name in found_tensor_names:
-            if name.startswith("allreduce_ub_"):
+            if name.startswith("allreduce_ub_") or name.startswith(
+                    "gemm_allreduce"):
                 expected_tensor_names += [name]
         if not self.debug_mode and set(expected_tensor_names) != set(
                 found_tensor_names):
@@ -2411,25 +2401,29 @@ class GenerationSession(object):
         if self.mapping.tp_size > 1:
             add_tensor(self.all_reduce_workspace, 'all_reduce_workspace')
             if self.use_gemm_allreduce_plugin:
-                # bind pointers to symbolic tensors
-                idx = 0
-                for i in range(self.num_attn_layers):
-                    # XXX (xsimmons): this is a bit hacky as it assumes
-                    # 2x RowLinear layers per attention block.
-                    # This will be fixed soon when I remove coupling between model
-                    # and runtime.
-                    for _ in range(2):
+                found_tensor_names = [
+                    self.runtime.engine.get_tensor_name(i)
+                    for i in range(self.runtime.engine.num_io_tensors)
+                ]
+                for name in found_tensor_names:
+                    if name.startswith("gemm_allreduce_uc_out"):
                         add_tensor_from_pointer(
                             self.gemm_allreduce_output_handle.uc_ptr,
-                            f'gemm_allreduce_uc_out_{idx}',
+                            name,
                             shape=(self.gemm_allreduce_output_size),
                             str_dtype=self.gemm_allreduce_plugin)
+                    if name.startswith("gemm_allreduce_mc_out"):
                         add_tensor_from_pointer(
                             self.gemm_allreduce_output_handle.mc_ptr,
-                            f'gemm_allreduce_mc_out_{idx}',
+                            name,
                             shape=(self.gemm_allreduce_output_size),
                             str_dtype=self.gemm_allreduce_plugin)
-                        idx += 1
+                    if name.startswith("gemm_allreduce_ipc_out"):
+                        add_tensor_from_pointer(
+                            self.gemm_allreduce_output_handle.get_ipc_ptrs(),
+                            name,
+                            shape=(self.gemm_allreduce_output_size),
+                            str_dtype=self.gemm_allreduce_plugin)
 
         if self.use_lora_plugin:
             for idx in range(self.num_layers):
@@ -2777,26 +2771,29 @@ class GenerationSession(object):
         if self.mapping.tp_size > 1:
             add_tensor(self.all_reduce_workspace, 'all_reduce_workspace')
             if self.use_gemm_allreduce_plugin:
-                # bind pointers to symbolic tensors
-                idx = 0
-                for i in range(self.num_attn_layers):
-                    # XXX (xsimmons): this is very hacky as it makes
-                    # an assumption about having 2x RowLinear layers
-                    # per attention block. The design doesn't provide
-                    # an way to determine which layers use RowLinear
-                    # without a lot of surgery
-                    for _ in range(2):
+                found_tensor_names = [
+                    self.runtime.engine.get_tensor_name(i)
+                    for i in range(self.runtime.engine.num_io_tensors)
+                ]
+                for name in found_tensor_names:
+                    if name.startswith("gemm_allreduce_uc_out"):
                         add_tensor_from_pointer(
                             self.gemm_allreduce_output_handle.uc_ptr,
-                            f'gemm_allreduce_uc_out_{idx}',
+                            name,
                             shape=(self.gemm_allreduce_output_size),
                             str_dtype=self.gemm_allreduce_plugin)
+                    if name.startswith("gemm_allreduce_mc_out"):
                         add_tensor_from_pointer(
                             self.gemm_allreduce_output_handle.mc_ptr,
-                            f'gemm_allreduce_mc_out_{idx}',
+                            name,
                             shape=(self.gemm_allreduce_output_size),
                             str_dtype=self.gemm_allreduce_plugin)
-                        idx += 1
+                    if name.startswith("gemm_allreduce_ipc_out"):
+                        add_tensor_from_pointer(
+                            self.gemm_allreduce_output_handle.get_ipc_ptrs(),
+                            name,
+                            shape=(self.gemm_allreduce_output_size),
+                            str_dtype=self.gemm_allreduce_plugin)
 
         # Since we are using a ping-pong context design and the lora weight remains constant within the same request,
         # it is only necessary to set the lora weight for the first two steps.

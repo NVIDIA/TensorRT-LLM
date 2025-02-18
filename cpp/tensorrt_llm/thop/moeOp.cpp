@@ -429,7 +429,7 @@ private:
             tensorrt_llm::runtime::TorchUtils::dataType(mActivationDtype),
             tensorrt_llm::runtime::TorchUtils::dataType(mWeightDtype),
             tensorrt_llm::runtime::TorchUtils::dataType(mOutputDtype), num_experts, top_k, hidden_size, inter_size,
-            tensorrt_llm::ActivationType::Swiglu,
+            /* group_size */ -1, tensorrt_llm::ActivationType::Swiglu,
             /* bias */ false, /* use_lora */ false, parallelism_config);
 
         char* profile_workspace = nullptr;
@@ -543,7 +543,8 @@ private:
         kernels::MOEExpertScaleNormalizationMode norm_mode, kernels::MOEParallelismConfig const& parallelismConfig)
     {
         size_t moe_workspace_size = mKernelRunner->getWorkspaceSize(num_rows, hidden_size, inter_size, num_experts,
-            top_k, activation_type, norm_mode, parallelismConfig, /* use_lora */ false, mUseFp8BlockScaling);
+            top_k, activation_type, norm_mode, parallelismConfig, /* use_lora */ false, mUseFp8BlockScaling,
+            /* hasExpertPrequantScales */ false);
         size_t scale_prob_size = num_rows * num_experts * sizeof(float);
         size_t src_to_dest_map_size = top_k * num_rows * sizeof(int);
         size_t selected_expert_size = top_k * num_rows * sizeof(int);

@@ -403,5 +403,16 @@ private:
     BaseType mValue{0};
 };
 
+class GroupwiseQuantAlgo
+{
+    // Keep align with tensorrt_llm/quantization/mode.py
+public:
+    static constexpr int BIAS = int(1) << 0;
+    static constexpr int ZERO = int(1) << 1;
+    static constexpr int PRE_QUANT_SCALE = int(1) << 2;
+    static constexpr int FP8_ALPHA = int(1) << 3;
+    static constexpr int INT8_WEIGHT = int(1) << 4;
+};
+
 } // namespace common
 } // namespace tensorrt_llm

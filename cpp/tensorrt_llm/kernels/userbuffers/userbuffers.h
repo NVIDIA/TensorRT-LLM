@@ -14,12 +14,9 @@
  * limitations under the License.
  */
 #pragma once
-#include "cuda_runtime.h"
-#include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/dataType.h"
-#include "tensorrt_llm/common/envUtils.h"
-#include "tensorrt_llm/common/mpiUtils.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
+
 #include <cuda.h>
 #if defined(__aarch64__) || defined(_M_ARM64)
 #define MNNVL
@@ -98,7 +95,7 @@ struct communicator
     int *send_id, *recv_id;
     int mydev;
 };
-typedef struct communicator communicator;
+using communicator = struct communicator;
 
 int create_communicator_grouped2(communicator** comm, tensorrt_llm::runtime::WorldConfig const& world_config);
 /*  creates communicator with

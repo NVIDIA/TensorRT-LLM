@@ -166,11 +166,22 @@ inline std::optional<bool> isCudaLaunchBlocking()
     return ptr;
 }
 
+inline bool isCapturing()
+{
+    cudaStreamCaptureStatus status;
+    check_cuda_error(cudaStreamIsCapturing(cudaStreamPerThread, &status));
+    return status == cudaStreamCaptureStatus::cudaStreamCaptureStatusActive;
+}
+
 inline bool doCheckError()
 {
     auto const cudaLaunchBlocking = isCudaLaunchBlocking();
+    if (cudaLaunchBlocking.has_value() && cudaLaunchBlocking.value())
+    {
+        return !isCapturing();
+    }
 #ifndef NDEBUG
-    bool const checkError = cudaLaunchBlocking.value_or(true);
+    bool const checkError = cudaLaunchBlocking.value_or(!isCapturing());
 #else
     bool const checkError = cudaLaunchBlocking.value_or(false);
 #endif

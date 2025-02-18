@@ -167,6 +167,8 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         tllmRunnerParams.oSfScalePtr = runnerParams.oSfScalePtr;
         tllmRunnerParams.oPtr = runnerParams.outputPtr;
         tllmRunnerParams.oSfPtr = runnerParams.outputSfPtr;
+        // The sequence lengths for K/V.
+        tllmRunnerParams.seqLensKvPtr = reinterpret_cast<int const*>(runnerParams.kvSeqLenPtr);
         tllmRunnerParams.mHeadDim = mFixedParams.headSize;
         tllmRunnerParams.mNumHeadsQ = mFixedParams.numQHeads;
         tllmRunnerParams.mNumHeadsKv = mFixedParams.numKvHeads;

@@ -577,7 +577,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                 dtype=q.dtype,
                                 device=q.device)
                 return AttentionBackend.dummy_forward(
-                    q, k, v)[..., :num_kv_heads * self.mla_params.v_head_dim]
+                    q, k, v)[..., :num_kv_heads *
+                             self.mla_params.v_head_dim].contiguous()
 
         assert isinstance(
             metadata,

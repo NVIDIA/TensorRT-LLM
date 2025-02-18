@@ -16,3 +16,4 @@
 #
 
 add_subdirectory(fmha)
+add_subdirectory(blockscaleGemm)

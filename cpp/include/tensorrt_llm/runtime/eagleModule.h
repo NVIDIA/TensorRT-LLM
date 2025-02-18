@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/speculativeDecodingModule.h"
 

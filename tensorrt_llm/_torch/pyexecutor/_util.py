@@ -1,8 +1,10 @@
+import random
 from collections.abc import Iterable
 
 import torch
 
 import tensorrt_llm
+from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm.bindings.executor import ExecutorConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -42,8 +44,7 @@ def cal_max_tokens(peak_memory, total_gpu_memory, fraction, model_config,
     if mla:
         # MLA has kv_lora_rank and qk_rope_head_dim
         head_dim = config.kv_lora_rank + config.qk_rope_head_dim
-        # todo: keep this factor be aligned with kvCacheManager
-        kv_factor = 2
+        kv_factor = 1
     else:
         head_dim = (config.hidden_size * num_key_value_heads /
                     config.num_attention_heads / tp_size)
@@ -61,7 +62,7 @@ def cal_max_tokens(peak_memory, total_gpu_memory, fraction, model_config,
     return max_tokens
 
 
-def _create_dummy_context(req_id: int, input_len: int):
+def _create_dummy_context(req_id: int, input_len: int, vocab_size: int):
     # To avoid recursive dependency during init tensorrt_llm.executor
     from tensorrt_llm import SamplingParams
     sampling_params = SamplingParams()
@@ -69,8 +70,10 @@ def _create_dummy_context(req_id: int, input_len: int):
     result = LlmRequest(
         request_id=req_id,
         max_new_tokens=1,
-        input_tokens=[i for i in range(0, input_len)],
-        position_ids=[0 for _ in range(0, input_len)],
+        input_tokens=[
+            random.randint(0, vocab_size - 1) for _ in range(input_len)
+        ],
+        position_ids=list(range(input_len)),
         sampling_config=tensorrt_llm.bindings.SamplingConfig(
             sampling_params._get_sampling_config()),
         is_streaming=False,
@@ -80,10 +83,10 @@ def _create_dummy_context(req_id: int, input_len: int):
 
 
 def create_dummy_context_request(
-        req_id: int, input_len: int,
+        req_id: int, input_len: int, vocab_size: int,
         kv_cache_manager: KVCacheManager) -> LlmRequest:
 
-    requests = [_create_dummy_context(req_id, input_len)]
+    requests = [_create_dummy_context(req_id, input_len, vocab_size)]
     result = ScheduledRequests()
     result.generation_requests = []
     result.context_requests = requests
@@ -97,8 +100,10 @@ def create_dummy_context_request(
     return result
 
 
-def estimate_max_kv_cache_tokens(model_engine, executor_config: ExecutorConfig,
+def estimate_max_kv_cache_tokens(model_engine: PyTorchModelEngine,
+                                 executor_config: ExecutorConfig,
                                  mapping: Mapping):
+    vocab_size = model_engine.model.model_config.pretrained_config.vocab_size
     max_num_tokens = executor_config.max_num_tokens
     fraction = executor_config.kv_cache_config.free_gpu_memory_fraction
     kv_cache_max_tokens = executor_config.kv_cache_config.max_tokens
@@ -108,7 +113,8 @@ def estimate_max_kv_cache_tokens(model_engine, executor_config: ExecutorConfig,
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
-        req = create_dummy_context_request(0, max_num_tokens, resource_manager)
+        req = create_dummy_context_request(0, max_num_tokens, vocab_size,
+                                           resource_manager)
         model_engine.forward(req, resource_manager)
         torch.cuda.synchronize()
         peak_memory = torch.cuda.memory_stats()["allocated_bytes.all.peak"]

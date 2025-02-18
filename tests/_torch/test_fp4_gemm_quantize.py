@@ -154,6 +154,7 @@ class TestProfiling(unittest.TestCase):
     )
     @skip_pre_blackwell_unittest
     def test_fp4_quantize_gemm_torch_profiling(self, m: int, n: int, k: int):
+        pytest.skip("https://nvbugs/5100633")
         a = torch.randn([m, k], dtype=torch.float32)
         b = torch.randn([n, k], dtype=torch.float32)
         a_global_sf = (448 * 6) / a.abs().max().float()

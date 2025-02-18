@@ -351,8 +351,8 @@ Fp4GemmPluginCreator::Fp4GemmPluginCreator()
 {
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
-    mPluginAttributes.emplace_back(PluginField("sv_vec_size", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("output_type_id", nullptr, PluginFieldType::kINT32, 0));
+    mPluginAttributes.emplace_back(PluginField("sv_vec_size", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("output_type_id", nullptr, PluginFieldType::kINT32));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }

@@ -15,7 +15,6 @@
  * limitations under the License.
  */
 #include "bertAttentionPlugin.h"
-#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
@@ -114,26 +113,20 @@ bool BertAttentionPlugin::supportsFormatCombination(
         {
             return inOut[pos].type == nvinfer1::DataType::kINT32;
         }
-        else
-        {
-            return (inOut[pos].type == mType) && (inOut[pos].format == TensorFormat::kLINEAR);
-        }
+
+        return (inOut[pos].type == mType) && (inOut[pos].format == TensorFormat::kLINEAR);
     }
-    else if (nbInputs > 2)
+    if (nbInputs > 2)
     { // Encoder in encoder-decoder
         if (pos == 1 || pos == 2)
         {
             return inOut[pos].type == nvinfer1::DataType::kINT32;
         }
-        else
-        {
-            return (inOut[pos].type == mType) && (inOut[pos].format == TensorFormat::kLINEAR);
-        }
+
+        return (inOut[pos].type == mType) && (inOut[pos].format == TensorFormat::kLINEAR);
     }
-    else
-    {
-        return false;
-    }
+
+    return false;
 }
 
 void BertAttentionPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int nbInputs,
@@ -153,17 +146,17 @@ size_t BertAttentionPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* i
 
     auto const size = tensorrt_llm::runtime::BufferDataType(inputs[0].type).getSize();
 
-    const size_t attention_mask_size = mEnableContextFMHA ? 0 : size * batch_size * input_seq_len * input_seq_len;
-    const size_t cu_seqlens_size = sizeof(int) * (batch_size + 1);
-    const size_t q_buf_2_size = mEnableContextFMHA ? 0 : size * batch_size * input_seq_len * local_hidden_units_;
-    const size_t k_buf_2_size = mEnableContextFMHA ? 0 : size * batch_size * input_seq_len * local_hidden_units_;
-    const size_t v_buf_2_size = mEnableContextFMHA ? 0 : size * batch_size * input_seq_len * local_hidden_units_;
-    const size_t qk_buf_size = mEnableContextFMHA ? 0 : size * batch_size * mNumHeads * input_seq_len * input_seq_len;
-    const size_t qkv_buf_2_size = mEnableContextFMHA ? 0 : size * batch_size * input_seq_len * local_hidden_units_;
-    const size_t qk_buf_float_size
+    size_t const attention_mask_size = mEnableContextFMHA ? 0 : size * batch_size * input_seq_len * input_seq_len;
+    size_t const cu_seqlens_size = sizeof(int) * (batch_size + 1);
+    size_t const q_buf_2_size = mEnableContextFMHA ? 0 : size * batch_size * input_seq_len * local_hidden_units_;
+    size_t const k_buf_2_size = mEnableContextFMHA ? 0 : size * batch_size * input_seq_len * local_hidden_units_;
+    size_t const v_buf_2_size = mEnableContextFMHA ? 0 : size * batch_size * input_seq_len * local_hidden_units_;
+    size_t const qk_buf_size = mEnableContextFMHA ? 0 : size * batch_size * mNumHeads * input_seq_len * input_seq_len;
+    size_t const qkv_buf_2_size = mEnableContextFMHA ? 0 : size * batch_size * input_seq_len * local_hidden_units_;
+    size_t const qk_buf_float_size
         = mEnableContextFMHA ? 0 : sizeof(float) * batch_size * mNumHeads * input_seq_len * input_seq_len;
-    const size_t padding_offset_size = mEnableContextFMHA ? 0 : sizeof(int) * batch_size * input_seq_len;
-    const size_t fmha_scheduler_counter = mEnableContextFMHA ? sizeof(uint32_t) : 0;
+    size_t const padding_offset_size = mEnableContextFMHA ? 0 : sizeof(int) * batch_size * input_seq_len;
+    size_t const fmha_scheduler_counter = mEnableContextFMHA ? sizeof(uint32_t) : 0;
 
     int const NUM_BUFFERS = 11;
     size_t workspaces[NUM_BUFFERS];
@@ -232,17 +225,17 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
 #endif
 
     const size_t attention_mask_size = mEnableContextFMHA ? 0 : sizeof(T) * batch_size * input_seq_len * input_seq_len;
-    const size_t cu_seqlens_size = sizeof(int) * (batch_size + 1);
-    const size_t q_buf_2_size = mEnableContextFMHA ? 0 : sizeof(T) * batch_size * input_seq_len * local_hidden_units_;
-    const size_t k_buf_2_size = mEnableContextFMHA ? 0 : sizeof(T) * batch_size * input_seq_len * local_hidden_units_;
-    const size_t v_buf_2_size = mEnableContextFMHA ? 0 : sizeof(T) * batch_size * input_seq_len * local_hidden_units_;
-    const size_t qk_buf_size
+    size_t const cu_seqlens_size = sizeof(int) * (batch_size + 1);
+    size_t const q_buf_2_size = mEnableContextFMHA ? 0 : sizeof(T) * batch_size * input_seq_len * local_hidden_units_;
+    size_t const k_buf_2_size = mEnableContextFMHA ? 0 : sizeof(T) * batch_size * input_seq_len * local_hidden_units_;
+    size_t const v_buf_2_size = mEnableContextFMHA ? 0 : sizeof(T) * batch_size * input_seq_len * local_hidden_units_;
+    size_t const qk_buf_size
         = mEnableContextFMHA ? 0 : sizeof(T) * batch_size * mNumHeads * input_seq_len * input_seq_len;
-    const size_t qkv_buf_2_size = mEnableContextFMHA ? 0 : sizeof(T) * batch_size * input_seq_len * local_hidden_units_;
-    const size_t qk_buf_float_size
+    size_t const qkv_buf_2_size = mEnableContextFMHA ? 0 : sizeof(T) * batch_size * input_seq_len * local_hidden_units_;
+    size_t const qk_buf_float_size
         = mEnableContextFMHA ? 0 : sizeof(float) * batch_size * mNumHeads * input_seq_len * input_seq_len;
-    const size_t padding_offset_size = mEnableContextFMHA ? 0 : sizeof(int) * batch_size * input_seq_len;
-    const size_t fmha_scheduler_counter = mEnableContextFMHA ? sizeof(uint32_t) : 0;
+    size_t const padding_offset_size = mEnableContextFMHA ? 0 : sizeof(int) * batch_size * input_seq_len;
+    size_t const fmha_scheduler_counter = mEnableContextFMHA ? sizeof(uint32_t) : 0;
 
     // Workspace pointer shift
     int8_t* workspace_byte_ptr = reinterpret_cast<int8_t*>(workspace);
@@ -262,8 +255,7 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
         = reinterpret_cast<uint32_t*>(tc::nextWorkspacePtr(workspace_byte_ptr, offset, fmha_scheduler_counter));
 
     // build attention_mask, cu_seqlens, and padding_offset tensors
-    BuildDecoderInfoParams<T> params;
-    memset(&params, 0, sizeof(params));
+    BuildDecoderInfoParams<T> params{};
     params.seqQOffsets = cu_seqlens;
     params.paddingOffsets = padding_offset;
     params.attentionMask = attention_mask;
@@ -286,7 +278,7 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
     float const qk_scale
         = 1.0f / (sqrtf(mHeadSize * 1.0f) * q_scaling); // q_scaling in denominator. by default q_scaling =1.0f
     float const qk_scale_gemm = mRelativeAttention ? qk_scale : 1.0f;
-    const T qk_scale_softmax = static_cast<T>(mRelativeAttention ? 1.0f : qk_scale);
+    T const qk_scale_softmax = static_cast<T>(mRelativeAttention ? 1.0f : qk_scale);
 
     T* linear_bias_slopes = nullptr;
 
@@ -566,14 +558,14 @@ BertAttentionPluginCreator::BertAttentionPluginCreator()
 {
     // Fill PluginFieldCollection with PluginField arguments metadata
     mPluginAttributes.clear();
-    mPluginAttributes.emplace_back(PluginField("num_heads", nullptr, PluginFieldType::kINT32, -1));
-    mPluginAttributes.emplace_back(PluginField("head_size", nullptr, PluginFieldType::kINT32, -1));
-    mPluginAttributes.emplace_back(PluginField("q_scaling", nullptr, PluginFieldType::kFLOAT32, 1.0));
-    mPluginAttributes.emplace_back(PluginField("context_fmha_type", nullptr, PluginFieldType::kINT8, 0));
-    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32, 1));
-    mPluginAttributes.emplace_back(PluginField("do_relative_attention", nullptr, PluginFieldType::kINT8, 0));
-    mPluginAttributes.emplace_back(PluginField("max_distance", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(PluginField("remove_padding", nullptr, PluginFieldType::kINT8, 0));
+    mPluginAttributes.emplace_back(PluginField("num_heads", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("head_size", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("q_scaling", nullptr, PluginFieldType::kFLOAT32));
+    mPluginAttributes.emplace_back(PluginField("context_fmha_type", nullptr, PluginFieldType::kINT8));
+    mPluginAttributes.emplace_back(PluginField("type_id", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("do_relative_attention", nullptr, PluginFieldType::kINT8));
+    mPluginAttributes.emplace_back(PluginField("max_distance", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(PluginField("remove_padding", nullptr, PluginFieldType::kINT8));
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }

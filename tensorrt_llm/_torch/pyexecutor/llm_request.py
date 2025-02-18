@@ -44,9 +44,7 @@ def executor_request_to_llm_request(req_id: int,
     # todo: remove this when have pytorch tensor binding
     assert executor_request.embedding_bias is None, "Tensor not supported now."
     assert executor_request.bad_words is None or len(
-        executor_request.bad_words
-    ) == 0 and executor_request.stop_words is None or len(
-        executor_request.stop_words) == 0, "Tensor not supported now."
+        executor_request.bad_words) == 0, "Tensor not supported now."
 
     input_tokens = input_token_ids if input_token_ids is not None else executor_request.input_token_ids
     llm_request = LlmRequest(
@@ -81,4 +79,7 @@ def executor_request_to_llm_request(req_id: int,
         return_encoder_output=False,
         client_id=executor_request.client_id,
         priority=0.5)
+    # TODO: remove this when use DynamicDecodeOp in pytorch flow.
+    # currently, keep py_stop_workds_list as python list, rather than tensor.
+    llm_request.py_stop_words_list = executor_request.stop_words
     return llm_request

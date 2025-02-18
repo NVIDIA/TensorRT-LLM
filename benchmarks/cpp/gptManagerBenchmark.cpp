@@ -17,7 +17,6 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/tensor.h"
 #include "tensorrt_llm/executor/types.h"
@@ -25,6 +24,7 @@
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/numpyUtils.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 #include "utils/utils.h"
@@ -201,7 +201,7 @@ public:
     {
         TLLM_CHECK_WITH_INFO(mRequestBenchInfos.find(requestId) == mRequestBenchInfos.end(),
             "Request %lu already exists in record before start, please report a bug to developers.", requestId);
-        const std::lock_guard<std::mutex> lock(mRequestBenchInfosMutex);
+        std::lock_guard<std::mutex> const lock(mRequestBenchInfosMutex);
         mRequestBenchInfos[requestId] = BenchInfo(inputLength, start);
     }
 
@@ -217,7 +217,7 @@ public:
             outputLength = std::max(static_cast<int32_t>(beam.size()), outputLength);
         }
 
-        const std::lock_guard<std::mutex> lock(mRequestBenchInfosMutex);
+        std::lock_guard<std::mutex> const lock(mRequestBenchInfosMutex);
         mRequestBenchInfos[requestId].outputLength += outputLength;
 
         if (!mRequestBenchInfos[requestId].firstTokenSeen)
@@ -250,7 +250,7 @@ public:
                     int inputSeqLen = mRequestBenchInfos[requestId].inputLength;
                     outSeqLen -= inputSeqLen;
                 }
-                const std::lock_guard<std::mutex> lock(mRequestBenchInfosMutex);
+                std::lock_guard<std::mutex> const lock(mRequestBenchInfosMutex);
                 mRequestBenchInfos[requestId].outputLength = outSeqLen;
                 mRequestBenchInfos[requestId].decodingIter = response.getResult().decodingIter;
 
@@ -264,7 +264,7 @@ public:
             }
         }
 
-        const std::lock_guard<std::mutex> lock(mRequestBenchInfosMutex);
+        std::lock_guard<std::mutex> const lock(mRequestBenchInfosMutex);
         mRequestBenchInfos[requestId].end = end;
         mRequestBenchInfos[requestId].hasError = response.hasError();
     }
