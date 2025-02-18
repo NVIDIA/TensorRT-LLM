@@ -232,13 +232,6 @@ def throughput_command(
     engine_bs = exec_settings["settings_config"]["max_batch_size"]
     engine_tokens = exec_settings["settings_config"]["max_num_tokens"]
 
-    # Check that we are not using a low latency engine
-    # Right now, this is based on max batch size.
-    if engine_bs == 1:
-        raise ValueError(
-            "An engine with a batch size greater than 1 should be used for "
-            "throughput benchmarking. Exiting.")
-
     # Runtime Options
     runtime_max_bs = params.pop("max_batch_size")
     runtime_max_tokens = params.pop("max_num_tokens")

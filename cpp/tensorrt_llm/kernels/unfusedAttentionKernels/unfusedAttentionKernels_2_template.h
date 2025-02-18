@@ -650,6 +650,33 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
             }
         }
     }
+
+    // Prepare values for fmha.
+    if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.y == 0)
+    {
+        // Reset fmha tile counter to 0 before launching fmha kernels.
+        if (params.fmha_tile_counter)
+        {
+            params.fmha_tile_counter[0] = 0u;
+        }
+        // Take the quantization scales into consideration.
+        float q_scale_quant_orig = params.q_scale_quant_orig ? params.q_scale_quant_orig[0] : 1.f;
+        float kv_scale_quant_orig = params.kv_scale_quant_orig ? params.kv_scale_quant_orig[0] : 1.f;
+        float o_scale_orig_quant = params.o_scale_orig_quant ? params.o_scale_orig_quant[0] : 1.f;
+        if (params.fmha_bmm1_scale)
+        {
+            // The scale after fmha bmm1.
+            params.fmha_bmm1_scale[0] = q_scale_quant_orig * kv_scale_quant_orig * params.fmha_host_bmm1_scale;
+            // The scale prepared for log2 optimization.
+            constexpr float kLog2e = 1.4426950408889634074f;
+            params.fmha_bmm1_scale[1] = params.fmha_bmm1_scale[0] * kLog2e;
+        }
+        if (params.fmha_bmm2_scale)
+        {
+            // The scale after fmha bmm2.
+            params.fmha_bmm2_scale[0] = o_scale_orig_quant * kv_scale_quant_orig;
+        }
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1037,6 +1064,33 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
                     }
                 }
             }
+        }
+    }
+
+    // Prepare values for fmha.
+    if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.y == 0)
+    {
+        // Reset fmha tile counter to 0 before launching fmha kernels.
+        if (params.fmha_tile_counter)
+        {
+            params.fmha_tile_counter[0] = 0u;
+        }
+        // Take the quantization scales into consideration.
+        float q_scale_quant_orig = params.q_scale_quant_orig ? params.q_scale_quant_orig[0] : 1.f;
+        float kv_scale_quant_orig = params.kv_scale_quant_orig ? params.kv_scale_quant_orig[0] : 1.f;
+        float o_scale_orig_quant = params.o_scale_orig_quant ? params.o_scale_orig_quant[0] : 1.f;
+        if (params.fmha_bmm1_scale)
+        {
+            // The scale after fmha bmm1.
+            params.fmha_bmm1_scale[0] = q_scale_quant_orig * kv_scale_quant_orig * params.fmha_host_bmm1_scale;
+            // The scale prepared for log2 optimization.
+            constexpr float kLog2e = 1.4426950408889634074f;
+            params.fmha_bmm1_scale[1] = params.fmha_bmm1_scale[0] * kLog2e;
+        }
+        if (params.fmha_bmm2_scale)
+        {
+            // The scale after fmha bmm2.
+            params.fmha_bmm2_scale[0] = o_scale_orig_quant * kv_scale_quant_orig;
         }
     }
 }

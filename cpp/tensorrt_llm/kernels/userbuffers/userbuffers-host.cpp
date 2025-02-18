@@ -15,14 +15,15 @@
  */
 
 #include "ipcsocket.h"
+#include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "userbuffers.h"
-#include <assert.h>
-#include <chrono>
+
+#include <cassert>
+#include <cstdio>
+#include <cstring>
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
-#include <iostream>
-#include <stdio.h>
-#include <string.h>
 #include <unistd.h>
 
 namespace tensorrt_llm::runtime::ub
@@ -50,7 +51,7 @@ typedef CUmemFabricHandle_v1 CUmemFabricHandle;
 #define CUCHECK(cmd)                                                                                                   \
     do                                                                                                                 \
     {                                                                                                                  \
-        CUresult retval = cmd;                                                                                         \
+        CUresult const retval = cmd;                                                                                   \
         if (retval != CUDA_SUCCESS)                                                                                    \
         {                                                                                                              \
             const char* error_string;                                                                                  \
@@ -63,7 +64,7 @@ typedef CUmemFabricHandle_v1 CUmemFabricHandle;
 #define NCCLCHECK(cmd)                                                                                                 \
     do                                                                                                                 \
     {                                                                                                                  \
-        ipcSocketResult_t r = cmd;                                                                                     \
+        ipcSocketResult_t const r = cmd;                                                                               \
         if (r != ipcSocketSuccess)                                                                                     \
         {                                                                                                              \
             printf("Failed, NCCL error %s:%d ''\n", __FILE__, __LINE__);                                               \
@@ -82,9 +83,12 @@ typedef CUmemFabricHandle_v1 CUmemFabricHandle;
         }                                                                                                              \
     } while (0);
 
+namespace
+{
 void ub_alloc_copy_allgather(void** globaldata, size_t data_bytes, void* localdata, MPI_Comm c)
 {
-    int myrank, nranks;
+    int myrank = 0;
+    int nranks = 0;
     MPI_Comm_rank(c, &myrank);
     MPI_Comm_size(c, &nranks);
     *globaldata = malloc(nranks * data_bytes); // peer addresses
@@ -117,12 +121,16 @@ void ub_free(void* ptr)
 {
     free(ptr);
 }
+} // namespace
 
 int create_communicator_grouped2(communicator** comm, tensorrt_llm::runtime::WorldConfig const& world_config)
 {
     *comm = (communicator*) malloc(sizeof(communicator));
 
-    int myrank, nranks, cur_dev, ndev;
+    int myrank = 0;
+    int nranks = 0;
+    int cur_dev = 0;
+    int ndev = 0;
     MPI_Comm_dup(MPI_COMM_WORLD, &(*comm)->comm_world);
     myrank = world_config.getRank();
     nranks = world_config.getSize();
@@ -131,7 +139,7 @@ int create_communicator_grouped2(communicator** comm, tensorrt_llm::runtime::Wor
     (*comm)->free_region = 0;
     (*comm)->pdl_launch = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
 
-    cudaDeviceProp device_prop;
+    cudaDeviceProp device_prop{};
     TLLM_CUDA_CHECK(cudaGetDevice(&cur_dev));
     TLLM_CUDA_CHECK(cudaGetDeviceCount(&ndev));
     TLLM_CUDA_CHECK(cudaGetDeviceProperties(&device_prop, cur_dev));
@@ -170,7 +178,7 @@ int create_communicator_grouped2(communicator** comm, tensorrt_llm::runtime::Wor
 
 #define NBUF 1
 
-    int nvls_supported = 1;
+    constexpr bool nvls_supported = true;
 
     if (nvls_supported && (*comm)->sm_arch >= 9 && (*comm)->tp_size > 1 && !getenv("UB_SKIPMC"))
     {
@@ -212,8 +220,8 @@ int create_communicator_grouped2(communicator** comm, tensorrt_llm::runtime::Wor
         free(exphndl);
         free(tmphndl);
 #else
-        int fd;
-        volatile uint32_t abortFlag = 0;
+        int fd = 0;
+        uint32_t volatile abortFlag = 0;
         IpcSocketHandle ipcSock{};
         srand(time(NULL));
         uint64_t opId = (uint64_t) (rand()) ^ ((uint64_t) (rand()) << 32);
@@ -296,14 +304,14 @@ int register_user_buffer_collective(void** gpubuff, size_t bytes, communicator* 
 {
     if (comm->free_region > MAX_REGIONS)
         return -1;
-    int hndl = comm->free_region;
+    int const hndl = comm->free_region;
     comm->peer_ptr[hndl] = (void**) malloc(sizeof(void*) * (comm->nvsize));
     size_t aligned_size = bytes;
     comm->memflags[hndl] = 0;
 
-    int nranks = comm->nvsize;
-    int myrank = comm->nvrank;
-    void** remptrs = (void**) malloc(nranks * sizeof(void*));
+    int const nranks = comm->nvsize;
+    int const myrank = comm->nvrank;
+    auto** remptrs = static_cast<void**>(malloc(nranks * sizeof(void*)));
 
     CUmemAllocationProp prop = {};
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
@@ -345,11 +353,11 @@ int register_user_buffer_collective(void** gpubuff, size_t bytes, communicator* 
                 &comm->uchandles[hndl][p], reinterpret_cast<void*>(&exphndl[p]), CU_MEM_HANDLE_TYPE_FABRIC));
     ub_free(exphndl);
 #else
-    int* peerfd = (int*) malloc(nranks * sizeof(int));
+    auto* peerfd = static_cast<int*>(malloc(nranks * sizeof(int)));
     CUCHECK(cuMemExportToShareableHandle(
         &peerfd[myrank], comm->uchandles[hndl][myrank], CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0 /*flags*/));
 
-    volatile uint32_t abortFlag = 0;
+    uint32_t volatile abortFlag = 0;
     IpcSocketHandle ipcSock{};
     uint64_t opId = (uint64_t) (rand()) ^ ((uint64_t) (rand()) << 32);
     ub_bcast(&opId, sizeof(uint64_t), 0, comm->comm_world);

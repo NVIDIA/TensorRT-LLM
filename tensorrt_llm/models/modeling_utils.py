@@ -37,6 +37,7 @@ from ..module import Module, ModuleList
 from ..parameter import Parameter
 from ..plugin import init_all_reduce_helper
 from ..quantization import QuantMode
+from ..quantization.functional import preprocess_weights_for_mixed_gemm
 from ..quantization.layers import (FP8Linear, Fp8RowwiseFusedGatedMLP,
                                    Fp8RowwiseGatedMLP,
                                    WeightOnlyGroupwiseQuantLinear,
@@ -1661,9 +1662,10 @@ def preprocess_perlayer_weights(weights,
                                 quant_algo,
                                 from_pruned=False):
     exclude_modules = model_config.quantization.exclude_modules
+
     # INT4_AWQ
     if quant_algo == QuantAlgo.W4A8_AWQ or quant_algo == QuantAlgo.W4A16_AWQ:
-        preprocessor = torch.ops.trtllm.preprocess_weights_for_mixed_gemm
+        preprocessor = preprocess_weights_for_mixed_gemm
         if quant_algo == QuantAlgo.W4A8_AWQ:
             activation_type = torch.float8_e4m3fn
         elif quant_algo == QuantAlgo.W4A16_AWQ:
@@ -1675,8 +1677,7 @@ def preprocess_perlayer_weights(weights,
                 dtype = torch.float16
                 if model_config.dtype == "bfloat16":
                     dtype = torch.bfloat16
-                weights[name] = preprocessor(param.T.contiguous(),
-                                             torch.quint4x2,
+                weights[name] = preprocessor(param.T, torch.quint4x2,
                                              activation_type).view(dtype)
             if name.endswith('weights_scaling_factor'
                              ) and param.shape[0] > param.shape[1]:

@@ -33,9 +33,11 @@ add_library(
   fp4Gemm.cpp
   fp4Quantize.cpp
   fp8BlockScalingGemm.cpp
+  fp8Quantize.cpp
   gatherTreeOp.cpp
   mambaConv1dOp.cpp
   moeOp.cpp
+  noAuxTcOp.cpp
   ncclCommunicatorOp.cpp
   parallelDecodeKVCacheUpdateOp.cpp
   redrafterCurandOp.cpp

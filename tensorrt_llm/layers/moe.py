@@ -38,8 +38,10 @@ from ..mapping import Mapping
 from ..module import Module, ModuleList
 from ..parameter import Parameter
 from ..plugin import TRT_LLM_PLUGIN_NAMESPACE
-from ..quantization import QuantMode
-from ..quantization.functional import postprocess_weight_only, quantize
+from ..quantization import GroupwiseQuantAlgo, QuantMode
+from ..quantization.functional import (postprocess_weight_only,
+                                       preprocess_weights_for_mixed_gemm,
+                                       quantize)
 from .linear import RowLinear
 
 activation_str_to_int_map = {
@@ -52,6 +54,46 @@ activation_str_to_int_map = {
     "geglu": 4,
     "identity": 5,
 }
+
+
+class MoeGroupwiseQuantParams():
+
+    def __init__(self,
+                 group_size=-1,
+                 zero=False,
+                 pre_quant_scale=False,
+                 use_w4a8_awq=False,
+                 act_scale_1=None,
+                 weight_scale_1=None,
+                 weight_zero_1=None,
+                 alpha_1=None,
+                 act_scale_2=None,
+                 weight_scale_2=None,
+                 weight_zero_2=None,
+                 alpha_2=None) -> None:
+        self.group_size = group_size
+        self.quant_algo = zero * GroupwiseQuantAlgo.ZERO + pre_quant_scale * GroupwiseQuantAlgo.PRE_QUANT_SCALE + use_w4a8_awq * GroupwiseQuantAlgo.W4A8_ALPHA
+
+        self.quant_params = []
+
+        if group_size == -1:
+            return
+
+        assert weight_scale_1
+        assert weight_scale_2
+        self.quant_params += [weight_scale_1, weight_scale_2]
+        if pre_quant_scale:
+            assert act_scale_1
+            assert act_scale_2
+            self.quant_params += [act_scale_1, act_scale_2]
+        if zero:
+            assert weight_zero_1
+            assert weight_zero_2
+            self.quant_params += [weight_zero_1, weight_zero_2]
+        if use_w4a8_awq:
+            assert alpha_1
+            assert alpha_2
+            self.quant_params += [alpha_1, alpha_2]
 
 
 @dataclass
@@ -109,6 +151,7 @@ def _moe_plugin(moe_config,
                 expert_scale_4,
                 expert_scale_5,
                 expert_scale_6,
+                groupwise_quant_params,
                 hidden_size,
                 ffn_hidden_size,
                 act_fn,
@@ -167,6 +210,13 @@ def _moe_plugin(moe_config,
     p_expert_inter_size = trt.PluginField(
         "expert_inter_size", np.array(ffn_hidden_size, dtype=np.int32),
         trt.PluginFieldType.INT32)
+    p_groupwise_quant_algo = trt.PluginField(
+        "groupwise_quant_algo",
+        np.array(groupwise_quant_params.quant_algo, dtype=np.int32),
+        trt.PluginFieldType.INT32)
+    p_group_size = trt.PluginField(
+        "group_size", np.array(groupwise_quant_params.group_size,
+                               dtype=np.int32), trt.PluginFieldType.INT32)
     p_activation_type = trt.PluginField(
         "activation_type",
         np.array(activation_str_to_int_map[act_fn], dtype=np.int32),
@@ -236,11 +286,11 @@ def _moe_plugin(moe_config,
 
     pfc_inputs = [
         p_remove_input_padding, p_num_experts, p_top_k, p_expert_hidden_size,
-        p_expert_inter_size, p_activation_type, p_type_id, p_weight_type_id,
-        p_output_type_id, p_quant_mode, p_use_finished, p_use_bias, p_tp_size,
-        p_tp_rank, p_ep_size, p_ep_rank, p_normalization_mode,
-        p_sparse_mixer_epsilon, p_force_determinism, p_side_stream_id,
-        p_use_lora
+        p_expert_inter_size, p_groupwise_quant_algo, p_group_size,
+        p_activation_type, p_type_id, p_weight_type_id, p_output_type_id,
+        p_quant_mode, p_use_finished, p_use_bias, p_tp_size, p_tp_rank,
+        p_ep_size, p_ep_rank, p_normalization_mode, p_sparse_mixer_epsilon,
+        p_force_determinism, p_side_stream_id, p_use_lora
     ]
 
     if use_lora:
@@ -265,7 +315,7 @@ def _moe_plugin(moe_config,
         plugin_inputs += [finished]
 
     # Add conditional inputs
-    if quant_mode.is_weight_only():
+    if (quant_mode.is_weight_only() and not quant_mode.has_per_group_scaling()):
         assert expert_scale_1
         assert expert_scale_2
         plugin_inputs += [expert_scale_1, expert_scale_2]
@@ -280,6 +330,12 @@ def _moe_plugin(moe_config,
             assert output_dtype == trt.fp8
             plugin_inputs += [expert_scale_4]
 
+        # Lora needs an extra parameter to be able to dequant the input back to backbone type
+        if use_lora:
+            assert expert_scale_5
+            plugin_inputs += [expert_scale_5]
+    elif quant_mode.has_per_group_scaling():
+        plugin_inputs += groupwise_quant_params.quant_params
         # Lora needs an extra parameter to be able to dequant the input back to backbone type
         if use_lora:
             assert expert_scale_5
@@ -339,11 +395,26 @@ def _moe_plugin(moe_config,
     return output
 
 
+def unpack_int32_into_int8(w_packed):
+    # Unpack inputs packed in int32/float32 into uint4 and store them in int8 format
+    w_packed_int4x2 = w_packed.contiguous().view(torch.uint8)
+    w_unpacked = torch.zeros(w_packed_int4x2.shape[0],
+                             w_packed_int4x2.shape[1],
+                             w_packed_int4x2.shape[2] * 2,
+                             dtype=torch.int8)
+    w_unpacked[:, :, ::2] = w_packed_int4x2 % 16
+    w_unpacked[:, :, 1::2] = w_packed_int4x2 // 16
+    w_unpacked = w_unpacked.view(-1, 8)[:, [0, 4, 1, 5, 2, 6, 3, 7]].view(
+        w_unpacked.shape)
+    return w_unpacked.contiguous()
+
+
 # This exists so that MOE can have the same name format as a regular MLP, just with different shaped weight tensors
 class MOEWeightWrapper(Module):
 
     def __init__(self, in_features: int, out_features: int,
                  experts_per_node: int, quant_mode: QuantMode,
+                 groupwise_quant_algo: int, group_size: int,
                  dtype: Union[str,
                               trt.DataType], weight_dtype: Union[str,
                                                                  trt.DataType],
@@ -351,16 +422,20 @@ class MOEWeightWrapper(Module):
                  tp_size: int, tp_dim: int):
         super().__init__()
         self.quant_mode = quant_mode
+        self.groupwise_quant_algo = groupwise_quant_algo
+        self.group_size = group_size
         self.expert_shape = (experts_per_node, out_features, in_features)
         self.dtype = dtype
         self.weight_dtype = weight_dtype
         self.has_bias = has_bias
         self.tllm_to_externel_key_dict = wrapper_tllm_to_externel_key_dict
         self.tp_size = tp_size
-        self.tp_dim = tp_dim
+        self.tp_dim = 1 - tp_dim if quant_mode.has_per_group_scaling(
+        ) else tp_dim
         self.is_padded = False
 
-        if quant_mode.is_weight_only():
+        if quant_mode.is_weight_only(
+        ) and not quant_mode.has_per_group_scaling():
             bytes_per_col_scale = 2 if quant_mode.is_int4_weight_only() else 1
             # We use a different shape here because the quantized weights have their own layout
             self.expert_shape = (experts_per_node, in_features,
@@ -375,9 +450,10 @@ class MOEWeightWrapper(Module):
             self.expert_shape = (experts_per_node, out_features, in_features)
             weight_dtype = trt.fp4
 
-        self.weight = Parameter(shape=self.expert_shape,
-                                dtype=weight_dtype,
-                                prefer_managed=True)
+        if not quant_mode.has_per_group_scaling():
+            self.weight = Parameter(shape=self.expert_shape,
+                                    dtype=weight_dtype,
+                                    prefer_managed=True)
 
         if has_bias:
             self.bias = Parameter(shape=(experts_per_node, out_features),
@@ -405,6 +481,30 @@ class MOEWeightWrapper(Module):
             # alpha = 1.0 / (weight_global_scale * act_global_scale)
             self.alpha = Parameter(shape=(experts_per_node, ),
                                    dtype=trt.float32)
+        elif quant_mode.has_per_group_scaling():
+            self.weight = Parameter(shape=(experts_per_node, in_features,
+                                           out_features // 4),
+                                    dtype=dtype)
+            scale_shape = (experts_per_node, in_features // group_size,
+                           out_features)
+            self.weights_scaling_factor = Parameter(shape=scale_shape,
+                                                    dtype=dtype)
+            if groupwise_quant_algo & GroupwiseQuantAlgo.ZERO:
+                self.zero = Parameter(shape=scale_shape, dtype=dtype)
+            else:
+                self.register_parameter('zero', None)
+            if groupwise_quant_algo & GroupwiseQuantAlgo.PRE_QUANT_SCALE:
+                self.prequant_scaling_factor = Parameter(shape=(1, in_features),
+                                                         dtype=dtype)
+            else:
+                self.register_parameter('prequant_scaling_factor', None)
+            if groupwise_quant_algo & GroupwiseQuantAlgo.W4A8_ALPHA:
+                self.alpha = Parameter(shape=(experts_per_node, 1),
+                                       dtype=trt.float32)
+            else:
+                self.register_parameter('alpha', None)
+            self.tllm_to_externel_key_dict.update(
+                {"weight": ["qweight", "qzeros", "scales"]})
         else:
             self.register_parameter('weights_scaling_factor', None)
             self.register_parameter('weights_block_scaling_factor', None)
@@ -413,6 +513,8 @@ class MOEWeightWrapper(Module):
             self.register_parameter('activation_scaling_factor', None)
             self.register_parameter('activation_global_scaling_factor', None)
             self.register_parameter('alpha', None)
+            self.register_parameter('zero', None)
+            self.register_parameter('prequant_scaling_factor', None)
 
     def postprocess(self, tllm_key, weights, **kwargs):
 
@@ -427,7 +529,45 @@ class MOEWeightWrapper(Module):
                 weights = torch.stack(weights)
             return weights
 
-        if tllm_key.endswith("weight"):
+        def postprocess_awq(tllm_key, weights):
+            if not tllm_key.endswith("weight"):
+                return {}
+            weights = [weights[i::3] for i in range(3)]
+            for idx, w in enumerate(weights):
+                if "fc" in tllm_key:
+                    weights[idx] = torch.cat([
+                        torch.stack(w[:len(w) // 2]),
+                        torch.stack(w[len(w) // 2:])
+                    ],
+                                             dim=-1)
+                elif "proj" in tllm_key:
+                    weights[idx] = torch.stack(w)
+            qweight_int32, qzeros_int32, scales_fp16 = weights
+            qweight = unpack_int32_into_int8(qweight_int32) - 8
+            qweight -= (qweight >> 4) << 4
+            qweight = qweight.view(torch.uint8)
+            qweight = (qweight[:, :, 1::2] * 16 + qweight[:, :, ::2]).view(
+                torch.int8)
+            qweight = preprocess_weights_for_mixed_gemm(
+                qweight, torch.quint4x2,
+                torch.float16).view(str_dtype_to_torch(self.dtype))
+            # zeros = zeros * scales
+            qzeros_unpacked_int32 = unpack_int32_into_int8(qzeros_int32)
+            zeros_x_scales_fp16 = (-qzeros_unpacked_int32 + 8) * scales_fp16
+            zeros_x_scales_fp16 = zeros_x_scales_fp16.to(
+                str_dtype_to_torch(self.dtype))
+
+            results = {
+                tllm_key: qweight,
+                tllm_key.replace("weight", "weights_scaling_factor"):
+                scales_fp16,
+                tllm_key.replace("weight", "zero"): zeros_x_scales_fp16,
+            }
+            return results
+
+        if self.quant_mode.has_per_group_scaling():
+            return postprocess_awq(tllm_key, weights)
+        elif tllm_key.endswith("weight"):
             if isinstance(weights, torch.Tensor):
                 weights = [weights]
             else:
@@ -591,7 +731,12 @@ class MixtureOfExperts(Module):
                  tp_group: List[int] = None,
                  tp_size: int = 1,
                  quant_mode=QuantMode(0),
-                 use_all_reduce=True):
+                 use_all_reduce=True,
+                 pre_quant_scale=False,
+                 zero=False,
+                 use_w4a8_awq=False,
+                 use_int8_weight=False,
+                 group_size: int = -1):
         super().__init__()
 
         self.moe_config = moe_config
@@ -610,6 +755,14 @@ class MixtureOfExperts(Module):
         self.quant_mode = quant_mode
         self.bias = bias
         self.use_all_reduce = use_all_reduce
+        self.zero = zero
+        self.pre_quant_scale = pre_quant_scale
+        self.use_w4a8_awq = use_w4a8_awq
+        self.use_int8_weight = use_int8_weight
+        self.group_size = group_size
+
+        if self.use_int8_weight:
+            raise NotImplementedError("INT8-GPTQ is not implemented for MoE.")
 
         self.experts_per_node = self.num_experts
         if self.mapping.has_moe_ep():
@@ -701,14 +854,17 @@ class MixtureOfExperts(Module):
         # The naming convention is the inverse of GatedMLP, but the same as `tensorrt_llm/functional.py`
         fc_out_size = self.expert_inter_size * 2 if is_gated_activation(
             self.hidden_act) else self.expert_inter_size
+        groupwise_quant_algo = self.zero * GroupwiseQuantAlgo.ZERO + self.pre_quant_scale * GroupwiseQuantAlgo.PRE_QUANT_SCALE + self.use_w4a8_awq * GroupwiseQuantAlgo.W4A8_ALPHA
 
         self.fc = MOEWeightWrapper(self.hidden_size, fc_out_size,
                                    self.experts_per_node, self.quant_mode,
+                                   groupwise_quant_algo, self.group_size,
                                    self.dtype, self.weight_dtype, self.bias,
                                    self.wrapper_tllm_to_externel_key_dict,
                                    self.mapping.moe_tp_size, 0)
         self.proj = MOEWeightWrapper(self.expert_inter_size, self.hidden_size,
                                      self.experts_per_node, self.quant_mode,
+                                     groupwise_quant_algo, self.group_size,
                                      self.dtype, self.weight_dtype, self.bias,
                                      self.wrapper_tllm_to_externel_key_dict,
                                      self.mapping.moe_tp_size, 1)
@@ -766,6 +922,7 @@ class MixtureOfExperts(Module):
     def forward_experts(self, hidden_states, routing, finished,
                         lora_layer_params, side_stream_id):
 
+        groupwise_quant_params = MoeGroupwiseQuantParams()
         if self.quant_mode.has_fp8_qdq():
             assert self.fc.weight.value.dtype == trt.fp8, (
                 "mlp fc weight dtype should be fp8 in the fp8 quantization mode."
@@ -813,6 +970,38 @@ class MixtureOfExperts(Module):
             scale_4 = div(1.0, self.proj.activation_global_scaling_factor.value)
             scale_5 = self.proj.weights_block_scaling_factor_interleaved
             scale_6 = self.proj.alpha
+        elif self.quant_mode.has_per_group_scaling():
+            hidden_states_quant = hidden_states
+            dtype_quant = trt.fp8 if self.use_w4a8_awq else self.dtype
+            weight_dtype_quant = self.weight_dtype
+            output_dtype_quant = self.dtype
+
+            scale_1 = None
+            scale_2 = None
+            scale_3 = None
+            scale_4 = None
+            scale_5 = None
+            scale_6 = None
+            pre_quant_scale_1 = self.fc.prequant_scaling_factor.value if self.fc.prequant_scaling_factor else None
+            zero_1 = self.fc.zero.value if self.fc.zero else None
+            alpha_1 = self.fc.alpha.value if self.fc.alpha else None
+            pre_quant_scale_2 = self.proj.prequant_scaling_factor.value if self.proj.prequant_scaling_factor else None
+            zero_2 = self.proj.zero.value if self.proj.zero else None
+            alpha_2 = self.proj.alpha.value if self.proj.alpha else None
+            groupwise_quant_params = MoeGroupwiseQuantParams(
+                self.group_size,
+                self.zero,
+                self.pre_quant_scale,
+                self.use_w4a8_awq,
+                pre_quant_scale_1,
+                self.fc.weights_scaling_factor.value,
+                zero_1,
+                alpha_1,
+                pre_quant_scale_2,
+                self.proj.weights_scaling_factor.value,
+                zero_2,
+                alpha_2,
+            )
         else:
             hidden_states_quant = hidden_states
             dtype_quant = self.dtype
@@ -825,7 +1014,6 @@ class MixtureOfExperts(Module):
             scale_4 = None
             scale_5 = None
             scale_6 = None
-
         output = _moe_plugin(self.moe_config,
                              hidden_states_quant,
                              hidden_states,
@@ -840,6 +1028,7 @@ class MixtureOfExperts(Module):
                              expert_scale_4=scale_4,
                              expert_scale_5=scale_5,
                              expert_scale_6=scale_6,
+                             groupwise_quant_params=groupwise_quant_params,
                              finished=finished,
                              hidden_size=self.hidden_size,
                              ffn_hidden_size=self.expert_inter_size,

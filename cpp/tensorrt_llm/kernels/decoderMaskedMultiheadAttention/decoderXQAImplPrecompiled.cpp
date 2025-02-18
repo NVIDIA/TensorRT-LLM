@@ -203,23 +203,54 @@ public:
         // IDEA: Store rotary_processed Q buffer to output buffer.
         // NOTE: MHA kernels should read kv cache that has already been appended with new tokens' kv cache.
         void* xqa_q_input_ptr = inputScratch;
-        QKVPreprocessingParams<T, KVCacheBuffer> preprocessingParms{static_cast<T*>(const_cast<void*>(xqaParams.qkv)),
-            nullptr, nullptr, static_cast<T*>(xqa_q_input_ptr), kv_cache_buffer,
-            /* kv_cache_block_scales_buffer */ KVCacheBuffer{}, static_cast<T const*>(xqaParams.qkv_bias),
-            xqaParams.logn_scaling_ptr, launchParams.tokens_info, xqaParams.spec_decoding_generation_lengths,
-            xqaParams.sequence_lengths, /* encoder_seqlens */ nullptr,
-            xqaParams.multi_query_tokens ? launchParams.cu_seq_lens : nullptr,
-            /* cu_kv_seqlens */ nullptr, rotary_inv_freq_buf, xqaParams.rotary_cos_sin, xqaParams.kv_scale_orig_quant,
-            /* kv_cache_scale_factors */ nullptr, xqaParams.spec_decoding_position_offsets, (float2 const*) nullptr,
-            xqaParams.mrope_position_deltas, int(batch_beam_size), xqaParams.generation_input_length,
-            xqaParams.max_past_kv_length, xqaParams.cyclic_attention_window_size, xqaParams.sink_token_length,
-            xqaParams.total_num_input_tokens,
-            /*remove_padding*/ true, /*cross_attention*/ false, xqaParams.num_q_heads, xqaParams.num_kv_heads,
-            xqaParams.num_q_heads / xqaParams.num_kv_heads, xqaParams.head_size, xqaParams.rotary_embedding_dim,
-            xqaParams.rotary_embedding_base, xqaParams.rotary_embedding_scale_type, xqaParams.rotary_embedding_scale,
-            xqaParams.rotary_embedding_max_positions, xqaParams.position_embedding_type,
-            xqaParams.position_shift_enabled, cache_type, true, false, /* generation_phase */ true,
-            multiprocessor_count, xqaParams.rotary_vision_start, xqaParams.rotary_vision_length};
+        // The preprocessing kernel that applies RoPE and updates kv cache.
+        QKVPreprocessingParams<T, KVCacheBuffer> preprocessingParms;
+        memset(&preprocessingParms, 0, sizeof(preprocessingParms));
+        // Set parameters.
+        preprocessingParms.qkv_input = static_cast<T*>(const_cast<void*>(xqaParams.qkv));
+        preprocessingParms.q_output = static_cast<T*>(xqa_q_input_ptr);
+        preprocessingParms.kv_cache_buffer = kv_cache_buffer;
+        preprocessingParms.kv_cache_block_scales_buffer = {};
+        preprocessingParms.qkv_bias = static_cast<T const*>(xqaParams.qkv_bias);
+        // Buffers.
+        preprocessingParms.logn_scaling = xqaParams.logn_scaling_ptr;
+        preprocessingParms.tokens_info = launchParams.tokens_info;
+        preprocessingParms.seq_lens = xqaParams.spec_decoding_generation_lengths;
+        preprocessingParms.cache_seq_lens = xqaParams.sequence_lengths;
+        preprocessingParms.cu_seq_lens = xqaParams.multi_query_tokens ? launchParams.cu_seq_lens : nullptr;
+        preprocessingParms.rotary_embedding_inv_freq = rotary_inv_freq_buf;
+        preprocessingParms.rotary_coef_cache_buffer = xqaParams.rotary_cos_sin;
+        preprocessingParms.kvScaleOrigQuant = xqaParams.kv_scale_orig_quant;
+        preprocessingParms.kv_cache_scale_factors = nullptr;
+        preprocessingParms.spec_decoding_position_offsets = xqaParams.spec_decoding_position_offsets;
+        preprocessingParms.mrope_position_deltas = xqaParams.mrope_position_deltas;
+        // Scalar parameters.
+        preprocessingParms.batch_size = int(batch_beam_size);
+        preprocessingParms.max_input_seq_len = xqaParams.generation_input_length;
+        preprocessingParms.max_kv_seq_len = xqaParams.max_past_kv_length;
+        preprocessingParms.cyclic_kv_cache_len = xqaParams.cyclic_attention_window_size;
+        preprocessingParms.sink_token_len = xqaParams.sink_token_length;
+        preprocessingParms.token_num = xqaParams.total_num_input_tokens;
+        preprocessingParms.remove_padding = true;
+        preprocessingParms.cross_attention = false;
+        preprocessingParms.head_num = xqaParams.num_q_heads;
+        preprocessingParms.kv_head_num = xqaParams.num_kv_heads;
+        preprocessingParms.qheads_per_kv_head = xqaParams.num_q_heads / xqaParams.num_kv_heads;
+        preprocessingParms.size_per_head = xqaParams.head_size;
+        preprocessingParms.rotary_embedding_dim = xqaParams.rotary_embedding_dim;
+        preprocessingParms.rotary_embedding_base = xqaParams.rotary_embedding_base;
+        preprocessingParms.rotary_scale_type = xqaParams.rotary_embedding_scale_type;
+        preprocessingParms.rotary_embedding_scale = xqaParams.rotary_embedding_scale;
+        preprocessingParms.rotary_embedding_max_positions = xqaParams.rotary_embedding_max_positions;
+        preprocessingParms.position_embedding_type = xqaParams.position_embedding_type;
+        preprocessingParms.position_shift_enabled = xqaParams.position_shift_enabled;
+        preprocessingParms.cache_type = cache_type;
+        preprocessingParms.separate_q_kv_output = true;
+        preprocessingParms.quantized_fp8_output = false;
+        preprocessingParms.generation_phase = true;
+        preprocessingParms.multi_processor_count = multiprocessor_count;
+        preprocessingParms.rotary_vision_start = xqaParams.rotary_vision_start;
+        preprocessingParms.rotary_vision_length = xqaParams.rotary_vision_length;
 
         invokeQKVPreprocessing<T, KVCacheBuffer>(preprocessingParms, stream);
         sync_check_cuda_error();

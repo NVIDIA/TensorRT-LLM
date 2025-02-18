@@ -396,3 +396,11 @@ class QuantMode(IntFlag):
             'weight_only_precision':
             'int8' if self.is_int8_weight_only() else 'int4',
         }
+
+
+class GroupwiseQuantAlgo:
+    BIAS = 1
+    ZERO = 2
+    PRE_QUANT_SCALE = 4
+    W4A8_ALPHA = 8
+    INT8_WEIGHT = 16

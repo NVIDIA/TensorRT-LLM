@@ -148,6 +148,7 @@ class QWenConfig(PretrainedConfig):
                 hf_config, 'rotary_dim',
                 int(hf_config.hidden_size / hf_config.num_attention_heads *
                     rotary_embedding_percentage))
+            rotary_scaling['type'] = 'mrope'
         else:
             pe_type = 'rope_gpt_neox'
             rotary_embedding_dim = None

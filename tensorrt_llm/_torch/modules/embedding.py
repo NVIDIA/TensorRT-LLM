@@ -48,7 +48,6 @@ class LMHead(Linear):
             dtype=dtype,
             parallel_config=parallel_config,
         )
-        super()._create_weights()
 
         if parallel_config.tensor_parallel_mode == TensorParallelMode.ROW:
             if self.tp_rank == self.tp_size - 1:

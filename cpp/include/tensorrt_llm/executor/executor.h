@@ -723,7 +723,6 @@ public:
     void setSkipCrossAttnBlocks(Tensor skipCrossAttnBlocks);
     void setGuidedDecodingParams(GuidedDecodingParams const& guidedDecodingParams);
     void setAllottedTimeMs(MillisecondsType allottedTimeMs);
-    void setAdditionalOutputNames(std::optional<std::vector<std::string>> additionalOutputNames);
 
 private:
     friend class Serialization;
@@ -751,6 +750,12 @@ struct AdditionalOutput
         , output(std::move(output))
     {
     }
+
+    AdditionalOutput(AdditionalOutput const& other) = default;
+    AdditionalOutput(AdditionalOutput&& other) noexcept = default;
+    AdditionalOutput& operator=(AdditionalOutput const& other) = default;
+    AdditionalOutput& operator=(AdditionalOutput&& other) noexcept = default;
+    ~AdditionalOutput() = default;
 
     std::string name;
     Tensor output;

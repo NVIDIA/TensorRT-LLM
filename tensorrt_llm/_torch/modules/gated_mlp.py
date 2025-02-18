@@ -31,7 +31,8 @@ class GatedMLP(nn.Module):
                  activation: Callable[[torch.Tensor], torch.Tensor] = F.silu,
                  dtype: Optional[torch.dtype] = None,
                  config: Optional[ModelConfig] = None,
-                 use_dp: bool = False):
+                 use_dp: bool = False,
+                 is_expert: bool = False):
         super().__init__()
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
@@ -59,6 +60,8 @@ class GatedMLP(nn.Module):
             weights_loading_config=WeightsLoadingConfig(
                 weight_mode=WeightMode.FUSED_GATE_UP_LINEAR),
             quant_config=config.get_quant_config(),
+            is_expert=is_expert,
+            skip_create_weights=config.skip_create_weights,
         )
         self.down_proj = Linear(
             self.intermediate_size,
@@ -71,11 +74,9 @@ class GatedMLP(nn.Module):
                 tensor_parallel_mode=TensorParallelMode.ROW,
                 gpus_per_node=gpus_per_node),
             quant_config=config.get_quant_config(),
+            is_expert=is_expert,
+            skip_create_weights=config.skip_create_weights,
         )
-
-    def _create_weights(self):
-        self.gate_up_proj._create_weights()
-        self.down_proj._create_weights()
 
     def forward(self,
                 x: torch.Tensor,

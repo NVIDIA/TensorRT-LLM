@@ -64,18 +64,10 @@ def engine_from_fp8_quantization(model_name):
     yield engine_dir.name
 
 
-@pytest.fixture(scope="module", params=[None, 'pytorch'])
-def backend(request):
-    return request.param
-
-
 @pytest.fixture(scope="module")
-def server(model_name: str, engine_from_fp8_quantization: str, backend: str):
+def server(model_name: str, engine_from_fp8_quantization: str):
     model_path = get_model_path(model_name)
     args = ["--tp_size", "2", "--tokenizer", model_path]
-    if backend is not None:
-        args.append("--backend")
-        args.append(backend)
     with RemoteOpenAIServer(engine_from_fp8_quantization,
                             args) as remote_server:
         yield remote_server

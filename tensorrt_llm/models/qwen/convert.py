@@ -26,7 +26,7 @@ import safetensors
 import torch
 import torch.nn as nn
 from tqdm import tqdm
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer
 from transformers.pytorch_utils import Conv1D
 
 from ..._utils import pad_vocab_size, str_dtype_to_torch
@@ -925,7 +925,11 @@ def quantize(hf_model_dir: str,
     assert hf_model_dir is not None
     ## only load and call smooth quant routine once for all ranks
     hf_config = AutoConfig.from_pretrained(hf_model_dir, trust_remote_code=True)
-    hf_model = AutoModelForCausalLM.from_pretrained(
+    if hf_config.architectures == ['Qwen2VLForConditionalGeneration']:
+        from transformers import Qwen2VLForConditionalGeneration as model_cls
+    else:
+        from transformers import AutoModelForCausalLM as model_cls
+    hf_model = model_cls.from_pretrained(
         hf_model_dir,
         device_map='auto',
         torch_dtype='auto' if not use_smooth_quant else torch.float16,

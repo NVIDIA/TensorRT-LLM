@@ -15,8 +15,8 @@
  * limitations under the License.
  */
 #include "gemmAllReducePlugin.h"
-#include "tensorrt_llm/kernels/cutlass_kernels/allreduce_gemm/allreduce_gemm_runner.h"
-#include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
+#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/kernels/internal_cutlass_kernels/src/internal_cutlass_type_conversion.h"
 #include "tensorrt_llm/plugins/common/pluginUtils.h"
 
 #include <unistd.h>
@@ -34,9 +34,12 @@ static std::pair<K, V> makeEntry()
         {
             using GemmTraits = tensorrt_llm::kernels::cutlass_kernels::GemmTypes<typename CutlassType<ElementA>::type,
                 typename CutlassType<ElementB>::type,
-                typename CutlassType<ElementD>::type, // C, unused
-                typename CutlassType<ElementD>::type, cutlass::layout::RowMajor, cutlass::layout::ColumnMajor,
-                cutlass::layout::RowMajor,            // C, unused
+                typename CutlassType<ElementD>::type,                                         // C, unused
+                typename CutlassType<ElementD>::type,
+                std::conditional_t<ElementA == DataType::kFP4, cutlass::float_ue4m3_t, void>, // SFA
+                std::conditional_t<ElementB == DataType::kFP4, cutlass::float_ue4m3_t, void>, // SFB
+                cutlass::layout::RowMajor, cutlass::layout::ColumnMajor,
+                cutlass::layout::RowMajor,                                                    // C, unused
                 cutlass::layout::RowMajor>;
 
             return new GemmAllReduceImplRunner<GemmTraits>();
@@ -49,7 +52,9 @@ static std::map<K, V> getTypedInstantiators()
     return std::map<K, V>({makeEntry<K, V, DataType::kHALF, DataType::kHALF, DataType::kHALF>(),
         makeEntry<K, V, DataType::kBF16, DataType::kBF16, DataType::kBF16>(),
         makeEntry<K, V, DataType::kFP8, DataType::kFP8, DataType::kHALF>(),
-        makeEntry<K, V, DataType::kFP8, DataType::kFP8, DataType::kBF16>()});
+        makeEntry<K, V, DataType::kFP8, DataType::kFP8, DataType::kBF16>(),
+        makeEntry<K, V, DataType::kFP4, DataType::kFP4, DataType::kHALF>(),
+        makeEntry<K, V, DataType::kFP4, DataType::kFP4, DataType::kBF16>()});
 }
 
 ////////////////////////////////////////////////////////////
@@ -60,6 +65,36 @@ GemmAllReducePlugin::GemmAllReducePlugin(GemmAllReducePluginOptions const& optio
     , mGemmId(GemmIdCore(options.maxProblemShape.n, options.maxProblemShape.k, options.typeD))
     , mProfiler(mGemmPluginProfileManager.createGemmPluginProfiler(/*inference=*/options.deserialize))
 {
+    // construct mapping of input/output pos to argument
+    int argIdx = 0;
+    // inputs
+    mArgMap[argIdx++] = TensorArg::IN_ACTIVATION;
+    mArgMap[argIdx++] = TensorArg::IN_WEIGHT;
+    if (mOptions.hasSFA)
+    {
+        mArgMap[argIdx++] = TensorArg::IN_ACTIVATION_SF;
+    }
+    if (mOptions.hasSFB)
+    {
+        mArgMap[argIdx++] = TensorArg::IN_WEIGHT_SF;
+    }
+    if (mOptions.alphaIsPtr)
+    {
+        mArgMap[argIdx++] = TensorArg::IN_ALPHA;
+    }
+    mNbInputs = argIdx;
+    // outputs
+    mArgMap[argIdx++] = TensorArg::OUT_D_UC;
+    mArgMap[argIdx++] = TensorArg::OUT_D_MC;
+    mArgMap[argIdx++] = TensorArg::OUT_D_IPC;
+    mNbOutputs = argIdx - mNbInputs;
+
+    // Create mapping of argument to tensor pos
+    for (auto const& pair : mArgMap)
+    {
+        mArgInvMap[pair.second] = pair.first;
+    }
+
     // Use map instead of huge switch case
     mTypedInstantiators = getTypedInstantiators<KeyType, ValueType>();
 
@@ -112,6 +147,16 @@ static GemmAllReducePluginOptions deserializeOptions(void const*& data, size_t l
         read(end, rank);
         options.group.insert(rank);
     }
+    read(end, options.hasSFA);
+    read(end, options.hasSFB);
+    read(end, options.alphaIsPtr);
+
+    TLLM_CHECK_WITH_INFO(end == begin + length,
+        "Expected length (%d) != real length (%d). This is often "
+        "caused by using different TensorRT-LLM version to build "
+        "engine and run engine.",
+        (int) length, (int) (end - begin));
+
     return options;
 }
 
@@ -135,9 +180,18 @@ DimsExprs GemmAllReducePlugin::getOutputDimensions(
 {
     try
     {
-        TLLM_CHECK(nbInputs == 2); // number of input tensors
+        TLLM_CHECK(nbInputs == mNbInputs); // number of input tensors
         TLLM_CHECK(inputs[0].nbDims == inputs[1].nbDims);
         TLLM_CHECK(outputIndex < getNbOutputs());
+
+        // List of pointers to D on each rank
+        if ((nbInputs + outputIndex) == TensorArg::OUT_D_IPC)
+        {
+            DimsExprs out_dims;
+            out_dims.nbDims = 1;
+            out_dims.d[0] = exprBuilder.constant(mOptions.groupSize);
+            return out_dims;
+        }
 
         TLLM_CHECK(mOptions.transA == false);
         TLLM_CHECK(mOptions.transB == true);
@@ -191,10 +245,16 @@ bool GemmAllReducePlugin::supportsFormatCombination(
 {
     // inOut[0] -> activation
     // inOut[1] -> weight
-    // inOut[2] -> output[0]
-    // inOut[3] -> output[1]
-    TLLM_CHECK_WITH_INFO(pos < 2 + getNbOutputs(), "Unexpected pos: %d", pos);
+    // inOut[1+hasInputSF] -> activation_sf
+    // inOut[1+hasInputSF*2] -> weight_sf
+    // inOut[2+hasInputSF*2] -> output[0] = D_uc
+    // inOut[3+hasInputSF*2] -> output[1] = D_mc
+
+    TLLM_CHECK_WITH_INFO(pos < mNbInputs + mNbOutputs, "Unexpected pos: %d", pos);
     auto const& desc = inOut[pos];
+
+    TLLM_CHECK_WITH_INFO(mArgMap.count(pos) > 0, "pos %d not found in mArgMap.", pos);
+    TensorArg arg = mArgMap[pos];
 
     auto typeExists = [&](DataType dtype, auto idx) -> bool
     {
@@ -209,15 +269,18 @@ bool GemmAllReducePlugin::supportsFormatCombination(
         return false;
     };
 
-    switch (pos)
+    switch (arg)
     {
-    case 0: // activation
-        return typeExists(desc.type, std::integral_constant<size_t, 0>{});
-    case 1: // weight
-        return typeExists(desc.type, std::integral_constant<size_t, 1>{});
-    case 2: // output[0]
-    case 3: // output[1]
-        return typeExists(desc.type, std::integral_constant<size_t, 2>{});
+    case TensorArg::IN_ACTIVATION: return typeExists(desc.type, std::integral_constant<size_t, 0>{});
+    case TensorArg::IN_WEIGHT: return typeExists(desc.type, std::integral_constant<size_t, 1>{});
+    case TensorArg::IN_ACTIVATION_SF:
+    case TensorArg::IN_WEIGHT_SF:
+        // Assumed SF for only FP4 at the moment
+        return desc.type == DataType::kFP8;
+    case TensorArg::IN_ALPHA: return desc.type == DataType::kFLOAT;
+    case TensorArg::OUT_D_UC:
+    case TensorArg::OUT_D_MC:
+    case TensorArg::OUT_D_IPC: return typeExists(desc.type, std::integral_constant<size_t, 2>{});
     default: return false;
     }
 }
@@ -273,8 +336,6 @@ size_t GemmAllReducePlugin::getWorkspaceSize(
 int GemmAllReducePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDesc const* outputDesc,
     void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
 {
-    int const rank = COMM_SESSION.getRank();
-
     // inputs[0] -> [M(*), K]
     // inputs[1] -> [K, N]
     // outputs[0] -> [M(*), N] unicast ptr
@@ -287,26 +348,64 @@ int GemmAllReducePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensor
     TLLM_CHECK_WITH_INFO(M > 0, "GemmAllReducePlugin M is 0.");
     TLLM_CHECK_WITH_INFO(N > 0, "GemmAllReducePlugin N is 0.");
     TLLM_CHECK_WITH_INFO(K > 0, "GemmAllReducePlugin K is 0.");
-    TLLM_CHECK_WITH_INFO(inputs[0] != nullptr, "GemmAllReducePlugin inputs[0] is null.");
-    TLLM_CHECK_WITH_INFO(inputs[1] != nullptr, "GemmAllReducePlugin inputs[1] is null.");
-    TLLM_CHECK_WITH_INFO(outputs[0] != nullptr, "GemmAllReducePlugin outputs[0] is null.");
-    TLLM_CHECK_WITH_INFO(outputs[1] != nullptr, "GemmAllReducePlugin outputs[1] is null.");
-    TLLM_CHECK_WITH_INFO(outputs[1] != nullptr, "GemmAllReducePlugin outputs[1] is null.");
     TLLM_CHECK_WITH_INFO(mWorkspace != nullptr, "GemmAllReducePlugin workspace is null.");
 
-    auto bestLaunchConfig = mProfiler->getBestConfig(M, mGemmId);
+    auto bestLaunchConfig = mProfiler->getBestConfig(M, mGemmId).value();
+
+    // For 2x GPUs, switch AR is less efficient that unicast AR.
+    // Since the gemmPluginProfiler does not run across ranks, it may
+    // not select SM based reduction, therefore force override this.
+    // TODO: remove this override when profiling across multiple GPUs
+    // is supported.
+    bestLaunchConfig.reduce_location = mOptions.groupSize <= 2 ? ReduceLocationType::kSM : ReduceLocationType::kSWITCH;
+
+    void const* activation = inputs[mArgInvMap[TensorArg::IN_ACTIVATION]];
+    void const* weight = inputs[mArgInvMap[TensorArg::IN_WEIGHT]];
+    void* D_out_uc = outputs[mArgInvMap[TensorArg::OUT_D_UC] - mNbInputs];
+    void* D_out_mc = outputs[mArgInvMap[TensorArg::OUT_D_MC] - mNbInputs];
+    void* D_out_ipc = outputs[mArgInvMap[TensorArg::OUT_D_IPC] - mNbInputs];
+
+    TLLM_CHECK_WITH_INFO(activation != nullptr, "GemmAllReducePlugin activation is NULL");
+    TLLM_CHECK_WITH_INFO(weight != nullptr, "GemmAllReducePlugin weight is NULL");
+    TLLM_CHECK_WITH_INFO(D_out_uc != nullptr, "GemmAllReducePlugin out_uc is NULL");
+    TLLM_CHECK_WITH_INFO(D_out_mc != nullptr, "GemmAllReducePlugin out_mc is NULL");
+    TLLM_CHECK_WITH_INFO(D_out_ipc != nullptr, "GemmAllReducePlugin out_ipc is NULL");
 
     GemmAllReduceImplInterface::ProblemArgs args;
     args.argProblemShape(M, N, K, 1)
-        .argA(inputs[0])
-        .argB(inputs[1])
+        .argA(activation)
+        .argB(weight)
         .argC(nullptr)
-        .argD(outputs[0], outputs[1])
+        .argD(D_out_uc, D_out_mc, (void**) D_out_ipc)
         .argRanks(mRank, mOptions.group)
-        .argAlpha(mOptions.alpha)
         .argBeta(0.f) // no bias
-        .argLaunchConfig(bestLaunchConfig.value())
+        .argLaunchConfig(bestLaunchConfig)
         .argWorkspace(mWorkspace->mWorkspace.get());
+    // tensor for scaling input A
+    if (mOptions.hasSFA)
+    {
+        void const* activation_sf = inputs[mArgInvMap[TensorArg::IN_ACTIVATION_SF]];
+        TLLM_CHECK_WITH_INFO(activation_sf != nullptr, "GemmAllReducePlugin activation_sf is NULL");
+        args.argAScale(activation_sf);
+    }
+    // tensor for scaling input B
+    if (mOptions.hasSFB)
+    {
+        void const* weight_sf = inputs[mArgInvMap[TensorArg::IN_WEIGHT_SF]];
+        TLLM_CHECK_WITH_INFO(weight_sf != nullptr, "GemmAllReducePlugin weight_sf is NULL");
+        args.argBScale(weight_sf);
+    }
+    // tensor for scaling output D
+    if (mOptions.alphaIsPtr)
+    {
+        void const* alpha_vec = inputs[mArgInvMap[TensorArg::IN_ALPHA]];
+        TLLM_CHECK_WITH_INFO(alpha_vec != nullptr, "GemmAllReducePlugin alpha_vec is NULL");
+        args.argAlphaPtr(reinterpret_cast<float const*>(alpha_vec));
+    }
+    else
+    {
+        args.argAlpha(mOptions.alpha);
+    }
 
     mGemm->run(args, stream);
 
@@ -337,9 +436,7 @@ char const* GemmAllReducePlugin::getPluginVersion() const noexcept
 
 int GemmAllReducePlugin::getNbOutputs() const noexcept
 {
-    // outputs[0] -> unicast address
-    // outputs[1] -> multicast address
-    return 2;
+    return mNbOutputs;
 }
 
 int GemmAllReducePlugin::initialize() noexcept
@@ -385,6 +482,9 @@ size_t GemmAllReducePlugin::getSerializationSize() const noexcept
     size += sizeof(mOptions.maxProblemShape);
     size += sizeof(mOptions.groupSize);
     size += mOptions.group.size() * sizeof(int);
+    size += sizeof(mOptions.hasSFA);
+    size += sizeof(mOptions.hasSFB);
+    size += sizeof(mOptions.alphaIsPtr);
     return size;
 }
 
@@ -405,7 +505,10 @@ void GemmAllReducePlugin::serialize(void* buffer) const noexcept
     {
         write(end, rank);
     }
-    assert(end == begin + getSerializationSize());
+    write(end, mOptions.hasSFA);
+    write(end, mOptions.hasSFB);
+    write(end, mOptions.alphaIsPtr);
+    TLLM_CHECK(end == begin + getSerializationSize());
 
     // Profiler MNK->kernel mappings need to be deterministic and consistent across ranks
     // to ensure correct functionality (unlike standalone GEMMs).
@@ -440,6 +543,9 @@ GemmAllReducePluginCreator::GemmAllReducePluginCreator()
     mPluginAttributes.emplace_back("transb", nullptr, PluginFieldType::kINT32, 1);
     mPluginAttributes.emplace_back("alpha", nullptr, PluginFieldType::kFLOAT32, 1);
     mPluginAttributes.emplace_back("group", nullptr, PluginFieldType::kINT32, 1);
+    mPluginAttributes.emplace_back("has_sfa", nullptr, PluginFieldType::kINT8, 1);
+    mPluginAttributes.emplace_back("has_sfb", nullptr, PluginFieldType::kINT8, 1);
+    mPluginAttributes.emplace_back("alpha_is_ptr", nullptr, PluginFieldType::kINT8, 1);
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }
@@ -508,6 +614,21 @@ IPluginV2* GemmAllReducePluginCreator::createPlugin(char const* name, PluginFiel
                 options.group.insert(ranks[j]);
             }
             options.groupSize = options.group.size();
+        }
+        else if (!strcmp(attrName, "has_sfa")) // passed in as input tensor
+        {
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT8);
+            options.hasSFA = *static_cast<int8_t const*>(fields[i].data);
+        }
+        else if (!strcmp(attrName, "has_sfb")) // passed in as input tensor
+        {
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT8);
+            options.hasSFB = *static_cast<int8_t const*>(fields[i].data);
+        }
+        else if (!strcmp(attrName, "alpha_is_ptr")) // passed in as input tensor
+        {
+            TLLM_CHECK(fields[i].type == PluginFieldType::kINT8);
+            options.alphaIsPtr = *static_cast<int8_t const*>(fields[i].data);
         }
     }
 

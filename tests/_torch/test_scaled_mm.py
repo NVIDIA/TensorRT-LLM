@@ -56,6 +56,7 @@ def test_fp8_scaled_mm(output_dtype, m, k_n):
         scale_w,
         bias=None,
         out_dtype=output_dtype,
+        userbuffers_id=-1,
     )
     cutlass_output = torch.ops.trtllm.cutlass_scaled_mm(
         x,

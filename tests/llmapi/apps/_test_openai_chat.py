@@ -2,34 +2,71 @@
 # https://github.com/vllm-project/vllm/blob/aae6927be06dedbda39c6b0c30f6aa3242b84388/tests/entrypoints/openai/test_chat.py
 import os
 import sys
+import tempfile
 from typing import List
 
 import numpy as np
 import openai
 import pytest
+import yaml
 from openai_server import RemoteOpenAIServer
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from test_llm import get_model_path
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="module", ids=["TinyLlama-1.1B-Chat"])
 def model_name():
     return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 
 
-@pytest.fixture(scope="module", params=[None, 'pytorch'])
+@pytest.fixture(scope="module",
+                params=[None, 'pytorch'],
+                ids=["trt", "pytorch"])
 def backend(request):
     return request.param
 
 
+@pytest.fixture(scope="module",
+                params=[True, False],
+                ids=["extra_options", "no_extra_options"])
+def extra_llm_api_options(request):
+    return request.param
+
+
 @pytest.fixture(scope="module")
-def server(model_name: str, backend: str):
+def temp_extra_llm_api_options_file(request):
+    temp_dir = tempfile.gettempdir()
+    temp_file_path = os.path.join(temp_dir, "extra_llm_api_options.yaml")
+    try:
+        extra_llm_api_options_dict = {
+            "enable_chunked_prefill": False,
+            "kv_cache_config": {
+                "enable_block_reuse": False,
+                "max_tokens": 40000
+            }
+        }
+
+        with open(temp_file_path, 'w') as f:
+            yaml.dump(extra_llm_api_options_dict, f)
+
+        yield temp_file_path
+    finally:
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+
+
+@pytest.fixture(scope="module")
+def server(model_name: str, backend: str, extra_llm_api_options: bool,
+           temp_extra_llm_api_options_file: str):
     model_path = get_model_path(model_name)
     if backend == "pytorch":
         args = ["--backend", f"{backend}"]
     else:
         args = ["--max_beam_width", "4"]
+    if extra_llm_api_options:
+        args.append("--extra_llm_api_options")
+        args.append(temp_extra_llm_api_options_file)
     with RemoteOpenAIServer(model_path, args) as remote_server:
         yield remote_server
 

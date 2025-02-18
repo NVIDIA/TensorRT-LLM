@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/runtime/utils/multiDeviceUtils.h"
 #include <functional>
 #include <limits>

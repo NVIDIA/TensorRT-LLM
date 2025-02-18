@@ -144,7 +144,6 @@ void CublasMMWrapper::Gemm(cublasOperation_t transa, cublasOperation_t transb, i
     // TODO: default cublas libs
     usingCublasLt = usingCublasLt && (mAType == CUDA_R_16F || mAType == CUDA_R_8F_E4M3);
     bool isFp16ComputeType = mComputeType == CUBLAS_COMPUTE_16F;
-    int batch_count = 1;
     // fp32 use cublas as default
     // fp16 use cublasLt as default
     void const* alpha = isFp16ComputeType ? reinterpret_cast<void*>(&h_alpha) : reinterpret_cast<void*>(&f_alpha);
@@ -290,8 +289,6 @@ bool CublasMMWrapper::checkTactic(cublasOperation_t transa, cublasOperation_t tr
 {
     TLLM_CHECK_WITH_INFO(
         descriptorsCreated(), "Descriptors are not created! Call createDescriptors before calling this function");
-
-    int workspaceSize = mCublasWorkspace == NULL ? 0 : CUBLAS_WORKSPACE_SIZE;
 
     cublasLtMatmulHeuristicResult_t heurResult;
     cublasStatus_t algoStatus = cublasLtMatmulAlgoCheck(

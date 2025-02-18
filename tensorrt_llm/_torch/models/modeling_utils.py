@@ -1,4 +1,5 @@
 import contextlib
+import fnmatch
 import math
 import time
 from abc import ABC
@@ -139,10 +140,20 @@ class DecoderModel(nn.Module, ABC):
         return hidden_states
 
 
+class PostInitCaller(type):
+
+    def __call__(cls, *args, **kwargs):
+        obj = type.__call__(cls, *args, **kwargs)
+        obj.__post_init__()
+        return obj
+
+
 TModel = TypeVar("TModel", bound=DecoderModel)
 
 
-class DecoderModelForCausalLM(nn.Module, Generic[TModel, TConfig]):
+class DecoderModelForCausalLM(nn.Module,
+                              Generic[TModel, TConfig],
+                              metaclass=PostInitCaller):
 
     def __init__(self, model: TModel, *, config: ModelConfig[TConfig],
                  hidden_size: int, vocab_size: int):
@@ -177,15 +188,6 @@ class DecoderModelForCausalLM(nn.Module, Generic[TModel, TConfig]):
                 ),
             )
 
-        # Exclude modules in QuantConfig.exclude_modules from quantization
-        # It's hard to check for exclude_modules during model.init time,
-        # so instead, split the model.init into three stages:
-        # 1. model.init()
-        # 2. model.update_quant_config()
-        # 3. model.create_weights()
-        self.update_quant_config()
-        self.create_weights()
-
         # use embedding weights in lm_head if tie word embedding is enabled
         if config.pretrained_config.tie_word_embeddings:
             assert self.lm_head.tp_size == self.model.embed_tokens.tp_size, (
@@ -193,35 +195,28 @@ class DecoderModelForCausalLM(nn.Module, Generic[TModel, TConfig]):
             assert self.lm_head.tp_mode == self.model.embed_tokens.tp_mode, (
                 "lm_head and vocab embedding should use the same TP mode")
             self.lm_head.weight = self.model.embed_tokens.weight
+
         self.logits_processor = LogitsProcessor()
 
-    def update_quant_config(self):
-        # skip quant for modules in QuantConfig.exclude_modules
+    def __post_init__(self):
         quant_config = self.model_config.quant_config
-        if quant_config is None:
-            return
-        if quant_config.exclude_modules is not None:
-            exclude_modules = quant_config.exclude_modules
-            for name, module in self.named_modules():
-                for exclude_module in exclude_modules:
-                    if name == exclude_module or (exclude_module.endswith('*')
-                                                  and name.startswith(
-                                                      exclude_module[:-1])):
-                        if getattr(module, "quant_config", None) is not None:
-                            f_reset_quant_config = getattr(
-                                module, "reset_quant_config", None)
-                            if callable(f_reset_quant_config):
-                                module.reset_quant_config()
-                            else:
-                                raise NotImplementedError(
-                                    f"Found {module} in QuantConfig.exclude_modules, but"
-                                    "it doesn't have a `reset_quant_config` method to reset its quant_config."
-                                )
+        if quant_config is not None:
+            # skip quant for modules in QuantConfig.exclude_modules
+            if quant_config.exclude_modules is not None:
+                exclude_modules = quant_config.exclude_modules
+                for name, module in self.named_modules():
+                    is_excluded = False
+                    for exclude_module in exclude_modules:
+                        if fnmatch.fnmatchcase(name, exclude_module):
+                            is_excluded = True
+                            break
+                    if is_excluded and getattr(module, "quant_config",
+                                               None) is not None:
+                        module.quant_config = None
 
-    def create_weights(self):
         for _, module in self.named_modules():
-            if callable(getattr(module, "_create_weights", None)):
-                module._create_weights()
+            if callable(getattr(module, "create_weights", None)):
+                module.create_weights()
 
     @property
     def config(self):

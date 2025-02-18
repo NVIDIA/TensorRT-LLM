@@ -449,6 +449,8 @@ public:
 
     QuantParams mQuantParams{};
     bool mUseLora = false;
+    bool mUsePrequantScale = false;
+    int mGroupSize = -1;
     LoraParams mLoraParams{};
 
     std::optional<tensorrt_llm::cutlass_extensions::CutlassGemmConfig> mSelectedConfig = std::nullopt;
@@ -481,7 +483,7 @@ public:
         auto const gated_inter = mInterSize * mGatedMultiplier;
 
         size_t workspace_size = mMoERunner.getWorkspaceSize(mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK,
-            mActType, mNormMode, {}, mUseLora, /*use_fp8_block_scaling=*/false);
+            mActType, mNormMode, {}, mUseLora, /*use_fp8_block_scaling=*/false, mUsePrequantScale);
 
         mWorkspace = allocBuffer<char>(workspace_size);
         size_t const expert_matrix_size = mNumExperts * mHiddenSize * mInterSize;
@@ -609,8 +611,8 @@ public:
 
         GemmProfilerBackend profiler;
         profiler.init(mMoERunner, gemm_to_profile, typeToDtypeID<DataType>(), typeToDtypeID<WeightType>(),
-            typeToDtypeID<OutputType>(), mNumExperts, mK, mHiddenSize, mInterSize, mActType, mUseBias, mUseLora,
-            parallelism_config);
+            typeToDtypeID<OutputType>(), mNumExperts, mK, mHiddenSize, mInterSize, mGroupSize, mActType, mUseBias,
+            mUseLora, parallelism_config);
         auto workspace_size = profiler.getWorkspaceSize(mTotalTokens);
         auto workspace = bufferManager->gpu(workspace_size);
 

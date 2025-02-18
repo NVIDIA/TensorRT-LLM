@@ -242,12 +242,9 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* qkv_output, T const*
                 auto const src_k_global_offset = static_cast<size_t>(global_token_idx) * (c_q + c_k + ROPE_DIM) + c_q;
 
                 auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_idx_in_kv_cache));
-                auto vDst = reinterpret_cast<T*>(kv_cache.getVBlockPtr(batch_idx, token_idx_in_kv_cache));
                 auto inBlockIdx
                     = kv_cache.getKVLocalIdx(token_idx_in_kv_cache, 0, TOTAL_VECS_PER_HEAD, head_dim_vec_idx);
                 reinterpret_cast<VecT*>(kDst)[inBlockIdx]
-                    = *reinterpret_cast<VecT const*>(&fuse_buf[src_k_global_offset + head_dim_idx]);
-                reinterpret_cast<VecT*>(vDst)[inBlockIdx]
                     = *reinterpret_cast<VecT const*>(&fuse_buf[src_k_global_offset + head_dim_idx]);
             }
         }
@@ -399,12 +396,9 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_buf
                 auto const src_kv_global_offset = static_cast<size_t>(global_token_idx) * (c_q + c_k + ROPE_DIM) + c_q;
 
                 auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_kv_idx));
-                auto vDst = reinterpret_cast<T*>(kv_cache.getVBlockPtr(batch_idx, token_kv_idx));
                 auto inBlockIdx = kv_cache.getKVLocalIdx(token_kv_idx, 0, TOTAL_VEC_PER_HEAD, head_dim_vec_idx);
 
                 reinterpret_cast<VecT*>(kDst)[inBlockIdx]
-                    = *reinterpret_cast<VecT const*>(&fuse_buf[src_kv_global_offset + head_dim_idx]);
-                reinterpret_cast<VecT*>(vDst)[inBlockIdx]
                     = *reinterpret_cast<VecT const*>(&fuse_buf[src_kv_global_offset + head_dim_idx]);
             }
         }
@@ -440,7 +434,7 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_buf
 }
 
 template <typename T, typename KVCacheBuffer>
-void invokeMLARopeContext(mlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream)
+void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream)
 {
     dim3 grid(int(tensorrt_llm::common::divUp(params.max_input_seq_len, 32)), params.batch_size, params.head_num + 8);
     auto head_size = params.meta.qk_nope_head_dim;
@@ -451,7 +445,7 @@ void invokeMLARopeContext(mlaParams<T>& params, KVCacheBuffer kv_cache_buffer, c
 }
 
 template <typename T, typename KVCacheBuffer>
-void invokeMLARopeGeneration(mlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream)
+void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream)
 {
     dim3 grid(int(tensorrt_llm::common::divUp(params.acc_q_len, 32)), params.head_num + 1 + 8);
     auto head_size = params.meta.qk_nope_head_dim;
@@ -462,8 +456,8 @@ void invokeMLARopeGeneration(mlaParams<T>& params, KVCacheBuffer kv_cache_buffer
 }
 
 #define INSTANTIATE_MLA_ROPE(T, KVCacheBuffer)                                                                         \
-    template void invokeMLARopeContext(mlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream);      \
-    template void invokeMLARopeGeneration(mlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream);
+    template void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream);      \
+    template void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream);
 
 INSTANTIATE_MLA_ROPE(float, KVBlockArray);
 INSTANTIATE_MLA_ROPE(half, KVBlockArray);

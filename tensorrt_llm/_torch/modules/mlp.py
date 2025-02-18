@@ -41,6 +41,7 @@ class MLP(nn.Module):
             weights_loading_config=WeightsLoadingConfig(
                 weight_mode=WeightMode.VANILLA),
             quant_config=config.get_quant_config(),
+            skip_create_weights=config.skip_create_weights,
         )
         self.down_proj = Linear(
             self.intermediate_size,
@@ -53,6 +54,7 @@ class MLP(nn.Module):
                 tensor_parallel_mode=TensorParallelMode.ROW,
                 gpus_per_node=gpus_per_node),
             quant_config=config.get_quant_config(),
+            skip_create_weights=config.skip_create_weights,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

@@ -16,8 +16,8 @@
 
 #include <gtest/gtest.h>
 
-#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 #if ENABLE_MULTI_DEVICE
 #include "tensorrt_llm/plugins/common/plugin.h"

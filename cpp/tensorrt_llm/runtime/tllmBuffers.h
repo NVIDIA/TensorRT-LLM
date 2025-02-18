@@ -674,10 +674,10 @@ private:
     void* mBuffer;
 };
 
-class IpcNvlsBuffer : virtual public IBuffer
+class MulticastBuffer : virtual public IBuffer
 {
 public:
-    explicit IpcNvlsBuffer(nvinfer1::DataType type, std::set<int> ranks)
+    explicit MulticastBuffer(nvinfer1::DataType type, std::set<int> const& ranks)
         : mSize(0)
         , mCapacity(0)
         , mType(type)
@@ -686,7 +686,7 @@ public:
         TLLM_CHECK(ranks.size() > 1);
     }
 
-    explicit IpcNvlsBuffer(size_t size, nvinfer1::DataType type, std::set<int> ranks)
+    explicit MulticastBuffer(size_t size, nvinfer1::DataType type, std::set<int> const& ranks)
         : mSize(0)
         , mCapacity(0)
         , mType(type)
@@ -697,7 +697,10 @@ public:
         resize(size);
     }
 
-    IpcNvlsBuffer(IpcNvlsBuffer&& other) noexcept
+    MulticastBuffer(MulticastBuffer& other) = delete;
+    MulticastBuffer& operator=(MulticastBuffer const& other) = delete;
+
+    MulticastBuffer(MulticastBuffer&& other) noexcept
         : mSize(other.mSize)
         , mCapacity(other.mCapacity)
         , mType(other.mType)
@@ -709,12 +712,12 @@ public:
         other.mHandle = IpcNvlsHandle{};
     }
 
-    ~IpcNvlsBuffer() override
+    ~MulticastBuffer() override
     {
-        IpcNvlsBuffer::release();
+        MulticastBuffer::release();
     }
 
-    IpcNvlsBuffer& operator=(IpcNvlsBuffer&& other) noexcept
+    MulticastBuffer& operator=(MulticastBuffer&& other) noexcept
     {
         if (this != &other)
         {
@@ -735,14 +738,25 @@ public:
         return *this;
     }
 
-    void* dataMC()
+    // Return list of pointers to each rank
+    [[nodiscard]] void* dataIpcList()
+    {
+        return reinterpret_cast<void*>(mHandle.ipc_uc_ptrs.data());
+    }
+
+    [[nodiscard]] void const* dataIpcList() const
+    {
+        return reinterpret_cast<void const*>(mHandle.ipc_uc_ptrs.data());
+    }
+
+    [[nodiscard]] void* dataMC()
     {
         return reinterpret_cast<void*>(mHandle.mc_ptr);
     }
 
-    void const* dataMC() const
+    [[nodiscard]] void const* dataMC() const
     {
-        return reinterpret_cast<void*>(mHandle.mc_ptr);
+        return reinterpret_cast<void const*>(mHandle.mc_ptr);
     }
 
     //////////////////////////
@@ -752,33 +766,33 @@ public:
     using IBuffer::data;
 
     // Return unicast pointer
-    void* data() override
+    [[nodiscard]] void* data() override
     {
         return reinterpret_cast<void*>(mHandle.uc_ptr);
     }
 
     // Return unicast pointer
-    void const* data() const override
+    [[nodiscard]] void const* data() const override
     {
-        return reinterpret_cast<void*>(mHandle.uc_ptr);
+        return reinterpret_cast<void const*>(mHandle.uc_ptr);
     }
 
-    std::size_t getSize() const override
+    [[nodiscard]] std::size_t getSize() const override
     {
         return mSize;
     }
 
-    std::size_t getCapacity() const override
+    [[nodiscard]] std::size_t getCapacity() const override
     {
         return mCapacity;
     }
 
-    nvinfer1::DataType getDataType() const override
+    [[nodiscard]] nvinfer1::DataType getDataType() const override
     {
         return mType;
     }
 
-    MemoryType getMemoryType() const override
+    [[nodiscard]] MemoryType getMemoryType() const override
     {
         return MemoryType::kGPU;
     }
@@ -789,7 +803,7 @@ public:
         if (mCapacity < newSize)
         {
             release();
-            printf("IpcNvlsBuffer resize: %d B\n", int(toBytes(newSize)));
+            printf("MulticastBuffer resize: %d B\n", int(toBytes(newSize)));
             mHandle = ipcNvlsAllocate(toBytes(newSize), mRanks);
 
             TLLM_CHECK(mHandle.size % BufferDataType(mType).getSize() == 0);
@@ -906,16 +920,23 @@ private:
 };
 
 // Forward declaration
-class IpcNvlsTensor;
+class MulticastTensor;
 
-class IpcNvlsTensorView : virtual public ITensor
+class MulticastTensorView : virtual public ITensor
 {
 public:
-    explicit IpcNvlsTensorView(std::weak_ptr<IpcNvlsTensor> const& tensor, bool unicastView);
+    enum class ViewType
+    {
+        kUNICAST,
+        kMULTICAST,
+        kIPC_LIST
+    };
 
-    IpcNvlsTensorView(IpcNvlsTensorView&& other) noexcept;
+    explicit MulticastTensorView(std::weak_ptr<MulticastTensor> const& tensor, ViewType viewType);
 
-    IpcNvlsTensorView& operator=(IpcNvlsTensorView&& other) noexcept;
+    MulticastTensorView(MulticastTensorView&& other) noexcept;
+
+    [[nodiscard]] MulticastTensorView& operator=(MulticastTensorView&& other) noexcept;
 
     /////////////////////
     // ITensor methods
@@ -928,71 +949,76 @@ public:
     // IBuffer methods
     /////////////////////
 
-    std::size_t getSize() const override;
+    [[nodiscard]] std::size_t getSize() const override;
 
-    std::size_t getCapacity() const override;
+    [[nodiscard]] std::size_t getCapacity() const override;
 
-    nvinfer1::DataType getDataType() const override;
+    [[nodiscard]] nvinfer1::DataType getDataType() const override;
 
-    MemoryType getMemoryType() const override;
+    [[nodiscard]] MemoryType getMemoryType() const override;
 
     using ITensor::data;
 
-    void* data() override
+    [[nodiscard]] void* data() override
     {
         return _data();
     }
 
-    void const* data() const override
+    [[nodiscard]] void const* data() const override
     {
         return _data();
     }
 
     void resize(std::size_t newSize) override
     {
-        TLLM_THROW("Cannot resize() IpcNvlsTensorView");
+        TLLM_THROW("Cannot resize() MulticastTensorView");
     }
 
     void release() override
     {
-        TLLM_THROW("Cannot release() IpcNvlsTensorView");
+        TLLM_THROW("Cannot release() MulticastTensorView");
     }
 
 private:
-    std::shared_ptr<IpcNvlsBuffer> lock() const;
+    [[nodiscard]] std::shared_ptr<MulticastBuffer> lock() const;
 
-    void* _data() const;
+    [[nodiscard]] void* _data() const;
 
-    std::weak_ptr<IpcNvlsTensor> mTensor;
-    bool mUnicastView;
+    std::weak_ptr<MulticastTensor> mTensor;
+    ViewType mViewType;
     nvinfer1::Dims mDims{};
 };
 
-class IpcNvlsTensor : virtual public ITensor, public IpcNvlsBuffer, public std::enable_shared_from_this<IpcNvlsTensor>
+class MulticastTensor : virtual public ITensor,
+                        public MulticastBuffer,
+                        public std::enable_shared_from_this<MulticastTensor>
 {
 public:
-    using Base = IpcNvlsBuffer;
+    using Base = MulticastBuffer;
 
-    explicit IpcNvlsTensor(nvinfer1::DataType type, std::set<int> ranks)
+    explicit MulticastTensor(nvinfer1::DataType type, std::set<int> const& ranks)
         : Base(type, ranks)
     {
         mDims.nbDims = 0;
     }
 
-    explicit IpcNvlsTensor(nvinfer1::Dims const& dims, nvinfer1::DataType type, std::set<int> ranks)
+    explicit MulticastTensor(nvinfer1::Dims const& dims, nvinfer1::DataType type, std::set<int> const& ranks)
         : Base(nonNegative(volume(dims)), type, ranks)
         , mDims(dims)
     {
     }
 
-    IpcNvlsTensor(IpcNvlsTensor&& tensor) noexcept
+    MulticastTensor(MulticastTensor& other) = delete;
+    MulticastTensor& operator=(MulticastTensor const& other) = delete;
+
+    MulticastTensor(MulticastTensor&& tensor) noexcept
         : Base(std::move(tensor))
         , mDims(tensor.mDims)
     {
         tensor.mDims.nbDims = 0;
     }
 
-    IpcNvlsTensor& operator=(IpcNvlsTensor&& tensor) noexcept
+    [[nodiscard]] MulticastTensor& operator=(MulticastTensor&& tensor) noexcept
     {
         if (this != &tensor)
         {
@@ -1004,14 +1030,9 @@ public:
         return *this;
     }
 
-    std::shared_ptr<ITensor> getUnicastView()
+    [[nodiscard]] std::shared_ptr<ITensor> getTensorView(MulticastTensorView::ViewType viewType)
     {
-        return std::make_shared<IpcNvlsTensorView>(weak_from_this(), true /* UC view */);
-    }
-
-    std::shared_ptr<ITensor> getMulticastView()
-    {
-        return std::make_shared<IpcNvlsTensorView>(weak_from_this(), false /* MC view */);
+        return std::make_shared<MulticastTensorView>(weak_from_this(), viewType);
     }
 
     /////////////////////

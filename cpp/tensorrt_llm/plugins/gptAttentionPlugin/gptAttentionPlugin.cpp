@@ -515,43 +515,13 @@ void GPTAttentionPlugin::configurePluginImpl(nvinfer1::DynamicPluginTensorDesc c
     int const num_requests = 256;
     int const sink_token_length = 0;
 
-    EnqueueGenerationParams<T> enqueueParams{
-        /*attention_input=*/nullptr,
-        /*qkv_bias=*/nullptr,
-        /*attention_mask*/ nullptr,
-        /*rotary_inv_freq*/ nullptr,
-        /*rotary_cos_sin*/ nullptr,
-        /*input_seq_length=*/0,
-        /*sequence_lengths=*/nullptr,
-        /*past_kv_length=*/0,
-        beamWidth,
-        /*context_lengths=*/nullptr,
-        /*kv_scale_orig_quant=*/nullptr,
-        /*kv_scale_quant_orig=*/nullptr,
-        /*attention_out_orig_quant=*/nullptr,
-        /*attention_out_sf_scale=*/nullptr,
-        /*alibi_slopes=*/nullptr,
-        /*context_buf_=*/nullptr,
-        /*context_buf_sf=*/nullptr,
-        /*key_value_cache=*/nullptr,
-        /*block_offsets=*/nullptr,
-        /*host_primary_pool_pointer=*/nullptr,
-        /*host_secondary_pool_pointer=*/nullptr,
-        /*attention_mask_stride*/ 0,
-        max_attention_window_size,
-        cyclic_attention_window_size,
-        cyclic_attention_window_size,
-        /*can_use_one_more_block=*/false,
-        sink_token_length,
-        num_requests,
-        /*max_blocks_per_sequence=*/0,
-        /*cache_indir=*/nullptr,
-        /*semaphores=*/nullptr,
-        /*workspace=*/nullptr,
-        /*max_context_kv_len_list=*/nullptr,
-        /*mrope_position_deltas*/ nullptr,
-
-    };
+    EnqueueGenerationParams<T> enqueueParams;
+    enqueueParams.max_attention_window_size = max_attention_window_size;
+    enqueueParams.cyclic_attention_window_size = cyclic_attention_window_size;
+    enqueueParams.max_cyclic_attention_window_size = cyclic_attention_window_size;
+    enqueueParams.sink_token_length = sink_token_length;
+    enqueueParams.beam_width = beamWidth;
+    enqueueParams.num_requests = num_requests;
 
     prepareEnqueueGeneration<T, KVCacheBuffer>(enqueueParams);
 
@@ -720,7 +690,7 @@ int GPTAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc,
 }
 
 template <typename T, typename AttentionOutT>
-mlaParams<T> GPTAttentionPlugin::enqueueMLAPreprocess(int32_t localNbSeq, int32_t localNbTokens,
+MlaParams<T> GPTAttentionPlugin::enqueueMLAPreprocess(int32_t localNbSeq, int32_t localNbTokens,
     nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
     void const* const* inputs, void* const* outputs, void*& workspace, bool is_context, cudaStream_t stream)
 {
@@ -733,7 +703,7 @@ mlaParams<T> GPTAttentionPlugin::enqueueMLAPreprocess(int32_t localNbSeq, int32_
 
     AttentionOutT* context_buf_ = static_cast<AttentionOutT*>(outputs[0]);
 
-    mlaParams<T> mla_params;
+    MlaParams<T> mla_params;
     mla_params.fused_a_input = input;
     mla_params.context_buf = reinterpret_cast<T*>(context_buf_);
     mla_params.q_b_proj = q_b_proj;
@@ -795,7 +765,7 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         mMultiBlockMode = mUseSpecDecoding ? false : true;
     }
 
-    [[maybe_unused]] mlaParams<T> mla_params;
+    [[maybe_unused]] MlaParams<T> mla_params;
     if (mIsMLAEnabled)
     {
         // In MLA, attention_input will be the ptr of workspace, and workspace value will be updated in
@@ -1013,13 +983,10 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         + outputDesc[0].dims.d[getPackedTensorHiddenDimIndex(mRemovePadding)] * tokenIdxBeg / numEltsPerStorageType;
 
     __nv_fp8_e4m3* context_buf_sf_ = nullptr;
-    int32_t start_token_idx_sf = 0;
     if (mFuseFp4Quant)
     {
         // The output address for FP4 scaling factor.
         context_buf_sf_ = static_cast<__nv_fp8_e4m3*>(outputs[1]);
-        // If inflight batching is enabled, generation output starts at row tokenIdxBeg in the SF output tensor.
-        start_token_idx_sf = tokenIdxBeg;
     }
 
     void* key_value_cache = nullptr;
@@ -1082,6 +1049,53 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
 
     int64_t const* runtime_perf_knobs = static_cast<int64_t const*>(inputs[getIdx(IdxEntry::HOST_RUNTIME_PERF_KNOBS)]);
 
+    EnqueueParams<T> common_enqueue_params;
+    common_enqueue_params.attention_input = attention_input;
+    common_enqueue_params.qkv_bias = qkv_bias;
+    common_enqueue_params.attention_mask = attention_mask;
+    common_enqueue_params.rotary_inv_freq = rotary_inv_freq;
+    common_enqueue_params.rotary_cos_sin = rotary_cos_sin;
+    common_enqueue_params.max_attention_window_size = max_attention_window_size;
+    common_enqueue_params.cyclic_attention_window_size = cyclic_attention_window_size;
+    common_enqueue_params.max_cyclic_attention_window_size = max_cyclic_attention_window_size;
+    common_enqueue_params.can_use_one_more_block = can_use_one_more_block;
+    common_enqueue_params.sink_token_length = sink_token_length;
+    common_enqueue_params.kv_scale_orig_quant = kv_scale_orig_quant;
+    common_enqueue_params.kv_scale_quant_orig = kv_scale_quant_orig;
+    common_enqueue_params.attention_output_orig_quant = attention_output_orig_quant;
+    common_enqueue_params.attention_output_sf_scale = attention_output_sf_scale;
+    common_enqueue_params.alibi_slopes = alibi_slopes;
+    common_enqueue_params.context_buf = context_buf_;
+    common_enqueue_params.context_buf_sf = context_buf_sf_;
+    common_enqueue_params.key_value_cache = key_value_cache;
+    common_enqueue_params.block_offsets = block_offsets;
+    common_enqueue_params.host_primary_pool_pointer = host_primary_pool_pointer;
+    common_enqueue_params.host_secondary_pool_pointer = host_secondary_pool_pointer;
+    common_enqueue_params.num_tokens = localNbTokens;
+    common_enqueue_params.max_blocks_per_sequence = max_blocks_per_sequence;
+    common_enqueue_params.sequence_lengths = sequence_kv_length;
+    common_enqueue_params.context_lengths = context_q_lengths;
+    common_enqueue_params.host_context_lengths = host_context_lengths;
+    common_enqueue_params.workspace = workspace;
+    common_enqueue_params.runtime_perf_knobs = runtime_perf_knobs;
+
+    if (isRelativePosition())
+    {
+        common_enqueue_params.relative_attention_bias
+            = static_cast<T const*>(inputs[getIdx(IdxEntry::RELATIVE_ATTENTION_BIAS)]);
+        common_enqueue_params.relative_attention_bias_stride
+            = inputDesc[getIdx(IdxEntry::RELATIVE_ATTENTION_BIAS)].dims.d[1]; // max_seq_len or num_buckets
+    }
+    if (isLognScaling())
+    {
+        common_enqueue_params.logn_scaling_ptr = static_cast<float const*>(inputs[getIdx(IdxEntry::LOGN_SCALING)]);
+    }
+    if (isCrossAttention())
+    {
+        common_enqueue_params.encoder_input_lengths
+            = reinterpret_cast<int const*>(inputs[getIdx(IdxEntry::ENCODER_INPUT_LENGTH)]) + seqIdxBeg;
+    }
+
     if (is_context) // context stage
     {
         int const batch_size = localNbSeq;
@@ -1100,39 +1114,19 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
             }
         }
 
-        EnqueueContextParams<T> enqueue_params{attention_input, qkv_bias, attention_mask, attention_packed_mask,
-            rotary_inv_freq, rotary_cos_sin, max_context_q_len, max_context_kv_len, max_attention_window_size,
-            cyclic_attention_window_size, max_cyclic_attention_window_size, can_use_one_more_block, sink_token_length,
-            context_q_lengths, sequence_kv_length, kv_scale_orig_quant, kv_scale_quant_orig,
-            attention_output_orig_quant, attention_output_sf_scale, alibi_slopes, context_buf_, context_buf_sf_,
-            key_value_cache, block_offsets, host_block_offsets, host_primary_pool_pointer, host_secondary_pool_pointer,
-            batch_size, localNbTokens, max_blocks_per_sequence, host_context_lengths, workspace, mrope_rotary_cos_sin};
+        common_enqueue_params.input_seq_length = max_context_q_len;
+        common_enqueue_params.max_past_kv_length = max_context_kv_len;
+        EnqueueContextParams<T> enqueue_params{common_enqueue_params};
+        enqueue_params.attention_packed_mask = attention_packed_mask;
+        enqueue_params.host_block_offsets = host_block_offsets;
+        enqueue_params.batch_size = batch_size;
+        enqueue_params.mrope_rotary_cos_sin = mrope_rotary_cos_sin;
 
-        enqueue_params.runtime_perf_knobs = runtime_perf_knobs;
-        if (isRelativePosition())
-        {
-            enqueue_params.relative_attention_bias
-                = static_cast<T const*>(inputs[getIdx(IdxEntry::RELATIVE_ATTENTION_BIAS)]);
-            enqueue_params.relative_attention_bias_stride
-                = inputDesc[getIdx(IdxEntry::RELATIVE_ATTENTION_BIAS)].dims.d[1]; // max_seq_len or num_buckets
-        }
-        if (isLognScaling())
-        {
-            enqueue_params.logn_scaling_ptr = static_cast<float const*>(inputs[getIdx(IdxEntry::LOGN_SCALING)]);
-        }
         if (isCrossAttention())
         {
             enqueue_params.cross_kv = static_cast<T const*>(inputs[getIdx(IdxEntry::CROSS_KV)]);
             enqueue_params.cross_kv_length = max_encoder_context_len;
-            enqueue_params.encoder_input_lengths
-                = reinterpret_cast<int const*>(inputs[getIdx(IdxEntry::ENCODER_INPUT_LENGTH)]) + seqIdxBeg;
             enqueue_params.num_encoder_tokens = num_encoder_tokens;
-        }
-        if (mCpSize > 1)
-        {
-            enqueue_params.host_context_lengths = mRemovePadding
-                ? reinterpret_cast<int const*>(inputs[getIdx(IdxEntry::HOST_CONTEXT_LENGTH)])
-                : nullptr;
         }
 
         if (mIsMLAEnabled)
@@ -1180,8 +1174,6 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
 
         int const* cache_indir
             = beamWidth == 1 ? nullptr : reinterpret_cast<int const*>(inputs[getIdx(IdxEntry::CACHE_INDIR)]);
-        int const* host_context_lengths
-            = mRemovePadding ? reinterpret_cast<int const*>(inputs[getIdx(IdxEntry::HOST_CONTEXT_LENGTH)]) : nullptr;
 
         // Medusa: the max input sequence length if variable sequence length is needed.
         int const input_seq_length = getGenerationInputSequenceLength(inputDesc, localNbSeq, localNbTokens);
@@ -1194,32 +1186,16 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
             qkvDims.d[2]);
         TLLM_CHECK_WITH_INFO(
             input_seq_length == num_decoding_draft_tokens + 1, "The generation input length is not expected.");
-        EnqueueGenerationParams<T> enqueue_params{attention_input, qkv_bias, attention_mask, rotary_inv_freq,
-            rotary_cos_sin, input_seq_length, sequence_kv_length, max_past_kv_length, beamWidth, context_q_lengths,
-            kv_scale_orig_quant, kv_scale_quant_orig, attention_output_orig_quant, attention_output_sf_scale,
-            alibi_slopes, context_buf_, context_buf_sf_, key_value_cache, block_offsets, host_primary_pool_pointer,
-            host_secondary_pool_pointer, attention_mask_stride, max_attention_window_size, cyclic_attention_window_size,
-            max_cyclic_attention_window_size, can_use_one_more_block, sink_token_length, num_requests,
-            max_blocks_per_sequence, cache_indir, mMultiBlockSemaphores.get(), workspace, host_past_kv_len_list,
-            mrope_position_deltas};
-        enqueue_params.host_context_lengths = host_context_lengths;
-        enqueue_params.runtime_perf_knobs = runtime_perf_knobs;
-        if (isRelativePosition())
-        {
-            enqueue_params.relative_attention_bias
-                = static_cast<T const*>(inputs[getIdx(IdxEntry::RELATIVE_ATTENTION_BIAS)]);
-            enqueue_params.relative_attention_bias_stride
-                = inputDesc[getIdx(IdxEntry::RELATIVE_ATTENTION_BIAS)].dims.d[1]; // max_seq_len or num_buckets
-        }
-        if (isLognScaling())
-        {
-            enqueue_params.logn_scaling_ptr = static_cast<float const*>(inputs[getIdx(IdxEntry::LOGN_SCALING)]);
-        }
-        if (isCrossAttention())
-        {
-            enqueue_params.encoder_input_lengths
-                = reinterpret_cast<int const*>(inputs[getIdx(IdxEntry::ENCODER_INPUT_LENGTH)]) + seqIdxBeg;
-        }
+        common_enqueue_params.input_seq_length = input_seq_length;
+        common_enqueue_params.max_past_kv_length = max_past_kv_length;
+        EnqueueGenerationParams<T> enqueue_params{common_enqueue_params};
+        enqueue_params.beam_width = beamWidth;
+        enqueue_params.attention_mask_stride = attention_mask_stride;
+        enqueue_params.num_requests = num_requests;
+        enqueue_params.cache_indir = cache_indir;
+        enqueue_params.semaphores = multiBlockSemaphores();
+        enqueue_params.host_past_key_value_lengths = host_past_kv_len_list;
+        enqueue_params.mrope_position_deltas = mrope_position_deltas;
         if (mIsSpecDecodingEnabled && mUseSpecDecoding)
         {
             enqueue_params.spec_decoding_packed_mask = spec_decoding_packed_mask;
@@ -1228,7 +1204,6 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
             enqueue_params.spec_decoding_is_generation_length_variable = mSpecDecodingIsGenerationLengthVariable;
             enqueue_params.spec_decoding_max_generation_length = mSpecDecodingMaxGenerationLength;
         }
-        enqueue_params.total_num_input_tokens = localNbTokens;
         if (mFuseFp4Quant)
         {
             enqueue_params.start_token_idx_sf = tokenIdxBeg;
@@ -1409,10 +1384,6 @@ void GPTAttentionPlugin::serialize(void* buffer) const noexcept
 GPTAttentionPluginCreator::GPTAttentionPluginCreator()
     : GPTAttentionPluginCreatorCommon()
 {
-
-    mPluginAttributes.emplace_back(PluginField("in_flight_batching", nullptr, PluginFieldType::kINT8, 0));
-    mFC.nbFields = mPluginAttributes.size();
-    mFC.fields = mPluginAttributes.data();
 }
 
 char const* GPTAttentionPluginCreator::getPluginName() const noexcept

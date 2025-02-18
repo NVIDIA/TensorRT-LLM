@@ -95,6 +95,9 @@ struct KernelParams
     float const* ptrScaleSfKv;
     // The SF scale for O on device. Only needed by trt-llm kernels as the scales have to be on the device currently.
     float const* ptrScaleSfO;
+    // The sequence lengths for K/V. Required by pagedKv kernels to avoid unnecessary computation
+    // based on (ptrCumSeqLensKv[batchIdx + 1] - ptrCumSeqLensKv[batchIdx]).
+    int32_t const* ptrSeqLensKv;
 
     // The attention window size for sliding window attention.
     int32_t mAttentionWindowSize;
@@ -666,6 +669,9 @@ struct KernelParams
 
         // TRT-LLM restrictions: the quantization scales must be on the device.
         params.ptrOutputScale = options.outputScalePtr;
+
+        // The sequence lengths for Kv.
+        params.ptrSeqLensKv = options.seqLensKvPtr;
 
         // The partial buffers' pointers when the multiCtasKv mode is enabled.
         int64_t partialStatsBufferSize = options.mMaxNumCtas * kernelMeta.mStepQ;

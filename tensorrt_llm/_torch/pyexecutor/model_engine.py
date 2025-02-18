@@ -11,6 +11,7 @@ import torch
 
 import tensorrt_llm._torch
 import tensorrt_llm.bindings
+import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._torch.attention_backend import *
 from tensorrt_llm._torch.attention_backend.interface import (
     AttentionMetadata, AttentionRuntimeFeatures)
@@ -128,51 +129,6 @@ def load_weights(checkpoint_dir: str):
     raise RuntimeError(f"No weight files found in {checkpoint_dir}.")
 
 
-@contextlib.contextmanager
-def _get_warmup_batch(batch_size: int, kv_cache_manager: KVCacheManager):
-    available_blocks = kv_cache_manager.get_num_free_blocks()
-    if available_blocks >= batch_size:
-        result = ScheduledRequests()
-        result.context_requests = []
-        # Add (batch_size - 1) dummy requests with seq_len=1.
-        # Should only need one more page per request.
-        requests = kv_cache_manager.add_dummy_requests(
-            list(range(batch_size - 1)),
-            is_gen=True,
-        )
-        available_blocks -= batch_size - 1
-        available_tokens = available_blocks * kv_cache_manager.tokens_per_block
-        # When we generate last token for the max_seq_len case,
-        # we only need to store (max_seq_len - 1) tokens in the KV cache.
-        token_num = max(
-            1,
-            min(available_tokens, kv_cache_manager.max_seq_len - 1),
-        )
-        # Add one dummy request with the maximum possible sequence length.
-        # The sequence length is limited by both the max_seq_len and the number of available blocks.
-        max_seq_len_request = kv_cache_manager.add_dummy_requests(
-            request_ids=[batch_size - 1],
-            token_nums=[token_num],
-            is_gen=True,
-        )[0]
-        # Add the longest request before all other seq_len=1 request to simulate the padding CUDA graph case.
-        # This batch contains both the longest request and the shortest requests,
-        # it also contains the maximum number of requests and the maximum token number,
-        # which simulates the extreme case for the padding CUDA graph.
-        # Thus we can replay this CUDA graph in all other cases.
-        requests.insert(0, max_seq_len_request)
-        result.generation_requests = requests
-    else:
-        result = None
-
-    try:
-        yield result
-    finally:
-        if result is not None:
-            for req in result.generation_requests:
-                kv_cache_manager.free_resources(req)
-
-
 class PyTorchModelEngine(ModelEngine):
 
     def __init__(
@@ -204,21 +160,26 @@ class PyTorchModelEngine(ModelEngine):
             attn_backend=attn_backend,
         )
         self.enable_attention_dp = self.model.model_config.mapping.enable_attention_dp
+        self.dtype = self.model.config.torch_dtype
+        self._init_model_capacity()
+        self.ub_buffers = None
+
         try:
             if pytorch_backend_config.torch_compile_enabled:
+                use_ub = pytorch_backend_config.torch_compile_enable_userbuffers and self._init_userbuffers(
+                    self.model.config.hidden_size,
+                    self.model.model_config.get_quant_config(), self.dtype)
                 self.model = torch.compile(
                     self.model,
                     backend=Backend(
-                        pytorch_backend_config.torch_compile_inductor_enabled),
+                        pytorch_backend_config.torch_compile_inductor_enabled,
+                        enable_userbuffers=use_ub),
                     fullgraph=pytorch_backend_config.torch_compile_fullgraph)
         except Exception as e:
             import traceback
             traceback.print_exception(Exception, e, e.__traceback__)
             raise e
         self._torch_compile_enabled = pytorch_backend_config.torch_compile_enabled
-
-        self.dtype = self.model.config.torch_dtype
-        self._init_model_capacity()
 
         self.attn_backend = get_attention_backend(attn_backend)
 
@@ -253,6 +214,7 @@ class PyTorchModelEngine(ModelEngine):
         self.position_ids_cuda = torch.empty((self.max_num_tokens, ),
                                              dtype=torch.int,
                                              device='cuda')
+        self.iter_counter = 0
 
     def warmup(self, resource_manager: ResourceManager) -> None:
         kv_cache_manager = resource_manager.get_resource_manager(
@@ -488,6 +450,9 @@ class PyTorchModelEngine(ModelEngine):
         return self._cuda_graphs[batch_size]
 
     def __del__(self) -> None:
+        if self.ub_buffers:
+            for u in self.ub_buffers:
+                ub.ub_deallocate(u)
         torch.cuda.empty_cache()
 
     def _load_model(self, checkpoint_dir: str, **kwargs):
@@ -1041,6 +1006,7 @@ class PyTorchModelEngine(ModelEngine):
                     attn_metadata.num_tokens)
                 attn_metadata.all_rank_num_tokens = all_rank_num_tokens
 
+            self.iter_counter += 1
             if maybe_graph is None:
                 return self._forward_step(inputs, gather_ids)
             else:
@@ -1068,3 +1034,30 @@ class PyTorchModelEngine(ModelEngine):
             return {'logits': logits[gather_ids]}
         else:
             return {'logits': logits}
+
+    def _init_userbuffers(self, hidden_size, quant_config, dtype):
+        # No quant, do not allow UB
+        if self.mapping.tp_size <= 1:
+            return False
+
+        if quant_config is None:
+            return False
+
+        # UB currently only support FP8 quant
+        if not quant_config.layer_quant_mode.has_fp8_qdq():
+            return False
+
+        if dtype != torch.float16 and dtype != torch.bfloat16:
+            return False
+
+        # Disable UB for unsupported platforms
+        if not ub.ub_supported():
+            return False
+        ub.ub_initialize(self.mapping.tp_size)
+        if not ub.ub_is_initialized():
+            return False
+        self.ub_buffers = [
+            ub.ub_allocate(0, hidden_size * self.max_num_tokens * 2),
+            ub.ub_allocate(1, hidden_size * self.max_num_tokens * 2),
+        ]
+        return True

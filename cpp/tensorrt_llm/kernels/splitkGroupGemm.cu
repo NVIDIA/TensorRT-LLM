@@ -15,6 +15,8 @@
  * limitations under the License.
  */
 
+#include "splitkGroupGemm.h"
+
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/device/gemm_universal.h"
 #include "cutlass/gemm/gemm.h"
@@ -23,15 +25,11 @@
 #include "tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm/kernel/default_splitk_gemm_grouped.h"
 #include "tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm/kernel/splitk_gemm_grouped.h"
 
-#include "splitkGroupGemm.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 
-#include "tensorrt_llm/common/cudaUtils.h"
-
-namespace tensorrt_llm
-{
-namespace kernels
+namespace tensorrt_llm::kernels
 {
 
 int64_t inline getGemmCoordSize(int64_t problemCount)
@@ -66,7 +64,7 @@ int64_t getSplitkGroupedGemmParamsWorkSpaceSize(int64_t problemCount)
 
 template <int M1, int N1, int K1, int M2, int N2, int K2, typename cutlassType, int kAlignmentAB, int kAlignmentC,
     int kStages>
-void splitkGroupedGemm_(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vector<void*> const& ptrA,
+void splitkGroupedGemm_(std::vector<cutlass::gemm::GemmCoord> problemSizes, std::vector<void*> const& ptrA,
     std::vector<void*> const& ptrB, std::vector<void*> const& ptrC, std::vector<void*> const& ptrD,
     void* gemmParamsWorkSpace, int64_t gemmParamsWorkSpaceSize, void* gemmWorkSpace, int64_t gemmWorkSpaceSize,
     int splitKSlices, cudaStream_t stream)
@@ -81,8 +79,6 @@ void splitkGroupedGemm_(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std
     using LayoutA = cutlass::layout::RowMajor;
     using LayoutB = cutlass::layout::ColumnMajor;
     using LayoutC = cutlass::layout::RowMajor;
-
-    int problemCount = problem_sizes.size();
 
     using GemmKernel = typename cutlass::gemm::kernel::DefaultSplitkGemmGrouped<ElementA, LayoutA,
         cutlass::ComplexTransform::kNone, kAlignmentAB, ElementB, LayoutB, cutlass::ComplexTransform::kNone,
@@ -102,6 +98,7 @@ void splitkGroupedGemm_(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std
     float beta = 0.0f;
     typename Gemm::EpilogueOutputOp::Params epilogue_op(alpha, beta);
 
+    int problemCount = problemSizes.size();
     auto gemm_coord_size = getGemmCoordSize(problemCount);
     auto ptr_size = getPtrSize(problemCount);
     auto ldd_size = getLddSize(problemCount);
@@ -130,13 +127,13 @@ void splitkGroupedGemm_(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std
     int64_t cumulative_offsets = 0;
     for (int32_t i = 0; i < problemCount; ++i)
     {
-        problem_sizes_host[i] = problem_sizes.at(i);
+        problem_sizes_host[i] = problemSizes.at(i);
         ptr_A_host[i] = (ElementA*) ptrA.at(i);
         ptr_B_host[i] = (ElementB*) ptrB.at(i);
         ptr_C_host[i] = (ElementFinalOutput*) ptrC.at(i);
         ptr_D_host[i] = (ElementFinalOutput*) ptrD.at(i);
 
-        auto problem = problem_sizes.at(i);
+        auto const& problem = problemSizes.at(i);
         lda_host[i] = LayoutA::packed({problem.m(), problem.k()}).stride(0);
         TLLM_CHECK(lda_host[i] % kAlignmentAB == 0);
         ldb_host[i] = LayoutB::packed({problem.k(), problem.n()}).stride(0);
@@ -172,10 +169,10 @@ void splitkGroupedGemm_(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std
     tensorrt_llm::common::cudaAutoCpy(
         (int8_t*) gemmParamsWorkSpace, (int8_t*) host_workspace, gemmParamsWorkSpaceSize, stream);
 
-    int threadblock_count = Gemm::sufficient(problem_sizes.data(), problemCount);
+    int threadblock_count = Gemm::sufficient(problemSizes.data(), problemCount);
 
     typename Gemm::Arguments args(problem_sizes_device, problemCount, threadblock_count, epilogue_op, ptr_A, ptr_B,
-        ptr_C, ptr_D, lda, ldb, ldc, ldd, problem_sizes.data(), splitKSlices, offset);
+        ptr_C, ptr_D, lda, ldb, ldc, ldd, problemSizes.data(), splitKSlices, offset);
 
     // Initialize the GEMM object
     Gemm gemm;
@@ -200,14 +197,14 @@ void splitkGroupedGemm_(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std
 }
 
 template <int M1, int N1, int K1, int M2, int N2, int K2, int kAlignmentAB, int kAlignmentC, int kStages>
-void splitkGroupedGemmType_(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vector<void*> const& ptrA,
+void splitkGroupedGemmType_(std::vector<cutlass::gemm::GemmCoord> const& problemSizes, std::vector<void*> const& ptrA,
     std::vector<void*> const& ptrB, std::vector<void*> const& ptrC, std::vector<void*> const& ptrD,
     void* gemmParamsWorkSpace, int64_t gemmParamsWorkSpaceSize, void* gemmWorkSpace, int64_t gemmWorkSpaceSize,
     nvinfer1::DataType dataType, int splitKSlices, cudaStream_t stream)
 {
     if (dataType == nvinfer1::DataType::kHALF)
     {
-        splitkGroupedGemm_<M1, N1, K1, M2, N2, K2, cutlass::half_t, kAlignmentAB, kAlignmentC, kStages>(problem_sizes,
+        splitkGroupedGemm_<M1, N1, K1, M2, N2, K2, cutlass::half_t, kAlignmentAB, kAlignmentC, kStages>(problemSizes,
             ptrA, ptrB, ptrC, ptrD, gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkSpaceSize,
             splitKSlices, stream);
     }
@@ -219,13 +216,13 @@ void splitkGroupedGemmType_(std::vector<cutlass::gemm::GemmCoord> problem_sizes,
     else if (dataType == nvinfer1::DataType::kBF16)
     {
         splitkGroupedGemm_<M1, N1, K1, M2, N2, K2, cutlass::bfloat16_t, kAlignmentAB, kAlignmentC, kStages>(
-            problem_sizes, ptrA, ptrB, ptrC, ptrD, gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace,
+            problemSizes, ptrA, ptrB, ptrC, ptrD, gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace,
             gemmWorkSpaceSize, splitKSlices, stream);
     }
 #endif
 }
 
-void splitkGroupedGemm(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vector<void*> const& ptrA,
+void splitkGroupedGemm(std::vector<cutlass::gemm::GemmCoord> const& problemSizes, std::vector<void*> const& ptrA,
     std::vector<void*> const& ptrB, std::vector<void*> const& ptrC, std::vector<void*> const& ptrD,
     void* gemmParamsWorkSpace, int64_t gemmParamsWorkSpaceSize, void* gemmWorkSpace, int64_t gemmWorkSpaceSize,
     bool isLoraIn, nvinfer1::DataType dataType, int splitKSlices, int minKN, cudaStream_t stream)
@@ -237,25 +234,25 @@ void splitkGroupedGemm(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std:
         // Use larger K tile and smaller N tile
         if (minKN >= 8)
         {
-            splitkGroupedGemmType_<16, 32, 64, 16, 32, 64, 8, 8, 4>(problem_sizes, ptrA, ptrB, ptrC, ptrD,
+            splitkGroupedGemmType_<16, 32, 64, 16, 32, 64, 8, 8, 4>(problemSizes, ptrA, ptrB, ptrC, ptrD,
                 gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkSpaceSize, dataType, splitKSlices,
                 stream);
         }
         else if (minKN >= 4)
         {
-            splitkGroupedGemmType_<16, 32, 64, 16, 32, 64, 8, 4, 4>(problem_sizes, ptrA, ptrB, ptrC, ptrD,
+            splitkGroupedGemmType_<16, 32, 64, 16, 32, 64, 8, 4, 4>(problemSizes, ptrA, ptrB, ptrC, ptrD,
                 gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkSpaceSize, dataType, splitKSlices,
                 stream);
         }
         else if (minKN >= 2)
         {
-            splitkGroupedGemmType_<16, 32, 64, 16, 32, 64, 8, 2, 2>(problem_sizes, ptrA, ptrB, ptrC, ptrD,
+            splitkGroupedGemmType_<16, 32, 64, 16, 32, 64, 8, 2, 2>(problemSizes, ptrA, ptrB, ptrC, ptrD,
                 gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkSpaceSize, dataType, splitKSlices,
                 stream);
         }
         else if (minKN >= 1)
         {
-            splitkGroupedGemmType_<16, 32, 64, 16, 32, 64, 8, 1, 2>(problem_sizes, ptrA, ptrB, ptrC, ptrD,
+            splitkGroupedGemmType_<16, 32, 64, 16, 32, 64, 8, 1, 2>(problemSizes, ptrA, ptrB, ptrC, ptrD,
                 gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkSpaceSize, dataType, splitKSlices,
                 stream);
         }
@@ -266,31 +263,29 @@ void splitkGroupedGemm(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std:
         // User larger N tile and smaller K tile
         if (minKN >= 8)
         {
-            splitkGroupedGemmType_<32, 128, 32, 32, 32, 32, 8, 8, 4>(problem_sizes, ptrA, ptrB, ptrC, ptrD,
+            splitkGroupedGemmType_<32, 128, 32, 32, 32, 32, 8, 8, 4>(problemSizes, ptrA, ptrB, ptrC, ptrD,
                 gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkSpaceSize, dataType, splitKSlices,
                 stream);
         }
         else if (minKN >= 4)
         {
-            splitkGroupedGemmType_<32, 128, 32, 32, 32, 32, 4, 8, 4>(problem_sizes, ptrA, ptrB, ptrC, ptrD,
+            splitkGroupedGemmType_<32, 128, 32, 32, 32, 32, 4, 8, 4>(problemSizes, ptrA, ptrB, ptrC, ptrD,
                 gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkSpaceSize, dataType, splitKSlices,
                 stream);
         }
         else if (minKN >= 2)
         {
-            splitkGroupedGemmType_<32, 128, 32, 32, 32, 32, 2, 8, 2>(problem_sizes, ptrA, ptrB, ptrC, ptrD,
+            splitkGroupedGemmType_<32, 128, 32, 32, 32, 32, 2, 8, 2>(problemSizes, ptrA, ptrB, ptrC, ptrD,
                 gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkSpaceSize, dataType, splitKSlices,
                 stream);
         }
         else if (minKN >= 1)
         {
-            splitkGroupedGemmType_<32, 128, 32, 32, 32, 32, 1, 8, 2>(problem_sizes, ptrA, ptrB, ptrC, ptrD,
+            splitkGroupedGemmType_<32, 128, 32, 32, 32, 32, 1, 8, 2>(problemSizes, ptrA, ptrB, ptrC, ptrD,
                 gemmParamsWorkSpace, gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkSpaceSize, dataType, splitKSlices,
                 stream);
         }
     }
 }
 
-} // namespace kernels
-
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::kernels

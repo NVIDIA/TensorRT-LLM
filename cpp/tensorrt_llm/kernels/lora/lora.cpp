@@ -18,18 +18,13 @@
 #include "tensorrt_llm/kernels/lora/lora.h"
 
 #include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/groupGemm.h"
 #include "tensorrt_llm/kernels/splitkGroupGemm.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 
 #include <algorithm>
-
-using namespace nvinfer1;
-using namespace tensorrt_llm::common;
-using tensorrt_llm::kernels::LoraImpl;
-using tensorrt_llm::kernels::CublasGemmWrapperPtr;
+#include <utility>
 
 namespace tensorrt_llm::kernels
 {
@@ -50,7 +45,7 @@ void _getProblemParams(cublasOperation_t& transa, cublasOperation_t& transb, int
 
 // TODO should reuse the function in gemmPlugin
 void _runGemm(int const M, int const N, int const K, bool const transA, bool const transB,
-    const nvinfer1::DataType type, CublasGemmWrapperPtr const& cublasWrapperPtr, void const* act, void const* weight,
+    nvinfer1::DataType const type, CublasGemmWrapperPtr const& cublasWrapperPtr, void const* act, void const* weight,
     void* output, std::optional<cublasLtMatmulHeuristicResult_t> const& heuristic, void* workspace, cudaStream_t stream)
 {
     cublasWrapperPtr->setStream(stream);
@@ -66,15 +61,15 @@ void _runGemm(int const M, int const N, int const K, bool const transA, bool con
     cublasWrapperPtr->destroyDescriptors();
 }
 
-LoraImpl::LoraImpl(int in_hidden_size, std::vector<int> out_hidden_sizes, int transA, int transB, int num_lora_modules,
-    nvinfer1::DataType type, int max_low_rank, std::shared_ptr<CublasGemmWrapper> cublasWrapper)
+LoraImpl::LoraImpl(int in_hidden_size, std::vector<int> out_hidden_sizes, bool transA, bool transB,
+    int num_lora_modules, nvinfer1::DataType type, int max_low_rank, std::shared_ptr<CublasGemmWrapper> cublasWrapper)
     : mInHiddenSize(in_hidden_size)
     , mTransA(transA)
     , mTransB(transB)
     , mNumLoraModules(num_lora_modules)
     , mType(type)
     , mMaxLowRank(max_low_rank)
-    , mCublasWrapper(cublasWrapper)
+    , mCublasWrapper(std::move(cublasWrapper))
 {
     mOutHiddenSizes.resize(mNumLoraModules);
     mOutHiddenSizes.assign(out_hidden_sizes.begin(), out_hidden_sizes.end());
@@ -84,16 +79,16 @@ LoraImpl::LoraImpl(int in_hidden_size, std::vector<int> out_hidden_sizes, int tr
 void LoraImpl::setGemmConfig()
 {
     TLLM_LOG_DEBUG("%s", __PRETTY_FUNCTION__);
-    if (mType == DataType::kHALF)
+    if (mType == nvinfer1::DataType::kHALF)
     {
         mCublasWrapper->setFP16GemmConfig();
     }
-    else if (mType == DataType::kFLOAT)
+    else if (mType == nvinfer1::DataType::kFLOAT)
     {
         mCublasWrapper->setFP32GemmConfig();
     }
 #ifdef ENABLE_BF16
-    else if (mType == DataType::kBF16)
+    else if (mType == nvinfer1::DataType::kBF16)
     {
         mCublasWrapper->setBF16GemmConfig();
     }
@@ -102,7 +97,7 @@ void LoraImpl::setGemmConfig()
 
 int64_t getLowRankWorkSpaceSize(int64_t numTokens, int64_t maxLoraModuleNum, int64_t maxLowRank, int64_t typeSize)
 {
-    return divUp(numTokens * maxLoraModuleNum * maxLowRank * typeSize, 16) * 16;
+    return common::divUp(numTokens * maxLoraModuleNum * maxLowRank * typeSize, 16) * 16;
 }
 
 int64_t getGemmParamsWorkSpaceSize(int64_t nbReq)
@@ -113,7 +108,7 @@ int64_t getGemmParamsWorkSpaceSize(int64_t nbReq)
 int64_t getSplitkGroupedGemmWorkSpaceSize(
     int64_t numTokens, int64_t maxLoraModuleNum, int64_t maxLowRank, int64_t splitKSlices)
 {
-    return divUp(numTokens * maxLoraModuleNum * maxLowRank * sizeof(float) * splitKSlices, 16) * 16;
+    return common::divUp(numTokens * maxLoraModuleNum * maxLowRank * sizeof(float) * splitKSlices, 16) * 16;
 }
 
 int64_t getGemmWorkSpaceSize(int64_t numTokens, int64_t maxLoraModuleNum, int64_t maxLowRank, int64_t splitKSlices)
@@ -135,7 +130,7 @@ size_t LoraImpl::getWorkspaceSize(
 
 void LoraImpl::setBestTactic(std::optional<Config> config)
 {
-    mBestConfig = std::move(config);
+    mBestConfig = config;
 }
 
 int LoraImpl::run(int64_t numTokens, int64_t numReqs, void const* input, int32_t const* loraRanks,
@@ -196,10 +191,10 @@ int LoraImpl::run(int64_t numTokens, int64_t numReqs, void const* input, int32_t
     {
         for (int loraModuleIdx = 0; loraModuleIdx < mNumLoraModules; loraModuleIdx++)
         {
-            int64_t const* loraWeightsPtrModule
+            auto const* loraWeightsPtrModule
                 = reinterpret_cast<int64_t const*>(&loraWeightsPtr[loraModuleIdx * numTokens * 2]);
 
-            int M = numTokens;
+            int const M = numTokens;
 
             auto const lora_rank = loraRanks[loraModuleIdx * numTokens];
 
@@ -208,7 +203,7 @@ int LoraImpl::run(int64_t numTokens, int64_t numReqs, void const* input, int32_t
             if (N > 0)
             {
                 TLLM_CHECK_WITH_INFO(N <= mMaxLowRank,
-                    fmtstr("Invalid low_rank (%d). low_rank must be smaller than mMaxLowRank (%d)", N, mMaxLowRank));
+                    "Invalid low_rank (%d). low_rank must be smaller than mMaxLowRank (%d)", N, mMaxLowRank);
                 // size
                 auto const K = mInHiddenSize;
                 auto const N2 = mOutHiddenSizes[loraModuleIdx];
@@ -256,7 +251,7 @@ int LoraImpl::run(int64_t numTokens, int64_t numReqs, void const* input, int32_t
         int minKN = mInHiddenSize; // Used to determine the alignment size
         for (int loraModuleIdx = 0; loraModuleIdx < mNumLoraModules; loraModuleIdx++)
         {
-            int64_t const* loraWeightsPtrModule
+            auto const* loraWeightsPtrModule
                 = reinterpret_cast<int64_t const*>(&loraWeightsPtr[loraModuleIdx * numTokens * 2]);
             int32_t const* loraRanksModule = &loraRanks[loraModuleIdx * numTokens];
 
@@ -281,8 +276,8 @@ int LoraImpl::run(int64_t numTokens, int64_t numReqs, void const* input, int32_t
                 if (N > 0)
                 {
                     TLLM_CHECK_WITH_INFO(N <= mMaxLowRank,
-                        fmtstr(
-                            "Invalid low_rank (%d). low_rank must be smaller than mMaxLowRank (%d)", N, mMaxLowRank));
+
+                        "Invalid low_rank (%d). low_rank must be smaller than mMaxLowRank (%d)", N, mMaxLowRank);
 
                     auto const K = mInHiddenSize;
                     minKN = std::min(minKN, N);
@@ -320,8 +315,8 @@ int LoraImpl::run(int64_t numTokens, int64_t numReqs, void const* input, int32_t
         if (problem_sizes.size() > 0)
         {
             TLLM_CHECK_WITH_INFO(mTransA == false && mTransB == true,
-                fmtstr("Invalid transA (%d) transB (%d). transA must be false, transB must be true", int(mTransA),
-                    int(mTransB)));
+                "Invalid transA (%d) transB (%d). transA must be false, transB must be true", int(mTransA),
+                int(mTransB));
             // For the first GEMM, K is the "hidden size" and N is the "lora rank". So, K is often much larger than N.
             // To improve the GPU utilization, we use splitK to handle the K dimension in multiple blocks in parallel.
             splitkGroupedGemm(problem_sizes, ptrA, ptrB, ptrC, ptrD, groupGemmParamsWorkSpace,

@@ -40,12 +40,18 @@ class PyTorchConfig:
     enable_overlap_scheduler: bool = False
 
     attn_backend: str = 'TRTLLM'
+    # If true, will iterate over sampling_params of each request and use the
+    # corresponding decoding way, like top-k, top-p, etc.
+    mixed_decoder: bool = False
     kv_cache_dtype: str = "auto"
+    enable_iter_perf_stats: bool = False
     print_iter_log: bool = True
 
     torch_compile_enabled: bool = False
     torch_compile_fullgraph: bool = False
     torch_compile_inductor_enabled: bool = False
+    # When torch compile is enabled, userbuffers is enabled by default
+    torch_compile_enable_userbuffers: bool = True
 
     def __post_init__(self) -> None:
         if self.cuda_graph_batch_sizes is not None:

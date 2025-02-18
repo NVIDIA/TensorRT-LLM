@@ -3,6 +3,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 import torch
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+from tensorrt_llm._torch.utils import make_weak_ref
 
 
 class DecodingCUDAGraphRunner:
@@ -60,7 +61,9 @@ class DecodingCUDAGraphRunner:
             forward_fn(inputs)
 
         with torch.cuda.graph(self._graph, pool=pool):
-            self._output = forward_fn(inputs)
+            output = forward_fn(inputs)
+        # Mark weak ref here. The output tensor should be freed properly.
+        self._output = make_weak_ref(output)
         return self._graph.pool()
 
     def needs_capture(self) -> bool:

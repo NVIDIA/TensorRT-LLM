@@ -4,7 +4,8 @@ import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.interface import \
     AttentionRuntimeFeatures
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-from tensorrt_llm._torch.pyexecutor.decoder import TorchGreedySearchDecoder
+from tensorrt_llm._torch.pyexecutor.decoder import (TorchDecoder,
+                                                    TorchStarAttentionDecoder)
 from tensorrt_llm._torch.pyexecutor.distributed import MPIDist
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
@@ -40,9 +41,13 @@ def create_py_executor(executor_config: ExecutorConfig,
         mapping.rank = tensorrt_llm.mpi_rank()
     if mapping.cp_config.get('cp_type') == 'star_attention':
         assert pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
+        decoder = TorchStarAttentionDecoder()
+    else:
+        decoder = TorchDecoder(
+            mixed_decoder=pytorch_backend_config.mixed_decoder)
 
     if pytorch_backend_config.attn_backend in [
-            "TRTLLM", "FLASHINFER", "FLASHINFER_STAR_ATTENTION"
+            "FLASHINFER", "FLASHINFER_STAR_ATTENTION"
     ]:
         # Workaround for flashinfer and star attention
         if executor_config.kv_cache_config.enable_block_reuse:
@@ -117,7 +122,7 @@ def create_py_executor(executor_config: ExecutorConfig,
     if is_mla(config):
         kv_cache_manager = MLAKVCacheManager(
             executor_config.kv_cache_config,
-            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
             model_engine.model.config.num_hidden_layers,
             num_attention_heads,
             num_key_value_heads,
@@ -172,7 +177,6 @@ def create_py_executor(executor_config: ExecutorConfig,
                                            executor_config.max_num_tokens,
                                            ctx_chunk_config)
     scheduler = SimpleScheduler(capacity_scheduler, mb_scheduler)
-    decoder = TorchGreedySearchDecoder(mapping=mapping)
     py_executor = PyExecutor(resource_manager,
                              scheduler,
                              model_engine=model_engine,

@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
+import yaml
 from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
@@ -940,6 +941,40 @@ class LlmArgs:
         if '_config_arbitrator' in state:
             del state['_config_arbitrator']
         return state
+
+
+def update_llm_args_with_extra_options(llm_args: Dict,
+                                       extra_llm_api_options: str) -> Dict:
+    if extra_llm_api_options is not None:
+        with open(extra_llm_api_options, 'r') as f:
+            llm_args_dict = yaml.safe_load(f)
+
+            from .._torch.pyexecutor.config import PyTorchConfig
+            field_mapping = {
+                "quant_config": QuantConfig,
+                "calib_config": CalibConfig,
+                "build_config": BuildConfig,
+                "kv_cache_config": KvCacheConfig,
+                "decoding_config": DecodingConfig,
+                "enable_build_cache": BuildCacheConfig,
+                "peft_cache_config": PeftCacheConfig,
+                "scheduler_config": SchedulerConfig,
+                "speculative_config": LookaheadDecodingConfig,
+                "batching_type": BatchingType,
+                "extended_runtime_perf_knob_config":
+                ExtendedRuntimePerfKnobConfig,
+                "pytorch_backend_config": PyTorchConfig,
+            }
+            for field, field_type in field_mapping.items():
+                if field in llm_args_dict:
+                    llm_args_dict[field] = field_type(**llm_args_dict[field])
+                    logger.warning(
+                        f"Overriding {field} because it's specified in {extra_llm_api_options}."
+                    )
+
+            llm_args = llm_args | llm_args_dict
+
+    return llm_args
 
 
 class ConfigArbitrateError(Exception):

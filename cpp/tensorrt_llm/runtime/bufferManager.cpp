@@ -108,7 +108,7 @@ BufferManager::ITensorPtr BufferManager::managed(nvinfer1::Dims dims, nvinfer1::
 
 BufferManager::ITensorPtr BufferManager::ipcNvls(std::set<int> ranks, nvinfer1::Dims dims, nvinfer1::DataType type)
 {
-    return std::make_unique<IpcNvlsTensor>(dims, type, ranks);
+    return std::make_unique<MulticastTensor>(dims, type, ranks);
 }
 
 void BufferManager::setZero(IBuffer& buffer) const

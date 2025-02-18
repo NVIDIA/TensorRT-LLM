@@ -166,6 +166,8 @@ class KVCacheBlock
 public:
     using IdType = std::int32_t;
 
+    static constexpr IdType kCachedBlocksRootId = -1;
+
     explicit KVCacheBlock(IdType blockId, kernels::KVCacheIndex blockIdx);
 
     void startScheduling();
@@ -379,6 +381,16 @@ public:
         return mKvCacheRetentionConfig.getDecodeDurationMs();
     }
 
+    [[nodiscard]] bool getContextRequiresCyclicKvCache() const
+    {
+        return mContextRequiresCyclicKvCache;
+    }
+
+    void setContextRequiresCyclicKvCache(bool contextRequiresCyclicKvCache)
+    {
+        mContextRequiresCyclicKvCache = contextRequiresCyclicKvCache;
+    }
+
 private:
     // Request id of the sequence
     LlmRequest::RequestIdType mRequestId;
@@ -392,6 +404,9 @@ private:
     runtime::ITensor::SharedPtr mCacheBlockIndices;
     // The retention priority to assign to decode blocks
     executor::KvCacheRetentionConfig mKvCacheRetentionConfig;
+
+    // A value indicating whether or not the context is long enough to warrant the use of cyclic kv-cache.
+    bool mContextRequiresCyclicKvCache{false};
 };
 
 // attach metadata to a pool pointer
@@ -733,6 +748,9 @@ private:
     SizeType32 mReusedUniqueBlocks;
     // Number of blocks that were not reused
     SizeType32 mMissedBlocks;
+    // Only be 1 or 2. If 2: general KV stored. If 1: K == V for any token, so only K is stored to optimize the
+    // max_num_tokens(For DeepSeek). Controlled by mCacheType
+    SizeType32 mKVFactor;
     std::set<KVCacheBlock::IdType> reusedBlockIds;
 
     // Whether or not to maintain a hashmap of blocks.
@@ -844,37 +862,40 @@ public:
     //! \details These blocks become reusable from next step.
     virtual void storeContextBlocks(LlmRequest const& llmRequest) = 0;
 
-    virtual bool schedulingHasFreeBlocks(SizeType32 numRequired = 1) const = 0;
+    [[nodiscard]] virtual bool schedulingHasFreeBlocks(SizeType32 numRequired = 1) const = 0;
 
-    virtual std::vector<std::vector<SizeType32>> const& getCacheBlockIds(LlmRequest::RequestIdType requestId) const = 0;
+    [[nodiscard]] virtual std::vector<std::vector<SizeType32>> const& getCacheBlockIds(
+        LlmRequest::RequestIdType requestId) const
+        = 0;
 
-    virtual std::vector<std::vector<std::vector<SizeType32>>> getBatchCacheBlockIds(
+    [[nodiscard]] virtual std::vector<std::vector<std::vector<SizeType32>>> getBatchCacheBlockIds(
         std::vector<LlmRequest::RequestIdType> const& requestIds) const
         = 0;
 
-    virtual runtime::ITensor::SharedPtr getPrimaryPool(SizeType32 layer_idx) const = 0;
-    virtual SizeType32 getPoolLayerIdx(SizeType32 layer_idx) const = 0;
+    [[nodiscard]] virtual runtime::ITensor::SharedPtr getPrimaryPool(SizeType32 layer_idx) const = 0;
+    [[nodiscard]] virtual SizeType32 getPoolLayerIdx(SizeType32 layer_idx) const = 0;
 
     virtual void refreshBlocks() = 0;
     virtual void flushIterationEvents() = 0;
 
     [[nodiscard]] static SizeType32 getSinkBubbleLength(SizeType32 sinkTokenLen, SizeType32 tokensPerBlock);
 
-    // Sum of numLayers * 2 * numKvHeads * sizePerHead for each pool
+    // Sum of numLayers * kvFactor * numKvHeads * sizePerHead for each pool
     [[nodiscard]] static SizeType32 calculateCacheSizePerToken(tensorrt_llm::runtime::ModelConfig const& modelConfig,
-        tensorrt_llm::runtime::WorldConfig const& worldConfig, bool isCrossAttention = false)
+        tensorrt_llm::runtime::WorldConfig const& worldConfig, bool isCrossAttention = false, SizeType32 kvFactor = 2)
     {
         // NOTE: We expect the initialization of modelConfig to have already taken the tp size into account and do not
         // address it here
         // consider only local layers for the calculation
         return modelConfig.getSumLocalKvHeads(
                    worldConfig.getPipelineParallelism(), worldConfig.getPipelineParallelRank(), isCrossAttention)
-            * 2 * modelConfig.getSizePerHead();
+            * kvFactor * modelConfig.getSizePerHead();
     }
 
-    [[nodiscard]] static std::tuple<SizeType32, SizeType32> const calculateMaxNumBlocks(KvCacheConfig const& config,
+    [[nodiscard]] static std::tuple<SizeType32, SizeType32> calculateMaxNumBlocks(KvCacheConfig const& config,
         nvinfer1::DataType dtype, tensorrt_llm::runtime::ModelConfig const& modelConfig,
-        tensorrt_llm::runtime::WorldConfig const& worldConfig, runtime::BufferManager const& bufferManager);
+        tensorrt_llm::runtime::WorldConfig const& worldConfig, runtime::BufferManager const& bufferManager,
+        SizeType32 kvFactor = 2);
 
     /// @brief Calculates the maximum batch size that can fit the kv-cache, given that all sequences in the batch have
     /// the provided input and output length.
@@ -950,7 +971,7 @@ public:
         return mBlockManager.getNumFreeBlocks();
     }
 
-    [[nodiscard]] virtual SizeType32 getNumPools() const override
+    [[nodiscard]] SizeType32 getNumPools() const override
     {
         return mBlockManager.getNumPools();
     }
@@ -1019,8 +1040,6 @@ public:
     /// @param req The request for which we need to calculate the number of needed KV cache blocks
     /// @return  The number of blocks
     [[nodiscard]] SizeType32 getRemainingBlocksToCompletion(LlmRequest const& req) const override;
-
-    void addContextTokens(LlmRequest::RequestIdType requestId, SizeType32 numTokens);
 
     /// @brief Increase size for request with requestId. Allocate new KV cache block(s) if needed.
     void addToken(LlmRequest::RequestIdType requestId) override;

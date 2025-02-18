@@ -173,7 +173,7 @@ public:
 
 private:
     template <typename T, typename AttentionOutT>
-    kernels::mlaParams<T> enqueueMLAPreprocess(int32_t localNbSeq, int32_t localNbTokens,
+    kernels::MlaParams<T> enqueueMLAPreprocess(int32_t localNbSeq, int32_t localNbTokens,
         nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
         void const* const* inputs, void* const* outputs, void*& workspace, bool is_context, cudaStream_t stream);
 

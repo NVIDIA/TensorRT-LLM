@@ -3,6 +3,7 @@ datasets==2.19.2
 einops
 graphviz
 mypy
+mako
 parameterized
 pre-commit
 pybind11

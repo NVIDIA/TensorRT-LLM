@@ -47,4 +47,4 @@ repos:
         - --skip=".git,3rdparty"
         - --exclude-file=examples/whisper/tokenizer.py
         - --ignore-words-list=rouge,inout,atleast,strat,nd,subtile,thrid,improbe
-        exclude: 'tests/llm-test-defs/turtle/test_input_files|.*/test_star_attention_input.jsonl'
+        exclude: 'tests/llm-test-defs/turtle/test_input_files|.*.jsonl'

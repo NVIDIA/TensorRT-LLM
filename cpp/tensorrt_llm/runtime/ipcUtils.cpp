@@ -15,11 +15,10 @@
  */
 
 #include "tensorrt_llm/runtime/ipcUtils.h"
-
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/customAllReduceUtils.h"
-#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/common/workspace.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 #include <NvInferRuntimeBase.h>
 #include <cstddef>

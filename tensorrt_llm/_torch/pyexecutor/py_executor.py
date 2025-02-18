@@ -13,6 +13,8 @@ from typing import Dict, List, Optional, Union
 
 import torch
 
+import tensorrt_llm.bindings.executor as trtllm
+
 from ..._utils import nvtx_range
 from ...logger import logger
 from .decoder import *
@@ -158,6 +160,7 @@ class PyExecutor:
         self.active = True
         self.next_req_id = 1
         self.print_log = model_engine.pytorch_backend_config.print_iter_log
+        self.enable_iter_perf_stats = model_engine.pytorch_backend_config.enable_iter_perf_stats
         self.num_fetch_requests_cur_rank = 0
         self.num_fetch_requests = 0
         self.shutdown_event = threading.Event()
@@ -187,6 +190,10 @@ class PyExecutor:
         event_loop = self._executor_loop_overlap if enable_overlap_scheduler else self._executor_loop
         self.worker_thread = threading.Thread(target=event_loop, daemon=True)
         self.worker_thread.start()
+        self.stats_lock = threading.Lock()
+        self.stats = []
+        self.start_times = {}
+        self.new_active_requests_queue_latency_ms = 0
 
     def __enter__(self):
         return self
@@ -201,14 +208,20 @@ class PyExecutor:
     def _profiler(self):
         it = -1
         enabled = False
+        start_time = None
 
         def profile_step():
-            nonlocal it, enabled
-
+            nonlocal it, enabled, start_time
             if it in self.profile_stop_iters:
                 assert enabled, "Inconsistent CUDA profiling state"
                 torch.cuda.cudart().cudaProfilerStop()
                 enabled = False
+
+            if start_time is not None and self.print_log and self.dist.rank == 0:
+                end_time = time.time()
+                print(
+                    f'iter = {self.model_engine.iter_counter}, rank = {self.dist.rank}, currank_total_requests = {self.num_fetch_requests_cur_rank}/{self.num_fetch_requests}, elapsed_time = {end_time - start_time}s, states = {self.model_engine.iter_states}'
+                )
 
             it += 1
 
@@ -216,6 +229,7 @@ class PyExecutor:
                 assert not enabled, "Inconsistent CUDA profiling state"
                 torch.cuda.cudart().cudaProfilerStart()
                 enabled = True
+            start_time = time.time()
 
         try:
             yield profile_step
@@ -224,15 +238,75 @@ class PyExecutor:
                 # Stop on early exit / exception
                 torch.cuda.cudart().cudaProfilerStop()
 
+    def _get_init_iter_stats(self, num_new_active_requests,
+                             new_active_requests_queue_latency_ms):
+        stats = trtllm.IterationStats()
+        stats.timestamp = ""
+
+        stats.num_new_active_requests = num_new_active_requests
+        stats.num_active_requests = len(self.active_requests)
+        stats.new_active_requests_queue_latency_ms = new_active_requests_queue_latency_ms
+        return stats
+
+    def _update_iter_stats(self, stats, iter_latency_ms, num_completed_requests,
+                           scheduled_batch):
+        stats.iter_latency_ms = iter_latency_ms
+
+        stats.num_queued_requests = self.request_queue.qsize()
+        stats.num_completed_requests = num_completed_requests
+        stats.max_num_active_requests = self.max_num_active_requests
+
+        end, total_gpu_memory = torch.cuda.mem_get_info()
+        stats.gpu_mem_usage = total_gpu_memory - end
+        stats.cpu_mem_usage = 0
+        stats.pinned_mem_usage = 0
+
+        stats.iter = self.model_engine.iter_counter
+
+        kv_cache_manager = self.resource_manager.resource_managers[
+            "kv_cache_manager"]
+        if kv_cache_manager is not None:
+            kv_stats = kv_cache_manager.get_kv_cache_stats()
+            kv_stats_to_save = trtllm.KvCacheStats()
+            kv_stats_to_save.max_num_blocks = kv_stats.max_num_blocks
+            kv_stats_to_save.free_num_blocks = kv_stats.free_num_blocks
+            kv_stats_to_save.used_num_blocks = kv_stats.used_num_blocks
+            kv_stats_to_save.tokens_per_block = kv_stats.tokens_per_block
+            kv_stats_to_save.alloc_total_blocks = kv_stats.alloc_total_blocks
+            kv_stats_to_save.alloc_new_blocks = kv_stats.alloc_new_blocks
+            kv_stats_to_save.reused_blocks = kv_stats.reused_blocks
+            stats.kv_cache_stats = kv_stats_to_save
+
+        model_stats = trtllm.InflightBatchingStats()
+        model_stats.num_scheduled_requests = len(
+            scheduled_batch.context_requests) + len(
+                scheduled_batch.generation_requests)
+        model_stats.num_context_requests = len(scheduled_batch.context_requests)
+        model_stats.num_gen_requests = len(scheduled_batch.generation_requests)
+        model_stats.num_paused_requests = len(scheduled_batch.paused_requests)
+        model_stats.avg_num_decoded_tokens_per_iter = 0
+        model_stats.num_ctx_tokens = 0
+        model_stats.micro_batch_id = 0
+        stats.inflight_batching_stats = model_stats
+        return stats
+
+    def _append_iter_stats(self, stats):
+        try:
+            self.stats_lock.acquire()
+            self.stats.append(stats)
+        finally:
+            self.stats_lock.release()
+
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)
         got_finish_signal = False
         attn_dp_idle_iter = False
-        iter = 0
         with self._profiler() as profile_step:
+            iter_start_time = time.time()
+            iter_end_time = iter_start_time
+            iter_stats = None
             while not got_finish_signal or len(self.active_requests) > 0:
                 profile_step()
-                t0 = time.time()
                 if self.enable_attention_dp:
                     new_requests = self._fetch_adp_new_requests()
                 else:
@@ -241,12 +315,18 @@ class PyExecutor:
                     new_requests) or got_finish_signal
                 if got_finish_signal and len(self.active_requests) == 0:
                     break
+
+                if self.enable_iter_perf_stats:
+                    iter_stats = self._get_init_iter_stats(
+                        len(new_requests),
+                        self.new_active_requests_queue_latency_ms)
                 attn_dp_idle_iter = ((not got_finish_signal)
                                      and len(self.active_requests) == 0
                                      and self.enable_attention_dp)
                 if attn_dp_idle_iter:
                     self._merge_one_dummy_request()
                 scheduled_batch = self._schedule()
+
                 assert scheduled_batch.batch_size > 0, (
                     "fail to schedule any pending request, "
                     "probably run out of resource.")
@@ -254,16 +334,21 @@ class PyExecutor:
                 self.pause_requests(scheduled_batch.paused_requests)
                 self.resource_manager.prepare_resources(scheduled_batch)
                 batch_outputs = self._forward_step(scheduled_batch)
+
                 self._decode(scheduled_batch, batch_outputs)
                 self._handle_cancelled_requests()
-                self._handle_responses()
+
+                finished_requests = self._handle_responses()
                 self.resource_manager.update_resources(scheduled_batch)
-                iter = iter + 1
-                t1 = time.time()
-                if self.print_log and self.dist.rank == 0:
-                    print(
-                        f'iter = {iter}, rank = {self.dist.rank}, currank_total_requests = {self.num_fetch_requests_cur_rank}/{self.num_fetch_requests}, elapsed_time = {t1 - t0}s, states = {self.model_engine.iter_states}'
-                    )
+
+                if self.enable_iter_perf_stats:
+                    iter_end_time = time.time()
+                    iter_latency_ms = iter_end_time - iter_start_time
+                    self._append_iter_stats(
+                        self._update_iter_stats(iter_stats, iter_latency_ms,
+                                                len(finished_requests),
+                                                scheduled_batch))
+                    iter_start_time = iter_end_time
 
         with self.response_cv:
             self.is_shutdown = True
@@ -273,11 +358,12 @@ class PyExecutor:
     def _executor_loop_overlap(self):
         torch.cuda.set_device(self.device_id)
         got_finish_signal = False
-        iter = 0
         with self._profiler() as profile_step:
+            iter_start_time = time.time()
+            iter_end_time = iter_start_time
+            iter_stats = None
             while not got_finish_signal or len(self.active_requests) > 0:
                 profile_step()
-                t0 = time.time()
                 if self.enable_attention_dp:
                     new_requests = self._fetch_adp_new_requests()
                 else:
@@ -286,12 +372,19 @@ class PyExecutor:
                     new_requests) or got_finish_signal
                 if got_finish_signal and len(self.active_requests) == 0:
                     break
+
+                if self.enable_iter_perf_stats:
+                    iter_stats = self._get_init_iter_stats(
+                        len(new_requests),
+                        self.new_active_requests_queue_latency_ms)
+
                 attn_dp_idle_iter = ((not got_finish_signal)
                                      and len(self.active_requests) == 0
                                      and self.enable_attention_dp)
 
                 if attn_dp_idle_iter:
                     self._merge_one_dummy_request()
+
                 scheduled_batch = self._schedule()
 
                 assert scheduled_batch.batch_size > 0, (
@@ -305,25 +398,37 @@ class PyExecutor:
 
                 previous_new_tokens_device = None
                 if self.previous_batch is not None:
-                    _, previous_new_tokens_device, _, _ = self.previous_batch
+                    _, previous_new_tokens_device, _, _, _ = self.previous_batch
 
                 self.resource_manager.prepare_resources(scheduled_batch)
                 batch_outputs = self._forward_step(scheduled_batch,
                                                    previous_new_tokens_device)
 
                 new_tokens_device, new_tokens_host, decoder_event = self._decode_async(
-                    batch_outputs)
+                    scheduled_batch, batch_outputs)
+
                 if attn_dp_idle_iter:
                     self._finish_one_dummy_request(scheduled_batch)
-                if self.previous_batch is not None:
-                    previous_scheduled_batch, _, previous_new_tokens_host, previous_decoder_event = self.previous_batch
+                has_previous_batch = self.previous_batch is not None
+                if has_previous_batch:
+                    previous_scheduled_batch, _, previous_new_tokens_host, previous_decoder_event, previous_iter_stats = self.previous_batch
                     self._update_requests(previous_scheduled_batch,
                                           previous_new_tokens_host,
                                           previous_decoder_event)
                     self._handle_cancelled_requests()
-                    self._handle_responses()
+                    finished_requests = self._handle_responses()
                     self.resource_manager.update_resources(
                         previous_scheduled_batch)
+
+                    if self.enable_iter_perf_stats:
+                        iter_end_time = time.time()
+                        self._update_iter_stats(
+                            previous_iter_stats,
+                            iter_latency_ms=(iter_end_time - iter_start_time),
+                            num_completed_requests=len(finished_requests),
+                            scheduled_batch=previous_scheduled_batch)
+                        self._append_iter_stats(previous_iter_stats)
+                        iter_start_time = iter_end_time
 
                 # Separate chunked requests so we can handle them in _update_requests w/o relying on the request state.
                 # This is necessary because _forward_step updates the state before _update_requests is executed.
@@ -337,13 +442,8 @@ class PyExecutor:
                 ]
 
                 self.previous_batch = (scheduled_batch, new_tokens_device,
-                                       new_tokens_host, decoder_event)
-                iter = iter + 1
-                t1 = time.time()
-                if self.print_log and self.dist.rank == 0:
-                    print(
-                        f'iter = {iter}, rank = {self.dist.rank}, currank_total_requests = {self.num_fetch_requests_cur_rank}/{self.num_fetch_requests}, elapsed_time = {t1 - t0}s, states = {self.model_engine.iter_states}'
-                    )
+                                       new_tokens_host, decoder_event,
+                                       iter_stats)
 
         with self.response_cv:
             self.is_shutdown = True
@@ -360,6 +460,14 @@ class PyExecutor:
                 self.request_queue, timeout,
                 self.max_num_active_requests - len(self.active_requests))
         new_requests = self.dist.broadcast(new_requests, root=0)
+
+        if self.enable_iter_perf_stats and self.dist.rank == 0:
+            now = time.time()
+            for req in new_requests:
+                if isinstance(req, tuple):
+                    self.new_active_requests_queue_latency_ms += now - self.start_times[
+                        req[0]]
+                    self.start_times.pop(req[0])
         return new_requests
 
     @nvtx_range("_fetch_adp_new_requests")
@@ -378,10 +486,16 @@ class PyExecutor:
         num_new_requests_all_ranks = len(new_requests)
         new_requests_cur_rank = []
         if new_requests != [] and new_requests[0] != None:
+            now = time.time()
             for idx, request in enumerate(new_requests):
                 if (idx + self.num_fetch_requests
                     ) % self.dist.world_size == self.dist.rank:
                     new_requests_cur_rank.append(request)
+
+                    if self.enable_iter_perf_stats and self.dist.rank == 0:
+                        self.new_active_requests_queue_latency_ms += now - self.start_times[
+                            request[0]]
+                        self.start_times.pop(request[0])
 
         self.num_fetch_requests = self.num_fetch_requests + num_new_requests_all_ranks
         self.num_fetch_requests_cur_rank = self.num_fetch_requests_cur_rank + len(
@@ -632,10 +746,10 @@ class PyExecutor:
             self._handle_errors(error_msg)
 
     @nvtx_range("_decode_async")
-    def _decode_async(self, batch_outputs):
+    def _decode_async(self, scheduled_batch, batch_outputs):
         try:
             if batch_outputs is not None:
-                return self.decoder.decode_async(batch_outputs)
+                return self.decoder.decode_async(scheduled_batch, batch_outputs)
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)
@@ -740,6 +854,8 @@ class PyExecutor:
         for request in finish_requests:
             self._terminate_request(request)
 
+        return finish_requests
+
     def shutdown(self):
         try:
             self.enqueue_lock.acquire()
@@ -759,6 +875,9 @@ class PyExecutor:
             self.enqueue_lock.acquire()
             assert self.active, "PyExecutor has already been shutdown."
             req_id = self.next_req_id
+            if self.enable_iter_perf_stats:
+                self.start_times[req_id] = time.time()
+
             if query is not None:
                 self.request_queue.put((req_id, request, query))
             else:
@@ -773,7 +892,9 @@ class PyExecutor:
         try:
             self.enqueue_lock.acquire()
             assert self.active, "PyExecutor has already been shutdown."
+            start_time = time.time()
             for request in requests:
+                self.start_times[self.next_req_id] = start_time
                 self.request_queue.put((self.next_req_id, request))
                 req_ids.append(self.next_req_id)
                 self.next_req_id += 1
@@ -850,12 +971,21 @@ class PyExecutor:
         return can_enqueue and self.dist.rank == 0
 
     def get_latest_iteration_stats(self):
-        # raise NotImplementedError("get_latest_iteration_stats not implemented")
-        # todo: implement it
-        return []
+        if self.enable_iter_perf_stats == False:
+            return []
+
+        latest_stats = tuple()
+        try:
+            self.stats_lock.acquire()
+            latest_stats = tuple(self.stats)
+            self.stats = []
+        finally:
+            self.stats_lock.release()
+
+        return latest_stats
 
     def get_latest_request_stats(self):
-        #raise NotImplementedError("get_latest_iteration_stats not implemented")
+        #raise NotImplementedError("get_latest_request_stats not implemented")
         # todo: implement it
         return []
 

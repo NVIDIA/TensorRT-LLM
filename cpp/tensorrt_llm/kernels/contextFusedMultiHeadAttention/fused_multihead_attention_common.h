@@ -221,6 +221,8 @@ struct MHARunnerParams
     void const* packedMaskPtr;
     // The cumulative Q sequence lengths.
     void const* cuQSeqLenPtr;
+    // The KV sequence lengths.
+    void const* kvSeqLenPtr;
     // The cumulative KV sequence lengths.
     void const* cuKvSeqLenPtr;
     // The cumulative packed mask rows.

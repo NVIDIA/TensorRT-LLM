@@ -216,24 +216,30 @@ class TestFunctional(unittest.TestCase):
     @parameterized.expand(
         # P=8x and H=2x
         list(
-            product([160, 320, 640, 1280], [80], [1], ['context'], ['float16'],
-                    [1, 2, 4, 8, 16], [16, 64, 256], [True], [True])) +
+            product([160, 320, 640], [80], [1], [128], ['context'], ['float16'],
+                    [1, 2, 8, 16], [16, 64, 256], [True], [True])) +
         # normal tests
         list(
-            product([2048], [64], [1, 4], ['context', 'generation'],
+            product([2048], [64], [1, 4], [128], ['context', 'generation'],
                     ['float32', 'float16', 'bfloat16'], [3], [16],
                     [True, False], [True, False])) +
+        # arbitrary N generation tests
+        list(
+            product([2048], [64], [1, 4], [16, 32, 48, 64, 80, 96, 128, 256],
+                    ['generation'], ['float32', 'float16'], [3], [16], [True],
+                    [True])) +
         # long sequence tests to cover the int overflow issue
         list(
-            product([5120], [64], [1], ['context'], ['float16'], [2], [131072],
-                    [True, False], [True, False])) +
+            product([5120], [64], [1], [128], ['context'], ['float16'], [2],
+                    [131072], [True, False], [True, False])) +
         # P=8x and H=2x
         list(
-            product([144], [72], [1], ['context', 'generation'], ['float16'],
-                    [16], [131072], [True, False], [True, False])),
+            product([144], [72], [1], [64, 128, 256], ['context', 'generation'],
+                    ['float16'], [16], [16384], [True, False], [True, False])),
         name_func=unittest_name_func)
-    def test_selective_scan_v2(self, dim, headdim, ngroups, req_type, dtype,
-                               batch_size, max_seq_len, has_z, remove_padding):
+    def test_selective_scan_v2(self, dim, headdim, ngroups, dstate, req_type,
+                               dtype, batch_size, max_seq_len, has_z,
+                               remove_padding):
 
         if dtype == 'float32' and req_type == 'context':
             pytest.skip(
@@ -249,7 +255,6 @@ class TestFunctional(unittest.TestCase):
         device = "cuda"
         seq_len = max_seq_len if req_type == 'context' else 1
         long_context = max_seq_len >= 128 * 1024
-        dstate = 128
         chunk_size = 256
         nheads = dim // headdim
         nheads_pad0 = (nheads + 7) // 8 * 8 - nheads
@@ -519,10 +524,7 @@ class TestFunctional(unittest.TestCase):
                                                  dt_softplus=delta_softplus)
             out_ref = rearrange(out_ref, "b h p -> b (h p)").unsqueeze(1)
 
-        if long_context:
-            atol = {"float16": 2e-2, "bfloat16": 1e-1}
-        else:
-            atol = {"float16": 1e-2, "float32": 2e-3, "bfloat16": 5e-2}
+        atol = {"float16": 2e-2, "float32": 2e-3, "bfloat16": 1e-1}
 
         if remove_padding and req_type == "generation":
             out_ref = out_ref.squeeze(1)

@@ -81,7 +81,7 @@ endfunction()
 
 add_subdirectory(unit_tests)
 
-add_gtest(mpiUtilsTest common/mpiUtilsTest.cpp)
+add_gtest(mpiUtilsTest runtime/mpiUtilsTest.cpp)
 
 add_gtest(loraManagerTest runtime/loraManagerTest.cpp)
 add_gtest(loraCacheTest runtime/loraCacheTest.cpp)
@@ -89,7 +89,6 @@ add_gtest(gptDecoderTest runtime/gptDecoderTest.cpp)
 add_gtest(gptDecoderBatchedTest runtime/gptDecoderBatchedTest.cpp)
 add_gtest(gptSessionTest runtime/gptSessionTest.cpp)
 target_link_libraries(gptSessionTest PRIVATE modelSpecStatic)
-
 add_gtest(medusaModuleTest runtime/medusaModuleTest.cpp)
 
 add_gtest(eaglePackDataTest kernels/eaglePackDataTest.cpp)

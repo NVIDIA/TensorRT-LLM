@@ -81,6 +81,7 @@ class Deepseekv3Gate(nn.Module):
         n_group: int,
         topk_group: int,
         routed_scaling_factor: float,
+        is_thop: bool = True,
     ):
         super().__init__()
         self.top_k = top_k
@@ -94,43 +95,51 @@ class Deepseekv3Gate(nn.Module):
         self.e_score_correction_bias = nn.Parameter(torch.empty(
             (num_experts), dtype=torch.float32),
                                                     requires_grad=False)
+        self.is_thop = is_thop
 
     def noaux_tc(self, logits):
         n_group = self.n_group
         scores = F.sigmoid(logits)
         scores_with_bias = scores + self.e_score_correction_bias
         scores_shape = list(scores_with_bias.shape)
-        group_scores = torch.sum(torch.topk(
-            scores_with_bias.view(scores_shape[:-1] +
-                                  [n_group, scores_shape[-1] // n_group]),
-            k=2,
-            dim=-1,
-            largest=True,
-            sorted=True)[0],
-                                 dim=-1)
-        _, group_idx = torch.topk(group_scores,
-                                  k=self.topk_group,
-                                  dim=-1,
-                                  largest=True,
-                                  sorted=True)
-        group_mask = torch.zeros_like(group_scores)
-        group_mask.scatter_(-1, group_idx, 1)
-        score_mask = group_mask.unsqueeze(-1).expand(
-            scores_shape[:-1] +
-            [n_group, scores_shape[-1] // n_group]).reshape(scores_shape)
-        scores_with_bias = scores_with_bias * score_mask
-        _, topk_idx = torch.topk(scores_with_bias,
-                                 k=self.top_k,
-                                 dim=-1,
-                                 largest=True,
-                                 sorted=True)
-        new_mask = torch.zeros_like(scores)
-        new_mask.scatter_(-1, topk_idx, 1)
-        scores = scores * new_mask
-        score_sum = torch.sum(scores, dim=-1, keepdim=True) + 1e-20
-        scores = scores / score_sum * \
-            self.routed_scaling_factor
-        return scores
+        if self.is_thop == False:
+            group_scores = torch.sum(torch.topk(
+                scores_with_bias.view(scores_shape[:-1] +
+                                      [n_group, scores_shape[-1] // n_group]),
+                k=2,
+                dim=-1,
+                largest=True,
+                sorted=True)[0],
+                                     dim=-1)
+            _, group_idx = torch.topk(group_scores,
+                                      k=self.topk_group,
+                                      dim=-1,
+                                      largest=True,
+                                      sorted=True)
+            group_mask = torch.zeros_like(group_scores)
+            group_mask.scatter_(-1, group_idx, 1)
+            score_mask = group_mask.unsqueeze(-1).expand(
+                scores_shape[:-1] +
+                [n_group, scores_shape[-1] // n_group]).reshape(scores_shape)
+            scores_with_bias = scores_with_bias * score_mask
+            _, topk_idx = torch.topk(scores_with_bias,
+                                     k=self.top_k,
+                                     dim=-1,
+                                     largest=True,
+                                     sorted=True)
+            new_mask = torch.zeros_like(scores)
+            new_mask.scatter_(-1, topk_idx, 1)
+            scores = scores * new_mask
+            score_sum = torch.sum(scores, dim=-1, keepdim=True) + 1e-20
+            scores = scores / score_sum * \
+                self.routed_scaling_factor
+            return scores
+        else:
+            scores = torch.ops.trtllm.noaux_tc_op(scores, scores_with_bias,
+                                                  n_group, self.topk_group,
+                                                  self.top_k,
+                                                  self.routed_scaling_factor)
+            return scores
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         logits = F.linear(hidden_states.to(torch.float32), self.weight)
@@ -154,25 +163,28 @@ class Deepseekv3MoE(nn.Module):
         intermediate_size: int,
         shared_expert_intermediate_size: int,
         dtype: Optional[torch.dtype] = None,
-        reduce_results: bool = False,
         tune_max_num_tokens: int = 8192,
         model_config: ModelConfig = ModelConfig(),
         normalization_mode: int = MOEExpertScaleNormalizationMode.
         DEVICE_LIMITED,
     ):
+        from tensorrt_llm._torch.distributed import AllReduce
+
         super().__init__()
         config = model_config.pretrained_config
         self.top_k = top_k
         self.use_dp = model_config.mapping.enable_attention_dp
-        self.experts = FusedMoE(num_experts=num_experts,
-                                top_k=top_k,
-                                hidden_size=hidden_size,
-                                intermediate_size=intermediate_size,
-                                dtype=dtype,
-                                reduce_results=not self.use_dp,
-                                tune_max_num_tokens=tune_max_num_tokens,
-                                model_config=model_config,
-                                normalization_mode=normalization_mode)
+        self.experts = FusedMoE(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            reduce_results=
+            False,  # In both low latency and attention dp scenarios, FusedMoE needs not to do allreduce inside op.
+            tune_max_num_tokens=tune_max_num_tokens,
+            model_config=model_config,
+            normalization_mode=normalization_mode)
 
         self.shared_experts = GatedMLP(
             hidden_size=hidden_size,
@@ -180,7 +192,8 @@ class Deepseekv3MoE(nn.Module):
             bias=False,
             dtype=dtype,
             config=model_config,
-            use_dp=self.use_dp)
+            use_dp=self.use_dp,
+            is_expert=not self.use_dp)
 
         self.gate = Deepseekv3Gate(hidden_size, num_experts, top_k,
                                    config.n_group, config.topk_group,
@@ -189,6 +202,7 @@ class Deepseekv3MoE(nn.Module):
         self.parallel_config = ParallelConfig(
             tensor_parallel_rank=model_config.mapping.tp_rank,
             tensor_parallel_size=model_config.mapping.tp_size)
+        self.all_reduce = AllReduce(self.parallel_config)
 
     def all_gather(self, input_tensor, all_rank_num_tokens):
         world_size = self.parallel_config.tensor_parallel_size
@@ -226,6 +240,8 @@ class Deepseekv3MoE(nn.Module):
         assert shared_output.size() == routed_output.size(
         ), f'unmatched tensor shape'
         final_hidden_states = shared_output + routed_output
+        if not self.use_dp and self.parallel_config.tensor_parallel_size > 1:
+            final_hidden_states = self.all_reduce(final_hidden_states)
 
         return final_hidden_states
 
@@ -242,8 +258,6 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.num_shared_experts = config.n_shared_experts
         self.top_k = config.num_experts_per_tok
 
-        reduce_results = True
-
         self.self_attn = DeepseekV3Attention(model_config, layer_idx=layer_idx)
 
         if (config.n_routed_experts is not None
@@ -257,7 +271,6 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 shared_expert_intermediate_size=self.moe_intermediate_size *
                 self.num_shared_experts,
                 dtype=config.torch_dtype,
-                reduce_results=reduce_results,
                 tune_max_num_tokens=config.max_position_embeddings // 4,
                 model_config=model_config)
         else:
@@ -266,7 +279,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                 bias=False,
                                 dtype=config.torch_dtype,
                                 config=model_config,
-                                use_dp=model_config.mapping.enable_attention_dp)
+                                use_dp=model_config.mapping.enable_attention_dp,
+                                is_expert=False)
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
