@@ -23,7 +23,6 @@ import random
 import sys
 import time
 from importlib.metadata import version
-from tqdm import tqdm
 
 import numpy as np
 import torch
@@ -31,6 +30,7 @@ from accelerate.hooks import remove_hook_from_module
 from datasets import load_dataset
 from safetensors.torch import load_file, save_file
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 from transformers import (AutoConfig, AutoModelForCausalLM, AutoProcessor,
                           AutoTokenizer)
 
@@ -465,11 +465,12 @@ def quantize_model(model, quant_cfg, calib_dataloader, batch_size, qformat,
             return
         with torch.no_grad():
             safe_factor = 1  # Worst-case split factor needed so far
-            infer_method =  model.forward
+            infer_method = model.forward
 
             def run_splits(data, factor: int):
                 batch_size = data[list(data.keys())[0]].shape[0]
-                l_of_indices = torch.chunk(torch.arange(batch_size), chunks=factor)
+                l_of_indices = torch.chunk(torch.arange(batch_size),
+                                           chunks=factor)
                 for idxs in l_of_indices:
                     infer_method(**{k: v[idxs] for k, v in data.items()})
 
@@ -486,8 +487,7 @@ def quantize_model(model, quant_cfg, calib_dataloader, batch_size, qformat,
                     except torch.cuda.OutOfMemoryError:
                         print(
                             f"torch.OutOfMemoryError with batch size {batch_size} split into {safe_factor}. "
-                            "Trying higher splits..."
-                        )
+                            "Trying higher splits...")
                         factor *= 2  # Increase the split factor
                         if factor >= batch_size:
                             raise RuntimeError(
