@@ -23,6 +23,7 @@ import random
 import sys
 import time
 from importlib.metadata import version
+from tqdm import tqdm
 
 import numpy as np
 import torch
@@ -463,35 +464,37 @@ def quantize_model(model, quant_cfg, calib_dataloader, batch_size, qformat,
         if calib_dataloader is None:
             return
         with torch.no_grad():
-            low_mem_mode = False
-            for idx, data in enumerate(calib_dataloader):
-                logger.debug(f"Calibrating batch {idx}")
+            safe_factor = 1  # Worst-case split factor needed so far
+            infer_method =  model.forward
+
+            def run_splits(data, factor: int):
                 batch_size = data[list(data.keys())[0]].shape[0]
-                if batch_size == 1:
-                    model(**data)
-                elif not low_mem_mode:
-                    # Try running the forward once.
-                    # If output memory, we try running inference with split input tensors
+                l_of_indices = torch.chunk(torch.arange(batch_size), chunks=factor)
+                for idxs in l_of_indices:
+                    infer_method(**{k: v[idxs] for k, v in data.items()})
+
+            for idx, data in enumerate(tqdm(calib_dataloader)):
+                batch_size = data[list(data.keys())[0]].shape[0]
+                factor = min(safe_factor, batch_size)
+                while True:  # until inference is successful
                     try:
-                        model(**data)
-                    except torch.OutOfMemoryError:
+                        if factor == 1:
+                            infer_method(**data)
+                        else:
+                            run_splits(data, factor)
+                        break  # Inference successful, break out of the loop
+                    except torch.cuda.OutOfMemoryError:
                         print(
-                            "Warning: torch.OutOfMemoryError detected, try reducing the batch size..."
+                            f"torch.OutOfMemoryError with batch size {batch_size} split into {safe_factor}. "
+                            "Trying higher splits..."
                         )
-                        low_mem_mode = True
-
-                if low_mem_mode:
-                    split_data_1 = {
-                        key: data[key][:batch_size // 2, ...]
-                        for key in data
-                    }
-                    model(**split_data_1)
-
-                    split_data_2 = {
-                        key: data[key][batch_size // 2:, ...]
-                        for key in data
-                    }
-                    model(**split_data_2)
+                        factor *= 2  # Increase the split factor
+                        if factor >= batch_size:
+                            raise RuntimeError(
+                                f"Forward loop failed on batch {idx}: "
+                                " even processing one example at a time causes torch.OutOfMemoryError."
+                            )
+                safe_factor = max(safe_factor, factor)
 
     QUANT_CFG_CHOICES = {
         "int8": "INT8_DEFAULT_CFG",
