@@ -35,7 +35,7 @@ jobs:
 
     # This job only runs for pull request comments
     if: |
-         github.event.comment.body == '/build' && (github.actor == 'niukuo' || github.actor == 'niukuo')
+         startsWith( github.event.comment.body, '/bot' ) && contains('["niukuo", "tburt-nv"]', github.actor)
     steps:
       - name: Check if comment is issued by authorized person
         run: blossom-ci
