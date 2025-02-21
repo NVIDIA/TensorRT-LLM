@@ -200,6 +200,12 @@ def parse_arguments():
 
     parser.add_argument('--rotary_base', type=float, default=10000.0)
 
+    parser.add_argument('--rotary_scaling',
+                        nargs=2,
+                        type=str,
+                        default=None,
+                        help='There are two arguments, the config can be --rotary_scaling linear 4.0')
+
     parser.add_argument('--group_size',
                         type=int,
                         default=128,
@@ -411,6 +417,15 @@ def args_to_build_options(args):
 
 def from_cli_args(args):
     n_kv_head = args.n_kv_head if args.n_kv_head is not None else args.n_head
+    if args.rotary_scaling is not None:
+        # assert args.use_gpt_attention_plugin, "RoPE scaling is only supported through GPT attention plugin."
+        rotary_scaling = {
+            "type": args.rotary_scaling[0],
+            "factor": float(args.rotary_scaling[1])
+        }
+        assert rotary_scaling["type"] in ["linear", "dynamic"]
+        assert rotary_scaling["factor"] > 1.0
+        args.rotary_scaling = rotary_scaling
     config = {
         'architecture': "LlamaForCausalLM",
         'dtype': infer_dtype(args.dtype),
@@ -427,6 +442,7 @@ def from_cli_args(args):
         'max_position_embeddings': args.n_positions,
         'hidden_act': args.hidden_act,
         'rotary_base': args.rotary_base,
+        'rotary_scaling': args.rotary_scaling,
         'norm_epsilon': args.rms_norm_eps,
         'moe': {
             'num_experts': args.moe_num_experts,
