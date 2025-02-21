@@ -91,19 +91,20 @@ __global__ void addCumLogProbs(T* __restrict pStage1Probs, float const* __restri
     runtime::SizeType32 const* batchSlots, size_t const nBS, size_t const nBM)
 {
     int const bid = blockIdx.x;
-    float const diversityRate{diversityRates[batchSlots[bid]]};
+    runtime::SizeType32 const slot = batchSlots[bid];
+    float const diversityRate{diversityRates[slot]};
     T* pLocalProbs = pStage1Probs + bid * nBM * nBM * 2;
 
     for (int index = threadIdx.x; index < nBM * nBM * 2; index += blockDim.x)
     {
         int const indexBM = index / (nBM * 2);
-        if (finished[bid * nBM + indexBM].isFinished())
+        if (finished[slot * nBM + indexBM].isFinished())
         {
-            pLocalProbs[index] += (index == endIds[bid]) ? 1.0f : 0.0f;
+            pLocalProbs[index] += (index == endIds[slot]) ? 1.0f : 0.0f;
         }
         else
         {
-            pLocalProbs[index] += cumLogProbs[bid * nBM + indexBM] + diversityRate * indexBM;
+            pLocalProbs[index] += cumLogProbs[slot * nBM + indexBM] + diversityRate * indexBM;
         }
     }
     return;
