@@ -375,10 +375,12 @@ class GenerationMixin:
                 host_kv_cache_pool_mapping = Tensor(
                     name=f'host_kv_cache_pool_mapping',
                     dtype=trt.int32,
-                    shape=[len(local_attn_layers)],
+                    shape=[len(local_attn_layers),
+                           2],  # 2: (Index of pool, Index of layer within pool)
                     dim_range=OrderedDict([
                         ('pools_mapping',
                          [len(local_attn_layers)] * num_profiles),
+                        ('layer_cache_pool_locator', [2] * num_profiles)
                     ]))
 
                 for i in layers_range:

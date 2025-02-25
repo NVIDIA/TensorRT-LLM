@@ -37,6 +37,7 @@
 
 namespace tensorrt_llm::common::op
 {
+
 class AttentionOp
 {
 public:
@@ -45,7 +46,7 @@ public:
     using AttentionMaskType = tensorrt_llm::kernels::AttentionMaskType;
 
     using Fp8BlockScaleGemmRunnerPtr
-        = std::shared_ptr<tensorrt_llm::kernels::small_m_gemm::CutlassFp8BlockScaleGemmRunnerInterface>;
+        = std::shared_ptr<tensorrt_llm::kernels::fp8_blockscale_gemm::CutlassFp8BlockScaleGemmRunnerInterface>;
 
     AttentionOp(){};
     ~AttentionOp() = default;
@@ -333,7 +334,6 @@ public:
     int mVisionStart = -1;
     int mVisionLength = -1;
     int mNumKVHeads = -1;
-    int mLayerIdxInCachePool = -1;
     int mHeadSize = -1;
     int mUnidirectional = 1;
     float mQScaling = 1.0;
@@ -398,15 +398,15 @@ public:
 
     [[nodiscard]] auto data() const
     {
-        return std::make_tuple(mLayerIdx, mNumHeads, mVisionStart, mVisionLength, mNumKVHeads, mLayerIdxInCachePool,
-            mHeadSize, mUnidirectional, mQScaling, mAttnLogitSoftcappingScale, mRotaryEmbeddingDim,
-            mRotaryEmbeddingBase, (int8_t) mRotaryEmbeddingScaleType, mRotaryEmbeddingScale,
-            mRotaryEmbeddingShortMscale, mRotaryEmbeddingLongMscale, mRotaryEmbeddingMaxPositions,
-            mRotaryEmbeddingOriginalMaxPositions, (int8_t) mPositionEmbeddingType, mUseLognScaling, mRemovePadding,
-            (int32_t) mMaskType, mBlockSparseParams.data(), mPagedKVCache, mTokensPerBlock, mKVCacheQuantMode.value(),
-            mTpSize, mTpRank, mUnfuseQkvGemm, (int32_t) mType, mMaxContextLength, mQKVBiasEnabled, mCrossAttention,
-            mMaxDistance, mPosShiftEnabled, mPagedContextFMHA, mFP8ContextFMHA, mDenseContextFMHA,
-            mHasFullAttentionMask, mIsSpecDecodingEnabled, mUseSpecDecoding, mSpecDecodingIsGenerationLengthVariable,
+        return std::make_tuple(mLayerIdx, mNumHeads, mVisionStart, mVisionLength, mNumKVHeads, mHeadSize,
+            mUnidirectional, mQScaling, mAttnLogitSoftcappingScale, mRotaryEmbeddingDim, mRotaryEmbeddingBase,
+            (int8_t) mRotaryEmbeddingScaleType, mRotaryEmbeddingScale, mRotaryEmbeddingShortMscale,
+            mRotaryEmbeddingLongMscale, mRotaryEmbeddingMaxPositions, mRotaryEmbeddingOriginalMaxPositions,
+            (int8_t) mPositionEmbeddingType, mUseLognScaling, mRemovePadding, (int32_t) mMaskType,
+            mBlockSparseParams.data(), mPagedKVCache, mTokensPerBlock, mKVCacheQuantMode.value(), mTpSize, mTpRank,
+            mUnfuseQkvGemm, (int32_t) mType, mMaxContextLength, mQKVBiasEnabled, mCrossAttention, mMaxDistance,
+            mPosShiftEnabled, mPagedContextFMHA, mFP8ContextFMHA, mDenseContextFMHA, mHasFullAttentionMask,
+            mIsSpecDecodingEnabled, mUseSpecDecoding, mSpecDecodingIsGenerationLengthVariable,
             mSpecDecodingMaxGenerationLength, mIsMLAEnabled, mMLAParams.data(), mIsFP8BlockScalingEnabled, mCpSize,
             mCpRank, mCpGroup, mEnableContextFMHA, mFMHAForceFP32Acc, mMultiBlockMode, mEnableXQA, mUseKVCache,
             mSkipAttn, mFuseFp4Quant, mNbMultiBlockSemaphores);
@@ -425,7 +425,10 @@ private:
     UniqPtrWNullCopy<tensorrt_llm::kernels::FusedMHARunnerV2> mDecoderFMHARunner;
     UniqPtrWNullCopy<tensorrt_llm::kernels::FmhaDispatcher> mFmhaDispatcher;
     UniqPtrWNullCopy<tensorrt_llm::kernels::XqaDispatcher> mXqaDispatcher;
+    UniqPtrWNullCopy<tensorrt_llm::kernels::TllmGenFmhaRunner> mTllmGenFMHARunner;
     Fp8BlockScaleGemmRunnerPtr mGemmRunner;
+
+    // The default copy constructor will leave it as nullptr. clone() shall initialize it.
     UniqPtrWNullCopy<tensorrt_llm::common::CublasMMWrapper> mCublasWrapper;
 
 #if ENABLE_MULTI_DEVICE

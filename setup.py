@@ -175,6 +175,8 @@ def extract_from_precompiled(precompiled_location: str, package_data: List[str],
 
     with zipfile.ZipFile(wheel_path) as wheel:
         for file in wheel.filelist:
+            if file.filename.endswith(".py"):
+                continue
             for filename_pattern in package_data:
                 if fnmatch.fnmatchcase(file.filename,
                                        f"tensorrt_llm/{filename_pattern}"):

@@ -24,20 +24,28 @@ namespace tensorrt_llm
 {
 namespace kernels
 {
+namespace
+{
 
 int32_t constexpr kBitsPerMaskElement = 32;
 int32_t constexpr kThreadsPerBlock = 256;
 
 template <typename T>
-__device__ T GetNegativeInfinity()
+__device__ T negativeInfinity()
 {
     return -INFINITY;
 }
 
 template <>
-__device__ half GetNegativeInfinity<half>()
+__device__ half negativeInfinity<half>()
 {
-    return __float2half(-INFINITY);
+    return -CUDART_INF_FP16;
+}
+
+template <>
+__device__ __nv_bfloat16 negativeInfinity<__nv_bfloat16>()
+{
+    return -CUDART_INF_BF16;
 }
 
 template <typename T, typename PackedT>
@@ -77,7 +85,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock) logitsBitmaskKernel(
         }
         if (!((bitmaskVal >> offset) & 1))
         {
-            logitsSmem[threadIdx.x * kBitsPerMaskElement + offset] = GetNegativeInfinity<T>();
+            logitsSmem[threadIdx.x * kBitsPerMaskElement + offset] = negativeInfinity<T>();
         }
     }
     __syncthreads();
@@ -94,6 +102,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock) logitsBitmaskKernel(
             = *reinterpret_cast<PackedT*>(logitsSmem + localOffset);
     }
 }
+} // namespace
 
 template <typename T>
 void invokeLogitsBitmask(

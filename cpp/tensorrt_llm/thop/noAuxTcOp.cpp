@@ -43,8 +43,10 @@ th::Tensor noaux_tc_op(th::Tensor const& scores, th::Tensor const& scores_with_b
     int64_t num_experts = input_size[1];
     TORCH_CHECK(input_size.size() == 2, "scores_with_bias must be a 2D Tensor");
     TORCH_CHECK(num_experts % n_group == 0, "num_experts should be divisible by n_group");
-    TORCH_CHECK(n_group < 32, "n_group should be smaller than 32 for now"); //@todo: remove this restriction later
-    TORCH_CHECK(topk < 32, "topk should be smaller than 32 for now");       //@todo: remove this restriction later
+    TORCH_CHECK(
+        n_group <= 32, "n_group should be smaller than or equal to 32 for now"); //@todo: remove this restriction later
+    TORCH_CHECK(
+        topk <= 32, "topk should be smaller than or equal to 32 for now");       //@todo: remove this restriction later
 
     th::Tensor group_scores = th::empty({num_tokens, n_group}, th::dtype(data_type).device(torch::kCUDA));
 

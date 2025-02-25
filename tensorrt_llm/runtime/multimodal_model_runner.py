@@ -1353,7 +1353,7 @@ class MultimodalModelRunner:
             input_ids = [split_input_ids[0]]
             for idx in range(
                     len(visual_features)
-            ):  # TODO:alternatively make TensorInfo interable if this breaks others
+            ):  # TODO:alternatively make TensorInfo iterable if this breaks others
                 fake_prompt_id = torch.arange(
                     fake_prompt_counter,
                     fake_prompt_counter + visual_features.shape[1])
@@ -1486,7 +1486,7 @@ class MultimodalModelRunner:
                 width position_ids: [0, 1, 2, 3, 4]
 
             For vision and text embedding sequence, we calculate 3D rotary position embedding for vision part
-            and 1D rotary position embeddin for text part.
+            and 1D rotary position embedding for text part.
             Examples:
                 Assume we have a video input with 3 temporal patches, 2 height patches and 2 width patches.
                 input_ids: [V V V V V V V V V V V V T T T T T], here V is for vision.
@@ -1639,7 +1639,8 @@ class MultimodalModelRunner:
 
         visual_features = torch.unsqueeze(visual_features, 0)
 
-        #generate mrope_params
+        # Get the rope index
+        # From HF's preprocess code
         mrope_position_ids, mrope_position_deltas = self.get_rope_index(
             input_ids,
             image_grid_thw=vision_grid_thws,
@@ -1647,16 +1648,13 @@ class MultimodalModelRunner:
             attention_mask=attention_mask,
         )
 
-        for idx in range(input_ids.size(0)):
-            input_id = input_ids[idx]
-            mask = (input_id == self.image_token_id) | (
-                input_id == self.vision_token_id) | (input_id
-                                                     == self.video_token_id)
-            indices = torch.nonzero(mask, as_tuple=False)
-            value = self.model_config.vocab_size
-            for idx in indices:
-                input_id[tuple(idx)] = value
-                value += 1
+        # This is where we convert input_ids of image features into fake_prompt_ids mapping for TRT-LLM engine.
+        masks = (input_ids == self.image_token_id) | (
+            input_ids == self.vision_token_id) | (input_ids
+                                                  == self.video_token_id)
+        cumulative_counts = masks.cumsum(dim=1)
+        values = (self.model_config.vocab_size - 1) + cumulative_counts
+        input_ids[masks] = values[masks]
 
         if self.decoder_llm or self.runtime_mapping.is_first_pp_rank():
             ptuning_args = self.ptuning_setup(visual_features, input_ids,
@@ -1664,50 +1662,45 @@ class MultimodalModelRunner:
         else:
             ptuning_args = [None, None, None]
 
-        mrope_position_ids = mrope_position_ids
-        mrope_position_deltas = mrope_position_deltas
+        # This does not have dependency on input.
+        # Switch to attributes to use across iterations.
+        if not hasattr(self, 'rotary_cos_sin'):
+            inv_freq, rotary_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
+                num_pos=self.max_position_embeddings,
+                dim=int(self.hidden_size / self.num_attention_heads),
+                theta=float(self.rope_theta),
+                scale_type=RotaryScalingType.mrope)
+            self.rotary_cos_sin = torch.from_numpy(rotary_cos_sin).to(
+                visual_features.device)
+            self.rotary_cos_sin = self.rotary_cos_sin.reshape(
+                self.max_position_embeddings,
+                int(self.hidden_size / self.num_attention_heads / 2), 2)
+            self.cos_ori = self.rotary_cos_sin[:, :, 0]
+            self.sin_ori = self.rotary_cos_sin[:, :, 1]
+
         mrope_position_ids = mrope_position_ids.transpose(1, 0)
-        max_position_embeddings = int(self.max_position_embeddings)
-        rotary_embedding_dim = int(self.hidden_size / self.num_attention_heads)
-        mrope_position_ids_padding = torch.zeros(mrope_position_ids.shape[:-1] +
-                                                 (max_position_embeddings, ),
-                                                 dtype=torch.int32)
+        mrope_position_ids_padding = torch.zeros(
+            mrope_position_ids.shape[:-1] + (self.max_position_embeddings, ),
+            dtype=torch.int32,
+            device=visual_features.device)
         mrope_position_ids_padding[:, :, :mrope_position_ids.
                                    shape[-1]] = mrope_position_ids
-
-        rotary_embedding_base = float(self.rope_theta)
-        rotary_embedding_scale = float(1.0)
-        rotary_embedding_scale_type = RotaryScalingType.mrope
-        rotary_embedding_scaling = None
-        inv_freq, rotary_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
-            max_position_embeddings, rotary_embedding_dim,
-            rotary_embedding_base, rotary_embedding_scale,
-            rotary_embedding_scale_type, rotary_embedding_scaling)
-        rotary_cos_sin = rotary_cos_sin.reshape(max_position_embeddings,
-                                                int(rotary_embedding_dim / 2),
-                                                2)
-        rotary_cos_sin = torch.from_numpy(rotary_cos_sin)
-        cos_ori = rotary_cos_sin[:, :, 0]
-        sin_ori = rotary_cos_sin[:, :, 1]
-        cos = cos_ori[mrope_position_ids_padding]
-        sin = sin_ori[mrope_position_ids_padding]
+        cos = self.cos_ori[mrope_position_ids_padding]
+        sin = self.sin_ori[mrope_position_ids_padding]
 
         mrope_section = [16, 24, 24]
-        unsqueeze_dim = -1
         cos = torch.cat([
             m[:, i % 3] for i, m in enumerate(cos.split(mrope_section, dim=-1))
         ],
-                        dim=-1).unsqueeze(unsqueeze_dim)
+                        dim=-1).unsqueeze(-1)
         sin = torch.cat([
             m[:, i % 3] for i, m in enumerate(sin.split(mrope_section, dim=-1))
         ],
-                        dim=-1).unsqueeze(unsqueeze_dim)
-        concat_cos_sin = np.concatenate((cos, sin), axis=-1)
+                        dim=-1).unsqueeze(-1)
+        concat_cos_sin = torch.concatenate((cos, sin), axis=-1)
         concat_cos_sin = concat_cos_sin.reshape(concat_cos_sin.shape[0], -1)
-        concat_cos_sin = torch.from_numpy(concat_cos_sin)
 
         mrope_args = [concat_cos_sin, mrope_position_deltas]
-
         return input_ids, ptuning_args, mrope_args
 
     def ptuning_setup_fuyu(self, input_ids, image_patches_indices):
@@ -1990,14 +1983,22 @@ class MultimodalModelRunner:
                 image_grid_thw[:, 1] * image_grid_thw[:, 2],
                 image_grid_thw[:, 0]).cumsum(dim=0, dtype=torch.int32)
             cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+
             seq_length = image.shape[0]
-            attention_mask_vit = torch.full([1, seq_length, seq_length],
-                                            torch.finfo(torch.float16).min,
-                                            device=image.device,
-                                            dtype=image.dtype)
-            for i in range(1, len(cu_seqlens)):
-                attention_mask_vit[..., cu_seqlens[i - 1]:cu_seqlens[i],
-                                   cu_seqlens[i - 1]:cu_seqlens[i]] = 0
+            # Create block indices using bucketing
+            block_indices = torch.bucketize(torch.arange(seq_length,
+                                                         device=image.device),
+                                            cu_seqlens,
+                                            right=True) - 1
+
+            # Generate block diagonal mask using matrix expansion
+            attention_mask_vit = torch.where(
+                block_indices.view(-1, 1) == block_indices.view(1, -1),
+                torch.zeros((), device=image.device, dtype=image.dtype),
+                torch.full((),
+                           torch.finfo(torch.float16).min,
+                           device=image.device,
+                           dtype=image.dtype)).unsqueeze(0)
 
             decoder_input_ids = None
             post_prompt = None

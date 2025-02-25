@@ -56,8 +56,6 @@ def test_llama(model_name, quant, tp_size, torch_compile):
     # 16GB weight + 8GB KV cache + 8GB cache_indirection (TRT engine only) = 32GB
     if not is_fp8 and get_total_gpu_memory(0) < 32 * 1024**3:
         pytest.skip("Not enough GPU memory to run BF16 model")
-    if torch_compile and tp_size > 1:
-        pytest.skip("https://nvbugspro.nvidia.com/bug/5114651")
 
     prompts = [
         "The president of the United States is",

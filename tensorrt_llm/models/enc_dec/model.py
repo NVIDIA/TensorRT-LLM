@@ -1746,7 +1746,7 @@ class DecoderModel(PretrainedModel):
                     x for x in max_cross_blocks_per_seq_range[0]
                 ]]
 
-                # TODO(oargov): add support for vgqa, meanwhile assume a single kv cache pool
+                # TODO(oargov): add support for vgqa + vwindow, meanwhile assume a single kv cache pool
                 num_kv_cache_pools = 1
 
                 kv_cache_block_offsets = Tensor(
@@ -1780,9 +1780,11 @@ class DecoderModel(PretrainedModel):
                 host_kv_cache_pool_mapping = Tensor(
                     name=f"host_kv_cache_pool_mapping",
                     dtype=trt.int32,
-                    shape=[num_pp_layers],
+                    # 2: (Index of pool, Index of layer within pool)
+                    shape=[num_pp_layers, 2],
                     dim_range=OrderedDict([
                         ('pools_mapping', [num_pp_layers]),
+                        ('layer_cache_pool_locator', [2]),
                     ]))
 
                 # paged blocks for cross kv
@@ -1819,9 +1821,11 @@ class DecoderModel(PretrainedModel):
                 host_cross_kv_cache_pool_mapping = Tensor(
                     name=f"host_cross_kv_cache_pool_mapping",
                     dtype=trt.int32,
-                    shape=[num_pp_layers],
+                    # 2: (Index of pool, Index of layer within pool)
+                    shape=[num_pp_layers, 2],
                     dim_range=OrderedDict([
                         ('pools_mapping', [num_pp_layers]),
+                        ('layer_cache_pool_locator', [2]),
                     ]))
 
                 for i in layers_range:

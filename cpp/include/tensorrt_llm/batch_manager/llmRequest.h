@@ -123,7 +123,8 @@ public:
         SizeType32 numReturnSequences = 1, std::optional<executor::EagleConfig> eagleConfig = std::nullopt,
         std::optional<TensorPtr> skipCrossAttnBlocks = std::nullopt, bool returnPerfMetrics = false,
         std::optional<executor::GuidedDecodingParams> guidedDecodingParams = std::nullopt,
-        std::optional<MillisecondsType> allottedTimeMs = std::nullopt)
+        std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
+        std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt)
         : mRequestId(requestId)
         , mPromptLen(inputTokens->size())
         , mMaxNewTokens(maxNewTokens)
@@ -170,6 +171,7 @@ public:
         , mEncoderOutputLength(encoderOutputLength)
         , mCrossAttentionMask(std::move(crossAttentionMask))
         , mLlmRequestType(llmRequestType)
+        , mContextPhaseParams(contextPhaseParams)
         , mInputTokenExtraIds(std::move(inputTokenExtraIds))
         , mNumReturnSequences(numReturnSequences)
         , mEagleConfig(std::move(eagleConfig))
@@ -202,7 +204,8 @@ public:
         bool excludeInputFromOutput = false, std::optional<LogitsPostProcessor> logitsPostProcessor = std::nullopt,
         bool applyLogitsPostProcessorBatched = false, std::optional<VecTokens> encoderInputTokens = std::nullopt,
         bool returnEncoderOutput = false, std::optional<RequestIdType> clientId = std::nullopt,
-        executor::PriorityType priority = executor::Request::kDefaultPriority, SizeType32 numReturnSequences = 1)
+        executor::PriorityType priority = executor::Request::kDefaultPriority, SizeType32 numReturnSequences = 1,
+        std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt)
         : mRequestId(requestId)
         , mPromptLen(inputTokens.size())
         , mMaxNewTokens(maxNewTokens)
@@ -241,6 +244,7 @@ public:
         , mDecodingIter(0)
         , mPriority(priority)
         , mFinishReasons(samplingConfig.beamWidth)
+        , mContextPhaseParams(contextPhaseParams)
         , mNumReturnSequences(numReturnSequences)
         , mSequenceIndex(0)
     {
@@ -1869,6 +1873,11 @@ protected:
 private:
     void initialize(VecTokens const& inputTokens, bool outputLogProbs)
     {
+        if (mLlmRequestType == LlmRequestType::LLMREQUEST_TYPE_GENERATION_ONLY)
+        {
+            mState = LlmRequestState::kDISAGG_GENERATION_INIT;
+        }
+
         // Scatter the input tokens to other beam
         mTokens = BeamTokens(mSamplingConfig.beamWidth, inputTokens);
         mLastTokens = VecTokens(mSamplingConfig.beamWidth);
@@ -2034,7 +2043,8 @@ public:
         SizeType32 numReturnSequences = 1, std::optional<executor::EagleConfig> eagleConfig = std::nullopt,
         std::optional<TensorPtr> skipCrossAttnBlocks = std::nullopt, bool returnPerfMetrics = false,
         std::optional<executor::GuidedDecodingParams> guidedDecodingParams = std::nullopt,
-        std::optional<MillisecondsType> allottedTimeMs = std::nullopt)
+        std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
+        std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt)
         : Base(requestId, maxNewTokens, std::move(inputTokens), samplingConfig, isStreaming, endId, padId,
             std::move(embeddingBias), std::move(badWordsList), std::move(stopWordsList), std::move(positionIds),
             std::move(promptEmbeddingTable), promptVocabSize, std::move(mropeRotaryCosSin), mropePositionDeltas,
@@ -2044,7 +2054,8 @@ public:
             applyLogitsPostProcessorBatched, std::move(encoderInputTokens), returnEncoderOutput, clientId, priority,
             std::move(encoderInputFeatures), std::move(encoderOutputLength), std::move(crossAttentionMask),
             llmRequestType, std::move(inputTokenExtraIds), numReturnSequences, std::move(eagleConfig),
-            std::move(skipCrossAttnBlocks), returnPerfMetrics, std::move(guidedDecodingParams), allottedTimeMs)
+            std::move(skipCrossAttnBlocks), returnPerfMetrics, std::move(guidedDecodingParams), allottedTimeMs,
+            contextPhaseParams)
     {
     }
 
@@ -2075,7 +2086,8 @@ public:
         std::optional<executor::EagleConfig> eagleConfig = std::nullopt,
         std::optional<TensorPtr> skipCrossAttnBlocks = std::nullopt, bool returnPerfMetrics = false,
         std::optional<executor::GuidedDecodingParams> guidedDecodingParams = std::nullopt,
-        std::optional<MillisecondsType> allottedTimeMs = std::nullopt)
+        std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
+        std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt)
         : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
             samplingConfig, isStreaming, endId, padId, std::move(embeddingBias), std::move(badWordsList),
             std::move(stopWordsList),
@@ -2095,7 +2107,7 @@ public:
             inputTokenExtraIds ? std::make_optional(std::make_shared<VecTokenExtraIds>(std::move(*inputTokenExtraIds)))
                                : std::optional<std::shared_ptr<VecTokenExtraIds>>(std::nullopt),
             numReturnSequences, std::move(eagleConfig), skipCrossAttnBlocks, returnPerfMetrics,
-            std::move(guidedDecodingParams), allottedTimeMs)
+            std::move(guidedDecodingParams), allottedTimeMs, contextPhaseParams)
     {
     }
 
@@ -2114,14 +2126,15 @@ public:
         bool excludeInputFromOutput = false, std::optional<LogitsPostProcessor> logitsPostProcessor = std::nullopt,
         bool applyLogitsPostProcessorBatched = false, std::optional<VecTokens> encoderInputTokens = std::nullopt,
         bool returnEncoderOutput = false, std::optional<RequestIdType> clientId = std::nullopt,
-        executor::PriorityType priority = executor::Request::kDefaultPriority, SizeType32 numReturnSequences = 1)
+        executor::PriorityType priority = executor::Request::kDefaultPriority, SizeType32 numReturnSequences = 1,
+        std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt)
         : Base(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming, endId, padId,
             std::move(embeddingBias), std::move(badWordsList), std::move(stopWordsList), std::move(positionIds),
             std::move(promptEmbeddingTable), promptVocabSize, loraTaskId, std::move(loraWeights), std::move(loraConfig),
             lookaheadConfig, returnLogProbs, returnContextLogits, returnGenerationLogits, std::move(draftTokens),
             std::move(draftLogits), excludeInputFromOutput, std::move(logitsPostProcessor),
             applyLogitsPostProcessorBatched, std::move(encoderInputTokens), returnEncoderOutput, clientId, priority,
-            numReturnSequences)
+            numReturnSequences, contextPhaseParams)
     {
     }
 

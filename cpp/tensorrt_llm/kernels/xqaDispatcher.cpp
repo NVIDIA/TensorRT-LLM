@@ -190,7 +190,9 @@ bool XqaDispatcher::isSupported()
         tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
         tllmRunnerParams.mTileScheduler = TileScheduler::Static;
         tllmRunnerParams.mMultiCtasKvMode = true;
-        tllmRunnerParams.mHeadDim = mFixedParams.headSize;
+        // Assume same head size for Qk and V here.
+        tllmRunnerParams.mHeadDimQk = mFixedParams.headSize;
+        tllmRunnerParams.mHeadDimV = mFixedParams.headSize;
         tllmRunnerParams.mNumHeadsQ = mFixedParams.numQHeads;
         tllmRunnerParams.mNumHeadsKv = mFixedParams.numKvHeads;
         tllmRunnerParams.mNumHeadsQPerKv = mFixedParams.numQHeads / mFixedParams.numKvHeads;
@@ -240,8 +242,7 @@ void XqaDispatcher::runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buff
         buildXQALaunchParams(launchParams, inputScratch, /*needOutputCvt*/ false, params, kv_cache_buffer);
 
         // Build cu_seqlens, padding_offset, and rotary inv freq tensors
-        BuildDecoderInfoParams<T> decoder_params;
-        memset(&decoder_params, 0, sizeof(decoder_params));
+        BuildDecoderInfoParams<T> decoder_params{};
         decoder_params.seqQOffsets = launchParams.cu_seq_lens;
         decoder_params.seqKVOffsets = launchParams.cu_kv_seq_lens;
         decoder_params.seqQLengths = params.spec_decoding_generation_lengths;
@@ -386,7 +387,8 @@ void XqaDispatcher::runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buff
 
         tllmRunnerParams.oPtr = params.output;
         tllmRunnerParams.oSfPtr = params.output_sf;
-        tllmRunnerParams.mHeadDim = params.head_size;
+        tllmRunnerParams.mHeadDimQk = params.head_size;
+        tllmRunnerParams.mHeadDimV = params.head_size;
         tllmRunnerParams.mNumHeadsQ = params.num_q_heads;
         tllmRunnerParams.mNumHeadsKv = params.num_kv_heads;
         tllmRunnerParams.mNumHeadsQPerKv = num_q_heads_over_kv;
@@ -402,11 +404,13 @@ void XqaDispatcher::runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buff
         if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
         {
             auto const [freeMemory, totalMemory] = tensorrt_llm::common::getDeviceMemoryInfo(false);
+            // The kv cache should be based on the maximum headDim of K and V due to paddings.
+            int maxHeadDimKv = std::max(tllmRunnerParams.mHeadDimQk, tllmRunnerParams.mHeadDimV);
             tllmRunnerParams.mNumPagesInMemPool = totalMemory
-                / (tllmRunnerParams.mNumHeadsKv * tllmRunnerParams.mNumTokensPerPage * tllmRunnerParams.mHeadDim
+                / (tllmRunnerParams.mNumHeadsKv * tllmRunnerParams.mNumTokensPerPage * maxHeadDimKv
                     * get_size_in_bytes(mFixedParams.kvDataType));
         }
-        tllmRunnerParams.mMaxNumCtas = mMultiProcessorCount;
+        tllmRunnerParams.mMultiProcessorCount = mMultiProcessorCount;
         tllmRunnerParams.stream = params.stream;
         tllmRunnerParams.mSfStartTokenIdx = params.start_token_idx_sf;
 

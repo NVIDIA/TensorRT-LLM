@@ -102,6 +102,7 @@ def _register_fake():
         beam_width,
         mask_type,
         quant_mode,
+        q_scaling,
         position_embedding_type,
         rotary_embedding_dim,
         rotary_embedding_base,

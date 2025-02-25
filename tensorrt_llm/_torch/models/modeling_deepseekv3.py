@@ -1,3 +1,4 @@
+import warnings
 from typing import Dict, List, Optional
 
 import torch
@@ -10,6 +11,7 @@ from tensorrt_llm._torch.distributed import (ParallelConfig, allgather,
                                              reducescatter)
 from tensorrt_llm.functional import PositionEmbeddingType
 
+from ...llmapi.utils import enable_llm_debug
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..model_config import ModelConfig
@@ -102,6 +104,14 @@ class Deepseekv3Gate(nn.Module):
         scores = F.sigmoid(logits)
         scores_with_bias = scores + self.e_score_correction_bias
         scores_shape = list(scores_with_bias.shape)
+
+        if enable_llm_debug():
+            has_nan = torch.isnan(scores_with_bias).any()
+            if has_nan:
+                warnings.warn(
+                    "Detected NAN in the tensor scores_with_bias. Please check if it matches the expectation."
+                )
+
         if self.is_thop == False:
             group_scores = torch.sum(torch.topk(
                 scores_with_bias.view(scores_shape[:-1] +
@@ -201,7 +211,8 @@ class Deepseekv3MoE(nn.Module):
 
         self.parallel_config = ParallelConfig(
             tensor_parallel_rank=model_config.mapping.tp_rank,
-            tensor_parallel_size=model_config.mapping.tp_size)
+            tensor_parallel_size=model_config.mapping.tp_size,
+            gpus_per_node=model_config.mapping.gpus_per_node)
         self.all_reduce = AllReduce(self.parallel_config)
 
     def all_gather(self, input_tensor, all_rank_num_tokens):

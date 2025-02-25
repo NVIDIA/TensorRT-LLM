@@ -43,23 +43,7 @@ add_gtest(gemmSwigluKernelTestSm90Fp8
 foreach(target_name gemmSwigluRunnerTest;gemmSwigluKernelTestSm90Fp8)
   set_property(TARGET ${target_name} PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
-  # Note - we deliberately do not include 90a PTX (even when 9.0+PTX is
-  # specified). This is because sm_90a has arch conditional instructions that
-  # are not forward compatible. As a result, it does not make sense to embed PTX
-  # into the binary anyway.
-  if("90" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
-     OR "90-real" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
-     OR "90-real" IN_LIST CMAKE_CUDA_ARCHITECTURES_NATIVE)
-
-    message(STATUS "MANUALLY APPENDING FLAG TO COMPILE FOR SM_90a.")
-    target_compile_options(
-      ${target_name}
-      PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_90a,code=sm_90a
-              -res-usage>)
-
-    # Hopper kernels require cuda lib for TMA APIs
-    target_link_libraries(${target_name} PRIVATE CUDA::cuda_driver)
-
+  if("90" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
     # No kernels should be parsed, unless hopper is specified. This is a build
     # time improvement
     target_compile_definitions(${target_name} PRIVATE COMPILE_HOPPER_TMA_GEMMS)

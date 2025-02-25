@@ -26,6 +26,7 @@ KvCacheConfigCpp = tensorrt_llm.bindings.KvCacheConfig
 CacheTypeCpp = tensorrt_llm.bindings.internal.batch_manager.CacheType
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 DataType = tensorrt_llm.bindings.DataType
+RequestList = list[LlmRequest]
 
 
 def compute_page_count(token_count: int, tokens_per_page: int) -> int:
@@ -101,6 +102,8 @@ class KVCacheManager(BaseResourceManager):
         self.num_heads = num_heads
         self.num_layers = num_layers
         self.mapping = mapping
+        self.dtype = dtype
+
         tp_size = mapping.tp_size
         if mapping.enable_attention_dp:
             tp_size = 1
@@ -276,12 +279,13 @@ class KVCacheManager(BaseResourceManager):
             sampling_params = SamplingParams()
             token_num = token_nums[i] if token_nums is not None else 1
             encoder_input_tokens = [
-                0
+                1
             ] * token_num if self.impl.cross_kv else None
+            # Using 1 instead of 0 prevents NaN during warmup in e.g. Deepseek
             req = LlmRequest(
                 request_id=req_id,
                 max_new_tokens=1,
-                input_tokens=[0] * token_num,
+                input_tokens=[1] * token_num,
                 sampling_config=tensorrt_llm.bindings.SamplingConfig(
                     sampling_params._get_sampling_config()),
                 is_streaming=False,

@@ -844,7 +844,7 @@ def non_modelopt_quantize_if_needed(
     quant_cfg = trt_llm_config.quantization
 
     kv_cache_is_int8 = quant_cfg.kv_cache_quant_algo == QuantAlgo.INT8
-    use_smooth_quant = quant_cfg.use_plugin_sq
+    use_smooth_quant = quant_cfg._use_plugin_sq
 
     if use_smooth_quant or kv_cache_is_int8:
         qkv_para = {}

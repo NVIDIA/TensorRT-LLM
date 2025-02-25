@@ -175,6 +175,7 @@ public:
         for (int i = 0; i < max_arr_len_; ++i)
         {
             val_arr_[i] = dummy_;
+            idx_arr_[i] = 0;
         }
     }
 
@@ -354,8 +355,8 @@ __device__ void topk_with_k2(T* output, T const* input, cg::thread_block_tile<32
     int const num_experts_per_group)
 {
     // Get the top2 per thread
-    T largest = cuda::std::numeric_limits<T>::min();
-    T second_largest = cuda::std::numeric_limits<T>::min();
+    T largest = -INFINITY;
+    T second_largest = -INFINITY;
 
     if (num_experts_per_group > WARP_SIZE)
     {
@@ -387,6 +388,7 @@ __device__ void topk_with_k2(T* output, T const* input, cg::thread_block_tile<32
 
     T max2 = max1;
     bool equal_to_max1 = (max1 == largest);
+
     int count_max1 = __popc(__ballot_sync(FULL_WARP_MASK, equal_to_max1));
 
     if (count_max1 == 1)
@@ -439,18 +441,20 @@ __global__ void group_idx_and_topk_idx_kernel(T* scores, T const* group_scores, 
     cg::thread_block_tile<32> tile = cg::tiled_partition<32>(block);
 
     extern __shared__ char smem_buf[]; // NOTE: reuse the shared memory here to store the target topk idx
-    int32_t* s_topk_idx = reinterpret_cast<int32_t*>(smem_buf) + warp_id * topk;
+    int32_t* s_topk_idx = reinterpret_cast<int32_t*>(smem_buf);
     T* s_topk_value = reinterpret_cast<T*>(s_topk_idx + NUM_WARPS_PER_BLOCK * topk) + warp_id * topk;
+    s_topk_idx += warp_id * topk;
 
     T value = cuda::std::numeric_limits<T>::min();
     T topk_group_value = cuda::std::numeric_limits<T>::min();
     int32_t num_equalto_topkth_group;
 
-    if ((n_group > topk_group) && (case_id < num_tokens))
+    if (case_id < num_tokens)
     {
         // calculate group_idx
         int32_t target_num_min = WARP_SIZE - n_group + topk_group;
-        if (lane_id < n_group)
+        if (lane_id < n_group
+            && (isfinite(cuda_cast<float, T>(group_scores[lane_id])))) // The check is necessary to avoid abnormal input
         {
             value = group_scores[lane_id];
         }
@@ -474,11 +478,11 @@ __global__ void group_idx_and_topk_idx_kernel(T* scores, T const* group_scores, 
     }
     __syncthreads();
 
-    warp_topk::WarpSelect</*capability*/ WARP_SIZE, /*greater*/ true, T, int32_t> queue(
-        (int32_t) topk, cuda::std::numeric_limits<T>::min());
+    warp_topk::WarpSelect</*capability*/ WARP_SIZE, /*greater*/ true, T, int32_t> queue((int32_t) topk, -INFINITY);
 
     int count_equalto_topkth_group = 0;
-    if (case_id < num_tokens)
+    bool if_proceed_next_topk = (topk_group_value != cuda::std::numeric_limits<T>::min());
+    if (case_id < num_tokens && if_proceed_next_topk)
     {
         for (int i_group = 0; i_group < n_group; i_group++)
         {
@@ -489,8 +493,10 @@ __global__ void group_idx_and_topk_idx_kernel(T* scores, T const* group_scores, 
                 int32_t offset = i_group * num_experts_per_group;
                 for (int32_t i = lane_id; i < align_num_experts_per_group; i += WARP_SIZE)
                 {
-                    T candidates = i < num_experts_per_group ? scores_with_bias[offset + i]
-                                                             : cuda::std::numeric_limits<T>::min();
+                    T candidates
+                        = (i < num_experts_per_group) && isfinite(cuda_cast<float, T>(scores_with_bias[offset + i]))
+                        ? scores_with_bias[offset + i]
+                        : cuda::std::numeric_limits<T>::min();
                     queue.add(candidates, offset + i);
                 }
                 if (group_scores[i_group] == topk_group_value)
@@ -509,7 +515,7 @@ __global__ void group_idx_and_topk_idx_kernel(T* scores, T const* group_scores, 
     // Load the valid score value
     // Calculate the summation
     float topk_sum = 1e-20;
-    if (case_id < num_tokens)
+    if (case_id < num_tokens && if_proceed_next_topk)
     {
         for (int i = lane_id; i < warp_topk::round_up_to_multiple_of<WARP_SIZE>(topk); i += WARP_SIZE)
         {
@@ -523,23 +529,35 @@ __global__ void group_idx_and_topk_idx_kernel(T* scores, T const* group_scores, 
     }
 
     __syncthreads();
-    if (case_id < num_tokens)
-    {
-        for (int i = lane_id; i < num_experts; i += WARP_SIZE)
-        {
-            scores[i] = 0;
-        }
-    }
-    __threadfence();
-    __syncthreads();
 
     if (case_id < num_tokens)
     {
-        for (int i = lane_id; i < topk; i += WARP_SIZE)
+        if (if_proceed_next_topk)
         {
-            float value = cuda_cast<float, T>(s_topk_value[i]) / topk_sum * routed_scaling_factor;
-            scores[s_topk_idx[i]] = cuda_cast<T, float>(value);
+            if (case_id < num_tokens)
+            {
+                for (int i = lane_id; i < num_experts; i += WARP_SIZE)
+                {
+                    scores[i] = 0;
+                }
+            }
+            __threadfence();
+            __syncthreads();
+            for (int i = lane_id; i < topk; i += WARP_SIZE)
+            {
+                float value = cuda_cast<float, T>(s_topk_value[i]) / topk_sum * routed_scaling_factor;
+                scores[s_topk_idx[i]] = cuda_cast<T, float>(value);
+            }
         }
+        else
+        {
+            for (int i = lane_id; i < num_experts; i += WARP_SIZE)
+            {
+                scores[i] = i < topk ? cuda_cast<T, float>(1.0f / topk) : cuda_cast<T, float>(0.0f);
+            }
+        }
+        // Note: when if_proceed_next_topk==false, choose the first 8 experts as the default result.
+        //@TODO: check if this default strategy is acceptable. Might need to leave it as nan array.
     }
 }
 
@@ -552,13 +570,14 @@ void invokeNoAuxTc(T* scores, T* group_scores, T* scores_with_bias, int64_t cons
     int64_t topk_with_k2_num_blocks = (num_cases - 1) / NUM_WARPS_PER_BLOCK + 1;
     topk_with_k2_kernel<T><<<topk_with_k2_num_blocks, BLOCK_SIZE, 0, stream>>>(
         group_scores, scores_with_bias, num_tokens, num_cases, n_group, num_experts / n_group);
-
+    sync_check_cuda_error();
     int64_t topk_with_k_group_num_blocks = (num_tokens - 1) / NUM_WARPS_PER_BLOCK + 1;
     size_t dynamic_smem_in_bytes = warp_topk::calc_smem_size_for_block_wide<T, int32_t>(NUM_WARPS_PER_BLOCK, topk);
 
     group_idx_and_topk_idx_kernel<T><<<topk_with_k_group_num_blocks, BLOCK_SIZE, dynamic_smem_in_bytes, stream>>>(
         scores, group_scores, scores_with_bias, num_tokens, n_group, topk_group, topk, num_experts,
         num_experts / n_group, routed_scaling_factor);
+    sync_check_cuda_error();
 }
 
 #define INSTANTIATE_NOAUX_TC(T)                                                                                        \

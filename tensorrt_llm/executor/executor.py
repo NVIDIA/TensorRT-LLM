@@ -1,4 +1,3 @@
-import asyncio
 import atexit
 import faulthandler
 import multiprocessing
@@ -7,7 +6,7 @@ import signal
 import traceback
 from abc import ABC, abstractmethod
 from pathlib import Path
-from queue import Empty, Queue
+from queue import Queue
 from typing import (TYPE_CHECKING, Callable, Dict, Generator, List, Optional,
                     Union)
 
@@ -19,6 +18,7 @@ from tensorrt_llm.logger import logger, set_level
 from .._utils import mpi_world_size
 from ..bindings import executor as tllm
 from ..builder import Engine
+from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.llm_utils import KvCacheRetentionConfig
 from ..llmapi.mpi_session import (MpiSession, external_mpi_comm_available,
                                   need_spawn_mpi_workers)
@@ -28,7 +28,7 @@ from ..llmapi.utils import (AsyncQueue, enable_llm_debug,
 from ..sampling_params import SamplingParams
 from .postproc_worker import PostprocWorkerConfig
 from .request import GenerationRequest, LoRARequest, PromptAdapterRequest
-from .result import GenerationResult
+from .result import GenerationResult, IterationStatsResult
 from .utils import ProcessPoolExecutorSession, RequestError, has_event_loop
 
 if TYPE_CHECKING:
@@ -37,7 +37,6 @@ if TYPE_CHECKING:
 
 __all__ = [
     "GenerationExecutor",
-    "NoStatsAvailable",
     "CppExecutorError",
 ]
 
@@ -57,15 +56,12 @@ class CppExecutorError(RuntimeError):
         return f"{self.message}\nStack trace:\n{self.stack_trace}"
 
 
-class NoStatsAvailable(Exception):
-    pass
-
-
 class GenerationExecutor(ABC):
 
     def __init__(self,
                  num_postprocess_workers: int = 0,
-                 postprocess_tokenizer_dir: Optional[str] = None):
+                 postprocess_tokenizer_dir: Optional[str] = None,
+                 is_llm_executor: Optional[bool] = None):
         self.postproc_config = PostprocWorkerConfig(
             num_postprocess_workers=num_postprocess_workers,
             postprocess_tokenizer_dir=postprocess_tokenizer_dir)
@@ -83,8 +79,17 @@ class GenerationExecutor(ABC):
 
         self._last_client_id: int = 1
 
+        self._iter_stats_result = None
+
+        # whether it's the executor instance of LLM API
+        self._is_llm_executor = is_llm_executor
+
     @abstractmethod
     def submit(self, request: GenerationRequest) -> GenerationResult:
+        pass
+
+    @abstractmethod
+    def abort_request(self, request_id: int) -> None:
         pass
 
     def generate_async(
@@ -96,13 +101,23 @@ class GenerationExecutor(ABC):
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         streaming: bool = False,
         prompt_tuning_config: Optional[list] = None,
-        kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None
+        kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
+        disaggregated_params: Optional[DisaggregatedParams] = None,
     ) -> GenerationResult:
         """Generate output for the given prompt token ids in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
         """
         assert isinstance(prompt_token_ids[0], int)
         assert isinstance(sampling_params, SamplingParams)
+
+        if self._is_llm_executor:
+            if self._iter_stats_result is None:
+                # singleton to store cpp runtime stats
+                self._iter_stats_result = IterationStatsResult()
+            else:
+                # expect more engine stats whenever new prompts are submitted
+                self._iter_stats_result.mark_undone()
+
         result = self.submit(
             GenerationRequest(
                 prompt_token_ids,
@@ -112,7 +127,8 @@ class GenerationExecutor(ABC):
                 prompt_adapter_request=prompt_adapter_request,
                 streaming=streaming,
                 prompt_tuning_config=prompt_tuning_config,
-                kv_cache_retention_config=kv_cache_retention_config))
+                kv_cache_retention_config=kv_cache_retention_config,
+                disaggregated_params=disaggregated_params))
         return result
 
     def generate(
@@ -123,6 +139,7 @@ class GenerationExecutor(ABC):
         lora_request: Optional[Union[LoRARequest, List[LoRARequest]]] = None,
         prompt_adapter_request: Optional[Union[
             PromptAdapterRequest, List[PromptAdapterRequest]]] = None,
+        disaggregated_params: Optional[DisaggregatedParams] = None,
     ) -> Union[GenerationResult, List[GenerationResult]]:
         """Generate output for the given prompt token ids in the synchronous mode.
         Synchronous generation accepts either single prompt or batched prompts.
@@ -148,12 +165,14 @@ class GenerationExecutor(ABC):
                 pa_req = prompt_adapter_request[i]
             else:
                 pa_req = prompt_adapter_request
-            future = self.generate_async(p,
-                                         sampling_params=sp,
-                                         query_token_ids=query_token_ids,
-                                         lora_request=lora_req,
-                                         prompt_adapter_request=pa_req,
-                                         streaming=False)
+            future = self.generate_async(
+                p,
+                sampling_params=sp,
+                query_token_ids=query_token_ids,
+                lora_request=lora_req,
+                prompt_adapter_request=pa_req,
+                streaming=False,
+                disaggregated_params=disaggregated_params)
             futures.append(future)
 
         for future in futures:
@@ -220,49 +239,29 @@ class GenerationExecutor(ABC):
                 self.stats_queue = self._stats
                 self.stats_aqueue = None
 
-    def get_stats(self, timeout=None) -> str:
-        ''' Get the stats from the runtime.
-
-        Exceptions:
-            NoStatsAvailable: If the stats are not available.
-
+    def get_stats(self, timeout: float) -> List[dict]:
+        """
+        Get iteration statistics from the runtime.
+        Args:
+            timeout (float): Max wait time in seconds when retrieving stats from queue.
         Returns:
-            str: The stats in JSON format.
+            List[dict]: A list of runtime stats as dict.
+        """
+        assert self._iter_stats_result is not None, "IterationStatsResult is not properly instantiated."
 
-        Known issue:
-            The `get_stats` cannot mix with `aget_stats` in the same Executor instance.
-        '''
-        assert self.stats_queue, "The stats queue is not created. It is likely that `get_stats` and `aget_stats` methods" \
-            " are mixed."
-        try:
-            res = self.stats_queue.get(timeout=timeout)
-        except Empty:
-            raise NoStatsAvailable
-        return res
+        self._iter_stats_result.set_timeout(timeout)
+        return self._iter_stats_result.get_results()
 
-    async def aget_stats(self, timeout=None) -> Optional[str]:
-        ''' Get the stats from the runtime.
-
-        Exceptions:
-            NoStatsAvailable: If the stats are not available.
-
+    def aget_stats(self, timeout: float) -> IterationStatsResult:
+        """
+        Get iteration statistics from the runtime.
         Returns:
-            str: The stats in JSON format.
+            IterationStatsResult: An async iterable object containing runtime stats.
+        """
+        assert self._iter_stats_result is not None, "IterationStatsResult is not properly instantiated."
 
-        Known issue:
-            The `aget_stats` cannot mix with `get_stats` in the same Executor instance.
-        '''
-        self.create_stats_queue()
-        assert self.stats_aqueue is not None
-
-        if not has_event_loop():
-            raise NoStatsAvailable
-
-        try:
-            res = await self.stats_aqueue.get(timeout=timeout)
-        except asyncio.TimeoutError:
-            raise NoStatsAvailable
-        return res
+        self._iter_stats_result.set_timeout(timeout)
+        return self._iter_stats_result
 
     @staticmethod
     def create(
@@ -275,6 +274,7 @@ class GenerationExecutor(ABC):
         reuse_mpi_comm: bool = False,
         return_logits: bool = False,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
+        is_llm_executor: Optional[bool] = None,
     ) -> Union["ExecutorBindingsProxy", "ExecutorBindingsWorker"]:
         # local imports to avoid cyclic importing
         from .proxy import ExecutorBindingsProxy
@@ -314,7 +314,8 @@ class GenerationExecutor(ABC):
                 worker_kwargs,
                 model_world_size=model_world_size,
                 mpi_session=mpi_session,
-                postproc_worker_config=postproc_worker_config)
+                postproc_worker_config=postproc_worker_config,
+                is_llm_executor=is_llm_executor)
 
         # WAR: For the performance of gathering logits, we use single process worker
         # for TP1 to avoid the large overhead of IPC.
@@ -324,7 +325,8 @@ class GenerationExecutor(ABC):
             logger.warning(
                 "Using single process worker for TP1, this may hurt streaming generation performance."
             )
-            return ExecutorBindingsWorker(**worker_kwargs)
+            return ExecutorBindingsWorker(**worker_kwargs,
+                                          is_llm_executor=is_llm_executor)
 
         # For single-gpu case:
         # Partition the workload to multiple process for streaming performance.
@@ -336,7 +338,7 @@ class GenerationExecutor(ABC):
                 model_world_size=model_world_size,
                 mpi_session=None,  # use mpi4py
                 postproc_worker_config=postproc_worker_config,
-            )
+                is_llm_executor=is_llm_executor)
         else:
             ctx = multiprocessing.get_context("spawn")
             # The ProcessPoolExecutorSession is used to support Windows, as mpi4py cannot.
@@ -347,7 +349,7 @@ class GenerationExecutor(ABC):
                 model_world_size=model_world_size,
                 mpi_session=mpi_session,
                 postproc_worker_config=postproc_worker_config,
-            )
+                is_llm_executor=is_llm_executor)
 
     def wait_first_completed(
         self, futures: List[GenerationResult]

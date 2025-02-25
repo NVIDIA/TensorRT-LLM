@@ -21,7 +21,6 @@
 #include "tensorrt_llm/common/algorithm.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iGptDecoderBatched.h"
-#include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 
 namespace tensorrt_llm::batch_manager
@@ -32,26 +31,24 @@ class RuntimeBuffers;
 
 namespace tensorrt_llm::batch_manager
 {
-
-namespace tr = tensorrt_llm::runtime;
-
 class MakeDecodingBatchInputOutput : Algorithm
 {
 public:
     constexpr static auto name{"MakeDecodingBatchInputOutput"};
 
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
+    using TensorPtr = runtime::decoder_batch::Input::TensorPtr;
 
     MakeDecodingBatchInputOutput() = default;
 
-    std::tuple<std::unique_ptr<tr::decoder_batch::Input>, std::unique_ptr<tr::decoder_batch::Output>> operator()(
-        RequestVector const& contextRequests, RequestVector const& generationRequests, DecoderBuffers& decoderBuffers,
-        RuntimeBuffers const& genRuntimeBuffers, executor::DecodingMode const& decodingMode,
+    std::tuple<std::unique_ptr<runtime::decoder_batch::Input>, std::unique_ptr<runtime::decoder_batch::Output>>
+    operator()(RequestVector const& contextRequests, RequestVector const& generationRequests,
+        DecoderBuffers& decoderBuffers, RuntimeBuffers const& fusedRuntimeBuffers, TensorPtr const& batchSlots,
         runtime::ModelConfig const& modelConfig, SizeType32 maxNumSequences) const;
 
 private:
-    std::vector<bool> computeActiveVec(RequestVector const& contextRequests, RequestVector const& generationRequests,
-        SizeType32 maxNumSequences) const;
+    [[nodiscard]] std::vector<bool> computeActiveVec(RequestVector const& contextRequests,
+        RequestVector const& generationRequests, SizeType32 maxNumSequences) const;
 };
 
 } // namespace tensorrt_llm::batch_manager

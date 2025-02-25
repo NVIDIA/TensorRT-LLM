@@ -10,6 +10,7 @@ import torch
 from tensorrt_llm.logger import logger
 
 from ..bindings import executor as tllm
+from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.mpi_session import MpiSession
 
 BATCH_RESP_IN_AWAIT = os.getenv("TLLM_EXECUTOR_BATCH_RESP_IN_AWAIT") == "1"
@@ -82,6 +83,8 @@ class ExecutorResponse(NamedTuple):
     error: Optional[str | Exception]
     # The timestamp of the creation of the response. We use this to track the IPC overhead.
     timestamp: Optional[float] = None
+    # Optional disaggregated serving params needed by the generation instances
+    disaggregated_params: Optional[DisaggregatedParams] = None
 
 
 class IntraProcessQueue:

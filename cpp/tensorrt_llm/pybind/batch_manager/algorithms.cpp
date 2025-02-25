@@ -106,7 +106,7 @@ void tensorrt_llm::pybind::batch_manager::algorithms::initBindings(pybind11::mod
             py::arg("is_leader_in_orch_mode"), py::arg("is_normalize_log_probs"))
         .def("__call__", &GenerateRequestOptions::operator(), py::arg("model_config"), py::arg("world_config"),
             py::arg("decoding_config"), py::arg("runtime"), py::arg("context_requests"), py::arg("buffer"),
-            py::arg("decoder_input_ids"))
+            py::arg("decoder_input_buffers"))
         .def("name", [](GenerateRequestOptions const&) { return GenerateRequestOptions::name; });
 
     py::class_<MakeDecodingBatchInputOutput>(m, MakeDecodingBatchInputOutput::name)

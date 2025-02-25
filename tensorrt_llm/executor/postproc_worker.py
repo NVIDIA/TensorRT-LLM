@@ -11,13 +11,14 @@ import zmq.asyncio
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 
 from ..llmapi.tokenizer import load_hf_tokenizer
-from ..llmapi.utils import nvtx_range
+from ..llmapi.utils import nvtx_range, print_traceback_on_error
 from ..sampling_params import SamplingParams
 from .ipc import ZeroMqQueue
 from .utils import ExecutorResponse
 
 if TYPE_CHECKING:
-    from .result import DetokenizedGenerationResultBase, GenerationResultBase
+    from .result import (DetokenizedGenerationResultBase, GenerationResult,
+                         GenerationResultBase)
 
 __all__ = [
     "PostprocWorker",
@@ -116,7 +117,7 @@ class PostprocWorker:
                     input, self._tokenizer)
 
             record = self._records[req_id]
-            record.handle_response(input.rsp)  # inplace
+            record._handle_response(input.rsp)  # inplace
             # Left the result_handler determine the final output dtype.
             # NOTE: This will change the CompletionOutput._postprocess_result
             if self._result_handler:
@@ -191,3 +192,15 @@ class PostprocWorker:
         except Exception as e:
             print(traceback.format_exc())
             raise e
+
+
+@print_traceback_on_error
+def postproc_worker_main(feedin_ipc_addr: str, feedout_ipc_addr: str,
+                         tokenizer_dir: str, record_creator: Callable,
+                         result_handler: Callable):
+    worker = PostprocWorker(feedin_ipc_addr,
+                            feedout_ipc_addr,
+                            tokenizer_dir=tokenizer_dir,
+                            record_creator=record_creator,
+                            result_handler=result_handler)
+    worker.start()

@@ -48,8 +48,8 @@ void invokeTopkBeamSearch(T const* logProbs, T const* bias, void* workspace, Bea
         case 2:
         case 4: CASE_K(4)
         case 8: CASE_K(8)
-#ifndef FAST_BUILD
         case 16: CASE_K(16)
+#ifndef FAST_BUILD // Skip beam_width larger than 16
         case 32: CASE_K(32)
         case 64: CASE_K(64)
         case 128: CASE_K(128)

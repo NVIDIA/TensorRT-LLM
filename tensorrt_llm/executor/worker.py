@@ -2,33 +2,43 @@ import copy
 import datetime
 import enum
 import json
+import os
 import time
 import traceback
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from queue import Queue
 from typing import Callable, Dict, List, Optional, Union
 
 import torch
 
-from .._utils import mpi_rank
+from tensorrt_llm.logger import logger
+
+from .._utils import global_mpi_rank, mpi_comm, mpi_rank
 from ..bindings import executor as tllm
 from ..builder import ConfigEncoder, Engine, EngineConfig
-from ..llmapi.tracer import global_tracer
+from ..disaggregated_params import DisaggregatedParams
+from ..llmapi.mpi_session import set_mpi_session_cpp
+from ..llmapi.tracer import VizTracer, global_tracer, set_global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
-                            enable_llm_debug, nvtx_range, print_colored,
-                            print_colored_debug)
+                            clear_sched_affinity, enable_llm_debug, nvtx_range,
+                            print_colored, print_colored_debug,
+                            print_traceback_on_error)
 from ..lora_manager import LoraManager
 from ..prompt_adapter_manager import PromptAdapterManager
 from ..runtime import ModelConfig
 from ..runtime.model_runner import _engine_config_to_model_config
 from ..sampling_params import SamplingParams
 from .executor import GenerationExecutor
-from .ipc import IpcQueue
-from .postproc_worker import PostprocWorker, PostprocWorkerConfig
-from .request import GenerationRequest, LoRARequest, PromptAdapterRequest
+from .ipc import FusedIpcQueue, IpcQueue
+from .postproc_worker import (PostprocWorker, PostprocWorkerConfig,
+                              postproc_worker_main)
+from .request import (CancellingRequest, GenerationRequest, LoRARequest,
+                      PromptAdapterRequest)
 from .result import GenerationResult
 from .utils import (BATCH_RESP_IN_AWAIT, ExecutorResponse,
-                    ExecutorResponseTensors, RequestError, has_event_loop)
+                    ExecutorResponseTensors, RequestError, WorkerCommIpcAddrs,
+                    WorkerCommQueues, has_event_loop)
 
 __all__ = [
     "ExecutorBindingsWorker",
@@ -46,19 +56,24 @@ class ExecutorBindingsWorker(GenerationExecutor):
         executor_config: Optional[tllm.ExecutorConfig] = None,
         logits_post_processor_map: Optional[Dict[str, Callable]] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
+        is_llm_executor: Optional[bool] = None,
     ) -> None:
         postproc_config = postproc_worker_config or PostprocWorkerConfig()
         super().__init__(
             num_postprocess_workers=postproc_config.num_postprocess_workers,
             postprocess_tokenizer_dir=postproc_config.postprocess_tokenizer_dir,
+            is_llm_executor=is_llm_executor,
         )
 
         self.engine = None
         self.result_queue: Optional[IpcQueue] = None
-        self.post_process_queues: Optional[List[IpcQueue]] = None
+        self.postproc_queues: Optional[List[IpcQueue]] = None
         self.rank = mpi_rank()
+        self.global_rank = global_mpi_rank()
         # mapping: client_id -> GenerationResult
         self._results: Dict[int, GenerationResult] = {}
+        # mapping: client_id from Proxy -> request_id returned from runtime backend
+        self._client_id_to_request_id: Dict[int, int] = {}
         self._await_response_helper = AwaitResponseHelper(
             self)  # TODO: make it weakref
 
@@ -87,19 +102,26 @@ class ExecutorBindingsWorker(GenerationExecutor):
                                      executor_config=executor_config,
                                      managed_weights=engine.managed_weights)
 
-            if not hasattr(executor_config,
-                           "backend") or executor_config.backend != "pytorch":
+            if not hasattr(executor_config, "backend"):
                 return tllm.Executor(engine, tllm.ModelType.DECODER_ONLY,
                                      executor_config)
+            elif executor_config.backend == "pytorch":
+                from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
+                    create_py_executor
+                create_executor = create_py_executor
+            elif executor_config.backend == "autodeploy":
+                from tensorrt_llm._torch.auto_deploy.shim.ad_executor import \
+                    create_autodeploy_executor
+                create_executor = create_autodeploy_executor
+            else:
+                raise ValueError(
+                    f"Unsupported backend config: {executor_config.backend}")
 
-            from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
-                create_py_executor
-            device_id = self.rank % torch.cuda.device_count()
+            device_id = self.global_rank % torch.cuda.device_count()
             torch.cuda.set_device(device_id)
-            return create_py_executor(
-                executor_config=executor_config,
-                checkpoint_dir=executor_config.hf_model_dir,
-                engine_dir=executor_config.trt_engine_dir)
+            return create_executor(executor_config=executor_config,
+                                   checkpoint_dir=executor_config.hf_model_dir,
+                                   engine_dir=executor_config.trt_engine_dir)
 
         self.engine = _create_engine()
 
@@ -143,13 +165,13 @@ class ExecutorBindingsWorker(GenerationExecutor):
 
     def set_result_queue(self, queue):
         """In multi-gpu mode, result_queue will be set here to communicate between the proxy and the worker 0 process."""
-        assert self.post_process_queues is None
+        assert self.postproc_queues is None
         self.result_queue = queue
 
-    def set_postprocess_queues(self, queues: List["IpcQueue"]):
+    def set_postproc_queues(self, queues: List["IpcQueue"]):
         """ Set the IPC queues for feeding post-processing processes. """
-        assert not self.result_queue
-        self.post_process_queues = queues
+        assert self.result_queue is None
+        self.postproc_queues = queues
 
     def set_stats_queue(self, queue):
         """In multi-gpu mode, stats_queue will be set here to communicate between the proxy and the worker 0 process."""
@@ -176,6 +198,16 @@ class ExecutorBindingsWorker(GenerationExecutor):
         ) and not self.dispatch_stats_thread.is_alive():
             self.dispatch_stats_thread.start()
 
+    def abort_request(self, client_id: int) -> None:
+        # NOTE: the request_id is the request_id generated by cpp runtime, not the client_id
+        if self.engine.can_enqueue_requests():
+            request_id = self._client_id_to_request_id.get(client_id, None)
+            if request_id is None:
+                logger.warning(
+                    f"Request of client_id {client_id} is finished, cannot abort it."
+                )
+            self.engine.cancel_request(request_id)
+
     def _engine_response_callback(self, response: tllm.Response):
         return response
 
@@ -199,27 +231,43 @@ class ExecutorBindingsWorker(GenerationExecutor):
 
     def dispatch_stats_task(self) -> bool:
         time.sleep(0.1)
-        # Get stats and place in queue.
-        for stats in self.engine.get_latest_iteration_stats():
-            self.stats_count += 1
-            while hasattr(self.stats_queue, "full") and self.stats_queue.full():
-                self.stats_queue.get()
 
-            try:
+        # Get stats and place in queue.
+        async_queues = []
+        queue = self._iter_stats_result.queue if self._is_llm_executor and self._iter_stats_result else self.stats_queue
+        try:
+            for stats in self.engine.get_latest_iteration_stats():
+                self.stats_count += 1
                 stat = stats.to_json_str()
-                self.stats_queue.put(stat)
-            except AsyncQueue.EventLoopShutdownError:
-                # This happens in the last stats loop while the generate workflow is stopped.
-                pass
-            except Exception as e:
-                raise e
+                if self._is_llm_executor and self._iter_stats_result:
+                    # In this case, there's no ExecutorBindingProxy.
+                    # Worker needs to take care of putting to result queue.
+                    while queue.full():
+                        queue.get()
+                    if isinstance(queue, _SyncQueue):
+                        queue.put_nowait(stat)
+                        async_queues.append(queue)
+                    else:
+                        queue.put(stat)
+                else:
+                    # Send to ExecutorBindingProxy via IPC
+                    queue.put(stat)
+
+            if async_queues:
+                _SyncQueue.notify_many(queue.loop, async_queues)
+        except AsyncQueue.EventLoopShutdownError:
+            # This happens in the last stats loop while the generate workflow is stopped.
+            pass
+        except Exception as e:
+            raise e
 
         return True  # success
 
     def start(self):
         self.create_stats_queue()
         self.start_awaiter_thread()
-        self.start_stats_thread()
+        if mpi_rank() == 0:
+            self.start_stats_thread()
 
     def _load_lora_adapter(self, lora_request: LoRARequest):
         self._lora_manager.load_from_ckpt(
@@ -264,6 +312,14 @@ class ExecutorBindingsWorker(GenerationExecutor):
             prompt_tuning_config = tllm.PromptTuningConfig(
                 request.prompt_tuning_config[0])
 
+        context_phase_params = None
+        request_type = tllm.RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION
+        if request.disaggregated_params is not None:
+            request_type = request.disaggregated_params.get_request_type()
+            if request_type == tllm.RequestType.REQUEST_TYPE_GENERATION_ONLY:
+                context_phase_params = request.disaggregated_params.get_context_phase_params(
+                )
+
         assert request.id is not None
         try:
             executor_request = tllm.Request(
@@ -283,13 +339,13 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 bad_words=request.sampling_params._get_bad_words(),
                 stop_words=request.sampling_params._get_stop_words(),
                 embedding_bias=request.sampling_params.embedding_bias,
-                external_draft_tokens_config=request.sampling_params.
-                external_draft_tokens_config,
                 lora_config=lora_config,
                 prompt_tuning_config=prompt_tuning_config,
                 logits_post_processor_name=request.sampling_params.
                 logits_post_processor_name,
-                kv_cache_retention_config=request.kv_cache_retention_config)
+                kv_cache_retention_config=request.kv_cache_retention_config,
+                context_phase_params=context_phase_params,
+                type=request_type)
             if request.query_token_ids is not None:
                 # pytorch star attention workflow
                 # a workaround to avoid public interface update
@@ -317,14 +373,23 @@ class ExecutorBindingsWorker(GenerationExecutor):
             request.set_id(client_id)
 
         result = GenerationResult(
-            request, background_error_handler=self._handle_background_error)
+            request,
+            background_error_handler=self._handle_background_error,
+            executor=self)
+
         self._results[client_id] = result
 
-        self._enqueue_request(request)
+        request_id = self._enqueue_request(request)
+        # request_id returned from backend is necessary for the abort_request method.
+        self._client_id_to_request_id[client_id] = request_id
 
         self._handle_background_error()
 
         return result
+
+    def _pop_result(self, client_id: int):
+        self._results.pop(client_id, None)
+        self._client_id_to_request_id.pop(client_id, None)
 
     def shutdown(self):
         if enable_llm_debug():
@@ -377,6 +442,194 @@ class ExecutorBindingsWorker(GenerationExecutor):
         self.shutdown()
 
 
+@print_traceback_on_error
+def worker_main(
+        engine: Path | Engine,
+        worker_queues: WorkerCommIpcAddrs | WorkerCommQueues,
+        log_level: str,
+        executor_config: Optional[tllm.ExecutorConfig] = None,
+        logits_post_processor_map: Optional[Dict[str, Callable]] = None,
+        worker_cls: type = ExecutorBindingsWorker,
+        tracer_init_kwargs: Optional[dict] = None,
+        _torch_model_class_mapping: Optional[dict] = None,
+        postproc_worker_config: Optional[PostprocWorkerConfig] = None,
+        rank0_extra_kwargs: Optional[
+            dict] = None,  # a placeholder for multi-node
+        ready_signal: Optional[str] = None,
+        is_llm_executor: Optional[
+            bool] = True,  # whether it's the main executor instance
+) -> None:
+    pid = os.getpid()
+    cpus = os.sched_getaffinity(pid)
+    if cpus:
+        logger.warning(
+            f"Found worker process {pid} was bound to {cpus}, this may harm"
+            "performance.", )
+        logger.warning(f"Will clear the cpu affinity")
+        clear_sched_affinity(pid)
+
+    result_queue: Optional[IpcQueue] = None
+    result_queues: Optional[List[IpcQueue]] = None
+
+    postproc_worker_config = postproc_worker_config or PostprocWorkerConfig()
+
+    is_leader: bool = mpi_rank() == 0
+    if tracer_init_kwargs is not None and is_leader:
+        tracer = VizTracer(**tracer_init_kwargs)
+        tracer.register_exit()
+        tracer.start()
+        set_global_tracer(tracer)
+
+    if _torch_model_class_mapping is not None:
+        from tensorrt_llm._torch.models.modeling_auto import MODEL_CLASS_MAPPING
+        MODEL_CLASS_MAPPING.update(**_torch_model_class_mapping)
+
+    set_mpi_session_cpp(mpi_comm())
+
+    if is_leader:
+        # Only set the log level for the leader process, the other processes will inherit the log level from "TLLM_LOG_LEVEL" environment variable
+        logger.set_level(log_level)
+        if isinstance(worker_queues, WorkerCommIpcAddrs):  # intra-process mode
+            request_queue = IpcQueue(worker_queues.request_queue_addr,
+                                     is_server=False,
+                                     name="worker_request_queue")
+            request_error_queue = IpcQueue(
+                worker_queues.request_error_queue_addr,
+                is_server=False,
+                name="worker_request_error_queue")
+            mp_stats_queue = FusedIpcQueue(worker_queues.stats_queue_addr,
+                                           is_server=False,
+                                           fuse_message=False,
+                                           name="worker_stats_queue")
+        else:
+            request_queue = worker_queues.request_queue
+            request_error_queue = worker_queues.request_error_queue
+            mp_stats_queue = worker_queues.stats_queue
+
+        if postproc_worker_config.enabled:
+            # IPC queues for sending inputs to the postprocess parallel
+            # processes, each one is a PAIR zmq socket
+            result_queues = [
+                FusedIpcQueue(is_server=True,
+                              fuse_message=True,
+                              name=f"postprocess_{i}_feedin_queue")
+                for i in range(postproc_worker_config.num_postprocess_workers)
+            ]
+        else:
+            if isinstance(worker_queues, WorkerCommIpcAddrs):
+                # IPC queue for sending results back to the proxy, and let the
+                # Proxy process to handle the postprocess
+                result_queue = FusedIpcQueue(
+                    worker_queues.result_queue_addr,
+                    is_server=False,
+                    fuse_message=not BATCH_RESP_IN_AWAIT,
+                    name="worker_result_queue")
+            else:
+                result_queue = worker_queues.result_queue
+
+    def notify_proxy_threads_to_quit():
+        # Signal the dispatcher thread in the proxy to quit
+        if result_queue is not None:
+            result_queue.put(None)
+        else:
+            assert result_queues is not None
+            for q in result_queues:
+                q.put(None)
+        # Signal the stats thread in the proxy to quit
+        mp_stats_queue.put(None)
+
+    postprocess_worker_futures = []
+    if is_leader and postproc_worker_config.enabled:
+        proxy_result_queue: str = worker_queues.result_queue if isinstance(
+            worker_queues,
+            WorkerCommQueues) else worker_queues.result_queue_addr
+
+        print_colored_debug(f"initiate postprocess workers...", "yellow")
+
+        proxy_result_queue: str = worker_queues.result_queue if isinstance(
+            worker_queues,
+            WorkerCommQueues) else worker_queues.result_queue_addr
+
+        assert result_queues is not None
+        assert postproc_worker_config.postprocess_tokenizer_dir is not None
+        postproc_worker_pool = ProcessPoolExecutor(
+            max_workers=postproc_worker_config.num_postprocess_workers)
+        assert isinstance(proxy_result_queue, str)
+        for i in range(postproc_worker_config.num_postprocess_workers):
+            fut = postproc_worker_pool.submit(
+                postproc_worker_main,
+                result_queues[i].address,
+                proxy_result_queue,
+                postproc_worker_config.postprocess_tokenizer_dir,
+                PostprocWorker.default_record_creator,
+                result_handler=postproc_worker_config.postprocess_result_handler
+            )
+            postprocess_worker_futures.append(fut)
+
+    # Error handling in the Worker/MPI process
+    #   1. During Executor initialization, the errors will be captured and
+    #      send back via request_error_queue.
+    #   2. During execution, the errors will be captured by ManagedThreads
+    #      a) For per-request error, the error will be send back via
+    #         result_queue, and eventually raised in handle_response() in
+    #         the main thread.
+    #      b) For system error, the error will be raised in the MPI process
+    #         and handled by future.done_callback, that will propagate the
+    #         error to the error_queue in the main thread.
+
+    try:
+        worker: ExecutorBindingsWorker = worker_cls(
+            engine,
+            executor_config,
+            logits_post_processor_map,
+            postproc_worker_config=postproc_worker_config,
+            is_llm_executor=is_llm_executor)
+    except Exception as e:
+        logger.error(f"Failed to initialize executor on rank {mpi_rank()}: {e}")
+        logger.error(traceback.format_exc())
+        if is_leader:
+            request_error_queue.put(e)
+        return
+
+    with worker:
+        try:
+            worker.block_subordinates()
+
+            if is_leader:
+                if postproc_worker_config.enabled:
+                    worker.set_postproc_queues(result_queues)
+                else:
+                    worker.set_result_queue(result_queue)
+
+                worker.set_stats_queue(mp_stats_queue)
+                request_error_queue.put(ready_signal)
+                while (req := request_queue.get()) is not None:
+                    if isinstance(req, CancellingRequest):
+                        worker.abort_request(req.id)
+                    elif isinstance(req, GenerationRequest):
+                        try:
+                            worker.submit(req)
+                            request_error_queue.put(None)  # None means success
+                        except RequestError as e:
+                            request_error_queue.put(e)
+                    else:
+                        raise ValueError(f"Unknown request type: {type(req)}")
+
+                notify_proxy_threads_to_quit()
+
+        except ExecutorBindingsWorker.WorkerExit as e:
+            # This will capture by the with-statement and exit normally.
+            raise e
+
+        except Exception as e:  # other critical errors
+            if is_leader:
+                notify_proxy_threads_to_quit()
+            err = Exception(f"Failed during generation: {e}")
+            logger.error(err)
+            if is_leader:
+                request_error_queue.put(err)
+
+
 class AwaitResponseHelper:
     ''' Multiple-implementations for await_response for performance. '''
 
@@ -397,14 +650,14 @@ class AwaitResponseHelper:
 
         if self.handler_kind is HandlerKind.unknown:
             if not (self.worker.result_queue is not None
-                    or self.worker.post_process_queues is not None):
+                    or self.worker.postproc_queues is not None):
                 print_colored_debug(
                     f"creating await_response helper for Worker\n",
                     color="yellow")
                 # When ExecutorBindingWorker is used in the main process
                 # aka the single process mode
                 self.handler_kind = HandlerKind.single_process_worker
-            elif self.worker.result_queue is not None or self.worker.post_process_queues is not None:
+            elif self.worker.result_queue is not None or self.worker.postproc_queues is not None:
                 # The ExecutorBindingProxy is used
                 print_colored_debug(f"creating await_response helper for IPC\n",
                                     color="yellow")
@@ -462,7 +715,7 @@ class AwaitResponseHelper:
                 queue.put(rsp)
 
             if rsp.is_final:
-                self.worker._results.pop(response.client_id)
+                self.worker._pop_result(response.client_id)
 
         # Notify the events in bulk for performance.
         if async_queues:
@@ -504,7 +757,7 @@ class AwaitResponseHelper:
 
         if postproc_batches:
             for wid, batch in enumerate(postproc_batches):
-                self.worker.post_process_queues[wid].put(batch)
+                self.worker.postproc_queues[wid].put(batch)
 
         if rsp_batch:
             self.worker.result_queue.put(rsp_batch)
@@ -539,14 +792,14 @@ class AwaitResponseHelper:
                 # Bucketing is used instead of random dispatching because the
                 # incremental detokenization during postprocessing relies on the
                 # prior CompletionOutput of a given request.
-                self.worker.post_process_queues[pid].put(inp)
+                self.worker.postproc_queues[pid].put(inp)
             else:
                 postproc_batches[pid].append(inp)
 
         # Eliminate the finished GenerationRequest instances timely, which may
         # take considerable memory.
         if rsp.is_final:
-            self.worker._results.pop(rsp.client_id, None)
+            self.worker._pop_result(rsp.client_id)
 
     def _get_sampling_params_for_first_rsp(
             self, client_id) -> Optional[SamplingParams]:
@@ -559,7 +812,7 @@ class AwaitResponseHelper:
 
     def _get_streaming(self, client_id) -> bool:
         res = self.worker._results.get(client_id, None)
-        return res.generation_request.streaming
+        return res._streaming
 
     def _create_rsp(self, response) -> ExecutorResponse:
         client_id = response.client_id
@@ -586,6 +839,15 @@ class AwaitResponseHelper:
                 cum_log_probs=response.result.cum_log_probs,
             )
 
+            disaggregated_params = None
+            context_phase_params = response.result.context_phase_params
+            if context_phase_params is not None:
+                disaggregated_params = DisaggregatedParams(
+                    request_type="context_only",
+                    first_gen_tokens=context_phase_params.first_gen_tokens,
+                    ctx_request_id=context_phase_params.req_id,
+                    opaque_state=context_phase_params.opaque_state)
+
             rsp = ExecutorResponse(
                 client_id,
                 tensors,
@@ -593,6 +855,9 @@ class AwaitResponseHelper:
                 is_final=response.result.is_final,
                 sequence_index=response.result.sequence_index,
                 error=None,
-                timestamp=time.perf_counter())
+                timestamp=time.perf_counter(),
+                disaggregated_params=disaggregated_params)
+
+            print_colored_debug(f"rsp: {rsp}\n", color="yellow")
 
         return rsp

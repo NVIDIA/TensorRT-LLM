@@ -59,6 +59,10 @@ ARG TORCH_INSTALL_TYPE="skip"
 COPY docker/common/install_pytorch.sh install_pytorch.sh
 RUN bash ./install_pytorch.sh $TORCH_INSTALL_TYPE && rm install_pytorch.sh
 
+# Install OpenCV with FFMPEG support
+RUN pip3 uninstall -y opencv && rm -rf /usr/local/lib/python3*/dist-packages/cv2/
+RUN pip3 install 'numpy<2' && pip3 install ffmpeg && pip3 install opencv-python-headless --force-reinstall --no-deps
+
 FROM ${DEVEL_IMAGE} as wheel
 WORKDIR /src/tensorrt_llm
 COPY benchmarks benchmarks

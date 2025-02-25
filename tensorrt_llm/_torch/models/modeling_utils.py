@@ -303,7 +303,7 @@ class DecoderModelForCausalLM(nn.Module,
         rope_factor = 1
         if rope_scaling is not None:
             rope_type = rope_scaling.get('type', rope_scaling.get('rope_type'))
-            if rope_type not in ("su", "longrope", "llama3"):
+            if rope_type not in ("su", "longrope", "llama3", "yarn"):
                 rope_factor = rope_scaling.get('factor', 1.0)
 
         # Step 1: Find the upper bound of max_seq_len

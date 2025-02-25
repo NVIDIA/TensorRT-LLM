@@ -53,10 +53,9 @@ public:
 
     CreateNewDecoderRequests() = default;
 
-    void operator()(std::vector<SizeType32> const& seqSlots,
-        std::vector<runtime::decoder_batch::Request> const& requests,
+    void operator()(TensorPtr const& batchSlots, std::vector<runtime::decoder_batch::Request> const& requests,
         std::vector<SamplingConfig> const& samplingConfigs, runtime::ModelConfig const& modelConfig,
-        GptDecoderBatched& decoder, CudaStreamPtr runtimeStream, SizeType32 maxSequenceLength) const;
+        GptDecoderBatched& decoder, CudaStreamPtr const& runtimeStream, SizeType32 maxSequenceLength) const;
 
     //! @brief Initialize the decoder at `batchSlot` with a new `request`. Exposed only for static batching via
     //! GptDecoderBatched::newBatch()

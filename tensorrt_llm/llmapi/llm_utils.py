@@ -44,7 +44,8 @@ import yaml
 from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
-from .._utils import mpi_barrier, mpi_broadcast, mpi_rank, release_gc
+from .._utils import (global_mpi_rank, mpi_barrier, mpi_broadcast, mpi_rank,
+                      release_gc)
 from ..auto_parallel import AutoParallelConfig, infer_cluster_config
 # yapf: disable
 from ..bindings.executor import (BatchingType, CapacitySchedulerPolicy,
@@ -159,13 +160,13 @@ class CalibConfig:
     Calibration configuration.
 
     Args:
-        device (Literal['cuda', 'cpu'], default='cuda'): The device to run calibration.
-        calib_dataset (str, default='cnn_dailymail'): The name or local path of calibration dataset.
-        calib_batches (int, default=512): The number of batches that the calibration runs.
-        calib_batch_size (int, default=1): The batch size that the calibration runs.
-        calib_max_seq_length (int, default=512): The maximum sequence length that the calibration runs.
-        random_seed (int, default=1234): The random seed used for calibration.
-        tokenizer_max_seq_length (int, default=2048): The maximum sequence length to initialize tokenizer for calibration.
+        device (Literal['cuda', 'cpu']): The device to run calibration. Defaults to 'cuda'.
+        calib_dataset (str): The name or local path of calibration dataset. Defaults to 'cnn_dailymail'.
+        calib_batches (int): The number of batches that the calibration runs. Defaults to 512.
+        calib_batch_size (int): The batch size that the calibration runs. Defaults to 1.
+        calib_max_seq_length (int): The maximum sequence length that the calibration runs. Defaults to 512.
+        random_seed (int): The random seed used for calibration. Defaults to 1234.
+        tokenizer_max_seq_length (int): The maximum sequence length to initialize tokenizer for calibration. Defaults to 2048.
     """
     device: Literal['cuda', 'cpu'] = 'cuda'
     calib_dataset: str = 'cnn_dailymail'
@@ -176,10 +177,23 @@ class CalibConfig:
     tokenizer_max_seq_length: int = 2048
 
     @classmethod
-    def from_dict(cls, config: dict):
+    def from_dict(cls, config: dict) -> 'CalibConfig':
+        """Create a CalibConfig instance from a dict.
+
+        Args:
+            config (dict): The dict used to create CalibConfig.
+
+        Returns:
+            tensorrt_llm.llmapi.CalibConfig: The CalibConfig created from dict.
+        """
         return cls(**config)
 
-    def to_dict(self):
+    def to_dict(self) -> dict:
+        """Dump a CalibConfig instance to a dict.
+
+        Returns:
+            dict: The dict dumped from CalibConfig.
+        """
         return asdict(self)
 
 
@@ -278,48 +292,45 @@ class _ModelWrapper:
 
 
 # The docstring for LlmArgs and LLM; will be appended to the two classes' apidocs.
-LLMARGS_DOCSTRING = r"""
-        model (str or Path): The model name or a local model directory.
-            Note that if the value could be both a model name or a local model directory,
-            the local model directory will be prioritized.
+LLMARGS_EXPLICIT_DOCSTRING = """
+        model (str, pathlib.Path): The model name or a local model directory.
+            Note that if the value could be both a model name or a local model directory, the local model directory will be prioritized.
 
-        tokenizer (str, Path, TokenizerBase, PreTrainedTokenizerBase, optional):
-            The name or path of a HuggingFace Transformers tokenizer, or the loaded tokenizer.
-            Defaults to None.
+        tokenizer (str, pathlib.Path, transformers.PreTrainedTokenizerBase, tensorrt_llm.llmapi.tokenizer.TokenizerBase, optional):
+            The name or path of a HuggingFace Transformers tokenizer, or the loaded tokenizer. Defaults to None.
 
-        tokenizer_mode (Literal['auto', 'slow']): The tokenizer mode.
+        tokenizer_mode (Literal['auto', 'slow']): The tokenizer mode. Defaults to 'auto'.
             'auto' will use the fast tokenizer if available, and 'slow' will always use the slow tokenizer.
             The fast tokenizer is based on Huggingface's Rust library tokenizers, which achieves a significant speed-up compared to its slow counterpart.
-            Defaults to 'auto'.
 
-        skip_tokenizer_init (bool):
-            If true, skip initialization of tokenizer and detokenizer.
+        skip_tokenizer_init (bool): Whether to skip initialization of tokenizer and detokenizer. Defaults to False.
             LLM.generate and LLM.generate_async will accept prompt token ids as input only.
-            Defaults to False.
 
         trust_remote_code (bool): Whether to trust remote code when downloading model and tokenizer from Hugging Face. Defaults to False.
 
         tensor_parallel_size(int): The number of processes for tensor parallelism. Defaults to 1.
 
-        dtype (str): The data type for the model weights and activations.
-            Can be "float16", "bfloat16", "float32", or "auto". If "auto", the data type
-            will be automatically inferred from the source model. If the source data type
-            is "float32", it will be converted to "float16". Defaults to "auto".
+        dtype (str): The data type for the model weights and activations. Defaults to "auto".
+            Can be "float16", "bfloat16", "float32", or "auto". If "auto", the data type will be automatically inferred from the source model.
+            If the source data type is "float32", it will be converted to "float16".
 
         revision (str, optional): The revision of the model to use. Defaults to None.
 
         tokenizer_revision (str, optional): The revision of the tokenizer to use. Defaults to None.
 
+        speculative_model (str, pathlib.Path, optional): Speculative model name. Defaults to None.
+"""
+
+LLMARGS_IMPLICIT_DOCSTRING = """
         pipeline_parallel_size (int): The pipeline parallel size. Defaults to 1.
 
         context_parallel_size (int): The context parallel size. Defaults to 1.
 
-        gpus_per_node (Optional[int]): The number of GPUs per node. Defaults to None for automatic configure.
+        gpus_per_node (int, optional): The number of GPUs per node. None means automatic configure. Defaults to None.
 
-        load_format (Literal['auto', 'dummy']): The format of the model weights to load.
+        load_format (Literal['auto', 'dummy']): The format of the model weights to load. Defaults to 'auto'.
             * 'auto' will try to load the weights from the provided checkpoint.
             * 'dummy' will initialize the weights with random values, which is mainly for profiling.
-            Defaults to 'auto'.
 
         enable_tqdm (bool): Whether to display a progress bar during model building. Defaults to False.
 
@@ -335,17 +346,15 @@ LLMARGS_DOCSTRING = r"""
 
         max_prompt_adapter_token (int): Maximum number of prompt adapter tokens. Defaults to 0.
 
-        quant_config (QuantConfig, optional): The quantization configuration for the model. Defaults to None.
+        quant_config (tensorrt_llm.llmapi.QuantConfig, optional): The quantization configuration for the model. Defaults to None.
 
-        calib_config (CalibConfig, optional): The calibration configuration for the model. Defaults to None.
+        calib_config (tensorrt_llm.llmapi.CalibConfig, optional): The calibration configuration for the model. Defaults to None.
 
-        build_config (BuildConfig, optional)): The build configuration for the model. Defaults to None.
+        build_config (tensorrt_llm.llmapi.BuildConfig, optional): The build configuration for the model. Defaults to None.
 
-        kv_cache_config (KvCacheConfig, optional): The key-value cache configuration for the model. Defaults to None.
+        kv_cache_config (tensorrt_llm.bindings.executor.KvCacheConfig, optional): The key-value cache configuration for the model. Defaults to None.
 
         enable_chunked_prefill (bool): Whether to enable chunked prefill. Defaults to False.
-
-        decoding_config (DecodingConfig, optional): The decoding configuration for the model. Defaults to None.
 
         guided_decoding_backend (str, optional): The guided decoding backend, currently supports 'xgrammar'. Defaults to None.
 
@@ -355,7 +364,7 @@ LLMARGS_DOCSTRING = r"""
 
         request_stats_max_iterations (int, optional): The maximum number of iterations for request statistics. Defaults to None.
 
-        workspace(str, optional): The directory to store intermediate files. Defaults to None.
+        workspace (str, optional): The directory to store intermediate files. Defaults to None.
 
         embedding_parallel_mode (str): The parallel mode for embeddings. Defaults to 'SHARDING_ALONG_VOCAB'.
 
@@ -363,45 +372,50 @@ LLMARGS_DOCSTRING = r"""
 
         auto_parallel_world_size (int): The MPI world size for auto parallel. Defaults to 1.
 
-        moe_tensor_parallel_size (int, optional): The tensor parallel size for MoE models's expert weights.
+        moe_tensor_parallel_size (int, optional): The tensor parallel size for MoE models's expert weights. Defaults to None.
 
-        moe_expert_parallel_size (int, optional): The expert parallel size for MoE models's expert weights.
+        moe_expert_parallel_size (int, optional): The expert parallel size for MoE models's expert weights. Defaults to None.
 
-        enable_attention_dp (bool, optional): Enable attention data parallel. Defaults to False.
+        enable_attention_dp (bool): Enable attention data parallel. Defaults to False.
 
-        fast_build: (bool): Enable features for faster engine building.
+        cp_config (dict, optional): Context parallel config. Defaults to None.
+
+        fast_build (bool): Enable features for faster engine building. Defaults to False.
             This may cause some performance degradation and is currently incompatible with int8/int4 quantization.
-            Defaults to False.
 
-        enable_build_cache (bool, BuildCacheConfig, optional): Whether to enable build caching for the model. Defaults to None.
+        enable_build_cache (bool, tensorrt_llm.llmapi.BuildCacheConfig): Whether to enable build caching for the model. Defaults to False.
 
-        peft_cache_config (PeftCacheConfig, optional): The PEFT cache configuration for the model. Defaults to None.
+        peft_cache_config (tensorrt_llm.bindings.executor.PeftCacheConfig, optional): The PEFT cache configuration for the model. Defaults to None.
 
-        scheduler_config (SchedulerConfig, optional): The scheduler configuration for the model. Defaults to None.
+        scheduler_config (tensorrt_llm.bindings.executor.SchedulerConfig, optional): The scheduler configuration for the model. Defaults to None.
 
-        speculative_config (LookaheadDecodingConfig or other speculative configurations, optional): The speculative decoding configuration. Defaults to None.
+        speculative_config (tensorrt_llm.bindings.executor.LookaheadDecodingConfig, tensorrt_llm.llmapi.MedusaDecodingConfig, tensorrt_llm.llmapi.EagleDecodingConfig, optional):
+            The speculative decoding configuration. Defaults to None.
 
-        batching_type (BatchingType, optional): The batching type for the model. Defaults to None.
+        decoding_config (tensorrt_llm.bindings.executor.DecodingConfig, optional): The decoding configuration for the model. Defaults to None.
+
+        batching_type (tensorrt_llm.bindings.executor.BatchingType, optional): The batching type for the model. Defaults to None.
 
         normalize_log_probs (bool): Whether to normalize log probabilities for the model. Defaults to False.
 
-        gather_generation_logits (bool): Enable gathering generation logits.
+        gather_generation_logits (bool): Enable gathering generation logits. Defaults to False.
 
         max_batch_size (int, optional): The maximum batch size for runtime. Defaults to None.
 
         max_num_tokens (int, optional): The maximum number of tokens for runtime. Defaults to None.
 
-        extended_runtime_perf_knob_config (ExtendedRuntimePerfKnobConfig, optional): The extended runtime performance knob configuration for the model. Defaults to None.
+        extended_runtime_perf_knob_config (tensorrt_llm.bindings.executor.ExtendedRuntimePerfKnobConfig, optional): The extended runtime performance knob configuration for the model. Defaults to None.
 
+        backend (str, optional): The backend to use. None means TensorRT engine and C++ executor. Defaults to None.
 """
 
 
-@append_docstring(LLMARGS_DOCSTRING)
+@append_docstring(LLMARGS_EXPLICIT_DOCSTRING + LLMARGS_IMPLICIT_DOCSTRING)
 @dataclass
 class LlmArgs:
     """The arguments for constructing a LLM instance.
 
-    Parameters:
+    Args:
     """
     # Explicit arguments
     model: Union[str, Path]
@@ -438,7 +452,7 @@ class LlmArgs:
 
     enable_attention_dp: bool = False
 
-    cp_config: Optional[dict] = field(default_factory=dict)
+    cp_config: Optional[dict] = None
 
     auto_parallel: bool = False
 
@@ -475,9 +489,6 @@ class LlmArgs:
 
     enable_chunked_prefill: bool = False
 
-    # TODO[enweiz]: this might affect medusa, and could be removed in the future for API consistency
-    decoding_config: Optional[DecodingConfig] = None
-
     guided_decoding_backend: Optional[str] = None
 
     logits_post_processor_map: Optional[Dict[str, Callable]] = None
@@ -501,7 +512,11 @@ class LlmArgs:
     scheduler_config: Optional[SchedulerConfig] = None
 
     # Speculative decoding parameters
-    speculative_config: Optional[Union[LookaheadDecodingConfig]] = None
+    speculative_config: Optional[Union[LookaheadDecodingConfig,
+                                       MedusaDecodingConfig,
+                                       EagleDecodingConfig]] = None
+
+    decoding_config: Optional[DecodingConfig] = None
 
     batching_type: Optional[BatchingType] = None
 
@@ -513,13 +528,16 @@ class LlmArgs:
         ExtendedRuntimePerfKnobConfig] = None
 
     # TODO: remove this option in the future
-    use_runtime_defaults: bool = True
+    _use_runtime_defaults: bool = True
 
     max_batch_size: Optional[int] = None
     max_num_tokens: Optional[int] = None
 
     # backend to use
     backend: Optional[str] = None
+
+    # Optional mpi session to use for this LLM instance
+    _mpi_session: Optional[MpiSession] = None
 
     # private options
     _num_postprocess_workers: int = 0  # Number of postprocess worker processes
@@ -558,6 +576,9 @@ class LlmArgs:
         if self.moe_expert_parallel_size is None:
             self.moe_expert_parallel_size = -1
 
+        if self.cp_config is None:
+            self.co_config = {}
+
         self.parallel_config = _ParallelConfig(
             tp_size=self.tensor_parallel_size,
             pp_size=self.pipeline_parallel_size,
@@ -590,13 +611,26 @@ class LlmArgs:
         self._convert_checkpoint_options = {}
 
     @classmethod
-    def from_kwargs(cls, **kwargs) -> "LlmArgs":
+    def from_kwargs(cls, **kwargs: Any) -> "LlmArgs":
+        """Create `LlmArgs` instance from kwargs.
+
+        Args:
+            kwargs (Any): Arguments passed to `LlmArgs` constructor.
+
+        Returns:
+            tensorrt_llm.llmapi.llm_utils.LlmArgs: The `LlmArgs` instance.
+        """
         LlmArgs._check_executor_config_options_consistency()
         ret = cls(**kwargs)
-        ret.setup()
+        ret._setup()
         return ret
 
-    def to_dict(self):
+    def to_dict(self) -> dict:
+        """Dump `LlmArgs` instance to a dict.
+
+        Returns:
+            dict: The dict that contains all fields of the `LlmArgs` instance.
+        """
         return dict(
             (field.name, getattr(self, field.name)) for field in fields(self))
 
@@ -616,7 +650,7 @@ class LlmArgs:
             llm_args_attr
         ), f"New options found in underlying ExecutorConfig: {llm_args_attr - executor_config_attrs}"
 
-    def setup(self):
+    def _setup(self):
         ''' This method will setup the configs right before building the model.
         It will check the consistency of the configs and arbitrate the conflicts.
         '''
@@ -636,8 +670,9 @@ class LlmArgs:
         speculative_model_obj = _ModelWrapper(
             self.speculative_model
         ) if self.speculative_model is not None else None
-        if model_obj.is_local_model and getattr(self, 'backend',
-                                                None) != 'pytorch':
+        if model_obj.is_local_model and self.backend not in [
+                'pytorch', 'autodeploy'
+        ]:
             # Load parallel_config from the engine.
             self.model_format = ModelLoader.get_model_format(self.model)
 
@@ -648,7 +683,7 @@ class LlmArgs:
                     )
                 self._load_config_from_engine(model_obj.model_dir)
                 runtime_defaults = self._pretrained_config.runtime_defaults
-                if self.use_runtime_defaults and runtime_defaults:
+                if self._use_runtime_defaults and runtime_defaults:
                     self.kv_cache_config.fill_empty_fields_from_runtime_defaults(
                         runtime_defaults)
 
@@ -737,6 +772,8 @@ class LlmArgs:
                     eagle_config=eagle_config)
             else:
                 raise ValueError(f"Speculative config type not recognized")
+        else:
+            self.decoding_config = None
 
     def _perform_config_arbitration(self):
         '''
@@ -744,7 +781,7 @@ class LlmArgs:
         features might be conflicted, and this method will arbitrate the conflicts and raise errors if necessary.
         '''
         self._config_arbitrator = _ConfigArbitrator()
-        if self.build_config_mutable:
+        if self._build_config_mutable:
             if not self.build_config.max_num_tokens:
                 self.build_config.max_num_tokens = 2048
 
@@ -770,7 +807,7 @@ class LlmArgs:
         self._config_arbitrator = None
 
     @property
-    def build_config_mutable(self) -> bool:
+    def _build_config_mutable(self) -> bool:
         return self.model_format is not _ModelFormatKind.TLLM_ENGINE
 
     def _update_plugin_config(self, key: str, value: Any):
@@ -876,7 +913,7 @@ class LlmArgs:
             self.enable_chunked_prefill = False
 
         if self.enable_chunked_prefill:
-            if self.build_config_mutable:
+            if self._build_config_mutable:
                 self._config_arbitrator.claim_perf("chunked_context",
                                                    config_name="plugin_config",
                                                    use_paged_context_fmha=True,
@@ -943,37 +980,43 @@ class LlmArgs:
         return state
 
 
+def update_llm_args_with_extra_dict(
+        llm_args: Dict,
+        llm_args_dict: Dict,
+        extra_llm_api_options: Optional[str] = None) -> Dict:
+
+    from .._torch.pyexecutor.config import PyTorchConfig
+    field_mapping = {
+        "quant_config": QuantConfig,
+        "calib_config": CalibConfig,
+        "build_config": BuildConfig,
+        "kv_cache_config": KvCacheConfig,
+        "decoding_config": DecodingConfig,
+        "enable_build_cache": BuildCacheConfig,
+        "peft_cache_config": PeftCacheConfig,
+        "scheduler_config": SchedulerConfig,
+        "speculative_config": LookaheadDecodingConfig,
+        "batching_type": BatchingType,
+        "extended_runtime_perf_knob_config": ExtendedRuntimePerfKnobConfig,
+        "pytorch_backend_config": PyTorchConfig,
+    }
+    for field, field_type in field_mapping.items():
+        if field in llm_args_dict:
+            llm_args_dict[field] = field_type(**llm_args_dict[field])
+            extra_llm_str = f"because it's specified in {extra_llm_api_options}" if extra_llm_api_options else ""
+            logger.warning(f"Overriding {field} {extra_llm_str}")
+
+    llm_args = llm_args | llm_args_dict
+    return llm_args
+
+
 def update_llm_args_with_extra_options(llm_args: Dict,
                                        extra_llm_api_options: str) -> Dict:
     if extra_llm_api_options is not None:
         with open(extra_llm_api_options, 'r') as f:
             llm_args_dict = yaml.safe_load(f)
-
-            from .._torch.pyexecutor.config import PyTorchConfig
-            field_mapping = {
-                "quant_config": QuantConfig,
-                "calib_config": CalibConfig,
-                "build_config": BuildConfig,
-                "kv_cache_config": KvCacheConfig,
-                "decoding_config": DecodingConfig,
-                "enable_build_cache": BuildCacheConfig,
-                "peft_cache_config": PeftCacheConfig,
-                "scheduler_config": SchedulerConfig,
-                "speculative_config": LookaheadDecodingConfig,
-                "batching_type": BatchingType,
-                "extended_runtime_perf_knob_config":
-                ExtendedRuntimePerfKnobConfig,
-                "pytorch_backend_config": PyTorchConfig,
-            }
-            for field, field_type in field_mapping.items():
-                if field in llm_args_dict:
-                    llm_args_dict[field] = field_type(**llm_args_dict[field])
-                    logger.warning(
-                        f"Overriding {field} because it's specified in {extra_llm_api_options}."
-                    )
-
-            llm_args = llm_args | llm_args_dict
-
+            llm_args = update_llm_args_with_extra_dict(llm_args, llm_args_dict,
+                                                       extra_llm_api_options)
     return llm_args
 
 
@@ -1131,6 +1174,7 @@ class ModelLoader:
         ) if self.llm_args.speculative_model is not None else None
         self.convert_checkpoint_options = self.llm_args._convert_checkpoint_options
         self.rank = mpi_rank()
+        self.global_rank = global_mpi_rank()
         self.mapping = llm_args.parallel_config.to_mapping()
 
         self._build_pipeline = []
@@ -1268,7 +1312,7 @@ class ModelLoader:
             return self.model_obj.model_dir
 
         if self.llm_args.parallel_config.is_multi_gpu:
-            torch.cuda.set_device(self.rank)
+            torch.cuda.set_device(self.global_rank % self.mapping.gpus_per_node)
 
         pipeline = ModelLoader.BuildPipeline(
             self.llm_args.enable_tqdm,
@@ -1459,7 +1503,7 @@ class ModelLoader:
                 **self.convert_checkpoint_options,
             )
             self.model = model_cls(config)
-        elif self.llm_args.quant_config.requires_calibration and not already_quantized:
+        elif self.llm_args.quant_config._requires_calibration and not already_quantized:
             assert self.workspace is not None
             checkpoint_dir = f"{self.workspace}/quantized-checkpoint"
             if self.rank == 0:
@@ -1585,7 +1629,7 @@ class ModelLoader:
                                            use_fast)) is not None:
             return tokenizer
         else:
-            logger.error(f"Failed to load tokenizer from {model_dir}")
+            logger.warning(f"Failed to load tokenizer from {model_dir}")
             return None
 
 
@@ -1619,7 +1663,7 @@ class CachedModelLoader:
     def __call__(self) -> Tuple[Path, Union[Path, None]]:
 
         if self.llm_args.model_format is _ModelFormatKind.TLLM_ENGINE:
-            return self.llm_args.model, None
+            return Path(self.llm_args.model), None
 
         self.engine_cache_stage: Optional[CachedStage] = None
 
@@ -1651,7 +1695,7 @@ class CachedModelLoader:
                 return self.llm_build_stats.engine_dir, self._hf_model_dir
 
         if (self.llm_args.backend is not None):
-            if self.llm_args.backend != "pytorch":
+            if self.llm_args.backend not in ["pytorch", "autodeploy"]:
                 raise ValueError(
                     f'backend {self.llm_args.backend} is not supported.')
 

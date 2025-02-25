@@ -45,21 +45,21 @@ tkc::CutlassGemmConfig getDefaultGemmConfig(int64_t m, int64_t n, int64_t k)
 
 template <typename T>
 void runGemm(at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1Scale,
-    at::Tensor const& mat2Scale, at::Tensor const& globalScale, int64_t m, int64_t n, int64_t k,
+    at::Tensor const& mat2Scale, at::Tensor const& globalScale, int64_t m, int64_t n, int64_t k, int batch_count,
     tkc::CutlassGemmConfig const& gemmConfig)
 {
     CutlassFp4GemmRunner<T> gemmRunner;
-    int64_t wsBytes = gemmRunner.getWorkspaceSize(m, n, k);
+    int64_t wsBytes = gemmRunner.getWorkspaceSize(m, n, k, batch_count);
 
     at::Tensor workspace = at::detail::empty_cuda({wsBytes}, at::ScalarType::Char, mat1.device(), std::nullopt);
 
     gemmRunner.gemm(out.data_ptr(), mat1.const_data_ptr(), mat2.const_data_ptr(), mat1Scale.const_data_ptr(),
-        mat2Scale.const_data_ptr(), globalScale.data_ptr<float>(), m, n, k, gemmConfig,
+        mat2Scale.const_data_ptr(), globalScale.data_ptr<float>(), m, n, k, batch_count, gemmConfig,
         reinterpret_cast<char*>(workspace.data_ptr()), wsBytes, at::cuda::getCurrentCUDAStream(mat1.get_device()));
 }
 
-// mat1: [M, K / 2], FLOAT4_E2M1X2
-// mat2: [N, K / 2], FLOAT4_E2M1X2
+// mat1: [B, M, K / 2], FLOAT4_E2M1X2
+// mat2: [B, N, K / 2], FLOAT4_E2M1X2
 // out: [M, N], fp16/bf16/fp32
 // mat1Scale: ceil(M / 128) * 128 * ceil(K / sfVecSize / 4) * 4, SF_DTYPE (UE4M3 or UE8M0)
 // mat2Scale: ceil(N / 128) * 128 * ceil(K / sfVecSize / 4) * 4, SF_DTYPE (UE4M3 or UE8M0)
@@ -88,6 +88,8 @@ at::Tensor fp4_gemm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Ten
     auto const n = mat2.sizes()[0];
     auto const k = mat1.sizes()[1] * 2;
 
+    constexpr auto batch_count = 1; // Batch count is 1 for plain GEMM
+
     auto config = maybe_config ? *maybe_config : getDefaultGemmConfig(m, n, k);
 
     constexpr int alignment = 32;
@@ -108,13 +110,13 @@ at::Tensor fp4_gemm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Ten
     switch (out_dtype.value())
     {
     case at::ScalarType::Half:
-        runGemm<half>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k, config);
+        runGemm<half>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k, batch_count, config);
         break;
     case at::ScalarType::BFloat16:
-        runGemm<__nv_bfloat16>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k, config);
+        runGemm<__nv_bfloat16>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k, batch_count, config);
         break;
     case at::ScalarType::Float:
-        runGemm<float>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k, config);
+        runGemm<float>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k, batch_count, config);
         break;
     default: C10_THROW_ERROR(NotImplementedError, "out_dtype must be one of fp16/bf16/fp32.");
     }
@@ -168,9 +170,10 @@ void eventDelete(cudaEvent_t event)
     }
 }
 
-float profileConfigForProblem(CutlassFp4GemmRunnerInterface& gemmRunner, int m, int n, int k, at::Tensor& out,
-    at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1Scale, at::Tensor const& mat2Scale,
-    at::Tensor const& globalScale, at::Tensor& workspace, int wsBytes, tkc::CutlassGemmConfig const& config)
+float profileConfigForProblem(CutlassFp4GemmRunnerInterface& gemmRunner, int m, int n, int k, int batch_count,
+    at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1Scale,
+    at::Tensor const& mat2Scale, at::Tensor const& globalScale, at::Tensor& workspace, int wsBytes,
+    tkc::CutlassGemmConfig const& config)
 {
     constexpr int warmup = 5;
     constexpr int runs = 10;
@@ -180,7 +183,7 @@ float profileConfigForProblem(CutlassFp4GemmRunnerInterface& gemmRunner, int m, 
     auto runGemm = [&]
     {
         gemmRunner.gemm(out.data_ptr(), mat1.const_data_ptr(), mat2.const_data_ptr(), mat1Scale.const_data_ptr(),
-            mat2Scale.const_data_ptr(), globalScale.data_ptr<float>(), m, n, k, config,
+            mat2Scale.const_data_ptr(), globalScale.data_ptr<float>(), m, n, k, batch_count, config,
             reinterpret_cast<char*>(workspace.data_ptr()), wsBytes, stream);
     };
 
@@ -259,7 +262,9 @@ std::pair<tkc::CutlassGemmConfig, int64_t> runProfilingFor(
 
     at::Tensor globalScale = at::randn({1}, at::ScalarType::Float, std::nullopt, torch::kCUDA, std::nullopt);
 
-    int64_t wsBytes = gemmRunner.getWorkspaceSize(m, gemmId.n, gemmId.k);
+    constexpr auto batch_count = 1; // Always 1 for plain GEMM
+
+    int64_t wsBytes = gemmRunner.getWorkspaceSize(m, gemmId.n, gemmId.k, batch_count);
     at::Tensor workspace = at::detail::empty_cuda({wsBytes}, at::ScalarType::Char, torch::kCUDA, std::nullopt);
 
     for (int64_t i = 0; i < configs.size(); ++i)
@@ -267,8 +272,8 @@ std::pair<tkc::CutlassGemmConfig, int64_t> runProfilingFor(
         auto& config = configs[i];
         try
         {
-            float time = profileConfigForProblem(gemmRunner, m, gemmId.n, gemmId.k, out, mat1, mat2, mat1Scale,
-                mat2Scale, globalScale, workspace, wsBytes, config);
+            float time = profileConfigForProblem(gemmRunner, m, gemmId.n, gemmId.k, batch_count, out, mat1, mat2,
+                mat1Scale, mat2Scale, globalScale, workspace, wsBytes, config);
 
             if (time < bestTime)
             {

@@ -18,7 +18,6 @@ import subprocess
 import sys
 from argparse import BooleanOptionalAction
 from functools import partial
-from os.path import abspath, dirname
 from pathlib import Path
 from typing import List, Optional
 
@@ -193,11 +192,9 @@ def prepare_enc_dec_inputs(batch_input_ids: List[torch.Tensor], model_name: str,
     encoder_input_features = None
     encoder_input_ids = None
     if 'whisper' in model_name.lower():
-        tllm_path = dirname(dirname(abspath(__file__)))
-        sys.path.insert(0, tllm_path)
-
-        from examples.whisper.whisper_utils import \
-            log_mel_spectrogram  # cannot directly import whisper due to name collision
+        # cannot directly import whisper due to name collision
+        sys.path.append(f"{os.path.dirname(__file__)}/whisper")
+        from whisper_utils import log_mel_spectrogram
 
         config_path = os.path.join(engine_dir, 'encoder', 'config.json')
         with open(config_path, 'r') as f:

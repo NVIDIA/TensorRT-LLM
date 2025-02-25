@@ -22,14 +22,13 @@
 
 #include <optional>
 
-using namespace tensorrt_llm::kernels::small_m_gemm;
+using namespace tensorrt_llm::kernels::fp8_blockscale_gemm;
 using namespace tensorrt_llm::kernels;
 
 namespace torch_ext
 {
 
-using Fp8BlockScaleGemmRunnerPtr
-    = std::unique_ptr<tensorrt_llm::kernels::small_m_gemm::CutlassFp8BlockScaleGemmRunnerInterface>;
+using Fp8BlockScaleGemmRunnerPtr = std::unique_ptr<CutlassFp8BlockScaleGemmRunnerInterface>;
 
 namespace
 {

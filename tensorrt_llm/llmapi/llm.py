@@ -13,16 +13,17 @@ from transformers import PreTrainedTokenizerBase
 from .. import bindings as tllm
 from ..bindings import executor as tllm
 from ..builder import EngineConfig
+from ..disaggregated_params import DisaggregatedParams
 from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
-                        GenerationResult, LoRARequest, PostprocWorkerConfig,
-                        PromptAdapterRequest)
+                        GenerationResult, IterationStatsResult, LoRARequest,
+                        PostprocWorkerConfig, PromptAdapterRequest)
 from ..inputs import PromptInputs, create_input_processor, prompt_inputs
 from ..logger import logger
 from ..sampling_params import SamplingParams
-from .llm_utils import (LLMARGS_DOCSTRING, CachedModelLoader,
+from .llm_utils import (LLMARGS_EXPLICIT_DOCSTRING, CachedModelLoader,
                         KvCacheRetentionConfig, LlmArgs, LlmBuildStats,
                         ModelLoader, _ModelRuntimeContext)
-from .mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
+from .mpi_session import (MpiCommSession, MpiPoolSession,
                           external_mpi_comm_available)
 from .tokenizer import TokenizerBase, _xgrammar_tokenizer_info
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
@@ -32,7 +33,7 @@ from .utils import append_docstring, exception_handler, get_device_count
 class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
     """The output data of a completion request to the LLM.
 
-    Parameters:
+    Attributes:
         request_id (int): The unique ID of the request.
         prompt (str, optional): The prompt string of the request.
         prompt_token_ids (List[int]): The token ids of the prompt.
@@ -41,15 +42,28 @@ class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
         finished (bool): Whether the whole request is finished.
     """
 
-    def __init__(self,
-                 generation_result: GenerationResult,
-                 prompt: Optional[str] = None,
-                 tokenizer: Optional[TokenizerBase] = None) -> None:
+    def __init__(self) -> None:
+        raise RuntimeError(
+            f"{self.__class__.__name__} is designed to be instantiated using {self.__class__.__name__}._from_generation_result by GenerationExecutor. "
+            f"Users are not expected to create {self.__class__.__name__} directly."
+        )
 
-        self.__dict__.update(generation_result.__dict__)
-        self.tokenizer = tokenizer
-        self._streaming = generation_result.streaming
-        self.prompt = prompt
+    @classmethod
+    def _from_generation_result(
+            cls,
+            generation_result: GenerationResult,
+            prompt: Optional[str] = None,
+            tokenizer: Optional[TokenizerBase] = None) -> 'RequestOutput':
+        inst = cls.__new__(cls)
+        inst.__dict__.update(generation_result.__dict__)
+        inst.tokenizer = tokenizer
+        inst._streaming = generation_result._streaming
+        inst._prompt = prompt
+        return inst
+
+    @property
+    def prompt(self) -> Optional[str]:
+        return self._prompt
 
     def _repr_fields(self):
         return [
@@ -57,7 +71,16 @@ class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
         ]
 
 
-@append_docstring(LLMARGS_DOCSTRING)
+LLM_DOCSTRING = LLMARGS_EXPLICIT_DOCSTRING + """
+        kwargs (Any): Advanced arguments passed to `LlmArgs`.
+
+    Attributes:
+        tokenizer (tensorrt_llm.llmapi.tokenizer.TokenizerBase, optional): The tokenizer loaded by LLM instance, if any.
+        workspace (pathlib.Path): The directory to store intermediate files.
+"""
+
+
+@append_docstring(LLM_DOCSTRING)
 class LLM:
     """LLM class is the main class for running a LLM model.
 
@@ -65,7 +88,7 @@ class LLM:
     """
 
     def __init__(self,
-                 model: str,
+                 model: Union[str, Path],
                  tokenizer: Optional[Union[str, Path, TokenizerBase,
                                            PreTrainedTokenizerBase]] = None,
                  tokenizer_mode: Literal['auto', 'slow'] = 'auto',
@@ -75,11 +98,10 @@ class LLM:
                  dtype: str = "auto",
                  revision: Optional[str] = None,
                  tokenizer_revision: Optional[str] = None,
-                 speculative_model: Optional[str] = None,
-                 **kwargs: Any):
+                 speculative_model: Optional[Union[str, Path]] = None,
+                 **kwargs: Any) -> None:
 
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
-        self.mpi_session: Optional[MpiSession] = None
 
         try:
             self.pytorch_backend_config = kwargs.pop('pytorch_backend_config',
@@ -101,6 +123,9 @@ class LLM:
             logger.error(
                 f"Failed to parse the arguments for the LLM constructor: {e}")
             raise e
+
+        self.mpi_session = self.args._mpi_session
+
         if self.args.parallel_config.is_multi_gpu:
             if get_device_count(
             ) < self.args.parallel_config.world_size_per_node:
@@ -111,13 +136,14 @@ class LLM:
             logger.info(
                 f'start MpiSession with {self.args.parallel_config.world_size} workers'
             )
-            if not external_mpi_comm_available(
-                    self.args.parallel_config.world_size):
-                self.mpi_session = MpiPoolSession(
-                    n_workers=self.args.parallel_config.world_size)
-            else:
-                self.mpi_session = MpiCommSession(
-                    n_workers=self.args.parallel_config.world_size)
+            if not self.mpi_session:
+                if not external_mpi_comm_available(
+                        self.args.parallel_config.world_size):
+                    self.mpi_session = MpiPoolSession(
+                        n_workers=self.args.parallel_config.world_size)
+                else:
+                    self.mpi_session = MpiCommSession(
+                        n_workers=self.args.parallel_config.world_size)
 
         try:
             # Due to the Executor can only accept a engine path, we need to save the engine to a directory
@@ -142,11 +168,6 @@ class LLM:
         atexit.register(LLM._shutdown_wrapper, weakref.ref(self))
 
     @property
-    def hf_model_dir(self) -> str:
-        "Get the downloaded HF model directory (if a Hub repo_id was given)."
-        return str(self._hf_model_dir)
-
-    @property
     def workspace(self) -> Path:
         return Path(self._workspace.name)
 
@@ -161,25 +182,28 @@ class LLM:
         prompt_adapter_request: Optional[Union[
             PromptAdapterRequest, Sequence[PromptAdapterRequest]]] = None,
         queries: Optional[Union[PromptInputs, Sequence[PromptInputs]]] = None,
-        kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None
+        kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
+        disaggregated_params: Optional[DisaggregatedParams] = None,
     ) -> Union[RequestOutput, List[RequestOutput]]:
         """Generate output for the given prompts in the synchronous mode.
         Synchronous generation accepts either single prompt or batched prompts.
 
         Args:
-            inputs (PromptInputs or Sequence[PromptInputs]): The prompt text or token ids.
-                it can be single prompt or batched prompts.
-            sampling_params (SamplingParams, List[SamplingParams], optional): The sampling params for the
-                generation, a default one will be used if not provided. Defaults to None.
+            inputs (tensorrt_llm.inputs.data.PromptInputs, Sequence[tensorrt_llm.inputs.data.PromptInputs]): The prompt text or token ids.
+                It can be single prompt or batched prompts.
+            sampling_params (tensorrt_llm.sampling_params.SamplingParams, List[tensorrt_llm.sampling_params.SamplingParams], optional): The sampling params for the generation. Defaults to None.
+                A default one will be used if not provided.
             use_tqdm (bool): Whether to use tqdm to display the progress bar. Defaults to True.
-            lora_request (LoRARequest, Sequence[LoRARequest], optional): LoRA request to use for generation,
-                if any. Defaults to None.
-            prompt_adapter_request (PromptAdapterRequest, Sequence[PromptAdapterRequest], optional):
+            lora_request (tensorrt_llm.executor.request.LoRARequest, Sequence[tensorrt_llm.executor.request.LoRARequest], optional):
+                LoRA request to use for generation, if any. Defaults to None.
+            prompt_adapter_request (tensorrt_llm.executor.request.PromptAdapterRequest, Sequence[tensorrt_llm.executor.request.PromptAdapterRequest], optional):
                 Prompt Adapter request to use for generation, if any. Defaults to None.
-            queries (PromptInputs or Sequence[PromptInputs]): The query text or token ids.
+            queries (tensorrt_llm.inputs.data.PromptInputs, Sequence[tensorrt_llm.inputs.data.PromptInputs], optional): The query text or token ids. Defaults to None.
                 it can be single prompt or batched prompts. it is used for star attention to run long context tasks.
+            kv_cache_retention_config (tensorrt_llm.bindings.executor.KvCacheRetentionConfig, optional): Configuration for the request's retention in the KV Cache. Defaults to None.
+            disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Disaggregated parameters. Defaults to None.
         Returns:
-            Union[RequestOutput, List[RequestOutput]]: The output data of the completion request to the LLM.
+            Union[tensorrt_llm.llmapi.RequestOutput, List[tensorrt_llm.llmapi.RequestOutput]]: The output data of the completion request to the LLM.
         """
         unbatched = not isinstance(inputs, list)
         if not unbatched:
@@ -217,7 +241,8 @@ class LLM:
                 lora_request=lora_req,
                 prompt_adapter_request=pa_req,
                 kv_cache_retention_config=kv_cache_retention_config,
-                streaming=False)
+                streaming=False,
+                disaggregated_params=disaggregated_params)
             futures.append(future)
 
         for future in tqdm(futures,
@@ -239,28 +264,33 @@ class LLM:
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         streaming: bool = False,
         queries: Optional[PromptInputs] = None,
-        kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None
+        kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
+        disaggregated_params: Optional[DisaggregatedParams] = None,
     ) -> RequestOutput:
         """Generate output for the given prompt in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
 
         Args:
-            inputs (PromptInputs): The prompt text or token ids; it must be single prompt.
-            sampling_params (SamplingParams, optional): The sampling params for the generation,
-                a default one will be used if not provided. Defaults to None.
-            lora_request (LoRARequest, optional): LoRA request to use for generation, if any.
-                Defaults to None.
-            prompt_adapter_request (PromptAdapterRequest, optional): Prompt Adapter request to
-                use for generation, if any. Defaults to None.
-            streaming (bool): Whether to use the streaming mode for the generation. Defaults to
-                False.
-            queries (PromptInputs or Sequence[PromptInputs]): The query text or token ids.
-                it can be single prompt or batched prompts. it is used for star attention to run long context tasks.
+            inputs (tensorrt_llm.inputs.data.PromptInputs): The prompt text or token ids; it must be single prompt.
+            sampling_params (tensorrt_llm.sampling_params.SamplingParams, optional): The sampling params for the generation. Defaults to None.
+                A default one will be used if not provided.
+            lora_request (tensorrt_llm.executor.request.LoRARequest, optional): LoRA request to use for generation, if any. Defaults to None.
+            prompt_adapter_request (tensorrt_llm.executor.request.PromptAdapterRequest, optional): Prompt Adapter request to use for generation, if any. Defaults to None.
+            streaming (bool): Whether to use the streaming mode for the generation. Defaults to False.
+            queries (tensorrt_llm.inputs.data.PromptInputs, optional): The query text or token ids. Defaults to None.
+                It can be single prompt or batched prompts. it is used for star attention to run long context tasks.
+            kv_cache_retention_config (tensorrt_llm.bindings.executor.KvCacheRetentionConfig, optional): Configuration for the request's retention in the KV Cache. Defaults to None.
+            disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Disaggregated parameters. Defaults to None.
 
         Returns:
-            RequestOutput: The output data of the completion request to the LLM.
+            tensorrt_llm.llmapi.RequestOutput: The output data of the completion request to the LLM.
         """
         sampling_params = self._prepare_sampling_params(sampling_params)
+
+        if sampling_params.n > self.args.build_config.max_batch_size:
+            raise ValueError(
+                f"SamplingParams.n ({sampling_params.n}) should not exceed max_batch_size ({self.args.build_config.max_batch_size})"
+            )
 
         inputs = prompt_inputs(inputs)
         if queries is not None:
@@ -300,36 +330,34 @@ class LLM:
             prompt_adapter_request=prompt_adapter_request,
             streaming=streaming,
             prompt_tuning_config=prompt_tuning_config,
-            kv_cache_retention_config=kv_cache_retention_config)
-        return RequestOutput(result, prompt, self.tokenizer)
+            kv_cache_retention_config=kv_cache_retention_config,
+            disaggregated_params=disaggregated_params)
+        return RequestOutput._from_generation_result(result, prompt,
+                                                     self.tokenizer)
 
-    def _get_stats(self, timeout=None) -> str:
-        ''' Get the stats from the runtime.
+    def get_stats(self, timeout: Optional[float] = 2) -> List[dict]:
+        '''Get iteration statistics from the runtime.
 
-        Exceptions:
-            NoStatsAvailable: If the stats are not available.
+        Args:
+            timeout (float, optional): Max wait time in seconds when retrieving stats from queue. Defaults to 2.
 
         Returns:
-            str: The stats in JSON format.
-
-        Known issue:
-            The `_get_stats` cannot mix with `_get_stats_async` in the same LLM instance.
+            List[dict]: A list of runtime stats as dict.
+                e.g., ['{"cpuMemUsage": ..., "iter": 0, ...}', '{"cpuMemUsage": ..., "iter": 1, ...}']
         '''
         return self._executor.get_stats(timeout=timeout)
 
-    async def _get_stats_async(self, timeout=None) -> str:
-        ''' Get the stats from the runtime.
+    def get_stats_async(self,
+                        timeout: Optional[float] = 2) -> IterationStatsResult:
+        '''Get iteration statistics from the runtime.
 
-        Exceptions:
-            NoStatsAvailable: If the stats are not available.
+        Args:
+            timeout (float, optional): Max wait time in seconds when retrieving stats from queue. . Defaults to 2.
 
         Returns:
-            str: The stats in JSON format.
-
-        Known issue:
-            The `_get_stats_async` cannot mix with `_get_stats` in the same LLM instance.
+            tensorrt_llm.executor.result.IterationStatsResult: An async iterable object containing runtime stats.
         '''
-        return await self._executor.aget_stats(timeout=timeout)
+        return self._executor.aget_stats(timeout=timeout)
 
     def _prepare_sampling_params(
             self,
@@ -347,7 +375,7 @@ class LLM:
                     raise ValueError(
                         "tokenizer is required to reset end_id if it is None, or you can explicitly specify the end_id for sampling_params"
                     )
-                sampling_params.setup(self.tokenizer)
+                sampling_params._setup(self.tokenizer)
             return sampling_params
         else:
             raise TypeError(
@@ -357,7 +385,7 @@ class LLM:
     def _check_arguments(self, prompt_len: int, query_len: int,
                          sampling_params: SamplingParams) -> None:
 
-        if getattr(self.args, 'backend', None) == 'pytorch':
+        if self.args.backend in ['pytorch', 'autodeploy']:
             return
 
         build_config = self.args.build_config
@@ -473,7 +501,8 @@ class LLM:
                 num_postprocess_workers=self.args._num_postprocess_workers,
                 postprocess_tokenizer_dir=self.args._postprocess_tokenizer_dir,
                 postprocess_result_handler=self.args._postprocess_result_handler
-            ))
+            ),
+            is_llm_executor=True)
 
     def _try_load_tokenizer(self) -> Optional[TokenizerBase]:
         if self.args.skip_tokenizer_init:
@@ -502,14 +531,11 @@ class LLM:
     def tokenizer(self, tokenizer: TokenizerBase):
         self._tokenizer = tokenizer
 
-    def save(self, engine_dir: str):
+    def save(self, engine_dir: str) -> None:
         """Save the built engine to the given path.
 
         Args:
             engine_dir (str): The path to save the engine.
-
-        Returns:
-            None
         """
         logger.info(f"Save model to {engine_dir}")
         if self._engine_dir is None:
@@ -517,12 +543,12 @@ class LLM:
         if self._engine_dir.absolute() != os.path.abspath(engine_dir):
             shutil.copytree(self._engine_dir, engine_dir, dirs_exist_ok=True)
 
-    def shutdown(self):
+    def shutdown(self) -> None:
         if hasattr(self, "_executor") and self._executor is not None:
             self._executor.shutdown()
             self._executor = None
 
-        if self.mpi_session is not None:
+        if hasattr(self, 'mpi_session') and self.mpi_session is not None:
             self.mpi_session.shutdown()
             self.mpi_session = None
 

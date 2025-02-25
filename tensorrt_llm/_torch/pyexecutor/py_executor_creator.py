@@ -7,6 +7,8 @@ from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm._torch.pyexecutor.decoder import (TorchDecoder,
                                                     TorchStarAttentionDecoder)
 from tensorrt_llm._torch.pyexecutor.distributed import MPIDist
+from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import \
+    create_kv_cache_transceiver
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
@@ -120,6 +122,8 @@ def create_py_executor(executor_config: ExecutorConfig,
 
     config = model_engine.model.model_config.pretrained_config
     if is_mla(config):
+        executor_config.kv_cache_config.enable_block_reuse = False
+        executor_config.enable_chunked_context = False
         kv_cache_manager = MLAKVCacheManager(
             executor_config.kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
@@ -135,10 +139,16 @@ def create_py_executor(executor_config: ExecutorConfig,
             kv_lora_rank=config.kv_lora_rank,
             qk_rope_head_dim=config.qk_rope_head_dim)
     else:
+        num_hidden_layers = model_engine.model.config.num_hidden_layers
+        # the number of layers using attention in Nemotron5 is lower from the number of hidden layers
+        if model_engine.model.config.architectures[0] == "Nemotron5ForCausalLM":
+            # attention layers are derived from configuration (hybrid_override_pattern)
+            num_hidden_layers = model_engine.model.config.hybrid_override_pattern.count(
+                "*")
         kv_cache_manager = KVCacheManager(
             executor_config.kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
-            model_engine.model.config.num_hidden_layers,
+            num_hidden_layers,
             num_attention_heads,
             num_key_value_heads,
             head_dim,
@@ -177,11 +187,15 @@ def create_py_executor(executor_config: ExecutorConfig,
                                            executor_config.max_num_tokens,
                                            ctx_chunk_config)
     scheduler = SimpleScheduler(capacity_scheduler, mb_scheduler)
+    kv_cache_transceiver = create_kv_cache_transceiver(mapping,
+                                                       kv_cache_manager)
+
     py_executor = PyExecutor(resource_manager,
                              scheduler,
                              model_engine=model_engine,
                              decoder=decoder,
                              dist=dist,
                              enable_overlap_scheduler=pytorch_backend_config.
-                             enable_overlap_scheduler)
+                             enable_overlap_scheduler,
+                             kv_cache_transceiver=kv_cache_transceiver)
     return py_executor

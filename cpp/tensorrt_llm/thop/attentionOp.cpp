@@ -214,10 +214,8 @@ public:
         bool const can_use_one_more_block = beam_width > 1;
 
         int max_blocks_per_sequence = kv_cache_block_offsets.size(-1);
-        int32_t const pool_index = host_kv_cache_pool_mapping.index({op.mLayerIdx}).item<int32_t>();
-        int32_t const layer_idx_in_cache_pool
-            = host_kv_cache_pool_mapping.slice(0, 0, op.mLayerIdx).eq(pool_index).sum().item<int32_t>();
-        op.mLayerIdxInCachePool = layer_idx_in_cache_pool;
+        int32_t const pool_index = host_kv_cache_pool_mapping.index({op.mLayerIdx, 0}).item<int32_t>();
+        int32_t const layer_idx_in_cache_pool = host_kv_cache_pool_mapping.index({op.mLayerIdx, 1}).item<int32_t>();
         KVBlockArray::DataType* block_offsets
             = static_cast<KVBlockArray::DataType*>(kv_cache_block_offsets.index({pool_index, seq_offset}).data_ptr());
         KVBlockArray::DataType* host_block_offsets = static_cast<KVBlockArray::DataType*>(
@@ -227,7 +225,7 @@ public:
         auto const block_size = op.mTokensPerBlock * op.mNumKVHeads * op.mHeadSize;
         auto const bytes_per_block = block_size * cache_elem_size;
         int32_t const kv_factor = op.isMLAEnabled() ? 1 : 2;
-        auto const intra_pool_offset = op.mLayerIdxInCachePool * kv_factor * bytes_per_block;
+        auto const intra_pool_offset = layer_idx_in_cache_pool * kv_factor * bytes_per_block;
 
         void* host_primary_pool_pointer = reinterpret_cast<void*>(
             reinterpret_cast<char*>(host_kv_cache_pool_pointers.index({pool_index, 0}).item<int64_t>())
@@ -355,7 +353,7 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
     int64_t const layer_idx, int64_t const num_heads, int64_t const num_kv_heads, int64_t const head_size,
     int64_t const tokens_per_block, int64_t const max_num_requests, int64_t const max_context_length,
     int64_t const attention_window_size, int64_t const sink_token_length, int64_t const beam_width,
-    int64_t const mask_type, int64_t const quant_mode, int64_t const position_embedding_type,
+    int64_t const mask_type, int64_t const quant_mode, double const q_scaling, int64_t const position_embedding_type,
     int64_t const rotary_embedding_dim, double const rotary_embedding_base, int64_t const rotary_embedding_scale_type,
     double const rotary_embedding_scale, double const rotary_embedding_short_m_scale,
     double const rotary_embedding_long_m_scale, int64_t const rotary_embedding_max_positions,
@@ -432,6 +430,7 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
     op->mKVCacheQuantMode = tensorrt_llm::common::QuantMode(uint32_t(quant_mode));
     op->mTokensPerBlock = tokens_per_block;
     op->mMaxContextLength = max_context_length;
+    op->mQScaling = q_scaling;
     op->mPositionEmbeddingType
         = static_cast<tensorrt_llm::kernels::PositionEmbeddingType>(int8_t(position_embedding_type));
     op->mRotaryEmbeddingDim = rotary_embedding_dim;
@@ -593,6 +592,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", int beam_width"
         ", int mask_type"
         ", int quant_mode"
+        ", float q_scaling"
         ", int position_embedding_type"
         ", int rotary_embedding_dim"
         ", float rotary_embedding_base"

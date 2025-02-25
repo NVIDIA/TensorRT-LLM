@@ -364,6 +364,15 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm100(CutlassGemmConfig::Ca
                     if (cluster_n == 1)
                     {
                         base.push_back(CutlassTileConfigSM100::CtaShape128x32x128B);
+                        if ((config & CutlassGemmConfig::FP8_ONLY) != 0)
+                        {
+                            base.push_back(CutlassTileConfigSM100::CtaShape128x16x128B);
+                        }
+                    }
+
+                    if (cluster_n == 1 && cluster_m == 1 && ((config & CutlassGemmConfig::FP8_ONLY) != 0))
+                    {
+                        base.push_back(CutlassTileConfigSM100::CtaShape128x8x256B);
                     }
 
                     std::vector onesm{CutlassTileConfigSM100::CtaShape64x64x128B,

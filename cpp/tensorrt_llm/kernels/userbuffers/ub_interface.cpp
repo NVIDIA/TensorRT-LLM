@@ -28,7 +28,9 @@ void ub_initialize(tensorrt_llm::runtime::WorldConfig const& world_config)
 
 void ub_initialize(int tp_size)
 {
-    tensorrt_llm::runtime::WorldConfig world_config(tp_size, 1, 1, COMM_SESSION.getRank());
+    int num_devices;
+    TLLM_CUDA_CHECK(cudaGetDeviceCount(&num_devices));
+    tensorrt_llm::runtime::WorldConfig world_config(tp_size, 1, 1, COMM_SESSION.getRank(), num_devices);
     UserBufferAllocator::Instance().initialize(world_config);
 }
 

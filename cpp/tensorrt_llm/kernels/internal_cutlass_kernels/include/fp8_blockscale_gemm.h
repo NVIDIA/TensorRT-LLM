@@ -21,9 +21,7 @@
 #include <vector>
 
 // non-persistent-cooperative GEMM
-namespace tensorrt_llm::kernels
-{
-namespace small_m_gemm
+namespace tensorrt_llm::kernels::fp8_blockscale_gemm
 {
 
 class CutlassFp8BlockScaleGemmRunnerInterface
@@ -34,7 +32,7 @@ public:
     virtual ~CutlassFp8BlockScaleGemmRunnerInterface() {}
 
     virtual void gemm(void* mat_d, void const* mat_a, void const* mat_b, int shape_m, int shape_n, int shape_k,
-        char* workspace_ptr, cudaStream_t stream, float const* scales_a = nullptr, float const* scales_b = nullptr)
+        cudaStream_t stream, float const* scales_a = nullptr, float const* scales_b = nullptr)
         = 0;
 
     virtual void gemm(__nv_fp8_e4m3 const* mat_a, int ld_a, __nv_fp8_e4m3 const* mat_b, int ld_b, __nv_bfloat16* mat_d,
@@ -43,8 +41,8 @@ public:
         = 0;
 
     virtual void moeGemm(void* mat_d, void const* mat_a, void const* mat_b, int64_t const* problem_m_offsets,
-        size_t num_problems, size_t shape_n, size_t shape_k, char* workspace_ptr, cudaStream_t stream,
-        float const* scales_a = nullptr, float const* scales_b = nullptr)
+        size_t num_problems, size_t shape_n, size_t shape_k, cudaStream_t stream, float const* scales_a = nullptr,
+        float const* scales_b = nullptr)
         = 0;
 
     virtual void strideBatchGemm(__nv_bfloat16* mat_d, int ld_d, int stride_d, __nv_fp8_e4m3* mat_a, int ld_a,
@@ -64,31 +62,38 @@ public:
     // Returns desired workspace size in bytes.
     virtual size_t getWorkspaceSize(size_t max_shape_m, size_t shape_n, size_t shape_k, size_t num_problems = 1) = 0;
 
+    void configureWorkspace(char* ws_ptr)
+    {
+        workspace_ = ws_ptr;
+    }
+
     virtual size_t getFP8DataSize(int shape_m, int shape_n, bool is_act) = 0;
     virtual size_t getActScaleSize(int shape_m, int shape_k) = 0;
     virtual size_t getWeightScaleSize(int shape_n, int shape_k) = 0;
     virtual size_t getActWorkspaceSize(int shape_m, int shape_k) = 0;
     virtual size_t getWeightWorkspaceSize(int shape_n, int shape_k) = 0;
+
+protected:
+    char* workspace_ = nullptr;
 };
 
 template <typename ElementA, typename ElementB, typename ElementD>
-class CutlassFp8BlockScaleGemmRunner : public virtual CutlassFp8BlockScaleGemmRunnerInterface
+class CutlassFp8BlockScaleGemmRunner : public CutlassFp8BlockScaleGemmRunnerInterface
 {
 public:
     CutlassFp8BlockScaleGemmRunner();
     ~CutlassFp8BlockScaleGemmRunner();
 
     void gemm(void* mat_d, void const* mat_a, void const* mat_b, int shape_m, int shape_n, int shape_k,
-        char* workspace_ptr, cudaStream_t stream, float const* scales_a = nullptr,
-        float const* scales_b = nullptr) override;
+        cudaStream_t stream, float const* scales_a = nullptr, float const* scales_b = nullptr) override;
 
     void gemm(__nv_fp8_e4m3 const* mat_a, int ld_a, __nv_fp8_e4m3 const* mat_b, int ld_b, __nv_bfloat16* mat_d,
         int ld_d, int shape_m, int shape_n, int shape_k, float const* scales_a, float const* scales_b,
         cudaStream_t stream) override;
 
     void moeGemm(void* mat_d, void const* mat_a, void const* mat_b, int64_t const* problem_m_offsets,
-        size_t num_problems, size_t shape_n, size_t shape_k, char* workspace_ptr, cudaStream_t stream,
-        float const* scales_a = nullptr, float const* scales_b = nullptr) override;
+        size_t num_problems, size_t shape_n, size_t shape_k, cudaStream_t stream, float const* scales_a = nullptr,
+        float const* scales_b = nullptr) override;
 
     void strideBatchGemm(__nv_bfloat16* mat_d, int ld_d, int stride_d, __nv_fp8_e4m3* mat_a, int ld_a, int stride_a,
         __nv_fp8_e4m3* mat_b, int ld_b, int stride_b, int num_problems, int shape_m, int shape_n, int shape_k,
@@ -114,5 +119,4 @@ private:
     int64_t max_shape_m_4_align_ = 0;
 };
 
-} // namespace small_m_gemm
-} // namespace tensorrt_llm::kernels
+} // namespace tensorrt_llm::kernels::fp8_blockscale_gemm

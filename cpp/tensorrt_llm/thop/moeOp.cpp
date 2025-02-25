@@ -359,16 +359,9 @@ public:
             static_cast<int>(top_k), activation_type, norm_mode, parallelism_config);
 
         auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales);
+
         // TODO: support lora in the future
         kernels::LoraParams lora_params{};
-        kernels::BlockScaleParams deepseek_params{};
-        if (mUseFp8BlockScaling)
-        {
-            auto& fc1_scales = quant_scales.value()[0];
-            auto& fc2_scales = quant_scales.value()[1];
-            deepseek_params = kernels::BlockScaleParams(
-                static_cast<float const*>(fc1_scales.data_ptr()), static_cast<float const*>(fc2_scales.data_ptr()));
-        }
 
         mKernelRunner->runMoe(input.const_data_ptr(), static_cast<float const*>(gating_output.const_data_ptr()),
             fc1_expert_weights.const_data_ptr(), nullptr, activation_type, fc2_expert_weights.const_data_ptr(), nullptr,
@@ -376,7 +369,7 @@ public:
             static_cast<char*>(workspace_info.workspace), output.data_ptr(), nullptr, output.sizes()[0],
             workspace_info.scale_probs, static_cast<int*>(workspace_info.src_to_dest_map),
             static_cast<int*>(workspace_info.selected_experts), 0, parallelism_config, norm_mode, false, lora_params,
-            mUseFp8BlockScaling, deepseek_params, stream);
+            mUseFp8BlockScaling, stream);
 
         return output;
     }
@@ -643,6 +636,13 @@ private:
                 static_cast<tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc2_weight_block.data_ptr()),
                 static_cast<float const*>(fc2_global.data_ptr()));
         }
+        else if (mUseFp8BlockScaling)
+        {
+            auto& fc1_scales = quant_scales.value()[0];
+            auto& fc2_scales = quant_scales.value()[1];
+            return kernels::QuantParams::FP8BlockScaling(
+                static_cast<float const*>(fc1_scales.data_ptr()), static_cast<float const*>(fc2_scales.data_ptr()));
+        }
         else
         {
             return kernels::QuantParams{};
@@ -651,7 +651,8 @@ private:
 
     bool isFp8Quant() const
     {
-        return mActivationDtype == c10::ScalarType::Float8_e4m3fn && mWeightDtype == c10::ScalarType::Float8_e4m3fn;
+        return !mUseFp8BlockScaling && mActivationDtype == c10::ScalarType::Float8_e4m3fn
+            && mWeightDtype == c10::ScalarType::Float8_e4m3fn;
     }
 
     bool isNvfp4Quant() const

@@ -504,7 +504,7 @@ def load_weights_from_hf_model(hf_model,
     use_gemm_woq_plugin = (not config.disable_weight_only_quant_plugin)
     use_fp8_rowwise = quant_algo in [QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN]
 
-    use_smooth_quant = config.quantization.use_plugin_sq
+    use_smooth_quant = config.quantization._use_plugin_sq
     per_channel = use_smooth_quant and 'PER_CHANNEL' in quant_algo
     per_token = use_smooth_quant and 'PER_TOKEN' in quant_algo
     int8_kv_cache = config.quantization.kv_cache_quant_algo == QuantAlgo.INT8
@@ -1053,34 +1053,28 @@ def load_weights_from_hf_model(hf_model,
         convert_layer(l)
         release_gc()
 
-    v = get_weight(model_params,
-                   f'{model_prefix}.{param_name_map["vocab_embedding"]}', dtype)
-    if hf_model.config.tie_word_embeddings:
-        # lm_head.weight has the same weights as embedding
-        if mapping.is_last_pp_rank():
-            if config.vocab_size % mapping.tp_size != 0:
-                # padding
-                vocab_size_padded = pad_vocab_size(config.vocab_size,
-                                                   mapping.tp_size)
-                pad_width = vocab_size_padded - config.vocab_size
-
-                v = torch.nn.functional.pad(v, (0, 0, 0, pad_width), 'constant',
-                                            0)
-            weights['lm_head.weight'] = split(v, mapping.tp_size,
-                                              mapping.tp_rank)
-
-    if config.use_parallel_embedding:
-        v = split_matrix_tp(v,
-                            mapping.tp_size,
-                            mapping.tp_rank,
-                            dim=config.embedding_sharding_dim)
+    vocab_embedding = get_weight(
+        model_params, f'{model_prefix}.{param_name_map["vocab_embedding"]}',
+        dtype)
 
     if mapping.is_first_pp_rank():
-        weights['transformer.vocab_embedding.weight'] = v
-
-    lm_head_weights = get_weight(model_params, param_name_map["lm_head"], dtype)
+        if config.use_parallel_embedding:
+            weights['transformer.vocab_embedding.weight'] = split_matrix_tp(
+                vocab_embedding,
+                mapping.tp_size,
+                mapping.tp_rank,
+                dim=config.embedding_sharding_dim)
+        else:
+            weights['transformer.vocab_embedding.weight'] = vocab_embedding
 
     if mapping.is_last_pp_rank():
+        if hf_model.config.tie_word_embeddings:
+            # lm_head.weight has the same weights as embedding
+            lm_head_weights = vocab_embedding.clone()
+        else:
+            lm_head_weights = get_weight(model_params,
+                                         param_name_map["lm_head"], dtype)
+
         if config.vocab_size % mapping.tp_size != 0:
             # padding
             vocab_size_padded = pad_vocab_size(config.vocab_size,
@@ -1123,7 +1117,7 @@ def quantize(hf_model_dir: str,
     assert mapping.rank == 0, "quantize should be called at rank 0 only"
 
     quant_config = config.quantization
-    use_smooth_quant = quant_config.use_plugin_sq
+    use_smooth_quant = quant_config._use_plugin_sq
     int8_kv_cache = quant_config.kv_cache_quant_algo == QuantAlgo.INT8
 
     assert use_smooth_quant or int8_kv_cache, "Call from_hugging_face when there is no quantization"

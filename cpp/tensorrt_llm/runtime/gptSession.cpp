@@ -18,7 +18,6 @@
 
 #include "common.h"
 #include "iBuffer.h"
-#include "tensorrt_llm/batch_manager/createNewDecoderRequests.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/stringUtils.h"
@@ -194,8 +193,8 @@ void GptSession::createDecoders(SizeType32 batchSize, SizeType32 beamWidth, Size
     {
         if (decoderPerRequest)
         {
-            mDecoders.emplace_back(std::make_shared<GptDecoderBatched>(
-                vocabSize, vocabSizePadded, stream, mModelConfig.getSpeculativeDecodingMode(), logitsType));
+            mDecoders.emplace_back(
+                std::make_shared<GptDecoderBatched>(stream, mModelConfig.getSpeculativeDecodingMode(), logitsType));
         }
         else
         {
@@ -203,7 +202,7 @@ void GptSession::createDecoders(SizeType32 batchSize, SizeType32 beamWidth, Size
         }
         constexpr SizeType32 maxTokensPerStep = 1;
         mDecoders.back()->setup(decodingMode, batchSize, beamWidth, maxAttentionWindow, sinkTokenLength,
-            maxSequenceLength, maxTokensPerStep, logitsType, mModelConfig);
+            maxSequenceLength, maxTokensPerStep, logitsType, mModelConfig, mWorldConfig);
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);

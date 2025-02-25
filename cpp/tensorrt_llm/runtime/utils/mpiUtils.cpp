@@ -332,6 +332,17 @@ MpiComm MpiComm::split(int color, int key) const
     return MpiComm{splitComm, true};
 }
 
+MpiComm const& MpiComm::setRawSessionByFortran(int64_t fortranHandle)
+{
+#if ENABLE_MULTI_DEVICE
+    auto comm = MpiComm{MPI_Comm_f2c(fortranHandle), false};
+#else
+    TLLM_THROW("Multi device support is disabled.");
+    auto comm = MpiComm(nullptr, false);
+#endif // ENABLE_MULTI_DEVICE
+    return MpiComm::setSession(std::move(comm));
+}
+
 void MpiComm::allreduce(void const* sendbuf, void* recvbuf, int count, MpiType dtype, MpiOp op) const
 {
 #if ENABLE_MULTI_DEVICE

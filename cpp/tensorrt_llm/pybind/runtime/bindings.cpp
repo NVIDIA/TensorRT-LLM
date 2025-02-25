@@ -240,14 +240,14 @@ void initBindings(pybind11::module_& m)
         .def(py::init<std::vector<tr::ITensor::SharedPtr>>(), py::arg("logits"))
         .def_readwrite("logits", &tr::decoder_batch::Input::logits)
         .def_readwrite("active", &tr::decoder_batch::Input::active)
-        .def_readwrite("cacheIndirection", &tr::decoder_batch::Input::cacheIndirection)
-        .def_readwrite("predictedDraftLogits", &tr::decoder_batch::Input::predictedDraftLogits)
-        .def_readwrite("seqSlots", &tr::decoder_batch::Input::seqSlots);
+        .def_readwrite("cache_indirection", &tr::decoder_batch::Input::cacheIndirection)
+        .def_readwrite("predicted_draft_logits", &tr::decoder_batch::Input::predictedDraftLogits)
+        .def_readwrite("batch_slots", &tr::decoder_batch::Input::batchSlots);
 
     py::class_<tr::decoder_batch::Output>(m, "DecoderBatchOutput")
         .def(py::init())
-        .def_readwrite("cacheIndirection", &tr::decoder::Output::cacheIndirection)
-        .def_readwrite("sequenceLengths", &tr::decoder::Output::sequenceLengths);
+        .def_readwrite("cache_indirection", &tr::decoder::Output::cacheIndirection)
+        .def_readwrite("sequence_lengths", &tr::decoder::Output::sequenceLengths);
 
     py::class_<tr::decoder::Input>(m, "Input")
         .def(py::init<tr::ITensor::SharedPtr>(), py::arg("logits"))
@@ -292,33 +292,29 @@ void initBindings(pybind11::module_& m)
         .def("synchronize", [](tr::decoder_batch::DecoderFinishedEvent& self) { self.event.synchronize(); });
 
     py::class_<tr::GptDecoderBatched>(m, "GptDecoderBatched")
-        .def(py::init<std::size_t, std::size_t, tr::GptDecoderBatched::CudaStreamPtr,
-                 tr::SpeculativeDecodingMode const&, nvinfer1::DataType>(),
-            py::arg("vocab_size"), py::arg("vocab_size_padded"), py::arg("stream"),
-            py::arg("speculative_decoding_mode"), py::arg("dtype"))
+        .def(py::init<tr::GptDecoderBatched::CudaStreamPtr, tr::SpeculativeDecodingMode const&, nvinfer1::DataType>(),
+            py::arg("stream"), py::arg("speculative_decoding_mode"), py::arg("dtype"))
         .def("setup", &tr::GptDecoderBatched::setup, py::arg("mode"), py::arg("max_batch_size"),
             py::arg("max_beam_width"), py::arg("max_attention_window"), py::arg("sink_token_length"),
-            py::arg("max_sequence_length"), py::arg("max_tokens_per_step"), py::arg("dtype"), py::arg("model_config"))
+            py::arg("max_sequence_length"), py::arg("max_tokens_per_step"), py::arg("dtype"), py::arg("model_config"),
+            py::arg("world_config"))
         .def("forward_async",
             py::overload_cast<tr::decoder_batch::Output&, tr::decoder_batch::Input const&>(
                 &tr::GptDecoderBatched::forwardAsync),
             py::arg("output"), py::arg("input"))
-        .def("forward_sync",
-            py::overload_cast<tr::decoder_batch::DecoderFinishedEvent const&>(&tr::GptDecoderBatched::forwardSync),
-            py::arg("token"))
         .def("setup_explicit_draft_tokens", &tr::GptDecoderBatched::setupExplicitDraftTokens,
             py::arg("explicit_draft_tokens_buffers"))
         .def("setup_lookahead", py::overload_cast<tr::LookaheadDecodingBuffers>(&tr::GptDecoderBatched::setupLookahead),
             py::arg("lookahead_decoding_buffers"))
         .def_property_readonly("decoding_mode", &tr::GptDecoderBatched::getDecodingMode)
-        .def_property_readonly("finished", &tr::GptDecoderBatched::getFinished)
         .def_property_readonly("joint_decoding_input", &tr::GptDecoderBatched::getJointDecodingInput)
         .def_property_readonly("joint_decoding_output", &tr::GptDecoderBatched::getJointDecodingOutput)
-        .def_property_readonly("batch_slots_setup", &tr::GptDecoderBatched::getBatchSlotsSetup)
         .def_property_readonly("stream_ptr", &tr::GptDecoderBatched::getDecoderStream)
         .def_property_readonly("max_decoding_engine_tokens", &tr::GptDecoderBatched::getMaxDecodingEngineTokens)
         .def_property_readonly(
             "all_new_tokens", [](tr::GptDecoderBatched& self) { return tr::Torch::tensor(self.getAllNewTokens()); })
+        .def_property_readonly(
+            "finished_sum", [](tr::GptDecoderBatched& self) { return tr::Torch::tensor(self.getFinishedSum()); })
         .def_property_readonly(
             "finish_reasons", [](tr::GptDecoderBatched& self) { return tr::Torch::tensor(self.getFinishReasons()); });
 

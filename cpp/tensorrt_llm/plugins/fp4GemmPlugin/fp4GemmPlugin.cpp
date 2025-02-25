@@ -42,7 +42,7 @@ void Fp4GemmPluginProfiler::runTactic(
     // Workspace size required by gemm runner
     // NB: this function will throw exception when selected tactic exceeds SMEM, which is then
     // caught by gemmPluginProfiler and it will register this tactic as invalid
-    size_t wsSizeRunner = mRunner->getWorkspaceSize(m, n, k);
+    size_t wsSizeRunner = mRunner->getWorkspaceSize(m, n, k, /* batch_count */ 1);
 
     // Workspace size required by profiling
     size_t wsByteOffset = 0;
@@ -62,7 +62,8 @@ void Fp4GemmPluginProfiler::runTactic(
     char* workspaceTmp = reinterpret_cast<char*>(nextWorkspacePtr(wsBytePointer, wsByteOffset, wsSizeRunner));
 
     // Run profiling
-    mRunner->gemm(dTmp, aTmp, bTmp, a_sf, b_sf, global_sf, m, n, k, tactic, workspaceTmp, wsSizeRunner, stream);
+    mRunner->gemm(dTmp, aTmp, bTmp, a_sf, b_sf, global_sf, m, n, k, /* batch_count */ 1, tactic, workspaceTmp,
+        wsSizeRunner, stream);
     sync_check_cuda_error();
 }
 
@@ -79,7 +80,7 @@ void Fp4GemmPluginProfiler::computeTmpSize(size_t maxM, size_t n, size_t k)
         (size_t) (sf_round_m * sf_round_k),                         // A_SF
         (size_t) (sf_round_n * sf_round_k),                         // B_SF
         sizeof(float),                                              // Global_SF
-        mRunner->getWorkspaceSize(maxM, n, k)                       // workspace
+        mRunner->getWorkspaceSize(maxM, n, k, /* batch_count */ 1)  // workspace
     };
     size_t bytes = calculateTotalWorkspaceSize(workspaces.data(), workspaces.size());
     setTmpWorkspaceSizeInBytes(bytes);
@@ -241,7 +242,7 @@ void Fp4GemmPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in,
         mDims = {minM, maxM, maxN, maxK};
     }
     mGemmId = {maxN, maxK, mOutputType};
-    m_workspaceMaxSize = mGemmRunner->getWorkspaceSize(maxM, maxN, maxK);
+    m_workspaceMaxSize = mGemmRunner->getWorkspaceSize(maxM, maxN, maxK, /* batch_count */ 1);
 }
 
 size_t Fp4GemmPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* inputs, int nbInputs,
@@ -271,14 +272,14 @@ int Fp4GemmPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1
     TLLM_CHECK_WITH_INFO(k % 32 == 0, "K dim should be aligned to 16 Bytes");
     int N_align = mOutputType == nvinfer1::DataType::kFLOAT ? 4u : 8u;
     TLLM_CHECK_WITH_INFO(n % N_align == 0, "N dim should be aligned to 16 Bytes");
-    size_t const wsSize = mGemmRunner->getWorkspaceSize(m, n, k);
+    size_t const wsSize = mGemmRunner->getWorkspaceSize(m, n, k, /* batch_count */ 1);
     auto const bestTactic = mPluginProfiler->getBestConfig(m, mGemmId);
     TLLM_CHECK_WITH_INFO(bestTactic, "No valid FP4 GEMM tactic");
     if (m >= 1)
     {
         mGemmRunner->gemm(outputs[0], inputs[0], inputs[2], inputs[1], inputs[3],
-            reinterpret_cast<float const*>(inputs[4]), m, n, k, *bestTactic, reinterpret_cast<char*>(workspace), wsSize,
-            stream);
+            reinterpret_cast<float const*>(inputs[4]), m, n, k, /* batch_count */ 1, *bestTactic,
+            reinterpret_cast<char*>(workspace), wsSize, stream);
     }
     sync_check_cuda_error();
     return 0;

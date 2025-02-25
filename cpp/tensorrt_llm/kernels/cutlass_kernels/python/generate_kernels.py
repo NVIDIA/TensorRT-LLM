@@ -317,6 +317,12 @@ def is_gemm_op_valid_sm100(op):
     if tile_m not in [64, 128]:
         return False
 
+    # Shapes for fp8 small N shapes
+    if (op.act_type == DataType.e4m3) and (tile_n == 16
+                                           or tile_n == 8) and (cga_m == 1
+                                                                and cga_n == 1):
+        return True
+
     # Default alignment requirements
     if tile_n % 32 != 0 or tile_n < 32 or tile_n > 256:
         return False
@@ -498,6 +504,16 @@ def generate_sm90_operations(is_arch_enabled):
     return operations
 
 
+def calc_shape_mnk_sm100_grouped_gemm(cta_shape_mn, dtype):
+    max_k_bits = 128 * 8
+    cta_shape_k = max_k_bits // GetDataTypeBits(dtype)
+    if dtype == DataType.e4m3 and (cta_shape_mn[1] == 8):
+        cta_shape_k = 256
+    if dtype == DataType.e4m3 and (cta_shape_mn[1] == 16):
+        cta_shape_k = 128
+    return cta_shape_mn + (cta_shape_k, )
+
+
 def generate_sm100_grouped_gemm_operations(is_arch_enabled):
     if not is_arch_enabled:
         return []
@@ -526,9 +542,7 @@ def generate_sm100_grouped_gemm_operations(is_arch_enabled):
 
     operations = list()
     for dtype, quant_op, epi_tag, epi_fusion, cta_shape_mn, cga_shape in partial_args:
-        max_k_bits = 128 * 8
-        cta_shape_k = max_k_bits // GetDataTypeBits(dtype)
-        cta_shape_mnk = cta_shape_mn + (cta_shape_k, )
+        cta_shape_mnk = calc_shape_mnk_sm100_grouped_gemm(cta_shape_mn, dtype)
         cga_tile_shape_mnk = elementwise(cta_shape_mnk, cga_shape, mul)
 
         # Ignored

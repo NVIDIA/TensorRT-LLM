@@ -80,6 +80,7 @@ Checkpoint saved in `output_dir` can be directly passed to `trtllm-build`.
 - tp_size: Checkpoint is tensor paralleled by tp_size. Default is 1.
 - pp_size: Checkpoint is pipeline paralleled by pp_size. Default is 1.
 - awq_block_size: AWQ algorithm specific parameter. Indicate the block size when quantizing weights. 64 and 128 are supported by TRTLLM.
+- quantize_lm_head: Enable quantization of lm_head layer. This is only supported for FP8 quantization. Default is false.
 
 #### NeMo model specific arguments:
 

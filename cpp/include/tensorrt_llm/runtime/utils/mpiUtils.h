@@ -282,6 +282,8 @@ public:
         return session;
     }
 
+    static MpiComm const& setRawSessionByFortran(int64_t fortranHandle);
+
     [[nodiscard]] MpiComm split(int color, int key) const;
 
     std::shared_ptr<MpiRequest> bcastAsync(void* buffer, size_t size, MpiType dtype, int root) const;

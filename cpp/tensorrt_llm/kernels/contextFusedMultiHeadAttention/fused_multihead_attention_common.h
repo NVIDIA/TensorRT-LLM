@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -128,17 +128,12 @@ struct MHARunnerFixedParams
     int tpSize = 1;
     // The tensor parallel rank (alibi).
     int tpRank = 0;
-
-    bool isDeepseekSpecialized()
-    {
-        if (headSize == 192 && headSizeV == 128)
-            return true;
-
-        if (headSize == 576 && headSizeV == 512)
-            return true;
-
-        return false;
-    }
+    // q tensor quant block size in sage attention
+    int sageBlockSizeQ = 0;
+    // k tensor quant block size in sage attention
+    int sageBlockSizeK = 0;
+    // v tensor quant block size in sage attention
+    int sageBlockSizeV = 0;
 
     // Convert to string for debug.
     std::string convertToStrOutput()
@@ -239,6 +234,14 @@ struct MHARunnerParams
     cudaStream_t stream;
     // Force using fp32 accumulation data type.
     bool forceFp32Acc = false;
+    // pointer to q, k, v scale tensor in sageattention
+    float* qScalePtr;
+    float* kScalePtr;
+    float* vScalePtr;
+    // q, k, v block size in sageattention
+    int qMaxNBlock;
+    int kMaxNBlock;
+    int vMaxNBlock;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -360,6 +363,18 @@ struct Fused_multihead_attention_params_v2
     int dv = 0;
     // The stride of V. If unset, v_stride_in_bytes = kv_stride_in_bytes * dv / d
     int64_t v_stride_in_bytes = 0;
+
+    // SageAttention parameters
+    struct SageAttention
+    {
+        struct Scales
+        {
+            // ceil(max_seqlen / block_size)
+            int max_nblock;
+            // The scale of each block, layout: (B, H, max_nblock)
+            float* scales;
+        } q, k, v;
+    } sage;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -410,6 +425,12 @@ struct Launch_params
     int device_l2_cache_size = 0;
     // total device memory (used by TMA loading of paged kv cache).
     size_t total_device_memory = 0;
+    // q tensor quant block size in sage attention
+    int sage_block_size_q = 0;
+    // k tensor quant block size in sage attention
+    int sage_block_size_k = 0;
+    // v tensor quant block size in sage attention
+    int sage_block_size_v = 0;
 };
 
 } // namespace kernels

@@ -1228,7 +1228,7 @@ def build(model: PretrainedModel, build_config: BuildConfig) -> Engine:
             network.plugin_config.weight_only_groupwise_quant_matmul_plugin = model.config.dtype
         else:
             network.plugin_config.weight_only_quant_matmul_plugin = model.config.dtype
-    if use_smooth_quant and model.config.quantization.use_plugin_sq and build_config.plugin_config.smooth_quant_plugins:
+    if use_smooth_quant and model.config.quantization._use_plugin_sq and build_config.plugin_config.smooth_quant_plugins:
         network.plugin_config.set_smooth_quant_plugins(model.config.dtype)
     if use_qserve:
         network.plugin_config.set_qserve_plugins(model.config.dtype)

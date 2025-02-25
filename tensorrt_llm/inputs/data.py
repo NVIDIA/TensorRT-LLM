@@ -55,9 +55,6 @@ def prompt_inputs(inputs: PromptInputs, ) -> Union[TextPrompt, TokensPrompt]:
     elif isinstance(inputs, dict):
         assert inputs.get("prompt") is not None \
             or inputs.get("prompt_token_ids") is not None
-        assert inputs.get("multi_modal_data") is None or inputs.get(
-            "mm_processor_kwargs"
-        ) is not None, "For multimodal inputs, must specify both input data and processor kwargs."
         return inputs
     else:
         raise TypeError(

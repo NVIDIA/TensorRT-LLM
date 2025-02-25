@@ -170,8 +170,7 @@ public:
         buildXQALaunchParams(launchParams, inputScratch, needOutputCvt, xqaParams, kv_cache_buffer);
 
         // Build cu_seqlens, padding_offset, and rotary inv freq tensors
-        BuildDecoderInfoParams<T> decoder_params;
-        memset(&decoder_params, 0, sizeof(decoder_params));
+        BuildDecoderInfoParams<T> decoder_params{};
         decoder_params.seqQOffsets = launchParams.cu_seq_lens;
         decoder_params.seqQLengths = xqaParams.spec_decoding_generation_lengths;
         decoder_params.seqKVLengths = xqaParams.sequence_lengths;

@@ -17,21 +17,17 @@
 file(GLOB_RECURSE SRC_CU *.cu)
 add_library(ws_layernorm_src STATIC ${SRC_CU})
 
-if("100" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
-   OR "100-real" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
-   OR "100-real" IN_LIST CMAKE_CUDA_ARCHITECTURES_NATIVE)
+if("100" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
 
   # for blackwell
   set(WS_LAYERNORM_NVCC_FLAGS)
   list(APPEND WS_LAYERNORM_NVCC_FLAGS --extra-device-vectorization)
-  list(APPEND WS_LAYERNORM_NVCC_FLAGS -gencode=arch=compute_100a,code=sm_100a)
   list(APPEND WS_LAYERNORM_NVCC_FLAGS
        --ptxas-options=--warn-on-local-memory-usage,--warn-on-spills)
 
   target_compile_options(
     ws_layernorm_src
     PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${WS_LAYERNORM_NVCC_FLAGS}>)
-  target_link_libraries(ws_layernorm_src PRIVATE CUDA::cuda_driver)
   target_compile_definitions(ws_layernorm_src
                              PRIVATE CUDA_PTX_KNOB_COLD_BLOCK_ENABLED)
 endif()

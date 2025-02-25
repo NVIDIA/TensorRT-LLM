@@ -98,6 +98,7 @@ class TrtllmAttentionWrapper:
         self.qk_nope_head_dim = mla_params.qk_nope_head_dim
         self.qk_rope_head_dim = mla_params.qk_rope_head_dim
         self.v_head_dim = mla_params.v_head_dim
+        self.q_scaling = 1.0
 
         if is_mla_enable:
             self.rotary_embedding_dim = 0
@@ -357,6 +358,7 @@ class TrtllmAttentionWrapper:
             self.beam_width,
             int(mask_type),
             self.quant_mode,
+            self.q_scaling,
             self.position_embedding_type,
             self.rotary_embedding_dim,
             self.rotary_embedding_base,

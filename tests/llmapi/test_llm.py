@@ -23,7 +23,7 @@ from tensorrt_llm.llmapi import (LLM, BuildCacheConfig, EagleDecodingConfig,
                                  GuidedDecodingParams, KvCacheConfig,
                                  KvCacheRetentionConfig,
                                  LookaheadDecodingConfig, MedusaDecodingConfig,
-                                 NoStatsAvailable, SamplingParams)
+                                 SamplingParams)
 from tensorrt_llm.llmapi._perf_evaluator import perform_faked_oai_postprocess
 from tensorrt_llm.llmapi.llm_utils import (BuildConfig, LlmArgs, QuantAlgo,
                                            QuantConfig, _ParallelConfig)
@@ -490,8 +490,11 @@ def _test_llm_generate_async(model_name=default_model_name,
 
 @pytest.fixture(scope="module")
 def llm_for_sampling_params() -> LLM:
+    build_config = BuildConfig(max_beam_width=3)
     llm = LLM(
         model=llama_model_path,
+        build_config=build_config,
+        fast_build=True,
         kv_cache_config=global_kvcache_config,
     )
     return llm
@@ -528,7 +531,6 @@ def test_generate_with_sampling_params_per_prompt(llm_for_sampling_params: LLM):
 
 
 @force_ampere
-@pytest.fixture(scope="module")
 @pytest.mark.parametrize(
     "sampling_params",
     [
@@ -560,6 +562,29 @@ def test_generate_with_SamplingConfig(llm_for_sampling_params: LLM,
     for output in llm.generate(prompts, sampling_params=sampling_params):
         print(output)
         assert len(output.outputs) == sampling_params.n
+
+
+@force_ampere
+def test_generate_with_seed(llm_for_sampling_params: LLM):
+    prompts = ["The capital of France is"] * 10
+    # Use a high temperature and large max_tokens to increase the diversity
+    sampling_params = [
+        SamplingParams(temperature=100, top_k=100, max_tokens=100)
+        for _ in range(10)
+    ]
+    # Fix the seed for the first 5 prompts
+    for i in range(5):
+        sampling_params[i].seed = 515
+
+    llm = llm_for_sampling_params
+    generated_texts = []
+    for output in llm.generate(prompts, sampling_params):
+        generated_texts.append(output.outputs[0].text)
+    for output in llm.generate(prompts, sampling_params):
+        generated_texts.append(output.outputs[0].text)
+
+    assert len(generated_texts) == 20
+    assert len(set(generated_texts)) == 11
 
 
 @force_ampere
@@ -1466,14 +1491,6 @@ class DummyExecutorMeta(type):
         return new_cls
 
 
-def test_llm_apidocs():
-    doc = LLM.__doc__
-    assert doc
-    assert doc.find('pipeline_parallel_size') != -1
-    assert doc.find('tensor_parallel_size') != -1
-    assert doc.find('auto_parallel') != -1
-
-
 def check_llm_return_context_logits(tp_size=1):
     build_config = BuildConfig(gather_context_logits=True)
 
@@ -1603,37 +1620,57 @@ def test_llm_handling_per_requeust_error_async():
     asyncio.run(task())
 
 
-def llm_get_stats_test_harness(tp_size: int = 1):
+def llm_get_stats_test_harness(tp_size: int = 1,
+                               return_context_logits: bool = False):
+    llm_args_extra = {}
+    sampling_args_extra = {}
+    if return_context_logits:
+        llm_args_extra["build_config"] = BuildConfig(gather_context_logits=True)
+        sampling_args_extra["return_context_logits"] = True
+
     llm = LLM(model=llama_model_path,
               kv_cache_config=global_kvcache_config,
               tensor_parallel_size=tp_size,
-              fast_build=True)
-    sampling_params = SamplingParams(max_tokens=100)
+              fast_build=True,
+              **llm_args_extra)
+
+    sampling_params = SamplingParams(max_tokens=100, **sampling_args_extra)
 
     for output in llm.generate(prompts, sampling_params=sampling_params):
         print(output)
 
-    while True:
-        try:
-            stats = llm._get_stats(2)
-            print(stats)
-        except NoStatsAvailable:
-            break
+    results = llm.get_stats(2)
+    assert results
+    print(results[-1])
+
+    assert not llm.get_stats(2)
+
+    # test that IterationStatsResult()._done is properly set
+    _ = llm.generate(prompts, sampling_params=sampling_params)
+    assert llm.get_stats(2)
 
 
-# The LLM._get_stats/_async is temporary APIs, and we don't plan to have a public one in the short run.
-# TODO Introduce some dedicated DS similar to executor.GenerationResult, that should be more stable
-@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5000903")
-def test_llm_get_stats():
-    llm_get_stats_test_harness(tp_size=1)
+@pytest.mark.parametrize("return_context_logits", [True, False])
+def test_llm_get_stats(return_context_logits):
+    llm_get_stats_test_harness(tp_size=1,
+                               return_context_logits=return_context_logits)
 
 
-def llm_get_stats_async_test_harness(tp_size: int = 1):
+def llm_get_stats_async_test_harness(tp_size: int = 1,
+                                     return_context_logits: bool = False):
+    llm_args_extra = {}
+    sampling_args_extra = {}
+    if return_context_logits:
+        llm_args_extra["build_config"] = BuildConfig(gather_context_logits=True)
+        sampling_args_extra["return_context_logits"] = True
+
     llm = LLM(model=llama_model_path,
               kv_cache_config=global_kvcache_config,
               tensor_parallel_size=tp_size,
-              fast_build=True)
-    sampling_params = SamplingParams(max_tokens=6)
+              fast_build=True,
+              **llm_args_extra)
+
+    sampling_params = SamplingParams(max_tokens=6, **sampling_args_extra)
 
     async def task0():
         async for output in llm.generate_async(prompts[0],
@@ -1642,22 +1679,24 @@ def llm_get_stats_async_test_harness(tp_size: int = 1):
             print(output)
 
     async def task1():
-        while True:
-            try:
-                stats = await llm._get_stats_async(2)
-                print(stats)
-            except NoStatsAvailable:
-                break
+        results = []
+        async for stats in llm.get_stats_async(timeout=2):
+            print(stats)
+            results.append(stats)
+
+        assert results
 
     async def main():
-        await asyncio.gather(task0(), task1())
+        for i in range(2):  # test recurrent usage
+            await asyncio.gather(task0(), task1())
 
     asyncio.run(main())
 
 
-@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5000903")
-def test_llm_get_stats_async():
-    llm_get_stats_async_test_harness(tp_size=1)
+@pytest.mark.parametrize("return_context_logits", [True, False])
+def test_llm_get_stats_async(return_context_logits):
+    llm_get_stats_async_test_harness(
+        tp_size=1, return_context_logits=return_context_logits)
 
 
 def test_llm_chunked_prefill():
@@ -1786,6 +1825,108 @@ def run_llm_with_postprocess_parallel_and_result_handler(tp_size: int = 1):
 
 def test_llm_with_postprocess_parallel_and_result_handler():
     run_llm_with_postprocess_parallel_and_result_handler(tp_size=1)
+
+
+def run_llm_abort_request(llm: LLM, sampling_params: SamplingParams):
+    # to make sure LLM run slower for canceling the request to be actually performed
+    sampling_params.max_tokens = 100
+    sampling_params.end_id = -1  # let it run for a while
+
+    async def task():
+        result = llm.generate_async(prompts[0],
+                                    sampling_params=sampling_params,
+                                    streaming=True)
+        print(f"to abort")
+        result.abort()
+
+        print(f"waiting for the result")
+        # Before it actually abort, we should see some outputs
+        outputs = []
+        async for output in result:
+            print(f"get output: {output}")
+            outputs.append(output)
+        print(f"get {len(outputs)} remaining outputs")
+        print(f"outputs: {outputs}")
+        print(f"finish_reason: {outputs[-1].outputs[0].finish_reason}")
+        assert 1 <= len(
+            outputs) < 1000  # It should be aborted before the completion
+        # NOTE: known issue: only the last output is finished and got the finish_reason
+        assert outputs[-1].outputs[-1].finish_reason == "cancelled"
+
+    asyncio.run(task())
+
+
+sampling_params_for_aborting_request = [
+    SamplingParams(),
+    # n-returns
+    SamplingParams(n=2, top_k=2),
+    SamplingParams(n=2, top_k=2, best_of=3),
+    SamplingParams(n=3, use_beam_search=True),
+    SamplingParams(n=2, best_of=3, use_beam_search=True),
+]
+
+
+@force_ampere
+@pytest.mark.parametrize("sampling_params",
+                         sampling_params_for_aborting_request)
+def test_llm_abort_request(llm_for_sampling_params,
+                           sampling_params: SamplingParams):
+    run_llm_abort_request(llm=llm_for_sampling_params,
+                          sampling_params=sampling_params)
+
+
+@force_ampere
+@pytest.mark.parametrize(
+    "sampling_params",
+    [
+        SamplingParams()  # pytorch only supports n=1
+    ])
+def test_llm_abort_request_pytorch(sampling_params):
+    from tensorrt_llm._torch import LLM as LLM_torch
+    llm = LLM_torch(model=llama_model_path,
+                    kv_cache_config=global_kvcache_config)
+    run_llm_abort_request(llm=llm, sampling_params=sampling_params)
+
+
+def test_llm_sampling_params_n_lt_max_batch_size():
+    sampling_params = SamplingParams(n=2, best_of=1)
+    build_config = BuildConfig(max_batch_size=1, max_seq_len=1024)
+    llm = LLM(model=llama_model_path,
+              kv_cache_config=global_kvcache_config,
+              build_config=build_config)
+
+    with pytest.raises(ValueError):
+        llm.generate_async(prompts[0], sampling_params=sampling_params)
+
+
+def test_llm_api_draft_target():
+    sampling_params = SamplingParams(max_tokens=4)
+
+    build_config = BuildConfig(
+        speculative_decoding_mode=SpeculativeDecodingMode.DRAFT_TOKENS_EXTERNAL,
+        max_draft_len=4,
+        max_batch_size=2,
+        max_beam_width=1,
+        max_seq_len=128,
+        max_num_tokens=64)
+
+    llm = LLM(llama_model_path,
+              build_config=build_config,
+              kv_cache_config=global_kvcache_config)
+
+    prompts = [
+        "Hello, my name is",
+        "The president of the United States is",
+        "The capital of France is",
+        "The future of AI is",
+    ]
+
+    outputs = llm.generate(prompts, sampling_params)
+
+    for output in outputs:
+        prompt = output.prompt
+        generated_text = output.outputs[0].text
+        print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
 
 
 if __name__ == '__main__':
