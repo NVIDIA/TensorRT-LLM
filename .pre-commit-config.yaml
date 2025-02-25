@@ -11,6 +11,7 @@ repos:
     rev: v0.43.0
     hooks:
     -   id: yapf
+        exclude: ".*/auto_deploy/.*"
 -   repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.1.0
     hooks:
@@ -22,12 +23,29 @@ repos:
     -   id: detect-private-key
     -   id: end-of-file-fixer
     -   id: check-yaml
+        args: [--allow-multiple-documents]
+        exclude: ".*/gitlab/.*.yml"
     -   id: trailing-whitespace
+    -   id: check-toml
+    -   id: mixed-line-ending
+        args: [--fix=lf]
+        files: ".*/auto_deploy/.*"
+    -   id: debug-statements
+        files: ".*/auto_deploy/.*"
+    -   id: check-json
+        files: ".*/auto_deploy/.*"
+        exclude: >
+          (?x)^(
+            .*\.vscode/.*\.json | # vscode files can take comments
+            .*\.devcontainer/.*\.json # devcontainer json files can take comments
+          )$
 -   repo: https://github.com/PyCQA/autoflake
-    rev: v1.6.1
+    rev: v2.3.1
     hooks:
     -   id: autoflake
-        args: ['--in-place', '--remove-all-unused-imports', '--remove-unused-variables']
+        additional_dependencies:
+        - tomli
+        args: ['--config', 'pyproject.toml']
 -   repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v16.0.0
     hooks:
@@ -40,11 +58,23 @@ repos:
     hooks:
     -   id: cmake-format
 -   repo: https://github.com/codespell-project/codespell
-    rev: v2.2.4
+    rev: v2.4.1
     hooks:
     -   id: codespell
-        args:
-        - --skip=".git,3rdparty"
-        - --exclude-file=examples/whisper/tokenizer.py
-        - --ignore-words-list=rouge,inout,atleast,strat,nd,subtile,thrid,improbe
-        exclude: 'tests/llm-test-defs/turtle/test_input_files|.*.jsonl'
+        additional_dependencies:
+        - tomli
+-   repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.4
+    hooks:
+    -   id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+        files: ".*/auto_deploy/.*"
+    -   id: ruff-format
+        files: ".*/auto_deploy/.*"
+-   repo: https://github.com/executablebooks/mdformat
+    rev: 0.7.17
+    hooks:
+    -   id: mdformat
+        additional_dependencies:
+        - mdformat_frontmatter
+        files: ".*/auto_deploy/.*"

@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 
 import numpy as np
 from cuda import cuda
+from mpi4py import MPI
 from packaging import version
 
 # isort: off
@@ -438,14 +439,28 @@ def dim_resolve_negative(dim, ndim):
 # mpi4py only exports MPI_COMM_TYPE_SHARED, so we define OMPI_COMM_TYPE_HOST here
 OMPI_COMM_TYPE_HOST = 9
 
+comm = MPI.COMM_WORLD
+
+
+def set_mpi_comm(new_comm):
+    global comm
+    comm = new_comm
+
 
 def mpi_comm():
-    from mpi4py import MPI
-    return MPI.COMM_WORLD
+    return comm
 
 
 def mpi_rank():
     return mpi_comm().Get_rank() if ENABLE_MULTI_DEVICE else 0
+
+
+def global_mpi_rank():
+    return MPI.COMM_WORLD.Get_rank() if ENABLE_MULTI_DEVICE else 0
+
+
+def global_mpi_size():
+    return MPI.COMM_WORLD.Get_size() if ENABLE_MULTI_DEVICE else 1
 
 
 def mpi_world_size():

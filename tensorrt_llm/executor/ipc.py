@@ -93,13 +93,15 @@ class ZeroMqQueue:
 
         if isinstance(obj, ExecutorResponse):
             tensors = self._store_tensors_in_shmm(obj.tensors)
-            obj = ExecutorResponse(client_id=obj.client_id,
-                                   sequence_index=obj.sequence_index,
-                                   tensors=tensors,
-                                   finish_reasons=obj.finish_reasons,
-                                   is_final=obj.is_final,
-                                   error=obj.error,
-                                   timestamp=obj.timestamp)
+            obj = ExecutorResponse(
+                client_id=obj.client_id,
+                sequence_index=obj.sequence_index,
+                tensors=tensors,
+                finish_reasons=obj.finish_reasons,
+                is_final=obj.is_final,
+                error=obj.error,
+                timestamp=obj.timestamp,
+                disaggregated_params=obj.disaggregated_params)
 
         with nvtx_range("send", color="blue", category="IPC"):
             self.socket.send_pyobj(obj)
@@ -108,12 +110,14 @@ class ZeroMqQueue:
         self.setup_lazily()
         if isinstance(obj, ExecutorResponse):
             tensors = self._store_tensors_in_shmm(obj.tensors)
-            obj = ExecutorResponse(client_id=obj.client_id,
-                                   tensors=tensors,
-                                   finish_reasons=obj.finish_reasons,
-                                   is_final=obj.is_final,
-                                   error=obj.error,
-                                   timestamp=obj.timestamp)
+            obj = ExecutorResponse(
+                client_id=obj.client_id,
+                tensors=tensors,
+                finish_reasons=obj.finish_reasons,
+                is_final=obj.is_final,
+                error=obj.error,
+                timestamp=obj.timestamp,
+                disaggregated_params=obj.disaggregated_params)
 
         try:
             await self.socket.send_pyobj(obj)
@@ -135,12 +139,14 @@ class ZeroMqQueue:
 
         if isinstance(obj, ExecutorResponse):
             tensors = self._load_tensors_from_shmm(obj.tensors)
-            obj = ExecutorResponse(client_id=obj.client_id,
-                                   tensors=tensors,
-                                   finish_reasons=obj.finish_reasons,
-                                   is_final=obj.is_final,
-                                   error=obj.error,
-                                   timestamp=obj.timestamp)
+            obj = ExecutorResponse(
+                client_id=obj.client_id,
+                tensors=tensors,
+                finish_reasons=obj.finish_reasons,
+                is_final=obj.is_final,
+                error=obj.error,
+                timestamp=obj.timestamp,
+                disaggregated_params=obj.disaggregated_params)
         return obj
 
     async def get_async(self) -> Any:
@@ -151,13 +157,15 @@ class ZeroMqQueue:
 
         if isinstance(obj, ExecutorResponse):
             tensors = self._load_tensors_from_shmm(obj.tensors)
-            obj = ExecutorResponse(client_id=obj.client_id,
-                                   tensors=tensors,
-                                   sequence_index=obj.sequence_index,
-                                   finish_reasons=obj.finish_reasons,
-                                   is_final=obj.is_final,
-                                   error=obj.error,
-                                   timestamp=obj.timestamp)
+            obj = ExecutorResponse(
+                client_id=obj.client_id,
+                tensors=tensors,
+                sequence_index=obj.sequence_index,
+                finish_reasons=obj.finish_reasons,
+                is_final=obj.is_final,
+                error=obj.error,
+                timestamp=obj.timestamp,
+                disaggregated_params=obj.disaggregated_params)
         return obj
 
     def close(self):
@@ -291,23 +299,29 @@ class FusedIpcQueue:
     def _prepare_message(self, obj: Any) -> Any:
         if isinstance(obj, ExecutorResponse):
             tensors = self.queue._store_tensors_in_shmm(obj.tensors)
-            return ExecutorResponse(client_id=obj.client_id,
-                                    tensors=tensors,
-                                    finish_reasons=obj.finish_reasons,
-                                    is_final=obj.is_final,
-                                    sequence_index=obj.sequence_index,
-                                    error=obj.error)
+            return ExecutorResponse(
+                client_id=obj.client_id,
+                tensors=tensors,
+                finish_reasons=obj.finish_reasons,
+                is_final=obj.is_final,
+                sequence_index=obj.sequence_index,
+                error=obj.error,
+                timestamp=obj.timestamp,
+                disaggregated_params=obj.disaggregated_params)
         return obj
 
     def _process_message(self, obj: Any) -> Any:
         if isinstance(obj, ExecutorResponse):
             tensors = self.queue._load_tensors_from_shmm(obj.tensors)
-            return ExecutorResponse(client_id=obj.client_id,
-                                    tensors=tensors,
-                                    finish_reasons=obj.finish_reasons,
-                                    is_final=obj.is_final,
-                                    sequence_index=obj.sequence_index,
-                                    error=obj.error)
+            return ExecutorResponse(
+                client_id=obj.client_id,
+                tensors=tensors,
+                finish_reasons=obj.finish_reasons,
+                is_final=obj.is_final,
+                sequence_index=obj.sequence_index,
+                error=obj.error,
+                timestamp=obj.timestamp,
+                disaggregated_params=obj.disaggregated_params)
         return obj
 
     @property

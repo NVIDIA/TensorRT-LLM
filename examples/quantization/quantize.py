@@ -111,6 +111,9 @@ if __name__ == "__main__":
                         help="KV Cache dtype.",
                         default=None,
                         choices=["int8", "fp8", None])
+    parser.add_argument("--quantize_lm_head",
+                        action='store_true',
+                        default=False)
     # Medusa
     parser.add_argument('--num_medusa_heads', type=int, default=4)
     parser.add_argument('--num_medusa_layers', type=int, default=1)
@@ -179,7 +182,8 @@ if __name__ == "__main__":
             medusa_model_dir=args.medusa_model_dir,
             quant_medusa_head=args.quant_medusa_head,
             auto_quantize_bits=args.auto_quantize_bits,
-            device_map=args.device_map)
+            device_map=args.device_map,
+            quantize_lm_head=args.quantize_lm_head)
     elif args.nemo_ckpt_path is not None:
         quantize_nemo_and_export(nemo_ckpt_path=args.nemo_ckpt_path,
                                  decoder_type=args.decoder_type,

@@ -9,9 +9,10 @@ from typing import List, Optional, TypeVar
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 
 if ENABLE_MULTI_DEVICE:
+    import mpi4py
     from mpi4py.futures import MPICommExecutor, MPIPoolExecutor
 
-    from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
+    from tensorrt_llm._utils import global_mpi_size, mpi_world_size
 
 T = TypeVar("T")
 
@@ -48,7 +49,9 @@ def external_mpi_comm_available(model_world_size: int) -> bool:
     e.g. mpirun -np 4 python script.py
     '''
     if ENABLE_MULTI_DEVICE:
-        return mpi_world_size() == model_world_size and model_world_size > 1
+        return (mpi_world_size() == model_world_size
+                and model_world_size > 1) or (global_mpi_size()
+                                              > mpi_world_size())
     else:
         return False
 
@@ -59,6 +62,13 @@ def need_spawn_mpi_workers(model_world_size: int) -> bool:
         return mpi_world_size() == 1 and model_world_size > 1
     else:
         return False
+
+
+def set_mpi_session_cpp(comm):
+    if ENABLE_MULTI_DEVICE:
+        comm_fortran = comm.py2f()
+        from tensorrt_llm.bindings import MpiComm
+        MpiComm.set_raw_mpi_session_by_fortran_handle(comm_fortran)
 
 
 class MpiSession(abc.ABC):
@@ -83,6 +93,11 @@ class MpiPoolSession(MpiSession):
         self.n_workers = n_workers
         self.mpi_pool: Optional[MPIPoolExecutor] = None
         self._start_mpi_pool()
+        if ENABLE_MULTI_DEVICE:
+            self.comm = mpi4py.MPI.COMM_WORLD
+
+    def get_comm(self):
+        return self.comm
 
     def submit(self, task: Callable[..., T], *args,
                **kwargs) -> List[Future[T]]:
@@ -118,26 +133,38 @@ class MpiPoolSession(MpiSession):
 
 class MpiCommSession(MpiSession):
 
-    def __init__(self, n_workers: int = 1):
+    def __init__(self, comm=None, n_workers: int = 1):
+        self.comm = comm
+
         if n_workers <= 0:
             raise ValueError(
                 f'n_workers must be non-negative, but got {n_workers}')
-        if n_workers != mpi_world_size():
-            raise ValueError(
-                f'n_workers must be equal to the number of processes launched by mpirun, got {n_workers} vs {mpi_world_size()}'
-            )
 
-        if mpi_rank() != 0:
-            raise RuntimeError(
-                f'only rank 0 can start multi-node session, got {mpi_rank()}')
-        if not external_mpi_comm_available(n_workers):
-            raise RuntimeError('The LLM instance should be launched by mpirun.')
+        if ENABLE_MULTI_DEVICE:
+            if not self.comm:
+                self.comm = mpi4py.MPI.COMM_WORLD
+
+            if self.comm.Get_rank() != 0:
+                raise RuntimeError(
+                    f'only rank 0 can start multi-node session, got {self.comm.Get_rank()}'
+                )
+
+            if self.comm.Get_size() != n_workers:
+                raise ValueError(
+                    f'n_workers must be equal to the number of processes , got {n_workers} vs {mpi_world_size()}'
+                )
 
         self.n_workers = n_workers
         self.thread_pool: Optional[ThreadPoolExecutor] = None
         self.mpi_pool: Optional[MPIPoolExecutor] = None
 
         self._start_mpi_pool()
+
+        if not external_mpi_comm_available(n_workers):
+            raise RuntimeError('The LLM instance should be launched by mpirun.')
+
+    def get_comm(self):
+        return self.comm
 
     def submit(self,
                task: (...),
@@ -186,7 +213,7 @@ class MpiCommSession(MpiSession):
         assert not self.mpi_pool, 'MPI session already started'
 
         self.thread_pool = ThreadPoolExecutor(max_workers=2)
-        comm_executor = MPICommExecutor(mpi_comm())
+        comm_executor = MPICommExecutor(self.comm)
         self.mpi_pool = comm_executor.__enter__()
 
     def __del__(self):

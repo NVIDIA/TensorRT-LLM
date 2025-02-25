@@ -383,7 +383,6 @@ class Attention(Module):
                  block_sparse_params=None,
                  use_implicit_relative_attention=False,
                  reorder=False,
-                 layer_idx_in_cache_pool=None,
                  enable_qkv=True,
                  cp_group=[0],
                  cp_size=1,
@@ -397,7 +396,6 @@ class Attention(Module):
         self.attention_mask_type = attention_mask_type
         self.attention_head_size = hidden_size // num_attention_heads if attention_head_size is None else attention_head_size
         self.num_kv_heads = num_kv_heads
-        self.layer_idx_in_cache_pool = layer_idx_in_cache_pool if layer_idx_in_cache_pool is not None else local_layer_idx
         assert num_attention_heads % tp_size == 0, \
         "num_attention_heads must be divisible by tp_size"
         self.num_attention_heads = num_attention_heads // tp_size
@@ -1060,7 +1058,6 @@ class Attention(Module):
                 layer_idx=self.local_layer_idx,
                 num_heads=self.num_attention_heads,
                 num_kv_heads=self.num_attention_kv_heads,
-                layer_idx_in_cache_pool=self.layer_idx_in_cache_pool,
                 hidden_size_per_head=self.attention_head_size,
                 q_scaling=self.q_scaling,
                 rotary_embedding_dim=self.rotary_embedding_dim,
@@ -2219,7 +2216,6 @@ class DeepseekV2Attention(Attention):
                 layer_idx=self.local_layer_idx,
                 num_heads=self.num_attention_heads,
                 num_kv_heads=1,
-                layer_idx_in_cache_pool=self.layer_idx_in_cache_pool,
                 hidden_size_per_head=self.kv_lora_rank + self.qk_rope_head_dim,
                 q_scaling=self.q_scaling,
                 position_embedding_type=self.position_embedding_type,

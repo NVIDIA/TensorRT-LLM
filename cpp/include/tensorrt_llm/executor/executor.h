@@ -155,7 +155,7 @@ private:
     std::optional<TokenIdType> mTopPResetIds;
     /// @brief Controls decay in the top-P algorithm. The decay value. Default is 1.f
     std::optional<FloatType> mTopPDecay;
-    /// @brief Controls the random seed used by the random number generator in sampling
+    /// @brief Controls the random seed used by the random number generator in sampling. Default is 0.
     std::optional<RandomSeedType> mSeed;
     /// @brief Controls the modulation of logits when sampling new tokens. It can have values > 0.f. Default is 1.0f
     std::optional<FloatType> mTemperature;
@@ -175,7 +175,7 @@ private:
     /// @brief Controls how to penalize longer sequences in beam search. Default is 0.f
     std::optional<FloatType> mLengthPenalty;
     /// @brief Controls whether the generation process finishes once beamWidth sentences are generated (ends with
-    /// end_token)
+    /// end_token). Default is 1.
     std::optional<SizeType32> mEarlyStopping;
     /// @brief Controls how many repeat ngram size are acceptable. Default is 1 << 30.
     std::optional<SizeType32> mNoRepeatNgramSize;
@@ -399,6 +399,7 @@ public:
 
     explicit ContextPhaseParams(VecTokens firstGenTokens, RequestIdType reqId);
     ContextPhaseParams(VecTokens firstGenTokens, RequestIdType reqId, void* state);
+    ContextPhaseParams(VecTokens firstGenTokens, RequestIdType reqId, std::vector<char> const& serializedState);
 
     ContextPhaseParams(ContextPhaseParams const&);
     ContextPhaseParams(ContextPhaseParams&&) noexcept;
@@ -415,6 +416,7 @@ public:
     [[nodiscard]] void const* getState() const noexcept;
     [[nodiscard]] void* getState() noexcept;
     [[nodiscard]] void* releaseState() noexcept;
+    [[nodiscard]] std::vector<char> getSerializedState() const noexcept;
 
 private:
     friend class Serialization;
@@ -895,7 +897,7 @@ private:
 
     /// @brief A vector of (batchSizeLimit, batchSize). When max capacity batch size is less than
     // batchSizeLimit_{i} but greater or equal to batchSizeLimit_{i-1}, the batch size will be batchSize_{i}.
-    // For max capcity batch size beyond the last batchSizeLimit, the batch size may be rounded down to multiple of 512
+    // For max capacity batch size beyond the last batchSizeLimit, the batch size may be rounded down to multiple of 512
     // based on the actual implementation.
     std::vector<std::pair<SizeType32, SizeType32>> mBatchSizeTable;
 };

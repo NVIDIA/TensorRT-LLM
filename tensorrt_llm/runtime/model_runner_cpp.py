@@ -810,14 +810,14 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 mrope_rotary_cos_sin,
                 torch.Tensor), "mrope_rotary_cos_sin should be torch.Tensor"
             mrope_rotary_cos_sin_data = mrope_rotary_cos_sin.to(
-                dtype=torch.float32).to(torch.device('cpu'))
+                dtype=torch.float32)
 
             mrope_position_deltas = mrope.mrope_position_deltas
             assert isinstance(
                 mrope_position_deltas,
                 torch.Tensor), "mrope_position_deltas should be torch.Tensor"
             mrope_position_deltas_data = mrope_position_deltas.to(
-                dtype=torch.int32).to(torch.device('cpu'))
+                dtype=torch.int32)
 
             mrope_configs = [
                 trtllm.MropeConfig(

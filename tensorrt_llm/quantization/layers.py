@@ -1844,8 +1844,7 @@ class Fp8RowwiseAttention(Module):
                  scale_alibi_bias=False,
                  paged_kv_cache=False,
                  quant_mode=QuantMode(0),
-                 clamp_val=None,
-                 layer_idx_in_cache_pool=None):
+                 clamp_val=None):
         super().__init__()
         self.local_layer_idx = local_layer_idx
         self.attention_mask_type = attention_mask_type
@@ -1854,7 +1853,6 @@ class Fp8RowwiseAttention(Module):
         self.num_attention_kv_heads = (
             num_kv_heads + tp_size - 1
         ) // tp_size if num_kv_heads is not None else self.num_attention_heads
-        self.layer_idx_in_cache_pool = layer_idx_in_cache_pool
         self.hidden_size = hidden_size // tp_size
         self.max_position_embeddings = 0 if max_position_embeddings is None else max_position_embeddings
         self.tp_size = tp_size
@@ -2012,7 +2010,6 @@ class Fp8RowwiseAttention(Module):
             layer_idx=self.local_layer_idx,
             num_heads=self.num_attention_heads,
             num_kv_heads=self.num_attention_kv_heads,
-            layer_idx_in_cache_pool=self.layer_idx_in_cache_pool,
             hidden_size_per_head=self.attention_head_size,
             q_scaling=self.q_scaling,
             rotary_embedding_dim=self.rotary_embedding_dim,
@@ -2464,8 +2461,7 @@ class SmoothQuantAttention(Module):
                  tp_rank=0,
                  scale_alibi_bias=False,
                  paged_kv_cache=False,
-                 quant_mode=QuantMode(0),
-                 layer_idx_in_cache_pool=None):
+                 quant_mode=QuantMode(0)):
         super().__init__()
         self.local_layer_idx = local_layer_idx
         self.attention_mask_type = attention_mask_type
@@ -2474,7 +2470,6 @@ class SmoothQuantAttention(Module):
         self.num_attention_kv_heads = (
             num_kv_heads + tp_size - 1
         ) // tp_size if num_kv_heads is not None else self.num_attention_heads
-        self.layer_idx_in_cache_pool = layer_idx_in_cache_pool
         self.hidden_size = hidden_size // tp_size
         self.max_position_embeddings = 0 if max_position_embeddings is None else max_position_embeddings
         self.tp_size = tp_size
@@ -2639,7 +2634,6 @@ class SmoothQuantAttention(Module):
                 layer_idx=self.local_layer_idx,
                 num_heads=self.num_attention_heads,
                 num_kv_heads=self.num_attention_kv_heads,
-                layer_idx_in_cache_pool=self.layer_idx_in_cache_pool,
                 hidden_size_per_head=self.attention_head_size,
                 q_scaling=self.q_scaling,
                 rotary_embedding_dim=self.rotary_embedding_dim,
@@ -2987,8 +2981,7 @@ class QServeAttention(Module):
                  tp_rank=0,
                  scale_alibi_bias=False,
                  paged_kv_cache=False,
-                 quant_mode=QuantMode(0),
-                 layer_idx_in_cache_pool=None):
+                 quant_mode=QuantMode(0)):
         super().__init__()
         self.local_layer_idx = local_layer_idx
         self.attention_mask_type = attention_mask_type
@@ -2997,7 +2990,6 @@ class QServeAttention(Module):
         self.num_attention_kv_heads = (
             num_kv_heads + tp_size - 1
         ) // tp_size if num_kv_heads is not None else self.num_attention_heads
-        self.layer_idx_in_cache_pool = layer_idx_in_cache_pool
         self.hidden_size = hidden_size // tp_size
         self.max_position_embeddings = 0 if max_position_embeddings is None else max_position_embeddings
         self.tp_size = tp_size
@@ -3162,7 +3154,6 @@ class QServeAttention(Module):
                 layer_idx=self.local_layer_idx,
                 num_heads=self.num_attention_heads,
                 num_kv_heads=self.num_attention_kv_heads,
-                layer_idx_in_cache_pool=self.layer_idx_in_cache_pool,
                 hidden_size_per_head=self.attention_head_size,
                 q_scaling=self.q_scaling,
                 rotary_embedding_dim=self.rotary_embedding_dim,

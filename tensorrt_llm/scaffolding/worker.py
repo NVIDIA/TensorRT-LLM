@@ -123,7 +123,7 @@ class ProposerWorker(Worker):
             ]:
                 if token in vocab and token != self.tokenizer.eos_token:
                     sampling_params.stop.append(token)
-        sampling_params.setup(self.tokenizer)
+        sampling_params._setup(self.tokenizer)
         return sampling_params
 
     def _combine_sampling_params(self, base: SamplingParams, custom: dict):

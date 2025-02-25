@@ -12,11 +12,12 @@ __all__ = [
     "GenerationRequest",
     "LoRARequest",
     "PromptAdapterRequest",
-    "GenerationResult",
     "ExecutorBindingsWorker",
     "ExecutorBindingsProxy",
     "RequestError",
+    "CompletionOutput",
     "GenerationResultBase",
     "DetokenizedGenerationResultBase",
     "GenerationResult",
+    "IterationStatsResult",
 ]

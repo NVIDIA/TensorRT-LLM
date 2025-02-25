@@ -8,13 +8,16 @@ parameterized
 pre-commit
 pybind11
 pybind11-stubgen
+pytest
 pytest-asyncio
 pytest-cov
 pytest-csv
+pytest-env
 pytest-forked
 pytest-xdist
 pytest-timeout
 pytest-split
+pytest-mock
 rouge_score
 cloudpickle
 typing-extensions==4.12.2
@@ -23,3 +26,6 @@ jsonlines==4.0.0
 jieba==0.42.1
 rouge==1.0.1
 pytest-rerunfailures
+ruff==0.9.4
+lm_eval[api]==0.4.5
+docstring_parser

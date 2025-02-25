@@ -173,7 +173,7 @@ class LLaMADecoderLayer(Module):
                     ).plugin_config.gemm_plugin == "nvfp4", "UB with nvfp4 model must use nvfp4 gemm plugin"
                     reduce_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4
                 else:
-                    assert false, "UB must enabled with fp8 or nvfp4 model"
+                    assert False, "UB must enabled with fp8 or nvfp4 model"
             else:
                 reduce_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
 
@@ -569,7 +569,7 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
         tokenizer_max_seq_length: int = 2048,
         **kwargs,
     ):
-        if quant_config.requires_modelopt_quantization:
+        if quant_config._requires_modelopt_quantization:
             # modelopt quantization flow
             super().quantize(hf_model_dir,
                              output_dir,
@@ -583,7 +583,7 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
                              calib_max_seq_length=calib_max_seq_length,
                              random_seed=random_seed,
                              tokenizer_max_seq_length=tokenizer_max_seq_length)
-        elif quant_config.requires_calibration:
+        elif quant_config._requires_calibration:
             # non-modelopt quantization flow
             from . import convert
 

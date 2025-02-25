@@ -30,6 +30,7 @@ add_library(
   fmhaPackMaskOp.cpp
   fp8Op.cpp
   fp4Op.cpp
+  fp4Bmm.cpp
   fp4Gemm.cpp
   fp4Quantize.cpp
   fp8BlockScalingGemm.cpp

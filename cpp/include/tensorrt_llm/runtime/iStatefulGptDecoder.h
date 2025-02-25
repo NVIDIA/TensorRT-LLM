@@ -23,6 +23,7 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
+#include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <memory>
 #include <utility>
@@ -81,7 +82,8 @@ public:
     //! Setup the decoder before calling `forward()`, also calls reshapeBuffers
     virtual void setup(executor::DecodingMode const& mode, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
         SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, SizeType32 maxSequenceLength,
-        SizeType32 maxTokensPerStep, nvinfer1::DataType dtype, ModelConfig const& modelConfig)
+        SizeType32 maxTokensPerStep, nvinfer1::DataType dtype, ModelConfig const& modelConfig,
+        WorldConfig const& worldConfig)
         = 0;
 
     //! @brief Initialize the decoder with new batch of inputs.

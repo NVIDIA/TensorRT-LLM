@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -4185,7 +4185,7 @@ def gemm_allreduce(a: Tensor,
         Returns GEMM output tensor which has been reduced across ranks.
     '''
 
-    # Output tensor needs to be bound to externally mananged
+    # Output tensor needs to be bound to externally managed
     # memory so keep track of layer index so we can assign
     # output tensor unique label.
     if not hasattr(gemm_allreduce, 'layer_idx'):
@@ -4297,7 +4297,11 @@ def bert_attention(tensor: Tensor,
                    relative_attention: bool = False,
                    relative_attention_bias: Tensor = None,
                    max_distance: int = 0,
-                   max_input_length: Tensor = None) -> Tuple[Tensor]:
+                   max_input_length: Tensor = None,
+                   sage_attn: bool = False,
+                   sage_attn_q_block_size: int = 0,
+                   sage_attn_k_block_size: int = 0,
+                   sage_attn_v_block_size: int = 0) -> Tuple[Tensor]:
     '''
     Add an operation that performs the multi-head attention in BERT.
 
@@ -4351,6 +4355,19 @@ def bert_attention(tensor: Tensor,
         max_input_length: Tensor = None
             The maximum input sequence length represented by Tensor shape. Requires for remove_input_padding to pre-define plugin workspace size.
 
+        sage_attn: bool = False
+            SageAttention is a 8-bit implementation of attention kernel. It's input q, k, v and output datatypes are 16-bit. It performance dynamic quantization for q, k, v
+            tensor every time before attention. https://github.com/thu-ml/SageAttention
+
+        sage_attn_q_quant_size: int = 0
+            dynamic quant block size along sequence dimension of q tensor. Each quant block will share one scale.
+
+        sage_attn_k_quant_size: int = 0
+            dynamic quant block size along sequence dimension of k tensor. Each quant block will share one scale.
+
+        sage_attn_v_quant_size: int = 0
+            dynamic quant block size along sequence dimension of v tensor. Each quant block will share one scale.
+
     Returns:
         The tensor produced by that layer.
     '''
@@ -4385,9 +4402,30 @@ def bert_attention(tensor: Tensor,
         "remove_padding",
         np.array(np.int8(default_net().plugin_config.remove_input_padding),
                  dtype=np.int8), trt.PluginFieldType.INT8)
+
+    sage_attn = trt.PluginField("sage_attn",
+                                np.array(np.int8(sage_attn), dtype=np.int8),
+                                trt.PluginFieldType.INT8)
+
+    sage_attn_q_block_size = trt.PluginField(
+        "sage_attn_q_block_size",
+        np.array(sage_attn_q_block_size, dtype=np.int32),
+        trt.PluginFieldType.INT32)
+
+    sage_attn_k_block_size = trt.PluginField(
+        "sage_attn_k_block_size",
+        np.array(sage_attn_k_block_size, dtype=np.int32),
+        trt.PluginFieldType.INT32)
+
+    sage_attn_v_block_size = trt.PluginField(
+        "sage_attn_v_block_size",
+        np.array(sage_attn_v_block_size, dtype=np.int32),
+        trt.PluginFieldType.INT32)
+
     pfc = trt.PluginFieldCollection([
         nheads, head_size, q_scaling, context_fmha_type, pf_type,
-        do_relative_attention, max_distance, remove_padding
+        do_relative_attention, max_distance, remove_padding, sage_attn,
+        sage_attn_q_block_size, sage_attn_k_block_size, sage_attn_v_block_size
     ])
 
     attn_plug = attn_plg_creator.create_plugin("padding_attn", pfc)
@@ -4995,7 +5033,6 @@ def gpt_attention(
     mrope_position_deltas: Tensor = None,
     host_runtime_perf_knobs: Optional[Tensor] = None,
     host_context_progress: Tensor = None,
-    layer_idx_in_cache_pool: Optional[int] = None,
     is_mla_enabled_flag: bool = False,
     q_lora_rank: int = 0,
     kv_lora_rank: int = 0,
@@ -5193,7 +5230,7 @@ def gpt_attention(
             See KV cache section in docs/source/advanced/gpt-attention.md, on gpu,
 
         host_kv_cache_pool_mapping:
-            The tensor of pool mapping for the different memory pools. Its shape is [num_layers,],
+            The tensor of pool mapping for the different memory pools. Its shape is [num_layers,2] - for each layer, the index of the pool, and the index of the layer within the pool,
 
         do_cross_attention: bool = False
             Do we use this as cross attention instead of self attention,
@@ -5287,9 +5324,6 @@ def gpt_attention(
     assert host_max_attention_window_sizes is not None
     assert host_sink_token_length is not None
 
-    if layer_idx_in_cache_pool is None:
-        layer_idx_in_cache_pool = layer_idx
-
     paged_kv_cache_flag = default_net().plugin_config.paged_kv_cache
     if isinstance(qkv, list):
         is_unfuse_qkv_gemm = 1
@@ -5322,10 +5356,6 @@ def gpt_attention(
     num_kv_heads = trt.PluginField("num_kv_heads",
                                    np.array(num_kv_heads, dtype=np.int32),
                                    trt.PluginFieldType.INT32)
-    layer_idx_in_cache_pool = trt.PluginField(
-        "layer_idx_in_cache_pool",
-        np.array(layer_idx_in_cache_pool, dtype=np.int32),
-        trt.PluginFieldType.INT32)
     head_size = trt.PluginField("head_size",
                                 np.array(hidden_size_per_head, dtype=np.int32),
                                 trt.PluginFieldType.INT32)
@@ -5517,10 +5547,9 @@ def gpt_attention(
         trt.PluginFieldType.INT8)
 
     pfc = trt.PluginFieldCollection([
-        layer_idx, nheads, vision_start, vision_length, num_kv_heads,
-        layer_idx_in_cache_pool, head_size, unidirectional, q_scaling,
-        attn_logit_softcapping_scale, position_embedding_type,
-        rotary_embedding_dim, rotary_embedding_base,
+        layer_idx, nheads, vision_start, vision_length, num_kv_heads, head_size,
+        unidirectional, q_scaling, attn_logit_softcapping_scale,
+        position_embedding_type, rotary_embedding_dim, rotary_embedding_base,
         rotary_embedding_scale_type, rotary_embedding_scale,
         rotary_embedding_short_m_scale, rotary_embedding_long_m_scale,
         rotary_embedding_max_positions, rotary_embedding_original_max_positions,

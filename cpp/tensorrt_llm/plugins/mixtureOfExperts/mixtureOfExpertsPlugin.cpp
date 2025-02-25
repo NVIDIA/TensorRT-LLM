@@ -957,7 +957,6 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     }
 
     mMOERunner->setTactic(gemm1, gemm2);
-    BlockScaleParams deepseek_params{};
     mMOERunner->runMoe(inputs[getInputTensorIndex()], static_cast<float const*>(inputs[getRoutingTensorIndex()]),
         inputs[getExpertWeights1Index()], hasBias() ? inputs[getExpertBias1Index()] : nullptr, mActivationType,
         inputs[getExpertWeights2Index()], hasBias() ? inputs[getExpertBias2Index()] : nullptr, quant_params, num_tokens,
@@ -967,7 +966,7 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         hasFinishedTensor() ? static_cast<bool const*>(inputs[getFinishedTensorIndex()]) : nullptr, num_not_finished,
         workspace.scale_probs, static_cast<int*>(workspace.src_to_dest_map),
         static_cast<int*>(workspace.selected_experts), mSparseMixerEpsilon, mParallelismConfig, mNormalizationMode,
-        hasLora(), lora_params, /*use_fp8_block_scaling=*/false, deepseek_params, stream);
+        hasLora(), lora_params, /*use_fp8_block_scaling=*/false, stream);
 
     if (useSideStream())
     {

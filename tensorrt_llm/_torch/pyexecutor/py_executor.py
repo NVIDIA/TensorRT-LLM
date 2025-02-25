@@ -15,10 +15,11 @@ import torch
 
 import tensorrt_llm.bindings.executor as trtllm
 
-from ..._utils import nvtx_range
+from ..._utils import global_mpi_rank, nvtx_range
 from ...logger import logger
 from .decoder import *
 from .distributed import *
+from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import *
 from .model_engine import *
 from .resource_manager import *
@@ -137,9 +138,11 @@ class PyExecutor:
                  decoder: Decoder,
                  dist: Distributed,
                  enable_overlap_scheduler: bool = False,
-                 max_input_len: int = 2048):
+                 max_input_len: int = 2048,
+                 kv_cache_transceiver: KvCacheTransceiver = None):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
+        self.global_rank = global_mpi_rank()
         self.request_queue = queue.Queue()
 
         # profile config
@@ -178,6 +181,7 @@ class PyExecutor:
         self.all_ranks_num_active_requests = [
             0
         ] * self.dist.world_size if self.enable_attention_dp else []
+        self.ctx_in_transmission_requests = []
         self.previous_batch = None
         self.inflight_req_ids = tensorrt_llm.bindings.internal.batch_manager.ReqIdsSet(
         )
@@ -187,7 +191,16 @@ class PyExecutor:
         self.model_engine.warmup(self.resource_manager)
 
         self.is_shutdown = False
-        event_loop = self._executor_loop_overlap if enable_overlap_scheduler else self._executor_loop
+
+        self.kv_cache_transceiver = kv_cache_transceiver
+        if kv_cache_transceiver is not None:
+            event_loop = self._executor_disagg_loop
+            if enable_overlap_scheduler:
+                logger.warning(
+                    "enable_overlap_scheduler is not yet supported for disaggregated serving, "
+                    "falling back to normal executor loop.")
+        else:
+            event_loop = self._executor_loop_overlap if enable_overlap_scheduler else self._executor_loop
         self.worker_thread = threading.Thread(target=event_loop, daemon=True)
         self.worker_thread.start()
         self.stats_lock = threading.Lock()
@@ -220,7 +233,7 @@ class PyExecutor:
             if start_time is not None and self.print_log and self.dist.rank == 0:
                 end_time = time.time()
                 print(
-                    f'iter = {self.model_engine.iter_counter}, rank = {self.dist.rank}, currank_total_requests = {self.num_fetch_requests_cur_rank}/{self.num_fetch_requests}, elapsed_time = {end_time - start_time}s, states = {self.model_engine.iter_states}'
+                    f'iter = {self.model_engine.iter_counter}, global_rank = {self.global_rank}, rank = {self.dist.rank}, currank_total_requests = {self.num_fetch_requests_cur_rank}/{self.num_fetch_requests}, elapsed_time = {end_time - start_time}s, states = {self.model_engine.iter_states}'
                 )
 
             it += 1
@@ -325,7 +338,7 @@ class PyExecutor:
                                      and self.enable_attention_dp)
                 if attn_dp_idle_iter:
                     self._merge_one_dummy_request()
-                scheduled_batch = self._schedule()
+                scheduled_batch, _, _ = self._schedule()
 
                 assert scheduled_batch.batch_size > 0, (
                     "fail to schedule any pending request, "
@@ -385,7 +398,7 @@ class PyExecutor:
                 if attn_dp_idle_iter:
                     self._merge_one_dummy_request()
 
-                scheduled_batch = self._schedule()
+                scheduled_batch, _, _ = self._schedule()
 
                 assert scheduled_batch.batch_size > 0, (
                     "fail to schedule any pending request, "
@@ -450,6 +463,69 @@ class PyExecutor:
             self.response_cv.notify_all()
         self.shutdown_event.set()
 
+    def _executor_disagg_loop(self):
+        torch.cuda.set_device(self.device_id)
+        got_finish_signal = False
+        with self._profiler() as profile_step:
+            while not got_finish_signal or len(self.active_requests) > 0:
+                profile_step()
+                new_requests = self._fetch_new_requests()
+                got_finish_signal = self._merge_requests(
+                    new_requests) or got_finish_signal
+                if got_finish_signal and len(self.active_requests) == 0:
+                    break
+
+                self._check_disagg_gen_transfer_status()
+
+                scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
+                )
+
+                # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
+                self._prepare_disagg_gen_init(fitting_disagg_gen_init_requests)
+
+                if num_fitting_reqs == 0:
+                    self.kv_cache_transceiver.check_context_transfer_status(
+                        False)
+
+                self.pause_requests(scheduled_batch.paused_requests)
+
+                if scheduled_batch.batch_size > 0:
+                    self.resource_manager.prepare_resources(scheduled_batch)
+
+                    # For generation requests which have completed KV cache transfer
+                    self._prepare_disagg_gen_transmission_complete(
+                        scheduled_batch)
+
+                    batch_outputs = self._forward_step(scheduled_batch)
+
+                    self._send_disagg_ctx_cache(
+                        scheduled_batch.context_requests)
+
+                    # Keep track of ctx requests that are in transmission
+                    ctx_transmission_reqs = [
+                        req for req in scheduled_batch.context_requests
+                        if req.state ==
+                        LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+                    ]
+
+                    self._decode(scheduled_batch, batch_outputs)
+
+                    # For context only req in transmission, we reset the state since decoder might have changed it
+                    for req in ctx_transmission_reqs:
+                        req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+
+                    self._handle_cancelled_requests()
+                    self._handle_responses()
+                    self.resource_manager.update_resources(scheduled_batch)
+
+                    if self.ctx_in_transmission_requests:
+                        self._terminate_ctx_finished_requests()
+
+        with self.response_cv:
+            self.is_shutdown = True
+            self.response_cv.notify_all()
+        self.shutdown_event.set()
+
     @nvtx_range("_fetch_new_requests")
     def _fetch_new_requests(self):
         timeout = None if len(
@@ -459,15 +535,18 @@ class PyExecutor:
             new_requests = _get_from_request_queue(
                 self.request_queue, timeout,
                 self.max_num_active_requests - len(self.active_requests))
+
         new_requests = self.dist.broadcast(new_requests, root=0)
 
         if self.enable_iter_perf_stats and self.dist.rank == 0:
             now = time.time()
             for req in new_requests:
                 if isinstance(req, tuple):
-                    self.new_active_requests_queue_latency_ms += now - self.start_times[
-                        req[0]]
-                    self.start_times.pop(req[0])
+                    req_id = req[0]
+                    if req_id in self.start_times:
+                        self.new_active_requests_queue_latency_ms += now - self.start_times.pop(
+                            req_id)
+
         return new_requests
 
     @nvtx_range("_fetch_adp_new_requests")
@@ -518,7 +597,7 @@ class PyExecutor:
                 req.is_dummy = False
                 self.active_requests.append(req)
             elif _is_cancel_request(req_item):
-                self.canceled_req_ids.add(req_item)
+                self.canceled_req_ids.insert(req_item)
         return got_finish_signal
 
     def _merge_one_dummy_request(self):
@@ -654,7 +733,7 @@ class PyExecutor:
                 req.is_dummy = False
                 self.active_requests.append(req)
             elif _is_cancel_request(req_item):
-                self.canceled_req_ids.add(req_item)
+                self.canceled_req_ids.insert(req_item)
         return got_finish_signal
 
     @nvtx_range("_merge_requests")
@@ -665,19 +744,104 @@ class PyExecutor:
             if cp_type == 'star_attention':
                 ret = self._merge_star_attention_requests(new_requests)
             elif cp_type == 'ring_attention':
-                assert False, 'unsupport ring attention now'
+                raise NotImplementedError("ring attention not implemented yet")
             else:
-                assert False, f'unsupport sp type {cp_type}'
+                raise NotImplementedError(f'unsupport cp type {cp_type}')
         else:
             ret = self._merge_tp_requests(new_requests)
         return ret
 
     @nvtx_range("_schedule")
     def _schedule(self):
+        scheduler_output = self.scheduler.schedule_request(
+            self.active_requests, self.inflight_req_ids)
         scheduled_requests = ScheduledRequests()
-        scheduled_requests.context_requests, scheduled_requests.generation_requests, scheduled_requests.paused_requests = \
-            self.scheduler.schedule_request(self.active_requests, self.inflight_req_ids)
-        return scheduled_requests
+
+        scheduled_requests.context_requests = scheduler_output.context_requests
+        scheduled_requests.generation_requests = scheduler_output.generation_requests
+        scheduled_requests.paused_requests = scheduler_output.paused_requests
+        return scheduled_requests, scheduler_output.fitting_disagg_gen_init_requests, scheduler_output.num_fitting_requests
+
+    @nvtx_range("_check_disagg_gen_transfer_status")
+    def _check_disagg_gen_transfer_status(self):
+
+        if self.kv_cache_transceiver is not None:
+            #Check if any requests in disagg generation init state
+            to_prepare = any([
+                req.is_disagg_generation_init_state
+                for req in self.active_requests
+            ])
+
+            if not to_prepare:
+                need_check = any([
+                    req.is_disagg_generation_transmission_in_progress
+                    for req in self.active_requests
+                ])
+                need_check_one = all([
+                    req.is_disagg_generation_transmission_in_progress
+                    for req in self.active_requests
+                ])
+
+                if need_check:
+                    at_least_num = 1 if need_check_one else 0
+                    self.kv_cache_transceiver.check_gen_transfer_status(
+                        at_least_num)
+
+        return
+
+    @nvtx_range("_prepare_disagg_gen_init")
+    def _prepare_disagg_gen_init(self, fitting_disagg_gen_init_requests):
+        if fitting_disagg_gen_init_requests:
+            disagg_gen_init_to_prepare = ScheduledRequests()
+            disagg_gen_init_to_prepare.context_requests = fitting_disagg_gen_init_requests
+            disagg_gen_init_to_prepare.generation_requests = []
+            disagg_gen_init_to_prepare.paused_requests = []
+
+            self.resource_manager.resource_managers[
+                'kv_cache_manager'].prepare_resources(
+                    disagg_gen_init_to_prepare)
+
+            # Trigger KV cache exchange for new disagg_gen_init_requests
+            self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
+
+    @nvtx_range("_prepare_disagg_gen_transmission_complete")
+    def _prepare_disagg_gen_transmission_complete(self, scheduled_batch):
+
+        for req in scheduled_batch.generation_requests:
+            if req.is_disagg_generation_transmission_complete:
+                req.state = LlmRequestState.GENERATION_IN_PROGRESS
+                req.context_current_position = req.prompt_len
+                req.decoding_iter = 1
+                first_gen_tokens = req.context_phase_params.first_gen_tokens
+                beam_width = req.sampling_config.beam_width
+                for beam in range(0, beam_width):
+                    req.add_new_token(first_gen_tokens[beam], beam)
+
+    @nvtx_range("_recv_disagg_gen_cache")
+    def _recv_disagg_gen_cache(self, new_gen_reqs):
+
+        for req in new_gen_reqs:
+            self.kv_cache_transceiver.request_and_receive_async(req)
+
+        block_transfer = all([
+            req.is_disagg_generation_transmission_in_progress
+            for req in self.active_requests
+        ])
+        self.kv_cache_transceiver.check_gen_transfer_status(
+            1 if block_transfer else 0)
+
+        return
+
+    @nvtx_range("_send_disagg_ctx_cache")
+    def _send_disagg_ctx_cache(self, scheduled_ctx_requests):
+
+        for req in scheduled_ctx_requests:
+            if req.is_context_only_request and req.is_context_finished:
+                self.kv_cache_transceiver.respond_and_send_async(req)
+
+        self.kv_cache_transceiver.check_context_transfer_status(False)
+
+        return
 
     def _forward_step(self,
                       scheduled_requests,
@@ -787,18 +951,26 @@ class PyExecutor:
         if not self.canceled_req_ids:
             return
 
-        if self.dist.has_tp() and len(self.canceled_req_ids) > 0:
+        if self.dist.has_tp and self.canceled_req_ids:
             self.canceled_req_ids = self.dist.broadcast(self.canceled_req_ids,
                                                         root=0)
 
+        cancelled_responses = {}
         left_requests = []
         for request in self.active_requests:
             req_id = request.py_request_id
             if req_id in self.canceled_req_ids:
                 self._terminate_request(request)
+                request.finish_by_reason(trtllm.FinishReason.CANCELLED)
+                cancelled_responses[req_id] = request.create_response(
+                    False, self.dist.rank)
             else:
                 left_requests.append(request)
         self.active_requests = left_requests
+
+        # enqueue the cancelled requests' responses as they are not
+        # active_requests and be discarded in the decoder loop.
+        self._enqueue_responses(cancelled_responses)
 
     def _enqueue_responses(self, responses: Dict[int, ExecutorResponse]):
 
@@ -828,7 +1000,7 @@ class PyExecutor:
     @nvtx_range("_handle_responses")
     def _handle_responses(self):
         new_responses = {}
-        finish_requests = []
+        requests_to_terminate = []
         new_active_requests = []
         logger.debug(
             f'------before _handle_responses, rank = {self.dist.rank}, output = {self.active_requests}'
@@ -837,7 +1009,7 @@ class PyExecutor:
             req_id = request.py_request_id
             #no responses for dummy request, and finish it
             if request.is_dummy == True:
-                finish_requests.append(request)
+                requests_to_terminate.append(request)
                 continue
 
             response = request.create_response(False, self.dist.rank)
@@ -846,15 +1018,24 @@ class PyExecutor:
                 request_done = response.result.is_final
                 new_responses.update({req_id: response})
             if request_done:
-                finish_requests.append(request)
+                if request.is_disagg_context_transmission_state:
+                    self.ctx_in_transmission_requests.append(request)
+                else:
+                    requests_to_terminate.append(request)
             else:
                 new_active_requests.append(request)
         self.active_requests = new_active_requests
         self._enqueue_responses(new_responses)
-        for request in finish_requests:
+        for request in requests_to_terminate:
             self._terminate_request(request)
 
-        return finish_requests
+        return requests_to_terminate
+
+    @nvtx_range("_terminate_ctx_finished_requests")
+    def _terminate_ctx_finished_requests(self):
+        for request in self.ctx_in_transmission_requests:
+            if request.is_disagg_context_complete_state:
+                self._terminate_request(request)
 
     def shutdown(self):
         try:
@@ -949,7 +1130,7 @@ class PyExecutor:
         return responses
 
     def cancel_request(self, id: int):
-        raise NotImplementedError("Cancel request not implemented")
+        self.canceled_req_ids.insert(id)
 
     def get_num_responses_ready(self, id: Union[int, None]) -> int:
         with self.response_cv:
@@ -989,7 +1170,7 @@ class PyExecutor:
         # todo: implement it
         return []
 
-    def pause_requests(self, requests_to_pause):
+    def pause_requests(self, requests_to_pause: RequestList):
         # todo: support work with self.inflight_req_ids.
         #       Currently, self.inflight_req_ids is not.
         max_input_len = self.max_input_len

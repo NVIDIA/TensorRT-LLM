@@ -165,6 +165,7 @@ void initBindings(pybind11::module_& m)
         .def_property_readonly(
             "context_current_position", py::overload_cast<>(&GenLlmReq::getContextCurrentPosition, py::const_))
         .def_property("context_chunk_size", &GenLlmReq::getContextChunkSize, &GenLlmReq::setContextChunkSize)
+        .def_property("decoding_iter", &GenLlmReq::getDecodingIter, &GenLlmReq::setDecodingIter)
         .def_readwrite("request_id", &GenLlmReq::mRequestId)
         .def_readwrite("prompt_len", &GenLlmReq::mPromptLen)
         .def_readwrite("max_new_tokens", &GenLlmReq::mMaxNewTokens)
@@ -194,6 +195,18 @@ void initBindings(pybind11::module_& m)
         .def("is_first_context_chunk", py::overload_cast<>(&GenLlmReq::isFirstContextChunk, py::const_))
         .def("get_context_remaining_length", py::overload_cast<>(&GenLlmReq::getContextRemainingLength, py::const_))
         .def("set_finished_reason", &GenLlmReq::setFinishedReason, py::arg("finish_reason"), py::arg("beam"))
+        .def_property(
+            "context_current_position", &GenLlmReq::getContextCurrentPosition, &GenLlmReq::setContextCurrentPosition)
+        .def_property_readonly("context_phase_params", &GenLlmReq::getContextPhaseParams)
+        .def_property_readonly("is_context_only_request", &GenLlmReq::isContextOnlyRequest)
+        .def_property_readonly("is_context_finished", &GenLlmReq::isContextFinished)
+        .def_property_readonly("is_disagg_generation_init_state", &GenLlmReq::isDisaggGenerationInitState)
+        .def_property_readonly(
+            "is_disagg_generation_transmission_complete", &GenLlmReq::isDisaggGenerationTransmissionComplete)
+        .def_property_readonly(
+            "is_disagg_generation_transmission_in_progress", &GenLlmReq::isDisaggGenerationTransmissionInProgress)
+        .def_property_readonly("is_disagg_context_transmission_state", &GenLlmReq::isDisaggContextTransmissionState)
+        .def_property_readonly("is_disagg_context_complete_state", &GenLlmReq::isDisaggContextCompleteState)
         .def_property_readonly("position_ids",
             [](GenLlmReq& self)
             {
@@ -253,7 +266,8 @@ void initBindings(pybind11::module_& m)
                      tb::LlmRequest::SizeType32 num_return_sequences, std::optional<executor::EagleConfig> eagle_config,
                      std::optional<at::Tensor> skip_cross_attn_blocks, bool return_perf_metrics,
                      std::optional<executor::GuidedDecodingParams> guided_decoding_params,
-                     std::optional<tb::LlmRequest::MillisecondsType> allotted_time_ms)
+                     std::optional<tb::LlmRequest::MillisecondsType> allotted_time_ms,
+                     std::optional<executor::ContextPhaseParams> context_phase_params)
                  {
                      auto makeOptionalTensor = [](std::optional<at::Tensor> const& atTensor)
                      {
@@ -288,7 +302,7 @@ void initBindings(pybind11::module_& m)
                          encoder_input_features_tensor_ptr, encoder_output_length, cross_attention_mask_tensor_ptr,
                          llm_request_type, input_token_extra_ids, num_return_sequences, eagle_config,
                          skip_cross_attn_blocks_tensor_ptr, return_perf_metrics, guided_decoding_params,
-                         allotted_time_ms};
+                         allotted_time_ms, context_phase_params};
                  }),
             py::arg("request_id"), py::arg("max_new_tokens"), py::arg("input_tokens"), py::arg("sampling_config"),
             py::arg("is_streaming"), py::arg("end_id") = std::nullopt, py::arg("pad_id") = std::nullopt,
@@ -311,14 +325,15 @@ void initBindings(pybind11::module_& m)
             py::arg("input_token_extra_ids") = std::nullopt, py::arg("num_return_sequences") = 1,
             py::arg("eagle_config") = std::nullopt, py::arg("skip_cross_attn_blocks") = std::nullopt,
             py::arg("return_perf_metrics") = false, py::arg("guided_decoding_params") = std::nullopt,
-            py::arg("allotted_time_ms") = std::nullopt)
+            py::arg("allotted_time_ms") = std::nullopt, py::arg("context_phase_params") = std::nullopt)
         .def("validate", &tb::LlmRequest::validate, py::arg("max_input_len"), py::arg("max_seq_len"),
             py::arg("max_draft_len"), py::arg("max_endocer_input_len") = std::nullopt,
             py::arg("enable_kv_cache_reuse") = false, py::arg("gather_context_outputs") = false)
         .def("create_response", &tb::LlmRequest::createResponse, py::arg("use_fast_logits") = false,
             py::arg("mpi_world_rank") = 0)
         .def("move_prompt_embedding_table_to_gpu", &tb::LlmRequest::movePromptEmbeddingTableToGpu, py::arg("manager"))
-        .def("move_lora_weights_to_gpu", &tb::LlmRequest::moveLoraWeightsToGpu, py::arg("manager"));
+        .def("move_lora_weights_to_gpu", &tb::LlmRequest::moveLoraWeightsToGpu, py::arg("manager"))
+        .def("finish_by_reason", &tb::LlmRequest::finishByReason, py::arg("finish_reason"));
 
     py::bind_vector<tb::RequestVector>(m, "RequestVector");
     // Note: Making an opaque binding out of RequestList would impact any std::vector<unsigned> conversion
@@ -335,6 +350,13 @@ void initBindings(pybind11::module_& m)
     py::classh<tb::rnn_state_manager::RnnStateManager>(m, "RnnStateManager")
         .def(py::init<tr::SizeType32, tr::ModelConfig, tr::WorldConfig, tr::BufferManager>(),
             py::arg("max_num_sequences"), py::arg("model_config"), py::arg("world_config"), py::arg("buffer_manager"));
+
+    py::class_<tb::DecoderInputBuffers>(m, "DecoderInputBuffers")
+        .def(py::init<runtime::SizeType32, runtime::SizeType32>(), py::arg("max_batch_size"),
+            py::arg("max_tokens_per_engine_step"))
+        .def_readwrite("setup_batch_slots", &tb::DecoderInputBuffers::setupBatchSlots)
+        .def_readwrite("inputs_ids", &tb::DecoderInputBuffers::inputsIds)
+        .def_readwrite("forward_batch_slots", &tb::DecoderInputBuffers::forwardBatchSlots);
 
     py::class_<tb::DecoderBuffers::DraftBuffers>(m, "DraftBuffers")
         .def(py::init())
@@ -367,7 +389,7 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("cache_indirection_output", &tb::DecoderBuffers::cacheIndirectionOutput)
         .def_readwrite("sequence_lengths", &tb::DecoderBuffers::sequenceLengths)
         .def_readwrite("sequence_lengths_host", &tb::DecoderBuffers::sequenceLengthsHost)
-        .def_readwrite("finished", &tb::DecoderBuffers::finished)
+        .def_readwrite("finished_sum_host", &tb::DecoderBuffers::finishedSumHost)
         .def_readwrite("new_output_tokens", &tb::DecoderBuffers::newOutputTokens)
         .def_readwrite("new_output_tokens_host", &tb::DecoderBuffers::newOutputTokensHost)
         .def_readwrite("cum_log_probs", &tb::DecoderBuffers::cumLogProbs)

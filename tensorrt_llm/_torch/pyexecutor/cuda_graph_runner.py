@@ -29,9 +29,10 @@ class DecodingCUDAGraphRunner:
         """
         self.batch_size = batch_size
 
-        self.input_ids = torch.zeros((batch_size, ),
-                                     device=device,
-                                     dtype=torch.int64)
+        # Using ones instead of zeros prevents NaNs in e.g. Deepseek
+        self.input_ids = torch.ones((batch_size, ),
+                                    device=device,
+                                    dtype=torch.int64)
         self.position_ids = torch.zeros((1, batch_size),
                                         device=device,
                                         dtype=torch.int64)

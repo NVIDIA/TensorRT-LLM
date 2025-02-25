@@ -44,3 +44,5 @@ ordered-set
 peft
 einops
 flashinfer-python~=0.2.0
+ffmpeg
+opencv-python-headless

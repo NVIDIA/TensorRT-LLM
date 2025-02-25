@@ -35,6 +35,20 @@ class TllmRuntime;
 namespace tensorrt_llm::batch_manager
 {
 
+class DecoderInputBuffers
+{
+public:
+    using SizeType32 = runtime::SizeType32;
+    using TensorPtr = runtime::ITensor::SharedPtr;
+
+    explicit DecoderInputBuffers(SizeType32 maxBatchSize, SizeType32 maxTokensPerEngineStep);
+
+    TensorPtr setupBatchSlots;
+    TensorPtr inputsIds;
+
+    TensorPtr forwardBatchSlots;
+};
+
 class DecoderStepAsyncSend
 {
 public:
@@ -96,15 +110,15 @@ public:
     TensorPtr cacheIndirectionInput;
     TensorPtr cacheIndirectionOutput;
     TensorPtr sequenceLengths;     // [mMaxNumRequests]
-    TensorPtr sequenceLengthsHost; // [mMaxNumRequests] pinned host tensor
-    TensorPtr finished;            // [mMaxNumRequests] pinned host tensor
+    TensorPtr sequenceLengthsHost; // [mMaxNumRequests], pinned host tensor
     TensorPtr newOutputTokens;     // [maxTokensPerStep, mMaxNumRequests, beamWidth]
     TensorPtr newOutputTokensHost; // [maxTokensPerStep, mMaxNumRequests, beamWidth]
     TensorPtr cumLogProbs;         // [mMaxNumRequests, beamWidth]
     TensorPtr cumLogProbsHost;     // [mMaxNumRequests, beamWidth]
     TensorPtr logProbs;            // [mMaxNumRequests, beamWidth, maxSeqLen]
     TensorPtr logProbsHost;        // [mMaxNumRequests, beamWidth, maxSeqLen]
-    TensorPtr finishReasonsHost;   // [mMaxNumRequests, beamWidth]
+    TensorPtr finishedSumHost;     // [mMaxNumRequests], pinned host tensor
+    TensorPtr finishReasonsHost;   // [mMaxNumRequests, beamWidth], pinned host tensor
 
     class DraftBuffers
     {

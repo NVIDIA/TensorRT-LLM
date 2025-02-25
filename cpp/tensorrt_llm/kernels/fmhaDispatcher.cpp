@@ -44,11 +44,6 @@ FmhaDispatcher::FmhaDispatcher(MHARunnerFixedParams fixedParams)
     : mFixedParams(fixedParams)
     , mUseTllmGen(tensorrt_llm::common::getSMVersion() == 100)
 {
-    if (fixedParams.isDeepseekSpecialized())
-    {
-        mUseTllmGen = false;
-    }
-
     if (mUseTllmGen)
     {
         mTllmGenFMHARunner.reset(
@@ -101,7 +96,9 @@ bool FmhaDispatcher::isSupported()
         tllmRunnerParams.mKernelType = FmhaKernelType::Context;
         tllmRunnerParams.mTileScheduler = TileScheduler::Persistent;
         tllmRunnerParams.mMultiCtasKvMode = false;
-        tllmRunnerParams.mHeadDim = mFixedParams.headSize;
+        // Assume same headDim for Qk and V here.
+        tllmRunnerParams.mHeadDimQk = mFixedParams.headSize;
+        tllmRunnerParams.mHeadDimV = mFixedParams.headSizeV;
         tllmRunnerParams.mNumTokensPerPage = mFixedParams.numTokensPerBlock;
         tllmRunnerParams.mNumHeadsQPerKv = mFixedParams.numQHeads / mFixedParams.numKvHeads;
         foundKernels = mTllmGenFMHARunner->isSupported(tllmRunnerParams);
@@ -169,7 +166,9 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         tllmRunnerParams.oSfPtr = runnerParams.outputSfPtr;
         // The sequence lengths for K/V.
         tllmRunnerParams.seqLensKvPtr = reinterpret_cast<int const*>(runnerParams.kvSeqLenPtr);
-        tllmRunnerParams.mHeadDim = mFixedParams.headSize;
+        // Assume same headDim for Qk and V here.
+        tllmRunnerParams.mHeadDimQk = mFixedParams.headSize;
+        tllmRunnerParams.mHeadDimV = mFixedParams.headSizeV;
         tllmRunnerParams.mNumHeadsQ = mFixedParams.numQHeads;
         tllmRunnerParams.mNumHeadsKv = mFixedParams.numKvHeads;
         tllmRunnerParams.mNumHeadsQPerKv = tllmRunnerParams.mNumHeadsQ / tllmRunnerParams.mNumHeadsKv;
@@ -187,8 +186,10 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         if (mFixedParams.attentionInputLayout == AttentionInputLayout::Q_PAGED_KV)
         {
             auto const [freeMemory, totalMemory] = tensorrt_llm::common::getDeviceMemoryInfo(false);
+            // The kv cache should be based on the maximum headDim of K and V due to paddings.
+            int maxHeadDimKv = std::max(tllmRunnerParams.mHeadDimQk, tllmRunnerParams.mHeadDimV);
             tllmRunnerParams.mNumPagesInMemPool = totalMemory
-                / (tllmRunnerParams.mNumHeadsKv * tllmRunnerParams.mNumTokensPerPage * tllmRunnerParams.mHeadDim
+                / (tllmRunnerParams.mNumHeadsKv * tllmRunnerParams.mNumTokensPerPage * maxHeadDimKv
                     * get_size_in_bytes(mFixedParams.dataType));
         }
         tllmRunnerParams.mSfStartTokenIdx = 0;

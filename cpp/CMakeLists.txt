@@ -221,17 +221,19 @@ if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS CUDA_REQUIRED_VERSION)
   )
 endif()
 
-# Initialize CMAKE_CUDA_ARCHITECTURES before enabling CUDA
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.7")
-    set(CMAKE_CUDA_ARCHITECTURES 80-real 86-real 89-real 90-real 100-real
-                                 120-real)
-  elseif(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "11.8")
-    set(CMAKE_CUDA_ARCHITECTURES 80-real 86-real 89-real 90-real)
-  else()
-    set(CMAKE_CUDA_ARCHITECTURES 80-real 86-real)
-  endif()
-endif()
+# cmake-format: off
+# Initialize and normalize CMAKE_CUDA_ARCHITECTURES before enabling CUDA.
+# Special values:
+# * `native` is resolved to HIGHEST available architecture.
+#   * Fallback to `all` if detection failed.
+# * `all`/unset is resolved to a set of architectures we optimized for and compiler supports.
+# * `all-major` is unsupported.
+# Numerical architectures:
+# * PTX is never included in result binary.
+#   * `*-virtual` architectures are therefore rejected.
+#   * `-real` suffix is automatically added to exclude PTX.
+# * Always use accelerated (`-a` suffix) target for supported architectures.
+# cmake-format: on
 
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "native")
   # Detect highest available compute capability
@@ -247,28 +249,74 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "native")
   if(NOT ${CUDA_RETURN_CODE} EQUAL 0)
     message(WARNING "Detecting native CUDA compute capability - fail")
     message(
-      WARNING "CUDA compute capability detection failed, compiling for 'all'")
-    set(CMAKE_CUDA_ARCHITECTURES_ORIG "all")
+      WARNING
+        "CUDA compute capability detection failed, compiling for all optimized architectures"
+    )
+    unset(CMAKE_CUDA_ARCHITECTURES)
   else()
     message(STATUS "Detecting native CUDA compute capability - done")
-    set(CMAKE_CUDA_ARCHITECTURES_ORIG "${CUDA_ARCH_OUTPUT}")
+    set(CMAKE_CUDA_ARCHITECTURES "${CUDA_ARCH_OUTPUT}")
   endif()
+elseif(CMAKE_CUDA_ARCHITECTURES STREQUAL "all")
+  unset(CMAKE_CUDA_ARCHITECTURES)
+  message(
+    STATUS
+      "Setting CMAKE_CUDA_ARCHITECTURES to all enables all architectures TensorRT-LLM optimized for, "
+      "not all architectures CUDA compiler supports.")
+elseif(CMAKE_CUDA_ARCHITECTURES STREQUAL "all-major")
+  message(
+    FATAL_ERROR
+      "Setting CMAKE_CUDA_ARCHITECTURES to all-major does not make sense for TensorRT-LLM. "
+      "Please enable all architectures you intend to run on, so we can enable optimized kernels for them."
+  )
 else()
-  # Store CMAKE_CUDA_ARCHITECTURES for later use since torch sets this to "OFF"
-  set(CMAKE_CUDA_ARCHITECTURES_ORIG "${CMAKE_CUDA_ARCHITECTURES}")
+  unset(CMAKE_CUDA_ARCHITECTURES_CLEAN)
+  foreach(CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
+    if(CUDA_ARCH MATCHES "^([1-9])([0-9])+a?-virtual$")
+      message(FATAL_ERROR "Including PTX in compiled binary is unsupported.")
+    elseif(CUDA_ARCH MATCHES "^(([1-9])([0-9])+)a?(-real)?$")
+      list(APPEND CMAKE_CUDA_ARCHITECTURES_CLEAN ${CMAKE_MATCH_1})
+    else()
+      message(FATAL_ERROR "Unrecognized CUDA architecture: ${CUDA_ARCH}")
+    endif()
+  endforeach()
+  list(REMOVE_DUPLICATES CMAKE_CUDA_ARCHITECTURES_CLEAN)
+  set(CMAKE_CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES_CLEAN})
 endif()
+
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+  set(CMAKE_CUDA_ARCHITECTURES "80" "86")
+  if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "11.8")
+    list(APPEND CMAKE_CUDA_ARCHITECTURES "89" "90")
+  endif()
+  if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.7")
+    list(APPEND CMAKE_CUDA_ARCHITECTURES "100" "120")
+  endif()
+endif()
+
+# CMAKE_CUDA_ARCHITECTURES_ORIG contains all architectures enabled, without
+# automatically added -real or -a suffix.
+set(CMAKE_CUDA_ARCHITECTURES_ORIG "${CMAKE_CUDA_ARCHITECTURES}")
 message(STATUS "GPU architectures: ${CMAKE_CUDA_ARCHITECTURES_ORIG}")
 
-set(ARCHES "80" "86" "89" "90" "100" "120")
-foreach(ARCH IN LISTS ARCHES)
-  if(NOT "${ARCH}" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
-     AND NOT "${ARCH}-real" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
-     AND NOT "all" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
-     AND NOT "all-major" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
-    add_definitions("-DEXCLUDE_SM_${ARCH}")
-    message(STATUS "Excluding SM ${ARCH}")
+set(ARCHITECTURES_WITH_KERNELS "80" "86" "89" "90" "100" "120")
+foreach(CUDA_ARCH IN LISTS ARCHITECTURES_WITH_KERNELS)
+  if(NOT "${CUDA_ARCH}" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
+    add_definitions("-DEXCLUDE_SM_${CUDA_ARCH}")
+    message(STATUS "Excluding SM ${CUDA_ARCH}")
   endif()
 endforeach()
+
+set(ARCHITECTURES_WITH_ACCEL "90" "100" "101" "120")
+unset(CMAKE_CUDA_ARCHITECTURES_NORMALIZED)
+foreach(CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
+  if("${CUDA_ARCH}" IN_LIST ARCHITECTURES_WITH_ACCEL)
+    list(APPEND CMAKE_CUDA_ARCHITECTURES_NORMALIZED "${CUDA_ARCH}a-real")
+  else()
+    list(APPEND CMAKE_CUDA_ARCHITECTURES_NORMALIZED "${CUDA_ARCH}-real")
+  endif()
+endforeach()
+set(CMAKE_CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES_NORMALIZED})
 
 enable_language(C CXX CUDA)
 
@@ -509,18 +557,8 @@ if(BUILD_PYT)
   # Build TORCH_CUDA_ARCH_LIST
   set(TORCH_CUDA_ARCH_LIST "")
   foreach(CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
-    if(CUDA_ARCH MATCHES "^([0-9])([0-9])(-real)*$")
-      set(TORCH_ARCH "${CMAKE_MATCH_1}.${CMAKE_MATCH_2}")
-    elseif(CUDA_ARCH MATCHES "^1([0-9])([0-9])(-real)*$")
-      set(TORCH_ARCH "1${CMAKE_MATCH_1}.${CMAKE_MATCH_2}")
-    elseif(CUDA_ARCH STREQUAL "native")
-      set(TORCH_ARCH "Auto")
-    else()
-      message(FATAL_ERROR "${CUDA_ARCH} is not supported")
-    endif()
-    if(NOT CUDA_ARCH MATCHES "-real$" AND NOT CUDA_ARCH STREQUAL "native")
-      string(APPEND TORCH_ARCH "+PTX")
-    endif()
+    string(REGEX REPLACE "^([1-9][0-9]*)([0-9]a?)-real$" "\\1.\\2" TORCH_ARCH
+                         ${CUDA_ARCH})
     list(APPEND TORCH_CUDA_ARCH_LIST ${TORCH_ARCH})
   endforeach()
 
@@ -579,28 +617,6 @@ print(os.path.dirname(torch.__file__),end='');"
   endif()
 
 else()
-  if(NOT "all" IN_LIST CMAKE_CUDA_ARCHITECTURES
-     AND NOT "all-major" IN_LIST CMAKE_CUDA_ARCHITECTURES
-     AND NOT "native" IN_LIST CMAKE_CUDA_ARCHITECTURES)
-    foreach(CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
-      if(CUDA_ARCH MATCHES "^([1-9][0-9][0-9]?a?)(-real)?$")
-        string(
-          APPEND
-          CMAKE_CUDA_FLAGS
-          " --generate-code=arch=compute_${CMAKE_MATCH_1},code=sm_${CMAKE_MATCH_1}"
-        )
-      endif()
-      if(CUDA_ARCH MATCHES "^([1-9][0-9][0-9]?a?)(-virtual)?$")
-        string(
-          APPEND
-          CMAKE_CUDA_FLAGS
-          " --generate-code=arch=compute_${CMAKE_MATCH_1},code=compute_${CMAKE_MATCH_1}"
-        )
-      endif()
-    endforeach()
-    set(CMAKE_CUDA_ARCHITECTURES OFF)
-  endif()
-
   if(NOT WIN32)
     if(NOT USE_CXX11_ABI)
       add_compile_options("-D_GLIBCXX_USE_CXX11_ABI=0")
@@ -639,12 +655,6 @@ if(ENABLE_UCX)
   endif()
 endif()
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DENABLE_UCX=${ENABLE_UCX}")
-
-string(REPLACE "arch=compute_100,code=sm_100" "arch=compute_100a,code=sm_100a"
-               CMAKE_CUDA_FLAGS ${CMAKE_CUDA_FLAGS})
-
-string(REPLACE "arch=compute_120,code=sm_120" "arch=compute_120a,code=sm_120a"
-               CMAKE_CUDA_FLAGS ${CMAKE_CUDA_FLAGS})
 
 file(STRINGS "${TRT_INCLUDE_DIR}/NvInferVersion.h" VERSION_STRINGS
      REGEX "#define NV_TENSORRT_.*")

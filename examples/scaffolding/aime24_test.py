@@ -84,7 +84,8 @@ def main():
         f'Controller {controller_name} Accuracy: {correct_count} out of {total_count}'
     )
     if args.threshold is not None:
-        assert correct_count >= args.threshold * total_count
+        assert correct_count >= args.threshold * total_count, \
+                f'Accuracy check failed with {correct_count}/{total_count} < {args.threshold}'
         print(f'Accuracy check passed with threshold={args.threshold}')
     print(f'main shutting down...')
     llm.shutdown()

@@ -104,22 +104,29 @@ class SpeculativeDecodingMode(IntFlag):
 
 @dataclasses.dataclass
 class QuantConfig:
-    '''Serializable quantization configuration class, part of the PretrainedConfig
-    '''
+    """
+    Serializable quantization configuration class, part of the PretrainedConfig.
 
+    Args:
+        quant_algo (tensorrt_llm.quantization.mode.QuantAlgo, optional): Quantization algorithm. Defaults to None.
+        kv_cache_quant_algo (tensorrt_llm.quantization.mode.QuantAlgo, optional): KV cache quantization algorithm. Defaults to None.
+        group_size (int): The group size for group-wise quantization. Defaults to 128.
+        smoothquant_val (float): The smoothing parameter alpha used in smooth quant. Defaults to 0.5.
+        clamp_val (List[float], optional): The clamp values used in FP8 rowwise quantization. Defaults to None.
+        use_meta_recipe (bool): Whether to use Meta's recipe for FP8 rowwise quantization. Defaults to False.
+        has_zero_point (bool): Whether to use zero point for quantization. Defaults to False.
+        pre_quant_scale (bool): Whether to use pre-quant scale for quantization. Defaults to False.
+        exclude_modules (List[str], optional): The module name patterns that are skipped in quantization. Defaults to None.
+    """
     quant_algo: Optional[QuantAlgo] = None
     kv_cache_quant_algo: Optional[QuantAlgo] = None
-    group_size: Optional[int] = 128
+    group_size: int = 128
     smoothquant_val: float = 0.5
     clamp_val: Optional[List[float]] = None
     use_meta_recipe: bool = False
-    has_zero_point: Optional[bool] = False
-    pre_quant_scale: Optional[bool] = False
+    has_zero_point: bool = False
+    pre_quant_scale: bool = False
     exclude_modules: Optional[List[str]] = None
-
-    @property
-    def use_plugin_sq(self):
-        return self.quant_algo in W8A8_SQ_PLUGIN_LIST
 
     @cached_property
     def quant_mode(self) -> QuantModeWrapper:
@@ -139,14 +146,18 @@ class QuantConfig:
         )
 
     @property
-    def requires_calibration(self):
+    def _use_plugin_sq(self):
+        return self.quant_algo in W8A8_SQ_PLUGIN_LIST
+
+    @property
+    def _requires_calibration(self):
         return self.quant_algo in (set(QUANT_ALGO_LIST) - {
             QuantAlgo.W8A16, QuantAlgo.W4A16,
             QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN
         }) or self.kv_cache_quant_algo in KV_CACHE_QUANT_ALGO_LIST
 
     @property
-    def requires_modelopt_quantization(self):
+    def _requires_modelopt_quantization(self):
         if self.quant_algo in [
                 QuantAlgo.NVFP4, QuantAlgo.FP8, QuantAlgo.W4A16_AWQ,
                 QuantAlgo.W4A8_AWQ, QuantAlgo.W8A8_SQ_PER_CHANNEL,
@@ -158,7 +169,7 @@ class QuantConfig:
         else:
             return False
 
-    def get_quant_cfg(self, module_name=None):
+    def _get_quant_cfg(self, module_name=None):
         if self.exclude_modules is not None:
             for exclude_module in self.exclude_modules:
                 if exclude_module == module_name or (
@@ -168,7 +179,7 @@ class QuantConfig:
                                             quantized_layers={})
         return self
 
-    def get_modelopt_qformat(self):
+    def _get_modelopt_qformat(self):
         algo_to_modelopt_map = {
             QuantAlgo.W8A16: "int8_wo",
             QuantAlgo.W4A16: "int4_wo",
@@ -185,7 +196,7 @@ class QuantConfig:
         else:
             return 'full_prec'
 
-    def get_modelopt_kv_cache_dtype(self):
+    def _get_modelopt_kv_cache_dtype(self):
         algo_to_modelopt_map = {
             QuantAlgo.FP8: 'fp8',
             QuantAlgo.INT8: 'int8',
@@ -197,11 +208,24 @@ class QuantConfig:
             return None
 
     @classmethod
-    def from_dict(cls, config: dict):
+    def from_dict(cls, config: dict) -> 'QuantConfig':
+        """Create a QuantConfig instance from a dict.
+
+        Args:
+            config (dict): The dict used to create QuantConfig.
+
+        Returns:
+            tensorrt_llm.models.modeling_utils.QuantConfig: The QuantConfig created from dict.
+        """
         obj = cls(**config)
         return obj
 
-    def to_dict(self):
+    def to_dict(self) -> dict:
+        """Dump a QuantConfig instance to a dict.
+
+        Returns:
+            dict: The dict dumped from QuantConfig.
+        """
         return dataclasses.asdict(self)
 
 
@@ -268,7 +292,7 @@ class LayerQuantConfig(QuantConfig):
         return obj
 
     #@lru_cache(maxsize=None)
-    def get_quant_cfg(self, module_name):
+    def _get_quant_cfg(self, module_name):
         quant_res = QuantConfig()
 
         for name, quant_cfg in self.quantized_layers.items():
@@ -277,7 +301,7 @@ class LayerQuantConfig(QuantConfig):
                 break
         return quant_res
 
-    def get_modelopt_qformat(self):
+    def _get_modelopt_qformat(self):
         algo_to_modelopt_map = {
             QuantAlgo.NVFP4: "nvfp4",
             QuantAlgo.FP8: "fp8",
@@ -484,8 +508,8 @@ class PretrainedConfig:
     def quant_algo(self):
         return self.quantization.quant_algo
 
-    def get_quant_cfg(self, module_name: str):
-        return self.quantization.get_quant_cfg(module_name)
+    def _get_quant_cfg(self, module_name: str):
+        return self.quantization._get_quant_cfg(module_name)
 
     def set_rank(self, rank: int):
         self.mapping.rank = rank
@@ -931,7 +955,7 @@ class PretrainedModel(Module,
         if config.mapping.moe_ep_size > 1:
             raise NotImplementedError(
                 "Quantization for expert parallelism is not supported")
-        if not config.quantization.requires_modelopt_quantization:
+        if not config.quantization._requires_modelopt_quantization:
             raise ValueError(
                 f"The quant_config ({quant_config}) should not call modelopt quantization"
             )
@@ -942,8 +966,8 @@ class PretrainedModel(Module,
             device=device,
             calib_dataset=calib_dataset,
             dtype=config.dtype,
-            qformat=config.quantization.get_modelopt_qformat(),
-            kv_cache_dtype=config.quantization.get_modelopt_kv_cache_dtype(),
+            qformat=config.quantization._get_modelopt_qformat(),
+            kv_cache_dtype=config.quantization._get_modelopt_kv_cache_dtype(),
             calib_size=calib_batches,
             batch_size=calib_batch_size,
             calib_max_seq_length=calib_max_seq_length,
@@ -1103,7 +1127,7 @@ def fuse_gate_mlp(
             fused_layer = FusedGatedMLP(**init_params)
 
             fc_name = name + '.fc'
-            layer_quant_cfg = model.config.get_quant_cfg(fc_name)
+            layer_quant_cfg = model.config._get_quant_cfg(fc_name)
             layer_quant_algo = layer_quant_cfg.quant_algo
             if layer_quant_algo != QuantAlgo.FP8 and layer_quant_algo is not None:
                 continue
@@ -1260,7 +1284,7 @@ def unfuse_qkv_gemm(model: PretrainedModel) -> PretrainedModel:
                     layer.tp_size * layer.num_attention_kv_heads *
                     layer.attention_head_size,
                 })
-            layer_quant_cfg = model.config.get_quant_cfg(name + '.qkv')
+            layer_quant_cfg = model.config._get_quant_cfg(name + '.qkv')
             q = quantize(q, layer_quant_cfg)
             k = quantize(k, layer_quant_cfg)
             v = quantize(v, layer_quant_cfg)
@@ -1470,6 +1494,10 @@ def share_embedding(model: PretrainedModel) -> PretrainedModel:
 
     # lm_head and vocab_embedding have different shapes, e.g., tensor parallel without embedding parallel
     if lm_head.weight.shape != vocab_embedding.weight.shape:
+        return model
+
+    # lm_head can have a different type if quantized
+    if lm_head.weight.dtype != vocab_embedding.weight.dtype:
         return model
 
     # Don't assume weight can be shared if vocab_embedding is not initialized, e.g., dummy weights
@@ -1718,10 +1746,9 @@ def preprocess_perlayer_weights(weights,
         for name, param in weights.items():
             if name.endswith('weight') and param.dtype == torch.int8:
                 weights[name] = param.view(torch.float8_e4m3fn)
-        # lm_head is not quantized to FP8
-        if "lm_head.weight" in weights:
-            assert weights['lm_head.weight'].dtype == str_dtype_to_torch(
-                model_config.dtype)
+        # lm_head is not always quantized to FP8
+        if "lm_head.weight" in weights and weights[
+                'lm_head.weight'].dtype is not torch.float8_e4m3fn:
             weights.pop('lm_head.weights_scaling_factor', None)
             weights.pop('lm_head.activation_scaling_factor', None)
     elif quant_algo == QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN:
@@ -1790,7 +1817,24 @@ def preprocess_weights(weights: Dict[str, torch.Tensor],
 
     pattern_info = ['fc', 'gate', 'proj', 'qkv', 'dense']
 
-    def add_kv_cache_rcp_scaling_factor(weights: Dict[str, torch.Tensor]):
+    def process_kv_scaling_factor(weights: Dict[str, torch.Tensor]):
+        new_entries = {}
+        names_to_delete = set()
+
+        # If k, v cache scaling factors are stored separately, combine them into kv cache scaling factor.
+        for name, param in weights.items():
+            if name.endswith('.k_cache_scaling_factor'):
+                v_name = name.replace('k_cache_scaling_factor',
+                                      'v_cache_scaling_factor')
+                assert v_name in weights, f"{v_name} not found"
+                kv_name = name.replace('k_cache_scaling_factor',
+                                       'kv_cache_scaling_factor')
+                new_entries[kv_name] = torch.max(weights[name], weights[v_name])
+                names_to_delete.update([name, v_name])
+        weights.update(new_entries)
+        for k in names_to_delete:
+            del weights[k]
+
         new_entries = []
         # The unified converter generate_tllm_weights() already generates these rcp weights, but legacy
         # converters do not. Handle it here.
@@ -1802,7 +1846,7 @@ def preprocess_weights(weights: Dict[str, torch.Tensor],
                     new_entries.append((rcp_name, torch.reciprocal(param)))
         weights.update(new_entries)
 
-    add_kv_cache_rcp_scaling_factor(weights)
+    process_kv_scaling_factor(weights)
 
     per_layer_weights = {}
 
@@ -1830,7 +1874,7 @@ def preprocess_weights(weights: Dict[str, torch.Tensor],
         if quant_algo != QuantAlgo.MIXED_PRECISION:
             layer_quant_algo = quant_algo
         else:
-            quant_cfg = quant_config.get_quant_cfg(base_name)
+            quant_cfg = quant_config._get_quant_cfg(base_name)
             if not quant_cfg.quant_algo:
                 new_weights.update(layer_weights)
                 continue

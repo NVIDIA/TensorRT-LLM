@@ -668,6 +668,7 @@ class SamplingConfig:
     top_p_decay: Optional[torch.Tensor] = field(default=None)  # float
     top_p_min: Optional[torch.Tensor] = field(default=None)  # float
     top_p_reset_ids: Optional[torch.Tensor] = field(default=None)  # int
+    random_seed: Union[int, torch.Tensor] = field(default=None)
 
     length_penalty: Union[float, torch.Tensor] = field(default=1.0)
     early_stopping: Union[int, torch.Tensor] = field(default=1)
@@ -681,7 +682,6 @@ class SamplingConfig:
     # The real default value is set in dynamicDecodeOp.cpp when it's None
     beam_search_diversity_rate: Union[float, torch.Tensor] = field(init=False,
                                                                    default=0.0)
-    random_seed: Union[int, torch.Tensor] = field(init=False, default=None)
     output_cum_log_probs: bool = field(init=False, default=False)
     output_log_probs: bool = field(init=False, default=False)
     no_repeat_ngram_size: Union[int, torch.Tensor] = field(init=False,

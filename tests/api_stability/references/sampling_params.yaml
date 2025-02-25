@@ -1,0 +1,202 @@
+methods:
+  __init__:
+    name: __init__
+    parameters:
+      add_special_tokens:
+        annotation: bool
+        default: true
+        name: add_special_tokens
+      additional_model_outputs:
+        annotation: Optional[List[tensorrt_llm.sampling_params.AdditionalModelOutput]]
+        default: null
+        name: additional_model_outputs
+      bad:
+        annotation: Union[List[str], str, NoneType]
+        default: null
+        name: bad
+      bad_token_ids:
+        annotation: Optional[List[int]]
+        default: null
+        name: bad_token_ids
+      beam_search_diversity_rate:
+        annotation: Optional[float]
+        default: null
+        name: beam_search_diversity_rate
+      beam_width:
+        annotation: int
+        default: 1
+        name: beam_width
+      best_of:
+        annotation: Optional[int]
+        default: null
+        name: best_of
+      detokenize:
+        annotation: bool
+        default: true
+        name: detokenize
+      early_stopping:
+        annotation: Optional[int]
+        default: null
+        name: early_stopping
+      embedding_bias:
+        annotation: Optional[torch.Tensor]
+        default: null
+        name: embedding_bias
+      end_id:
+        annotation: Optional[int]
+        default: null
+        name: end_id
+      exclude_input_from_output:
+        annotation: bool
+        default: true
+        name: exclude_input_from_output
+      frequency_penalty:
+        annotation: Optional[float]
+        default: null
+        name: frequency_penalty
+      guided_decoding:
+        annotation: Optional[tensorrt_llm.sampling_params.GuidedDecodingParams]
+        default: null
+        name: guided_decoding
+      ignore_eos:
+        annotation: bool
+        default: false
+        name: ignore_eos
+      include_stop_str_in_output:
+        annotation: bool
+        default: false
+        name: include_stop_str_in_output
+      length_penalty:
+        annotation: Optional[float]
+        default: null
+        name: length_penalty
+      logits_post_processor_name:
+        annotation: Optional[str]
+        default: null
+        name: logits_post_processor_name
+      lookahead_config:
+        annotation: Optional[tensorrt_llm.bindings.executor.LookaheadDecodingConfig]
+        default: null
+        name: lookahead_config
+      max_new_tokens:
+        annotation: Optional[int]
+        default: null
+        name: max_new_tokens
+      max_tokens:
+        annotation: int
+        default: 32
+        name: max_tokens
+      min_length:
+        annotation: Optional[int]
+        default: null
+        name: min_length
+      min_p:
+        annotation: Optional[float]
+        default: null
+        name: min_p
+      min_tokens:
+        annotation: Optional[int]
+        default: null
+        name: min_tokens
+      n:
+        annotation: int
+        default: 1
+        name: n
+      no_repeat_ngram_size:
+        annotation: Optional[int]
+        default: null
+        name: no_repeat_ngram_size
+      num_return_sequences:
+        annotation: Optional[int]
+        default: null
+        name: num_return_sequences
+      pad_id:
+        annotation: Optional[int]
+        default: null
+        name: pad_id
+      presence_penalty:
+        annotation: Optional[float]
+        default: null
+        name: presence_penalty
+      random_seed:
+        annotation: Optional[int]
+        default: null
+        name: random_seed
+      repetition_penalty:
+        annotation: Optional[float]
+        default: null
+        name: repetition_penalty
+      return_context_logits:
+        annotation: bool
+        default: false
+        name: return_context_logits
+      return_encoder_output:
+        annotation: bool
+        default: false
+        name: return_encoder_output
+      return_generation_logits:
+        annotation: bool
+        default: false
+        name: return_generation_logits
+      return_log_probs:
+        annotation: bool
+        default: false
+        name: return_log_probs
+      return_perf_metrics:
+        annotation: bool
+        default: false
+        name: return_perf_metrics
+      seed:
+        annotation: Optional[int]
+        default: null
+        name: seed
+      skip_special_tokens:
+        annotation: bool
+        default: true
+        name: skip_special_tokens
+      spaces_between_special_tokens:
+        annotation: bool
+        default: true
+        name: spaces_between_special_tokens
+      stop:
+        annotation: Union[List[str], str, NoneType]
+        default: null
+        name: stop
+      stop_token_ids:
+        annotation: Optional[List[int]]
+        default: null
+        name: stop_token_ids
+      temperature:
+        annotation: Optional[float]
+        default: null
+        name: temperature
+      top_k:
+        annotation: Optional[int]
+        default: null
+        name: top_k
+      top_p:
+        annotation: Optional[float]
+        default: null
+        name: top_p
+      top_p_decay:
+        annotation: Optional[float]
+        default: null
+        name: top_p_decay
+      top_p_min:
+        annotation: Optional[float]
+        default: null
+        name: top_p_min
+      top_p_reset_ids:
+        annotation: Optional[int]
+        default: null
+        name: top_p_reset_ids
+      truncate_prompt_tokens:
+        annotation: Optional[int]
+        default: null
+        name: truncate_prompt_tokens
+      use_beam_search:
+        annotation: bool
+        default: false
+        name: use_beam_search
+    return_annotation: None
+properties: {}

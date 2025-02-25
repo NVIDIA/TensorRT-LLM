@@ -993,15 +993,13 @@ protected:
         }
 
         LoraParams lora_params;
-        BlockScaleParams deepseekParams{};
-        bool const useDeepseek = false;
+        bool const useFp8BlockScales = false;
 
         mMoERunner.setTactic(tactic1, tactic2);
         mMoERunner.runMoe(mInputTensor, mInputProbabilities, weight1_ptr, bias1_ptr, mActType, weight2_ptr, bias2_ptr,
             quant_params, mTotalTokens, mHiddenSize, mInterSize / parallelism_config.tp_size, mNumExperts, mK,
             mWorkspace, mFinalOutput, mFinished, mActiveRows, mScaleProbs, mSourceToExpandedMap, mSelectedExpert,
-            mSparseMixerEpsilon, parallelism_config, mNormMode, mUseLora, lora_params, useDeepseek, deepseekParams,
-            stream);
+            mSparseMixerEpsilon, parallelism_config, mNormMode, mUseLora, lora_params, useFp8BlockScales, stream);
 
         check_cuda_error(cudaStreamSynchronize(stream));
     }

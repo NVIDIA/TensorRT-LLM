@@ -7,6 +7,7 @@ import transformers
 
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
 
@@ -51,6 +52,8 @@ class ModelConfig(Generic[TConfig]):
 
         quant_config = QuantConfig()
         quant_config_file = os.path.join(checkpoint_dir, 'hf_quant_config.json')
+
+        # quantized ckpt in ModelOpt format
         if os.path.exists(quant_config_file):
             with open(quant_config_file) as f:
                 quant_config_dict = json.load(f)
@@ -68,6 +71,14 @@ class ModelConfig(Generic[TConfig]):
             quant_config.group_size = _load_json_quant_config('group_size')
             quant_config.exclude_modules = _load_json_quant_config(
                 'exclude_modules')
+        # quantized ckpt in other formats
+        elif hasattr(pretrained_config, "quantization_config"):
+            hf_quant_config = pretrained_config.quantization_config
+            # DeepSeek V3 FP8 ckpt
+            if hf_quant_config.get(
+                    "quant_method") == "fp8" and hf_quant_config.get(
+                        "weight_block_size", []):
+                quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
 
         return cls(pretrained_config=pretrained_config,
                    quant_config=quant_config,

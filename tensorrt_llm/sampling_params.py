@@ -16,7 +16,7 @@ class GuidedDecodingParams:
     Guided decoding parameters for text generation. Only one of the fields could be effective.
 
     Args:
-        json (str, BaseModel, dict, optional): The generated text is amenable to json format with additional user-specified restrictions, namely schema. Defaults to None.
+        json (str, pydantic.main.BaseModel, dict, optional): The generated text is amenable to json format with additional user-specified restrictions, namely schema. Defaults to None.
         regex (str, optional): The generated text is amenable to the user-specified regular expression. Defaults to None.
         grammar (str, optional): The generated text is amenable to the user-specified extended Backus-Naur form (EBNF) grammar. Defaults to None.
         json_object (bool): If True, the generated text is amenable to json format. Defaults to False.
@@ -26,15 +26,11 @@ class GuidedDecodingParams:
     grammar: Optional[str] = None
     json_object: bool = False
 
-    @property
-    def num_guides(self):
+    def _validate(self):
         num_guides = 0
         for field in fields(self):
             num_guides += bool(getattr(self, field.name))
-        return num_guides
-
-    def _validate(self):
-        if (num_guides := self.num_guides) > 1:
+        if num_guides > 1:
             raise ValueError(
                 f"Only one guide can be used for a request, but got {num_guides}."
             )
@@ -69,7 +65,6 @@ class SamplingParams:
         stop_token_ids (List[int], optional): A list of token ids that stop the generation when they are generated. Defaults to None.
         include_stop_str_in_output (bool): Whether to include the stop strings in output text. Defaults to False.
         embedding_bias (torch.Tensor, optional): The embedding bias tensor. Expected type is kFP32 and shape is [vocab_size]. Defaults to None.
-        external_draft_tokens_config (ExternalDraftTokensConfig, optional): The speculative decoding configuration. Defaults to None.
         logits_post_processor_name (str, optional): The logits postprocessor name. Must correspond to one of the logits postprocessor name provided to the ExecutorConfig. Defaults to None.
 
         n (int): Number of sequences to generate. Defaults to 1.
@@ -77,37 +72,37 @@ class SamplingParams:
         use_beam_search (bool): Whether to use beam search. Defaults to False.
 
         beam_width (int): The beam width. Setting 1 disables beam search. This parameter will be deprecated from the LLM API in a future release. Please use n/best_of/use_beam_search instead. Defaults to 1.
-        num_return_sequences (int, optional): The number of sequences to return. If set to None, it defaults to the value of `beam_width`. The default is None. This parameter will be deprecated from the LLM API in a future release. Please use n/best_of/use_beam_search instead. Defaults to None.
+        num_return_sequences (int, optional): The number of sequences to return. If set to None, it defaults to the value of `beam_width`. This parameter will be deprecated from the LLM API in a future release. Please use n/best_of/use_beam_search instead. Defaults to None.
 
-        top_k (int): Controls number of logits to sample from. Default is 0 (all logits).
-        top_p (float): Controls the top-P probability to sample from. Default is 0.f
-        top_p_min (float): Controls decay in the top-P algorithm. topPMin is lower-bound. Default is 1.e-6.
-        top_p_reset_ids (int): Controls decay in the top-P algorithm. Indicates where to reset the decay. Default is 1.
-        top_p_decay (float): Controls decay in the top-P algorithm. The decay value. Default is 1.f
-        seed (int): Controls the random seed used by the random number generator in sampling
-        random_seed (int): Controls the random seed used by the random number generator in sampling. This argument is being deprecated; please use seed instead.
-        temperature (float): Controls the modulation of logits when sampling new tokens. It can have values > 0.f. Default is 1.0f
-        min_tokens (int): Lower bound on the number of tokens to generate. Values < 1 have no effect. Default is 1.
-        min_length (int): Lower bound on the number of tokens to generate. Values < 1 have no effect. Default is 1. This argument is being deprecated; please use min_tokens instead.
-        beam_search_diversity_rate (float): Controls the diversity in beam search.
-        repetition_penalty (float): Used to penalize tokens based on how often they appear in the sequence. It can have any value > 0.f. Values < 1.f encourages repetition, values > 1.f discourages it. Default is 1.f
-        presence_penalty (float): Used to penalize tokens already present in the sequence (irrespective of the number of appearances). It can have any values. Values < 0.f encourage repetition, values > 0.f discourage it. Default is 0.f
-        frequency_penalty (float): Used to penalize tokens already present in the sequence (dependent on the number of appearances). It can have any values. Values < 0.f encourage repetition, values > 0.f discourage it. Default is 0.f
-        length_penalty (float): Controls how to penalize longer sequences in beam search. Default is 0.f
-        early_stopping (int): Controls whether the generation process finishes once beamWidth sentences are generated (ends with end_token)
-        no_repeat_ngram_size (int): Controls how many repeat ngram size are acceptable. Default is 1 << 30.
-        min_p (float): scale the most likely token to determine the minimum token probability. Default is 0.0.
+        top_k (int, optional): Controls number of logits to sample from. None means using C++ runtime default 0, i.e., all logits. Defaults to None.
+        top_p (float, optional): Controls the top-P probability to sample from. None means using C++ runtime default 0.f. Defaults to None.
+        top_p_min (float, optional): Controls decay in the top-P algorithm. topPMin is lower-bound. None means using C++ runtime default 1.e-6. Defaults to None.
+        top_p_reset_ids (int, optional): Controls decay in the top-P algorithm. Indicates where to reset the decay. None means using C++ runtime default 1. Defaults to None.
+        top_p_decay (float, optional): Controls decay in the top-P algorithm. The decay value. None means using C++ runtime default 1.f. Defaults to None.
+        seed (int, optional): Controls the random seed used by the random number generator in sampling. None means using C++ runtime default 0. Defaults to None.
+        random_seed (int, optional): This argument is being deprecated; please use seed instead. Defaults to None.
+        temperature (float, optional): Controls the modulation of logits when sampling new tokens. It can have values > 0.f. None means using C++ runtime default 1.0f. Defaults to None.
+        min_tokens (int, optional): Lower bound on the number of tokens to generate. Values < 1 have no effect. None means using C++ runtime default 1. Defaults to None.
+        min_length (int, optional): This argument is being deprecated; please use min_tokens instead. Defaults to None.
+        beam_search_diversity_rate (float, optional): Used to penalize tokens based on how often they appear in the sequence. It can have any value > 0.f. Values < 1.f encourages repetition, values > 1.f discourages it. None means using C++ runtime default 1.f. Defaults to None.
+        repetition_penalty (float, optional): Used to penalize tokens based on how often they appear in the sequence. It can have any value > 0.f. Values < 1.f encourages repetition, values > 1.f discourages it. None means using C++ runtime default 1.f. Defaults to None.
+        presence_penalty (float, optional): Used to penalize tokens already present in the sequence (irrespective of the number of appearances). It can have any values. Values < 0.f encourage repetition, values > 0.f discourage it. None means using C++ runtime default 0.f. Defaults to None.
+        frequency_penalty (float, optional): Used to penalize tokens already present in the sequence (dependent on the number of appearances). It can have any values. Values < 0.f encourage repetition, values > 0.f discourage it. None means using C++ runtime default 0.f. Defaults to None.
+        length_penalty (float, optional): Controls how to penalize longer sequences in beam search. None means using C++ runtime default 0.f. Defaults to None.
+        early_stopping (int, optional): Controls whether the generation process finishes once beamWidth sentences are generated (ends with end_token).  None means using C++ runtime default 1. Defaults to None.
+        no_repeat_ngram_size (int, optional): Controls how many repeat ngram size are acceptable. None means using C++ runtime default 1 << 30. Defaults to None.
+        min_p (float, optional): scale the most likely token to determine the minimum token probability. None means using C++ runtime default 0.0. Defaults to None.
 
-        return_log_probs (bool): Controls if Result should contain log probabilities. Default is false.
-        return_context_logits (bool): Controls if Result should contain the context logits. Default is false.
-        return_generation_logits (bool): Controls if Result should contain the generation logits. Default is false.
-        exclude_input_from_output (bool): Controls if output tokens in Result should include the input tokens. Default is true.
-        return_encoder_output (bool): Controls if Result should contain encoder output hidden states (for encoder-only and encoder-decoder models). Default is false.
-        return_perf_metrics (bool): Controls if Result should contain the performance metrics for this request. Default is false.
-        additional_model_outputs (list[AdditionalModelOutput], optional): The additional outputs to gather from the model.
+        return_log_probs (bool): Controls if Result should contain log probabilities. Defaults to False.
+        return_context_logits (bool): Controls if Result should contain the context logits. Defaults to False.
+        return_generation_logits (bool): Controls if Result should contain the generation logits. Defaults to False.
+        exclude_input_from_output (bool): Controls if output tokens in Result should include the input tokens. Defaults to True.
+        return_encoder_output (bool): Controls if Result should contain encoder output hidden states (for encoder-only and encoder-decoder models). Defaults to False.
+        return_perf_metrics (bool): Controls if Result should contain the performance metrics for this request. Defaults to False.
+        additional_model_outputs (List[tensorrt_llm.sampling_params.AdditionalModelOutput], optional): The additional outputs to gather from the model. Defaults to None.
 
-        lookahead_config (LookaheadDecodingConfig , optional): Lookahead decoding config. Defaults to None.
-        guided_decoding (GuidedDecodingParams, optional): Guided decoding params. Defaults to None.
+        lookahead_config (tensorrt_llm.bindings.executor.LookaheadDecodingConfig , optional): Lookahead decoding config. Defaults to None.
+        guided_decoding (tensorrt_llm.sampling_params.GuidedDecodingParams, optional): Guided decoding params. Defaults to None.
 
         ignore_eos (bool): Whether to ignore the EOS token and continue generating tokens after the EOS token is generated. Defaults to False.
         detokenize (bool): Whether to detokenize the output. Defaults to True.
@@ -143,8 +138,6 @@ class SamplingParams:
                                                       repr=False)
 
     embedding_bias: Optional[torch.Tensor] = None
-    external_draft_tokens_config: Optional[
-        tllme.ExternalDraftTokensConfig] = None
     logits_post_processor_name: Optional[str] = None
 
     n: int = 1
@@ -180,7 +173,7 @@ class SamplingParams:
     exclude_input_from_output: bool = True
     return_encoder_output: bool = False
     return_perf_metrics: bool = False
-    additional_model_outputs: Optional[list[AdditionalModelOutput]] = None
+    additional_model_outputs: Optional[List[AdditionalModelOutput]] = None
 
     # Lookahead decoding config
     lookahead_config: Optional[tllme.LookaheadDecodingConfig] = None
@@ -256,7 +249,7 @@ class SamplingParams:
                     f'greater than or equal to num_return_sequences '
                     f'({self.num_return_sequences}).')
 
-            if (self.best_of > 1 and self.greedy_decoding and
+            if (self.best_of > 1 and self._greedy_decoding and
                     not os.environ.get('TLLM_ALLOW_N_GREEDY_DECODING', None)):
                 raise ValueError(
                     f'Greedy decoding in the LLM API does not allow multiple '
@@ -274,14 +267,14 @@ class SamplingParams:
             self.guided_decoding._validate()
 
     @property
-    def greedy_decoding(self) -> bool:
+    def _greedy_decoding(self) -> bool:
         return (not self.use_beam_search
                 and (self.top_k is None or self.top_k == 1)
                 and (self.top_p is None or self.top_p == 0.0))
 
-    def setup(self,
-              tokenizer,
-              add_special_tokens: bool = False) -> 'SamplingParams':
+    def _setup(self,
+               tokenizer,
+               add_special_tokens: bool = False) -> 'SamplingParams':
         if self.end_id is None:
             self.end_id = tokenizer.eos_token_id
             self.pad_id = tokenizer.pad_token_id
@@ -351,25 +344,6 @@ class SamplingParams:
         return list(zip(stop_reasons, stop_words))
 
     def _get_sampling_config(self) -> tllme.SamplingConfig:
-        expected_fields = {
-            "beam_width", "top_k", "top_p", "top_p_min", "top_p_reset_ids",
-            "top_p_decay", "seed", "random_seed", "temperature", "min_tokens",
-            "min_length", "beam_search_diversity_rate", "repetition_penalty",
-            "presence_penalty", "frequency_penalty", "length_penalty",
-            "early_stopping", "no_repeat_ngram_size", "num_return_sequences",
-            "min_p"
-        }
-        found_fields = {
-            f
-            for f in dir(tllme.SamplingConfig) if not f.startswith('__')
-        }
-
-        if found_fields != expected_fields:
-            raise RuntimeError(
-                "Found fields in `tllme.SamplingConfig` different than expected; "
-                f"if `tllme.SamplingConfig` is changed, please update {self.__class__.__name__} accordingly. "
-                "See [TO DEVELOPER] comments for detailed instructions.")
-
         # A map from the SamplingConfig fields of the LLM API to their
         # corresponding field names of the Executor of TRT-LLM C++ runtime.
         # In sampling, there is no parameter that directly matches 'best_of',
@@ -383,13 +357,17 @@ class SamplingParams:
         # | Sampling    | use_beam_search | beam_width == 1        |
         # | Sampling    | n               | num_return_sequences   |
         # | Sampling    | best_of         | no corresponding param |
+        fields = {
+            f
+            for f in dir(tllme.SamplingConfig) if not f.startswith('__')
+        }
         unmatched_params = [
             'num_return_sequences', 'beam_width', 'n', 'best_of',
             'use_beam_search'
         ]
         llmapi_to_rt_param_map = {
             f: getattr(self, f)
-            for f in expected_fields if f not in unmatched_params
+            for f in fields if f not in unmatched_params
         }
         if self.use_beam_search:
             llmapi_to_rt_param_map['num_return_sequences'] = self.n
@@ -401,26 +379,11 @@ class SamplingParams:
         return tllme.SamplingConfig(**llmapi_to_rt_param_map)
 
     def _get_output_config(self) -> tllme.OutputConfig:
-        expected_fields = [
-            "return_log_probs", "return_context_logits",
-            "return_generation_logits", "exclude_input_from_output",
-            "return_encoder_output", "return_perf_metrics",
-            "additional_model_outputs"
-        ]
-        found_fields = [
-            f for f in dir(tllme.OutputConfig) if not f.startswith('__')
-        ]
-        if set(found_fields) != set(expected_fields):
-            raise RuntimeError(
-                "Found fields in `tllme.OutputConfig` different than expected; "
-                f"if `tllme.OutputConfig` is changed, please update {self.__class__.__name__} accordingly. "
-                "See [TO DEVELOPER] comments for detailed instructions.")
-        return tllme.OutputConfig(
-            **{f: getattr(self, f)
-               for f in expected_fields})
+        fields = [f for f in dir(tllme.OutputConfig) if not f.startswith('__')]
+        return tllme.OutputConfig(**{f: getattr(self, f) for f in fields})
 
     def _get_guided_decoding_params(self) -> tllme.GuidedDecodingParams:
-        if self.guided_decoding is None or self.guided_decoding.num_guides == 0:
+        if self.guided_decoding is None:
             return None
 
         if self.guided_decoding.json_object:
@@ -438,7 +401,9 @@ class SamplingParams:
             return tllme.GuidedDecodingParams(
                 tllme.GuidedDecodingParams.GuideType.REGEX,
                 self.guided_decoding.regex)
-        else:
+        elif self.guided_decoding.grammar is not None:
             return tllme.GuidedDecodingParams(
                 tllme.GuidedDecodingParams.GuideType.EBNF_GRAMMAR,
                 self.guided_decoding.grammar)
+        else:
+            return None

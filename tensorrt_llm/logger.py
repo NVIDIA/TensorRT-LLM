@@ -15,6 +15,7 @@
 import logging
 import os
 import sys
+from typing import Optional
 
 import tensorrt as trt
 
@@ -36,6 +37,10 @@ class Singleton(type):
 
 class Logger(metaclass=Singleton):
 
+    ENV_VARIABLE = 'TLLM_LOG_LEVEL'
+    PREFIX = 'TRT-LLM'
+    DEFAULT_LEVEL = 'error'
+
     INTERNAL_ERROR = '[F]'
     ERROR = '[E]'
     WARNING = '[W]'
@@ -44,19 +49,20 @@ class Logger(metaclass=Singleton):
     DEBUG = '[D]'
 
     def __init__(self):
-        environ_severity = os.environ.get('TLLM_LOG_LEVEL')
+        environ_severity = os.environ.get(self.ENV_VARIABLE)
         self._set_from_env = environ_severity is not None
-        default_level = "error"
+
+        self.rank: Optional[int] = None
 
         min_severity = environ_severity.lower(
-        ) if self._set_from_env else default_level
+        ) if self._set_from_env else self.DEFAULT_LEVEL
         invalid_severity = min_severity not in severity_map
         if invalid_severity:
-            min_severity = default_level
+            min_severity = self.DEFAULT_LEVEL
 
         self._min_severity = min_severity
         self._trt_logger = trt.Logger(severity_map[min_severity][0])
-        self._logger = logging.getLogger('TRT-LLM')
+        self._logger = logging.getLogger(self.PREFIX)
         handler = logging.StreamHandler(stream=sys.stdout)
         handler.setFormatter(
             logging.Formatter(fmt='[%(asctime)s] %(message)s',
@@ -70,8 +76,11 @@ class Logger(metaclass=Singleton):
 
         if invalid_severity:
             self.warning(
-                f"Requested log level {environ_severity} is invalid. Using '{default_level}' instead"
+                f"Requested log level {environ_severity} is invalid. Using '{self.DEFAULT_LEVEL}' instead"
             )
+
+    def set_rank(self, rank: int):
+        self.rank = rank
 
     def _func_wrapper(self, severity):
         if severity == self.INTERNAL_ERROR:
@@ -91,26 +100,30 @@ class Logger(metaclass=Singleton):
     def trt_logger(self) -> trt.ILogger:
         return self._trt_logger
 
-    def log(self, severity, msg):
-        msg = f'[TRT-LLM] {severity} ' + msg
-        self._func_wrapper(severity)(msg)
+    def log(self, severity, *msg):
+        parts = [f'[{self.PREFIX}]']
+        if self.rank is not None:
+            parts.append(f'[RANK {self.rank}]')
+        parts.append(severity)
+        parts.extend(map(str, msg))
+        self._func_wrapper(severity)(" ".join(parts))
 
-    def critical(self, msg):
-        self.log(self.INTERNAL_ERROR, msg)
+    def critical(self, *msg):
+        self.log(self.INTERNAL_ERROR, *msg)
 
     fatal = critical
 
-    def error(self, msg):
-        self.log(self.ERROR, msg)
+    def error(self, *msg):
+        self.log(self.ERROR, *msg)
 
-    def warning(self, msg):
-        self.log(self.WARNING, msg)
+    def warning(self, *msg):
+        self.log(self.WARNING, *msg)
 
-    def info(self, msg):
-        self.log(self.INFO, msg)
+    def info(self, *msg):
+        self.log(self.INFO, *msg)
 
-    def debug(self, msg):
-        self.log(self.VERBOSE, msg)
+    def debug(self, *msg):
+        self.log(self.VERBOSE, *msg)
 
     @property
     def level(self) -> str:

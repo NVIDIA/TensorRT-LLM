@@ -529,9 +529,44 @@ void InitBindings(pybind11::module_& m)
         .def(py::pickle(kvCacheRetentionConfigGetstate, kvCacheRetentionConfigSetstate))
         .def("__eq__", &tle::KvCacheRetentionConfig::operator==);
 
+    auto ContextPhaseParamsGetState = [](tle::ContextPhaseParams const& self)
+    {
+        auto serializedState = self.getSerializedState();
+        return py::make_tuple(
+            self.getFirstGenTokens(), self.getReqId(), py::bytes(serializedState.data(), serializedState.size()));
+    };
+
+    auto ContextPhaseParamsSetState = [](py::tuple const& state)
+    {
+        if (state.size() != 3)
+        {
+            throw std::runtime_error("Invalid ContextPhaseParams state!");
+        }
+        auto opaque_state = state[2].cast<py::bytes>();
+        auto opaque_state_str_view = std::string_view(opaque_state.cast<std::string_view>());
+        return std::make_unique<tle::ContextPhaseParams>(state[0].cast<VecTokens>(),
+            state[1].cast<tle::ContextPhaseParams::RequestIdType>(),
+            std::vector<char>(opaque_state_str_view.begin(), opaque_state_str_view.end()));
+    };
+
     py::class_<tle::ContextPhaseParams>(m, "ContextPhaseParams")
-        .def(py::init<VecTokens, tle::ContextPhaseParams::RequestIdType>(), py::arg("first_gen_tokens"),
-            py::arg("req_id"));
+        .def(py::init(
+            [](VecTokens const& first_gen_tokens, tle::ContextPhaseParams::RequestIdType req_id,
+                py::bytes const& opaque_state)
+            {
+                auto opaque_state_str_view = std::string_view(opaque_state.cast<std::string_view>());
+                return std::make_unique<tle::ContextPhaseParams>(first_gen_tokens, req_id,
+                    std::vector<char>(opaque_state_str_view.begin(), opaque_state_str_view.end()));
+            }))
+        .def_property_readonly("first_gen_tokens", &tle::ContextPhaseParams::getFirstGenTokens)
+        .def_property_readonly("req_id", &tle::ContextPhaseParams::getReqId)
+        .def_property_readonly("opaque_state",
+            [](tle::ContextPhaseParams const& self)
+            {
+                auto serializedState = self.getSerializedState();
+                return py::bytes(serializedState.data(), serializedState.size());
+            })
+        .def(py::pickle(ContextPhaseParamsGetState, ContextPhaseParamsSetState));
 
     auto SpeculativeDecodingConfigGetState
         = [](tle::SpeculativeDecodingConfig const& self) { return py::make_tuple(self.fastLogits); };
@@ -752,6 +787,8 @@ void InitBindings(pybind11::module_& m)
         .def_property(
             "guided_decoding_params", &tle::Request::getGuidedDecodingParams, &tle::Request::setGuidedDecodingParams)
         .def_property("allotted_time_ms", &tle::Request::getAllottedTimeMs, &tle::Request::setAllottedTimeMs)
+        .def_property(
+            "context_phase_params", &tle::Request::getContextPhaseParams, &tle::Request::setContextPhaseParams)
         .def(py::pickle(requestGetstate, requestSetstate));
     request.attr("BATCHED_POST_PROCESSOR_NAME") = tle::Request::kBatchedPostProcessorName;
 
@@ -759,7 +796,9 @@ void InitBindings(pybind11::module_& m)
         .value("NOT_FINISHED", tle::FinishReason::kNOT_FINISHED)
         .value("END_ID", tle::FinishReason::kEND_ID)
         .value("STOP_WORDS", tle::FinishReason::kSTOP_WORDS)
-        .value("LENGTH", tle::FinishReason::kLENGTH);
+        .value("LENGTH", tle::FinishReason::kLENGTH)
+        .value("TIMED_OUT", tle::FinishReason::kTIMED_OUT)
+        .value("CANCELLED", tle::FinishReason::kCANCELLED);
 
     py::class_<tle::SpeculativeDecodingFastLogitsInfo>(m, "SpeculativeDecodingFastLogitsInfo")
         .def(py::init<>())
@@ -854,6 +893,7 @@ void InitBindings(pybind11::module_& m)
         .def_readwrite("context_phase_params", &tle::Result::contextPhaseParams)
         .def_readwrite("request_perf_metrics", &tle::Result::requestPerfMetrics)
         .def_readwrite("additional_outputs", &tle::Result::additionalOutputs)
+        .def_readwrite("context_phase_params", &tle::Result::contextPhaseParams)
         .def(py::pickle(resultGetstate, resultSetstate));
 
     auto responseGetstate = [](tle::Response const& self)

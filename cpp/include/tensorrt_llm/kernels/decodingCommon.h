@@ -99,7 +99,7 @@ public:
 
     __host__ __device__ void constexpr setSkipDecoding()
     {
-        mState = kSkipDecoding;
+        mState |= kSkipDecoding;
     }
 
     __host__ __device__ bool constexpr isSkipDecoding() const

@@ -1,11 +1,15 @@
+import asyncio
+import json
+import weakref
 from dataclasses import dataclass, field
-from queue import Queue
+from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Callable, List, Literal, Optional, Union
 from weakref import WeakMethod
 
 import torch
 
 from ..bindings import executor as tllm
+from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import AsyncQueue
 from ..sampling_params import SamplingParams
@@ -17,9 +21,11 @@ if TYPE_CHECKING:
     from .request import GenerationRequest
 
 __all__ = [
+    "CompletionOutput",
     "GenerationResultBase",
     "DetokenizedGenerationResultBase",
     "GenerationResult",
+    "IterationStatsResult",
 ]
 
 
@@ -30,14 +36,15 @@ class CompletionOutput:
     Args:
         index (int): The index of the output in the request.
         text (str): The generated output text. Defaults to "".
-        token_ids (List[int]): The token ids of the generated output text. Defaults to [].
+        token_ids (List[int], optional): The token ids of the generated output text. Defaults to None.
         cumulative_logprob (float, optional): The cumulative log probability of the generated output text. Defaults to None.
-        logprobs (List[float]): The log probabilities of the top probability words at each position if the logprobs are requested. Defaults to [].
-        finish_reason (Literal['stop', 'length'], optional): The reason why the sequence is finished. Defaults to None.
+        logprobs (List[float], optional): The log probabilities of the top probability words at each position if the logprobs are requested. Defaults to None.
+        finish_reason (Literal['stop', 'length', 'timeout', 'cancelled'], optional): The reason why the sequence is finished. Defaults to None.
         stop_reason (int, str, optional): The stop string or token id that caused the completion to stop, None if the completion finished for some other reason. Defaults to None.
         generation_logits (torch.Tensor, optional): The logits on the generated output token ids. Defaults to None.
+        disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Parameters needed for disaggregated serving. Includes the type of request, the first generated tokens, the context request id and the any additional state needing to be transferred from context and generation instances. Defaults to None.
 
-    Properties:
+    Attributes:
         length (int): The number of generated tokens.
         token_ids_diff (List[int]): Newly generated token ids.
         logprobs_diff (List[float]): Logprobs of newly generated tokens.
@@ -45,12 +52,14 @@ class CompletionOutput:
     """
     index: int
     text: str = ""
-    token_ids: List[int] = field(default_factory=list)
+    token_ids: Optional[List[int]] = None
     cumulative_logprob: Optional[float] = None
-    logprobs: List[float] = field(default_factory=list)
-    finish_reason: Optional[Literal['stop', 'length']] = None
+    logprobs: Optional[List[float]] = None
+    finish_reason: Optional[Literal['stop', 'length', 'timeout',
+                                    'cancelled']] = None
     stop_reason: Optional[Union[int, str]] = None
     generation_logits: Optional[torch.Tensor] = None
+    disaggregated_params: Optional[DisaggregatedParams] = None
 
     # hidden fields for tracking the diffs
     _last_text_len: int = field(default=0, init=False, repr=False)
@@ -62,8 +71,14 @@ class CompletionOutput:
     # the result of result_handler passed to postprocess workers
     _postprocess_result: Any = None
 
+    def __post_init__(self):
+        if self.token_ids is None:
+            self.token_ids = []
+        if self.logprobs is None:
+            self.logprobs = []
+
     @property
-    def length(self):
+    def length(self) -> int:
         return len(self.token_ids)
 
     @property
@@ -89,7 +104,6 @@ class GenerationResultBase:
         self.id = id
         self.sampling_params = sampling_params
         self._done = False
-        self._cancelled = False
 
         if has_event_loop():
             self.aqueue = AsyncQueue()
@@ -104,7 +118,7 @@ class GenerationResultBase:
         self._outputs: List[CompletionOutput] = [
             CompletionOutput(i) for i in range(self.sampling_params.best_of)
         ]
-        self.context_logits: Optional[torch.Tensor] = None
+        self._context_logits: Optional[torch.Tensor] = None
 
         self._background_error_handler = None
         if background_error_handler is not None:
@@ -137,8 +151,12 @@ class GenerationResultBase:
             sorted_out.index = i
         return sorted_outputs[:sampling_param.n]
 
-    def handle_sequence(self, response: "GenerationExecutor.Response",
-                        sequence_index: int):
+    @property
+    def context_logits(self) -> Optional[torch.Tensor]:
+        return self._context_logits
+
+    def _handle_sequence(self, response: "GenerationExecutor.Response",
+                         sequence_index: int):
         """ Handle a single sequence in the response. """
 
         tensors = response.tensors
@@ -149,6 +167,7 @@ class GenerationResultBase:
         src_idx = sequence_index if beam_search else 0
 
         output = self._outputs[seq_idx]
+        output.disaggregated_params = response.disaggregated_params
 
         output._last_token_ids_len = len(output.token_ids)
         output.token_ids.extend(tensors.output_token_ids[src_idx])
@@ -157,10 +176,18 @@ class GenerationResultBase:
         if tensors.log_probs is not None:
             output._last_logprobs_len = len(output.logprobs)
             output.logprobs = tensors.log_probs[src_idx]
-            assert len(output.logprobs) == output.length
+            # overcome some WAR in the cpp executor
+            if response.finish_reasons[src_idx] != tllm.FinishReason.CANCELLED:
+                assert len(output.logprobs) == output.length
         if tensors.generation_logits is not None:
             output.generation_logits = tensors.generation_logits[
                 src_idx, :output.length]
+
+        # when sampling_params.n > 1 and is cancelled, make sure all the outputs
+        # be marked as cancelled.
+        if response.finish_reasons and response.finish_reasons[
+                src_idx] == tllm.FinishReason.CANCELLED:
+            output.finish_reason = 'cancelled'
 
         if self._done:
             if response.finish_reasons[src_idx] == tllm.FinishReason.END_ID:
@@ -177,9 +204,19 @@ class GenerationResultBase:
                         break
             elif response.finish_reasons[src_idx] == tllm.FinishReason.LENGTH:
                 output.finish_reason = 'length'
+            elif response.finish_reasons[
+                    src_idx] == tllm.FinishReason.TIMED_OUT:
+                output.finish_reason = 'timeout'
+            elif response.finish_reasons[
+                    src_idx] == tllm.FinishReason.CANCELLED:
+                pass
+            else:
+                raise ValueError(
+                    f"Unknown finish reason: {response.finish_reasons[src_idx]}"
+                )
 
-    def handle_response(self, response: Union["GenerationExecutor.Response",
-                                              "PostprocWorker.Output"]):
+    def _handle_response(self, response: Union["GenerationExecutor.Response",
+                                               "PostprocWorker.Output"]):
 
         is_postprocess_res = isinstance(response, PostprocWorker.Output)
         if is_postprocess_res:
@@ -200,25 +237,22 @@ class GenerationResultBase:
         if is_postprocess_res: return
 
         tensors = response.tensors
+        self.disaggregated_params = response.disaggregated_params
 
         # output_token_ids = (beams, tokens)
         if self.sampling_params.use_beam_search:
             for beam_idx, _ in enumerate(tensors.output_token_ids):
-                self.handle_sequence(response, beam_idx)
+                self._handle_sequence(response, beam_idx)
         else:
-            self.handle_sequence(response, response.sequence_index)
+            self._handle_sequence(response, response.sequence_index)
 
         if tensors.context_logits is not None:
-            self.context_logits = tensors.context_logits
+            self._context_logits = tensors.context_logits
 
         # Processing background errors here ASAF during generation.
         if self._background_error_handler and (
                 handler := self._background_error_handler()):
             handler()
-
-    @property
-    def done(self) -> bool:
-        return self._done
 
 
 class DetokenizedGenerationResultBase(GenerationResultBase):
@@ -236,8 +270,8 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
         self.tokenizer = tokenizer
         self._streaming = streaming
 
-    def handle_response(self, response: "GenerationExecutor.Response"):
-        GenerationResultBase.handle_response(self, response)
+    def _handle_response(self, response: "GenerationExecutor.Response"):
+        GenerationResultBase._handle_response(self, response)
 
         # The postprocess has been performed, return directly
         if isinstance(response, PostprocWorker.Output):
@@ -279,15 +313,23 @@ class GenerationResult(GenerationResultBase):
     Args:
         generation_request (GenerationRequest): The generation request object.
         background_error_handler (Callable, optional): The error handler to process the errors from the background threads/processes. Defaults to None.
+        executor (GenerationExecutor, optional): The executor that created this result. Defaults to None.
     '''
 
     def __init__(self,
                  generation_request: "GenerationRequest",
-                 background_error_handler: Optional[Callable] = None) -> None:
+                 background_error_handler: Optional[Callable] = None,
+                 executor: Optional["GenerationExecutor"] = None) -> None:
         super().__init__(generation_request.id,
                          generation_request.sampling_params,
                          background_error_handler)
         self._generation_request = generation_request
+        self._streaming = generation_request.streaming
+
+        # for aborting the request
+        self._executor: Optional[weakref.ReferenceType[
+            "GenerationExecutor"]] = weakref.ref(executor) if executor else None
+        self._aborted = False
 
     @property
     def request_id(self) -> int:
@@ -297,36 +339,56 @@ class GenerationResult(GenerationResultBase):
     def prompt_token_ids(self) -> List[int]:
         return self._generation_request.prompt_token_ids
 
+    def abort(self) -> None:
+        """Abort the generation request.
+        """
+        assert self._executor is not None, "The executor is not set for this result."
+        self._executor().abort_request(self.request_id)
+        self._aborted = True
+
+    def aborted(self) -> bool:
+        """Return whether the generation request is aborted.
+
+        Returns:
+            bool: whether the generation request is aborted.
+        """
+        return self._aborted
+
     @property
     def finished(self) -> bool:
         return self._done
 
-    @property
-    def streaming(self):
-        return self._generation_request.streaming
-
-    @property
-    def generation_request(self) -> "GenerationRequest":
-        return self._generation_request
-
-    def result_step(self, timeout: Optional[float] = None):
+    def _result_step(self, timeout: Optional[float] = None):
         response = self.queue.get(timeout=timeout)
-        self.handle_response(response)
+        self._handle_response(response)
 
-    async def aresult_step(self):
+    async def _aresult_step(self):
         assert self.aqueue is not None, "The asyncio event loop was not present during initialization, so async operations are not available."
         response = await self.aqueue.get()
         global_tracer().log_instant("result_step.get")
-        self.handle_response(response)
+        self._handle_response(response)
 
     def result(self, timeout: Optional[float] = None) -> "GenerationResult":
+        """Wait for the completion of the request, and return the result.
+
+        Args:
+            timeout (float, optional): Timeout. Defaults to None.
+
+        Returns:
+            tensorrt_llm.executor.result.GenerationResult: generation result.
+        """
         while not self._done:
-            self.result_step(timeout)
+            self._result_step(timeout)
         return self
 
     async def aresult(self) -> "GenerationResult":
+        """Wait for the completion of the request, and return the result.
+
+        Returns:
+            tensorrt_llm.executor.result.GenerationResult: generation result.
+        """
         while not self._done:
-            await self.aresult_step()
+            await self._aresult_step()
         return self
 
     def __await__(self):
@@ -339,7 +401,7 @@ class GenerationResult(GenerationResultBase):
         if self._done:
             raise StopIteration
 
-        self.result_step()
+        self._result_step()
         return self
 
     def __aiter__(self):
@@ -349,19 +411,10 @@ class GenerationResult(GenerationResultBase):
         if self._done:
             raise StopAsyncIteration
 
-        await self.aresult_step()
+        await self._aresult_step()
         return self
 
-    def running(self) -> bool:
-        return not self._done
-
-    def cancelled(self) -> bool:
-        return self._cancelled
-
-    def cancel(self):
-        raise NotImplementedError
-
-    def exception(self, timeout: Optional[float] = None):
+    def _exception(self, timeout: Optional[float] = None):
         try:
             self.result(timeout)
         except RuntimeError as e:
@@ -387,3 +440,59 @@ class GenerationResult(GenerationResultBase):
 
     def __hash__(self):
         return hash(self.request_id)
+
+
+class IterationStatsResult:
+    """
+    Runtime statistics for all available iterations.
+    """
+
+    def __init__(self):
+        self._done = False
+        self._timeout = 2
+
+        if has_event_loop():
+            self.aqueue = AsyncQueue()
+            self.queue = self.aqueue.sync_q
+        else:
+            self.queue = Queue()
+            self.aqueue = None
+
+    def set_timeout(self, timeout: float):
+        self._timeout = timeout
+
+    def mark_undone(self):
+        # should be called when new prompts are submitted
+        self._done = False
+
+    def get_results(self) -> List[dict]:
+        """
+        Return all runtime stats in the queue.
+        """
+        results = []
+        while not self._done:
+            try:
+                stats = self.queue.get(timeout=self._timeout)
+                results.append(json.loads(stats))
+            except Empty:
+                self._done = True
+        return results
+
+    def __await__(self):
+        return self.aresult().__await__()
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._done:
+            raise StopAsyncIteration
+
+        assert self.aqueue is not None, "The asyncio event loop was not present during initialization, so async operations are not available."
+
+        try:
+            stats = await self.aqueue.get(timeout=self._timeout)
+            return json.loads(stats)
+        except asyncio.TimeoutError:
+            self._done = True
+            raise StopAsyncIteration

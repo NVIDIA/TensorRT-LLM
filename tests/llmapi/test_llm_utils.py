@@ -171,7 +171,7 @@ def test_ConfigArbitor_perf_fallback():
 def test_ModelLoader():
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
     args = LlmArgs(llama_model_path, kv_cache_config=kv_cache_config)
-    args.setup()
+    args._setup()
 
     # Test with HF model
     temp_dir = tempfile.TemporaryDirectory()
@@ -184,7 +184,7 @@ def test_ModelLoader():
 
     # Test with engine
     args.model = build_engine()
-    args.setup()
+    args._setup()
     assert args.model_format is _ModelFormatKind.TLLM_ENGINE
     print(f'engine_dir: {args.model}')
     model_loader = ModelLoader(args)
@@ -197,7 +197,7 @@ def test_CachedModelLoader():
     args = LlmArgs(llama_model_path,
                    kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4))
     args.enable_build_cache = True
-    args.setup()
+    args._setup()
     stats = LlmBuildStats()
     model_loader = CachedModelLoader(args, llm_build_stats=stats)
     engine_dir, _ = model_loader()

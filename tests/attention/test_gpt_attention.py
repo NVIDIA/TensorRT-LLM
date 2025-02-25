@@ -565,7 +565,7 @@ class TestFunctional(unittest.TestCase):
                         dtype=tensorrt_llm.str_dtype_to_trt('int64'))
                     host_kv_cache_pool_mapping_tensor = Tensor(
                         name='host_kv_cache_pool_mapping',
-                        shape=(1, ),
+                        shape=(1, 1),
                         dtype=tensorrt_llm.str_dtype_to_trt('int32'))
                 else:
                     past_key_value_tensor = Tensor(

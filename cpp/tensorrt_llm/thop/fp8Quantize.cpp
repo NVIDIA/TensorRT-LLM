@@ -23,7 +23,7 @@ namespace torch_ext
 {
 
 using Fp8BlockScaleGemmRunnerPtr
-    = std::unique_ptr<tensorrt_llm::kernels::small_m_gemm::CutlassFp8BlockScaleGemmRunnerInterface>;
+    = std::unique_ptr<tensorrt_llm::kernels::fp8_blockscale_gemm::CutlassFp8BlockScaleGemmRunnerInterface>;
 
 std::tuple<at::Tensor, at::Tensor> fp8_quantize(at::Tensor const& self)
 {
@@ -40,7 +40,7 @@ std::tuple<at::Tensor, at::Tensor> fp8_quantize(at::Tensor const& self)
     TORCH_CHECK(n <= std::numeric_limits<int32_t>::max(), "N must be within int32");
 
     Fp8BlockScaleGemmRunnerPtr mGemmRunner
-        = std::make_unique<tensorrt_llm::kernels::small_m_gemm::CutlassFp8BlockScaleGemmRunner<__nv_bfloat16,
+        = std::make_unique<tensorrt_llm::kernels::fp8_blockscale_gemm::CutlassFp8BlockScaleGemmRunner<__nv_bfloat16,
             __nv_fp8_e4m3, __nv_bfloat16>>();
 
     at::Tensor valueE4M3

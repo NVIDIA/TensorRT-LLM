@@ -116,7 +116,8 @@ def weight_only_quantize(model, quant_config: QuantConfig, model_config=None):
         if isinstance(module, ColumnLinear):
             module_name = name.rsplit('.', 1)[-1]
             init_params["transb"] = module_name == "lm_head"
-        init_params["tp_rank"] = model_cfg.mapping.tp_rank
+        if "tp_rank" in init_params:
+            init_params["tp_rank"] = model_cfg.mapping.tp_rank
 
     model = quantize_layers(
         model,
@@ -151,7 +152,7 @@ def weight_only_groupwise_quantize(model,
             "use_w4a8_awq"] = quant_config.quant_algo == QuantAlgo.W4A8_AWQ
         init_params[
             "use_int8_weight"] = quant_config.quant_algo == QuantAlgo.W8A16_GPTQ
-        if not isinstance(module, MixtureOfExperts):
+        if "tp_rank" in init_params:
             init_params["tp_rank"] = model_cfg.mapping.tp_rank
 
     model = quantize_layers(
@@ -570,7 +571,7 @@ def quantize(model, quant_config: Union[QuantConfig, LayerQuantConfig]):
         if layer_quant_mode == QuantMode(0):
             continue
 
-        layer_quant_cfg = quant_config.get_quant_cfg(name)
+        layer_quant_cfg = quant_config._get_quant_cfg(name)
 
         if layer_quant_mode.has_fp8_qdq():
             module = fp8_quantize(module, layer_quant_cfg)

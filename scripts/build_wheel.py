@@ -251,10 +251,14 @@ def main(*,
             build_dir /
             "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/libtensorrt_llm_nvrtc_wrapper.so",
             lib_dir / "libtensorrt_llm_nvrtc_wrapper.so")
-        copy(
-            build_dir /
-            "tensorrt_llm/batch_manager/libtensorrt_llm_ucx_wrapper.so",
-            lib_dir / "libtensorrt_llm_ucx_wrapper.so")
+        if os.path.exists(
+                build_dir /
+                "tensorrt_llm/executor/cache_transmission/ucx_utils/libtensorrt_llm_ucx_wrapper.so"
+        ):
+            copy(
+                build_dir /
+                "tensorrt_llm/executor/cache_transmission/ucx_utils/libtensorrt_llm_ucx_wrapper.so",
+                lib_dir / "libtensorrt_llm_ucx_wrapper.so")
         copy(
             build_dir /
             "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/libdecoder_attention_0.so",

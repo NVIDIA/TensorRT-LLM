@@ -197,8 +197,10 @@ struct TllmGenFmhaRunnerParams
     // The output scaling factor buffer.
     void* oSfPtr;
 
-    // Head dimension.
-    int mHeadDim;
+    // Head dimension for Q and K.
+    int mHeadDimQk;
+    // Head dimension for V.
+    int mHeadDimV;
     // Number of heads for Q and K/V.
     int mNumHeadsQ, mNumHeadsKv, mNumHeadsQPerKv;
     // The batch size.
@@ -220,8 +222,8 @@ struct TllmGenFmhaRunnerParams
     int mNumTokensPerPage;
     // The number of pages in memory pool.
     int mNumPagesInMemPool;
-    // The maximum Ctas in the multiCtasKv mode.
-    int mMaxNumCtas;
+    // The number of multiProcessor for the GPU.
+    int mMultiProcessorCount;
     // Scaling factor for Q.
     float mScaleQ;
     // The start token index in SF tensor. Used for FP4 SF offset calculation in generation phase kernel when inflight
@@ -232,6 +234,34 @@ struct TllmGenFmhaRunnerParams
     float mScaleSfKv;
     // The cuda stream.
     cudaStream_t stream;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Parameters that might be updated when selecting kernels.
+struct TllmGenSelectKernelParams
+{
+    // The headDimV per CTA, which is only used by MLA generation kernels currently.
+    int mHeadDimPerCtaV;
+    // The maximum number of headsQPerCta that will be processed in one CTA.
+    int mMaxNumHeadsQPerKvInCta;
+    // Enable the multiCtasKvMode or not.
+    bool mMultiCtasKvMode;
+    // Reuse smemK for V or not (only work with MLA generation kernels).
+    bool mReuseSmemKForV;
+    // Do we need to select a new kernel as the parameters have been updated.
+    bool mSelectNewKernel;
+    // The tile scheduler.
+    TileScheduler mTileScheduler;
+
+    // The constructor.
+    TllmGenSelectKernelParams(TllmGenFmhaRunnerParams params)
+        : mHeadDimPerCtaV(params.mHeadDimV)
+        , mMaxNumHeadsQPerKvInCta(1)
+        , mMultiCtasKvMode(params.mMultiCtasKvMode)
+        , mReuseSmemKForV(false)
+        , mSelectNewKernel(false)
+        , mTileScheduler(params.mTileScheduler){};
 };
 
 } // namespace kernels

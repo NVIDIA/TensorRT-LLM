@@ -8,7 +8,7 @@ import pytest
 from parameterized import parameterized
 
 from tensorrt_llm.executor import ExecutorBindingsProxy
-from tensorrt_llm.llmapi import LLM, KvCacheConfig, SamplingParams
+from tensorrt_llm.llmapi import LLM, BuildConfig, KvCacheConfig, SamplingParams
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import PretrainedConfig
@@ -25,10 +25,20 @@ from test_llm import (
     llm_get_stats_test_harness, llm_test_harness, mixtral_model_name, prompts,
     tinyllama_guided_decoding_test_harness,
     tinyllama_logits_processor_test_harness, run_llm_with_postprocess_parallel,
-    run_llm_with_postprocess_parallel_and_result_handler)
+    run_llm_with_postprocess_parallel_and_result_handler, run_llm_abort_request,
+    sampling_params_for_aborting_request)
 from utils.util import (skip_gpu_memory_less_than, skip_num_gpus_less_than,
                         skip_single_gpu, unittest_name_func)
 # isort: on
+
+# shrink the kv_cache_config to avoid OOM in CI
+global_kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
+
+# python api does not seem to support extra tokens needed for prompt tuning + reuse.
+# disable block reuse for those tests.
+# TODO: Add extra tokens to prompt tuning unit tests.
+global_kv_cache_config_no_reuse = KvCacheConfig(free_gpu_memory_fraction=0.4,
+                                                enable_block_reuse=False)
 
 
 @pytest.fixture(scope="module")
@@ -47,7 +57,7 @@ def engine_from_checkpoint() -> tempfile.TemporaryDirectory:
         llm = LLM(
             ckpt_dir,
             tokenizer=tokenizer,
-            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
+            kv_cache_config=global_kv_cache_config,
         )
         assert llm.args.parallel_config.tp_size == tp_size
 
@@ -55,16 +65,6 @@ def engine_from_checkpoint() -> tempfile.TemporaryDirectory:
     llm.save(tmpdir.name)
 
     return tmpdir
-
-
-# shrink the kv_cache_config to avoid OOM in CI
-global_kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
-
-# python api does not seem to support extra tokens needed for prompt tuning + reuse.
-# disable block reuse for those tests.
-# TODO: Add extra tokens to prompt tuning unit tests.
-global_kv_cache_config_no_reuse = KvCacheConfig(free_gpu_memory_fraction=0.4,
-                                                enable_block_reuse=False)
 
 
 @skip_single_gpu
@@ -267,7 +267,6 @@ def run_command(command: str):
 
 @skip_single_gpu
 def test_llm_multi_node(engine_from_checkpoint: tempfile.TemporaryDirectory):
-    pytest.skip("https://nvbugs/5114619")
     # TODO[chunweiy]: reactivate this later
     nworkers = 2
     test_case_file = os.path.join(os.path.dirname(__file__), "run_llm.py")
@@ -280,7 +279,6 @@ def test_llm_multi_node(engine_from_checkpoint: tempfile.TemporaryDirectory):
 
 @skip_single_gpu
 def test_llm_multi_node_with_postproc():
-    pytest.skip("https://nvbugs/5114619")
     # TODO[chunweiy]: reactivate this later
     nworkers = 2
     test_case_file = os.path.join(os.path.dirname(__file__),
@@ -399,13 +397,11 @@ DummyExecutor3 = DummyExecutorMeta("DummyExecutor3", (), {},
                                    proxy_class=DummyExecutorProxy3)
 
 
-@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/4955607")
 @skip_single_gpu
 def test_llm_get_stats_tp2():
     llm_get_stats_test_harness(tp_size=2)
 
 
-@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/4955607")
 @skip_single_gpu
 def test_llm_get_stats_async_tp2():
     llm_get_stats_async_test_harness(tp_size=2)
@@ -421,6 +417,27 @@ def test_llm_with_postprocess_parallel_tp2():
 
 def test_llm_with_postprocess_parallel_and_result_handler_tp2():
     run_llm_with_postprocess_parallel_and_result_handler(tp_size=2)
+
+
+@pytest.fixture(scope="module")
+def llm_for_sampling_params_tp2() -> LLM:
+    build_config = BuildConfig(max_beam_width=3)
+    llm = LLM(
+        model=llama_model_path,
+        build_config=build_config,
+        fast_build=True,
+        kv_cache_config=global_kv_cache_config,
+        tensor_parallel_size=2,
+    )
+    return llm
+
+
+@pytest.mark.parametrize("sampling_params",
+                         sampling_params_for_aborting_request)
+def test_llm_abort_request_tp2(llm_for_sampling_params_tp2: LLM,
+                               sampling_params: SamplingParams):
+    run_llm_abort_request(llm=llm_for_sampling_params_tp2,
+                          sampling_params=sampling_params)
 
 
 if __name__ == '__main__':

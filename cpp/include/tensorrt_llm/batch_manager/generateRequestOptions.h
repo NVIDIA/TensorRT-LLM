@@ -18,8 +18,6 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/common.h"
-#include "tensorrt_llm/batch_manager/runtimeBuffers.h"
-#include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
 #include "tensorrt_llm/common/algorithm.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
@@ -30,9 +28,10 @@
 
 namespace tensorrt_llm::batch_manager
 {
+class RuntimeBuffers;
+class DecoderInputBuffers;
 
 namespace tr = tensorrt_llm::runtime;
-namespace tle = tensorrt_llm::executor;
 
 class GenerateRequestOptions : Algorithm
 {
@@ -50,21 +49,22 @@ public:
     {
     }
 
-    std::tuple<std::vector<SizeType32>, std::vector<tr::decoder_batch::Request>, std::vector<tr::SamplingConfig>>
-    operator()(tr::ModelConfig const& modelConfig, tr::WorldConfig const& worldConfig,
+    std::tuple<TensorPtr, std::vector<tr::decoder_batch::Request>, std::vector<tr::SamplingConfig>> operator()(
+        tr::ModelConfig const& modelConfig, tr::WorldConfig const& worldConfig,
         executor::DecodingConfig const& decodingConfig, runtime::TllmRuntime const& runtime,
-        RequestVector const& contextRequests, RuntimeBuffers& buffers, TensorPtr& decoderInputsIds) const;
+        RequestVector const& contextRequests, RuntimeBuffers const& buffers,
+        DecoderInputBuffers const& inputBuffers) const;
 
 private:
-    std::shared_ptr<runtime::ITensor> retrieveDraftLogits(tr::ModelConfig const& modelConfig,
-        tr::WorldConfig const& worldConfig, std::shared_ptr<runtime::ITensor> tensor,
+    [[nodiscard]] std::shared_ptr<runtime::ITensor> retrieveDraftLogits(tr::ModelConfig const& modelConfig,
+        tr::WorldConfig const& worldConfig, std::shared_ptr<runtime::ITensor> const& tensor,
         runtime::TllmRuntime const& runtime) const;
 
     /// @brief Retrieve the embedding bias from the request. This potentially makes a copy of the tensor
     /// to the appropriate type if the input tensor does not match it.
-    TensorPtr getEmbeddingBias(runtime::TllmRuntime const& runtime, TensorPtr const& tensor) const;
+    [[nodiscard]] TensorPtr getEmbeddingBias(runtime::TllmRuntime const& runtime, TensorPtr const& tensor) const;
 
-    std::optional<TensorPtr> targetModelReceiveLogits(
+    [[nodiscard]] std::optional<TensorPtr> targetModelReceiveLogits(
         executor::SpeculativeDecodingFastLogitsInfo const& fastLogitsInfo, runtime::TllmRuntime const& runtime) const;
 
     bool mSpeculativeDecodingFastLogits;

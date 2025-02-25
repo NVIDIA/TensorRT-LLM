@@ -30,6 +30,7 @@
 #include "tensorrt_llm/pybind/batch_manager/algorithms.h"
 #include "tensorrt_llm/pybind/batch_manager/bindings.h"
 #include "tensorrt_llm/pybind/batch_manager/buffers.h"
+#include "tensorrt_llm/pybind/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/pybind/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/pybind/batch_manager/llmRequest.h"
 #include "tensorrt_llm/pybind/executor/bindings.h"
@@ -84,6 +85,8 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
                 return session.tensorrt_llm::mpi::MpiComm::getSize();
             })
         .def_static("local_init", []() { tensorrt_llm::mpi::MpiComm::localSession(); })
+        .def_static("set_raw_mpi_session_by_fortran_handle",
+            [](int64_t fortran_handle) { tensorrt_llm::mpi::MpiComm::setRawSessionByFortran(fortran_handle); })
         .def_static("split",
             [](size_t color, size_t rank)
             {
@@ -389,7 +392,12 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .value("CONTEXT_INIT", tb::LlmRequestState::kCONTEXT_INIT)
         .value("GENERATION_IN_PROGRESS", tb::LlmRequestState::kGENERATION_IN_PROGRESS)
         .value("GENERATION_TO_COMPLETE", tb::LlmRequestState::kGENERATION_TO_COMPLETE)
-        .value("GENERATION_COMPLETE", tb::LlmRequestState::kGENERATION_COMPLETE);
+        .value("GENERATION_COMPLETE", tb::LlmRequestState::kGENERATION_COMPLETE)
+        .value("DISAGG_GENERATION_INIT", tb::LlmRequestState::kDISAGG_GENERATION_INIT)
+        .value("DISAGG_CONTEXT_TRANS_IN_PROGRESS", tb::LlmRequestState::kDISAGG_CONTEXT_TRANS_IN_PROGRESS)
+        .value("DISAGG_CONTEXT_COMPLETE", tb::LlmRequestState::kDISAGG_CONTEXT_COMPLETE)
+        .value("DISAGG_GENERATION_TRANS_IN_PROGRESS", tb::LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS)
+        .value("DISAGG_CONTEXT_INIT_ANS_TRANS", tb::LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS);
 
     py::enum_<tb::TrtGptModelType>(m, "TrtGptModelType")
         .value("V1", tb::TrtGptModelType::V1)
@@ -446,6 +454,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
     tpb::initBindings(mInternalBatchManager);
     tb::kv_cache_manager::KVCacheManagerBindings::initBindings(mInternalBatchManager);
     tb::BasePeftCacheManagerBindings::initBindings(mInternalBatchManager);
+    tb::CacheTransceiverBindings::initBindings(mInternalBatchManager);
     tpb::Buffers::initBindings(mInternalBatchManager);
 
     auto mInternalAlgorithms = mInternal.def_submodule("algorithms", "Algorithms internal bindings");

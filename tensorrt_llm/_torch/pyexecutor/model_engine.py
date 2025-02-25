@@ -201,7 +201,7 @@ class PyTorchModelEngine(ModelEngine):
         self._cuda_graph_padding_enabled = pytorch_backend_config.cuda_graph_padding_enabled
         self._cuda_graph_batch_sizes = [
             bs for bs in pytorch_backend_config.cuda_graph_batch_sizes
-            if bs <= self.max_num_tokens
+            if bs <= self.max_num_tokens and bs <= self.batch_size
         ]
         self._max_cuda_graph_batch_size = self._cuda_graph_batch_sizes[-1]
 
@@ -479,8 +479,8 @@ class PyTorchModelEngine(ModelEngine):
                 model._apply(init_meta_tensor)
 
             except Exception:
-                print(
-                    f"Fallback to regular model init: {traceback.format_exc()}\n"
+                logger.info(
+                    f"Fallback to regular model init: {traceback.format_exc(limit=1)}\n"
                 )
                 model = AutoModelForCausalLM.from_config(config)
 
