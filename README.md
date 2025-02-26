@@ -18,6 +18,13 @@ TensorRT-LLM
 <div align="left">
 
 ## Latest News
+* [2025/02/25] 🌟 DeepSeek-R1 performance now optimized for Blackwell [➡️ link](https://huggingface.co/nvidia/DeepSeek-R1-FP4)
+<div align="center">
+<img src="https://media.licdn.com/dms/image/v2/D5610AQEUykmeWaN3DA/image-shrink_800/B56ZU6XdCTGUAc-/0/1740440982376?e=1741125600&v=beta&t=aHHCteDBaFo1vtSB_mSMSRtz0hhnT3C2BJakfmoNlO4" width="50%">
+  
+  <sub><sup>HGX B200 (8 GPUs) vs HGX H200 (8 GPUs) vs 2 x HGX H100 (normalized to 8 GPUs for comparison). Input tokens not included in TPS calculations. TensorRT-LLM Version:  0.18.0.dev2025021800 (pre-release) used for Feb measurements, SGLang used for Jan measurements. Hopper numbers in FP8. B200 numbers in FP4. Max concurrency use case. ISL/OSL: 1K/1K.</sub></sup>
+<div align="left">
+
 * [2025/01/07] 🌟 Getting Started with TensorRT-LLM
 [➡️ link](https://www.youtube.com/watch?v=TwWqPnuNHV8)
 
