@@ -2,6 +2,7 @@ import logging
 import math
 from pathlib import Path
 
+# Doc change
 
 def underline(title: str, character: str = "=") -> str:
     return f"{title}\n{character * len(title)}"
