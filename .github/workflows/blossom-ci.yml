@@ -30,15 +30,38 @@ on:
             description: 'test results url'
             required: true
 jobs:
+  Check-Team-Membership:
+    runs-on: ubuntu-latest
+    name: Check Team Membership
+    if: startsWith( github.event.comment.body, '/bot' )
+    steps:
+      - name: Get Membership
+        id: check_team_membership
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.CI_TEAM_TOKEN }}
+          script: |
+            try {
+              const { data: membership } = await github.rest.teams.getMembershipForUserInOrg({
+                org: context.repo.owner,
+                team_slug: 'tensorrt-llm-ci-approvers',
+                username: 'chzblych',
+              });
+              if (membership.state != 'active') {
+                core.setFailed('only member in [tensorrt-llm-ci-approvers] can run', membership)
+              }
+            } catch (error) {
+              console.log('check membership failed:', error);
+              core.setFailed('only member in [tensorrt-llm-ci-approvers] can run')
+            }
+
   Authorization:
     name: Authorization
     runs-on: blossom
     outputs:
       args: ${{ env.args }}
-
+    needs: [Check-Team-Membership]
     # This job only runs for pull request comments
-    if: |
-         startsWith( github.event.comment.body, '/bot' ) && contains('["niukuo", "tburt-nv"]', github.actor)
     steps:
       - name: Check if comment is issued by authorized person
         run: blossom-ci
