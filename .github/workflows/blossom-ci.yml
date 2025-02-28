@@ -33,7 +33,8 @@ jobs:
   Check-Team-Membership:
     runs-on: ubuntu-latest
     name: Check Team Membership
-    if: startsWith( github.event.comment.body, '/bot' )
+    if: |
+      startsWith( github.event.comment.body, '/bot' )
     steps:
       - name: Get Membership
         id: check_team_membership
@@ -62,7 +63,8 @@ jobs:
       args: ${{ env.args }}
     needs: [Check-Team-Membership]
     # This job only runs for pull request comments
-    if: startsWith( github.event.comment.body, '/bot' )
+    if: |
+      startsWith( github.event.comment.body, '/bot' )
     steps:
       - name: Check if comment is issued by authorized person
         run: blossom-ci
