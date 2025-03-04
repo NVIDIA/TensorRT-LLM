@@ -14,6 +14,10 @@ methods:
         annotation: Optional[str]
         default: null
         name: backend
+      batched_logits_processor:
+        annotation: Optional[tensorrt_llm.sampling_params.BatchedLogitsProcessor]
+        default: null
+        name: batched_logits_processor
       batching_type:
         annotation: Optional[tensorrt_llm.bindings.executor.BatchingType]
         default: null
@@ -102,10 +106,6 @@ methods:
         annotation: Literal['auto', 'dummy']
         default: auto
         name: load_format
-      logits_post_processor_map:
-        annotation: Optional[Dict[str, Callable]]
-        default: null
-        name: logits_post_processor_map
       max_batch_size:
         annotation: Optional[int]
         default: null
@@ -176,13 +176,9 @@ methods:
         name: skip_tokenizer_init
       speculative_config:
         annotation: Union[tensorrt_llm.bindings.executor.LookaheadDecodingConfig, tensorrt_llm.llmapi.llm_utils.MedusaDecodingConfig,
-          tensorrt_llm.llmapi.llm_utils.EagleDecodingConfig, NoneType]
+          tensorrt_llm.llmapi.llm_utils.EagleDecodingConfig, tensorrt_llm.llmapi.MTPDecodingConfig, NoneType]
         default: null
         name: speculative_config
-      speculative_model:
-        annotation: Union[str, pathlib.Path, NoneType]
-        default: null
-        name: speculative_model
       tensor_parallel_size:
         annotation: int
         default: 1

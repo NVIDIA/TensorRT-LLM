@@ -31,6 +31,7 @@ class Config:
     num_key_value_heads: int = 16
     num_attention_heads: int = 16
     hidden_size: int = 256
+    architectures: list[str] = None
 
     @property
     def head_dim(self) -> int:
@@ -96,14 +97,15 @@ def _create_request(num_tokens, req_id: int):
     return result
 
 
-def create_model_engine_and_kvcache():
+def create_model_engine_and_kvcache(config: PyTorchConfig = None):
     max_num_requests = 15
     executor_config = ExecutorConfig(max_batch_size=max_num_requests)
     tokens_per_block = 1
     max_tokens = 130
     num_layers = 1
 
-    config = PyTorchConfig(use_cuda_graph=True, cuda_graph_padding_enabled=True)
+    config = config if config else PyTorchConfig(
+        use_cuda_graph=True, cuda_graph_padding_enabled=True)
     test_batches = (5, 13)
     for batch_size in test_batches:
         assert batch_size not in config.cuda_graph_batch_sizes
@@ -235,6 +237,32 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                          kv_cache_manager.get_num_free_blocks())
 
         kv_cache_manager.shutdown()
+
+    def test_layerwise_nvtx_marker(self):
+        config = PyTorchConfig(use_cuda_graph=True,
+                               cuda_graph_padding_enabled=True,
+                               enable_layerwise_nvtx_marker=True)
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache(config)
+        resource_manager = ResourceManager(
+            {"kv_cache_manager": kv_cache_manager})
+
+        prompt_len = 32
+        requests = [_create_request(prompt_len, 0)]
+
+        batch = ScheduledRequests()
+        batch.context_requests = requests
+        batch.generation_requests = []
+        kv_cache_manager.prepare_resources(batch)
+        model_engine.forward(batch, resource_manager)
+
+        expected_prefill_pos_ids = torch.arange(0,
+                                                prompt_len,
+                                                dtype=torch.int32,
+                                                device='cuda').unsqueeze(0)
+        torch.testing.assert_close(model_engine.model.recorded_position_ids,
+                                   expected_prefill_pos_ids,
+                                   atol=0,
+                                   rtol=0)
 
 
 if __name__ == "__main__":

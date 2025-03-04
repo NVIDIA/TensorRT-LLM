@@ -491,11 +491,14 @@ public:
 
     void replaceSharedBlock(GenerationRequest& sequence, SizeType32 blockIdx);
 
+    //! \brief Get the ids of all newly allocated (not reused) blocks for the sequence.
+    std::vector<KVCacheBlock::IdType> getNewlyAllocatedBlockIds(GenerationRequest const& sequence) const;
+
     //! \brief Release blocks of the sequence. Store blocks for reuse if llmReqeust is provided.
     void releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest = std::nullopt);
 
     //! \brief Simulate freeing all blocks for that sequence to check impact on number of free blocks
-    void schedulingReleaseBlocks(GenerationRequest& sequence);
+    void schedulingReleaseBlocks(LlmRequest::RequestIdType requestId);
 
     //! \brief Release last block in the sequence
     void releaseLastBlock(GenerationRequest& sequence);
@@ -657,6 +660,11 @@ public:
     }
 
     [[nodiscard]] static bool blockInRadixTree(BlockPtr const& block);
+
+    [[nodiscard]] bool isEnableHashKey() const
+    {
+        return mEnableHashKey;
+    }
 
 private:
     //! \brief Add single block to beam of sequence and mAllocatedBlocksPerSeq.
@@ -849,6 +857,7 @@ public:
     virtual void rewindKVCache(LlmRequest::RequestIdType requestId, SizeType32 rewindLengths) = 0;
 
     [[nodiscard]] virtual GenerationRequest const& getSequence(LlmRequest::RequestIdType requestId) const = 0;
+    [[nodiscard]] virtual GenerationRequest& getSequence(LlmRequest::RequestIdType requestId) = 0;
 
     [[nodiscard]] virtual bool isCrossKv() const = 0;
 
@@ -870,6 +879,10 @@ public:
 
     [[nodiscard]] virtual std::vector<std::vector<std::vector<SizeType32>>> getBatchCacheBlockIds(
         std::vector<LlmRequest::RequestIdType> const& requestIds) const
+        = 0;
+
+    [[nodiscard]] virtual std::vector<KVCacheBlock::IdType> getNewlyAllocatedBlockIds(
+        LlmRequest::RequestIdType requestId) const
         = 0;
 
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getPrimaryPool(SizeType32 layer_idx) const = 0;
@@ -904,6 +917,8 @@ public:
     /// @param outputLength The number of output tokens in each sequence in the batch.
     /// @return SizeType32 A number of sequences per batch.
     [[nodiscard]] virtual SizeType32 getMaxCapacityBatchSize(SizeType32 inputLength, SizeType32 outputLength) const = 0;
+
+    [[nodiscard]] virtual CacheType getCacheType() const = 0;
 };
 
 class KVCacheManager : public BaseKVCacheManager
@@ -935,7 +950,7 @@ public:
         SizeType32 sinkTokenLength, CudaStreamPtr stream, std::optional<SizeType32> maxSequenceLength,
         bool enableBlockReuse = true, bool onboardBlocks = true, CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
-        std::shared_ptr<KVCacheEventManager> eventManager = nullptr);
+        std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enableHashKey = false);
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool, SizeType32 maxNumSequences,
@@ -1100,10 +1115,16 @@ public:
     void rewindKVCache(LlmRequest::RequestIdType requestId, SizeType32 rewindLengths) override;
 
     [[nodiscard]] GenerationRequest const& getSequence(LlmRequest::RequestIdType requestId) const override;
+    [[nodiscard]] GenerationRequest& getSequence(LlmRequest::RequestIdType requestId) override;
 
     [[nodiscard]] bool isCrossKv() const override
     {
         return mBlockManager.getCacheType() == CacheType::kCROSS;
+    }
+
+    [[nodiscard]] CacheType getCacheType() const override
+    {
+        return mBlockManager.getCacheType();
     }
 
     //! \brief Find first new block that must be allocated for context phase and return it's concatenated token vector.
@@ -1147,6 +1168,8 @@ public:
 
     std::vector<std::vector<std::vector<SizeType32>>> getBatchCacheBlockIds(
         std::vector<LlmRequest::RequestIdType> const& requestIds) const override;
+
+    std::vector<SizeType32> getNewlyAllocatedBlockIds(LlmRequest::RequestIdType requestId) const override;
 
     runtime::ITensor::SharedPtr getPrimaryPool(SizeType32 layer_idx) const override;
 
@@ -1219,6 +1242,8 @@ private:
     bool mEnableHashKey;
     // Whether use one more block for each sequence
     bool mUseOneMoreBlock;
+    // Mutex to protect access to mSequences
+    mutable std::mutex mSequencesMtx;
     // buffers for static tensors, will be created after allocating pools
     runtime::ITensor::SharedPtr mBlockPoolPointers;
     runtime::ITensor::SharedPtr mLayerToPoolMapping;

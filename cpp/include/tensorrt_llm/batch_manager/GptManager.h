@@ -94,6 +94,7 @@ private:
     [[nodiscard]] SizeType32 getMaxSequenceLen() const;
     [[nodiscard]] SizeType32 getMaxNumSequences() const;
     [[nodiscard]] SizeType32 getMaxDraftLen() const;
+    [[nodiscard]] SizeType32 getVocabSizePadded() const;
 
     void validateLlmRequest(
         LlmRequest& newReq, runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig) const;

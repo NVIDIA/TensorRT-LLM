@@ -6,10 +6,12 @@ import torch
 import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm.bindings.executor import ExecutorConfig
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
+from ..speculative import get_spec_resource_manager
 from .llm_request import LlmRequest
-from .resource_manager import KVCacheManager, ResourceManager
+from .resource_manager import ResourceManager
 from .scheduler import ScheduledRequests
 
 
@@ -20,6 +22,11 @@ def is_mla(config):
         ), "both of kv_lora_rank and qk_rope_head_dim are required."
         return True
     return False
+
+
+def is_bert(config):
+    assert hasattr(config, "architectures")
+    return "Bert" in config.architectures[0]
 
 
 def cal_max_tokens(peak_memory, total_gpu_memory, fraction, model_config,
@@ -57,6 +64,10 @@ def cal_max_tokens(peak_memory, total_gpu_memory, fraction, model_config,
         fraction = 0.9
 
     available_kv_mem = (total_gpu_memory - peak_memory) * fraction
+    logger.info(
+        f"Peak memory during memory usage profiling (torch + non-torch): {peak_memory / (1 << 30):.2f} GiB, "
+        f"available KV cache memory when calculating max tokens: {available_kv_mem / (1 << 30):.2f} GiB"
+    )
     max_tokens = int((available_kv_mem) // mem_per_token)
     max_tokens = max(max_tokens, 0)
     return max_tokens
@@ -82,21 +93,13 @@ def _create_dummy_context(req_id: int, input_len: int, vocab_size: int):
     return result
 
 
-def create_dummy_context_request(
-        req_id: int, input_len: int, vocab_size: int,
-        kv_cache_manager: KVCacheManager) -> LlmRequest:
+def create_dummy_context_request(req_id: int, input_len: int,
+                                 vocab_size: int) -> LlmRequest:
 
     requests = [_create_dummy_context(req_id, input_len, vocab_size)]
     result = ScheduledRequests()
     result.generation_requests = []
     result.context_requests = requests
-
-    if kv_cache_manager and kv_cache_manager.resource_managers[
-            'kv_cache_manager']:
-        for req in requests:
-            kv_cache_manager.resource_managers[
-                'kv_cache_manager'].add_padding_request(req)
-
     return result
 
 
@@ -109,12 +112,17 @@ def estimate_max_kv_cache_tokens(model_engine: PyTorchModelEngine,
     kv_cache_max_tokens = executor_config.kv_cache_config.max_tokens
     # todo: to support max token evaluation for cp mode
     if 'cp_type' not in mapping.cp_config:
-        resource_manager = ResourceManager({'kv_cache_manager': None})
+        resources = {}
+        if model_engine.spec_config is not None:
+            resources["spec_resource_manager"] = get_spec_resource_manager(
+                executor_config.speculative_config, model_engine.model.config,
+                model_engine.batch_size * 2)
+        resource_manager = ResourceManager(resources)
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
-        req = create_dummy_context_request(0, max_num_tokens, vocab_size,
-                                           resource_manager)
+        req = create_dummy_context_request(0, max_num_tokens, vocab_size)
+        resource_manager.prepare_resources(req)
         model_engine.forward(req, resource_manager)
         torch.cuda.synchronize()
         peak_memory = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
@@ -126,6 +134,9 @@ def estimate_max_kv_cache_tokens(model_engine: PyTorchModelEngine,
         total_used_bytes = total_gpu_memory - end
         extra_cost = max(total_used_bytes - torch_used_bytes, 0)
         peak_memory += extra_cost
+        logger.info(
+            f"Memory used outside torch in memory usage profiling: {extra_cost / (1<<30):.2f} GiB"
+        )
         kv_cache_max_tokens = cal_max_tokens(peak_memory, total_gpu_memory,
                                              fraction,
                                              model_engine.model.model_config,
@@ -134,5 +145,5 @@ def estimate_max_kv_cache_tokens(model_engine: PyTorchModelEngine,
     if executor_config.kv_cache_config.max_tokens is not None and kv_cache_max_tokens is not None:
         kv_cache_max_tokens = min(kv_cache_max_tokens,
                                   executor_config.kv_cache_config.max_tokens)
-
+    logger.info(f"Estimated max tokens in KV cache : {kv_cache_max_tokens}")
     return kv_cache_max_tokens

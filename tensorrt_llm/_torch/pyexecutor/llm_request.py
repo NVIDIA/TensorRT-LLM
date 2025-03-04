@@ -43,6 +43,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_orig_prompt_len = self.orig_prompt_len
         self.py_max_new_tokens = self.max_new_tokens
         self.py_batch_idx = None
+        self.py_rewind_len = 0
+        self.py_draft_tokens = None
 
 
 def executor_request_to_llm_request(req_id: int,
@@ -80,7 +82,8 @@ def executor_request_to_llm_request(req_id: int,
         lora_config=None,
         lookahead_config=None,
         return_log_probs=False,
-        return_context_logits=False,
+        return_context_logits=executor_request.output_config.
+        return_context_logits,
         return_generation_logits=False,
         draft_tokens=getattr(executor_request, "draft_tokens", None),
         draft_logits=None,

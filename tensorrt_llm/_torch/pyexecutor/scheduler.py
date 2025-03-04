@@ -27,6 +27,10 @@ class ScheduledRequests:
             len(req.draft_tokens) == 0 for req in self.generation_requests))
 
     @property
+    def can_run_cuda_graph(self) -> bool:
+        return (not self.context_requests)
+
+    @property
     def batch_size(self) -> int:
         return len(self.context_requests) + len(self.generation_requests)
 
@@ -70,8 +74,9 @@ class BindCapacityScheduler(CapacityScheduler):
         super(BindCapacityScheduler, self).__init__()
         self.kv_cache_manager = kv_cache_manager
         self.impl = tb_internal.algorithms.CapacityScheduler(
-            max_num_requests, scheduler_policy, True, False,
-            LlmRequestState.CONTEXT_INIT, LlmRequestState.GENERATION_COMPLETE)
+            max_num_requests, scheduler_policy, kv_cache_manager is not None,
+            False, LlmRequestState.CONTEXT_INIT,
+            LlmRequestState.GENERATION_COMPLETE)
 
     def schedule_request(
         self, active_requests: RequestList

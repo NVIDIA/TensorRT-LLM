@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 import click
-from click_option_group import MutuallyExclusiveOptionGroup, optgroup
+from click_option_group import (MutuallyExclusiveOptionGroup, OptionGroup,
+                                optgroup)
 
 from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
 
@@ -17,7 +19,7 @@ from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.enums import IFBSchedulingPolicy
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
-from tensorrt_llm.bench.dataclasses.reporting import report_statistics
+from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer)
 from tensorrt_llm.builder import BuildConfig
@@ -158,16 +160,18 @@ from tensorrt_llm.sampling_params import SamplingParams
     default=False,
     help="Enable streaming mode for requests.",
 )
-@click.option(
-    "--iteration_log",
+@optgroup.group("Reporting Options",
+                help="Options for reporting benchmark results.",
+                cls=OptionGroup)
+@optgroup.option(
+    "--report_json",
     type=click.Path(dir_okay=False,
                     writable=True,
                     readable=False,
                     path_type=Path,
                     resolve_path=True),
     required=False,
-    hidden=True,
-    help="Path where iteration stats should be written to.",
+    help="Path where report should be written to.",
 )
 @click.pass_obj
 def throughput_command(
@@ -175,7 +179,7 @@ def throughput_command(
     **params,
 ) -> None:
     """Run a throughput test on a TRT-LLM engine."""
-    logger.set_level("info")
+
     logger.info("Preparing to run throughput benchmark...")
     # Parameters from CLI
     # Model, experiment, and engine params
@@ -189,6 +193,7 @@ def throughput_command(
     engine_dir: Path = params.pop("engine_dir")
     # TODO: Re-add iteration log. Disabled due to instability in LLM API.
     #iteration_log: Path = params.pop("iteration_log")
+    report_json: Path = params.pop("report_json")
     concurrency: int = params.pop("concurrency")
     backend: str = params.get("backend")
 
@@ -202,10 +207,14 @@ def throughput_command(
     with open(dataset_path, "r") as dataset:
         metadata, requests = create_dataset_from_stream(
             tokenizer, dataset, num_requests=num_requests)
+        metadata.dataset_path = dataset_path
         params["target_input_len"] = params.get(
             "target_input_len") or metadata.avg_isl
         params["target_output_len"] = params.get(
             "target_output_len") or metadata.avg_osl
+
+    # Log dataset info
+    logger.info(metadata.get_summary_for_print())
 
     # Engine configuration parsing
     if backend and backend.lower() == "pytorch":
@@ -283,7 +292,15 @@ def throughput_command(
         statistics = asyncio.run(
             async_benchmark(llm, sampling_params, requests, streaming,
                             concurrency))
-        report_statistics(statistics, runtime_config, logger, kwargs, streaming)
+
+        report_utility = ReportUtility(statistics, metadata, runtime_config,
+                                       logger, kwargs, streaming)
+        if report_json:
+            logger.info(f"Writing report to '{report_json}'.")
+            with open(report_json, "w") as f:
+                f.write(
+                    json.dumps(report_utility.get_statistics_dict(), indent=4))
+        report_utility.report_statistics()
     finally:
         if llm is not None:
             llm.__exit__(None, None, None)

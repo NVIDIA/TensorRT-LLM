@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+
 import torch
 
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
@@ -18,3 +20,9 @@ def make_weak_ref(x):
         return x
     else:
         raise TypeError(f"Invalid type {type(x)} to make weak ref")
+
+
+@dataclass
+class Fp4QuantizedTensor:
+    fp4_tensor: torch.Tensor
+    scaling_factor: torch.Tensor

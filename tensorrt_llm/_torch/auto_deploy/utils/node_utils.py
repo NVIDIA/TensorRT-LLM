@@ -5,7 +5,7 @@ from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch._ops import OpOverload, OpOverloadPacket
-from torch.fx import Graph, Node
+from torch.fx import Graph, GraphModule, Node
 
 from ..custom_ops.quant import QUANT_OPS
 
@@ -209,3 +209,58 @@ def get_user_if_pattern_match(node, ops, numusers, user_idx: int = 0):
         if node and len(list(node.users.keys())) == numusers and is_op(node, ops)
         else None
     )
+
+
+def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
+    """Identify regions of the graph that we can investigate further for patterning matching.
+
+    Right now, we split the regions according to the following structure:
+        1. Input node
+        2. Embedding node
+        3. Residual nodes from the embedding node onwards (no other nodes in-between0)
+        4. Output node
+
+    The list will contain the boundary nodes between the regions.
+    """
+    assert gm.graph.nodes, "Graph is empty"
+
+    # get first input node and last output node
+    input_id_node = None
+    output_node = None
+    for node in gm.graph.nodes:
+        if input_id_node is None and node.op == "placeholder":
+            input_id_node = node
+        output_node = node
+    assert input_id_node, "Could not find input node"
+    assert output_node.op == "output", "Could not find output node"
+
+    # start list of boundary nodes
+    boundary_nodes = [input_id_node]
+
+    # find embedding node which we assume to be the first node in a sequence of residual nodes
+    for n_user in input_id_node.users:
+        if is_op(n_user, torch.ops.aten.embedding):
+            break
+    else:
+        # we could not identify any boundary regions via embedding nodes
+        boundary_nodes.append(output_node)
+        return boundary_nodes
+
+    # add embedding node to boundary nodes
+    boundary_nodes.append(n_user)
+
+    # find residual nodes from here on
+    # NOTE: for now, we assume that the residual nodes do not go through point-wise operations like
+    # activations. We are just looking for a "straight" path to the output.
+    for node in gm.graph.nodes:
+        if is_op(node, torch.ops.aten.add) and any(n == node for n in boundary_nodes[-1].users):
+            boundary_nodes.append(node)
+
+    # sanity check: we expect at most two users for any residual node
+    res_nodes_more_users = [n for n in boundary_nodes[2:] if len(n.users) > 2]
+    assert not res_nodes_more_users, f"Unexpected # of users for residuals: {res_nodes_more_users}"
+
+    # add output node to boundary nodes
+    boundary_nodes.append(output_node)
+
+    return boundary_nodes

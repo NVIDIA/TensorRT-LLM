@@ -10,7 +10,7 @@ from ..distributed import trtllm as trtllm_dist
 from .torch_libs.float8_python_api import addmm_float8_unwrapped
 
 try:
-    from tensorrt_llm._torch.quantization.utils import fp4_buckets
+    from tensorrt_llm.quantization.utils.fp4_utils import FP4_BUCKETS as fp4_buckets
 
     TRTLLM_FP4_OP_AVAILABLE = True
 except ImportError:

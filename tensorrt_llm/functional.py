@@ -452,6 +452,18 @@ class Tensor(object):
         '''
         return sqrt(self)
 
+    def squeeze(self, dim, zero_is_placeholder):
+        '''
+        See functional.squeeze.
+        '''
+        return squeeze(self, dim, zero_is_placeholder)
+
+    def unsqueeze(self, dim):
+        '''
+        See functional.squeeze.
+        '''
+        return unsqueeze(self, dim)
+
     def log(self):
         '''
         See functional.log.
@@ -725,6 +737,15 @@ class MLPType(IntEnum):
     MLP = 0
     GatedMLP = 1
     FusedGatedMLP = 2
+
+
+class SliceInputType(IntEnum):
+    data = 0
+    start = 1
+    size = 2
+    stride = 3
+    fill_value = 4
+    axes = 5
 
 
 def activation(input: Tensor, act_type: trt.ActivationType) -> Tensor:
@@ -1285,6 +1306,80 @@ def slice(input: Tensor,
         layer.set_input(4, fill_value.trt_tensor)
 
     return _create_tensor(layer.get_output(0), layer)
+
+
+def pad(input: Tensor,
+        pad: Union[Sequence[int], Tensor],
+        mode: str = 'constant',
+        value: Optional[float] = None) -> Tensor:
+    '''
+    Add a pad layer.
+
+    The padding layer adds zero-padding at the start and end of the input tensor. And the
+    padding size by which to pad some dimensions of input are described starting from the
+    last dimension and moving forward.
+
+    `[len(pad) / 2]` dimensions of input will be padded. For example, to pad only the last
+    dimension of the input tensor, then pad has the form [padding_left, padding_right]; to
+    pad the last 2 dimensions of the input tensor, then use [padding_left, padding_right,
+    padding_top, padding_bottom]; to pad the last 3 dimensions, use [padding_left,
+    padding_right, padding_top, padding_bottom, padding_front, padding_back].
+
+    Parameters:
+        input : Tensor
+            The input tensor on which the padding_2d is performed.
+        pad : sequence of int
+            An m-elements tuple for padding, where its length m meets the requirement that
+            m <= 2*input dimensions, and m is even.
+        mode : str
+            Only \'constant\' is supported.
+        value : float
+            Fill value for 'constant' padding. Default: 0.
+
+    Returns:
+        The tensor produced by the inserted layer.
+    '''
+    assert mode == "constant", "Only `'constant'` is supported now."
+
+    if isinstance(pad, list) or isinstance(pad, tuple):
+        assert (
+            len(pad) % 2 == 0 and len(pad) <= 2 * input.ndim()
+        ), "The length of `pad` should be even and less than 2*input.ndim"
+        pad = constant(np.array(pad).astype(np.int32)).view([-1, 2])
+    elif isinstance(pad, Tensor):
+        pad = pad.flatten()
+        assert (
+            pad.size(0) % 2 == 0 and pad.size(0) <= 2 * input.ndim()
+        ), "The length of `pad` should be even and less than 2*input.ndim"
+        pad = pad.cast("int32").view([-1, 2])
+    else:
+        raise NotImplementedError(f"pad type {type(pad)} not supported")
+    if value is None:
+        value = 0
+
+    pad = concat([constant(np.zeros((1, 2), dtype=np.int32)),
+                  pad])  # pre-padding the indices
+    padding_index = [0] * input.ndim()
+    padding_index[-(pad.size(0) - 1):] = list(range(pad.size(0) - 1, 0,
+                                                    -1))  # reverse the indices
+    pad = index_select(pad,
+                       dim=0,
+                       index=constant(np.array(padding_index, dtype=np.int32)))
+    pre_padding, post_padding = chunk(pad, chunks=2, dim=1)
+    start = (pre_padding.flatten() * (-1)).cast('int32')
+    extend_size = (pre_padding + post_padding).flatten()
+    size = (extend_size + shape(input)).cast('int32')
+    layer = default_trtnet().add_slice(input.trt_tensor,
+                                       start=[0] * input.ndim(),
+                                       shape=[0] * input.ndim(),
+                                       stride=[1] * input.ndim())
+    layer.mode = trt.SampleMode.FILL
+    layer.set_input(SliceInputType.start, start.trt_tensor)
+    layer.set_input(SliceInputType.size, size.trt_tensor)
+    layer.set_input(SliceInputType.fill_value,
+                    constant_to_tensor_(value, dtype=input.dtype).trt_tensor)
+    output = _create_tensor(layer.get_output(0), layer)
+    return output
 
 
 def rand(shape: Tensor,
@@ -3753,7 +3848,8 @@ class AllReduceParams():
                  norm_weight: Optional[Tensor] = None,
                  scale: Optional[Tensor] = None,
                  norm_pre_residual_weight: Optional[Tensor] = None,
-                 eps: float = 1e-06):
+                 eps: float = 1e-06,
+                 enable_allreduce: bool = True):
         self.strategy = strategy
         self.config = config
         self.fusion_op = fusion_op
@@ -3763,6 +3859,8 @@ class AllReduceParams():
         self.scale = scale
         self.norm_pre_residual_weight = norm_pre_residual_weight
         self.eps = eps
+        # For torch path only, has no effect on TRT path
+        self.enable_allreduce = enable_allreduce
         assert fusion_op == AllReduceFusionOp.NONE or (residual is not None)
 
     def has_affine(self):
@@ -5861,6 +5959,26 @@ def rms_norm(input: Tensor,
     return y
 
 
+def repeat(input: Tensor, sizes: Sequence[int]) -> Tensor:
+    '''
+    Repeats the tensor along the specified dimensions.
+
+    Parameters:
+        input : Tensor
+            The tensor to be repeated.
+        sizes : Sequence[int]
+            The number of times to repeat the tensor along each dimension.
+
+    Returns:
+        A tensor except for repeated input tensors along specified dim.
+
+    '''
+    repeated_tensor = input
+    for k in range(-1, -len(sizes) - 1, -1):
+        repeated_tensor = concat([repeated_tensor] * sizes[k], dim=k)
+    return repeated_tensor
+
+
 def repeat_interleave(tensor: Tensor, repeats: int, dim: int) -> Tensor:
     '''
     Repeats elements of a tensor along an axis.
@@ -5886,6 +6004,32 @@ def repeat_interleave(tensor: Tensor, repeats: int, dim: int) -> Tensor:
     tile_reshape_size[dim] = tile_reshape_size[dim] * repeats
     tensor = tile.view(concat(tile_reshape_size))
     return tensor
+
+
+def meshgrid2d(x: Tensor, y: Tensor) -> Tuple[Tensor]:
+    '''
+    Creates grids (2D) of coordinates specified by the 1D inputs (only supports `indexing=\'xy\'`).
+
+    Parameters:
+        x : Tensor
+            The first input (1D) tensor.
+        y : Tensor
+            The second input (1D) tensor.
+
+    Returns:
+        The tuple of two tensors produced.
+
+    TODO: Add full support for torch.meshgrid.
+          See https://pytorch.org/docs/stable/generated/torch.meshgrid.html#torch-meshgrid
+    '''
+    if x.ndim() == 1:
+        x = expand_dims(x, 0)
+    if y.ndim() == 1:
+        y = expand_dims(y, 0)
+    grid_x = repeat_interleave(x, shape(y, 1),
+                               1).view([x.shape[-1], y.shape[-1]])
+    grid_y = repeat(y, (x.shape[-1], 1))
+    return (grid_x, grid_y)
 
 
 def generate_logn_scaling(seq_length: int = 8192,
@@ -6123,6 +6267,7 @@ ACT2FN = {
     'squared-relu': squared_relu,
     'swiglu': swiglu,
     'fast-swiglu': swiglu,
+    'sigmoid': sigmoid,
 }
 
 GATED_ACT_2_ACT = {

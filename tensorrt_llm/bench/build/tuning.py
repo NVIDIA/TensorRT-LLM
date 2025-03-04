@@ -88,7 +88,22 @@ def calc_engine_setting(
     if total_gpu_memory < engine_size:
         raise RuntimeError(
             f"The model requires at least: {engine_size:.2f} GB, "
-            f"the total GPU memory of {total_gpu_memory:.2f} is insufficient.")
+            f"the total GPU memory of {total_gpu_memory:.2f} is insufficient.\n"
+            "----------------------------------------------------------\n"
+            f"Estimation based on the following:\n"
+            "----------------------------------------------------------\n"
+            f"Bytes per Element: {byte_per_elem}\n"
+            f"Bytes per KV Element: {byte_per_kv_elem}\n"
+            f"Number of GPUs: {n_gpus}\n"
+            f"Model Number of KV Heads: {model_config.num_key_value_heads}\n"
+            f"Adjusted Number of KV Heads: {adjusted_num_kv_heads}\n"
+            f"Head Size: {model_config.head_size}\n"
+            f"Number of Hidden Layers: {model_config.num_hidden_layers}\n"
+            f"Number of Pipeline Stages: {pp_size}\n"
+            f"Number of Tensor Parallel Shards: {tp_size}\n"
+            f"Number of Pipeline Parallel Stages: {pp_size}\n"
+            f"KV Cache GPU Memory Fraction: {kv_cache_gpu_mem_fraction}\n"
+            "----------------------------------------------------------\n")
     if kv_cache_max_requests < 1:
         raise RuntimeError("The amount of KV cache memory is insufficient to "
                            "run this model. Please try with more GPUs.")

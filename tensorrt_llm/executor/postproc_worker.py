@@ -8,9 +8,7 @@ from typing import (TYPE_CHECKING, Any, Callable, Dict, List, NamedTuple,
 import zmq
 import zmq.asyncio
 
-from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
-
-from ..llmapi.tokenizer import load_hf_tokenizer
+from ..llmapi.tokenizer import TransformersTokenizer, load_hf_tokenizer
 from ..llmapi.utils import nvtx_range, print_traceback_on_error
 from ..sampling_params import SamplingParams
 from .ipc import ZeroMqQueue
@@ -26,12 +24,24 @@ __all__ = [
 ]
 
 
+@dataclass(kw_only=True)
+class PostprocArgs:
+    first_iteration: bool = True
+    num_prompt_tokens: Optional[int] = None
+    tokenizer: Optional[TransformersTokenizer] = None
+
+
+@dataclass(kw_only=True)
+class PostprocParams:
+    post_processor: Callable[["GenerationResultBase", PostprocArgs], Any] = None
+    postproc_args: PostprocArgs = None
+
+
 @dataclass
 class PostprocWorkerConfig:
     ''' The config for the postprocess worker. '''
     num_postprocess_workers: int = 0
     postprocess_tokenizer_dir: Optional[str] = None
-    postprocess_result_handler: Optional[Callable] = None
 
     @property
     def enabled(self) -> bool:
@@ -48,11 +58,12 @@ class PostprocWorker:
 
         # The information necessary for creating a GenerationResult in the first Input for each request
         sampling_params: Optional[SamplingParams] = None
+        postproc_params: Optional[PostprocParams] = None
         streaming: Optional[bool] = None
 
     class Output(NamedTuple):
         client_id: int
-        res: List[str]
+        res: Any
         is_final: bool
         error: str = ""
 
@@ -63,8 +74,6 @@ class PostprocWorker:
         tokenizer_dir: str,
         record_creator: Callable[
             ["PostprocWorker.Input", TransformersTokenizer], Any],
-        result_handler: Optional[Callable[["GenerationResultBase"],
-                                          Any]] = None,
     ):
         '''
         Args:
@@ -75,7 +84,6 @@ class PostprocWorker:
             result_handler (Optional[Callable[[GenerationResultBase], Any]]): A callback handles the final result.
         '''
 
-        self._result_handler = result_handler
         self._records: Dict[int, GenerationResult] = {}
         self._record_creator = record_creator
         self._pull_pipe = ZeroMqQueue(address=pull_pipe_addr,
@@ -104,6 +112,7 @@ class PostprocWorker:
         return DetokenizedGenerationResultBase(
             inp.rsp.client_id,
             sampling_params=inp.sampling_params,
+            postproc_params=inp.postproc_params,
             streaming=inp.streaming,
             tokenizer=tokenizer)
 
@@ -120,8 +129,10 @@ class PostprocWorker:
             record._handle_response(input.rsp)  # inplace
             # Left the result_handler determine the final output dtype.
             # NOTE: This will change the CompletionOutput._postprocess_result
-            if self._result_handler:
-                out = self._result_handler(record)
+            if postproc_params := record.postproc_params:
+                result_handler, args = postproc_params.post_processor, postproc_params.postproc_args
+                args.tokenizer = self._tokenizer
+                out = result_handler(record, args)
             else:
                 # This should only be called in streaming mode, and each time it
                 # produces a single output.
@@ -196,11 +207,9 @@ class PostprocWorker:
 
 @print_traceback_on_error
 def postproc_worker_main(feedin_ipc_addr: str, feedout_ipc_addr: str,
-                         tokenizer_dir: str, record_creator: Callable,
-                         result_handler: Callable):
+                         tokenizer_dir: str, record_creator: Callable):
     worker = PostprocWorker(feedin_ipc_addr,
                             feedout_ipc_addr,
                             tokenizer_dir=tokenizer_dir,
-                            record_creator=record_creator,
-                            result_handler=result_handler)
+                            record_creator=record_creator)
     worker.start()

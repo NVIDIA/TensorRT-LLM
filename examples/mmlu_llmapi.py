@@ -336,6 +336,10 @@ def parse_args():
                         type=int,
                         default=1,
                         help="Tensor Parallel size (only for pytorch backend)")
+    parser.add_argument("--ep_size",
+                        type=int,
+                        default=1,
+                        help="Expert Parallel size (only for pytorch backend)")
     parser.add_argument("--enable_attention_dp",
                         default=False,
                         action='store_true')
@@ -417,6 +421,7 @@ def main():
             model=args.hf_model_dir,
             tokenizer=tokenizer,
             tensor_parallel_size=args.tp_size,
+            moe_expert_parallel_size=args.ep_size,
             pytorch_backend_config=config,
             enable_chunked_prefill=args.enable_chunked_prefill,
             build_config=build_config,

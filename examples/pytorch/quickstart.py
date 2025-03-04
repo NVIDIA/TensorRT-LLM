@@ -14,11 +14,10 @@ def main():
     llm = LLM(model='meta-llama/Llama-3.1-8B-Instruct')
     outputs = llm.generate(prompts, sampling_params)
 
-    # Print the outputs.
-    for output in outputs:
+    for i, output in enumerate(outputs):
         prompt = output.prompt
         generated_text = output.outputs[0].text
-        print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
+        print(f"[{i}] Prompt: {prompt!r}, Generated text: {generated_text!r}")
 
 
 if __name__ == '__main__':

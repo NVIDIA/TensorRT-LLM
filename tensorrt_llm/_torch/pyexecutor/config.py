@@ -1,13 +1,21 @@
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from enum import Enum
+from typing import Dict, List, Optional, Union
 
 from tensorrt_llm.bindings.executor import ExecutorConfig
 
 from ...builder import BuildConfig
 from ...logger import logger
 from ...mapping import Mapping
+from ..speculative import SpecConfig
 from .resource_manager import BaseResourceManager
+
+
+class LoadFormat(Enum):
+    AUTO = 0
+    # Initialize all weights randomly.
+    DUMMY = 1
 
 
 @dataclass
@@ -44,8 +52,9 @@ class PyTorchConfig:
     # corresponding decoding way, like top-k, top-p, etc.
     mixed_decoder: bool = False
     kv_cache_dtype: str = "auto"
+    use_kv_cache: bool = True
     enable_iter_perf_stats: bool = False
-    print_iter_log: bool = True
+    print_iter_log: bool = False
 
     torch_compile_enabled: bool = False
     torch_compile_fullgraph: bool = False
@@ -53,28 +62,48 @@ class PyTorchConfig:
     # When torch compile is enabled, userbuffers is enabled by default
     torch_compile_enable_userbuffers: bool = True
 
+    # If true, enable layerwise nvtx marker
+    enable_layerwise_nvtx_marker: bool = False
+    # How to load the model weights. By default, detect the weight type
+    # from the model checkpoint.
+    load_format: Union[str, LoadFormat] = 'auto'
+
+    def _convert_load_format(self) -> None:
+        if isinstance(self.load_format, LoadFormat):
+            return
+        load_format = self.load_format.upper()
+        if load_format not in LoadFormat.__members__:
+            raise NotImplementedError(f"Invalid LoadFormat: {self.load_format}")
+        self.load_format = LoadFormat[load_format]
+
     def __post_init__(self) -> None:
         if self.cuda_graph_batch_sizes is not None:
             assert self.cuda_graph_max_batch_size == 0, (
                 "Please don't set both cuda_graph_batch_sizes "
                 "and cuda_graph_max_batch_size.")
-            return sorted(self.cuda_graph_batch_sizes)
-        self.cuda_graph_max_batch_size = self.cuda_graph_max_batch_size or 128
-        if self.cuda_graph_padding_enabled:
-            self.cuda_graph_batch_sizes = [1, 2, 4
-                                           ] + [i * 8 for i in range(1, 17)]
+            self.cuda_graph_batch_sizes = sorted(self.cuda_graph_batch_sizes)
         else:
-            self.cuda_graph_batch_sizes = list(range(1, 32)) + [64, 128]
-        self.cuda_graph_batch_sizes += [
-            2**i for i in range(
-                8, math.floor(math.log(self.cuda_graph_max_batch_size, 2)))
-        ]
-        self.cuda_graph_batch_sizes = [
-            size for size in self.cuda_graph_batch_sizes
-            if size <= self.cuda_graph_max_batch_size
-        ]
-        if self.cuda_graph_max_batch_size != self.cuda_graph_batch_sizes[-1]:
-            self.cuda_graph_batch_sizes.append(self.cuda_graph_max_batch_size)
+            self.cuda_graph_max_batch_size = self.cuda_graph_max_batch_size or 128
+            if self.cuda_graph_padding_enabled:
+                self.cuda_graph_batch_sizes = [1, 2, 4] + [
+                    i * 8 for i in range(1, 17)
+                ]
+            else:
+                self.cuda_graph_batch_sizes = list(range(1, 32)) + [32, 64, 128]
+            self.cuda_graph_batch_sizes += [
+                2**i for i in range(
+                    8, math.floor(math.log(self.cuda_graph_max_batch_size, 2)))
+            ]
+            self.cuda_graph_batch_sizes = [
+                size for size in self.cuda_graph_batch_sizes
+                if size <= self.cuda_graph_max_batch_size
+            ]
+            if self.cuda_graph_max_batch_size != self.cuda_graph_batch_sizes[
+                    -1]:
+                self.cuda_graph_batch_sizes.append(
+                    self.cuda_graph_max_batch_size)
+
+        self._convert_load_format()
 
 
 EXETENDED_EXECUTOR_CONFIG_FIELDS = [
@@ -94,6 +123,7 @@ def update_executor_config(
         pytorch_backend_config: Optional[PyTorchConfig] = None,
         mapping: Optional[Mapping] = None,
         build_config: Optional[BuildConfig] = None,
+        speculative_config: Optional[SpecConfig] = None,
         hf_model_dir: str = None,
         trt_engine_dir: str = None):
     if backend is None:
@@ -108,6 +138,7 @@ def update_executor_config(
     executor_config.backend = backend
     executor_config.pytorch_backend_config = pytorch_backend_config
     executor_config.mapping = mapping
+    executor_config.speculative_config = speculative_config
 
     logger.info(f"{executor_config.pytorch_backend_config}")
 

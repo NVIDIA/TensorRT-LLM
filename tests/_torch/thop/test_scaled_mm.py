@@ -25,7 +25,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 
 @pytest.mark.skipif(
-    getSMVersion() != 90,
+    getSMVersion() < 90,
     reason="custom scaled_mm is only supported in SM90",
 )  # Skip tests that are not supported in SM90
 @pytest.mark.parametrize(
@@ -58,14 +58,6 @@ def test_fp8_scaled_mm(output_dtype, m, k_n):
         out_dtype=output_dtype,
         userbuffers_id=-1,
     )
-    cutlass_output = torch.ops.trtllm.cutlass_scaled_mm(
-        x,
-        w.t(),
-        scale_x,
-        scale_w,
-        bias=None,
-        out_dtype=output_dtype,
-    )
     ref = torch._scaled_mm(
         x,
         w.t(),
@@ -76,12 +68,21 @@ def test_fp8_scaled_mm(output_dtype, m, k_n):
     )
     np.testing.assert_allclose(ref.float().cpu(), output.float().cpu())
 
-    # TODO(zhenhuan): cutlass kernel has acc issue on some shapes
-    try:
-        np.testing.assert_allclose(ref.float().cpu(),
-                                   cutlass_output.float().cpu())
-    except Exception as e:
-        warn(RuntimeWarning("cutlass result is not correct: " + repr(e)))
+    if getSMVersion() == 90:
+        cutlass_output = torch.ops.trtllm.cutlass_scaled_mm(
+            x,
+            w.t(),
+            scale_x,
+            scale_w,
+            bias=None,
+            out_dtype=output_dtype,
+        )
+        # TODO(zhenhuan): cutlass kernel has acc issue on some shapes
+        try:
+            np.testing.assert_allclose(ref.float().cpu(),
+                                       cutlass_output.float().cpu())
+        except Exception as e:
+            warn(RuntimeWarning("cutlass result is not correct: " + repr(e)))
 
 
 if __name__ == '__main__':

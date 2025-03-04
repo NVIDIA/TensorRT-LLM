@@ -15,8 +15,9 @@ class Arguments:
     download: bool = False
     dtype: Literal['float16', 'float32', 'bfloat16'] = 'float16'
 
-    hf_repo_name: Literal['facebook/bart-large-cnn',
-                          't5-small'] = 'facebook/bart-large-cnn'
+    hf_repo_name: Literal[
+        'facebook/bart-large-cnn', 't5-small',
+        'language_adapter-enc_dec_language_adapter'] = 'facebook/bart-large-cnn'
 
     model_cache: str = '/llm-models'
 
@@ -110,7 +111,7 @@ class DownloadHF(RunCMDMixin):
         return [
             'git', 'clone', f'https://huggingface.co/{args.hf_repo_name}',
             args.hf_models_dir
-        ] if args.download else ''
+        ] if args.download and args.model_type != 'language_adapter' else ''
 
 
 class Convert(RunCMDMixin):
@@ -136,7 +137,6 @@ class Build(RunCMDMixin):
             f"trtllm-build --checkpoint_dir {join(weight_dir, 'encoder')}",
             f"--output_dir {join(engine_dir, 'encoder')}",
             f'--paged_kv_cache disable',
-            f'--moe_plugin disable',
             f'--max_beam_width {args.max_beam}',
             f'--max_batch_size 8',
             f'--max_input_len 512',
@@ -144,14 +144,12 @@ class Build(RunCMDMixin):
             f'--bert_attention_plugin {args.dtype}',
             f'--gpt_attention_plugin {args.dtype}',
             f'--remove_input_padding enable',
-            f'--context_fmha disable',
         ]
 
         decoder_build = [
             f"trtllm-build --checkpoint_dir {join(weight_dir, 'decoder')}",
             f"--output_dir {join(engine_dir, 'decoder')}",
             f'--paged_kv_cache enable',
-            f'--moe_plugin disable',
             f'--max_beam_width {args.max_beam}',
             f'--max_batch_size 8',
             f'--max_seq_len 201',
@@ -160,9 +158,20 @@ class Build(RunCMDMixin):
             f'--bert_attention_plugin {args.dtype}',
             f'--gpt_attention_plugin {args.dtype}',
             f'--remove_input_padding enable',
-            f'--context_fmha disable',
             '--max_input_len 1',
         ]
+
+        # t5 model with relative attention cannot use context_fmha
+        encoder_build.append(f'--context_fmha disable')
+        decoder_build.append(f'--context_fmha disable')
+
+        # language adapter plugin leverages MOE plugin for static expert selection
+        if args.model_type == 'language_adapter':
+            encoder_build.append(f'--moe_plugin auto')
+            decoder_build.append(f'--moe_plugin auto')
+        else:
+            encoder_build.append(f'--moe_plugin disable')
+            decoder_build.append(f'--moe_plugin disable')
 
         encoder_build = ' '.join(encoder_build)
         decoder_build = ' '.join(decoder_build)

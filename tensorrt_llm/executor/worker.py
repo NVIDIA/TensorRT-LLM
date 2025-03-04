@@ -8,7 +8,7 @@ import traceback
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from queue import Queue
-from typing import Callable, Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -28,11 +28,11 @@ from ..lora_manager import LoraManager
 from ..prompt_adapter_manager import PromptAdapterManager
 from ..runtime import ModelConfig
 from ..runtime.model_runner import _engine_config_to_model_config
-from ..sampling_params import SamplingParams
+from ..sampling_params import BatchedLogitsProcessor, SamplingParams
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
-from .postproc_worker import (PostprocWorker, PostprocWorkerConfig,
-                              postproc_worker_main)
+from .postproc_worker import (PostprocParams, PostprocWorker,
+                              PostprocWorkerConfig, postproc_worker_main)
 from .request import (CancellingRequest, GenerationRequest, LoRARequest,
                       PromptAdapterRequest)
 from .result import GenerationResult
@@ -54,7 +54,7 @@ class ExecutorBindingsWorker(GenerationExecutor):
         self,
         engine: Union[Path, Engine],
         executor_config: Optional[tllm.ExecutorConfig] = None,
-        logits_post_processor_map: Optional[Dict[str, Callable]] = None,
+        batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
     ) -> None:
@@ -83,15 +83,8 @@ class ExecutorBindingsWorker(GenerationExecutor):
         if executor_config is None:
             executor_config = tllm.ExecutorConfig(1)
 
-        if logits_post_processor_map is not None:
-            processor_batched = None
-            if tllm.Request.BATCHED_POST_PROCESSOR_NAME in logits_post_processor_map:
-                processor_batched = logits_post_processor_map.pop(
-                    tllm.Request.BATCHED_POST_PROCESSOR_NAME)
-            executor_config.logits_post_processor_config = tllm.LogitsPostProcessorConfig(
-                processor_map=logits_post_processor_map,
-                processor_batched=processor_batched,
-                replicate=False)
+        executor_config.logits_post_processor_config = tllm.LogitsPostProcessorConfig(
+            processor_batched=batched_logits_processor, replicate=False)
 
         def _create_engine():
             if isinstance(engine, Engine):
@@ -341,8 +334,11 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 embedding_bias=request.sampling_params.embedding_bias,
                 lora_config=lora_config,
                 prompt_tuning_config=prompt_tuning_config,
-                logits_post_processor_name=request.sampling_params.
-                logits_post_processor_name,
+                logits_post_processor_name=(
+                    tllm.Request.BATCHED_POST_PROCESSOR_NAME
+                    if request.sampling_params.apply_batched_logits_processor
+                    else None),
+                logits_post_processor=request.sampling_params.logits_processor,
                 kv_cache_retention_config=request.kv_cache_retention_config,
                 context_phase_params=context_phase_params,
                 type=request_type)
@@ -448,7 +444,7 @@ def worker_main(
         worker_queues: WorkerCommIpcAddrs | WorkerCommQueues,
         log_level: str,
         executor_config: Optional[tllm.ExecutorConfig] = None,
-        logits_post_processor_map: Optional[Dict[str, Callable]] = None,
+        batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         worker_cls: type = ExecutorBindingsWorker,
         tracer_init_kwargs: Optional[dict] = None,
         _torch_model_class_mapping: Optional[dict] = None,
@@ -562,7 +558,6 @@ def worker_main(
                 proxy_result_queue,
                 postproc_worker_config.postprocess_tokenizer_dir,
                 PostprocWorker.default_record_creator,
-                result_handler=postproc_worker_config.postprocess_result_handler
             )
             postprocess_worker_futures.append(fut)
 
@@ -581,7 +576,7 @@ def worker_main(
         worker: ExecutorBindingsWorker = worker_cls(
             engine,
             executor_config,
-            logits_post_processor_map,
+            batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
             is_llm_executor=is_llm_executor)
     except Exception as e:
@@ -625,7 +620,7 @@ def worker_main(
             if is_leader:
                 notify_proxy_threads_to_quit()
             err = Exception(f"Failed during generation: {e}")
-            logger.error(err)
+            logger.error(traceback.format_exc())
             if is_leader:
                 request_error_queue.put(err)
 
@@ -775,14 +770,16 @@ class AwaitResponseHelper:
             else:
                 self.worker.result_queue.put(rsp)
         else:
+            sampling_params, postproc_params = self._get_params_for_first_rsp(
+                rsp.client_id)
             inp = PostprocWorker.Input(
                 rsp,
                 # sampling_params is necessary for creating fake GenerationResult
                 # instances in the postproc processes. They are for incremental
                 # detokenize. They should be transmitted only once for each
                 # Request.
-                sampling_params=self._get_sampling_params_for_first_rsp(
-                    rsp.client_id),
+                sampling_params=sampling_params,
+                postproc_params=postproc_params,
                 streaming=self._get_streaming(rsp.client_id))
 
             pid = rsp.client_id % self.worker.postproc_config.num_postprocess_workers
@@ -801,14 +798,15 @@ class AwaitResponseHelper:
         if rsp.is_final:
             self.worker._pop_result(rsp.client_id)
 
-    def _get_sampling_params_for_first_rsp(
-            self, client_id) -> Optional[SamplingParams]:
+    def _get_params_for_first_rsp(
+            self, client_id
+    ) -> Tuple[Optional[SamplingParams], Optional[PostprocParams]]:
         res = self.worker._results.get(client_id, None)
         assert res is not None
-        if not res._postproc_sampling_params_transmitted:
-            res._postproc_sampling_params_transmitted = True
-            return res.sampling_params
-        return None
+        if not res._params_transmitted:
+            res._params_transmitted = True
+            return res.sampling_params, res.postproc_params
+        return None, None
 
     def _get_streaming(self, client_id) -> bool:
         res = self.worker._results.get(client_id, None)

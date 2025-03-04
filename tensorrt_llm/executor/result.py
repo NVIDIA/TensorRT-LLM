@@ -17,7 +17,7 @@ from .utils import has_event_loop
 
 if TYPE_CHECKING:
     from .executor import GenerationExecutor
-    from .postproc_worker import PostprocWorker
+    from .postproc_worker import PostprocParams, PostprocWorker
     from .request import GenerationRequest
 
 __all__ = [
@@ -100,9 +100,11 @@ class GenerationResultBase:
     def __init__(self,
                  id: int,
                  sampling_params: SamplingParams,
-                 background_error_handler: Optional[Callable] = None):
+                 background_error_handler: Optional[Callable] = None,
+                 postproc_params: "Optional[PostprocParams]" = None):
         self.id = id
         self.sampling_params = sampling_params
+        self.postproc_params = postproc_params
         self._done = False
 
         if has_event_loop():
@@ -131,7 +133,7 @@ class GenerationResultBase:
         # This is used for avoid duplicate transmission the sampling_params for a
         # request. SamplingParams is necessary for creating dummy
         # GenerationResultBase instances on postprocess worker processes.
-        self._postproc_sampling_params_transmitted = False
+        self._params_transmitted = False
 
     @property
     def outputs(self) -> List[CompletionOutput]:
@@ -265,8 +267,14 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
                  sampling_params: SamplingParams,
                  tokenizer: Optional[Callable] = None,
                  streaming: bool = False,
-                 background_error_handler: Optional[Callable] = None):
-        super().__init__(id, sampling_params, background_error_handler)
+                 background_error_handler: Optional[Callable] = None,
+                 postproc_params: Optional["PostprocParams"] = None):
+        super().__init__(
+            id,
+            sampling_params,
+            background_error_handler=background_error_handler,
+            postproc_params=postproc_params,
+        )
         self.tokenizer = tokenizer
         self._streaming = streaming
 
@@ -320,9 +328,12 @@ class GenerationResult(GenerationResultBase):
                  generation_request: "GenerationRequest",
                  background_error_handler: Optional[Callable] = None,
                  executor: Optional["GenerationExecutor"] = None) -> None:
-        super().__init__(generation_request.id,
-                         generation_request.sampling_params,
-                         background_error_handler)
+        super().__init__(
+            generation_request.id,
+            generation_request.sampling_params,
+            background_error_handler,
+            postproc_params=generation_request.postproc_params,
+        )
         self._generation_request = generation_request
         self._streaming = generation_request.streaming
 
@@ -477,9 +488,6 @@ class IterationStatsResult:
             except Empty:
                 self._done = True
         return results
-
-    def __await__(self):
-        return self.aresult().__await__()
 
     def __aiter__(self):
         return self

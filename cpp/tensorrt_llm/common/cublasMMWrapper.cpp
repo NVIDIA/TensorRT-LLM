@@ -142,7 +142,7 @@ void CublasMMWrapper::Gemm(cublasOperation_t transa, cublasOperation_t transb, i
     half h_beta = (half) (f_beta);
 
     // TODO: default cublas libs
-    usingCublasLt = usingCublasLt && (mAType == CUDA_R_16F || mAType == CUDA_R_8F_E4M3);
+    usingCublasLt = usingCublasLt && (mAType == CUDA_R_16F || mAType == CUDA_R_8F_E4M3 || mAType == CUDA_R_16BF);
     bool isFp16ComputeType = mComputeType == CUBLAS_COMPUTE_16F;
     // fp32 use cublas as default
     // fp16 use cublasLt as default
@@ -284,6 +284,123 @@ void CublasMMWrapper::setStream(cudaStream_t stream)
     mStream = stream;
 }
 
+namespace
+{
+
+static inline char const* mmaToString(uint16_t mma)
+{
+    static char const* mmaStr[] = {
+        "UNDEF", //
+        "MMA884",
+        "MMA1684",
+        "MMA1688",
+        "MMA16816",
+    };
+
+    static_assert(sizeof(mmaStr) / sizeof(mmaStr[0]) == CUBLASLT_MATMUL_INNER_SHAPE_END,
+        "all mma configs must be listed in the metadata table");
+
+    if (mma >= sizeof(mmaStr) / sizeof(mmaStr[0]))
+        return "UNKNOWN";
+    return mmaStr[mma];
+}
+
+static inline char const* cgaToString(uint16_t cga)
+{
+    // clang-format off
+  static const char* cgaStr[] = {"AUTO",
+                                 "ILLEGAL",
+                                 "1x1x1",
+                                 "1x2x1",
+                                 "1x4x1",
+                                 "2x1x1",
+                                 "2x2x1",
+                                 "2x4x1",
+                                 "4x1x1",
+                                 "4x2x1",
+                                 "4x4x1",
+                                 "1x8x1",
+                                 "8x1x1",
+                                 "2x8x1",
+                                 "8x2x1",
+                                 "1x16x1",
+                                 "16x1x1",
+                                 "1x3x1",
+                                 "1x5x1",
+                                 "1x6x1",
+                                 "1x7x1",
+                                 "1x9x1",
+                                 "1x10x1",
+                                 "1x11x1",
+                                 "1x12x1",
+                                 "1x13x1",
+                                 "1x14x1",
+                                 "1x15x1",
+                                 "2x3x1",
+                                 "2x5x1",
+                                 "2x6x1",
+                                 "2x7x1",
+                                 "3x1x1",
+                                 "3x2x1",
+                                 "3x3x1",
+                                 "3x4x1",
+                                 "3x5x1",
+                                 "4x3x1",
+                                 "5x1x1",
+                                 "5x2x1",
+                                 "5x3x1",
+                                 "6x1x1",
+                                 "6x2x1",
+                                 "7x1x1",
+                                 "7x2x1",
+                                 "9x1x1",
+                                 "10x1x1",
+                                 "11x1x1",
+                                 "12x1x1",
+                                 "13x1x1",
+                                 "14x1x1",
+                                 "15x1x1",
+                                 };
+    // clang-format on
+
+    static_assert(sizeof(cgaStr) / sizeof(cgaStr[0]) == CUBLASLT_CLUSTER_SHAPE_END,
+        "all cga configs must be listed in the metadata table");
+
+    if (cga >= sizeof(cgaStr) / sizeof(cgaStr[0]))
+        return "UNKNOWN";
+    return cgaStr[cga];
+}
+
+static void print_algo(cublasLtMatmulAlgo_t const* matmulAlgo)
+{
+    int algoId, tile, stages, swizzle, customOption, numSplitsK, reductionScheme;
+    uint16_t mma, cga;
+
+    cublasLtMatmulAlgoConfigGetAttribute(matmulAlgo, CUBLASLT_ALGO_CONFIG_ID, &algoId, sizeof(algoId), NULL);
+    cublasLtMatmulAlgoConfigGetAttribute(matmulAlgo, CUBLASLT_ALGO_CONFIG_TILE_ID, &tile, sizeof(tile), NULL);
+    cublasLtMatmulAlgoConfigGetAttribute(matmulAlgo, CUBLASLT_ALGO_CONFIG_STAGES_ID, &stages, sizeof(stages), NULL);
+    cublasLtMatmulAlgoConfigGetAttribute(
+        matmulAlgo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &numSplitsK, sizeof(numSplitsK), NULL);
+    cublasLtMatmulAlgoConfigGetAttribute(
+        matmulAlgo, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, &reductionScheme, sizeof(reductionScheme), NULL);
+    cublasLtMatmulAlgoConfigGetAttribute(
+        matmulAlgo, CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING, &swizzle, sizeof(swizzle), NULL);
+    cublasLtMatmulAlgoConfigGetAttribute(
+        matmulAlgo, CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION, &customOption, sizeof(customOption), NULL);
+
+    cublasLtMatmulAlgoConfigGetAttribute(matmulAlgo, CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID, &mma, sizeof(mma), NULL);
+    cublasLtMatmulAlgoConfigGetAttribute(matmulAlgo, CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID, &cga, sizeof(cga), NULL);
+
+    TLLM_LOG_DEBUG(
+        "algo={ %d %d %d splitK=%d reduc=%d swizzle=%d custom=%d mma=%s cga=%s}"
+        " [-algo%d -m_tile%d -m_stages%d -m_numsK%d -m_reduction%d -m_swizzle%d -m_custom%d -m_mma%d -m_cga%d "
+        "\n",
+        algoId, tile, stages, numSplitsK, reductionScheme, swizzle, customOption, mmaToString(mma), cgaToString(cga),
+        algoId, tile, stages, numSplitsK, reductionScheme, swizzle, customOption, mma, cga);
+}
+
+} // namespace
+
 bool CublasMMWrapper::checkTactic(cublasOperation_t transa, cublasOperation_t transb, int const m, int const n,
     int const k, int const lda, int const ldb, int const ldc, cublasLtMatmulAlgo_t const& algo)
 {
@@ -297,6 +414,8 @@ bool CublasMMWrapper::checkTactic(cublasOperation_t transa, cublasOperation_t tr
     if (algoStatus != CUBLAS_STATUS_SUCCESS || heurResult.state != CUBLAS_STATUS_SUCCESS
         || heurResult.workspaceSize > CUBLAS_WORKSPACE_SIZE)
     {
+        TLLM_LOG_WARNING("CheckTactic failed with status: %d and heuristic status: %d with workspace size: %d.\n",
+            algoStatus, heurResult.state, heurResult.workspaceSize);
         return false;
     }
 

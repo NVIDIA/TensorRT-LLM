@@ -1,22 +1,22 @@
 [submodule "3rdparty/cutlass"]
 	path = 3rdparty/cutlass
-	url = https://github.com/NVIDIA/cutlass.git
+	url = https://gitlab-master.nvidia.com/ftp/GitHubSync/cutlass-mirror.git
 [submodule "3rdparty/json"]
 	path = 3rdparty/json
-	url = https://github.com/nlohmann/json.git
+	url = https://gitlab-master.nvidia.com/ftp/GitHubSync/json-mirror.git
 [submodule "3rdparty/cxxopts"]
 	path = 3rdparty/cxxopts
-	url = https://github.com/jarro2783/cxxopts
+	url = https://gitlab-master.nvidia.com/ftp/GitHubSync/cxxopts-mirror.git
 	branch = v3.1.1
 [submodule "3rdparty/NVTX"]
 	path = 3rdparty/NVTX
-	url = https://github.com/NVIDIA/NVTX.git
+	url = https://gitlab-master.nvidia.com/ftp/GitHubSync/NVTX-mirror.git
 [submodule "3rdparty/ucxx"]
 	path = 3rdparty/ucxx
-	url = https://github.com/rapidsai/ucxx.git
+	url = https://gitlab-master.nvidia.com/ftp/GitHubSync/ucxx.git
 [submodule "3rdparty/pybind11"]
 	path = 3rdparty/pybind11
-	url = https://github.com/pybind/pybind11.git
+	url = https://gitlab-master.nvidia.com/ftp/GitHubSync/pybind11.git
 [submodule "3rdparty/xgrammar"]
 	path = 3rdparty/xgrammar
-	url = https://github.com/mlc-ai/xgrammar.git
+	url = https://gitlab-master.nvidia.com/ftp/GitHubSync/xgrammar.git

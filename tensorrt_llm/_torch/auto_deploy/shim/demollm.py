@@ -339,7 +339,6 @@ class DemoLLM(LLM):
         dtype: str = "auto",
         revision: Optional[str] = None,
         tokenizer_revision: Optional[str] = None,
-        speculative_model: Optional[str] = None,
         **kwargs: Any,
     ):
         try:
@@ -354,7 +353,6 @@ class DemoLLM(LLM):
                 dtype=dtype,
                 revision=revision,
                 tokenizer_revision=tokenizer_revision,
-                speculative_model=speculative_model,
                 **kwargs,
             )
 

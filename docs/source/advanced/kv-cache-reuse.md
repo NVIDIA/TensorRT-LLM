@@ -46,7 +46,7 @@ GptSession is scheduled to be obsoleted and does not support kv cache reuse.
 When using p-tuning, different requests may use same fake input ids (i.e. prompt ids whose values are larger than vocabulary size). That may lead to incorrect kv cache reuse, since TRT-LLM could not distinguish these requests only by input ids. To enable kv cache reuse for p-tuning correctly, users should provide an extra id (uint64) for each input id. Extra ids for normal input ids (i.e. text token ids) should always be 0, while fake input ids should have extra ids which are larger than 0. Requests using same prompt embeddings should use same extra ids, while requests using different prompt embeddings should use different extra ids.
 
 Example:
-Assume vocaburlay size is 100, which means normal text token ids are in range [0, 99] and prompt ids start from 100.
+Assume vocabulary size is 100, which means normal text token ids are in range [0, 99] and prompt ids start from 100.
 
 ```python
 # Request 1 uses prompt embedding table 1

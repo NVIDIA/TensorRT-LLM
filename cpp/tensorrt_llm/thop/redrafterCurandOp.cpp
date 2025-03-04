@@ -42,7 +42,7 @@ namespace
 {
 // Must be similar to [cpp/tensorrt_llm/runtime/gptSession.cpp] ExplicitDraftTokensLayer<T>::setup
 void initializeDeviceCurandStates(
-    uint64_t batchSize, th::Tensor& curandState, th::optional<th::Tensor>& randomSeeds, cudaStream_t stream)
+    int64_t batchSize, th::Tensor& curandState, th::optional<th::Tensor>& randomSeeds, cudaStream_t stream)
 {
     auto* curandStatePtr = get_ptr<curandState_t>(curandState);
     tr::SizeType32* batchSlotsPtr = nullptr;

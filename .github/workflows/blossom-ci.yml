@@ -25,7 +25,7 @@ on:
             required: true
           test_result:
             description: 'test result'
-            required: false
+            required: true
           test_results_url:
             description: 'test results url'
             required: true
@@ -38,7 +38,7 @@ jobs:
 
     # This job only runs for pull request comments
     if: |
-         startsWith( github.event.comment.body, '/bot' ) && contains('["niukuo", "tburt-nv"]', github.actor)
+         startsWith( github.event.comment.body, '/bot' ) && contains('["chzblych", "tburt-nv", "niukuo"]', github.actor)
     steps:
       - name: Check if comment is issued by authorized person
         run: blossom-ci
@@ -81,7 +81,7 @@ jobs:
           CI_SERVER: ${{ secrets.CI_SERVER }}
           REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  Upload-Test:
+  Upload-results:
     name: Upload test results
     runs-on: linux-amd64-cpu4
     if: github.event_name == 'workflow_dispatch'

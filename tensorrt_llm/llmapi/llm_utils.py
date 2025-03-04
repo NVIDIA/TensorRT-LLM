@@ -14,6 +14,7 @@ __all__ = [
     'KvCacheRetentionConfig',
     'LookaheadDecodingConfig',
     'MedusaDecodingConfig',
+    'MTPDecodingConfig',
     'ContextChunkingPolicy',
     'CapacitySchedulerPolicy',
     'BuildConfig',
@@ -37,7 +38,8 @@ from argparse import Namespace
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
+from typing import (Any, Callable, ClassVar, Dict, List, Literal, Optional,
+                    Tuple, Union)
 
 import torch
 import yaml
@@ -63,6 +65,7 @@ from ..models.automodel import MODEL_MAP, AutoConfig, AutoModelForCausalLM
 from ..models.modeling_utils import (PretrainedConfig, QuantAlgo, QuantConfig,
                                      SpeculativeDecodingMode)
 from ..module import Module
+from ..sampling_params import BatchedLogitsProcessor
 from .build_cache import (BuildCache, BuildCacheConfig, CachedStage,
                           get_build_cache_config_from_env)
 from .mpi_session import MPINodeState, MpiSession
@@ -235,13 +238,19 @@ class _ModelInfo:
 
 
 @dataclass
-class MedusaDecodingConfig:
+class DecodingBaseConfig:
+    max_draft_len: Optional[int] = None
+    speculative_model: Optional[Union[str, Path]] = None
+
+
+@dataclass
+class MedusaDecodingConfig(DecodingBaseConfig):
     medusa_choices: Optional[List[List[int]]] = None
     num_medusa_heads: Optional[int] = None
 
 
 @dataclass
-class EagleDecodingConfig:
+class EagleDecodingConfig(DecodingBaseConfig):
     eagle_choices: Optional[List[List[int]]] = None
     greedy_sampling: Optional[bool] = True
     posterior_threshold: Optional[float] = None
@@ -249,6 +258,17 @@ class EagleDecodingConfig:
     dynamic_tree_max_topK: Optional[int] = None
     num_eagle_layers: Optional[int] = None
     max_non_leaves_per_layer: Optional[int] = None
+
+
+@dataclass
+class MTPDecodingConfig(DecodingBaseConfig):
+    decoding_type: ClassVar[str] = "MTP"
+    num_nextn_predict_layers: Optional[int] = 1
+
+    @classmethod
+    def from_yaml(cls, data: dict):
+        return MTPDecodingConfig(
+            num_nextn_predict_layers=data["num_nextn_predict_layers"])
 
 
 @dataclass
@@ -317,8 +337,6 @@ LLMARGS_EXPLICIT_DOCSTRING = """
         revision (str, optional): The revision of the model to use. Defaults to None.
 
         tokenizer_revision (str, optional): The revision of the tokenizer to use. Defaults to None.
-
-        speculative_model (str, pathlib.Path, optional): Speculative model name. Defaults to None.
 """
 
 LLMARGS_IMPLICIT_DOCSTRING = """
@@ -358,7 +376,8 @@ LLMARGS_IMPLICIT_DOCSTRING = """
 
         guided_decoding_backend (str, optional): The guided decoding backend, currently supports 'xgrammar'. Defaults to None.
 
-        logits_post_processor_map (Dict[str, Callable], optional): A map of logit post-processing functions. Defaults to None.
+        batched_logits_processor (tensorrt_llm.sampling_params.BatchedLogitsProcessor, optional): The batched logits postprocessor callback. Defaults to None.
+            The BatchedLogitsProcessor class is recommended for callback creation.
 
         iter_stats_max_iterations (int, optional): The maximum number of iterations for iteration statistics. Defaults to None.
 
@@ -389,8 +408,7 @@ LLMARGS_IMPLICIT_DOCSTRING = """
 
         scheduler_config (tensorrt_llm.bindings.executor.SchedulerConfig, optional): The scheduler configuration for the model. Defaults to None.
 
-        speculative_config (tensorrt_llm.bindings.executor.LookaheadDecodingConfig, tensorrt_llm.llmapi.MedusaDecodingConfig, tensorrt_llm.llmapi.EagleDecodingConfig, optional):
-            The speculative decoding configuration. Defaults to None.
+        speculative_config (tensorrt_llm.bindings.executor.LookaheadDecodingConfig, tensorrt_llm.llmapi.MedusaDecodingConfig, tensorrt_llm.llmapi.EagleDecodingConfig, tensorrt_llm.llmapi.MTPDecodingConfig, optional): The speculative decoding configuration. Defaults to None.
 
         decoding_config (tensorrt_llm.bindings.executor.DecodingConfig, optional): The decoding configuration for the model. Defaults to None.
 
@@ -419,8 +437,6 @@ class LlmArgs:
     """
     # Explicit arguments
     model: Union[str, Path]
-
-    speculative_model: Optional[Union[str, Path]] = None
 
     tokenizer: Optional[Union[str, Path, TokenizerBase,
                               PreTrainedTokenizerBase]] = None
@@ -491,7 +507,7 @@ class LlmArgs:
 
     guided_decoding_backend: Optional[str] = None
 
-    logits_post_processor_map: Optional[Dict[str, Callable]] = None
+    batched_logits_processor: Optional[BatchedLogitsProcessor] = None
 
     iter_stats_max_iterations: Optional[int] = None
 
@@ -514,7 +530,8 @@ class LlmArgs:
     # Speculative decoding parameters
     speculative_config: Optional[Union[LookaheadDecodingConfig,
                                        MedusaDecodingConfig,
-                                       EagleDecodingConfig]] = None
+                                       EagleDecodingConfig,
+                                       MTPDecodingConfig]] = None
 
     decoding_config: Optional[DecodingConfig] = None
 
@@ -542,7 +559,6 @@ class LlmArgs:
     # private options
     _num_postprocess_workers: int = 0  # Number of postprocess worker processes
     _postprocess_tokenizer_dir: Optional[str] = None
-    _postprocess_result_handler: Optional[Callable] = None
 
     def __post_init__(self):
         # TODO[chunweiy]: Enable this option in the future
@@ -667,6 +683,9 @@ class LlmArgs:
                 raise ValueError(
                     f"Invalid build_cache_config: {self.enable_build_cache}")
         model_obj = _ModelWrapper(self.model)
+
+        self.speculative_model = getattr(self.speculative_config,
+                                         "speculative_model", None)
         speculative_model_obj = _ModelWrapper(
             self.speculative_model
         ) if self.speculative_model is not None else None
@@ -757,10 +776,19 @@ class LlmArgs:
                     decoding_mode=DecodingMode.Lookahead(),
                     lookahead_decoding_config=lookahead_config)
             elif isinstance(self.speculative_config, MedusaDecodingConfig):
+                self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.MEDUSA
+
+                assert self.speculative_config.max_draft_len > 0
+                self.build_config.max_draft_len = self.speculative_config.max_draft_len
                 self.decoding_config = DecodingConfig(
                     decoding_mode=DecodingMode.Medusa(),
                     medusa_choices=self.speculative_config.medusa_choices)
             elif isinstance(self.speculative_config, EagleDecodingConfig):
+                self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.EAGLE
+                assert self.speculative_config.max_draft_len > 0
+
+                self.build_config.max_draft_len = self.speculative_config.max_draft_len
+
                 eagle_config = EagleConfig(
                     self.speculative_config.eagle_choices,
                     self.speculative_config.greedy_sampling,
@@ -770,6 +798,12 @@ class LlmArgs:
                 self.decoding_config = DecodingConfig(
                     decoding_mode=DecodingMode.Eagle(),
                     eagle_config=eagle_config)
+            elif isinstance(self.speculative_config, MTPDecodingConfig):
+                from tensorrt_llm._torch.speculative import MTPConfig
+                self.speculative_config = MTPConfig(
+                    num_nextn_predict_layers=self.speculative_config.
+                    num_nextn_predict_layers,
+                    max_batch_size=self.build_config.max_batch_size)
             else:
                 raise ValueError(f"Speculative config type not recognized")
         else:
@@ -995,14 +1029,18 @@ def update_llm_args_with_extra_dict(
         "enable_build_cache": BuildCacheConfig,
         "peft_cache_config": PeftCacheConfig,
         "scheduler_config": SchedulerConfig,
-        "speculative_config": LookaheadDecodingConfig,
+        "speculative_config": MTPDecodingConfig,
         "batching_type": BatchingType,
         "extended_runtime_perf_knob_config": ExtendedRuntimePerfKnobConfig,
         "pytorch_backend_config": PyTorchConfig,
     }
     for field, field_type in field_mapping.items():
         if field in llm_args_dict:
-            llm_args_dict[field] = field_type(**llm_args_dict[field])
+            if field == "speculative_config":
+                llm_args_dict[field] = field_type.from_yaml(
+                    llm_args_dict[field])
+            else:
+                llm_args_dict[field] = field_type(**llm_args_dict[field])
             extra_llm_str = f"because it's specified in {extra_llm_api_options}" if extra_llm_api_options else ""
             logger.warning(f"Overriding {field} {extra_llm_str}")
 

@@ -215,7 +215,6 @@ def build_command(
     **params,
 ) -> None:
     """Build engines for benchmarking."""
-    logger.set_level("info")
 
     apply_build_mode_settings(params)
     # Collect configuration parameters from CLI parameters.

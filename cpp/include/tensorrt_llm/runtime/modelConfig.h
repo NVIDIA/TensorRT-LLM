@@ -140,6 +140,7 @@ public:
         , mUseShapeInference(true)
         , mManageWeightsType(ManageWeightsType::kDisabled)
         , mSkipCrossAttnBlocks(false)
+        , mNumLanguages(0)
     {
         TLLM_CHECK_WITH_INFO(mNbLayers >= mNbAttentionLayers + mNbRnnLayers,
             "Number of layers (%d) expected to be >= number of attention (%d) + number of rnn layers (%d)", mNbLayers,
@@ -839,6 +840,21 @@ public:
         mSkipCrossAttnBlocks = skipCrossAttnBlocks;
     }
 
+    [[nodiscard]] std::optional<SizeType32> constexpr getNumLanguages() const noexcept
+    {
+        return mNumLanguages;
+    }
+
+    [[nodiscard]] bool constexpr useLanguageAdapter() const noexcept
+    {
+        return getNumLanguages().has_value() && getNumLanguages().value() > 0;
+    }
+
+    void constexpr setNumLanguages(std::optional<SizeType32> numLanguages) noexcept
+    {
+        mNumLanguages = numLanguages;
+    }
+
     [[nodiscard]] bool isMultiModal() const
     {
         return getModelName() == "multiModal";
@@ -915,6 +931,9 @@ private:
     std::vector<SizeType32> mNumKvHeadsPerAttentionLayer;
     std::vector<SizeType32> mNumKvHeadsPerCrossAttentionLayer;
     bool mSkipCrossAttnBlocks;
+
+    // Language adapter info
+    std::optional<SizeType32> mNumLanguages;
 };
 
 } // namespace tensorrt_llm::runtime

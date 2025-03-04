@@ -35,7 +35,7 @@ Deepseek‑v3 is a high‑capacity language model that can be executed using NVI
 
 ---
 
-## Hardware 
+## Hardware
 DeepSeek-v3 has 671B parameters which needs about 671GB GPU memory. 8\*H100 (640GB) is not enough to accommodate the weights. The following steps have been tested on 8\*H20 141GB, we will test on 8*H20 96GB in the future.
 
 DeepSeek-v3 is trained natively with FP8 precision, we only provide FP8 solution in TRTLLM at this moment. Ampere architecture (SM80 & SM86) is not supported.
@@ -92,7 +92,7 @@ This command writes the dataset to `/workspace/dataset.txt`.
 
 ### Create Configuration Files
 
-1. **Backend Configuration:**  
+1. **Backend Configuration:**
    Enable attention data‑parallelism and overlap scheduler:
 
    ```bash
@@ -105,7 +105,7 @@ This command writes the dataset to `/workspace/dataset.txt`.
    echo -e "enable_attention_dp: false\npytorch_backend_config:\n  enable_overlap_scheduler: true\n  use_cuda_graph: true\n  cuda_graph_max_batch_size: 128" > extra-llm-api-config.yml
    ```
 
-2. **Quantization Configuration:**  
+2. **Quantization Configuration:**
    Configure the quantization settings for the model:
 
    ```bash

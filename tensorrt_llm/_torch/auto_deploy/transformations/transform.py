@@ -17,7 +17,9 @@ from .library import (
     fuse_allreduce_residual_rmsnorm,
     fuse_collectives,
     fuse_gemms,
+    fuse_moe,
     insert_mha_with_kv_cache,
+    match_moe_pattern,
     quantize,
 )
 
@@ -84,6 +86,9 @@ class InferenceOptimizer:
                 is_quantized_graph=quantized_graph,
             )
 
+        # Match MoE pattern
+        egm = match_moe_pattern(egm)
+
         # run sharding across ranks
         # NOTE (lliebenwein): sharding will cause the graph's metadata to be out-of-sync.
         # Specifically, torch.export tracks the metadata of each node in the graph and stores it in
@@ -116,6 +121,9 @@ class InferenceOptimizer:
         ############################################################################################
         # RUN POST-LOAD OPTIMIZATIONS
         ############################################################################################
+
+        # run MoE fusion
+        egm = fuse_moe(egm)
 
         # run GEMM fusion
         egm = fuse_gemms(egm)

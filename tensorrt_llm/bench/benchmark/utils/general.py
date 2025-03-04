@@ -9,7 +9,6 @@ from typing import Dict, List, Tuple, Union
 import yaml
 from torch.cuda import device_count
 
-import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._torch.pyexecutor.model_engine import \
     validate_and_set_kv_cache_quant
 from tensorrt_llm.bench.build.build import (get_benchmark_engine_settings,
@@ -23,63 +22,6 @@ _KV_CACHE_MAP = {
     QuantAlgo.FP8.value: "fp8",
     QuantAlgo.NVFP4.value: "fp8",
 }
-
-
-def get_executor_requests(
-    requests: List[InferenceRequest],
-    streaming: bool,
-    eos_id: int,
-    pad_id: int,
-) -> List[trtllm.Request]:
-    """Generate a list of TRT-LLM Executor requests.
-
-    Args:
-        requests (List[InferenceRequest]): A list of inference requests for processing.
-        pad_id (int): Padding token identifier
-        eos_id (int): End of sequence token identifier.
-        streaming (bool, optional): Enable streaming for this request. Defaults to False.
-
-    Returns:
-        List[trtllm.Request]:  A list of TRT-LLM Executor request instance.
-    """
-    executor_requests = []
-    while requests:
-        request = requests.pop()
-        executor_requests.append(
-            get_executor_request(request,
-                                 pad_id=pad_id,
-                                 eos_id=eos_id,
-                                 streaming=streaming))
-        del request
-
-    return executor_requests
-
-
-def get_executor_request(request: InferenceRequest,
-                         pad_id: int,
-                         eos_id: int,
-                         streaming: bool = False) -> trtllm.Request:
-    """Generate a TRT-LLM Executor request.
-
-    Args:
-        request (InferenceRequest): An inference request for processing.
-        pad_id (int): Padding token identifier
-        eos_id (int): End of sequence token identifier.
-        streaming (bool, optional): Enable streaming for this request. Defaults to False.
-
-    Returns:
-        trtllm.Request: A TRT-LLM Executor request instance.
-    """
-    return trtllm.Request(
-        input_token_ids=request.input_ids,
-        max_tokens=request.output_tokens,
-        stop_words=[],
-        bad_words=[],
-        streaming=streaming,
-        output_config=trtllm.OutputConfig(exclude_input_from_output=True),
-        pad_id=pad_id,
-        end_id=eos_id,
-    )
 
 
 def get_settings_from_engine(

@@ -10,6 +10,10 @@ methods:
         annotation: Optional[List[tensorrt_llm.sampling_params.AdditionalModelOutput]]
         default: null
         name: additional_model_outputs
+      apply_batched_logits_processor:
+        annotation: bool
+        default: false
+        name: apply_batched_logits_processor
       bad:
         annotation: Union[List[str], str, NoneType]
         default: null
@@ -70,10 +74,10 @@ methods:
         annotation: Optional[float]
         default: null
         name: length_penalty
-      logits_post_processor_name:
-        annotation: Optional[str]
+      logits_processor:
+        annotation: Optional[tensorrt_llm.sampling_params.LogitsProcessor]
         default: null
-        name: logits_post_processor_name
+        name: logits_processor
       lookahead_config:
         annotation: Optional[tensorrt_llm.bindings.executor.LookaheadDecodingConfig]
         default: null

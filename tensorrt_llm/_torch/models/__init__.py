@@ -1,8 +1,10 @@
 import transformers
 
 from .modeling_auto import AutoModelForCausalLM
+from .modeling_bert import BertForSequenceClassification
 from .modeling_deepseekv3 import DeepseekV3ForCausalLM
 from .modeling_llama import LlamaForCausalLM
+from .modeling_llava_next import LlavaNextModel
 from .modeling_mamba_hybrid import MambaHybridForCausalLM
 from .modeling_mixtral import MixtralForCausalLM
 from .modeling_nemotron import NemotronForCausalLM
@@ -11,11 +13,20 @@ from .modeling_qwen import Qwen2ForCausalLM
 from .modeling_utils import get_model_architecture
 from .modeling_vila import VilaModel
 
+# Note: for better readiblity, this should have same order as imports above
 __all__ = [
-    "AutoModelForCausalLM", "LlamaForCausalLM", "VilaModel",
-    "MixtralForCausalLM", "NVSmallForCausalLM", "Qwen2ForCausalLM",
-    "NemotronForCausalLM", "get_model_architecture", "DeepseekV3ForCausalLM",
-    "MambaHybridForCausalLM"
+    "AutoModelForCausalLM",
+    "BertForSequenceClassification",
+    "DeepseekV3ForCausalLM",
+    "LlamaForCausalLM",
+    "LlavaNextModel",
+    "MambaHybridForCausalLM",
+    "MixtralForCausalLM",
+    "NemotronForCausalLM",
+    "NVSmallForCausalLM",
+    "Qwen2ForCausalLM",
+    "get_model_architecture",
+    "VilaModel",
 ]
 
 if transformers.__version__ >= "4.45.1":

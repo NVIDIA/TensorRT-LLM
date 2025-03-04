@@ -7,7 +7,7 @@
 Clone the TensorRT-LLM repo and `cd` into it:
 
 ```bash
-git clone git@github.com:NVIDIA/TensorRT-LLM.git
+git clone https://github.com/NVIDIA/TensorRT-LLM.git
 cd TensorRT-LLM
 ```
 
@@ -48,10 +48,12 @@ We will use pre-compiled wheels from the latest CI builds. You can inspect avail
 [PyPI artifactory](https://pypi.nvidia.com/tensorrt-llm/)
 and set `TRTLLM_PRECOMPILED_LOCATION` according to the desired wheel URL.
 
-For example, for python=3.12 linux x86 system:
+*Note: We suggest using the latest pre-built wheel for compatibility and recommend repeating these steps regularly to keep the pre-built portion up-to-date.*
+
+For example, on a Linux x86 system running Python 3.12, the most recent pre-compiled wheel is available at:
 
 ```bash
-TRTLLM_PRECOMPILED_LOCATION=https://pypi.nvidia.com/tensorrt-llm/tensorrt_llm-0.18.0.dev2025020400-cp312-cp312-linux_x86_64.whl
+export TRTLLM_PRECOMPILED_LOCATION=https://pypi.nvidia.com/tensorrt-llm/tensorrt_llm-0.18.0.dev2025021800-cp312-cp312-linux_x86_64.whl
 ```
 
 Now can you proceed to do an editable pip install of `tensorrt_llm`:
@@ -59,9 +61,6 @@ Now can you proceed to do an editable pip install of `tensorrt_llm`:
 ```bash
 pip install -e ".[devel]" --extra-index-url https://pypi.nvidia.com/
 ```
-
-*Note: make sure to repeat above steps and reinstall the pre-built portion of `tensorrt_llm` on a
-regular basis to ensure the pre-built wheel portion stays up-to-date and compatible.*
 
 ### 4. Verify install
 
@@ -117,9 +116,9 @@ We provide recommended workspace settings for VSCode at [\`examples/auto_deploy/
 
 ### Run tests
 
-We use `pytest` to run a suit of standardized tests. You can invoke the test suit via `pytest` and pointing to the desired subfolder.
+We use `pytest` to run a suite of standardized tests. You can invoke the test suite via `pytest` and pointing to the desired subfolder.
 
-To invoke the full test suit, run
+To invoke the full test suite, run
 
 ```bash
 pytest tests/_torch/autodeploy

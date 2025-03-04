@@ -1,13 +1,17 @@
+from types import MethodType
 from typing import Optional
 
 import pytest
-from api_stability_core import ApiStabilityTestHarness
+from api_stability_core import (ApiStabilityTestHarness, ClassSnapshot,
+                                MethodSnapshot)
 
 from tensorrt_llm.bindings import executor as tllme
 from tensorrt_llm.llmapi import (LLM, CalibConfig, CompletionOutput,
                                  GuidedDecodingParams, QuantConfig,
-                                 RequestOutput, SamplingParams)
+                                 RequestOutput)
 from tensorrt_llm.llmapi.llm_utils import LlmArgs
+from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
+                                          LogitsProcessor, SamplingParams)
 
 
 class TestSamplingParams(ApiStabilityTestHarness):
@@ -54,6 +58,40 @@ class TestSamplingParams(ApiStabilityTestHarness):
 class TestGuidedDecodingParams(ApiStabilityTestHarness):
     TEST_CLASS = GuidedDecodingParams
     REFERENCE_FILE = "guided_decoding_params.yaml"
+
+
+class TestLogitsProcessor(ApiStabilityTestHarness):
+    TEST_CLASS = LogitsProcessor
+    REFERENCE_FILE = "logits_processor.yaml"
+
+    def create_snapshot_from_inspect(self):
+        method_snapshot = MethodSnapshot.from_inspect(
+            "__call__", MethodType(self.TEST_CLASS.__call__, object()))
+        return ClassSnapshot(methods={"__call__": method_snapshot},
+                             properties={})
+
+    def create_snapshot_from_docstring(self):
+        method_snapshot = MethodSnapshot.from_docstring(
+            "__call__", MethodType(self.TEST_CLASS.__call__, object()))
+        return ClassSnapshot(methods={"__call__": method_snapshot},
+                             properties={})
+
+
+class TestBatchedLogitsProcessor(ApiStabilityTestHarness):
+    TEST_CLASS = BatchedLogitsProcessor
+    REFERENCE_FILE = "batched_logits_processor.yaml"
+
+    def create_snapshot_from_inspect(self):
+        method_snapshot = MethodSnapshot.from_inspect(
+            "__call__", MethodType(self.TEST_CLASS.__call__, object()))
+        return ClassSnapshot(methods={"__call__": method_snapshot},
+                             properties={})
+
+    def create_snapshot_from_docstring(self):
+        method_snapshot = MethodSnapshot.from_docstring(
+            "__call__", MethodType(self.TEST_CLASS.__call__, object()))
+        return ClassSnapshot(methods={"__call__": method_snapshot},
+                             properties={})
 
 
 class TestLLM(ApiStabilityTestHarness):

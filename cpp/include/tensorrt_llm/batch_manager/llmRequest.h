@@ -32,6 +32,7 @@
 #include <memory>
 #include <optional>
 #include <utility>
+#include <valarray>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager
@@ -123,6 +124,7 @@ public:
         SizeType32 numReturnSequences = 1, std::optional<executor::EagleConfig> eagleConfig = std::nullopt,
         std::optional<TensorPtr> skipCrossAttnBlocks = std::nullopt, bool returnPerfMetrics = false,
         std::optional<executor::GuidedDecodingParams> guidedDecodingParams = std::nullopt,
+        std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt)
         : mRequestId(requestId)
@@ -179,6 +181,7 @@ public:
         , mSkipCrossAttnBlocks(std::move(skipCrossAttnBlocks))
         , mReturnPerfMetrics(returnPerfMetrics)
         , mGuidedDecodingParams(std::move(guidedDecodingParams))
+        , mLanguageAdapterUid(languageAdapterUid)
         , mAllottedTimeMs(allottedTimeMs)
     {
         if (mEncoderTokens.has_value() || encoderInputFeatures.has_value())
@@ -205,6 +208,7 @@ public:
         bool applyLogitsPostProcessorBatched = false, std::optional<VecTokens> encoderInputTokens = std::nullopt,
         bool returnEncoderOutput = false, std::optional<RequestIdType> clientId = std::nullopt,
         executor::PriorityType priority = executor::Request::kDefaultPriority, SizeType32 numReturnSequences = 1,
+        std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt)
         : mRequestId(requestId)
         , mPromptLen(inputTokens.size())
@@ -247,6 +251,7 @@ public:
         , mContextPhaseParams(contextPhaseParams)
         , mNumReturnSequences(numReturnSequences)
         , mSequenceIndex(0)
+        , mLanguageAdapterUid(languageAdapterUid)
     {
         if (draftTokens)
         {
@@ -321,6 +326,7 @@ public:
         , mSequenceIndex(0)
         , mReturnPerfMetrics(req.getOutputConfig().returnPerfMetrics)
         , mGuidedDecodingParams(req.getGuidedDecodingParams())
+        , mLanguageAdapterUid(req.getLanguageAdapterUid())
         , mAllottedTimeMs(req.getAllottedTimeMs())
     {
         if (req.getRequestType() == executor::RequestType::REQUEST_TYPE_GENERATION_ONLY)
@@ -1411,7 +1417,7 @@ public:
 
     void setState(LlmRequestState state)
     {
-        TLLM_LOG_DEBUG("Set request %ld from state %d to %d", mRequestId, mState, state);
+        TLLM_LOG_DEBUG("Set request %lu from state %d to %d", mRequestId, mState, state);
         mState = state;
     }
 
@@ -1682,6 +1688,23 @@ public:
         return mPerfMetrics.kvCacheMetrics.numReusedBlocks;
     }
 
+    [[nodiscard]] std::optional<SizeType32> getLanguageAdapterUid() const
+    {
+        return mLanguageAdapterUid;
+    }
+
+    std::valarray<float> getLanguageAdapterRouting(SizeType32 const reqNumLanguages, SizeType32 const inputLength) const
+    {
+        auto const reqLanguageAdapterUid = getLanguageAdapterUid().value();
+        TLLM_CHECK_WITH_INFO(reqLanguageAdapterUid < reqNumLanguages, "Language adapter uid is out of range.\n");
+        // Copy the same routing info for all the tokens in a request
+        // Construct the routing probabilities across all languages, put 1.0 for the selected language.
+        // Will be removed after TopK logic is removed from MOE kernel.
+        std::valarray<float> languageAdapterRouting(0.0f, inputLength * reqNumLanguages);
+        languageAdapterRouting[std::slice(reqLanguageAdapterUid, inputLength, reqNumLanguages)] = 1.0f;
+        return languageAdapterRouting;
+    }
+
     /// @brief mark all beams as finished by the given reason. Marks only unfinished beams.
     void finishByReason(executor::FinishReason finishReason)
     {
@@ -1741,6 +1764,16 @@ public:
             mPerfMetrics.lastIter = iter;
             mPerfMetrics.timingMetrics.lastTokenTime = currentTokenTime;
         }
+    }
+
+    void setRequestedBlockHashes(std::vector<size_t> hashes)
+    {
+        mRequestedBlockHashes = std::move(hashes);
+    }
+
+    [[nodiscard]] std::vector<size_t> const& getRequestedBlockHashes() const
+    {
+        return mRequestedBlockHashes;
     }
 
     RequestIdType mRequestId;
@@ -1862,6 +1895,8 @@ protected:
     // Guided decoding params
     std::optional<executor::GuidedDecodingParams> mGuidedDecodingParams;
 
+    std::optional<SizeType32> mLanguageAdapterUid;
+
     // the timepoint at which the request started. Used for tracking the timeout
     std::chrono::steady_clock::time_point mStartTime;
     // Time in milliseconds after which the model is finished with a `timeout` finishReason.
@@ -1869,6 +1904,9 @@ protected:
 
     TensorMap mAdditionalContextOutputTensors;    // Tensors containing the additional context output.
     TensorMap mAdditionalGenerationOutputTensors; // Tensors containing the additional generation output.
+
+    // Context request only. The hashes of the blocks that are requested by the corresponding generation request.
+    std::vector<size_t> mRequestedBlockHashes;
 
 private:
     void initialize(VecTokens const& inputTokens, bool outputLogProbs)
@@ -2043,6 +2081,7 @@ public:
         SizeType32 numReturnSequences = 1, std::optional<executor::EagleConfig> eagleConfig = std::nullopt,
         std::optional<TensorPtr> skipCrossAttnBlocks = std::nullopt, bool returnPerfMetrics = false,
         std::optional<executor::GuidedDecodingParams> guidedDecodingParams = std::nullopt,
+        std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt)
         : Base(requestId, maxNewTokens, std::move(inputTokens), samplingConfig, isStreaming, endId, padId,
@@ -2054,8 +2093,8 @@ public:
             applyLogitsPostProcessorBatched, std::move(encoderInputTokens), returnEncoderOutput, clientId, priority,
             std::move(encoderInputFeatures), std::move(encoderOutputLength), std::move(crossAttentionMask),
             llmRequestType, std::move(inputTokenExtraIds), numReturnSequences, std::move(eagleConfig),
-            std::move(skipCrossAttnBlocks), returnPerfMetrics, std::move(guidedDecodingParams), allottedTimeMs,
-            contextPhaseParams)
+            std::move(skipCrossAttnBlocks), returnPerfMetrics, std::move(guidedDecodingParams), languageAdapterUid,
+            allottedTimeMs, contextPhaseParams)
     {
     }
 
@@ -2086,6 +2125,7 @@ public:
         std::optional<executor::EagleConfig> eagleConfig = std::nullopt,
         std::optional<TensorPtr> skipCrossAttnBlocks = std::nullopt, bool returnPerfMetrics = false,
         std::optional<executor::GuidedDecodingParams> guidedDecodingParams = std::nullopt,
+        std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt)
         : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
@@ -2107,7 +2147,7 @@ public:
             inputTokenExtraIds ? std::make_optional(std::make_shared<VecTokenExtraIds>(std::move(*inputTokenExtraIds)))
                                : std::optional<std::shared_ptr<VecTokenExtraIds>>(std::nullopt),
             numReturnSequences, std::move(eagleConfig), skipCrossAttnBlocks, returnPerfMetrics,
-            std::move(guidedDecodingParams), allottedTimeMs, contextPhaseParams)
+            std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, contextPhaseParams)
     {
     }
 
@@ -2127,6 +2167,7 @@ public:
         bool applyLogitsPostProcessorBatched = false, std::optional<VecTokens> encoderInputTokens = std::nullopt,
         bool returnEncoderOutput = false, std::optional<RequestIdType> clientId = std::nullopt,
         executor::PriorityType priority = executor::Request::kDefaultPriority, SizeType32 numReturnSequences = 1,
+        std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt)
         : Base(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming, endId, padId,
             std::move(embeddingBias), std::move(badWordsList), std::move(stopWordsList), std::move(positionIds),
@@ -2134,7 +2175,7 @@ public:
             lookaheadConfig, returnLogProbs, returnContextLogits, returnGenerationLogits, std::move(draftTokens),
             std::move(draftLogits), excludeInputFromOutput, std::move(logitsPostProcessor),
             applyLogitsPostProcessorBatched, std::move(encoderInputTokens), returnEncoderOutput, clientId, priority,
-            numReturnSequences, contextPhaseParams)
+            numReturnSequences, languageAdapterUid, contextPhaseParams)
     {
     }
 
@@ -2154,7 +2195,7 @@ public:
     /// @return An optional Response
     std::optional<executor::Response> createResponse(bool useFastLogits = false, int32_t mpiWorldRank = 0);
 
-    void validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen,
+    void validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen, SizeType32 vocabSizePadded,
         std::optional<SizeType32> maxEncoderInputLen = std::nullopt, bool enableKVCacheReuse = false,
         bool gatherContextOutputs = false);
 

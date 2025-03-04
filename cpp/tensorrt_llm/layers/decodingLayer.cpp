@@ -175,7 +175,6 @@ std::tuple<std::shared_ptr<BaseDecodingOutputs>, std::shared_ptr<BaseDecodingInp
     auto params = std::dynamic_pointer_cast<DecodingInputs>(baseInputs);
 
     auto const localDecoderDomain = getLocalDecoderDomain(params, mDecoderDomain);
-    auto const maxSeqLen = baseOutputs->outputIds->getDimension<-1>();
     auto const& endIds = params->endIds;
 
     std::shared_ptr<BaseDecodingOutputs> preparedOutputs;

@@ -30,21 +30,24 @@ namespace torch_ext
 
 static int getExp(float v)
 {
-    int vIntRepr = *(int*) &v;
+    int vIntRepr;
+    memcpy(&vIntRepr, &v, sizeof(vIntRepr));
     int expBits = (vIntRepr >> 23) & 0xff;
     return expBits - 127;
 }
 
 static int getMantissaBits(float v)
 {
-    int vIntRepr = *(int*) &v;
+    int vIntRepr;
+    memcpy(&vIntRepr, &v, sizeof(vIntRepr));
     int mantissaBits = vIntRepr & 0x7fffff;
     return mantissaBits;
 }
 
 static bool getSign(float v)
 {
-    int vIntRepr = *(int*) &v;
+    int vIntRepr;
+    memcpy(&vIntRepr, &v, sizeof(vIntRepr));
     return vIntRepr >> 31;
 }
 
@@ -52,7 +55,9 @@ static float makeExpFloat(int expValue)
 {
     expValue += 127;
     expValue <<= 23;
-    return *(float*) &expValue;
+    float vFloat;
+    memcpy(&vFloat, &expValue, sizeof(vFloat));
+    return vFloat;
 }
 
 /*
@@ -138,7 +143,7 @@ torch::autograd::variable_list FloatToE2M1AndUFP8SFScale(th::Tensor floatTensor,
     int packedFp4HiddenDim = hiddenDim / 2;
     int groupsPerHiddenDim = hiddenDim / sfVecSize;
 
-    for (size_t vIdx = 0; vIdx < inputShape[0]; ++vIdx)
+    for (size_t vIdx = 0; vIdx < static_cast<size_t>(inputShape[0]); ++vIdx)
     {
         for (int group = 0; group < groupsPerHiddenDim; ++group)
         {
@@ -229,7 +234,7 @@ torch::autograd::variable_list HalfToE2M1AndUFP8SFScale(
         = th::zeros({num_experts * expert_sf_size}, th::dtype(SF_DTYPE).device(torch::kCUDA).requires_grad(false));
 
     int const mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
-    for (size_t eIdx = 0; eIdx < num_experts; eIdx++)
+    for (size_t eIdx = 0; eIdx < static_cast<size_t>(num_experts); eIdx++)
     {
         size_t const expert_elem_offset = rows * cols * eIdx;
         size_t const expert_sf_offset = expert_sf_size * eIdx;
@@ -257,11 +262,11 @@ th::Tensor NVFP4BlockScaleInterleave(th::Tensor blockScale)
     auto expert_out_size = tensorrt_llm::computeSFSize(rows, cols);
     th::Tensor interleavedBlockScale
         = th::zeros({expert_out_size * num_experts}, th::dtype(SF_DTYPE).requires_grad(false));
-    for (size_t eIdx = 0; eIdx < num_experts; eIdx++)
+    for (size_t eIdx = 0; eIdx < static_cast<size_t>(num_experts); eIdx++)
     {
         uint8_t* interleavedBlockScalePtr
             = static_cast<uint8_t*>(interleavedBlockScale.data_ptr()) + eIdx * expert_out_size;
-        for (size_t rIdx = 0; rIdx < rows; ++rIdx)
+        for (size_t rIdx = 0; rIdx < static_cast<size_t>(rows); ++rIdx)
         {
             auto globalRowIdx = eIdx * rows + rIdx;
             uint8_t* blockScalePtr = blockScale.data_ptr<uint8_t>() + globalRowIdx * cols;
@@ -328,7 +333,7 @@ th::Tensor E2M1AndUFP8SFScaleToFloat(th::Tensor valueE2M1, th::Tensor scaleFP8SF
     int packedFp4HiddenDim = hiddenDim / 2;
     int groupsPerHiddenDim = hiddenDim / sfVecSize;
 
-    for (size_t vIdx = 0; vIdx < packedShape[0]; ++vIdx)
+    for (size_t vIdx = 0; vIdx < static_cast<size_t>(packedShape[0]); ++vIdx)
     {
         for (int group = 0; group < groupsPerHiddenDim; ++group)
         {
@@ -383,7 +388,7 @@ th::Tensor E2M1AndUFP8SFScaleToFloatV2(
     int packedFp4HiddenDim = hiddenDim / 2;
     int groupsPerHiddenDim = hiddenDim / sfVecSize;
 
-    for (size_t vIdx = 0; vIdx < packedShape[0]; ++vIdx)
+    for (size_t vIdx = 0; vIdx < static_cast<size_t>(packedShape[0]); ++vIdx)
     {
         for (int group = 0; group < groupsPerHiddenDim; ++group)
         {
@@ -395,7 +400,7 @@ th::Tensor E2M1AndUFP8SFScaleToFloatV2(
             if (sfType == 0)
             {
                 uint32_t tmp = uint32_t(fp8Scale) << 23;
-                scaleFloat = reinterpret_cast<float&>(tmp);
+                memcpy(&scaleFloat, &tmp, sizeof(scaleFloat));
             }
             else
             {

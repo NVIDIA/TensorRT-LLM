@@ -21,6 +21,7 @@
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
+#include <cstdint>
 #include <string>
 #include <variant>
 #include <vector>
@@ -41,27 +42,41 @@ class CacheState final
 public:
     struct ModelConfig;
 
-    explicit CacheState(ModelConfig modelConfig, runtime::WorldConfig const& worldConfig, nvinfer1::DataType dataType)
+    enum class AttentionType : std::uint8_t
+    {
+        kDEFAULT = 0,
+        kMLA = 1,
+    };
+
+    CacheState(ModelConfig modelConfig, runtime::WorldConfig const& worldConfig, nvinfer1::DataType dataType,
+        AttentionType attentionType = AttentionType::kDEFAULT, int kvFactor = 2)
         : mModelConfig(std::move(modelConfig))
-        , mParallelConfig{worldConfig.getTensorParallelism(), worldConfig.getPipelineParallelism()}
+        , mParallelConfig{worldConfig.getTensorParallelism(), worldConfig.getPipelineParallelism(),
+              worldConfig.enableAttentionDP(), worldConfig.getTensorParallelRank(), worldConfig.getTensorParallelism()}
         , mDataType{dataType}
+        , mAttentionConfig(attentionType, kvFactor)
     {
     }
 
-    CacheState(std::vector<SizeType32> const& nbKvHeadPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
-        SizeType32 tensorParallelism, SizeType32 pipelineParallelism, nvinfer1::DataType dataType)
+    CacheState(std::vector<SizeType32> nbKvHeadPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
+        SizeType32 tensorParallelism, SizeType32 pipelineParallelism, nvinfer1::DataType dataType,
+        AttentionType attentionType = AttentionType::kDEFAULT, int kvFactor = 2, bool enableAttentionDP = false,
+        int DPrank = 0, int DPsize = 0)
         : mModelConfig{std::move(nbKvHeadPerLayer), sizePerHead, tokensPerBlock}
-        , mParallelConfig{tensorParallelism, pipelineParallelism}
+        , mParallelConfig{tensorParallelism, pipelineParallelism, enableAttentionDP, DPrank, DPsize}
         , mDataType{dataType}
-
+        , mAttentionConfig(attentionType, kvFactor)
     {
     }
 
     CacheState(SizeType32 nbAttentionLayers, SizeType32 nbKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
-        SizeType32 tensorParallelism, SizeType32 pipelineParallelism, nvinfer1::DataType dataType)
+        SizeType32 tensorParallelism, SizeType32 pipelineParallelism, nvinfer1::DataType dataType,
+        AttentionType attentionType = AttentionType::kDEFAULT, int kvFactor = 2, bool enableAttentionDP = false,
+        int DPrank = 0, int DPsize = 0)
         : mModelConfig{std::vector(nbAttentionLayers, nbKvHeads), sizePerHead, tokensPerBlock}
-        , mParallelConfig{tensorParallelism, pipelineParallelism}
+        , mParallelConfig{tensorParallelism, pipelineParallelism, enableAttentionDP, DPrank, DPsize}
         , mDataType{dataType}
+        , mAttentionConfig(attentionType, kvFactor)
     {
     }
 
@@ -88,11 +103,30 @@ public:
     {
         SizeType32 mTensorParallelism;
         SizeType32 mPipelineParallelism;
+        bool mEnableAttenionDP;
+        SizeType32 mDPrank;
+        SizeType32 mDPsize;
 
         [[nodiscard]] bool operator==(ParallelConfig const& other) const noexcept
         {
-            return mTensorParallelism == other.mTensorParallelism && mPipelineParallelism == other.mPipelineParallelism;
+            return mTensorParallelism == other.mTensorParallelism && mPipelineParallelism == other.mPipelineParallelism
+                && mEnableAttenionDP == other.mEnableAttenionDP && mDPrank == other.mDPrank && mDPsize == other.mDPsize;
         }
+    };
+
+    struct AttentionConfig
+    {
+
+        AttentionConfig(AttentionType attentionType, int kvFactor)
+            : mAttentionType(attentionType)
+            , mKvFactor(kvFactor)
+
+        {
+        }
+
+        // attentionType ;
+        AttentionType mAttentionType;
+        int mKvFactor;
     };
 
     [[nodiscard]] ModelConfig const& getModelConfig() const
@@ -103,6 +137,11 @@ public:
     [[nodiscard]] ParallelConfig const& getParallelConfig() const
     {
         return mParallelConfig;
+    }
+
+    [[nodiscard]] AttentionConfig const& getAttentionConfig() const
+    {
+        return mAttentionConfig;
     }
 
     [[nodiscard]] nvinfer1::DataType const& getDataType() const
@@ -122,7 +161,12 @@ public:
         sstring << "mTokensPerBlock:" << mModelConfig.mTokensPerBlock << "\n";
         sstring << "tp:" << mParallelConfig.mTensorParallelism << "\n";
         sstring << "pp:" << mParallelConfig.mPipelineParallelism << "\n";
+        sstring << "enableAttentionDP:" << mParallelConfig.mEnableAttenionDP << "\n";
         sstring << "datatype:" << static_cast<int32_t>(mDataType) << "\n";
+        sstring << "attentionType:" << static_cast<int32_t>(mAttentionConfig.mAttentionType) << "\n";
+        sstring << "kvFactor:" << mAttentionConfig.mKvFactor << "\n";
+        sstring << "dpRank:" << mParallelConfig.mDPrank << "\n";
+        sstring << "dpSize:" << mParallelConfig.mDPsize << "\n";
         return sstring.str();
     }
 
@@ -131,6 +175,7 @@ private:
     ModelConfig mModelConfig;
     ParallelConfig mParallelConfig;
     nvinfer1::DataType mDataType;
+    AttentionConfig mAttentionConfig;
 };
 
 struct MpiState

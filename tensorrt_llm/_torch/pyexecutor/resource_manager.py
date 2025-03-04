@@ -135,6 +135,7 @@ class KVCacheManager(BaseResourceManager):
         self.tokens_per_block = tokens_per_block
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
+        self.kv_factor = 1 if kv_cache_type == CacheTypeCpp.SELFKONLY else 2
 
         if kv_cache_config.max_attention_window is None:
             max_attention_window = max_seq_len
@@ -263,21 +264,29 @@ class KVCacheManager(BaseResourceManager):
                 if req.is_first_context_chunk():
                     self.impl.add_sequence(req.py_request_id, req.prompt_len,
                                            req_beam_width, req)
+                    if req.py_draft_tokens is not None:
+                        for _ in range(len(req.py_draft_tokens)):
+                            self.impl.add_token(req.py_request_id)
 
         for req in generation_batch:
             self.impl.add_token(req.py_request_id)
+            if req.py_draft_tokens is not None:
+                for _ in range(len(req.py_draft_tokens)):
+                    self.impl.add_token(req.py_request_id)
 
     def add_dummy_requests(
         self,
         request_ids: List[int],
         token_nums: Optional[List[int]] = None,
         is_gen: bool = False,
+        max_num_draft_tokens: int = 0,
     ):
         beam_width = 1
         requests = []
         for i, req_id in enumerate(request_ids):
             sampling_params = SamplingParams()
-            token_num = token_nums[i] if token_nums is not None else 1
+            token_num = token_nums[
+                i] if token_nums is not None else 1 + max_num_draft_tokens
             encoder_input_tokens = [
                 1
             ] * token_num if self.impl.cross_kv else None
@@ -294,14 +303,19 @@ class KVCacheManager(BaseResourceManager):
             self.impl.add_sequence(req_id, token_num, beam_width, req)
             if is_gen:
                 req.state = tensorrt_llm.bindings.LlmRequestState.GENERATION_IN_PROGRESS
-                req.prompt_len = token_num - 1
+                req.prompt_len = token_num - 1 + max_num_draft_tokens
                 req.py_prompt_len = req.prompt_len
+                if max_num_draft_tokens > 0:
+                    req.py_draft_tokens = [0] * max_num_draft_tokens
             requests.append(req)
         return requests
 
     def update_resources(self, scheduled_batch: ScheduledRequests):
-        # store context blocks
-        pass
+        # rewind kv cache
+        for request in scheduled_batch.generation_requests:
+            if request.state != tensorrt_llm.bindings.LlmRequestState.GENERATION_COMPLETE:
+                if request.py_rewind_len > 0:
+                    self.rewind_kv_cache(request, request.py_rewind_len)
 
     def free_resources(self, request: LlmRequest):
         self.impl.remove_sequence(request.py_request_id, request)
@@ -331,9 +345,6 @@ class KVCacheManager(BaseResourceManager):
 
         cache_size_bytes_per_token = cache_size_per_token * kv_cache_dtype_bytes
         free_mem, total_mem = torch.cuda.mem_get_info()
-        logger.info(
-            f'Memory usage when calculating max tokens in paged kv cache: total: {(total_mem / (1<<30)):.2f} GiB, available: {(free_mem / (1<<30)):.2f} GiB'
-        )
 
         assert free_mem_fraction < 1.0, f"Invalid freeMemFraction, freeMemFraction {free_mem_fraction} must be smaller than 1.0"
         max_tokens = free_mem_fraction * free_mem / cache_size_bytes_per_token
@@ -402,12 +413,16 @@ class KVCacheManager(BaseResourceManager):
 
     def get_buffers(self, layer_idx: int) -> Optional[torch.Tensor]:
         result = self.impl.get_primary_pool_data(layer_idx)
-        return result.reshape(result.shape[0], 2, self.tokens_per_block,
+        return result.reshape(result.shape[0], self.kv_factor,
+                              self.tokens_per_block,
                               self.num_kv_heads_per_layer[layer_idx],
                               self.head_dim)
 
     def get_kv_cache_stats(self):
         return self.impl.get_kv_cache_stats()
+
+    def rewind_kv_cache(self, request: LlmRequest, rewind_len: int):
+        self.impl.rewind_kv_cache(request.py_request_id, rewind_len)
 
 
 class MLAKVCacheManager(KVCacheManager):
@@ -488,7 +503,7 @@ class BaseDraftTokenManager(BaseResourceManager):
         results = self.get_draft_tokens(input_tokens)
         for request, output in zip(scheduled_batch.generation_requests,
                                    results):
-            request.draft_tokens = output
+            request.py_draft_tokens = output
 
     def get_max_resource_count(self) -> int:
         return 0
@@ -510,21 +525,24 @@ class ResourceManager(object):
         self.resource_managers[name] = resource_manager
 
     def get_resource_manager(self, name: str) -> BaseResourceManager:
-        return self.resource_managers[name]
+        return self.resource_managers.get(name)
 
     @nvtx_range("prepare_resources")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         for _, resource_manager in self.resource_managers.items():
-            resource_manager.prepare_resources(scheduled_batch)
+            if hasattr(resource_manager, "prepare_resources"):
+                resource_manager.prepare_resources(scheduled_batch)
 
     @nvtx_range("update_resources")
     def update_resources(self, scheduled_batch: ScheduledRequests):
         for _, resource_manager in self.resource_managers.items():
-            resource_manager.update_resources(scheduled_batch)
+            if hasattr(resource_manager, "update_resources"):
+                resource_manager.update_resources(scheduled_batch)
 
     def free_resources(self, request: LlmRequest):
         for _, resource_manager in reversed(self.resource_managers.items()):
-            resource_manager.free_resources(request)
+            if hasattr(resource_manager, "free_resources"):
+                resource_manager.free_resources(request)
 
     def reorder_pipeline(self, resource_manager_list: list[str]):
         assert set(resource_manager_list) == set(self.resource_managers.keys())

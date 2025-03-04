@@ -6,8 +6,8 @@ from .llm import LLM, RequestOutput
 from .llm_utils import (BuildConfig, CalibConfig, CapacitySchedulerPolicy,
                         EagleDecodingConfig, KvCacheConfig,
                         KvCacheRetentionConfig, LookaheadDecodingConfig,
-                        MedusaDecodingConfig, QuantAlgo, QuantConfig,
-                        SchedulerConfig)
+                        MedusaDecodingConfig, MTPDecodingConfig, QuantAlgo,
+                        QuantConfig, SchedulerConfig)
 from .mpi_session import MpiCommSession
 
 __all__ = [
@@ -22,6 +22,7 @@ __all__ = [
     'LookaheadDecodingConfig',
     'MedusaDecodingConfig',
     'EagleDecodingConfig',
+    'MTPDecodingConfig',
     'SchedulerConfig',
     'CapacitySchedulerPolicy',
     'BuildConfig',

@@ -185,12 +185,10 @@ EagleBuffers::EagleBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, run
         = manager.gpu(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
 
     // helper tensors
-    auto const& stream = manager.getStream();
-    scanTempStorageBytes
-        = tksd::invokeScanGenerationLengths(nullptr, 0, nullptr, nullptr, maxNumSequences, stream.get());
-    reduceTempStorageBytes
-        = tksd::invokeReduceMaxGenerationLengths(nullptr, 0, nullptr, nullptr, maxNumSequences, stream.get());
-    scanReduceTempStorage = manager.gpu(std::max(reduceTempStorageBytes, scanTempStorageBytes));
+    scanReduceTempStorageBytes = tksd::invokeScanReduceGenerationLengths(
+        maxNumSequences, nullptr, nullptr, 0, nullptr, nullptr, manager.getStream().get());
+    scanReduceTempStorage = manager.gpu(scanReduceTempStorageBytes);
+
     cumSumGenerationLengths = manager.emptyTensor(runtime::MemoryType::kGPU, nvinfer1::DataType::kINT32);
     maxGenerationLength = manager.gpu(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
 
@@ -364,9 +362,9 @@ void EagleBuffers::setFromInputs(RequestVector const& contextRequests, RequestVe
         // Compute inclusive sum and max
         tksd::invokeScanReduceGenerationLengths(numGenSequences,
             bufferCast<SizeType32>(*engineInputs.specDecodingGenerationLengths),
-            bufferCast<uint8_t>(*scanReduceTempStorage), scanTempStorageBytes,
-            bufferCast<SizeType32>(*cumSumGenerationLengths), bufferCast<uint8_t>(*scanReduceTempStorage),
-            reduceTempStorageBytes, bufferCast<SizeType32>(*maxGenerationLength), manager.getStream().get());
+            bufferCast<uint8_t>(*scanReduceTempStorage), scanReduceTempStorageBytes,
+            bufferCast<SizeType32>(*cumSumGenerationLengths), bufferCast<SizeType32>(*maxGenerationLength),
+            manager.getStream().get());
     }
 
     // Pack tensors from batch slot position to continuous array

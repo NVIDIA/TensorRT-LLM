@@ -7,39 +7,15 @@ from typing import Any, Dict, List, NamedTuple
 from tensorrt_llm._torch.pyexecutor.model_engine import \
     validate_and_set_kv_cache_quant
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
+from tensorrt_llm.bench.dataclasses.general import DatasetMetadata
 from tensorrt_llm.bench.dataclasses.statistics import (BenchmarkStatistics,
                                                        PercentileStats,
                                                        RequestRecord)
 from tensorrt_llm.logger import Logger
+from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 
 
-class ResponseTuple(NamedTuple):
-    """
-    A tuple for recording responses to requests.
-
-    DEPRECATED after switching to LLM API.
-    """
-    timestamp: int
-    request_id: int
-    final: bool
-    error: bool
-    tokens: List[int]
-    decoding_iteration: int
-    time_on_first_token: int
-
-
-class NewRequestTuple(NamedTuple):
-    """
-    A tuple for recording new requests.
-
-    DEPRECATED after switching to LLM API.
-    """
-    timestamp: int
-    request_id: int
-    input_length: int
-
-
-class NewRequestPerfItemTuple(NamedTuple):
+class PerfItemTuple(NamedTuple):
     """A tuple for recording new requests and their responses."""
     start_timestamp: int
     end_timestamp: int
@@ -92,8 +68,7 @@ class StatsKeeper:
         if final:
             self.num_complete = self.num_complete + 1
 
-    def register_request_perf_item(self,
-                                   request_perf_item: NewRequestPerfItemTuple):
+    def register_request_perf_item(self, request_perf_item: PerfItemTuple):
         """
         Register request perf items, used exclusively with LLM API.
         """
@@ -115,7 +90,6 @@ class StatsKeeper:
         Returns:
             BenchmarkStatistic: Benchmark run statistics.
         """
-        total_output_tokens: int = 0
         total_input_tokens: int = 0
         num_requests = len(self.requests)
         start_time = float("inf")
@@ -125,6 +99,7 @@ class StatsKeeper:
         generation_latencies = []
         generation_throughputs = []
         intertoken_avg_latencies = []
+        output_tokens = []
         request_acceptance = []
         total_decoding_iterations = 0
         ttft_times = []
@@ -140,16 +115,16 @@ class StatsKeeper:
 
             request_latencies.append(entry.end_to_end_latency)
             generation_latencies.append(entry.generation_time)
-            generation_throughputs.append(entry.output_token_throughput)
+            generation_throughputs.append(entry.generation_token_throughput)
             ttft_times.append(entry.time_to_first_token)
             intertoken_avg_latencies.append(entry.intertoken_latency)
             request_acceptance.append(request_ar)
             total_decoding_iterations += entry.decode_iteration + 1
 
-            total_output_tokens += entry.num_output_tokens
+            output_tokens.append(entry.num_total_output_tokens)
             total_input_tokens += entry.num_input_tokens
 
-        global_acceptance_rate = total_output_tokens / total_decoding_iterations
+        global_acceptance_rate = sum(output_tokens) / total_decoding_iterations
         queue_time_total = last_queue_time - start_time
         percentile_request_accept = PercentileStats.from_iterable(
             request_acceptance) if request_acceptance else None
@@ -157,18 +132,19 @@ class StatsKeeper:
         stats = BenchmarkStatistics(
             num_requests=num_requests,
             total_latency_ns=end_time - start_time,
-            total_output_tokens=total_output_tokens,
+            total_output_tokens=sum(output_tokens),
             total_input_tokens=total_input_tokens,
             acceptance_rate=global_acceptance_rate,
             request_latency_percentiles=PercentileStats.from_iterable(
                 request_latencies),
-            itl_percentiles=PercentileStats.from_iterable(
+            tpot_percentiles=PercentileStats.from_iterable(
                 intertoken_avg_latencies),
             ttft_percentiles=PercentileStats.from_iterable(ttft_times),
             generation_tp_percentiles=PercentileStats.from_iterable(
                 generation_throughputs),
             generation_latency_percentiles=PercentileStats.from_iterable(
                 generation_latencies),
+            token_percentiles=PercentileStats.from_iterable(output_tokens),
             issue_rate_ns=queue_time_total / num_requests,
             acceptance_percentiles=percentile_request_accept,
         )
@@ -176,208 +152,378 @@ class StatsKeeper:
         return stats
 
 
-def report_statistics(statistics: StatsKeeper,
-                      rt_cfg: RuntimeConfig,
-                      logger: Logger,
-                      kwargs: Dict[str, Any],
-                      streaming: bool = False) -> BenchmarkStatistics:
-    """Report internal statistics about benchmark.
+class ReportUtility:
+    """A utility for reporting statistics."""
 
-    Args:
-        statistics (StatsKeeper): A statistics container.
-        rt_cfg (RuntimeConfig): Configuration for the run.
-        logger (Logger): A logger for logging.
-        kwargs (Dict[str, Any]): Dictionary of LLM API kwargs.
-        streaming (bool, optional): Streaming benchmark used. Defaults to False.
+    def __init__(self,
+                 statistics: StatsKeeper,
+                 dataset_metadata: DatasetMetadata,
+                 rt_cfg: RuntimeConfig,
+                 logger: Logger,
+                 kwargs: Dict[str, Any],
+                 streaming: bool = False) -> None:
+        """Initialize the ReportingController.
 
-    Returns:
-        BenchmarkStatistics: Benchmark statistics for the provided keeper.
-    """
-    if rt_cfg.backend != 'pytorch':
-        config_path = rt_cfg.engine_dir / "config.json"
-        with open(config_path, "r") as config:
-            engine_config = json.load(config)
-        build_cfg = engine_config["build_config"]
-        pretrain_cfg = engine_config["pretrained_config"]
+        Args:
+            statistics (StatsKeeper): A statistics container.
+            dataset_metadata (DatasetMetadata): Metadata about the dataset.
+            rt_cfg (RuntimeConfig): Configuration for the run.
+            logger (Logger): A logger for logging.
+            streaming (bool, optional): Streaming benchmark used. Defaults to False.
+        """
+        self.statistics = statistics.generate_statistics_summary()
+        self.dataset_metadata = dataset_metadata
+        self.rt_cfg = rt_cfg
+        self.logger = logger
+        self.kwargs = kwargs
+        self.streaming = streaming
 
-        logging_info = (
-            "\n\n===========================================================\n"
-            "= ENGINE DETAILS\n"
+    @staticmethod
+    def convert_to_ms(ns: float) -> float:
+        """Convert nanoseconds to milliseconds."""
+        return ns * 1.0e-6
+
+    @staticmethod
+    def convert_to_s(ns: float) -> float:
+        """Convert nanoseconds to seconds."""
+        return ns * 1.0e-9
+
+    @staticmethod
+    def convert_rate_to_s(rate: float) -> float:
+        """Convert rate to seconds."""
+        return rate * 1.0e9
+
+    @property
+    def total_latency_s(self) -> float:
+        """Total latency in seconds."""
+        return self.convert_to_s(self.statistics.total_latency_ns)
+
+    @property
+    def request_throughput_req_s(self) -> float:
+        """Request throughput in requests per second."""
+        return self.statistics.num_requests / self.total_latency_s
+
+    @property
+    def output_throughput_tok_s(self) -> float:
+        """Output throughput in tokens per second."""
+        return self.statistics.total_output_tokens / self.total_latency_s
+
+    def get_statistics_dict(self) -> Dict[str, Any]:
+        """Get statistics as a dictionary.
+
+        Returns:
+            Dict[str, Any]: Dictionary containing benchmark statistics.
+        """
+        stats_dict = {
+            "engine": {
+                "model": self.rt_cfg.model,
+                "model_path": str(self.rt_cfg.model_path),
+                "engine_dir": str(self.rt_cfg.engine_dir),
+                "version": self.rt_cfg.sw_version,
+            },
+        }
+
+        # Engine/Backend details
+        if self.rt_cfg.backend != 'pytorch':
+            config_path = self.rt_cfg.engine_dir / "config.json"
+            with open(config_path, "r") as config:
+                engine_config = json.load(config)
+            build_cfg = engine_config["build_config"]
+            pretrain_cfg = engine_config["pretrained_config"]
+
+            stats_dict["engine"] |= {
+                "backend":
+                "TRT",
+                "dtype":
+                pretrain_cfg["dtype"],
+                "kv_cache_dtype":
+                pretrain_cfg["quantization"]["kv_cache_quant_algo"],
+                "quantization":
+                pretrain_cfg["quantization"]["quant_algo"],
+                "max_input_length":
+                build_cfg["max_input_len"],
+                "max_sequence_length":
+                build_cfg["max_seq_len"]
+            }
+        else:
+            from tensorrt_llm._torch.model_config import ModelConfig
+            from tensorrt_llm._utils import torch_dtype_to_str
+
+            model = self.rt_cfg.model_path or self.rt_cfg.model
+            model_config = ModelConfig.from_pretrained(model,
+                                                       trust_remote_code=True)
+            validate_and_set_kv_cache_quant(
+                model_config,
+                self.kwargs["pytorch_backend_config"].kv_cache_dtype)
+
+            stats_dict["engine"] |= {
+                "backend":
+                "Pytorch",
+                "dtype":
+                torch_dtype_to_str(model_config.pretrained_config.torch_dtype),
+                "kv_cache_dtype":
+                model_config.quant_config.kv_cache_quant_algo,
+                "quantization":
+                model_config.quant_config.quant_algo
+            }
+
+        # World and runtime info
+        stats_dict["world_info"] = {
+            "tp_size":
+            self.rt_cfg.world_config.tp_size,
+            "pp_size":
+            self.rt_cfg.world_config.pp_size,
+            "ep_size":
+            self.rt_cfg.world_config.ep_size,
+            "world_size":
+            self.rt_cfg.world_config.world_size,
+            "max_batch_size":
+            self.rt_cfg.settings_config.max_batch_size,
+            "max_num_tokens":
+            self.rt_cfg.settings_config.max_num_tokens,
+            "scheduling_policy":
+            self.rt_cfg.settings_config.scheduler_policy.values[1],
+            "kv_cache_percentage":
+            self.rt_cfg.settings_config.kv_cache_percent * 100.0,
+            "issue_rate":
+            self.convert_rate_to_s(self.statistics.issue_rate_ns)
+        }
+
+        # Request details
+        stats_dict["request_info"] = {
+            "num_requests": self.statistics.num_requests,
+            "avg_num_concurrent_requests":
+            self.statistics.avg_concurrent_requests,
+            "avg_input_length": self.statistics.average_input_length,
+            "avg_output_length": self.statistics.average_output_length
+        }
+
+        # Performance stats
+        stats_dict["performance"] = {
+            # End-to-End Latency (last request end - 1st request start)
+            "total_latency_ms":
+            self.convert_to_ms(self.statistics.total_latency_ns),
+            # Average per request latency (sum request latencies / num requests)
+            "avg_request_latency_ms":
+            self.convert_to_ms(
+                self.statistics.request_latency_percentiles.average),
+            # Request throughput (num requests / end-to-end latency)
+            "request_throughput_req_s":
+            self.request_throughput_req_s,
+            # NOTE: All mention of "output" below is in reference to OSL tokens
+            # including the first token.
+            # Output throughput (total output (OSL) tokens / end-to-end latency)
+            "system_output_throughput_tok_s":
+            self.output_throughput_tok_s,
+            # Output throughput per user (average per request total tokens / avg request latency)
+            "output_throughput_per_user_tok_s":
+            self.statistics.token_percentiles.average / self.convert_to_s(
+                self.statistics.request_latency_percentiles.average),
+            # Output throughput per GPU (total throughput / world size)
+            "output_throughput_per_gpu_tok_s":
+            self.output_throughput_tok_s / self.rt_cfg.world_config.world_size,
+            # Request latency percentiles
+            "request_latency_percentiles_ms":
+            self.statistics.request_latency_percentiles.model_dump(
+                exclude_none=True, by_alias=True, mode='json') | {
+                    k: self.convert_to_ms(v)
+                    for k, v in self.statistics.request_latency_percentiles.
+                    model_dump().items()
+                },
+        }
+
+        if self.streaming:
+            stats_dict["streaming_metrics"] = {
+                # Token output speed (1 / time-per-output-token)
+                # NOTE: Excludes TTFT by nature of using TPOT.
+                "token_output_speed_tok_s":
+                self.convert_rate_to_s(
+                    1.0 / self.statistics.tpot_percentiles.average),
+                # Average per request time-to-first-token (TTFT)
+                "avg_ttft_ms":
+                self.convert_to_ms(self.statistics.ttft_percentiles.average),
+                # Average per request time-per-output-token (TPOT)
+                "avg_tpot_ms":
+                self.convert_to_ms(self.statistics.tpot_percentiles.average),
+                # Per request Time-per-output-token percentiles (TPOT)
+                "tpot_percentiles":
+                self.statistics.tpot_percentiles.model_dump(
+                    exclude_none=True, by_alias=True, mode='json') | {
+                        k: self.convert_to_ms(v)
+                        for k, v in
+                        self.statistics.tpot_percentiles.model_dump().items()
+                    },
+                # Per request Time-to-first-token percentiles (TTFT)
+                "ttft_percentiles":
+                self.statistics.ttft_percentiles.model_dump(
+                    exclude_none=True, by_alias=True, mode='json') | {
+                        k: self.convert_to_ms(v)
+                        for k, v in
+                        self.statistics.ttft_percentiles.model_dump().items()
+                    }
+            }
+
+        if (self.rt_cfg.decoding_config
+                and self.rt_cfg.decoding_config.decoding_mode
+                != SpeculativeDecodingMode.NONE):
+            stats_dict["decoding_stats"] = {
+                "mode":
+                self.rt_cfg.decoding_config.decoding_mode.values[1],
+                "acceptance_percentiles":
+                self.statistics.acceptance_percentiles.model_dump(
+                    exclude_none=True, by_alias=True, mode='json')
+            }
+        # Dataset metadata
+        stats_dict["dataset"] = self.dataset_metadata.model_dump(by_alias=True,
+                                                                 mode='json')
+
+        return stats_dict
+
+    def report_statistics(self) -> None:
+        """Report internal statistics about benchmark.
+
+        Returns:
+            BenchmarkStatistics: Benchmark statistics for the provided keeper.
+        """
+        stats_dict = self.get_statistics_dict()
+        engine = stats_dict["engine"]
+        world_info = stats_dict["world_info"]
+        requests = stats_dict["request_info"]
+        perf = stats_dict["performance"]
+        streaming = stats_dict.get("streaming_metrics")
+        decoding = stats_dict.get("decoding_stats", None)
+
+        backend_info = ""
+        if self.rt_cfg.backend != "pytorch":
+            config_path = self.rt_cfg.engine_dir / "config.json"
+            with open(config_path, "r") as config:
+                engine_config = json.load(config)
+            build_cfg = engine_config["build_config"]
+            pretrain_cfg = engine_config["pretrained_config"]
+
+            backend_info = (
+                "\n\n===========================================================\n"
+                "= ENGINE DETAILS\n"
+                "===========================================================\n"
+                f"Model:\t\t\t{engine['model']}\n"
+                f"Model Path:\t\t{engine['model_path']}\n"
+                f"Engine Directory:\t{engine['engine_dir']}\n"
+                f"TensorRT-LLM Version:\t{engine['version']}\n"
+                f"Dtype:\t\t\t{pretrain_cfg['dtype']}\n"
+                f"KV Cache Dtype:\t\t{pretrain_cfg['quantization']['kv_cache_quant_algo']}\n"
+                f"Quantization:\t\t{pretrain_cfg['quantization']['quant_algo']}\n"
+                f"Max Input Length:\t{build_cfg['max_input_len']}\n"
+                f"Max Sequence Length:\t{build_cfg['max_seq_len']}\n"
+                f"\n")
+        else:
+            backend_info = (
+                "\n\n===========================================================\n"
+                "= PYTORCH BACKEND\n"
+                "===========================================================\n"
+                f"Model:\t\t\t{engine['model']}\n"
+                f"Model Path:\t\t{engine['model_path']}\n"
+                f"TensorRT-LLM Version:\t{engine['version']}\n"
+                f"Dtype:\t\t\t{engine['dtype']}\n"
+                f"KV Cache Dtype:\t\t{engine['kv_cache_dtype']}\n"
+                f"Quantization:\t\t{engine['quantization']}\n"
+                # TODO
+                # f"Max Input Length:\t{build_cfg['max_input_len']}\n"
+                # f"Max Sequence Length:\t{build_cfg['max_seq_len']}\n"
+                f"\n")
+
+        world_info = (
             "===========================================================\n"
-            f"Model:\t\t\t{rt_cfg.model}\n"
-            f"Engine Directory:\t{rt_cfg.engine_dir}\n"
-            f"TensorRT-LLM Version:\t{rt_cfg.sw_version}\n"
-            f"Dtype:\t\t\t{pretrain_cfg['dtype']}\n"
-            f"KV Cache Dtype:\t\t{pretrain_cfg['quantization']['kv_cache_quant_algo']}\n"
-            f"Quantization:\t\t{pretrain_cfg['quantization']['quant_algo']}\n"
-            f"Max Input Length:\t{build_cfg['max_input_len']}\n"
-            f"Max Sequence Length:\t{build_cfg['max_seq_len']}\n"
+            "= WORLD + RUNTIME INFORMATION \n"
+            "===========================================================\n"
+            f"TP Size:                {world_info['tp_size']}\n"
+            f"PP Size:                {world_info['pp_size']}\n"
+            f"EP Size:                {world_info['ep_size']}\n"
+            f"Max Runtime Batch Size: {world_info['max_batch_size']}\n"
+            f"Max Runtime Tokens:     {world_info['max_num_tokens']}\n"
+            f"Scheduling Policy:      {world_info['scheduling_policy']}\n"
+            f"KV Memory Percentage:   {world_info['kv_cache_percentage']:.2f}%\n"
+            f"Issue Rate (req/sec):   {world_info['issue_rate']:.4E}\n"
             f"\n")
-    else:
-        from tensorrt_llm._torch.model_config import ModelConfig
-        from tensorrt_llm._utils import torch_dtype_to_str
 
-        model = rt_cfg.model_path or rt_cfg.model
-        model_config = ModelConfig.from_pretrained(model,
-                                                   trust_remote_code=True)
-        validate_and_set_kv_cache_quant(
-            model_config, kwargs["pytorch_backend_config"].kv_cache_dtype)
+        req_lat_info = "\n".join(
+            f"[Latency] {key.upper():<7}: {perf['request_latency_percentiles_ms'][key]:.4f}"
+            for key in perf['request_latency_percentiles_ms'].keys())
 
-        dtype = torch_dtype_to_str(model_config.pretrained_config.torch_dtype)
-        quant_algo = model_config.quant_config.quant_algo
-        kv_cache_quant_algo = model_config.quant_config.kv_cache_quant_algo
-
-        logging_info = (
-            "\n\n===========================================================\n"
-            "= PyTorch backend\n"
+        request_info = (
             "===========================================================\n"
-            f"Model:\t\t\t{rt_cfg.model}\n"
-            f"Model Path:\t\t{rt_cfg.model_path}\n"
-            f"TensorRT-LLM Version:\t{rt_cfg.sw_version}\n"
-            f"Dtype:\t\t\t{dtype}\n"
-            f"KV Cache Dtype:\t\t{kv_cache_quant_algo}\n"
-            f"Quantization:\t\t{quant_algo}\n"
-            # TODO
-            # f"Max Input Length:\t{build_cfg['max_input_len']}\n"
-            # f"Max Sequence Length:\t{build_cfg['max_seq_len']}\n"
-            f"\n")
-
-    stats = statistics.generate_statistics_summary()
-
-    total_latency_s = stats.total_latency_ns / 1.0e9
-
-    logging_info += (
-        "===========================================================\n"
-        "= WORLD + RUNTIME INFORMATION \n"
-        "===========================================================\n"
-        f"TP Size:\t\t{rt_cfg.world_config.tp_size}\n"
-        f"PP Size:\t\t{rt_cfg.world_config.pp_size}\n"
-        f"EP Size:\t\t{rt_cfg.world_config.ep_size}\n"
-        f"Max Runtime Batch Size:\t{rt_cfg.settings_config.max_batch_size}\n"
-        f"Max Runtime Tokens:\t{rt_cfg.settings_config.max_num_tokens}\n"
-        f"Scheduling Policy:\t{rt_cfg.settings_config.scheduler_policy.values[1]}\n"
-        f"KV Memory Percentage:\t{rt_cfg.settings_config.kv_cache_percent * 100.0:.2f}%\n"
-        f"Issue Rate (req/sec):\t{stats.issue_rate_ns * 1e9:.4E}\n"
-        f"\n"
-        "===========================================================\n"
-        "= PERFORMANCE OVERVIEW \n"
-        "===========================================================\n"
-        f"Number of requests:\t\t{stats.num_requests}\n"
-        f"Average Input Length (tokens):\t{stats.average_input_length:.4f}\n"
-        f"Average Output Length (tokens):\t{stats.average_output_length:.4f}\n"
-        f"Token Throughput (tokens/sec):\t{stats.total_output_tokens / total_latency_s:.4f}\n"
-        f"Request Throughput (req/sec):\t{stats.num_requests / total_latency_s:.4f}\n"
-        f"Total Latency (ms):\t\t{stats.total_latency_ns * 1.0e-6:.4f}\n")
-
-    if streaming:
-        logging_info = (
-            f"{logging_info}"
-            "\n"
+            "= REQUEST DETAILS \n"
             "===========================================================\n"
-            "= STREAMING STATISTICS \n"
-            "===========================================================\n"
-            f"Average request latency (ms):\t\t{stats.request_latency_percentiles.average * 1.0e-6:.4f}\n"
-            f"Average time-to-first-token (ms):\t{stats.ttft_percentiles.average * 1.0e-6:.4f}\n"
-            f"Average inter-token latency (ms):\t{stats.itl_percentiles.average * 1.0e-6:.4f}\n"
+            f"Number of requests:             {requests['num_requests']}\n"
+            f"Number of concurrent requests:  {requests['avg_num_concurrent_requests']:.4f}\n"
+            f"Average Input Length (tokens):  {requests['avg_input_length']:.4f}\n"
+            f"Average Output Length (tokens): {requests['avg_output_length']:.4f}\n"
         )
 
-    logging_info = (
-        f"{logging_info}"
-        "\n===========================================================\n")
+        perf_header = (
+            "===========================================================\n"
+            "= PERFORMANCE OVERVIEW \n"
+            "===========================================================\n")
 
-    logger.info(logging_info)
-    return stats
+        perf_stats = (
+            f"Request Throughput (req/sec):                     {perf['request_throughput_req_s']:.4f}\n"
+            f"Total Output Throughput (tokens/sec):             {perf['system_output_throughput_tok_s']:.4f}\n"
+            f"Per User Output Throughput (tokens/sec/user):     {perf['output_throughput_per_user_tok_s']:.4f}\n"
+            f"Per GPU Output Throughput (tokens/sec/gpu):       {perf['output_throughput_per_gpu_tok_s']:.4f}\n"
+            f"Total Latency (ms):                               {perf['total_latency_ms']:.4f}\n"
+            f"Average request latency (ms):                     {perf['avg_request_latency_ms']:.4f}\n"
+        )
 
+        if streaming:
+            streaming = stats_dict["streaming_metrics"]
+            itl = streaming["tpot_percentiles"]
+            ttft = streaming["ttft_percentiles"]
 
-def report_latency_statistics(stats: StatsKeeper, rt_cfg: RuntimeConfig,
-                              logger: Logger) -> BenchmarkStatistics:
-    """Report internal statistics about low-latency.
+            tpot_stats = "\n".join(
+                f"[TPOT] {key.upper():<7}: {itl[key]:.4f}" for key in
+                ["minimum", "maximum", "average", "p50", "p90", "p95", "p99"])
 
-    Args:
-        statistics (StatsKeeper): A statistics container.
-        rt_cfg (RuntimeConfig): Configuration for the run.
-        logger (Logger): A logger for logging.
-        streaming (bool, optional): Streaming benchmark used. Defaults to False.
+            ttft_stats = "\n".join(
+                f"[TTFT] {key.upper():<7}: {ttft[key]:.4f}" for key in
+                ["minimum", "maximum", "average", "p50", "p90", "p95", "p99"])
 
-    Returns:
-        BenchmarkStatistics: Benchmark statistics for the provided keeper.
-    """
+            perf_stats += (
+                f"Per User Output Speed [1/TPOT] (tokens/sec/user): {streaming['token_output_speed_tok_s']:.4f}\n"
+                f"Average time-to-first-token [TTFT] (ms):          {streaming['avg_ttft_ms']:.4f}\n"
+                f"Average time-per-output-token [TPOT] (ms):        {streaming['avg_tpot_ms']:.4f}\n"
+                "\n-- Time-per-Output-Token [TPOT] Breakdown (ms) ----------\n\n"
+                f"{tpot_stats}\n"
+                "\n-- Time-to-First-Token [TTFT] Breakdown (ms) ------------\n\n"
+                f"{ttft_stats}\n")
 
-    config_path = rt_cfg.engine_dir / "config.json"
-    with open(config_path, "r") as config:
-        engine_config = json.load(config)
+        perf_stats += (
+            "\n-- Request Latency Breakdown (ms) -----------------------\n\n"
+            f"{req_lat_info}\n")
 
-    stats = stats.generate_statistics_summary()
-    build_cfg = engine_config["build_config"]
-    pretrain_cfg = engine_config["pretrained_config"]
+        decoding_stats = ""
+        if decoding is not None:
+            decoding = stats_dict["decoding_stats"]
+            acc = decoding["acceptance_percentiles"]
+            acc_stats = "\n".join(
+                f"[AR] {key.upper():<7}: {acc[key]:.2f}" for key in
+                ["minimum", "maximum", "average", "p50", "p90", "p95", "p99"])
 
-    logging_info = (
-        "\n\n===========================================================\n"
-        "= ENGINE DETAILS\n"
-        "===========================================================\n"
-        f"Model:\t\t\t{rt_cfg.model}\n"
-        f"Engine Directory:\t{rt_cfg.engine_dir}\n"
-        f"TensorRT-LLM Version:\t{rt_cfg.sw_version}\n"
-        f"Dtype:\t\t\t{pretrain_cfg['dtype']}\n"
-        f"KV Cache Dtype:\t\t{pretrain_cfg['quantization']['kv_cache_quant_algo']}\n"
-        f"Quantization:\t\t{pretrain_cfg['quantization']['quant_algo']}\n"
-        f"Max Input Length:\t{build_cfg['max_input_len']}\n"
-        f"Max Sequence Length:\t{build_cfg['max_seq_len']}\n"
-        f"\n"
-        "===========================================================\n"
-        "= WORLD + RUNTIME INFORMATION \n"
-        "===========================================================\n"
-        f"TP Size:\t\t{rt_cfg.world_config.tp_size}\n"
-        f"PP Size:\t\t{rt_cfg.world_config.pp_size}\n"
-        f"Max Runtime Batch Size:\t{rt_cfg.settings_config.max_batch_size}\n"
-        f"Max Runtime Tokens:\t{rt_cfg.settings_config.max_num_tokens}\n"
-        f"Scheduling Policy:\t{rt_cfg.settings_config.scheduler_policy.values[1]}\n"
-        f"KV Memory Percentage:\t{rt_cfg.settings_config.kv_cache_percent * 100.0:.2f}%\n"
-        f"\n"
-        "===========================================================\n"
-        "= GENERAL OVERVIEW \n"
-        "===========================================================\n"
-        f"Number of requests:\t\t{stats.num_requests}\n"
-        f"Average Input Length (tokens):\t{stats.average_input_length:.4f}\n"
-        f"Average Output Length (tokens):\t{stats.average_output_length:.4f}\n"
-        f"Average request latency (ms):\t{stats.request_latency_percentiles.average * 1.0e-6:.4f}\n"
-        f"\n"
-        "===========================================================\n"
-        "= THROUGHPUT OVERVIEW \n"
-        "===========================================================\n"
-        f"Request Throughput (req/sec):\t\t  {stats.request_throughput_ns * 1.0e9:.4f}\n"
-        f"Total Token Throughput (tokens/sec):\t  {stats.token_throughput_ns * 1.0e9:.4f}\n"
-        f"Generation Token Throughput (tokens/sec): {stats.generation_tp_percentiles.average * 1.0e9:.4f}\n"
-        f"\n"
-        "===========================================================\n"
-        "= LATENCY OVERVIEW \n"
-        "===========================================================\n"
-        f"Total Latency (ms):\t\t  {stats.total_latency_ns * 1.0e-6:.4f}\n"
-        f"Average time-to-first-token (ms): {stats.ttft_percentiles.average * 1.0e-6:.4f}\n"
-        f"Average inter-token latency (ms): {stats.itl_percentiles.average * 1.0e-6:.4f}\n"
-        f"Acceptance Rate (Speculative):\t  {stats.acceptance_rate:.2f}\n"
-        f"\n"
-        "===========================================================\n"
-        "= GENERATION LATENCY BREAKDOWN \n"
-        "===========================================================\n"
-        f"MIN (ms): {stats.generation_latency_percentiles.minimum * 1.0e-6:.4f}\n"
-        f"MAX (ms): {stats.generation_latency_percentiles.maximum * 1.0e-6:.4f}\n"
-        f"AVG (ms): {stats.generation_latency_percentiles.average * 1.0e-6:.4f}\n"
-        f"P90 (ms): {stats.generation_latency_percentiles.p50 * 1.0e-6:.4f}\n"
-        f"P95 (ms): {stats.generation_latency_percentiles.p95 * 1.0e-6:.4f}\n"
-        f"P99 (ms): {stats.generation_latency_percentiles.p99 * 1.0e-6:.4f}\n"
-        f"\n"
-        "===========================================================\n"
-        "= ACCEPTANCE BREAKDOWN \n"
-        "===========================================================\n"
-        f"MIN: {stats.acceptance_percentiles.minimum:.2f}\n"
-        f"MAX: {stats.acceptance_percentiles.maximum:.2f}\n"
-        f"AVG: {stats.acceptance_percentiles.average:.2f}\n"
-        f"P90: {stats.acceptance_percentiles.p50:.2f}\n"
-        f"P95: {stats.acceptance_percentiles.p95:.2f}\n"
-        f"P99: {stats.acceptance_percentiles.p99:.2f}\n"
-        f"\n"
-        "===========================================================\n")
+            decoding_stats = (
+                "===========================================================\n"
+                f"= DECODING STATISTICS ({decoding['mode']})\n"
+                "===========================================================\n"
+                "\n"
+                "-- Acceptance Rate Details --------------------------------\n\n"
+                "\n"
+                f"{acc_stats}"
+                f"\n"
+                "===========================================================\n")
 
-    logger.info(logging_info)
-    return stats
+        logging_info = (f"{backend_info}"
+                        f"{request_info}"
+                        f"{world_info}"
+                        f"{perf_header}"
+                        f"{perf_stats}"
+                        f"{decoding_stats}"
+                        f"{self.dataset_metadata.get_summary_for_print()}")
+        self.logger.info(logging_info)
+        return self.statistics

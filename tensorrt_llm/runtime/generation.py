@@ -40,6 +40,7 @@ from tensorrt_llm.runtime.redrafter_utils import *
 from .._utils import (pad_vocab_size, str_dtype_to_torch, torch_to_numpy,
                       trt_dtype_to_torch)
 from ..bindings import KVCacheType, ipc_nvls_allocate, ipc_nvls_free
+from ..layers import LanguageAdapterConfig
 from ..logger import logger
 from ..lora_manager import LoraManager
 from ..mapping import Mapping
@@ -219,8 +220,6 @@ class _Runtime(object):
         self.address = None
         self.device_memory_size = 0
         self.__prepare(mapping, engine_buffer)
-        if logger.level == "verbose":
-            self.__print_engine_info()
 
     def _serialize_engine(self) -> trt.IHostMemory:
         return self.engine.serialize()
@@ -280,6 +279,11 @@ class _Runtime(object):
         if not self.engine.streamable_weights_size:
             # engine does not have weight streaming enabled
             self.__prepare_execution_contexts()
+        else:
+            self.engine.weight_streaming_budget_v2 = 0  # avoid OOM when print engine info
+
+        if logger.level == "verbose":
+            self.__print_engine_info()
 
     def __prepare_execution_contexts(self):
         self.context_0 = None
@@ -643,6 +647,8 @@ class ModelConfig:
     num_kv_heads_per_layer: Optional[List[int]] = None
     num_kv_heads_per_cross_attn_layer: Optional[List[int]] = None
     skip_cross_attn_blocks: bool = False
+    # language adapter
+    language_adapter_config: Optional[LanguageAdapterConfig] = None
 
 
 @dataclass
@@ -1073,6 +1079,10 @@ class GenerationSession(object):
 
         if self.is_redrafter_mode:
             expected_tensor_names += get_redrafter_tensor_names()
+
+        # language adapter
+        if model_config.language_adapter_config:
+            expected_tensor_names += ['language_adapter_routings']
 
         found_tensor_names = [
             self.runtime.engine.get_tensor_name(i)
@@ -2126,6 +2136,7 @@ class GenerationSession(object):
         host_runtime_perf_knobs: torch.Tensor = None,
         host_context_progress: torch.Tensor = None,
         skip_cross_attn_blocks: torch.Tensor = None,
+        language_adapter_routings: torch.Tensor = None,
     ) -> Dict[str, RuntimeTensor]:
         tensors = {}
 
@@ -2183,6 +2194,9 @@ class GenerationSession(object):
                 add_tensor(self.cross_kv_reuse, 'cross_kv_reuse')
             add_tensor(encoder_output, 'encoder_output')
             add_tensor(encoder_input_lengths, 'encoder_input_lengths')
+            if language_adapter_routings is not None:
+                add_tensor(language_adapter_routings,
+                           'language_adapter_routings')
             add_tensor(self.buffer['encoder_max_input_length'],
                        'encoder_max_input_length')
             if not self.use_gpt_attention_plugin:
@@ -2475,6 +2489,7 @@ class GenerationSession(object):
         host_runtime_perf_knobs: torch.Tensor = None,
         host_context_progress: torch.Tensor = None,
         skip_cross_attn_blocks: torch.Tensor = None,
+        language_adapter_routings: torch.Tensor = None,
     ):
         torch.cuda.nvtx.range_push("_get_next_step_shape_buffer")
         tensors = {}  # Dict[str, RuntimeTensor]
@@ -2573,6 +2588,9 @@ class GenerationSession(object):
             add_tensor_with_shape(encoder_output, 'encoder_output',
                                   encoder_output_shape)
             add_tensor(encoder_input_lengths, 'encoder_input_lengths')
+            if language_adapter_routings is not None:
+                add_tensor(language_adapter_routings,
+                           'language_adapter_routings')
             add_tensor(self.buffer['encoder_max_input_length'],
                        'encoder_max_input_length')
             if not self.use_gpt_attention_plugin:
@@ -3467,6 +3485,8 @@ class GenerationSession(object):
 
         position_ids_raw = kwargs.get('position_ids', None)
         skip_cross_attn_blocks = kwargs.get('skip_cross_attn_blocks', None)
+        language_adapter_routings = kwargs.get('language_adapter_routings',
+                                               None)
         if step == 0:
             model_inputs = self._prepare_context_inputs(
                 batch_size=batch_size,
@@ -3528,6 +3548,7 @@ class GenerationSession(object):
                 host_runtime_perf_knobs=context_runtime_perf_knobs,
                 host_context_progress=host_context_progress,
                 skip_cross_attn_blocks=skip_cross_attn_blocks,
+                language_adapter_routings=language_adapter_routings,
             )
 
             context = self.runtime.ctx_context
@@ -3745,7 +3766,7 @@ class GenerationSession(object):
                 host_runtime_perf_knobs=gen_runtime_perf_knobs,
                 host_context_progress=host_context_progress,
                 skip_cross_attn_blocks=skip_cross_attn_blocks,
-            )
+                language_adapter_routings=language_adapter_routings)
 
             # there are some tensors created inside the _get_next_step_shape_buffer, not owned by any object
             # needs to pro-long the life time of the tensors inside the next_step_tensors array

@@ -24,6 +24,7 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include <c10/cuda/CUDAFunctions.h>
+#include <cstdint>
 
 namespace th = torch;
 
@@ -238,7 +239,7 @@ void FtDynamicDecode<T>::forward(th::Tensor const& logits, int const step, int c
     {
         outputParams = std::make_shared<tl::BaseDecodingOutputs>(outputIdsConverted);
     }
-    outputParams->newTokens = std::move(convert_tensor<tr::TokenIdType>(newTokens));
+    outputParams->newTokens = convert_tensor<tr::TokenIdType>(newTokens);
     safeUpdate<tk::FinishedState::UnderlyingType>(finishedInput, forwardParams->finished);
     safeUpdate<tk::FinishedState::UnderlyingType>(finishedOutput, outputParams->finished);
     safeUpdate<tr::SizeType32>(sequenceLengthsOpt, outputParams->sequenceLength);
@@ -263,7 +264,7 @@ void FtDynamicDecode<T>::forward(th::Tensor const& logits, int const step, int c
     {
         auto outputsBeamSearch = std::dynamic_pointer_cast<tl::BeamSearchOutputs>(outputParams);
         TLLM_CHECK_WITH_INFO(tgtCacheIndirectionOpt.has_value(), "tgtCacheIndirection must be set for beam search");
-        outputsBeamSearch->tgtCacheIndirection = std::move(convert_tensor<int>(tgtCacheIndirectionOpt.value()));
+        outputsBeamSearch->tgtCacheIndirection = convert_tensor<int>(tgtCacheIndirectionOpt.value());
         if (useBeamHyps)
         {
             // Additional parameters for beam search
@@ -284,7 +285,7 @@ void FtDynamicDecode<T>::forward(th::Tensor const& logits, int const step, int c
     if (finishedSumHost)
     {
         TLLM_CUDA_CHECK(::cudaStreamSynchronize(mDynamicDecodeLayer->getStream()));
-        tr::SizeType32 numRealFinished = 0;
+        uint32_t numRealFinished = 0;
         for (int32_t bi = 0; bi < localBatchSize; ++bi)
         {
             numRealFinished += finishedSumHost[bi];

@@ -21,6 +21,7 @@ from .attention import (Attention, AttentionMaskParams, AttentionMaskType,
 from .cast import Cast
 from .conv import Conv1d, Conv2d, ConvTranspose2d
 from .embedding import Embedding, PromptTuningEmbedding
+from .language_adapter import LanguageAdapter, LanguageAdapterConfig
 from .linear import ColumnLinear, Linear, RowLinear
 from .lora import Lora, LoraParams, LoraRuntimeParams
 from .mlp import MLP, FusedGatedMLP, GatedMLP
@@ -72,4 +73,6 @@ __all__ = [
     'GroupedLinear',
     'RgLru',
     'FusedRgLru',
+    'LanguageAdapter',
+    'LanguageAdapterConfig',
 ]

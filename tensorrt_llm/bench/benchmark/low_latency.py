@@ -1,19 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from pathlib import Path
 
 import click
 import yaml
-from click_option_group import MutuallyExclusiveOptionGroup, optgroup
+from click_option_group import (MutuallyExclusiveOptionGroup, OptionGroup,
+                                optgroup)
 
 from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
 from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.enums import IFBSchedulingPolicy
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
-from tensorrt_llm.bench.dataclasses.reporting import report_latency_statistics
+from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
 from tensorrt_llm.llmapi.llm import LLM
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 
@@ -92,6 +94,19 @@ from tensorrt_llm.sampling_params import SamplingParams
     required=False,
     help="Path to a YAML file that defines the Medusa tree.",
 )
+@optgroup.group("Reporting Options",
+                help="Options for reporting benchmark results.",
+                cls=OptionGroup)
+@optgroup.option(
+    "--report_json",
+    type=click.Path(dir_okay=False,
+                    writable=True,
+                    readable=False,
+                    path_type=Path,
+                    resolve_path=True),
+    required=False,
+    help="Path where report should be written to.",
+)
 @click.pass_obj
 def latency_command(
     bench_env: BenchmarkEnvironment,
@@ -99,7 +114,6 @@ def latency_command(
 ) -> None:
     """Run a latency test on a TRT-LLM engine."""
 
-    logger.set_level("info")
     logger.info("Preparing to run latency benchmark...")
     # Parameters from CLI
     # Model, experiment, and engine params
@@ -119,6 +133,9 @@ def latency_command(
     # Runtime Options
     kv_cache_percent = params.pop("kv_cache_free_gpu_mem_fraction")
     medusa_choices = params.pop("medusa_choices")
+
+    # Reporting Options
+    report_json: Path = params.pop("report_json")
 
     # Update configuration with runtime options
     exec_settings["settings_config"]["kv_cache_percent"] = kv_cache_percent
@@ -160,6 +177,7 @@ def latency_command(
     with open(dataset_path, "r") as dataset:
         metadata, requests = create_dataset_from_stream(
             tokenizer, dataset, num_requests=num_requests)
+        metadata.dataset_path = dataset_path
 
     if metadata.max_sequence_length > engine_max_seq_len:
         raise RuntimeError(
@@ -168,10 +186,8 @@ def latency_command(
             f"{metadata.max_sequence_length}. Please rebuild a new engine to"
             "support this dataset.")
 
+    logger.info(metadata.get_summary_for_print())
     logger.info("Running experimental latency benchmark.")
-
-    assert runtime_config.settings_config.max_batch_size == 1
-    assert runtime_config.settings_config.chunking is False
 
     llm = None
     try:
@@ -192,7 +208,14 @@ def latency_command(
 
         statistics = asyncio.run(
             async_benchmark(llm, sampling_params, requests, concurrency))
-        report_latency_statistics(statistics, runtime_config, logger)
+        report_utility = ReportUtility(statistics, metadata, runtime_config,
+                                       logger, params, True)
+        if report_json:
+            logger.info(f"Writing report to '{report_json}'.")
+            with open(report_json, "w") as f:
+                f.write(
+                    json.dumps(report_utility.get_statistics_dict(), indent=4))
+        report_utility.report_statistics()
     finally:
         if llm is not None:
             llm.__exit__(None, None, None)

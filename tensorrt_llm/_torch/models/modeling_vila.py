@@ -35,6 +35,7 @@ from transformers import AutoModelForCausalLM as HFAutoModelForCausalLM
 from transformers import (AutoTokenizer, LlavaConfig, PretrainedConfig,
                           PreTrainedModel)
 
+from ..._utils import nvtx_range
 from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
                        register_input_processor)
 from ...logger import logger
@@ -45,7 +46,7 @@ from .modeling_multimodal_encoder import (CLIPVisionTower, CLIPVisionTowerS2,
                                           SiglipVisionTower,
                                           SiglipVisionTowerDynamicS2,
                                           SiglipVisionTowerS2)
-from .modeling_multimodal_utils import (merge_chessboard,
+from .modeling_multimodal_utils import (fuse_input_embeds, merge_chessboard,
                                         merge_features_for_dynamic_s2,
                                         split_chessboard)
 from .modeling_utils import ModelConfig, register_auto_model
@@ -114,21 +115,6 @@ def _get_model_paths(config):
         )
 
     return paths
-
-
-def _ptuning_setup(mm_feature, input_ids):
-    assert mm_feature is not None, "Multimodal feature is empty!"
-
-    task_vocab_size = torch.tensor(
-        [mm_feature.shape[0]],
-        dtype=torch.int32,
-    ).cuda()
-
-    prompt_table = mm_feature
-
-    tasks = torch.zeros(input_ids.shape, dtype=torch.int32).cuda()
-
-    return [prompt_table, tasks, task_vocab_size]
 
 
 """
@@ -296,8 +282,8 @@ def process_image(image_file,
                                     max_num=model_config.max_tiles,
                                     image_size=crop_size["height"])
         images = [
-            image_processor.preprocess(image,
-                                       return_tensors="pt")["pixel_values"][0]
+            image_processor.preprocess(
+                image, return_tensors="pt")["pixel_values"][0].to('cuda')
             for image in images
         ]
         return torch.stack(images)
@@ -315,8 +301,8 @@ def process_image(image_file,
             max_num=model_config.max_tiles,
             image_size=crop_size["height"])
         images = [
-            image_processor.preprocess(image,
-                                       return_tensors="pt")["pixel_values"][0]
+            image_processor.preprocess(
+                image, return_tensors="pt")["pixel_values"][0].to('cuda')
             for image in images
         ]
         return torch.stack(images), block_size
@@ -345,8 +331,8 @@ def process_image(image_file,
         image = expand2square(
             image, tuple(int(x * 255) for x in image_processor.image_mean))
 
-    image = image_processor.preprocess(image,
-                                       return_tensors="pt")["pixel_values"][0]
+    image = image_processor.preprocess(
+        image, return_tensors="pt")["pixel_values"][0].to('cuda')
     return image
 
 
@@ -991,7 +977,7 @@ def _apply_chat_template(text, conv, tokenizer):
 
 class VilaInputProcessor(InputProcessor):
 
-    def __init__(self, model_config, tokenizer):
+    def __init__(self, model_path, model_config, tokenizer):
         self.model_config = model_config
         llm_path, vision_tower_path, mm_projector_path = _get_model_paths(
             self.model_config)
@@ -1010,6 +996,7 @@ class VilaInputProcessor(InputProcessor):
             self.model_config).to(device=self.device,
                                   dtype=torch.float16)  # must be fp16
 
+    @nvtx_range("[Vision] preprocess")
     def _preprocess(self, mm_data: dict[str, any],
                     processor_kwargs) -> Tuple[torch.Tensor, List[int]]:
         """Preprocess multimodal data, e.g. resize, patchify, etc., into torch.Tensor"""
@@ -1041,6 +1028,7 @@ class VilaInputProcessor(InputProcessor):
         else:
             raise RuntimeError(f"invalid mm_data: {mm_data}")
 
+    @nvtx_range("[Vision] process")
     def _process(self, mm_tensor, block_sizes):
         """Extract multimodal features from multimodal input"""
 
@@ -1084,6 +1072,7 @@ class VilaInputProcessor(InputProcessor):
             visual_features = self.mm_projector(visual_features)
         return visual_features  # [M, feature_length, hidden_dim], where M is number of multimodal inputs (e.g. images or frames) in the current request; or list of [feature_length_i, hidden_dim] tensors if images have different lengths
 
+    @nvtx_range("[Vision] postprocess")
     def _postprocess(self, input_ids, mm_features):
         """Postprocess multimodal features by fusing text + multimodal information"""
 
@@ -1218,7 +1207,7 @@ class VilaInputProcessor(InputProcessor):
         mm_features = self._process(mm_tensor, block_sizes)
         fused_input_ids, mm_features = self._postprocess(input_ids, mm_features)
         return fused_input_ids.to(torch.int32).tolist(), {
-            "prompt_tuning_config": _ptuning_setup(mm_features, fused_input_ids)
+            "prompt_tuning_config": [mm_features, None, None]
         }
 
 
@@ -1274,54 +1263,14 @@ class VilaModel(PreTrainedModel):
         num_context_requests, num_generation_requests = attn_metadata.num_contexts, attn_metadata.num_generations
         mm_embed = kwargs.get("multi_modal_data", [])
 
-        logger.debug(
-            f"num_context_requests: {num_context_requests}, num_generation_requests: {num_generation_requests}"
-        )
         assert mm_embed == [] or len(
             mm_embed
         ) == num_context_requests, "Number of multimodal features (if provided) should be equal to number of context requests"
 
-        input_ids, inputs_embeds = self._fuse_input_embeds(input_ids, mm_embed)
-        output_prob = self.llm.forward(attn_metadata, input_ids, position_ids,
-                                       inputs_embeds, return_context_logits)
-
-        logger.debug(
-            f"output_ids: {(output_prob if output_prob.dim() == 2 else output_prob.unsqueeze(0)).argmax(dim=1).tolist()}"
-        )
-        return output_prob
-
-    def _fuse_input_embeds(
-        self,
-        input_ids: torch.LongTensor,
-        mm_embeds: List[torch.Tensor],
-    ) -> Tuple[Optional[torch.FloatTensor], Optional[torch.FloatTensor]]:
-        """
-        Fuse text and multimodal embeddings. input_ids is [text_total_length + mm_total_length] and mm_embed is [mm_total_length, hidden_dim]. We just need to fuse them into [text_total_length + mm_total_length, hidden_dim] by slice-and-assign to the corresponding entries.
-
-        Args:
-            input_ids: shape [text_total_length + mm_total_length], flattened from List[(text_length1 + mm_total_length1), ..., (text_lengthi + mm_total_lengthi)]. For LLM model, the requests are inflight batched together, but the input_ids are flattened with padding removed. By the slice condition < vocab_size, we can easily separate text / multimodal tokens and naturally batched the LLM embedding lookup
-            mm_embed: List[(mm_total_length1, hidden_dim), ..., (mm_total_lengthi, hidden_dim)].
-        Returns:
-            - If (1) JIT test run, (2) non-multimodal run, i.e. all text-only requests, either context or generation phase (3) multimodal run, all requests in generation phase --> there is no multimodal data, return only the input_ids
-            - If (4) multimodal run, mixed batch of context and generation requests, each context request has a multimodal feature --> return only the fused input_embeds of shape [total length, hidden_dim]. For text tokens, LLM embedding layer has already run.
-        """
-        if len(mm_embeds) == 0:
-            return input_ids, None
-
-        mm_embed = torch.cat(mm_embeds, dim=0)
-        input_embeds = torch.empty(input_ids.shape[0],
-                                   mm_embed.shape[-1],
-                                   device=input_ids.device,
-                                   dtype=self.model_dtype)
-
-        text_token_indices = torch.where(input_ids < self.vocab_size)[0]
-        mm_token_indices = torch.where(input_ids >= self.vocab_size)[0]
-
-        text_embed = self.llm.model.embed_tokens(input_ids[text_token_indices])
-        input_embeds[text_token_indices, :] = text_embed.to(self.model_dtype)
-        input_embeds[mm_token_indices, :] = mm_embed.to(self.model_dtype)
-
-        return None, input_embeds.to(self.dtype)
+        input_ids, inputs_embeds = fuse_input_embeds(self, input_ids, mm_embed)
+        logits = self.llm.forward(attn_metadata, input_ids, position_ids,
+                                  inputs_embeds, return_context_logits)
+        return logits
 
     def get_llm(self):
         llm = getattr(self, "llm", None)

@@ -96,7 +96,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
 
     // Create submodule for executor bindings.
     py::module_ executor_submodule = m.def_submodule("executor", "Executor bindings");
-    tensorrt_llm::pybind::executor::InitBindings(executor_submodule);
+    tensorrt_llm::pybind::executor::initBindings(executor_submodule);
 
     auto buildInfo = m.def_submodule("BuildInfo");
     buildInfo.attr("ENABLE_MULTI_DEVICE") = py::int_(ENABLE_MULTI_DEVICE);
@@ -273,10 +273,10 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
 
     py::class_<tr::WorldConfig>(m, "WorldConfig")
         .def(py::init<SizeType32, SizeType32, SizeType32, SizeType32, SizeType32,
-                 std::optional<std::vector<SizeType32>> const&>(),
+                 std::optional<std::vector<SizeType32>> const&, bool>(),
             py::arg("tensor_parallelism") = 1, py::arg("pipeline_parallelism") = 1, py::arg("context_parallelism") = 1,
             py::arg("rank") = 0, py::arg("gpus_per_node") = tr::WorldConfig::kDefaultGpusPerNode,
-            py::arg("device_ids") = py::none())
+            py::arg("device_ids") = py::none(), py::arg("enable_attention_dp") = false)
         .def_property_readonly("size", &tr::WorldConfig::getSize)
         .def_property_readonly("tensor_parallelism", &tr::WorldConfig::getTensorParallelism)
         .def_property_readonly("pipeline_parallelism", &tr::WorldConfig::getPipelineParallelism)
@@ -293,12 +293,13 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property_readonly("pipeline_parallel_rank", &tr::WorldConfig::getPipelineParallelRank)
         .def_property_readonly("tensor_parallel_rank", &tr::WorldConfig::getTensorParallelRank)
         .def_property_readonly("context_parallel_rank", &tr::WorldConfig::getContextParallelRank)
+        .def_property_readonly("enable_attention_dp", &tr::WorldConfig::enableAttentionDP)
         .def_static("mpi",
             py::overload_cast<SizeType32, std::optional<SizeType32>, std::optional<SizeType32>,
-                std::optional<SizeType32>, std::optional<std::vector<SizeType32>> const&>(&tr::WorldConfig::mpi),
+                std::optional<SizeType32>, std::optional<std::vector<SizeType32>> const&, bool>(&tr::WorldConfig::mpi),
             py::arg("gpus_per_node") = tr::WorldConfig::kDefaultGpusPerNode, py::arg("tensor_parallelism") = py::none(),
             py::arg("pipeline_parallelism") = py::none(), py::arg("context_parallelism") = py::none(),
-            py::arg("device_ids") = py::none());
+            py::arg("device_ids") = py::none(), py::arg("enable_attention_dp") = false);
 
     auto SamplingConfigGetState = [](tr::SamplingConfig const& config) -> py::tuple
     {

@@ -398,13 +398,15 @@ DummyExecutor3 = DummyExecutorMeta("DummyExecutor3", (), {},
 
 
 @skip_single_gpu
-def test_llm_get_stats_tp2():
-    llm_get_stats_test_harness(tp_size=2)
+@pytest.mark.parametrize("pytorch_backend", [False, True])
+def test_llm_get_stats_tp2(pytorch_backend):
+    llm_get_stats_test_harness(tp_size=2, pytorch_backend=pytorch_backend)
 
 
 @skip_single_gpu
-def test_llm_get_stats_async_tp2():
-    llm_get_stats_async_test_harness(tp_size=2)
+@pytest.mark.parametrize("pytorch_backend", [False, True])
+def test_llm_get_stats_async_tp2(pytorch_backend):
+    llm_get_stats_async_test_harness(tp_size=2, pytorch_backend=pytorch_backend)
 
 
 def test_llm_capture_request_error():
@@ -415,8 +417,13 @@ def test_llm_with_postprocess_parallel_tp2():
     run_llm_with_postprocess_parallel(tp_size=2)
 
 
-def test_llm_with_postprocess_parallel_and_result_handler_tp2():
-    run_llm_with_postprocess_parallel_and_result_handler(tp_size=2)
+@pytest.mark.parametrize("streaming", [True, False])
+@pytest.mark.parametrize("backend", [None, "pytorch"])
+def test_llm_with_postprocess_parallel_and_result_handler_tp2(
+        streaming: bool, backend: str):
+    run_llm_with_postprocess_parallel_and_result_handler(streaming,
+                                                         backend,
+                                                         tp_size=2)
 
 
 @pytest.fixture(scope="module")

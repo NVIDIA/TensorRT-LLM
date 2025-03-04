@@ -25,6 +25,7 @@
 
 namespace tensorrt_llm::batch_manager
 {
+class DecoderInputBuffers;
 class DecoderBuffers;
 class RuntimeBuffers;
 } // namespace tensorrt_llm::batch_manager
@@ -43,12 +44,9 @@ public:
 
     std::tuple<std::unique_ptr<runtime::decoder_batch::Input>, std::unique_ptr<runtime::decoder_batch::Output>>
     operator()(RequestVector const& contextRequests, RequestVector const& generationRequests,
-        DecoderBuffers& decoderBuffers, RuntimeBuffers const& fusedRuntimeBuffers, TensorPtr const& batchSlots,
-        runtime::ModelConfig const& modelConfig, SizeType32 maxNumSequences) const;
-
-private:
-    [[nodiscard]] std::vector<bool> computeActiveVec(RequestVector const& contextRequests,
-        RequestVector const& generationRequests, SizeType32 maxNumSequences) const;
+        DecoderBuffers& decoderBuffers, RuntimeBuffers const& fusedRuntimeBuffers,
+        DecoderInputBuffers const& inputBuffers, runtime::ModelConfig const& modelConfig, SizeType32 maxNumSequences,
+        SizeType32 beamWidth, runtime::BufferManager const& manager, runtime::CudaStream const& stream) const;
 };
 
 } // namespace tensorrt_llm::batch_manager

@@ -77,6 +77,8 @@ GPTAttentionPlugin::GPTAttentionPlugin(int layer_idx, int num_heads, int vision_
         kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim, fuse_fp4_quant, skip_attn, cp_size, cp_rank,
         cp_group)
 {
+    TLLM_CHECK_WITH_INFO(
+        !is_mla_enabled, "GPTAttentionPlugin no longer supports MLA. Please use the PyTorch workflow instead.");
     initEntryIdx();
 }
 
@@ -171,7 +173,7 @@ bool GPTAttentionPlugin::isEntryUsed(IdxEntry const& entry) const
     case IdxEntry::ATTENTION_OUTPUT_QUANTIZATION_SCALE: return mFP8ContextFMHA;
     case IdxEntry::ATTENTION_OUTPUT_SF_SCALE: return mFuseFp4Quant;
     case IdxEntry::ROTARY_INV_FREQ: return isRoPE();
-    case IdxEntry::ROTARY_COS_SIN: return isRoPE() || mIsMLAEnabled;
+    case IdxEntry::ROTARY_COS_SIN: return isRoPE();
     case IdxEntry::ALIBI_SLOPES: return isALiBi();
     case IdxEntry::RELATIVE_ATTENTION_BIAS: return isRelativePosition();
     case IdxEntry::CROSS_KV: return isCrossAttention();
@@ -307,7 +309,7 @@ nvinfer1::DimsExprs GPTAttentionPlugin::getOutputDimensions(
         {
             auto ret = inputs[getIdx(IdxEntry::QKV_TENSOR)];
             // In MLA, the output dim is v_head_dim
-            auto const head_size = (mIsMLAEnabled ? mMLAParams.v_head_dim : mHeadSize);
+            auto const head_size = mHeadSize;
             ret.d[getPackedTensorHiddenDimIndex(mRemovePadding)] = exprBuilder.operation(
                 DimensionOperation::kPROD, *exprBuilder.constant(head_size), *exprBuilder.constant(mNumHeads));
             return ret;
@@ -354,11 +356,6 @@ bool GPTAttentionPlugin::supportsFormatCombination(
         result = inOut[pos].type == nvinfer1::DataType::kINT32;
     }
     else if (isRoPE() && (pos == getIdx(IdxEntry::ROTARY_INV_FREQ) || pos == getIdx(IdxEntry::ROTARY_COS_SIN)))
-    {
-        posCaseLine = __LINE__;
-        result = inOut[pos].type == nvinfer1::DataType::kFLOAT;
-    }
-    else if (mIsMLAEnabled && (pos == getIdx(IdxEntry::ROTARY_COS_SIN)))
     {
         posCaseLine = __LINE__;
         result = inOut[pos].type == nvinfer1::DataType::kFLOAT;
@@ -582,18 +579,8 @@ size_t GPTAttentionPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* in
         = getWorkspaceSizeForGeneration(type, max_num_seq, max_kv_cache_length, max_num_tokens);
 
     size_t attention_input_workspace_size = 0;
-    if (mIsMLAEnabled)
-    {
-        int32_t const size_per_head
-            = 2 * (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim) + mMLAParams.v_head_dim;
-        size_t const size = tensorrt_llm::runtime::BufferDataType(type).getSize();
-        size_t const attention_input_size = size * max_num_tokens * mNumHeads
-            * std::max(size_per_head, mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim);
-        size_t workspaces[1];
-        workspaces[0] = attention_input_size;
-        attention_input_workspace_size = tensorrt_llm::common::calculateTotalWorkspaceSize(workspaces, 1);
-    }
-    else if (mUnfuseQkvGemm)
+
+    if (mUnfuseQkvGemm)
     {
         int const local_hidden_units_q
             = inputs[getIdx(IdxEntry::QKV_TENSOR)].dims.d[getPackedTensorHiddenDimIndex(mRemovePadding)];
@@ -687,49 +674,6 @@ int GPTAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc,
     return 0;
 }
 
-template <typename T, typename AttentionOutT>
-MlaParams<T> GPTAttentionPlugin::enqueueMLAPreprocess(int32_t localNbSeq, int32_t localNbTokens,
-    nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
-    void const* const* inputs, void* const* outputs, void*& workspace, bool is_context, cudaStream_t stream)
-{
-    auto const* input = static_cast<T const*>(inputs[getIdx(IdxEntry::QKV_TENSOR)]);
-
-    auto const* q_b_proj = static_cast<T const*>(inputs[getIdx(IdxEntry::MLA_Q_B_PROJ_TENSOR)]);
-    auto const* kv_b_proj = static_cast<T const*>(inputs[getIdx(IdxEntry::MLA_KV_B_PROJ_TENSOR)]);
-    auto const* k_b_proj_trans = static_cast<T const*>(inputs[getIdx(IdxEntry::MLA_K_B_PROJ_TRANS_TENSOR)]);
-    float2 const* cos_sin_cache = static_cast<float2 const*>(inputs[getIdx(IdxEntry::ROTARY_COS_SIN)]);
-
-    AttentionOutT* context_buf_ = static_cast<AttentionOutT*>(outputs[0]);
-
-    MlaParams<T> mla_params;
-    mla_params.fused_a_input = input;
-    mla_params.context_buf = reinterpret_cast<T*>(context_buf_);
-    mla_params.q_b_proj = q_b_proj;
-    mla_params.kv_b_proj = kv_b_proj;
-    mla_params.k_b_proj_trans = k_b_proj_trans;
-    mla_params.cos_sin_cache = cos_sin_cache;
-    mla_params.batch_size = localNbSeq;
-    mla_params.acc_q_len = localNbTokens;
-    mla_params.head_num = mNumHeads;
-    mla_params.meta = mMLAParams;
-
-    // {
-    //     __nv_bfloat16 *h_input;
-    //     auto const inSize = sizeof(__nv_bfloat16) * 20;
-    //     cudaMallocHost(reinterpret_cast<void**>(&h_input), inSize);
-    //     cudaMemcpyAsync(reinterpret_cast<void*>(h_input), mla_params.fused_a_input, inSize, cudaMemcpyDeviceToHost,
-    //     stream); cudaDeviceSynchronize(); printf("gpt attention input\n"); for (int i = 0; i < 20; ++i) {
-    //         printf("%d: %f", i, __bfloat162float(h_input[i]));
-    //         if (i % 5 == 4) {
-    //             printf("\n");
-    //         }
-    //     }
-    //     cudaFreeHost(h_input);
-    // }
-
-    return mla_params;
-}
-
 template <typename T, typename AttentionOutT, typename KVCacheBuffer>
 int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32_t tokenIdxBeg, int32_t localNbTokens,
     nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
@@ -764,25 +708,6 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
     }
 
     [[maybe_unused]] MlaParams<T> mla_params;
-    if (mIsMLAEnabled)
-    {
-        // In MLA, attention_input will be the ptr of workspace, and workspace value will be updated in
-        // enqueueMLAPreprocess
-        mla_params = enqueueMLAPreprocess<T, AttentionOutT>(
-            localNbSeq, localNbTokens, inputDesc, outputDesc, inputs, outputs, workspace, is_context, stream);
-
-        size_t const size_per_head = is_context
-            ? (2 * (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim) + mMLAParams.v_head_dim)
-            : mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
-        size_t const total_size = sizeof(T) * mla_params.acc_q_len * mNumHeads * size_per_head;
-        int8_t* workspace_byte_ptr = reinterpret_cast<int8_t*>(workspace);
-        size_t offset = 0;
-        T* attention_input_qkv = reinterpret_cast<T*>(nextWorkspacePtr(workspace_byte_ptr, offset, total_size));
-        workspace = reinterpret_cast<void*>(workspace_byte_ptr + offset);
-        mla_params.attention_input_buf = attention_input_qkv;
-        mla_params.workspace = workspace;
-        attention_input = attention_input_qkv;
-    }
 
     T const* qkv_bias = nullptr;
     if (mQKVBiasEnabled)
@@ -812,7 +737,7 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         auto inputName = useLongRoPECache ? IdxEntry::LONG_ROPE_ROTARY_INV_FREQ : IdxEntry::ROTARY_INV_FREQ;
         rotary_inv_freq = reinterpret_cast<float const*>(inputs[getIdx(inputName)]);
     }
-    if (isRoPE() || mIsMLAEnabled)
+    if (isRoPE())
     {
         auto inputName = useLongRoPECache ? IdxEntry::LONG_ROPE_ROTARY_COS_SIN : IdxEntry::ROTARY_COS_SIN;
         rotary_cos_sin = reinterpret_cast<float2 const*>(inputs[getIdx(inputName)]);
@@ -1130,18 +1055,6 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
             enqueue_params.num_encoder_tokens = num_encoder_tokens;
         }
 
-        if (mIsMLAEnabled)
-        {
-            TLLM_CHECK_WITH_INFO((std::is_same_v<KVCacheBuffer, KVBlockArray>), "MLA requires paged KV cache");
-            if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
-            {
-                mla_params.cache_seq_lens = sequence_kv_length;
-                mla_params.max_input_seq_len = max_context_q_len;
-                mlaPreContext<T>(mla_params, stream);
-                enqueue_params.mla_param = &mla_params;
-            }
-        }
-
         enqueueContext<T, KVCacheBuffer>(enqueue_params, stream);
 
         {
@@ -1216,20 +1129,7 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
             prepareEnqueueGeneration<T, KVCacheBuffer>(enqueue_params);
         }
 
-        // Current mlaGeneration will using fmha to do attention, so we don't go into enqueueGeneration
-        if (mIsMLAEnabled)
-        {
-            TLLM_CHECK_WITH_INFO((std::is_same_v<KVCacheBuffer, KVBlockArray>), "MLA requires paged KV cache");
-            if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
-            {
-                mla_params.cache_seq_lens = sequence_kv_length;
-                mlaGeneration<T>(mla_params, enqueue_params, stream);
-            }
-        }
-        else
-        {
-            enqueueGeneration<T, KVCacheBuffer>(enqueue_params, stream);
-        }
+        enqueueGeneration<T, KVCacheBuffer>(enqueue_params, stream);
 
         {
             std::string const afterGenStr = "gen attention at layer " + std::to_string(mLayerIdx);

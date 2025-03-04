@@ -22,6 +22,7 @@
 #include <ATen/cuda/EmptyTensor.h>
 #include <ATen/native/cuda/Resize.h>
 
+#include <cstddef>
 #include <cuda_fp16.h>
 
 #include <cstdint>
@@ -267,7 +268,7 @@ std::pair<tkc::CutlassGemmConfig, int64_t> runProfilingFor(
     int64_t wsBytes = gemmRunner.getWorkspaceSize(m, gemmId.n, gemmId.k, batch_count);
     at::Tensor workspace = at::detail::empty_cuda({wsBytes}, at::ScalarType::Char, torch::kCUDA, std::nullopt);
 
-    for (int64_t i = 0; i < configs.size(); ++i)
+    for (int64_t i = 0; i < static_cast<int64_t>(configs.size()); ++i)
     {
         auto& config = configs[i];
         try
@@ -465,7 +466,7 @@ public:
     at::Tensor runGemm(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1Scale,
         at::Tensor const& mat2Scale, at::Tensor const& globalScale, bool sfUseUE8M0, int64_t configIdx) const
     {
-        TORCH_CHECK(configIdx >= 0 && configIdx < mConfigs.size());
+        TORCH_CHECK(configIdx >= 0 && static_cast<size_t>(configIdx) < mConfigs.size());
         auto const& config = mConfigs.at(configIdx);
         return fp4_gemm_impl(mat1, mat2, mat1Scale, mat2Scale, globalScale, sfUseUE8M0, mOutputDtype, &config);
     }

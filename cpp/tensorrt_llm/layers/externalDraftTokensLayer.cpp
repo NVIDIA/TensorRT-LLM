@@ -213,8 +213,6 @@ void ExternalDraftTokensLayer<T>::prepareInputs(
 
     if (inputs->step == 0)
     {
-        auto const batchSize = inputs->logits.value()->getDimension<0>();
-
         // Prepare mReturnAllSelectedTokensPerSlot
         auto numDraftTokensHost = BufferRange<SizeType32>(*inputs->numDraftTokensHost);
         auto returnAllSelectedTokensPerSlot = BufferRange<bool>(*mReturnAllSelectedTokensPerSlotHost);

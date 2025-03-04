@@ -51,14 +51,15 @@ size_t invokeReduceMaxGenerationLengths(void* __restrict__ reduceMaxTempStorage,
 }
 
 // inclusive prefix sum generationLengths and reduce max generationLengths
-void invokeScanReduceGenerationLengths(SizeType32 batchSize, SizeType32 const* __restrict__ generationLengths,
-    void* scanTempStorage, size_t scanTempStorageBytes, SizeType32* __restrict__ scanedGenerationLengths,
-    void* reduceMaxTempStorage, size_t reduceMaxTempStorageBytes, SizeType32* maxGenerationLengths, cudaStream_t stream)
+size_t invokeScanReduceGenerationLengths(SizeType32 batchSize, SizeType32 const* __restrict__ generationLengths,
+    void* scanReduceTempStorage, size_t scanReduceTempStorageBytes, SizeType32* __restrict__ scannedGenerationLengths,
+    SizeType32* maxGenerationLengths, cudaStream_t stream)
 {
-    invokeScanGenerationLengths(
-        scanTempStorage, scanTempStorageBytes, generationLengths, scanedGenerationLengths, batchSize, stream);
-    invokeReduceMaxGenerationLengths(
-        reduceMaxTempStorage, reduceMaxTempStorageBytes, generationLengths, maxGenerationLengths, batchSize, stream);
+    auto scanTempStorageBytes = invokeScanGenerationLengths(scanReduceTempStorage, scanReduceTempStorageBytes,
+        generationLengths, scannedGenerationLengths, batchSize, stream);
+    auto reduceTempStorageBytes = invokeReduceMaxGenerationLengths(
+        scanReduceTempStorage, scanReduceTempStorageBytes, generationLengths, maxGenerationLengths, batchSize, stream);
+    return std::max(scanTempStorageBytes, reduceTempStorageBytes);
 }
 
 ////////////////////////

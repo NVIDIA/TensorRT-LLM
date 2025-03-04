@@ -72,8 +72,6 @@ private:
     SizeType32 mNumPaths;
     SizeType32 mMaxPathLength;
 
-    size_t mScanWorkspaceSizeInBytes{0};
-    size_t mReduceWorkspaceSizeInBytes{0};
     size_t mWorkspaceSize{0};
 
     TensorPtr mCurandStatesDevice;

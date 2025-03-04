@@ -120,6 +120,8 @@ def _load_tokenizer(tokenizer_dir: Optional[str] = None,
                                                       language='english',
                                                       task='transcribe',
                                                       predict_timestamps=False)
+        elif tokenizer_type == 'language_adapter':
+            tokenizer = None
         else:
             use_fast = True
             if tokenizer_type is not None and tokenizer_type == "llama":
@@ -161,6 +163,9 @@ def _load_tokenizer(tokenizer_dir: Optional[str] = None,
     elif 'GLM' in model_name and model_version == 'glm':
         pad_id = tokenizer.pad_token_id
         end_id = tokenizer.eop_token_id
+    elif tokenizer_type == 'language_adapter':
+        pad_id = 0
+        end_id = 2
     else:
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
@@ -503,6 +508,15 @@ def add_common_args(parser):
         "If specified, return the full beams/outputs at each step. "
         "It is automatically enabled for num_beams>1 (only available with cpp session). "
         "WARNING: using this option may increase network usage significantly (quadratically w.r.t output length)."
+    )
+
+    parser.add_argument(
+        '--language_task_uids',
+        type=int,
+        nargs='+',
+        default=None,
+        help=
+        "language task id indicating which adapter to use in language adapter. Please include 1 locale per input text"
     )
     parser.add_argument('--backend', type=str, default=None)
 

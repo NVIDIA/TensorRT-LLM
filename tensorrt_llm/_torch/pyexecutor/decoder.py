@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from typing import Dict
 
 import torch
 
@@ -21,7 +22,7 @@ class Decoder(ABC):
 
     @abstractmethod
     def update_requests(self, scheduled_requests: ScheduledRequests,
-                        new_tokens_host: torch.tensor,
+                        new_tensors_host: Dict[str, torch.tensor],
                         decoder_event: torch.cuda.Event):
         raise NotImplementedError
 
@@ -37,6 +38,28 @@ class DummyDecoder(Decoder):
                 request.add_new_token(request.get_num_tokens(0) + 1000, 0)
             else:
                 request.state = LlmRequestState.GENERATION_COMPLETE
+
+
+class BertDecoder(Decoder):
+    """
+    Use Decoder class for Bert model request so it will early stop
+    """
+
+    def decode_async(self, model_outputs):
+        pass
+
+    def update_requests(self, scheduled_requests: ScheduledRequests,
+                        new_tokens_host: torch.tensor,
+                        decoder_event: torch.cuda.Event):
+        pass
+
+    def decode(self, scheduled_requests: ScheduledRequests, model_outputs):
+        assert (not scheduled_requests.generation_requests)
+        for idx, request in enumerate(scheduled_requests.context_requests):
+            request.state = LlmRequestState.GENERATION_COMPLETE
+            #NOTE: This is a hack: set finish reason manually and set the beam 0
+            request.set_finished_reason(tllm_executor.FinishReason.LENGTH, 0)
+            request.context_logits = model_outputs['logits'][idx]
 
 
 def top_k_sampling_batch(logits, top_k=50):
@@ -134,13 +157,16 @@ def decode_single_request(request, logits):
 
 class TorchDecoder(Decoder):
 
-    def __init__(self, mixed_decoder: bool = False):
+    def __init__(self, max_seq_len: int, mixed_decoder: bool = False):
+        self.max_seq_len = max_seq_len
         self.mixed_decoder = mixed_decoder
 
     def _meet_max_token_stop_criteria(self, request: LlmRequest,
                                       num_tokens: int):
 
-        return num_tokens - request.py_orig_prompt_len >= request.py_max_new_tokens
+        return (num_tokens - request.py_orig_prompt_len
+                >= request.py_max_new_tokens) or (num_tokens
+                                                  >= self.max_seq_len)
 
     def _meet_stop_token_criteria(self, request: LlmRequest):
         if not hasattr(request, 'py_stop_words_list'):
@@ -183,10 +209,10 @@ class TorchDecoder(Decoder):
         return False
 
     def update_requests(self, scheduled_requests: ScheduledRequests,
-                        new_tokens_host: torch.tensor,
+                        new_tensors_host: Dict[str, torch.tensor],
                         decoder_event: torch.cuda.Event):
         decoder_event.synchronize()
-        new_tokens_list = new_tokens_host.tolist()
+        new_tokens_list = new_tensors_host["new_tokens_host"].tolist()
 
         idx = 0
         beam_idx = 0
@@ -209,7 +235,7 @@ class TorchDecoder(Decoder):
         extend_requests = []
         generation_requests = []
         for request in scheduled_requests.generation_requests:
-            if request.has_draft_tokens():
+            if request.py_draft_tokens is not None:
                 extend_requests.append(request)
             else:
                 generation_requests.append(request)
@@ -223,8 +249,8 @@ class TorchDecoder(Decoder):
 
                 # Accept draft tokens (if we have any) if and only if they match the new
                 # token exactly.
-                for i in range(len(request.draft_tokens)):
-                    draft_token = request.draft_tokens[i]
+                for i in range(len(request.py_draft_tokens)):
+                    draft_token = request.py_draft_tokens[i]
                     if draft_token != new_token:
                         # Reject.
                         break
@@ -235,7 +261,7 @@ class TorchDecoder(Decoder):
                     if self._handle_stop_criteria(request, new_token,
                                                   num_tokens, beam_idx):
                         break
-            idx += len(request.draft_tokens) + 1
+            idx += len(request.py_draft_tokens) + 1
 
         for request in generation_requests:
             if request.state != LlmRequestState.GENERATION_COMPLETE:
@@ -259,8 +285,7 @@ class TorchDecoder(Decoder):
             idx += 1
 
         for request in scheduled_requests.generation_requests:
-            assert not request.has_draft_tokens(
-            ), "Speculative decoding not supported in SeparateDecoder."
+            assert request.py_draft_tokens is None, "Speculative decoding not supported in SeparateDecoder."
             token_logits = logits[idx:idx + 1, :]
             new_token = decode_single_request(request, token_logits)
             new_tokens_device_array += [new_token]
@@ -268,18 +293,22 @@ class TorchDecoder(Decoder):
 
         new_tokens_device = torch.cat(new_tokens_device_array)
         new_tokens_host = new_tokens_device.to('cpu', non_blocking=True)
+        new_tensors_device = {"new_tokens_device": new_tokens_device}
+        new_tensors_host = {"new_tokens_host": new_tokens_host}
         decoder_event = torch.cuda.Event()
         decoder_event.record()
-        return new_tokens_device, new_tokens_host, decoder_event
+        return new_tensors_device, new_tensors_host, decoder_event
 
     def _batch_decode(self, scheduled_requests: ScheduledRequests,
                       model_outputs):
         logits = model_outputs["logits"]
         new_tokens_device = torch.argmax(logits, dim=-1)
         new_tokens_host = new_tokens_device.to('cpu', non_blocking=True)
+        new_tensors_device = {"new_tokens_device": new_tokens_device}
+        new_tensors_host = {"new_tokens_host": new_tokens_host}
         decoder_event = torch.cuda.Event()
         decoder_event.record()
-        return new_tokens_device, new_tokens_host, decoder_event
+        return new_tensors_device, new_tensors_host, decoder_event
 
     def decode_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs):
@@ -289,18 +318,19 @@ class TorchDecoder(Decoder):
             return self._batch_decode(scheduled_requests, model_outputs)
 
     def decode(self, scheduled_requests: ScheduledRequests, model_outputs):
-        _, new_tokens_host, decoder_event = self.decode_async(
+        _, new_tensors_host, decoder_event = self.decode_async(
             scheduled_requests, model_outputs)
-        self.update_requests(scheduled_requests, new_tokens_host, decoder_event)
+        self.update_requests(scheduled_requests, new_tensors_host,
+                             decoder_event)
 
 
 class TorchStarAttentionDecoder(TorchDecoder):
 
     def update_requests(self, scheduled_requests: ScheduledRequests,
-                        new_tokens_host: torch.tensor,
+                        new_tensors_host: Dict[str, torch.tensor],
                         decoder_event: torch.cuda.Event):
         decoder_event.synchronize()
-        new_tokens_list = new_tokens_host.tolist()
+        new_tokens_list = new_tensors_host["new_tokens_host"].tolist()
 
         beam_idx = 0
         for request in scheduled_requests.context_requests:

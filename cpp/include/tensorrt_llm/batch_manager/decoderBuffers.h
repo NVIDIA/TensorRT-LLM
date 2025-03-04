@@ -41,11 +41,18 @@ public:
     using SizeType32 = runtime::SizeType32;
     using TensorPtr = runtime::ITensor::SharedPtr;
 
-    explicit DecoderInputBuffers(SizeType32 maxBatchSize, SizeType32 maxTokensPerEngineStep);
+    explicit DecoderInputBuffers(
+        SizeType32 maxBatchSize, SizeType32 maxTokensPerEngineStep, runtime::BufferManager const& manager);
 
+    // buffers for setup
     TensorPtr setupBatchSlots;
     TensorPtr inputsIds;
 
+    // buffers for forward
+    TensorPtr forwardBatchSlotsRequestOrder;
+    TensorPtr forwardBatchSlotsRequestOrderDevice;
+    TensorPtr fillValues;
+    TensorPtr fillValuesDevice;
     TensorPtr forwardBatchSlots;
 };
 

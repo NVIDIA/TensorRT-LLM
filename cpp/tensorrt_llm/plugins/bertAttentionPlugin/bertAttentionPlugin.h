@@ -97,7 +97,7 @@ private:
     int mSageAttnQBlockSize = 0;
     int mSageAttnKBlockSize = 0;
     int mSageAttnVBlockSize = 0;
-    std::set<std::vector<int>> mSageAttnSupportedBlockSizes{{64, 64, 256}};
+    std::set<std::vector<int>> mSageAttnSupportedBlockSizes{{64, 64, 256}, {64, 32, 32}};
 
     int mSM = tensorrt_llm::common::getSMVersion();
 
