@@ -17,9 +17,10 @@
 
 #pragma once
 
-#include "gemmCubins/MoE_ProjDown__BatchN_E4m3Fp32_Bfloat16_Tile128x128x128_EpiTile64x128_Mma64x128x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin.h"
-#include "gemmCubins/MoE_ProjDown__BatchN_E4m3Fp32_E4m3_Tile128x128x128_EpiTile64x128_Mma64x128x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin.h"
-#include "gemmCubins/MoE_ProjUp__BatchN_E4m3Fp32_E4m3_Tile128x128x128_EpiTile64x128_Mma64x128x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin.h"
+#include "gemmCubins/MoE_ProjDown_BatchN_E2m1Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin.h"
+#include "gemmCubins/MoE_ProjDown_BatchN_E4m3Fp32_Bfloat16_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin.h"
+#include "gemmCubins/MoE_ProjUp_BatchN_E2m1Fp32_E2m1_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_sm100a_cubin.h"
+#include "gemmCubins/MoE_ProjUp_BatchN_E4m3Fp32_E4m3_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin.h"
 #include <vector>
 
 namespace tensorrt_llm
@@ -50,12 +51,18 @@ struct GemmInfo
     tg::Dtype dtypeC{tg::Dtype::Void};
     tg::Dtype dtypeAcc{tg::Dtype::Void};
     bool useTmaStore{false};
+    bool useTwoTmaLoadWarps{false};
     unsigned numStages{0};
+    unsigned numStagesMma{0};
     unsigned paramsStructSize{0};
     bool useFusedAct{false};
     unsigned threadsPerCTA{0};
-    bool gateUseClusterSplitK;
-    int projGateNumSplitKSlices;
+    bool gateUseClusterSplitK{false};
+    int projGateNumSplitKSlices{0};
+    bool sliceK{false};
+    int mNumSlicesForSliceK{0};
+    tg::SfLayout mSfLayoutB{tg::SfLayout::Linear};
+    tg::SfLayout mSfLayoutC{tg::SfLayout::Linear};
 };
 
 namespace PermuteGemm1
@@ -63,32 +70,74 @@ namespace PermuteGemm1
 // clang-format off
 const std::vector<GemmInfo> gemmList {
     {
-        MoE_ProjUp__BatchN_E4m3Fp32_E4m3_Tile128x128x128_EpiTile64x128_Mma64x128x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin_data,
-        MoE_ProjUp__BatchN_E4m3Fp32_E4m3_Tile128x128x128_EpiTile64x128_Mma64x128x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin_len,
-        122880,
-        "MoE_ProjUp__BatchN_E4m3Fp32_E4m3_Tile128x128x128_EpiTile64x128_Mma64x128x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a",
-        true,
-        true,
-        false,
-        128,
-        128,
-        128,
-        64,
-        128,
-        64,
-        128,
-        32,
-        1,
-        tg::Dtype::E4m3,
-        tg::Dtype::E4m3,
-        tg::Dtype::Fp32,
-        true,
-        3,
-        17280,
-        false,
-        480,
-        false,
-        1
+        /* data */ MoE_ProjUp_BatchN_E4m3Fp32_E4m3_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin_data,
+        /* size */ MoE_ProjUp_BatchN_E4m3Fp32_E4m3_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a_cubin_len,
+        /* sharedMemSize */ 44032,
+        /* functionName */ "MoE_ProjUp_BatchN_E4m3Fp32_E4m3_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_InplaceRoute_sm100a",
+        /* blockScale */ true,
+        /* permuteFusion */ true,
+        /* shuffledMatrixA */ false,
+        /* tileM */ 128,
+        /* tileN */ 8,
+        /* tileK */ 128,
+        /* epilogueTileM */ 64,
+        /* epilogueTileN */ 8,
+        /* mmaM */ 64,
+        /* mmaN */ 8,
+        /* mmaK */ 32,
+        /* numSlicesForSplitK */ 1,
+        /* Dtype */ tg::Dtype::E4m3,
+        /* Dtype */ tg::Dtype::E4m3,
+        /* Dtype */ tg::Dtype::Fp32,
+        /* useTmaStore */ true,
+        /* useTwoTmaLoadWarps */ false,
+        /* numStages */ 2,
+        /* numStagesMma */ 1,
+        /* paramsStructSize */ 17280,
+        /* useFusedAct */ false,
+        /* threadsPerCTA */ 416,
+        /* gateUseClusterSplitK */ false,
+        /* projGateNumSplitKSlices */ 1,
+        /* sliceK */ false,
+        /* mNumSlicesForSliceK */ 1,
+        /* mSfLayoutB */ tg::SfLayout::Linear,
+        /* mSfLayoutC */ tg::SfLayout::Linear,
+    },
+    {
+        /* data */ MoE_ProjUp_BatchN_E2m1Fp32_E2m1_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_sm100a_cubin_data,
+        /* size */ MoE_ProjUp_BatchN_E2m1Fp32_E2m1_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_sm100a_cubin_len,
+        /* sharedMemSize */ 164864,
+        /* functionName */ "MoE_ProjUp_BatchN_E2m1Fp32_E2m1_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_InplaceRoute_GatedAct_sm100a",
+        /* blockScale */ true,
+        /* permuteFusion */ true,
+        /* shuffledMatrixA */ true,
+        /* tileM */ 128,
+        /* tileN */ 8,
+        /* tileK */ 512,
+        /* epilogueTileM */ 128,
+        /* epilogueTileN */ 8,
+        /* mmaM */ 128,
+        /* mmaN */ 8,
+        /* mmaK */ 64,
+        /* numSlicesForSplitK */ 1,
+        /* Dtype */ tg::Dtype::E2m1,
+        /* Dtype */ tg::Dtype::E2m1,
+        /* Dtype */ tg::Dtype::Fp32,
+        /* useTmaStore */ true,
+        /* useTwoTmaLoadWarps */ false,
+        /* numStages */ 3,
+        /* numStagesMma */ 1,
+        /* paramsStructSize */ 17280,
+        /* useFusedAct */ true,
+        /* threadsPerCTA */ 480,
+        /* gateUseClusterSplitK */ false,
+        /* projGateNumSplitKSlices */ 1,
+        /* sliceK */ false,
+        /* mNumSlicesForSliceK */ 1,
+        // FIXME: The actual data layout needs to be Linear, but for the other checks and TMA descriptor creation,
+        // we use the 8x4 SF layout. TMA descriptor won't be used for permute fusion version of the FC1.
+        /* mSfLayoutB */ tg::SfLayout::R8c4,
+        /* mSfLayoutC */ tg::SfLayout::R8c4,
     }
 };
 // clang-format on
@@ -99,60 +148,72 @@ namespace Gemm2
 // clang-format off
 const std::vector<GemmInfo> gemmList {
     {
-        MoE_ProjDown__BatchN_E4m3Fp32_E4m3_Tile128x128x128_EpiTile64x128_Mma64x128x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin_data,
-        MoE_ProjDown__BatchN_E4m3Fp32_E4m3_Tile128x128x128_EpiTile64x128_Mma64x128x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin_len,
-        121856,
-        "MoE_ProjDown__BatchN_E4m3Fp32_E4m3_Tile128x128x128_EpiTile64x128_Mma64x128x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a",
-        true,
-        false,
-        false,
-        128,
-        128,
-        128,
-        64,
-        128,
-        64,
-        128,
-        32,
-        1,
-        tg::Dtype::E4m3,
-        tg::Dtype::E4m3,
-        tg::Dtype::Fp32,
-        true,
-        3,
-        17280,
-        false,
-        384,
-        false,
-        1
+        /* data */ MoE_ProjDown_BatchN_E4m3Fp32_Bfloat16_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin_data,
+        /* size */ MoE_ProjDown_BatchN_E4m3Fp32_Bfloat16_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin_len,
+        /* sharedMemSize */ 44032,
+        /* functionName */ "MoE_ProjDown_BatchN_E4m3Fp32_Bfloat16_Tile128x8x128_EpiTile64x8_Mma64x8x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a",
+        /* blockScale */ true,
+        /* permuteFusion */ false,
+        /* shuffledMatrixA */ false,
+        /* tileM */ 128,
+        /* tileN */ 8,
+        /* tileK */ 128,
+        /* epilogueTileM */ 64,
+        /* epilogueTileN */ 8,
+        /* mmaM */ 64,
+        /* mmaN */ 8,
+        /* mmaK */ 32,
+        /* numSlicesForSplitK */ 1,
+        /* Dtype */ tg::Dtype::E4m3,
+        /* Dtype */ tg::Dtype::Bfloat16,
+        /* Dtype */ tg::Dtype::Fp32,
+        /* useTmaStore */ true,
+        /* useTwoTmaLoadWarps */ false,
+        /* numStages */ 2,
+        /* numStagesMma */ 1,
+        /* paramsStructSize */ 17280,
+        /* useFusedAct */ false,
+        /* threadsPerCTA */ 384,
+        /* gateUseClusterSplitK */ false,
+        /* projGateNumSplitKSlices */ 1,
+        /* sliceK */ false,
+        /* mNumSlicesForSliceK */ 1,
+        /* mSfLayoutB */ tg::SfLayout::Linear,
+        /* mSfLayoutC */ tg::SfLayout::Linear,
     },
     {
-        MoE_ProjDown__BatchN_E4m3Fp32_Bfloat16_Tile128x128x128_EpiTile64x128_Mma64x128x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin_data,
-        MoE_ProjDown__BatchN_E4m3Fp32_Bfloat16_Tile128x128x128_EpiTile64x128_Mma64x128x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a_cubin_len,
-        139264,
-        "MoE_ProjDown__BatchN_E4m3Fp32_Bfloat16_Tile128x128x128_EpiTile64x128_Mma64x128x32_Cluster1x1x1_transposeMmaOutput_DsFp8_sm100a",
-        true,
-        false,
-        false,
-        128,
-        128,
-        128,
-        64,
-        128,
-        64,
-        128,
-        32,
-        1,
-        tg::Dtype::E4m3,
-        tg::Dtype::Bfloat16,
-        tg::Dtype::Fp32,
-        true,
-        3,
-        17280,
-        false,
-        384,
-        false,
-        1
+        /* data */ MoE_ProjDown_BatchN_E2m1Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_data,
+        /* size */ MoE_ProjDown_BatchN_E2m1Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a_cubin_len,
+        /* sharedMemSize */ 165888,
+        /* functionName */ "MoE_ProjDown_BatchN_E2m1Fp32_Bfloat16_Tile128x8x512_EpiTile128x8_Mma128x8x64_Cluster1x1x1_transposeMmaOutput_sm100a",
+        /* blockScale */ true,
+        /* permuteFusion */ true,
+        /* shuffledMatrixA */ true,
+        /* tileM */ 128,
+        /* tileN */ 8,
+        /* tileK */ 512,
+        /* epilogueTileM */ 128,
+        /* epilogueTileN */ 8,
+        /* mmaM */ 128,
+        /* mmaN */ 8,
+        /* mmaK */ 64,
+        /* numSlicesForSplitK */ 1,
+        /* Dtype */ tg::Dtype::E2m1,
+        /* Dtype */ tg::Dtype::Bfloat16,
+        /* Dtype */ tg::Dtype::Fp32,
+        /* useTmaStore */ true,
+        /* useTwoTmaLoadWarps */ false,
+        /* numStages */ 3,
+        /* numStagesMma */ 1,
+        /* paramsStructSize */ 17280,
+        /* useFusedAct */ false,
+        /* threadsPerCTA */ 448,
+        /* gateUseClusterSplitK */ false,
+        /* projGateNumSplitKSlices */ 1,
+        /* sliceK */ false,
+        /* mNumSlicesForSliceK */ 1,
+        /* mSfLayoutB */ tg::SfLayout::R8c4,
+        /* mSfLayoutC */ tg::SfLayout::R8c4,
     }
 };
 // clang-format on
