@@ -307,6 +307,7 @@ def main():
         assert args.engine_dir is None, "pytorch backend does not need TRT Engine"
         config = PyTorchConfig(
             attn_backend=args.attn_backend,
+            moe_backend='TRTLLM',
             enable_overlap_scheduler=args.enable_overlap_scheduler,
             torch_compile_enabled=args.torch_compile)
         llm = tensorrt_llm._torch.LLM(

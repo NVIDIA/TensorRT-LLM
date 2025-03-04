@@ -60,6 +60,7 @@ add_library(
   mambaConv1dOp.cpp
   moeOp.cpp
   fp8BlockScaleMoe.cpp
+  fp4BlockScaleMoe.cpp
   noAuxTcOp.cpp
   ncclCommunicatorOp.cpp
   parallelDecodeKVCacheUpdateOp.cpp

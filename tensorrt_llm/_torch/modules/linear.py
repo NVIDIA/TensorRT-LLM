@@ -3,6 +3,7 @@ import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
 
+from setuptools import sic
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -108,6 +109,8 @@ def load_weight_scales_nvfp4(weights: List[Dict],
     weight_scale_2 = None
     weight_scale = []
 
+    device = torch.device("cuda")
+
     for w in weights:
         if "input_scale" in w:
             if input_scale is None:
@@ -116,8 +119,11 @@ def load_weight_scales_nvfp4(weights: List[Dict],
                 assert input_scale == w["input_scale"][
                     ...], "The input_scale should be same for all the weights"
         if "weight_scale" in w:
-            ws = load_weight_shard(w["weight_scale"], tp_size, tp_rank,
-                                   tp_mode).contiguous()
+            ws = load_weight_shard(w["weight_scale"],
+                                   tp_size,
+                                   tp_rank,
+                                   tp_mode,
+                                   device=device).contiguous()
             assert ws.dtype == torch.float8_e4m3fn  # TODO: or e8m0 for mxfp4 recipe?
             weight_scale.append(ws.view(fp4_utils.float4_sf_dtype))
         if "weight_scale_2" in w:
@@ -329,9 +335,15 @@ class Linear(nn.Module):
                 if input.dtype == torch.float8_e4m3fn:
                     input = input.to(torch.bfloat16) * self.input_scale
                 assert input.dtype == torch.bfloat16
-
-                act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
+                # TODO: We need a new kernel to support fp8 block scaling for blackwell
+                act_input_fp8, a_scale = torch.ops.trtllm.fp8_quantize_1x128(
                     input)
+                m_4_align = (input.shape[0] + 3) // 4 * 4
+                kscal_128 = (input.shape[1] + 127) // 128
+                act_scal_elesize = kscal_128 * m_4_align
+                a_scale = a_scale[:act_scal_elesize]
+                a_scale = a_scale.view(kscal_128, m_4_align)
+                act_input_sf = a_scale[:kscal_128, :input.shape[0]].contiguous()
 
                 output = torch.ops.trtllm.fp8_block_scaling_gemm(
                     act_input_fp8, self.weight, act_input_sf, self.weight_scale)
@@ -415,9 +427,13 @@ class Linear(nn.Module):
     def load_weights(self, weights: List[Dict]):
         assert self._weights_created
 
-        def _copy(dst: Parameter, src: torch.Tensor):
-            assert dst.dtype == src.dtype, f"Incompatible dtype. dst: {dst.dtype}, src: {src.dtype}"
-            dst.data.copy_(src)
+        def copy(dst: Parameter, src: torch.Tensor):
+            # TODO: Update this once we have BMM FP8 working with blackwell
+            #assert dst.dtype == src.dtype, f"Incompatible dtype. dst: {dst.dtype}, src: {src.dtype}"
+            assert dst.dtype == src.dtype or (
+                dst.dtype == torch.bfloat16 and src.dtype == torch.float8_e4m3fn
+            ), f"Incompatible dtype. dst: {dst.dtype}, src: {src.dtype}"
+            dst.data.copy_(sic)
 
         weight_mode = self.weights_loading_config.weight_mode
         quant_mode = self.quant_config.quant_mode if self.quant_config else None

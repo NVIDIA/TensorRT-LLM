@@ -267,7 +267,7 @@ inline Dtype dtypeFromString(std::string const& str)
     }
     else
     {
-        TLLM_LOG_ERROR("Unknown Dtype");
+        TLLM_LOG_ERROR("Unknown Dtype ", str);
     }
     return Dtype::Void;
 }
@@ -327,7 +327,7 @@ inline Dtype dtypeBlockSfType(Dtype dtype)
     case Dtype::E0m3:
     case Dtype::E2m1: return Dtype::E4m3;
     case Dtype::MxE2m1: return Dtype::UE8m0;
-    default: TLLM_LOG_ERROR("Unknown scaling factor type"); return Dtype::Void;
+    default: TLLM_LOG_ERROR("Unknown scaling factor type for ", dtypeToString(dtype)); return Dtype::Void;
     }
 }
 

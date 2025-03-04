@@ -19,6 +19,8 @@
 //// FIX
 #include "Utils.h"  // #include <trtllm/dev/Utils.h>
 #include "macros.h" // #include <utils/macros.h>
+#include <cutlass/cutlass.h>
+#include <cutlass/numeric_types.h>
 // #include <trtllm/gen/GenCtx.h>
 
 #include <cub/cub.cuh>
@@ -53,20 +55,32 @@ __global__ void activationKernel(KernelParams params)
     }
 #endif
 
-    int const numIters = params.outerDim * params.innerDim / 2;
-    for (int tid = threadIdx.x + blockDim.x * blockIdx.x; tid < numIters; tid += blockDim.x * gridDim.x)
+    for (int tokenIdx = blockIdx.z; tokenIdx < params.numTokens; tokenIdx += gridDim.z)
     {
-        int const innerIdx = tid % (params.innerDim / 2);
-        int const outerIdx = tid / (params.innerDim / 2);
-        int const baseIdx = outerIdx * params.innerDim + innerIdx;
-        float x1 = (float) params.inPtr[baseIdx];
-        float x2 = (float) params.inPtr[baseIdx + params.innerDim / 2];
+        // Look over experts per token
+        for (int k = blockIdx.y; k < params.topK; k += gridDim.y)
+        {
+            int const expandedIdx = tokenIdx * params.topK + k;
+            int const permutedIdx = params.expandedIdxToPermutedIdx[expandedIdx];
+            if (permutedIdx == -1)
+                continue;
 
-        float act = trtllm::dev::silu(x1);
-        Type out = (Type) (act * x2);
+            // Loop over hidden dim
+            for (int hiddenIdx = threadIdx.x + blockDim.x * blockIdx.x; hiddenIdx < params.innerDim / 2;
+                 hiddenIdx += blockDim.x * gridDim.x)
+            {
+                int const baseIdx = permutedIdx * params.innerDim + hiddenIdx;
 
-        int const outIdx = outerIdx * (params.innerDim / 2) + innerIdx;
-        params.outPtr[outIdx] = out;
+                float x1 = (float) params.inPtr[baseIdx];
+                float x2 = (float) params.inPtr[baseIdx + params.innerDim / 2];
+
+                float act = trtllm::dev::silu(x2);
+                Type out = (Type) (act * x1);
+
+                int const outIdx = permutedIdx * (params.innerDim / 2) + hiddenIdx;
+                params.outPtr[outIdx] = out;
+            }
+        }
     }
 }
 
@@ -89,47 +103,57 @@ __global__ void activationDeepSeekKernel(KernelParams params)
         cudaGridDependencySynchronize();
     }
 #endif
-
-    int const numIters = params.outerDim * params.innerDim / 2;
-    for (int tid = threadIdx.x + blockDim.x * blockIdx.x; tid < numIters; tid += blockDim.x * gridDim.x)
+    // Loop over tokens
+    for (int tokenIdx = blockIdx.z; tokenIdx < params.numTokens; tokenIdx += gridDim.z)
     {
-        int const innerIdx = tid % (params.innerDim / 2);
-        int const outerIdx = tid / (params.innerDim / 2);
-        int const baseIdx = outerIdx * params.innerDim + innerIdx;
-
-        int const permutedIdx = outerIdx;
-        int const expandedIdx = params.permutedIdxToExpandedIdx[permutedIdx];
-        if (expandedIdx == -1)
-            continue;
-
-        int const scale1_idx = outerIdx + params.totalNumPaddedTokens * (innerIdx / 128);
-        int const scale2_idx
-            = outerIdx + params.totalNumPaddedTokens * ((innerIdx / 128) + (params.innerDim / 2 / 128));
-        float const scale1 = params.inDqSfsPtr[scale1_idx];
-        float const scale2 = params.inDqSfsPtr[scale2_idx];
-
-        float x1 = scale1 * (float) params.inPtr[baseIdx];
-        float x2 = scale2 * (float) params.inPtr[baseIdx + params.innerDim / 2];
-
-        float act = trtllm::dev::silu(x1);
-        float out = act * x2;
-
-        // The largest (finite) value that can be represented using E4m3.
-        float constexpr E4m3MaxVal{448.f};
-
-        // Compute the absolute max
-        float aMax = BlockReduce(temp_storage).Reduce(fabsf(out), cub::Max());
-        if (threadIdx.x == 0)
+        // Look over experts per token
+        for (int k = blockIdx.y; k < params.topK; k += gridDim.y)
         {
-            s_scaleOut = aMax / E4m3MaxVal;
-            int const scaleOut_idx = outerIdx + params.totalNumPaddedTokens * (innerIdx / 128);
-            params.outDqSfsPtr[scaleOut_idx] = aMax / E4m3MaxVal;
+            int const expandedIdx = tokenIdx * params.topK + k;
+            int const permutedIdx = params.expandedIdxToPermutedIdx[expandedIdx];
+
+            // Needed for expert parallelism
+            if (permutedIdx == -1)
+                continue;
+
+            // Loop over hidden dim
+            for (int hiddenIdx = threadIdx.x + blockDim.x * blockIdx.x; hiddenIdx < params.innerDim / 2;
+                 hiddenIdx += blockDim.x * gridDim.x)
+            {
+                int const baseIdx = permutedIdx * params.innerDim + hiddenIdx;
+
+                int const totalNumPaddedTokens = params.totalNumPaddedTokens[0];
+
+                int const scale1_idx = permutedIdx + totalNumPaddedTokens * (hiddenIdx / 128);
+                int const scale2_idx
+                    = permutedIdx + totalNumPaddedTokens * ((hiddenIdx / 128) + (params.innerDim / 2 / 128));
+                float const scale1 = params.inDqSfsPtr[scale1_idx];
+                float const scale2 = params.inDqSfsPtr[scale2_idx];
+
+                float x1 = scale1 * (float) params.inPtr[baseIdx];
+                float x2 = scale2 * (float) params.inPtr[baseIdx + params.innerDim / 2];
+
+                float act = trtllm::dev::silu(x2);
+                float out = act * x1;
+
+                // The largest (finite) value that can be represented using E4m3.
+                float constexpr E4m3MaxVal{448.f};
+
+                // Compute the absolute max
+                float aMax = BlockReduce(temp_storage).Reduce(fabsf(out), cub::Max());
+                if (threadIdx.x == 0)
+                {
+                    s_scaleOut = aMax / E4m3MaxVal;
+                    int const scaleOut_idx = permutedIdx + totalNumPaddedTokens * (hiddenIdx / 128);
+                    params.outDqSfsPtr[scaleOut_idx] = aMax / E4m3MaxVal;
+                }
+                __syncthreads();
+                float const scaleOut = s_scaleOut;
+                __syncthreads();
+                int const outIdx = permutedIdx * (params.innerDim / 2) + hiddenIdx;
+                params.outPtr[outIdx] = (Type) (out / scaleOut);
+            }
         }
-        __syncthreads();
-        float const scaleOut = s_scaleOut;
-        __syncthreads();
-        int const outIdx = outerIdx * (params.innerDim / 2) + innerIdx;
-        params.outPtr[outIdx] = (Type) (out / scaleOut);
     }
 }
 
@@ -137,21 +161,27 @@ __global__ void activationDeepSeekKernel(KernelParams params)
 
 void run(Data const& data, void* stream)
 {
+    if (data.mDtypeElt == tg::Dtype::E2m1)
+    {
+        // Note: this should be unreachable because the options are checked beforehand.
+        // E2m1 requires using higher-precision intermediate data (bf16).
+        TLLM_LOG_ERROR("Activation with E2m1_t isn't supported.");
+        return;
+    }
+
     if (data.mUseDeepSeekFp8)
     {
         int const numThreads = 128;
-        int const numElems = (data.outerDim * data.innerDim / 2);
-        int const numBlocks = (numElems - 1 + numThreads) / numThreads;
+        const dim3 grid(data.innerDim / 128, data.topK, data.numTokens);
 
-        LAUNCH(data, activationDeepSeekKernel, numBlocks, numThreads, 0, stream);
+        LAUNCH(data, activationDeepSeekKernel, grid, numThreads, 0, stream);
     }
     else
     {
         int const numThreads = 256;
-        int const numElems = (data.outerDim * data.innerDim / 2);
-        int const numBlocks = (numElems - 1 + numThreads) / numThreads;
+        const dim3 grid(data.innerDim / 128, data.topK, data.numTokens);
 
-        LAUNCH(data, activationKernel, numBlocks, numThreads, 0, stream);
+        LAUNCH(data, activationKernel, grid, numThreads, 0, stream);
     }
 }
 
@@ -160,6 +190,191 @@ void run(Data const& data, void* stream)
 } // namespace activation
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+namespace convertsf
+{
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+namespace tg = trtllm::gen;
+
+namespace dev
+{
+// Compute the offset that corresponds to (dataRowIdx, dataBlkColIdx) in the SF tensor where
+// dataRowIdx and dataBlkColIdx are the respective indices of the row and the block of 16 elts
+// from the K dim in the tensor of data.
+inline __device__ int64_t getSfOffset(int32_t dataRowIdx, int32_t dataBlkColIdx, int32_t numDataBlksPerRow)
+{
+
+    // The number of rows of SF per block.
+    static int32_t constexpr NumRowsPerSfBlock = 128;
+    // The number of cols of SF per block.
+    static int32_t constexpr NumColsPerSfBlock = 4;
+    // The size of each SF block.
+    static int32_t constexpr NumBytesPerSfBlock = NumRowsPerSfBlock * NumColsPerSfBlock;
+
+    // The number of rows of data per SF block.
+    static int32_t constexpr NumDataRowsPerSfBlock = NumRowsPerSfBlock;
+    // The number of cols of blocks of data per SF block.
+    static int32_t constexpr NumDataBlkColsPerSfBlock = NumColsPerSfBlock;
+
+    // The row of the SF block in the SF tensor.
+    int sfBlkRowIdx = dataRowIdx / NumDataRowsPerSfBlock;
+    // The col of the SF block in the SF tensor.
+    int sfBlkColIdx = dataBlkColIdx / NumDataBlkColsPerSfBlock;
+    // The blocks are stored row-major in the tensor of scaling factors.
+    int sfBlkIdx = sfBlkRowIdx * numDataBlksPerRow / NumDataBlkColsPerSfBlock + sfBlkColIdx;
+
+    // Find the row in the SF block.
+    int sfRowIdx = (dataRowIdx % 32) * 4 + (dataRowIdx % NumDataRowsPerSfBlock) / 32;
+    // Find the col in the SF block.
+    int sfColIdx = (dataBlkColIdx % 4);
+
+    // Compute the offset in bytes.
+    return sfBlkIdx * NumBytesPerSfBlock + sfRowIdx * NumColsPerSfBlock + sfColIdx;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Given the GMEM address of an output element, compute the offset of the corresponding scaling
+// factor in the SF tensor. Optionally, a startTokenIndex can be provided if the first token is not
+// the start token in the SF tensor. This is useful when inflight batching is enabled in TRT-LLM,
+// where the context and generation output are stored as one output tensor. In this case, the
+// generation output may not start with zero offset in the SF output tensor.
+template <int32_t NumBitsPerElt>
+inline __device__ int64_t getSfOffset(int64_t gmemOffsetInBytes, int32_t hiddenDim, int32_t startTokenIdx = 0)
+{
+    // The number of elements per sf.
+    int32_t constexpr NumEltsPerSf = 16;
+    // The GMEM offset of the output element.
+    int64_t gmemOffset = gmemOffsetInBytes * 8 /*bits*/ / NumBitsPerElt;
+    // The row/col indices of the corresponding SF element.
+    int32_t sfRowIdx = gmemOffset / hiddenDim + startTokenIdx;
+    int32_t sfColIdx = (gmemOffset % hiddenDim) / NumEltsPerSf;
+    // Compute the SF offset.
+    return getSfOffset(sfRowIdx, sfColIdx, hiddenDim / NumEltsPerSf);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// TODO(tizheng): Refactor to track gmem offset instead of doing pointer subtraction.
+template <int32_t NumBitsPerElt>
+inline __device__ int64_t getSfOffset(
+    void const* gmemOutPtr, void const* gmemBasePtr, int32_t hiddenDim, int32_t startTokenIdx = 0)
+{
+    return getSfOffset<NumBitsPerElt>(
+        reinterpret_cast<char const*>(gmemOutPtr) - reinterpret_cast<char const*>(gmemBasePtr), hiddenDim,
+        startTokenIdx);
+}
+
+} // namespace dev
+
+// TODO: it would be nice to move some of that logic to Fp4Utils.h
+template <tg::SfLayout Layout>
+inline __device__ int32_t getSfOffset(int32_t dataRowIdx, int32_t dataBlkColIdx, int32_t numDataBlksPerRow)
+{
+    if constexpr (Layout == tg::SfLayout::Linear)
+    {
+        return numDataBlksPerRow * dataRowIdx + dataBlkColIdx;
+    }
+    else if constexpr (Layout == tg::SfLayout::R128c4)
+    {
+        return static_cast<int32_t>(dev::getSfOffset(dataRowIdx, dataBlkColIdx, numDataBlksPerRow));
+    }
+    else if constexpr (Layout == tg::SfLayout::R8c4 || Layout == tg::SfLayout::R8c16)
+    {
+        static int32_t constexpr NumRowsPerSfBlock = 8;
+        static int32_t constexpr NumColsPerSfBlock = (Layout == tg::SfLayout::R8c4) ? 4 : 16;
+        static int32_t constexpr NumBytesPerSfBlock = NumRowsPerSfBlock * NumColsPerSfBlock;
+        int sfBlkRowIdx = dataRowIdx / NumRowsPerSfBlock;
+        int sfBlkColIdx = dataBlkColIdx / NumColsPerSfBlock;
+        int sfBlkIdx = sfBlkRowIdx * numDataBlksPerRow / NumColsPerSfBlock + sfBlkColIdx;
+        int sfRowIdx = dataRowIdx % NumRowsPerSfBlock;
+        int sfColIdx = dataBlkColIdx % NumColsPerSfBlock;
+        return sfBlkIdx * NumBytesPerSfBlock + sfRowIdx * NumColsPerSfBlock + sfColIdx;
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <tg::SfLayout LayoutSrc, tg::SfLayout LayoutDst, typename KernelParams>
+__device__ void convertSfCommon(KernelParams params)
+{
+    // Note: it's assumed that the number of scaling factors per row is a multiple of 4.
+    constexpr int VecSize = 4;
+    using VecType = uint32_t;
+    static_assert(sizeof(VecType) == VecSize);
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    // Immediately trigger the secondary kernel when using PDL, then wait on primary.
+    if constexpr (KernelParams::UsePdl)
+    {
+        cudaTriggerProgrammaticLaunchCompletion();
+        cudaGridDependencySynchronize();
+    }
+#endif
+
+    // TODO: consider optimizing if used in production.
+    // This is a naive kernel. It's not doing coalesced loads.
+
+    int const numSfPerRow = params.hiddenDimSf;
+
+    for (int tokenIdx = blockIdx.y; tokenIdx < params.numTokens; tokenIdx += gridDim.y)
+    {
+        for (int hiddenSfVecIdx = threadIdx.x + blockDim.x * blockIdx.x; hiddenSfVecIdx < numSfPerRow / VecSize;
+             hiddenSfVecIdx += blockDim.x * gridDim.x)
+        {
+            // Index of the first SF in the vector.
+            int const hiddenSfIdx = VecSize * hiddenSfVecIdx;
+
+            // Load scale factors.
+            int sfIdxIn = getSfOffset<LayoutSrc>(tokenIdx, hiddenSfIdx, numSfPerRow);
+            const VecType sfVec = reinterpret_cast<VecType const*>(params.inSfPtr)[sfIdxIn / VecSize];
+
+            // Store scale factors.
+            int const sfIdxOut = getSfOffset<LayoutDst>(tokenIdx, hiddenSfIdx, numSfPerRow);
+            reinterpret_cast<VecType*>(params.outSfPtr)[sfIdxOut / VecSize] = sfVec;
+        }
+    }
+}
+
+#define CONVERT_FP4_SF_KERNEL(LayoutSrc, LayoutDst)                                                                    \
+    template <typename KernelParams>                                                                                   \
+    __global__ void convertSf##LayoutSrc##To##LayoutDst##Kernel(KernelParams params)                                   \
+    {                                                                                                                  \
+        convertSfCommon<tg::SfLayout::LayoutSrc, tg::SfLayout::LayoutDst>(params);                                     \
+    }
+// We only need a conversion to the linear layout.
+CONVERT_FP4_SF_KERNEL(R128c4, Linear);
+CONVERT_FP4_SF_KERNEL(R8c4, Linear);
+CONVERT_FP4_SF_KERNEL(R8c16, Linear);
+#undef CONVERT_FP4_SF_KERNEL
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void run(Data const& data, void* stream)
+{
+    constexpr int VecSize = 4;
+    int const numThreads = 128;
+    int const numBlocksX = (data.hiddenDimSf / VecSize - 1 + numThreads) / numThreads;
+    int const numBlocksY = data.numTokens;
+    dim3 numBlocks(numBlocksX, numBlocksY);
+#define CONVERT_FP4_SF_LAUNCH(LayoutSrc, LayoutDst)                                                                    \
+    if (data.sfLayoutSrc == tg::SfLayout::LayoutSrc && data.sfLayoutDst == tg::SfLayout::LayoutDst)                    \
+    {                                                                                                                  \
+        LAUNCH_PDL(data, false, cutlass::float_e4m3_t, convertSf##LayoutSrc##To##LayoutDst##Kernel, numBlocks,         \
+            numThreads, 0, stream);                                                                                    \
+        return;                                                                                                        \
+    }
+    CONVERT_FP4_SF_LAUNCH(R128c4, Linear);
+    CONVERT_FP4_SF_LAUNCH(R8c4, Linear);
+    CONVERT_FP4_SF_LAUNCH(R8c16, Linear);
+#undef CONVERT_FP4_SF_LAUNCH
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+} // namespace convertsf
 
 namespace permute
 {
@@ -213,7 +428,7 @@ __global__ void permuteKernel(KernelParams params)
                     int const permutedIdx = params.expandedIdxToPermutedIdx[expandedIdx];
 
                     int const idx_in = tokenIdx + params.numTokens * scaleIdx;
-                    int const idx_out = permutedIdx + params.totalNumPaddedTokens * scaleIdx;
+                    int const idx_out = permutedIdx + params.totalNumPaddedTokens[0] * scaleIdx;
 
                     params.outDqSfsPtr[idx_out] = params.inDqSfsPtr[idx_in];
                 }
@@ -277,11 +492,12 @@ __global__ void finalizeKernel(KernelParams params)
             for (int k = 0; k < params.topK; k++)
             {
                 int const expandedIdx = tokenIdx * params.topK + k;
-
                 const TypeExpW scale = params.expertWeightsPtr[expandedIdx];
 
-                int const permuteIdx = params.expandedIdxToPermutedIdx[expandedIdx];
-                data += float{scale} * float{params.inPtr[permuteIdx * params.hiddenDim + hiddenIdx]};
+                int const permutedIdx = params.expandedIdxToPermutedIdx[expandedIdx];
+                if (permutedIdx == -1)
+                    continue;
+                data += float{scale} * float{params.inPtr[permutedIdx * params.hiddenDim + hiddenIdx]};
             }
 
             params.outPtr[tokenIdx * params.hiddenDim + hiddenIdx] = static_cast<Type>(data);
@@ -322,8 +538,10 @@ __global__ void finalizeDeepSeekKernel(KernelParams params)
             {
                 int const expandedIdx = tokenIdx * params.topK + k;
                 int const permutedIdx = params.expandedIdxToPermutedIdx[expandedIdx];
-
-                int const scaleIdx = permutedIdx + params.totalNumPaddedTokens * (hiddenIdx / 128);
+                if (permutedIdx == -1)
+                    continue;
+                int const totalNumPaddedTokens = params.totalNumPaddedTokens[0];
+                int const scaleIdx = permutedIdx + totalNumPaddedTokens * (hiddenIdx / 128);
                 float const blockScale = params.inDqSfsPtr ? params.inDqSfsPtr[scaleIdx] : 1;
 
                 float const expertProb = (float) params.expertWeightsPtr[tokenIdx * params.topK + k];
