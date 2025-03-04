@@ -20,15 +20,23 @@
 #define TLLM_ENABLE_CUDA
 // #include "BatchedGemmOptions.h"
 #include "Dtype.h"
+#include "SfLayoutDecl.h"
 
 #include <cstdint>
 #ifdef TLLM_ENABLE_CUDA
 #include <cute/tensor.hpp>
-#include <cutlass/cutlass.h>
-#include <cutlass/half.h>
 #endif
 
 #include "TmaDescriptor.h"
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// TODO: Find a better header to put this in, that we can include from here.
+template <typename T>
+inline T ceilDiv(T m, T n)
+{
+    return (m + n - T(1)) / n;
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -39,6 +47,12 @@ namespace tg = trtllm::gen;
 struct KernelParams
 {
 #ifdef TLLM_ENABLE_CUDA
+
+    // Maximum number of batch
+    static constexpr int MaxBatchSize = 256;
+    // Maximum number of CTAs
+    static constexpr int MaxNumCtas = 2048;
+
     // TMA descriptor for A.
     CUtensorMap tmaA[1];
     // TMA descriptor for B.
@@ -50,11 +64,6 @@ struct KernelParams
     CUtensorMap tmaSfA[1];
     // TMA descriptor for block scaling factors for B.
     CUtensorMap tmaSfB[1];
-
-    // Maximum number of batch
-    static constexpr int MaxBatchSize = 256;
-    // Maximum number of CTAs
-    static constexpr int MaxNumCtas = 2048;
 
     // The output matrix C. The shape is m x n. Layout is row-major (contiguous in the n dimension).
     // (when useTmaStore is false)
@@ -125,8 +134,12 @@ struct KernelParams
     // The stride for matrix A in bytes.
     uint64_t strideInBytesB;
 
+    // The block scaling factors for A
     void* ptrSfA;
+    // The block scaling factors for B
     void* ptrSfB;
+    // The block scaling factors for C
+    void* ptrSfC;
 
     // **Expanded** limits for the batched dimension:
     //   tile * ctaIdxXyToTileIdxMn[ctaIdxXy] -> ctaIdxXyToMnLimit[ctaIdxXy]
@@ -142,6 +155,18 @@ struct KernelParams
     void* ptrSfTokens;
     // Number of tokens
     int32_t numTokens;
+
+    // In some cases, some CTAs must early-exit. E.g. when the grid size is set statically, but the
+    // actual workload is decided at runtime. This element on the device contains the number of CTAs
+    // that do not early-exit. The number corresponds to the X dim of the grid when the output is not
+    // transposed (i.e. transposeMmaOutput is false). To the Y dim, otherwise.
+    int32_t* ptrNumNonExitingCtas;
+    // Pointer to total number of padded tokens
+    int32_t* ptrTotalNumPaddedTokens;
+    // Pointer to CTA index X/Y to batch index
+    int32_t* ptrCtaIdxXyToBatchIdx;
+    // Pointer to CTA index X/Y to tile index **expanded** M/N for batched dimension
+    int32_t* ptrCtaIdxXyToMnLimit;
 
     enum class MatrixType
     {
@@ -162,12 +187,14 @@ struct KernelParams
             hiddenSize = mM;
         }
 
+        // For a fused activation kernel, the hidden size of output is halved. TODO: That's true for
+        // gated activations but not regular activations.
         if (useFusedAct)
         {
-            // for a fused activation kernel, hidden size of output is halved
             if (matrixType == MatrixType::MatrixC)
                 hiddenSize /= 2;
         }
+
         // The cute tensor shape for A/B: (numTokens, hiddenSize).
         // Note that TMA descriptor expects the first dimension's stride to be
         // 1, so swap the first two dimension so that the hiddenSize dimension comes first.
@@ -181,48 +208,143 @@ struct KernelParams
     }
 
     // Create the TMA shape/stride for A/B block scale factors.
-    static auto makeTmaShapeStrideSfAb(int mM, int mN, int mK, MatrixType matrixType)
+    static auto makeTmaShapeStrideSfAb(
+        int mM, int mN, int mK, MatrixType matrixType, int tileM, int tileN, int tileK, tg::SfLayout layout)
     {
-        // Note: the scale factor tensor packs 128x4 tiles into contiguous 512B blocks.
-        // The 512B block maps to a 32x16B (32x128b) block in TMEM.
-        // See https://nvbugspro.nvidia.com/bug/4165523
-        //
-        // Additionally, we have to meet constraints of TMA that the box dimensions are less
-        // than 256 and boxDim[0] is a multiple of 16B.
-        //
-        // The "logical" tensor is:      [outer,        inner / numEltsPerSf]
-        // The aforementioned format is: [outer / 128,  inner / numEltsPerSf / 4,    512]
-        // The shape we use for TMA is:  [outer / 128,  inner / numEltsPerSf / 4, 2, 256]
 
         // The outer dimension.
         auto numTokens = matrixType == MatrixType::MatrixA ? mM : mN;
         // The inner dimension.
         auto hiddenSize = mK;
-
+        // The outer tile dimension.
+        auto numTokensPerTile = matrixType == MatrixType::MatrixA ? tileM : tileN;
+        // The inner tile dimension.
+        auto hiddenSizePerTile = tileK;
+        // Number of elements per scaling factor.
         const int32_t numEltsPerSf = 16;
 
-        auto shape = std::vector<uint64_t>{
-            256, 2, static_cast<uint64_t>((hiddenSize / numEltsPerSf / 4)), static_cast<uint64_t>(numTokens / 128)};
-
-        std::vector<uint64_t> stride(shape.size());
-        stride[0] = 1;
-        for (size_t i = 1; i < shape.size(); i++)
+        switch (layout)
         {
-            stride[i] = shape[i - 1] * stride[i - 1];
+        case tg::SfLayout::R128c4:
+        {
+            // The scale factor tensor packs 128x4 tiles into contiguous 512B blocks.
+            // The 512B block maps to a 32x16B (32x128b) block in TMEM.
+            // See https://nvbugspro.nvidia.com/bug/4165523
+            //
+            // Additionally, we have to meet constraints of TMA that the box dimensions are less
+            // than 256 and boxDim[0] is a multiple of 16B.
+            //
+            // The "logical" tensor is:      [outer,       inner / numEltsPerSf]
+            // The aforementioned format is: [outer / 128, inner / numEltsPerSf / 4,    512]
+            // The shape we use for TMA is:  [outer / 128, inner / numEltsPerSf / 4, 2, 256]
+
+            auto shape = std::vector<uint64_t>{256, 2, static_cast<uint64_t>(ceilDiv(hiddenSize, numEltsPerSf * 4)),
+                static_cast<uint64_t>(ceilDiv(numTokens, 128))};
+
+            std::vector<uint64_t> stride(shape.size());
+            stride[0] = 1;
+            for (size_t i = 1; i < shape.size(); i++)
+            {
+                stride[i] = shape[i - 1] * stride[i - 1];
+            }
+
+            auto tileShapes
+                = std::vector<uint32_t>{256, 2, static_cast<uint32_t>(ceilDiv(hiddenSizePerTile, numEltsPerSf * 4)),
+                    static_cast<uint32_t>(ceilDiv(numTokensPerTile, 128))};
+
+            return std::make_tuple(shape, stride, tileShapes);
         }
 
-        return std::make_tuple(shape, stride);
+        case tg::SfLayout::R8c4:
+        {
+            // The scale factor tensor packs 8x4 tiles into contiguous 32B blocks.
+            //
+            // As the inner dimension (k) is required to be a multiple of the tile size, we
+            // can reshape to use fewer read requests, if the tile dimensions allow.
+            // I.e., let's define repeats = min(hiddenSizePerTile / numEltsPerSf / 4, 8)
+            //
+            // The "logical" tensor is: [outer,     inner / numEltsPerSf]
+            // The 8x4 SF layout is:    [outer / 8, inner / numEltsPerSf / 4, 32]
+            // The TMA tensor shape is: [outer / 8, inner / numEltsPerSf / 4 / repeats, repeats * 32]
+
+            int const repeats = std::min(ceilDiv(hiddenSizePerTile, numEltsPerSf * 4), 8);
+
+            auto shape = std::vector<uint64_t>{static_cast<uint64_t>(repeats * 32),
+                static_cast<uint64_t>(ceilDiv(hiddenSize, numEltsPerSf * 4 * repeats)),
+                static_cast<uint64_t>(ceilDiv(numTokens, 8))};
+
+            std::vector<uint64_t> stride(shape.size());
+            stride[0] = 1;
+            for (size_t i = 1; i < shape.size(); i++)
+            {
+                stride[i] = shape[i - 1] * stride[i - 1];
+            }
+
+            auto tileShapes = std::vector<uint32_t>{static_cast<uint32_t>(repeats * 32),
+                static_cast<uint32_t>(ceilDiv(hiddenSizePerTile, numEltsPerSf * 4 * repeats)),
+                static_cast<uint32_t>(ceilDiv(numTokensPerTile, 8))};
+
+            return std::make_tuple(shape, stride, tileShapes);
+        }
+
+        default: TLLM_CHECK_ERROR(false, "Unsupported SF layout");
+        }
+        return std::make_tuple(std::vector<uint64_t>{}, std::vector<uint64_t>{}, std::vector<uint32_t>{});
     }
 
-    static KernelParams setKernelParams(const int32_t numBatches, const int32_t numTokens, bool const batchM,
-        const int32_t m, const int32_t n, const int32_t k, std::vector<int32_t> batchedM, std::vector<int32_t> batchedN,
-        int const tileM, int const tileN, int const tileK, int const epilogueTileM, int const epilogueTileN,
-        bool const useDeepSeekFp8, bool const useTmaStore, bool const transposeMmaOutput, bool const useFusedAct,
+    static KernelParams setKernelParams(const int32_t numBatches, const int32_t numTokens,
+        const int32_t permutedRowCount, bool const batchM, const int32_t m, const int32_t n, const int32_t k,
+        std::vector<int32_t> batchedM, std::vector<int32_t> batchedN, int const tileM, int const tileN, int const tileK,
+        int const epilogueTileM, int const epilogueTileN, bool const useDeepSeekFp8, bool const useTmaStore,
+        bool const transposeMmaOutput, tg::SfLayout sfLayoutB, bool const useFusedAct, bool const allToAllRouteAct,
         tg::Dtype dtypeElt, tg::Dtype dtypeC, void* ptrA, void* ptrB, void* ptrC, float const* ptrScaleC,
-        float* dDqSfsA, float* dDqSfsB, float* dDqSfsC, void* dSfA, void* dSfB, void* dSfTokens,
+        float* dDqSfsA, float* dDqSfsB, float* dDqSfsC, void* dSfA, void* dSfB, void* dSfTokens, void* dSfC,
         float const* ptrScaleGate, void* ptrTokens, int32_t const* routeMap, float* dDqSfsTokens, float* rowMax,
-        uint32_t* rowMaxBars)
+        uint32_t* rowMaxBars, bool isStaticBatch = true, int32_t* ptrNumNonExitingCtas = nullptr,
+        int32_t* ptrTotalNumPaddedTokens = nullptr, int32_t* ptrCtaIdxXyToBatchIdx = nullptr,
+        int32_t* ptrCtaIdxXyToMnLimit = nullptr)
     {
+
+        // std::cout << "numBatches: " << numBatches << std::endl;
+        // std::cout << "numTokens: " << numTokens << std::endl;
+        // std::cout << "batchM: " << batchM << std::endl;
+        // std::cout << "m: " << m << std::endl;
+        // std::cout << "n: " << n << std::endl;
+        // std::cout << "k: " << k << std::endl;
+        // std::cout << "tileM: " << tileM << std::endl;
+        // std::cout << "tileN: " << tileN << std::endl;
+        // std::cout << "tileK: " << tileK << std::endl;
+        // std::cout << "epilogueTileM: " << epilogueTileM << std::endl;
+        // std::cout << "epilogueTileN: " << epilogueTileN << std::endl;
+        // std::cout << "useDeepSeekFp8: " << useDeepSeekFp8 << std::endl;
+        // std::cout << "useTmaStore: " << useTmaStore << std::endl;
+        // std::cout << "transposeMmaOutput: " << transposeMmaOutput << std::endl;
+        // std::cout << "sfLayoutB: " << (int) sfLayoutB << std::endl;
+        // std::cout << "useFusedAct: " << useFusedAct << std::endl;
+        // std::cout << "allToAllRouteAct: " << allToAllRouteAct << std::endl;
+        // std::cout << "dtypeElt: " << (int) dtypeElt << std::endl;
+        // std::cout << "dtypeC: " << (int) dtypeC << std::endl;
+        // std::cout << "ptrA: " << ptrA << std::endl;
+        // std::cout << "ptrB: " << ptrB << std::endl;
+        // std::cout << "ptrC: " << ptrC << std::endl;
+        // std::cout << "ptrScaleC: " << ptrScaleC << std::endl;
+        // std::cout << "ptrScaleGate: " << ptrScaleGate << std::endl;
+        // // std::cout << "dDqSfsA: " << dDqSfsA << std::endl;
+        // // std::cout << "dDqSfsB: " << dDqSfsB << std::endl;
+        // // std::cout << "dDqSfsC: " << dDqSfsC << std::endl;
+        // std::cout << "dSfA: " << dSfA << std::endl;
+        // std::cout << "dSfB: " << dSfB << std::endl;
+        // std::cout << "dSfTokens: " << dSfTokens << std::endl;
+        // std::cout << "dSfC: " << dSfC << std::endl;
+        // std::cout << "ptrTokens: " << ptrTokens << std::endl;
+        // std::cout << "routeMap: " << routeMap << std::endl;
+        // std::cout << "isStaticBatch: " << isStaticBatch << std::endl;
+        // std::cout << "ptrNumNonExitingCtas: " << ptrNumNonExitingCtas << std::endl;
+        // std::cout << "ptrTotalNumPaddedTokens: " << ptrTotalNumPaddedTokens << std::endl;
+        // std::cout << "ptrCtaIdxXyToBatchIdx: " << ptrCtaIdxXyToBatchIdx << std::endl;
+        // std::cout << "ptrCtaIdxXyToMnLimit: " << ptrCtaIdxXyToMnLimit << std::endl;
+        // std::cout << "batchedM.size(): " << batchedM.size() << std::endl;
+        // std::cout << "batchedN.size(): " << batchedN.size() << std::endl;
 
         static_assert(sizeof(KernelParams) <= 32 * 1024, "sizeof(KernelParams) has to be less or equal than 32KB");
 
@@ -241,35 +363,55 @@ struct KernelParams
         params.ptrScaleGate = ptrScaleGate;
 
         int32_t ctaOffset = 0;
-        params.totalNumPaddedTokens = 0;
-        for (int b = 0; b < numBatches; b++)
+
+        // Compute totalNumPaddedTokens, ctaIdxXyToBatchIdx and ctaIdxXyToMnLimit if the batch dims are
+        // known at kernel launch time. Otherwise, these parameters are defined in the device buffers:
+        // ptrTotalNumPaddedTokens, ptrCtaIdxXyToBatchIdx and ptrCtaIdxXyToMnLimit respectively.
+
+        if (isStaticBatch)
         {
-
-            int mM = batchM ? batchedM[b] : n;
-            int mN = batchM ? m : batchedN[b];
-
-            // Skip Tma descriptor creation if expert isn't used
-            if (mM == 0 || mN == 0)
-                continue;
-
-            int32_t numCta = batchM ? (mM + tileM - 1) / tileM : (mN + tileN - 1) / tileN;
-
-            int32_t tile = batchM ? tileM : tileN;
-            int32_t mn = batchM ? mM : mN;
-
-            TLLM_CHECK_ERROR(ctaOffset + numCta <= MaxNumCtas, "Too many CTAs");
-
-            for (int32_t cta = 0; cta < numCta; cta++)
+            params.totalNumPaddedTokens = 0;
+            for (int b = 0; b < numBatches; b++)
             {
-                params.ctaIdxXyToBatchIdx[ctaOffset + cta] = b;
-                // This is now an identity map and it is no longer needed.
-                // params.ctaIdxXyToTileIdxMn[ctaOffset + cta] = ctaOffset + cta;
-                params.ctaIdxXyToMnLimit[ctaOffset + cta]
-                    = std::min((ctaOffset + cta + 1) * tile, ctaOffset * tile + mn);
-            }
-            ctaOffset += numCta;
 
-            params.totalNumPaddedTokens += numCta * tile;
+                int mM = batchM ? batchedM[b] : n;
+                int mN = batchM ? m : batchedN[b];
+
+                // Skip Tma descriptor creation if expert isn't used
+                if (mM == 0 || mN == 0)
+                    continue;
+
+                // The number of CTAs.
+                int32_t numCtas = batchM ? (mM + tileM - 1) / tileM : (mN + tileN - 1) / tileN;
+                // The size of the tile.
+                int32_t tile = batchM ? tileM : tileN;
+                // The problem size.
+                int32_t mn = batchM ? mM : mN;
+                // In case of allToAllRouteAct, we run each expert with all input tokens.
+                int32_t tokensPerTile = allToAllRouteAct ? numTokens : mn;
+
+                // Make sure we do not exceed the launch limit.
+                TLLM_CHECK_ERROR(ctaOffset + numCtas <= MaxNumCtas, "Too many CTAs");
+
+                for (int32_t cta = 0; cta < numCtas; cta++)
+                {
+                    params.ctaIdxXyToBatchIdx[ctaOffset + cta] = b;
+                    // This is now an identity map and it is no longer needed.
+                    // params.ctaIdxXyToTileIdxMn[ctaOffset + cta] = ctaOffset + cta;
+                    params.ctaIdxXyToMnLimit[ctaOffset + cta]
+                        = std::min((ctaOffset + cta + 1) * tile, ctaOffset * tile + tokensPerTile);
+                }
+                ctaOffset += numCtas;
+
+                params.totalNumPaddedTokens += numCtas * tile;
+            }
+        }
+        else
+        {
+            params.ptrTotalNumPaddedTokens = ptrTotalNumPaddedTokens;
+            params.ptrCtaIdxXyToBatchIdx = ptrCtaIdxXyToBatchIdx;
+            params.ptrCtaIdxXyToMnLimit = ptrCtaIdxXyToMnLimit;
+            ctaOffset = MaxNumCtas;
         }
 
         if (useDeepSeekFp8 && dtypeElt == tg::Dtype::E4m3)
@@ -290,6 +432,7 @@ struct KernelParams
 
         params.ptrSfA = dSfA;
         params.ptrSfB = dSfB;
+        params.ptrSfC = dSfC;
 
         if (!batchM)
         {
@@ -303,30 +446,43 @@ struct KernelParams
             // Build tma descriptor for A.
             params.tmaA[0] = gemm::buildNdTmaDescriptor(dtypeElt, shapeA, strideA, tileM, tileK, ptrA);
 
+            // When the allToAllRouteAct, the input activations are packed [act0, act1, ...]
+            // Otherwise, the input is padded:
+            // [act0, padding, padding, ... TileN size .., act1, padding, padding, ...]
+            auto const inputNumTokens = allToAllRouteAct ? numTokens : permutedRowCount;
             // B is the activation
             // Shape/stride for gmem tensor B.
             auto [shapeB, strideB]
-                = makeTmaShapeStrideAbc(transposeMmaOutput, useFusedAct, m, ctaOffset * tileN, k, MatrixType::MatrixB);
+                = makeTmaShapeStrideAbc(transposeMmaOutput, useFusedAct, m, inputNumTokens, k, MatrixType::MatrixB);
+            // Load data from contiguous ptrToken buffer for allToAllRouteAct
+            auto ptrTokensB = allToAllRouteAct ? ptrTokens : ptrB;
             // Build tma descriptor for B.
-            params.tmaB[0] = gemm::buildNdTmaDescriptor(dtypeElt, shapeB, strideB, tileN, tileK, ptrB);
+            params.tmaB[0] = gemm::buildNdTmaDescriptor(dtypeElt, shapeB, strideB, tileN, tileK, ptrTokensB);
 
             if (dtypeElt == tg::Dtype::E2m1)
             {
                 const tg::Dtype dTypeSf = tg::Dtype::E4m3;
 
-                const int32_t numEltsPerSf = 16;
-
                 // Build TMA descriptor for gmem A block scale factors.
-                auto [shapeSfA, strideSfA] = makeTmaShapeStrideSfAb(m * numBatches, n, k, MatrixType::MatrixA);
-                auto tileShapesSfA = std::vector<uint32_t>{
-                    256, 2, static_cast<uint32_t>(tileK / numEltsPerSf / 4), static_cast<uint32_t>(tileM / 128)};
+                auto [shapeSfA, strideSfA, tileShapesSfA] = makeTmaShapeStrideSfAb(
+                    m * numBatches, n, k, MatrixType::MatrixA, tileM, tileN, tileK, tg::SfLayout::R128c4);
                 params.tmaSfA[0] = gemm::buildSfTmaDescriptor(dTypeSf, shapeSfA, strideSfA, tileShapesSfA, dSfA);
 
+                // When the allToAllRouteAct, the input activations are packed [act0, act1, ...]
+                // Otherwise, the input is padded:
+                // [act0, padding, padding, ... TileN size .., act1, padding, padding, ...]
+                //
+                // Due to the TileN=128 restriction, we must set num tokens
+                // per SfB to 128 for allToAllRouteAct.
+                auto const inputNumTokensSfB = allToAllRouteAct ? tileN : permutedRowCount;
+
+                // Load data from contiguous dSfTokens buffer for allToAllRouteAct
+                auto ptrSfTokensB = allToAllRouteAct ? dSfTokens : dSfB;
                 // Build TMA descriptor for gmem B block scale factors.
-                auto [shapeSfB, strideSfB] = makeTmaShapeStrideSfAb(m, ctaOffset * tileN, k, MatrixType::MatrixB);
-                auto tileShapesSfB = std::vector<uint32_t>{
-                    256, 2, static_cast<uint32_t>(tileK / numEltsPerSf / 4), static_cast<uint32_t>(tileN / 128)};
-                params.tmaSfB[0] = gemm::buildSfTmaDescriptor(dTypeSf, shapeSfB, strideSfB, tileShapesSfB, dSfB);
+                auto [shapeSfB, strideSfB, tileShapesSfB] = makeTmaShapeStrideSfAb(
+                    m, inputNumTokensSfB, k, MatrixType::MatrixB, tileM, tileN, tileK, sfLayoutB);
+                params.tmaSfB[0]
+                    = gemm::buildSfTmaDescriptor(dTypeSf, shapeSfB, strideSfB, tileShapesSfB, ptrSfTokensB);
             }
 
             // C is the output activation
@@ -334,7 +490,7 @@ struct KernelParams
             {
                 // Shape/stride for gmem tensor C.
                 auto [shapeC, strideC] = makeTmaShapeStrideAbc(
-                    transposeMmaOutput, useFusedAct, m, ctaOffset * tileN, k, MatrixType::MatrixC);
+                    transposeMmaOutput, useFusedAct, m, permutedRowCount, k, MatrixType::MatrixC);
 
                 // Swap M and N tiles for the M-major epilogue.
                 auto outputTileM = transposeMmaOutput ? epilogueTileN : epilogueTileM;
@@ -367,27 +523,41 @@ struct KernelParams
 
             // A is the activation
             // Shape/stride for gmem tensor A.
+            // When the allToAllRouteAct, the input activations are packed [act0, act1, ...]
+            // Otherwise, the input is padded:
+            // [act0, padding, padding, ... tileM size .., act1, padding, padding, ...]
+            auto const inputNumTokens = allToAllRouteAct ? numTokens : permutedRowCount;
             auto [shapeA, strideA]
-                = makeTmaShapeStrideAbc(transposeMmaOutput, useFusedAct, ctaOffset * tileM, n, k, MatrixType::MatrixA);
+                = makeTmaShapeStrideAbc(transposeMmaOutput, useFusedAct, inputNumTokens, n, k, MatrixType::MatrixA);
+            // Load data from contiguous ptrToken buffer for allToAllRouteAct
+            auto ptrTokensA = allToAllRouteAct ? ptrTokens : ptrA;
             // Build tma descriptor for A.
-            params.tmaA[0] = gemm::buildNdTmaDescriptor(dtypeElt, shapeA, strideA, tileM, tileK, ptrA);
+            params.tmaA[0] = gemm::buildNdTmaDescriptor(dtypeElt, shapeA, strideA, tileM, tileK, ptrTokensA);
 
             if (dtypeElt == tg::Dtype::E2m1)
             {
                 const tg::Dtype dTypeSf = tg::Dtype::E4m3;
 
-                const int32_t numEltsPerSf = 16;
+                // When the allToAllRouteAct, the input activations are packed [act0, act1, ...]
+                // Otherwise, the input is padded:
+                // [act0, padding, padding, ... tileM size .., act1, padding, padding, ...]
+                //
+                // Due to the tileM=128 restriction, we must set num tokens
+                // per SfA to 128 for allToAllRouteAct.
+                auto const inputNumTokensSfA = allToAllRouteAct ? tileM : permutedRowCount;
+
+                // Load data from contiguous dSfTokens buffer for allToAllRouteAct
+                auto ptrSfTokensA = allToAllRouteAct ? dSfTokens : dSfA;
 
                 // Build TMA descriptor for gmem A block scale factors.
-                auto [shapeSfA, strideSfA] = makeTmaShapeStrideSfAb(ctaOffset * tileM, n, k, MatrixType::MatrixA);
-                auto tileShapesSfA = std::vector<uint32_t>{
-                    256, 2, static_cast<uint32_t>(tileK / numEltsPerSf / 4), static_cast<uint32_t>(tileM / 128)};
-                params.tmaSfA[0] = gemm::buildSfTmaDescriptor(dTypeSf, shapeSfA, strideSfA, tileShapesSfA, dSfA);
+                auto [shapeSfA, strideSfA, tileShapesSfA] = makeTmaShapeStrideSfAb(
+                    inputNumTokensSfA, n, k, MatrixType::MatrixA, tileM, tileN, tileK, tg::SfLayout::R128c4);
+                params.tmaSfA[0]
+                    = gemm::buildSfTmaDescriptor(dTypeSf, shapeSfA, strideSfA, tileShapesSfA, ptrSfTokensA);
 
                 // Build TMA descriptor for gmem B block scale factors.
-                auto [shapeSfB, strideSfB] = makeTmaShapeStrideSfAb(m, n * numBatches, k, MatrixType::MatrixB);
-                auto tileShapesSfB = std::vector<uint32_t>{
-                    256, 2, static_cast<uint32_t>(tileK / numEltsPerSf / 4), static_cast<uint32_t>(tileN / 128)};
+                auto [shapeSfB, strideSfB, tileShapesSfB]
+                    = makeTmaShapeStrideSfAb(m, n * numBatches, k, MatrixType::MatrixB, tileM, tileN, tileK, sfLayoutB);
                 params.tmaSfB[0] = gemm::buildSfTmaDescriptor(dTypeSf, shapeSfB, strideSfB, tileShapesSfB, dSfB);
             }
 
@@ -396,7 +566,7 @@ struct KernelParams
             {
                 // Shape/stride for gmem tensor C.
                 auto [shapeC, strideC] = makeTmaShapeStrideAbc(
-                    transposeMmaOutput, useFusedAct, ctaOffset * tileM, n, k, MatrixType::MatrixC);
+                    transposeMmaOutput, useFusedAct, permutedRowCount, n, k, MatrixType::MatrixC);
 
                 // Swap M and N tiles for the M-major epilogue.
                 auto outputTileM = transposeMmaOutput ? epilogueTileN : epilogueTileM;
@@ -430,6 +600,8 @@ struct KernelParams
         params.ptrPartialRowMax = rowMax;
         params.ptrRowMaxCompletionBars = rowMaxBars;
 
+        params.ptrNumNonExitingCtas = ptrNumNonExitingCtas;
+
         return params;
     }
 
@@ -438,18 +610,26 @@ struct KernelParams
     template <class GemmOptions_>
     static KernelParams setKernelParams(GemmOptions_ const& options, void* ptrA, void* ptrB, void* ptrC,
         float const* ptrScaleC, float* dDqSfsA, float* dDqSfsB, float* dDqSfsC, void* dSfA, void* dSfB, void* dSfTokens,
-        float const* ptrScaleGate, void* ptrTokens, int32_t const* routeMap, float* dDqSfsTokens, float* rowMax,
-        uint32_t* rowMaxBars)
+        void* dSfC, float const* ptrScaleGate, void* ptrTokens, int32_t const* routeMap, float* dDqSfsTokens,
+        float* rowMax, uint32_t* rowMaxBars, int32_t* ptrNumNonExitingCtas = nullptr,
+        int32_t* ptrTotalNumPaddedTokens = nullptr, int32_t* ptrCtaIdxXyToBatchIdx = nullptr,
+        int32_t* ptrCtaIdxXyToMnLimit = nullptr)
     {
 
         bool const useFusedAct = options.mUseFusedAct;
+        // Taken from moe::getMaxPermutedPaddedCount
+        int const expandedRowCount = options.mNumTokens * options.mTopK;
+        int const maxPaddingRequired = ((options.mBatchM ? options.mTileM : options.mTileN) - 1) * options.mNumExperts;
+        const int32_t permutedRowCount = expandedRowCount + maxPaddingRequired;
 
-        return setKernelParams(options.mNumBatches, options.mNumTokens, options.mBatchM, options.mM, options.mN,
-            options.mK, options.mBatchedM, options.mBatchedN, options.mTileM, options.mTileN, options.mTileK,
-            options.mEpilogueTileM, options.mEpilogueTileN, options.mUseDeepSeekFp8, options.mUseTmaStore,
-            options.mTransposeMmaOutput, useFusedAct, options.mDtypeElt, options.mDtypeC, ptrA, ptrB, ptrC, ptrScaleC,
-            dDqSfsA, dDqSfsB, dDqSfsC, dSfA, dSfB, dSfTokens, ptrScaleGate, ptrTokens, routeMap, dDqSfsTokens, rowMax,
-            rowMaxBars);
+        return setKernelParams(options.mNumBatches, options.mNumTokens, permutedRowCount, options.mBatchM, options.mM,
+            options.mN, options.mK, options.mBatchedM, options.mBatchedN, options.mTileM, options.mTileN,
+            options.mTileK, options.mEpilogueTileM, options.mEpilogueTileN, options.mUseDeepSeekFp8,
+            options.mUseTmaStore, options.mTransposeMmaOutput, options.mSfLayoutB, useFusedAct,
+            options.mAllToAllRouteAct, options.mDtypeElt, options.mDtypeC, ptrA, ptrB, ptrC, ptrScaleC, dDqSfsA,
+            dDqSfsB, dDqSfsC, dSfA, dSfB, dSfTokens, dSfC, ptrScaleGate, ptrTokens, routeMap, dDqSfsTokens, rowMax,
+            rowMaxBars, options.mIsStaticBatch, ptrNumNonExitingCtas, ptrTotalNumPaddedTokens, ptrCtaIdxXyToBatchIdx,
+            ptrCtaIdxXyToMnLimit);
     }
 #endif
 };

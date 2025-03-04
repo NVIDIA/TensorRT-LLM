@@ -149,3 +149,29 @@ def test_fp4_batched_quantize(b, m, k, dtype, use_ue8m0):
     if not use_ue8m0:
         # The gap is too large for ue8m0, so we just make sure that it runs
         torch.testing.assert_allclose(a_pt, a, atol=1, rtol=0)
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize(
+    "b,m,k",
+    [
+        (1, 128, 4),
+        (1, 128, 8),
+        (1, 128, 128),
+        (1, 256, 4),
+        (1, 2048, 4),
+        (15, 128, 48),
+        (2, 255, 32),
+    ],
+)
+def test_fp4_sf_interleave(b, m, k):
+    shape = [m, k] if b is None else [b, m, k]
+    w = torch.randint(0, 256, shape, dtype=torch.uint8)
+    w_cuda = w.cuda()
+
+    # The cpu and cuda kernels are different
+    w_out_cpu = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(w)
+    w_out_cuda = torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(w_cuda)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_allclose(w_out_cpu.cuda(), w_out_cuda)

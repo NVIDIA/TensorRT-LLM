@@ -166,7 +166,7 @@ class TestFunctional(unittest.TestCase):
 
         if not use_ue8m0:
             # The gap is too large for ue8m0, so we just make sure that it runs
-            self.assertTrue(torch.allclose(a_pt, aq_fp32, atol=1, rtol=0))
+            self.assertTrue(torch.allclose(a_pt, aq_fp32, atol=0.3, rtol=0.3))
 
 
 class TestProfiling(unittest.TestCase):
