@@ -345,6 +345,8 @@ class MLA(nn.Module):
 
         if quant_mode.has_fp8_block_scales():
             mla_weight_dtype = torch.float8_e4m3fn
+            if config.moe_backend == "TRTLLM":
+                mla_weight_dtype = dtype
         else:
             mla_weight_dtype = dtype
 
@@ -496,6 +498,7 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams] = None,
     ) -> torch.Tensor:
+        assert hidden_states.dtype == torch.bfloat16, "Just for TRTLLM FP8 E2E test"
         if self.is_lite:
             compressed_kv, k_pe = self.fused_a(hidden_states).split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], -1)

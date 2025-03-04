@@ -20,6 +20,21 @@
 
 //// FIX
 #include "Dtype.h" // #include <trtllm/gen/Dtype.h>
+#include "Utils.h" // #include <trtllm/gen/Utils.h>
+
+namespace trtllm
+{
+namespace gen
+{
+template <typename T>
+inline T ceilDiv(T m, T n)
+{
+    return (m + n - T(1)) / n;
+}
+} // namespace gen
+} // namespace trtllm
+
+#include "Enums.h"
 
 namespace gemm
 {
@@ -31,14 +46,14 @@ namespace tg = trtllm::gen;
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Structure to manage memory allocation with configurable reuse
-class SmemAllocatorHelper
+class MemAllocatorHelper
 {
 public:
     // The default constructor.
-    SmemAllocatorHelper() {}
+    MemAllocatorHelper() {}
 
     // Constructor to initialize chunk sizes, alignments, and reuse flags
-    SmemAllocatorHelper(std::vector<std::pair<int32_t, int32_t>> const& sizes, std::vector<bool> const& reuse)
+    MemAllocatorHelper(std::vector<std::pair<int32_t, int32_t>> const& sizes, std::vector<bool> const& reuse)
         : mNumBytesAndAlignmentPerSmemChunk(sizes)
         , mFirstChunkReuse(reuse)
     {
@@ -119,113 +134,241 @@ public:
 
     // The constructor.
     KernelTraits(tg::Dtype dtypeElt, tg::Dtype dtypeC, tg::Dtype dtypeAcc, int32_t tileM, int32_t tileN, int32_t tileK,
-        int32_t epilogueTileM, int32_t epilogueTileN, int32_t numStages, int32_t numSlicesForSplitK, SplitK splitK,
-        bool useTmaStore, bool transposeMmaOutput, AllReduceAlgo allReduceAlgo, bool useDeepSeekFp8)
+        int32_t epilogueTileM, int32_t epilogueTileN, int32_t numStages, int32_t numStagesMma,
+        int32_t numSlicesForSplitK, int32_t numSlicesForSliceK, SplitK splitK, bool useTmaStore,
+        bool transposeMmaOutput, AllReduceAlgo allReduceAlgo, bool useDeepSeekFp8)
     {
-
-        // SMEM chunks
         //
-        // [smemA ] (1024B aligned)
-        // [smemB ] (1024B aligned)
-        // [gmemC0] (1024B aligned) (if needed)
-        // [gmemC1] (1024B aligned) (if needed)
-        // [rowMax] (16B aligned) (if needed)
+        // SMEM
         //
-        // SMEM for smemA and smemB might be repurposed and used for gmemC0 and gmemC1:
-        //
-        // [..smemA..][..smemB..]
-        // [..gmemC0..][..gmemC1..][..rowMax..]
-        //
-
-        std::vector<std::pair<int32_t, int32_t>> numBytesAndAlignmentPerSmemChunk;
-        std::vector<bool> firstChunkReuse;
-
-        // LoadA
         {
-            // Number of bytes in load A shared memory.
-            auto const numSmemBytesLoadA = numStages * tileM * tileK * tg::dtypeGetNumBits(dtypeElt) / 8 /* bits */;
-            // Number of bytes for load A alignment for TMA load.
-            auto const numBytesAlignmentLoadA = 1024;
-            // loadA is already at first chunk. No need to reuse it.
-            auto const reuseChunksSmemLoadA = false;
+            // [smemA        ] (1024B aligned)
+            // [smemB        ] (1024B aligned)
+            // [smemBShuffle ] (1024B aligned)
+            // [gmemC0       ] (1024B aligned) (if needed)
+            // [gmemC1       ] (1024B aligned) (if needed)
+            // [rowMax       ] (16B aligned) (if needed)
+            // [sliceK       ] (16B aligned) (if needed)
+            //
+            // SMEM for smemA and smemB might be repurposed and used for gmemC0 and gmemC1:
+            //
+            // [..smemA..][..smemB..][..smemBShuffle..]
+            // [..gmemC0..][..gmemC1..][..rowMax..][..sliceK..]
+            //
 
-            // Add info.
-            numBytesAndAlignmentPerSmemChunk.emplace_back(std::make_pair(numSmemBytesLoadA, numBytesAlignmentLoadA));
-            firstChunkReuse.emplace_back(reuseChunksSmemLoadA);
-        }
+            std::vector<std::pair<int32_t, int32_t>> numBytesAndAlignmentPerSmemChunk;
+            std::vector<bool> firstChunkReuseSmem;
 
-        // LoadB
-        {
-            // Number of bytes in load B shared memory.
-            auto const numSmemBytesLoadB = numStages * tileN * tileK * tg::dtypeGetNumBits(dtypeElt) / 8 /* bits */;
-            // Number of bytes for load B alignment for TMA load.
-            auto const numBytesAlignmentLoadB = 1024;
-            // No need to reuse the first chunk.
-            auto const reuseChunksSmemLoadB = false;
-
-            // Add info.
-            numBytesAndAlignmentPerSmemChunk.emplace_back(std::make_pair(numSmemBytesLoadB, numBytesAlignmentLoadB));
-            firstChunkReuse.emplace_back(reuseChunksSmemLoadB);
-        }
-
-        // GmemC
-        // FIXME we might need to fix this for GemmGatedAct, it needs less SMEM to store gated output.
-        for (int resIdx = 0; resIdx < 2; ++resIdx)
-        {
-            // Type of the data in the SMEM for GmemC
-            auto dtypeSmemC = dtypeC;
-            if (allReduceAlgo == AllReduceAlgo::TwoShot || numSlicesForSplitK > 1)
+            // LoadA
             {
-                dtypeSmemC = dtypeAcc;
-            }
-            // Smem is used for GmemC output tile for TMA store and SplitK in CGA.
-            bool usesSmemForGmemC = useTmaStore || doesSplitKUseDsmem(splitK);
-            // SMEM for at leader CTA in DSMEM split-k contains K slices.
-            auto extraGmemCMultiplier = doesSplitKUseDsmem(splitK) ? numSlicesForSplitK : 1;
-            if (resIdx != 0 && !useDeepSeekFp8)
-            {
-                // No data for Epilogue1 in case of non-DeepSeek GEMM.
-                extraGmemCMultiplier = 0;
+                // Number of bytes in load A shared memory.
+                auto const numSmemBytesLoadA = numStages * tileM * tileK * tg::dtypeGetNumBits(dtypeElt) / 8 /* bits */;
+                // Number of bytes for load A alignment for TMA load.
+                auto const numBytesAlignmentLoadA = 1024;
+                // loadA is already at first chunk. No need to reuse it.
+                auto const reuseChunksSmemLoadA = false;
+
+                // Add info.
+                numBytesAndAlignmentPerSmemChunk.emplace_back(
+                    std::make_pair(numSmemBytesLoadA, numBytesAlignmentLoadA));
+                firstChunkReuseSmem.emplace_back(reuseChunksSmemLoadA);
             }
 
-            // Number of bytes to store the output in smem.
-            auto const numBytesSmemStoreC = usesSmemForGmemC
-                ? extraGmemCMultiplier * epilogueTileM * epilogueTileN * tg::dtypeGetNumBits(dtypeSmemC) / 8 /* bits */
-                : 0;
-            // Number of bytes for store C alignment for TMA store.
-            auto const numBytesAlignmentStoreC = 1024;
-            // gmemC reuses loadAb memory for split-K in DSMEM.
-            // Epilogue1 does not reuse and continues after the memory allocated Epilogue0
-            // NOTE: we can always reuse loadAb SMEM as long as we don't have persistent scheduler.
-            auto const reuseFirstChunksSmemStoreC = doesSplitKUseDsmem(splitK) && resIdx == 0;
+            // LoadB
+            {
+                // Number of bytes in load B shared memory.
+                auto const numSmemBytesLoadB = numStages * tileN * tileK * tg::dtypeGetNumBits(dtypeElt) / 8 /* bits */;
+                // Number of bytes for load B alignment for TMA load.
+                auto const numBytesAlignmentLoadB = 1024;
+                // No need to reuse the first chunk.
+                auto const reuseChunksSmemLoadB = false;
 
-            // Add info.
-            numBytesAndAlignmentPerSmemChunk.emplace_back(std::make_pair(numBytesSmemStoreC, numBytesAlignmentStoreC));
-            firstChunkReuse.emplace_back(reuseFirstChunksSmemStoreC);
+                // Add info.
+                numBytesAndAlignmentPerSmemChunk.emplace_back(
+                    std::make_pair(numSmemBytesLoadB, numBytesAlignmentLoadB));
+                firstChunkReuseSmem.emplace_back(reuseChunksSmemLoadB);
+            }
+
+            // SmemBShuffle
+            // FIXME: we should be able either:
+            // - Do modification in-place. For that we need to resolve pipeline dependency between
+            // smemB -> shuffleSmemB -> mma
+            // - Do 4 TMA SW32 loads or several LDGSTS loads.
+            {
+                // Number of bytes in save shuffled B in shared memory.
+                auto const numSmemBytesLoadB = numSlicesForSliceK > 1
+                    ? numStages * tileN * tileK * tg::dtypeGetNumBits(dtypeElt) / 8 /* bits */
+                    : 0;
+                // Number of bytes for load B alignment for TMA load.
+                auto const numBytesAlignmentLoadB = 1024;
+                // No need to reuse the first chunk.
+                auto const reuseChunksSmemLoadB = false;
+
+                // Add info.
+                numBytesAndAlignmentPerSmemChunk.emplace_back(
+                    std::make_pair(numSmemBytesLoadB, numBytesAlignmentLoadB));
+                firstChunkReuseSmem.emplace_back(reuseChunksSmemLoadB);
+            }
+
+            // GmemC
+            // FIXME we might need to fix this for GemmGatedAct, it needs less SMEM to store gated output.
+            for (int resIdx = 0; resIdx < 2; ++resIdx)
+            {
+                // Type of the data in the SMEM for GmemC
+                auto dtypeSmemC = dtypeC;
+                if (allReduceAlgo == AllReduceAlgo::TwoShot || numSlicesForSplitK > 1)
+                {
+                    dtypeSmemC = dtypeAcc;
+                }
+                // Smem is used for GmemC output tile for TMA store and SplitK in CGA.
+                bool usesSmemForGmemC = useTmaStore || doesSplitKUseDsmem(splitK);
+                // SMEM for at leader CTA in DSMEM split-k contains K slices.
+                auto extraGmemCMultiplier = doesSplitKUseDsmem(splitK) ? numSlicesForSplitK : 1;
+                if (numSlicesForSliceK > 1)
+                {
+                    // TileN is expanded in N dimension for slice-K.
+                    extraGmemCMultiplier *= numSlicesForSliceK;
+                }
+
+                if (resIdx != 0 && !useDeepSeekFp8)
+                {
+                    // No data for Epilogue1 in case of non-DeepSeek GEMM.
+                    extraGmemCMultiplier = 0;
+                }
+
+                // Number of bytes to store the output in smem.
+                auto const numBytesSmemStoreC = usesSmemForGmemC ? extraGmemCMultiplier * epilogueTileM * epilogueTileN
+                        * tg::dtypeGetNumBits(dtypeSmemC) / 8 /* bits */
+                                                                 : 0;
+                // Number of bytes for store C alignment for TMA store.
+                auto const numBytesAlignmentStoreC = 1024;
+                // gmemC reuses loadAb memory for split-K in DSMEM.
+                // Epilogue1 does not reuse and continues after the memory allocated Epilogue0
+                // NOTE: we can always reuse loadAb SMEM as long as we don't have persistent scheduler.
+                auto const reuseFirstChunksSmemStoreC = doesSplitKUseDsmem(splitK) && resIdx == 0;
+
+                // Add info.
+                numBytesAndAlignmentPerSmemChunk.emplace_back(
+                    std::make_pair(numBytesSmemStoreC, numBytesAlignmentStoreC));
+                firstChunkReuseSmem.emplace_back(reuseFirstChunksSmemStoreC);
+            }
+
+            // RowMax
+            {
+                // Number of dqSfsC per CTA.
+                auto const numDqSfsCPerCta = transposeMmaOutput ? tileM : tileN;
+                // Number of bytes for rowMax in SMEM.
+                auto const numBytesSmemRowMax
+                    = (useDeepSeekFp8 ? numDqSfsCPerCta : 0) * tg::dtypeGetNumBits(tg::Dtype::Fp32) / 8 /* bits */;
+                // Number of bytes alignment for rowMax in SMEM.
+                auto const numBytesAlignmentRowMax = 16;
+
+                // Add info.
+                numBytesAndAlignmentPerSmemChunk.emplace_back(
+                    std::make_pair(numBytesSmemRowMax, numBytesAlignmentRowMax));
+                firstChunkReuseSmem.emplace_back(false);
+            }
+
+            // SliceK
+            {
+                // Real tile size before slice-K reduction.
+                auto const tileSize
+                    = numSlicesForSliceK > 1 ? numSlicesForSliceK * tileM * numSlicesForSliceK * tileN : 0;
+                // Number of bytes for tile in SMEM.
+                auto const numBytesSmemTile = tileSize * tg::dtypeGetNumBits(dtypeAcc) / 8 /* bits */;
+                // Number of bytes alignment for rowMax in SMEM.
+                auto const numBytesAlignmentTile = 16;
+
+                // Add info.
+                numBytesAndAlignmentPerSmemChunk.emplace_back(std::make_pair(numBytesSmemTile, numBytesAlignmentTile));
+                firstChunkReuseSmem.emplace_back(false);
+            }
+
+            // Create SMEM helper object.
+            mSmemAllocatorHelper = MemAllocatorHelper(numBytesAndAlignmentPerSmemChunk, firstChunkReuseSmem);
         }
 
-        // RowMax
+        //
+        // TMEM
+        //
+        // [..D..][..A..][.SfA.][.SfB.]
         {
-            // Number of dqSfsC per CTA.
-            auto const numDqSfsCPerCta = transposeMmaOutput ? tileM : tileN;
-            // Number of bytes for rowMax in SMEM.
-            auto const numBytesSmemRowMax
-                = (useDeepSeekFp8 ? numDqSfsCPerCta : 0) * tg::dtypeGetNumBits(tg::Dtype::Fp32) / 8 /* bits */;
-            // Number of bytes alignment for rowMax in SMEM.
-            auto const numBytesAlignmentRowMax = 16;
+            std::vector<std::pair<int32_t, int32_t>> numBytesAndAlignmentPerTmemChunk;
+            std::vector<bool> firstChunkReuseTmem;
 
-            // Add info.
-            numBytesAndAlignmentPerSmemChunk.emplace_back(std::make_pair(numBytesSmemRowMax, numBytesAlignmentRowMax));
-            firstChunkReuse.emplace_back(false);
+            // Matrix D
+            {
+                // Number of columns for accumulators.
+                auto const numTmemColsD = numSlicesForSliceK * tileN * numStagesMma * tg::dtypeGetNumBits(dtypeAcc)
+                    / tg::dtypeGetNumBits(tg::Dtype::UInt32);
+                // Number of columns for D alignment.
+                auto const numColsAlignmentD = 2;
+                // No need to reuse TMEM.
+                auto const reuseChunksTmemD = false;
+
+                // Add info.
+                numBytesAndAlignmentPerTmemChunk.emplace_back(std::make_pair(numTmemColsD, numColsAlignmentD));
+                firstChunkReuseTmem.emplace_back(reuseChunksTmemD);
+            }
+
+            // Matrix A
+            {
+                // Number of columns for A.
+                auto const numTmemColsA = numSlicesForSliceK > 1 ? numStages * tileK
+                        / (numSlicesForSliceK * tg::dtypeGetNumBits(tg::Dtype::UInt32) / tg::dtypeGetNumBits(dtypeElt))
+                                                                 : 0;
+                // Number of columns for A alignment.
+                auto const numColsAlignmentA = 4;
+                // No need to reuse TMEM.
+                auto const reuseChunksTmemA = false;
+
+                // Add info.
+                numBytesAndAlignmentPerTmemChunk.emplace_back(std::make_pair(numTmemColsA, numColsAlignmentA));
+                firstChunkReuseTmem.emplace_back(reuseChunksTmemA);
+            }
+
+            bool const useBlockScaling = tg::dtypeIsBlockFmt(dtypeElt);
+
+            // Sf A
+            {
+                // Number of columns for scaling factors of A.
+                auto const numTmemColsSfA
+                    = useBlockScaling ? ((tileK / 64) * 2 * tg::ceilDiv(tileM, 64)) * numStages : 0;
+                // Number of columns for Sf alignment.
+                auto const numColsAlignmentSfA = 2;
+                // No need to reuse TMEM.
+                auto const reuseChunksTmemSfA = false;
+
+                // Add info.
+                numBytesAndAlignmentPerTmemChunk.emplace_back(std::make_pair(numTmemColsSfA, numColsAlignmentSfA));
+                firstChunkReuseTmem.emplace_back(reuseChunksTmemSfA);
+            }
+
+            // Sf B
+            {
+                // Number of columns for scaling factors of B.
+                auto const numTmemColsSfB
+                    = useBlockScaling ? ((tileK / 64) * 2 * tg::ceilDiv(tileN, 64)) * numStages : 0;
+                // Number of columns for Sf alignment.
+                auto const numColsAlignmentSfB = 2;
+                // No need to reuse TMEM.
+                auto const reuseChunksTmemSfB = false;
+
+                // Add info.
+                numBytesAndAlignmentPerTmemChunk.emplace_back(std::make_pair(numTmemColsSfB, numColsAlignmentSfB));
+                firstChunkReuseTmem.emplace_back(reuseChunksTmemSfB);
+            }
+
+            // Create TMEM helper object.
+            mTmemAllocatorHelper = MemAllocatorHelper(numBytesAndAlignmentPerTmemChunk, firstChunkReuseTmem);
         }
-
-        // Create SMEM helper object.
-        mSmemAllocatorHelper = SmemAllocatorHelper(numBytesAndAlignmentPerSmemChunk, firstChunkReuse);
     }
 
 public:
-    // Helper for smem allocation.
-    SmemAllocatorHelper mSmemAllocatorHelper;
+    // Helper for SMEM allocation.
+    MemAllocatorHelper mSmemAllocatorHelper;
+    // Helper for TMEM allocation.
+    MemAllocatorHelper mTmemAllocatorHelper;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -233,6 +376,13 @@ public:
 inline int32_t getSmemBufferSize(KernelTraits traits)
 {
     return traits.mSmemAllocatorHelper.getTotalSize();
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline int32_t getTmemBufferSize(KernelTraits traits)
+{
+    return traits.mTmemAllocatorHelper.getTotalSize();
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -262,16 +412,62 @@ inline int32_t getSmemOffsetLoadAb(KernelTraits traits)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+inline int32_t getSmemOffsetLoadShuffleB(KernelTraits traits)
+{
+    return traits.mSmemAllocatorHelper.getChunkOffset(2);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 inline int32_t getSmemOffsetGmemC(KernelTraits traits, int resIdx = 0)
 {
-    return traits.mSmemAllocatorHelper.getChunkOffset(2 + resIdx);
+    return traits.mSmemAllocatorHelper.getChunkOffset(3 + resIdx);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline int32_t getSmemOffsetRowMax(KernelTraits traits)
 {
-    return traits.mSmemAllocatorHelper.getChunkOffset(4);
+    return traits.mSmemAllocatorHelper.getChunkOffset(5);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline int32_t getSmemOffsetSliceK(KernelTraits traits)
+{
+    return traits.mSmemAllocatorHelper.getChunkOffset(6);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+//
+// Starting address of each TMEM buffer.
+//
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline int32_t getTmemOffsetD(KernelTraits traits)
+{
+    return traits.mTmemAllocatorHelper.getChunkOffset(0);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline int32_t getTmemOffsetA(KernelTraits traits)
+{
+    return traits.mTmemAllocatorHelper.getChunkOffset(1);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline int32_t getTmemOffsetSfA(KernelTraits traits)
+{
+    return traits.mTmemAllocatorHelper.getChunkOffset(2);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline int32_t getTmemOffsetSfB(KernelTraits traits)
+{
+    return traits.mTmemAllocatorHelper.getChunkOffset(3);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

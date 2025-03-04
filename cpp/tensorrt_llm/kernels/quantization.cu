@@ -259,7 +259,7 @@ void invokeBatchedFP4Quantization(int b, int m, int n, __nv_fp8_e4m3 const* inpu
     dim3 block(std::min(int(n / CVT_FP8_TO_FP4_ELTS_PER_THREAD), 512));
     // Get number of blocks per SM (assume we can fully utilize the SM).
     int const numBlocksPerSM = 2048 / block.x;
-    dim3 grid(std::min(int(m), multiProcessorCount * numBlocksPerSM));
+    dim3 grid(std::min(m, multiProcessorCount * numBlocksPerSM));
 
     // Launch the cvt kernel.
     if (useUE8M0)
@@ -276,6 +276,19 @@ void invokeBatchedFP4Quantization(int b, int m, int n, __nv_fp8_e4m3 const* inpu
     }
 }
 #endif
+
+// This is intended for weight loading, so m and n are large, b <= 256
+void invokeNVFP4BlockScaleInterleave(
+    int b, int m, int n, uint8_t const* SFIn, uint8_t* SFOutput, int multiProcessorCount, cudaStream_t stream)
+{
+    // Each thread reads 1 int8 value
+    dim3 block(std::min(n, 1024));
+    // Get number of blocks per SM (assume we can fully utilize the SM).
+    int const numBlocksPerSM = 4096 / block.x;
+    dim3 grid(std::min(m, multiProcessorCount * numBlocksPerSM));
+
+    nvfp4_block_scale_interleave_kernel<<<grid, block, 0, stream>>>(b, m, n, SFIn, SFOutput);
+}
 
 // Instantiate the function.
 template void invokeFP4Quantization(int m, int n, half const* input, float const* SFScale, int64_t* output,
