@@ -1,67 +1,75 @@
-### Control generated text using logits post processor
-import typing as tp
+### Control generated text using logits processor
+from typing import List, Optional
 
 import torch
 
-from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm import LLM
+from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
+                                          LogitsProcessor, SamplingParams)
 
 
-def get_allowed_tokens(ids):
-    return 42
-
-
-# Define the logits post-processor callback. This simple callback will output
-# a specific token at each step irrespective of prompt.
+# The recommended way to create a customized logits processor:
+#     * Subclass this class and implement the processing logics in the __call__ method.
+#     * Create an instance and pass to SamplingParams.
+# Alternatively, you can create any callable with the same signature with the __call__ method.
+# This simple callback will output a specific token at each step irrespective of prompt.
 # Refer to ../bindings/executor/example_logits_processor.py for a more
 # sophisticated callback that generates JSON structured output.
-def logits_post_processor(req_id: int, logits: torch.Tensor,
-                          token_ids: tp.List[tp.List[int]], stream_ptr: int,
-                          client_id: tp.Optional[int]):
-    mask = torch.full_like(logits, fill_value=float("-inf"), device="cpu")
-    allowed = get_allowed_tokens(token_ids)
-    mask[:, :, allowed] = 0
+class MyLogitsProcessor(LogitsProcessor):
 
-    with torch.cuda.stream(torch.cuda.ExternalStream(stream_ptr)):
-        mask = mask.to(logits.device, non_blocking=True)
-        logits += mask
+    def __init__(self, allowed_token_id: int):
+        self.allowed_token_id = allowed_token_id
+
+    def __call__(self, req_id: int, logits: torch.Tensor,
+                 token_ids: List[List[int]], stream_ptr: int,
+                 client_id: Optional[int]):
+        mask = torch.full_like(logits, fill_value=float("-inf"), device="cpu")
+        mask[:, :, self.allowed_token_id] = 0
+
+        with torch.cuda.stream(torch.cuda.ExternalStream(stream_ptr)):
+            mask = mask.to(logits.device, non_blocking=True)
+            logits += mask
 
 
-# Define batched processor in which arguments for all requests in a batch are made available as lists.
+# The recommended way to create a customized batched logits processor:
+#     * Subclass this class and implement the processing logics in the __call__ method.
+#     * Create an instance and pass to LLM.
+# Alternatively, you can create any callable with the same signature with the __call__ method.
+# A batched logits processor's arguments for all requests in a batch are made available as lists.
 # This helps user optimize the callback for large batch sizes. For example:
 # 1. Process more work on host, e.g. running a JSON state machine, in parallel with model forward pass on device.
 # 2. Coalesce H2D memory transfers for all requests into a single cudaMemcpyAsync call.
 # 3. Launch a single batched kernel, e.g. for updating logits on device.
-def logits_post_processor_batched(
-        req_ids_batch: tp.List[int], logits_batch: tp.List[torch.Tensor],
-        token_ids_batch: tp.List[tp.List[tp.List[int]]], stream_ptr,
-        client_ids_batch: tp.List[tp.Optional[int]]):
-    # Generate masks for all requests on host
-    masks = []
-    for req_id, logits, token_ids, client_id in zip(req_ids_batch, logits_batch,
-                                                    token_ids_batch,
-                                                    client_ids_batch):
-        mask = torch.full_like(logits, fill_value=float("-inf"), device="cpu")
-        allowed = get_allowed_tokens(token_ids)
-        mask[:, :, allowed] = 0
-        masks.append(mask)
+class MyBatchedLogitsProcessor(BatchedLogitsProcessor):
 
-    # Move masks to device and add to logits using non-blocking operations
-    with torch.cuda.stream(torch.cuda.ExternalStream(stream_ptr)):
-        for logits, mask in zip(logits_batch, masks):
-            logits += mask.to(logits.device, non_blocking=True)
+    def __init__(self, allowed_token_id: int):
+        self.allowed_token_id = allowed_token_id
+
+    def __call__(self, req_ids: List[int], logits: List[torch.Tensor],
+                 token_ids: List[List[List[int]]], stream_ptr: int,
+                 client_ids: List[Optional[int]]):
+        # Generate masks for all requests on host
+        masks = []
+        for req_id, req_logits, req_token_ids, client_id in zip(
+                req_ids, logits, token_ids, client_ids):
+            mask = torch.full_like(req_logits,
+                                   fill_value=float("-inf"),
+                                   device="cpu")
+            mask[:, :, self.allowed_token_id] = 0
+            masks.append(mask)
+
+        # Move masks to device and add to logits using non-blocking operations
+        with torch.cuda.stream(torch.cuda.ExternalStream(stream_ptr)):
+            for req_logits, mask in zip(logits, masks):
+                req_logits += mask.to(req_logits.device, non_blocking=True)
 
 
 def main():
 
-    # Several callbacks can be specified when initializing LLM. In addition to multiple non-batched callbacks,
-    # a single batched callback can be specified using the key SamplingParams.BATCHED_POST_PROCESSOR_NAME
-    llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-              logits_post_processor_map={
-                  "my_logits_pp":
-                  logits_post_processor,
-                  SamplingParams.BATCHED_POST_PROCESSOR_NAME:
-                  logits_post_processor_batched
-              })
+    # Batched logits processor should be specified when initializing LLM.
+    llm = LLM(
+        model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        batched_logits_processor=MyBatchedLogitsProcessor(allowed_token_id=42))
 
     # Sample prompts
     prompts = [
@@ -71,15 +79,15 @@ def main():
 
     # Generate text
     for prompt_id, prompt in enumerate(prompts):
-        # We will use non-batched logits post processor callback only for odd-numbered prompts
+        # Use non-batched logits processor callback only for odd-numbered prompts
         if prompt_id % 2 == 0:
             sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
         else:
-            # Each prompt can use one callback from the choices that were provided to LLM
+            # Each prompt can be specified with a logits processor at runtime
             sampling_params = SamplingParams(
                 temperature=0.8,
                 top_p=0.95,
-                logits_post_processor_name='my_logits_pp')
+                logits_processor=MyLogitsProcessor(allowed_token_id=42))
 
         for output in llm.generate([prompt], sampling_params):
             print(
@@ -91,8 +99,7 @@ def main():
     # Prompt: 'The president of the United States is', Generated text: "''''''''''''''''''''''''''''''''"
 
     # Use batched processor with batch size = 2
-    sampling_params = SamplingParams(
-        logits_post_processor_name=SamplingParams.BATCHED_POST_PROCESSOR_NAME)
+    sampling_params = SamplingParams(apply_batched_logits_processor=True)
     for output in llm.generate(prompts, sampling_params):
         print(
             f"Prompt: {output.prompt!r}, Generated text: {output.outputs[0].text!r}"

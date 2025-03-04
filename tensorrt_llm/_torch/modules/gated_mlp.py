@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from ..custom_op import IS_FLASHINFER_AVAIABLE
-from ..distributed import ParallelConfig, TensorParallelMode
+from ..distributed import AllReduceParams, ParallelConfig, TensorParallelMode
 from ..model_config import ModelConfig
 from .linear import Linear, WeightMode, WeightsLoadingConfig
 
@@ -78,11 +78,15 @@ class GatedMLP(nn.Module):
             skip_create_weights=config.skip_create_weights,
         )
 
-    def forward(self,
-                x: torch.Tensor,
-                all_rank_num_tokens=None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        all_rank_num_tokens=None,
+        final_all_reduce_params: Optional[AllReduceParams] = None
+    ) -> torch.Tensor:
         if self.activation == F.silu:
-            return self.down_proj(swiglu(self.gate_up_proj(x)))
+            return self.down_proj(swiglu(self.gate_up_proj(x)),
+                                  all_reduce_params=final_all_reduce_params)
         else:
             raise NotImplementedError(
                 f"Activation {self.activation} not yet implemented for fused GatedMLP"

@@ -22,13 +22,21 @@ def backend(request):
     return request.param
 
 
+@pytest.fixture(scope="module",
+                params=[0, 2],
+                ids=["disable_processpool", "enable_processpool"])
+def num_postprocess_workers(request):
+    return request.param
+
+
 @pytest.fixture(scope="module")
-def server(model_name: str, backend: str):
+def server(model_name: str, backend: str, num_postprocess_workers: int):
     model_path = get_model_path(model_name)
     if backend == "pytorch":
         args = ["--backend", f"{backend}"]
     else:
         args = ["--max_beam_width", "4"]
+    args.extend(["--num_postprocess_workers", f"{num_postprocess_workers}"])
     with RemoteOpenAIServer(model_path, args) as remote_server:
         yield remote_server
 
@@ -43,10 +51,41 @@ def async_client(server: RemoteOpenAIServer):
     return server.get_async_client()
 
 
+def test_single_completion(client: openai.OpenAI, model_name):
+    completion = client.completions.create(
+        model=model_name,
+        prompt="Hello, my name is",
+        max_tokens=5,
+        temperature=0.0,
+    )
+
+    choice = completion.choices[0]
+    assert len(choice.text) >= 5
+    assert choice.finish_reason == "length"
+    assert completion.id is not None
+    assert completion.choices is not None and len(completion.choices) == 1
+    completion_tokens = 5
+    prompt_tokens = 6
+    assert completion.usage == openai.types.CompletionUsage(
+        completion_tokens=completion_tokens,
+        prompt_tokens=prompt_tokens,
+        total_tokens=prompt_tokens + completion_tokens)
+
+    # test using token IDs
+    completion = client.completions.create(
+        model=model_name,
+        prompt=[0, 0, 0, 0, 0],
+        max_tokens=5,
+        temperature=0.0,
+    )
+    assert len(completion.choices[0].text) >= 1
+
+
 @pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.parametrize("echo", [True, False])
 async def test_completion_streaming(async_client: openai.AsyncOpenAI,
                                     model_name: str, echo: bool):
+    # place this function here to avoid OAI completion bug
     prompt = "Hello, my name is"
 
     single_completion = await async_client.completions.create(
@@ -75,34 +114,6 @@ async def test_completion_streaming(async_client: openai.AsyncOpenAI,
     assert chunk.choices[0].finish_reason == "length"
     assert chunk.choices[0].text
     assert "".join(chunks) == single_output
-
-
-def test_single_completion(client: openai.OpenAI, model_name):
-    completion = client.completions.create(
-        model=model_name,
-        prompt="Hello, my name is",
-        max_tokens=5,
-        temperature=0.0,
-    )
-
-    choice = completion.choices[0]
-    assert len(choice.text) >= 5
-    assert choice.finish_reason == "length"
-    assert completion.id is not None
-    assert completion.choices is not None and len(completion.choices) == 1
-
-    assert completion.usage == openai.types.CompletionUsage(completion_tokens=5,
-                                                            prompt_tokens=6,
-                                                            total_tokens=11)
-
-    # test using token IDs
-    completion = client.completions.create(
-        model=model_name,
-        prompt=[0, 0, 0, 0, 0],
-        max_tokens=5,
-        temperature=0.0,
-    )
-    assert len(completion.choices[0].text) >= 1
 
 
 @pytest.mark.asyncio(loop_scope="module")

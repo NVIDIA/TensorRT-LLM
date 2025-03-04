@@ -73,7 +73,7 @@ BertAttentionPlugin::BertAttentionPlugin(int num_heads, int head_size, float q_s
         std::vector<int> blockSizeCombination
             = {sage_attn_q_block_size, sage_attn_k_block_size, sage_attn_v_block_size};
         if (mSageAttnSupportedBlockSizes.find(blockSizeCombination) == mSageAttnSupportedBlockSizes.end()
-            || head_size != 128)
+            || head_size == 128 || head_size == 72 || head_size == 80)
         {
             TLLM_LOG_WARNING(" Q, k ,v quant block size not support. disable sage attention");
             mSageAttn = false;
@@ -185,8 +185,9 @@ size_t BertAttentionPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* i
         = mEnableContextFMHA ? 0 : sizeof(float) * batch_size * mNumHeads * input_seq_len * input_seq_len;
     size_t const padding_offset_size = mEnableContextFMHA ? 0 : sizeof(int) * batch_size * input_seq_len;
     size_t const fmha_scheduler_counter = mEnableContextFMHA ? sizeof(uint32_t) : 0;
-
-    const size_t quanted_qkv_size = mSageAttn ? batch_size * input_seq_len * mNumHeads * mHeadSize * 3 : 0;
+    int const paddedHeadSize = mSageAttn ? ((mHeadSize + 15) / 16) * 16 : mHeadSize;
+    const size_t quanted_qkv_size
+        = mSageAttn ? sizeof(__nv_fp8_e4m3) * batch_size * input_seq_len * mNumHeads * paddedHeadSize * 3 : 0;
     const size_t q_scale_size = mSageAttn
         ? sizeof(float) * batch_size * ((input_seq_len + mSageAttnQBlockSize - 1) / mSageAttnQBlockSize) * mNumHeads
         : 0;
@@ -198,7 +199,13 @@ size_t BertAttentionPlugin::getWorkspaceSize(nvinfer1::PluginTensorDesc const* i
         : 0;
     const size_t scale_bmm1_device_size = mSageAttn ? sizeof(float) * 2 : 0;
     const size_t scale_bmm2_device_size = mSageAttn ? sizeof(float) : 0;
-    const size_t sage_quant_space_size = mSageAttn ? sizeof(float) * batch_size * mNumHeads * mHeadSize : 0;
+    size_t sage_quant_space_size = mSageAttn ? sizeof(float) * batch_size * mNumHeads * mHeadSize : 0;
+
+    if (paddedHeadSize != mHeadSize)
+        sage_quant_space_size
+            = sage_quant_space_size < (batch_size * input_seq_len * mNumHeads * paddedHeadSize * sizeof(__nv_bfloat16))
+            ? (batch_size * input_seq_len * mNumHeads * paddedHeadSize * sizeof(__nv_bfloat16))
+            : sage_quant_space_size;
 
     int const NUM_BUFFERS = 18;
     size_t workspaces[NUM_BUFFERS];
@@ -286,7 +293,9 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
     size_t const padding_offset_size = mEnableContextFMHA ? 0 : sizeof(int) * batch_size * input_seq_len;
     size_t const fmha_scheduler_counter = mEnableContextFMHA ? sizeof(uint32_t) : 0;
 
-    const size_t quanted_qkv_size = mSageAttn ? batch_size * input_seq_len * mNumHeads * mHeadSize * 3 : 0;
+    int const paddedHeadSize = mSageAttn ? ((mHeadSize + 15) / 16) * 16 : mHeadSize;
+    const size_t quanted_qkv_size
+        = mSageAttn ? sizeof(__nv_fp8_e4m3) * batch_size * input_seq_len * mNumHeads * paddedHeadSize * 3 : 0;
     const size_t q_scale_size = mSageAttn
         ? sizeof(float) * batch_size * ((input_seq_len + mSageAttnQBlockSize - 1) / mSageAttnQBlockSize) * mNumHeads
         : 0;
@@ -298,7 +307,13 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
         : 0;
     const size_t scale_bmm1_device_size = mSageAttn ? sizeof(float) * 2 : 0;
     const size_t scale_bmm2_device_size = mSageAttn ? sizeof(float) : 0;
-    const size_t sage_quant_space_size = mSageAttn ? sizeof(float) * batch_size * mNumHeads * mHeadSize : 0;
+    size_t sage_quant_space_size = mSageAttn ? sizeof(float) * batch_size * mNumHeads * mHeadSize : 0;
+
+    if (paddedHeadSize != mHeadSize)
+        sage_quant_space_size
+            = sage_quant_space_size < (batch_size * input_seq_len * mNumHeads * paddedHeadSize * sizeof(__nv_bfloat16))
+            ? (batch_size * input_seq_len * mNumHeads * paddedHeadSize * sizeof(__nv_bfloat16))
+            : sage_quant_space_size;
 
     // Workspace pointer shift
     int8_t* workspace_byte_ptr = reinterpret_cast<int8_t*>(workspace);
@@ -367,25 +382,139 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
     // We update mEnableContextFMHA in constructor to check this condition
     if (mEnableContextFMHA)
     {
-        if (mSageAttn && mHeadSize == 128 && mSageAttnQBlockSize == 64 && mSageAttnKBlockSize == 64
+        if (mSageAttn && mHeadSize == 72 && mSageAttnQBlockSize == 64 && mSageAttnKBlockSize == 64
             && mSageAttnVBlockSize == 256)
         {
-            // right now, this kernel only support 128 headsize
-            sage_quant<128, 64, 64, 256, __nv_bfloat16, __nv_fp8_e4m3, float>(
+            sage_quant<72, 80, 64, 64, 256, __nv_bfloat16, __nv_fp8_e4m3, float>(
                 // host var
                 batch_size, mNumHeads, input_seq_len, true, true,
-                // device var q, k, v
+                // device var
+                // q k v
                 attention_input, attention_input + mNumHeads * mHeadSize, attention_input + 2 * mNumHeads * mHeadSize,
                 // stride
                 3 * mNumHeads * mHeadSize, 3 * mNumHeads * mHeadSize, 3 * mNumHeads * mHeadSize, cu_seqlens, cu_seqlens,
                 sage_quant_space_ptr,
-                // quanted q k v
-                quanted_qkv_ptr, quanted_qkv_ptr + mNumHeads * mHeadSize, quanted_qkv_ptr + 2 * mNumHeads * mHeadSize,
+                // quant q k v
+                quanted_qkv_ptr, quanted_qkv_ptr + mNumHeads * paddedHeadSize,
+                quanted_qkv_ptr + 2 * mNumHeads * paddedHeadSize,
+                // quanted_qkv_ptr, quanted_qkv_ptr + mNumHeads * mHeadSize, context,
+                3 * mNumHeads * paddedHeadSize, 3 * mNumHeads * paddedHeadSize, 3 * mNumHeads * paddedHeadSize,
                 // scales
                 q_scale_ptr, k_scale_ptr, v_scale_ptr, stream);
 
             sync_check_cuda_error();
         }
+        if (mSageAttn && mHeadSize == 80 && mSageAttnQBlockSize == 64 && mSageAttnKBlockSize == 64
+            && mSageAttnVBlockSize == 256)
+        {
+            sage_quant<80, 80, 64, 64, 256, __nv_bfloat16, __nv_fp8_e4m3, float>(
+                // host var
+                batch_size, mNumHeads, input_seq_len, true, true,
+                // device var
+                // q k v
+                attention_input, attention_input + mNumHeads * mHeadSize, attention_input + 2 * mNumHeads * mHeadSize,
+                // stride
+                3 * mNumHeads * mHeadSize, 3 * mNumHeads * mHeadSize, 3 * mNumHeads * mHeadSize, cu_seqlens, cu_seqlens,
+                sage_quant_space_ptr,
+                // quant q k v
+                quanted_qkv_ptr, quanted_qkv_ptr + mNumHeads * paddedHeadSize,
+                quanted_qkv_ptr + 2 * mNumHeads * paddedHeadSize,
+                // quanted_qkv_ptr, quanted_qkv_ptr + mNumHeads * mHeadSize, context,
+                3 * mNumHeads * paddedHeadSize, 3 * mNumHeads * paddedHeadSize, 3 * mNumHeads * paddedHeadSize,
+                // scales
+                q_scale_ptr, k_scale_ptr, v_scale_ptr, stream);
+
+            sync_check_cuda_error();
+        }
+        if (mSageAttn && mHeadSize == 128 && mSageAttnQBlockSize == 64 && mSageAttnKBlockSize == 64
+            && mSageAttnVBlockSize == 256)
+        {
+            sage_quant<128, 128, 64, 64, 256, __nv_bfloat16, __nv_fp8_e4m3, float>(
+                // host var
+                batch_size, mNumHeads, input_seq_len, true, true,
+                // device var
+                // q k v
+                attention_input, attention_input + mNumHeads * mHeadSize, attention_input + 2 * mNumHeads * mHeadSize,
+                // stride
+                3 * mNumHeads * mHeadSize, 3 * mNumHeads * mHeadSize, 3 * mNumHeads * mHeadSize, cu_seqlens, cu_seqlens,
+                sage_quant_space_ptr,
+                // quant q k v
+                quanted_qkv_ptr, quanted_qkv_ptr + mNumHeads * paddedHeadSize,
+                quanted_qkv_ptr + 2 * mNumHeads * paddedHeadSize,
+                // quanted_qkv_ptr, quanted_qkv_ptr + mNumHeads * mHeadSize, context,
+                3 * mNumHeads * paddedHeadSize, 3 * mNumHeads * paddedHeadSize, 3 * mNumHeads * paddedHeadSize,
+                // scales
+                q_scale_ptr, k_scale_ptr, v_scale_ptr, stream);
+
+            sync_check_cuda_error();
+        }
+        if (mSageAttn && mHeadSize == 128 && mSageAttnQBlockSize == 64 && mSageAttnKBlockSize == 32
+            && mSageAttnVBlockSize == 32)
+        {
+            sage_quant<128, 128, 64, 32, 32, __nv_bfloat16, __nv_fp8_e4m3, float>(
+                // host var
+                batch_size, mNumHeads, input_seq_len, true, true,
+                // device var
+                // q k v
+                attention_input, attention_input + mNumHeads * mHeadSize, attention_input + 2 * mNumHeads * mHeadSize,
+                // stride
+                3 * mNumHeads * mHeadSize, 3 * mNumHeads * mHeadSize, 3 * mNumHeads * mHeadSize, cu_seqlens, cu_seqlens,
+                sage_quant_space_ptr,
+                // quant q k v
+                quanted_qkv_ptr, quanted_qkv_ptr + mNumHeads * paddedHeadSize,
+                quanted_qkv_ptr + 2 * mNumHeads * paddedHeadSize,
+                // quanted_qkv_ptr, quanted_qkv_ptr + mNumHeads * mHeadSize, context,
+                3 * mNumHeads * paddedHeadSize, 3 * mNumHeads * paddedHeadSize, 3 * mNumHeads * paddedHeadSize,
+                // scales
+                q_scale_ptr, k_scale_ptr, v_scale_ptr, stream);
+
+            sync_check_cuda_error();
+        }
+        if (mSageAttn && mHeadSize == 80 && mSageAttnQBlockSize == 64 && mSageAttnKBlockSize == 32
+            && mSageAttnVBlockSize == 32)
+        {
+            sage_quant<80, 80, 64, 32, 32, __nv_bfloat16, __nv_fp8_e4m3, float>(
+                // host var
+                batch_size, mNumHeads, input_seq_len, true, true,
+                // device var
+                // q k v
+                attention_input, attention_input + mNumHeads * mHeadSize, attention_input + 2 * mNumHeads * mHeadSize,
+                // stride
+                3 * mNumHeads * mHeadSize, 3 * mNumHeads * mHeadSize, 3 * mNumHeads * mHeadSize, cu_seqlens, cu_seqlens,
+                sage_quant_space_ptr,
+                // quant q k v
+                quanted_qkv_ptr, quanted_qkv_ptr + mNumHeads * paddedHeadSize,
+                quanted_qkv_ptr + 2 * mNumHeads * paddedHeadSize,
+                // quanted_qkv_ptr, quanted_qkv_ptr + mNumHeads * mHeadSize, context,
+                3 * mNumHeads * paddedHeadSize, 3 * mNumHeads * paddedHeadSize, 3 * mNumHeads * paddedHeadSize,
+                // scales
+                q_scale_ptr, k_scale_ptr, v_scale_ptr, stream);
+
+            sync_check_cuda_error();
+        }
+        if (mSageAttn && mHeadSize == 72 && mSageAttnQBlockSize == 64 && mSageAttnKBlockSize == 32
+            && mSageAttnVBlockSize == 32)
+        {
+            sage_quant<72, 80, 64, 32, 32, __nv_bfloat16, __nv_fp8_e4m3, float>(
+                // host var
+                batch_size, mNumHeads, input_seq_len, true, true,
+                // device var
+                // q k v
+                attention_input, attention_input + mNumHeads * mHeadSize, attention_input + 2 * mNumHeads * mHeadSize,
+                // stride
+                3 * mNumHeads * mHeadSize, 3 * mNumHeads * mHeadSize, 3 * mNumHeads * mHeadSize, cu_seqlens, cu_seqlens,
+                sage_quant_space_ptr,
+                // quant q k v
+                quanted_qkv_ptr, quanted_qkv_ptr + mNumHeads * paddedHeadSize,
+                quanted_qkv_ptr + 2 * mNumHeads * paddedHeadSize,
+                // quanted_qkv_ptr, quanted_qkv_ptr + mNumHeads * mHeadSize, context,
+                3 * mNumHeads * paddedHeadSize, 3 * mNumHeads * paddedHeadSize, 3 * mNumHeads * paddedHeadSize,
+                // scales
+                q_scale_ptr, k_scale_ptr, v_scale_ptr, stream);
+
+            sync_check_cuda_error();
+        }
+
         // Construct the fmha params for running kernels.
         MHARunnerParams fmhaParams{};
         fmhaParams.b = request_batch_size;
@@ -401,6 +530,8 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
         fmhaParams.stream = stream;
         if (mSageAttn)
         {
+            if (paddedHeadSize != mHeadSize)
+                fmhaParams.outputPtr = sage_quant_space_ptr;
             fmhaParams.qkvPtr = quanted_qkv_ptr;
             fmhaParams.scaleBmm1Ptr = scale_bmm1_ptr;
             fmhaParams.scaleBmm2Ptr = scale_bmm2_ptr;
@@ -414,6 +545,15 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
 
         // Run the fmha kernel.
         mFMHARunner->run(fmhaParams);
+        sync_check_cuda_error();
+        if (mSageAttn)
+        {
+            if (paddedHeadSize != mHeadSize && mHeadSize == 72)
+            {
+                unpadding<80, 72, __nv_bfloat16>(batch_size, mNumHeads, input_seq_len, sage_quant_space_ptr,
+                    mNumHeads * 72, mNumHeads * 80, cu_seqlens, context_buf_, stream);
+            }
+        }
     }
     else
     {
@@ -634,6 +774,11 @@ int BertAttentionPlugin::initialize() noexcept
         fmhaParams.sageBlockSizeQ = mSageAttnQBlockSize;
         fmhaParams.sageBlockSizeK = mSageAttnKBlockSize;
         fmhaParams.sageBlockSizeV = mSageAttnVBlockSize;
+        if (mSageAttn)
+        {
+            int const paddedHeadSize = ((mHeadSize + 15) / 16) * 16;
+            fmhaParams.headSize = paddedHeadSize;
+        }
 
         // Load kernels from the pre-compiled cubins.
         mFMHARunner.reset(new FusedMHARunnerV2(fmhaParams));

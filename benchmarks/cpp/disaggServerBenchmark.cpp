@@ -527,6 +527,7 @@ texec::Request makeExecutorContextRequest(Sample const& sample, SizeType32 const
             lookaheadConfig, // lookaheadConfig
             std::nullopt,    // kvCacheRetentionConfig
             std::nullopt,    // logitsPostProcessorName
+            std::nullopt,    // logitsPostProcessor
             encoderInputTokenIds.has_value() ? encoderInputTokenIds : std::nullopt);
     request.setRequestType(tensorrt_llm::executor::RequestType::REQUEST_TYPE_CONTEXT_ONLY);
     return request;

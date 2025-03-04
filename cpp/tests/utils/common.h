@@ -67,6 +67,7 @@ auto const ENC_DEC_DATA_BASE = DATA_PATH / "enc_dec";
 
 auto constexpr T5_NAME = "t5-small";
 auto constexpr BART_NAME = "bart-large-cnn";
+auto constexpr LANGUAGE_ADAPTER_NAME = "language_adapter-enc_dec_language_adapter";
 
 class PathUtil
 {

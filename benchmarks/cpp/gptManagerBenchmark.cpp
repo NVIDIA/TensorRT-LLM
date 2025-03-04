@@ -833,6 +833,7 @@ texec::Request makeExecutorRequest(Sample const& sample, SizeType32 const& beamW
         lookaheadConfig, // lookaheadConfig
         std::nullopt,    // kvCacheRetentionConfig
         std::nullopt,    // logitsPostProcessorName
+        std::nullopt,    // logitsPostProcessor
         encoderInputTokenIds.has_value() ? encoderInputTokenIds : std::nullopt);
 }
 

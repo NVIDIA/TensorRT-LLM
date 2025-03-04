@@ -3,7 +3,6 @@
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import (LLM, BuildConfig, EagleDecodingConfig,
                                  KvCacheConfig, SamplingParams)
-from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 
 
 def main():
@@ -18,11 +17,7 @@ def main():
     sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
 
     # The end user can customize the build configuration with the BuildConfig class
-    build_config = BuildConfig(
-        max_batch_size=1,
-        max_seq_len=1024,
-        max_draft_len=63,
-        speculative_decoding_mode=SpeculativeDecodingMode.EAGLE)
+    build_config = BuildConfig(max_batch_size=1, max_seq_len=1024)
 
     # The end user can customize the kv cache configuration with the KVCache class
     kv_cache_config = KvCacheConfig(enable_block_reuse=True)
@@ -30,14 +25,15 @@ def main():
     llm_kwargs = {}
 
     model = "lmsys/vicuna-7b-v1.3"
-    speculative_model = "yuhuili/EAGLE-Vicuna-7B-v1.3"
 
     # The end user can customize the eagle decoding configuration by specifying the
-    # num_eagle_layers, max_non_leaves_per_layer, eagle_choices
+    # speculative_model, max_draft_len, num_eagle_layers, max_non_leaves_per_layer, eagle_choices
     # greedy_sampling,posterior_threshold, use_dynamic_tree and dynamic_tree_max_topK
     # with the EagleDecodingConfig class
 
     speculative_config = EagleDecodingConfig(
+        speculative_model="yuhuili/EAGLE-Vicuna-7B-v1.3",
+        max_draft_len=63,
         num_eagle_layers=4,
         max_non_leaves_per_layer=10,
                             eagle_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], \
@@ -47,7 +43,6 @@ def main():
                                             [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], \
                                             [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [0, 0, 0, 1], [1, 6], [0, 7, 0]]
     )
-    llm_kwargs = {"speculative_model": speculative_model}
 
     llm = LLM(model=model,
               build_config=build_config,

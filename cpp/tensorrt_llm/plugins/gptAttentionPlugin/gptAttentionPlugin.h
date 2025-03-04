@@ -172,11 +172,6 @@ public:
     void serialize(void* buffer) const noexcept override;
 
 private:
-    template <typename T, typename AttentionOutT>
-    kernels::MlaParams<T> enqueueMLAPreprocess(int32_t localNbSeq, int32_t localNbTokens,
-        nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
-        void const* const* inputs, void* const* outputs, void*& workspace, bool is_context, cudaStream_t stream);
-
     template <typename T, typename AttentionOutT, typename KVCacheBuffer>
     int enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32_t tokenIdxBeg, int32_t localNbTokens,
         nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,

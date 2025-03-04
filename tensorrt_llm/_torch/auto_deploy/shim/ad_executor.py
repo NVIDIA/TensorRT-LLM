@@ -294,7 +294,7 @@ def create_autodeploy_executor(
     scheduler = SimpleScheduler(capacitor_scheduler, mb_scheduler)
 
     # search decoder with speculative decoding
-    decoder = TorchDecoder()
+    decoder = TorchDecoder(max_seq_len=max_seq_len)
 
     # creating the executor object
     py_config: PyTorchConfig = executor_config.pytorch_backend_config

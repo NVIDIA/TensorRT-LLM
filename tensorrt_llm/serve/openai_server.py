@@ -4,7 +4,8 @@ import signal
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from pathlib import Path
-from typing import AsyncGenerator, AsyncIterator, List, Tuple, TypedDict
+from typing import (AsyncGenerator, AsyncIterator, List, Optional, Tuple,
+                    TypedDict)
 
 import uvicorn
 from fastapi import FastAPI
@@ -15,17 +16,21 @@ from transformers import PreTrainedTokenizer
 
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
+from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.llmapi import LLM
 from tensorrt_llm.llmapi.llm import RequestOutput
-from tensorrt_llm.serve.openai_protocol import (
-    ChatCompletionLogProbs, ChatCompletionLogProbsContent,
-    ChatCompletionNamedToolChoiceParam, ChatCompletionRequest,
-    ChatCompletionResponse, ChatCompletionResponseChoice,
-    ChatCompletionResponseStreamChoice, ChatCompletionStreamResponse,
-    ChatMessage, CompletionRequest, CompletionResponse,
-    CompletionResponseChoice, CompletionResponseStreamChoice,
-    CompletionStreamResponse, DeltaMessage, ErrorResponse, FunctionCall,
-    ModelCard, ModelList, ToolCall, UsageInfo)
+from tensorrt_llm.llmapi.utils import nvtx_mark
+from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
+                                                ChatCompletionResponse,
+                                                CompletionRequest,
+                                                CompletionResponse,
+                                                CompletionResponseChoice,
+                                                ErrorResponse, ModelCard,
+                                                ModelList, UsageInfo)
+from tensorrt_llm.serve.postprocess_handlers import (
+    ChatPostprocArgs, CompletionPostprocArgs, chat_response_post_processor,
+    chat_stream_post_processor, completion_response_post_processor,
+    completion_stream_post_processor)
 from tensorrt_llm.version import __version__ as VERSION
 
 # yapf: enale
@@ -90,6 +95,10 @@ class OpenAIServer:
 
         self.register_routes()
 
+    @property
+    def postproc_worker_enabled(self) -> bool:
+        return True if self.llm.args._num_postprocess_workers > 0 else False
+
     @staticmethod
     def create_error_response(
             message: str,
@@ -132,175 +141,25 @@ class OpenAIServer:
                 role = request.messages[-1]["role"]
             return role
 
-        def stream_usage_info(prompt_tokens: int, completion_tokens: int):
-            if request.stream_options and request.stream_options.include_usage and \
-                request.stream_options.continuous_usage_stats:
-                usage = UsageInfo(prompt_tokens=prompt_tokens,
-                                    completion_tokens=completion_tokens,
-                                    total_tokens=prompt_tokens +
-                                    completion_tokens)
-            else:
-                usage = None
-            return usage
-
-        def create_logprobs(token_ids: List[int],
-                            logprobs: List[float]) -> ChatCompletionLogProbs:
-            assert len(token_ids) == len(logprobs), \
-                   "token_ids and logprobs have different lengths"
-            content: List[ChatCompletionLogProbsContent] = []
-            for token_id, logprob in zip(token_ids, logprobs):
-                token = self.tokenizer.decode(token_id)
-                # returning multiple logprobs is not supported
-                first_logprob = ChatCompletionLogProbsContent(
-                    token=token, logprob=max(logprob, -9999.0),
-                    bytes=list(token.encode("utf-8", errors="replace"))
-                )
-                content.append(first_logprob)
-            chat_logprobs = ChatCompletionLogProbs(content=content)
-            return chat_logprobs
-
-        async def chat_stream_generator(promise: RequestOutput) -> AsyncGenerator[str, None]:
-            first_iteration = True
-            num_choices = 1 if request.n is None else request.n
-            finish_reason_sent = [False] * num_choices
-            role = get_role()
-
-            def yield_first_chat(num_tokens: int, role: str = None, content: str = None):
-                for i in range(num_choices):
-                    choice_data = ChatCompletionResponseStreamChoice(
-                        index=i,
-                        delta=DeltaMessage(
-                            role=role, content=content),
-                        finish_reason=None)
-                    chunk = ChatCompletionStreamResponse(
-                        choices=[choice_data], model=self.model)
-                    chunk.usage = stream_usage_info(num_tokens, 0)
-
-                    data = chunk.model_dump_json(exclude_unset=True)
-                    return data
-
+        async def chat_stream_generator(
+                promise: RequestOutput, postproc_params: PostprocParams) -> AsyncGenerator[str, None]:
+            if not self.postproc_worker_enabled:
+                post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
             async for res in promise:
-                prompt_tokens = len(res.prompt_token_ids)
-                if first_iteration:
-                    yield f"data: {yield_first_chat(prompt_tokens, role=role)} \n\n"
-
-                    if request.echo:
-                        last_msg_content = ""
-                        if conversation and conversation[-1].get(
-                                "content") and conversation[-1].get(
-                                    "role") == role:
-                            last_msg_content = conversation[-1][
-                                "content"]
-
-                        if last_msg_content:
-                            yield f"data: {yield_first_chat(prompt_tokens, content=last_msg_content)}\n\n"
-                first_iteration = False
-
-                for output in res.outputs:
-                    i = output.index
-
-                    if finish_reason_sent[i]:
-                        continue
-
-                    delta_text = output.text_diff
-                    if request.tool_choice and type(
-                            request.tool_choice
-                    ) is ChatCompletionNamedToolChoiceParam:
-                        delta_message = DeltaMessage(tool_calls=[
-                            ToolCall(function=FunctionCall(
-                                name=request.tool_choice.function.name,
-                                arguments=delta_text))
-                        ])
-                    else:
-                        delta_message = DeltaMessage(content=delta_text)
-
-                    choice = ChatCompletionResponseStreamChoice(
-                        index=i,
-                        delta=delta_message,
-                        finish_reason=None)
-                    if request.logprobs:
-                        logprobs = output.logprobs_diff
-                        token_ids = output.token_ids_diff
-                        choice.logprobs = create_logprobs(token_ids, logprobs)
-                    if output.finish_reason is not None:
-                        choice.finish_reason = output.finish_reason
-                        choice.stop_reason = output.stop_reason
-                        finish_reason_sent[i] = True
-                    chunk = ChatCompletionStreamResponse(
-                        choices=[choice], model=self.model)
-                    chunk.usage = stream_usage_info(
-                        prompt_tokens, output.length)
-                    data = chunk.model_dump_json(exclude_unset=True)
-                    yield f"data: {data}\n\n"
-
-            if (request.stream_options
-                    and request.stream_options.include_usage):
-                completion_tokens = sum(output.length
-                                        for output in promise.outputs)
-                final_usage = UsageInfo(
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    total_tokens=prompt_tokens + completion_tokens,
-                )
-
-                final_usage_chunk = ChatCompletionStreamResponse(
-                    choices=[], model=self.model, usage=final_usage)
-                final_usage_data = final_usage_chunk.model_dump_json()
-                yield f"data: {final_usage_data}\n\n"
+                pp_results = res.outputs[0]._postprocess_result if self.postproc_worker_enabled else post_processor(res, args)
+                for pp_res in pp_results:
+                    yield pp_res
             yield f"data: [DONE]\n\n"
+            nvtx_mark("generation ends")
 
-        async def create_chat_response(promise: RequestOutput) -> ChatCompletionResponse:
+        async def create_chat_response(
+                promise: RequestOutput, postproc_params: PostprocParams) -> ChatCompletionResponse:
             await promise.aresult()
-            choices: List[ChatCompletionResponseChoice] = []
-            role = get_role()
-            for output in promise.outputs:
-                if request.tool_choice and isinstance(
-                        request.tool_choice,
-                        ChatCompletionNamedToolChoiceParam):
-                    message = ChatMessage(
-                        role=role,
-                        content="",
-                        tool_calls=[
-                            ToolCall(function=FunctionCall(
-                                name=request.tool_choice.function.name,
-                                arguments=output.text))
-                        ])
-                else:
-                    message = ChatMessage(role=role, content=output.text)
-                choice = ChatCompletionResponseChoice(
-                    index=output.index,
-                    message=message,
-                    finish_reason=output.finish_reason,
-                    stop_reason=output.stop_reason,
-                )
-
-                if request.logprobs:
-                    choice.logprobs = create_logprobs(output.token_ids, output.logprobs)
-                choices.append(choice)
-
-            if request.echo:
-                last_msg_content = ""
-                if conversation and conversation[-1].get(
-                        "content") and conversation[-1].get("role") == role:
-                    last_msg_content = conversation[-1]["content"]
-                for choice in choices:
-                    full_message = last_msg_content + choice.message.content
-                    choice.message.content = full_message
-
-            num_prompt_tokens = len(promise.prompt_token_ids)
-            num_generated_tokens = sum(
-                len(output.token_ids) for output in promise.outputs)
-            usage = UsageInfo(
-                prompt_tokens=num_prompt_tokens,
-                completion_tokens=num_generated_tokens,
-                total_tokens=num_prompt_tokens + num_generated_tokens,
-            )
-            response = ChatCompletionResponse(
-                model=self.model,
-                choices=choices,
-                usage=usage,
-            )
-            return response
+            if self.postproc_worker_enabled:
+                return promise.outputs[0]._postprocess_result
+            else:
+                post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
+                return post_processor(promise, args)
 
         try:
             conversation: List[ConversationMessage] = []
@@ -319,18 +178,32 @@ class OpenAIServer:
                 **(request.chat_template_kwargs or {}),
             )
             sampling_params = request.to_sampling_params()
+            postproc_args = ChatPostprocArgs.from_request(request)
+            if conversation and conversation[-1].get(
+                    "content") and conversation[-1].get("role") == get_role():
+                postproc_args.last_message_content = conversation[-1]["content"]
+            postproc_params = PostprocParams(
+                post_processor=chat_stream_post_processor
+                if request.stream else chat_response_post_processor,
+                postproc_args=postproc_args,
+            )
 
             promise = self.llm.generate_async(
                 inputs=prompt,
                 sampling_params=sampling_params,
+                _postproc_params=postproc_params if self.postproc_worker_enabled else None,
                 streaming=request.stream,
             )
+            if not self.postproc_worker_enabled:
+                postproc_args.tokenizer = self.tokenizer
+                postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
+
             if request.stream:
-                response_generator = chat_stream_generator(promise)
+                response_generator = chat_stream_generator(promise, postproc_params)
                 return StreamingResponse(content=response_generator,
-                                            media_type="text/event-stream")
+                                         media_type="text/event-stream")
             else:
-                response = await create_chat_response(promise)
+                response = await create_chat_response(promise, postproc_params)
                 return JSONResponse(content=response.model_dump())
         except CppExecutorError:
             # If internal executor error is raised, shutdown the server
@@ -340,17 +213,21 @@ class OpenAIServer:
 
     async def openai_completion(self, request: CompletionRequest) -> Response:
 
-        def merge_promises(promises: List[RequestOutput]) -> AsyncIterator[Tuple[int, RequestOutput]]:
+        def merge_promises(
+            promises: List[RequestOutput],
+            postproc_params_collections: List[Optional[PostprocParams]]
+        ) -> AsyncIterator[Tuple[RequestOutput, Optional[PostprocParams]]]:
             outputs = asyncio.Queue()
             finished = [False] * len(promises)
 
-            async def producer(i: int, promise: RequestOutput):
+            async def producer(i: int, promise: RequestOutput, postproc_params: Optional[PostprocParams]):
                 async for output in promise:
-                    await outputs.put((i, output))
+                    await outputs.put((output, postproc_params))
                 finished[i] = True
 
-            _tasks = [asyncio.create_task(producer(i, promise))
-                for i, promise in enumerate(promises)
+            _tasks = [
+                asyncio.create_task(producer(i, promise, postproc_params))
+                for i, (promise, postproc_params) in enumerate(zip(promises, postproc_params_collections))
             ]
 
             async def consumer():
@@ -361,56 +238,34 @@ class OpenAIServer:
 
             return consumer()
 
-        async def create_completion_generator(generator: AsyncIterator[Tuple[int, RequestOutput]],
-                                              num_choices: int):
-            num_repsonse_per_request = 1 if request.n is None else request.n
-            echoed = [False] * num_choices
-            async for prompt_idx, requst_output in generator:
-                prompt = requst_output.prompt
-                for gen_idx, output in enumerate(requst_output.outputs):
-                    response_idx = prompt_idx * num_repsonse_per_request + gen_idx
-                    delta_text = output.text_diff
-                    if request.echo and not echoed[response_idx]:
-                        delta_text = prompt + delta_text
-                        echoed[response_idx] = True
-                    response = CompletionStreamResponse(
-                        model=self.model,
-                        choices=[
-                            CompletionResponseStreamChoice(
-                                index=response_idx,
-                                text=delta_text,
-                                stop_reason=output.stop_reason,
-                                finish_reason=output.finish_reason,
-                            )
-                        ])
-                    response_json = response.model_dump_json(
-                        exclude_unset=False)
-                    yield f"data: {response_json}\n\n"
+        async def create_completion_generator(
+                generator: AsyncIterator[Tuple[RequestOutput, Optional[PostprocParams]]]):
+            async for request_output, postproc_params in generator:
+                if not self.postproc_worker_enabled:
+                    post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
+                    pp_result = post_processor(request_output, args)
+                else:
+                    pp_result = request_output.outputs[0]._postprocess_result
+                for pp_res in pp_result:
+                    yield pp_res
             yield f"data: [DONE]\n\n"
 
-        async def create_completion_response(generator: AsyncIterator[Tuple[int, RequestOutput]],
-                                             num_choices: int):
-            choices = [None] * num_choices
-            num_repsonse_per_request = 1 if request.n is None else request.n
+        async def create_completion_response(
+                generator: AsyncIterator[Tuple[RequestOutput, Optional[PostprocParams]]]) -> CompletionResponse:
+            all_choices: List[CompletionResponseChoice] = []
             num_prompt_tokens = num_gen_tokens = 0
-            async for prompt_idx, request_output in generator:
-                num_prompt_tokens += len(request_output.prompt_token_ids)
-                for gen_idx, output in enumerate(request_output.outputs):
-                    num_gen_tokens += len(output.token_ids)
-                    output_text = output.text
-                    if request.echo:
-                        output_text = request_output.prompt + output_text
-                    idx = prompt_idx * num_repsonse_per_request + gen_idx
+            async for request_output, postproc_params in generator:
+                pp_result: CompletionResponse
+                if not self.postproc_worker_enabled:
+                    post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
+                    pp_result = post_processor(request_output, args)
+                else:
+                    pp_result = request_output.outputs[0]._postprocess_result
 
-                    disaggregated_params = CompletionResponseChoice.to_disaggregated_params(output.disaggregated_params)
-                    choice = CompletionResponseChoice(
-                        index=idx,
-                        text=output_text,
-                        stop_reason=output.stop_reason,
-                        finish_reason=output.finish_reason,
-                        disaggregated_params=disaggregated_params,
-                    )
-                    choices[idx] = choice
+                choices, usage = pp_result.choices, pp_result.usage
+                all_choices.extend(choices)
+                num_prompt_tokens += usage.prompt_tokens
+                num_gen_tokens += usage.completion_tokens
 
             usage_info = UsageInfo(
                 prompt_tokens=num_prompt_tokens,
@@ -419,7 +274,7 @@ class OpenAIServer:
             )
             response = CompletionResponse(
                 model=self.model,
-                choices=choices,
+                choices=all_choices,
                 usage=usage_info,
             )
             return response
@@ -432,29 +287,47 @@ class OpenAIServer:
                 prompts = request.prompt
 
             promises: List[RequestOutput] = []
+            postproc_params_collection: List[Optional[PostprocParams]] = []
             sampling_params = request.to_sampling_params()
             disaggregated_params = request.to_llm_disaggregated_params()
-            for prompt in prompts:
+            for idx, prompt in enumerate(prompts):
+                postproc_args = CompletionPostprocArgs.from_request(request)
+                postproc_args.prompt_idx = idx
+                if request.echo:
+                    postproc_args.prompt = prompt
+                postproc_params = PostprocParams(
+                    post_processor=completion_stream_post_processor
+                    if request.stream else completion_response_post_processor,
+                    postproc_args=postproc_args,
+                )
                 promise = self.llm.generate_async(
                     inputs=prompt,
                     sampling_params=sampling_params,
+                    _postproc_params=postproc_params,
                     streaming=request.stream,
                     disaggregated_params=disaggregated_params
                 )
+                if not self.postproc_worker_enabled:
+                    postproc_args.tokenizer = self.tokenizer
+                    postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
                 promises.append(promise)
-            generator = merge_promises(promises)
-            num_choices = len(prompts) if request.n is None else len(prompts) * request.n
+                postproc_params_collection.append(None if self.postproc_worker_enabled else postproc_params)
+
+            generator = merge_promises(promises, postproc_params_collection)
             if request.stream:
-                response_generator = create_completion_generator(generator, num_choices)
+                response_generator = create_completion_generator(
+                    generator)
                 return StreamingResponse(content=response_generator,
-                                         media_type="text/event-stream")
+                                            media_type="text/event-stream")
             else:
-                response = await create_completion_response(generator, num_choices)
+                response = await create_completion_response(
+                    generator)
                 return JSONResponse(content=response.model_dump())
         except CppExecutorError:
             # If internal executor error is raised, shutdown the server
             signal.raise_signal(signal.SIGINT)
         except Exception as e:
+            print(f"Encountered an exception: {str(e)}")
             return self.create_error_response(str(e))
 
     async def __call__(self, host, port):

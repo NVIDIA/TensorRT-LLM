@@ -28,6 +28,13 @@ def backend(request):
 
 
 @pytest.fixture(scope="module",
+                params=[0, 2],
+                ids=["disable_processpool", "enable_processpool"])
+def num_postprocess_workers(request):
+    return request.param
+
+
+@pytest.fixture(scope="module",
                 params=[True, False],
                 ids=["extra_options", "no_extra_options"])
 def extra_llm_api_options(request):
@@ -58,15 +65,16 @@ def temp_extra_llm_api_options_file(request):
 
 @pytest.fixture(scope="module")
 def server(model_name: str, backend: str, extra_llm_api_options: bool,
-           temp_extra_llm_api_options_file: str):
+           temp_extra_llm_api_options_file: str, num_postprocess_workers: int):
     model_path = get_model_path(model_name)
     if backend == "pytorch":
         args = ["--backend", f"{backend}"]
     else:
         args = ["--max_beam_width", "4"]
     if extra_llm_api_options:
-        args.append("--extra_llm_api_options")
-        args.append(temp_extra_llm_api_options_file)
+        args.extend(
+            ["--extra_llm_api_options", temp_extra_llm_api_options_file])
+    args.extend(["--num_postprocess_workers", f"{num_postprocess_workers}"])
     with RemoteOpenAIServer(model_path, args) as remote_server:
         yield remote_server
 

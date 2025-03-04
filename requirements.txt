@@ -24,8 +24,7 @@ torchvision
 nvidia-modelopt[torch]~=0.23.0
 nvidia-nccl-cu12
 nvidia-cuda-nvrtc-cu12
-# TODO: Remove the <4.48.0 constraint once https://github.com/huggingface/transformers/issues/35625 is resolved.
-transformers>=4.47.0,<4.48.0
+transformers==4.48.3
 pydantic>=2.9.1
 pillow==10.3.0
 wheel
@@ -44,5 +43,4 @@ ordered-set
 peft
 einops
 flashinfer-python~=0.2.0
-ffmpeg
 opencv-python-headless

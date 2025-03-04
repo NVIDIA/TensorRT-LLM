@@ -88,9 +88,12 @@ class OpenAIDisaggServer:
 
         try:
             gen_req = copy.deepcopy(req)
-
-            if not isinstance(req.prompt, str) and not isinstance(req.prompt, List[int]):
-                raise ValueError("Disaggregated server currently only supports single prompt in request")
+            if not isinstance(req.prompt, str):
+                # Check if it's a list and contains integers
+                if type(req.prompt) is list and len(req.prompt) == 1:
+                    req.prompt = req.prompt[0]
+                elif not isinstance(req.prompt, list) or not all(isinstance(x, int) for x in req.prompt):
+                    raise ValueError("Disaggregated server currently only supports single string prompt or list of integers in request")
 
             # Pick a context server
             ctx_server = self.get_next_server(self.ctx_servers, "context")
@@ -127,11 +130,6 @@ class OpenAIDisaggServer:
             signal.raise_signal(signal.SIGINT)
         except HTTPException as e:
             raise e  # Re-raise HTTP exceptions properly
-        except (aiohttp.ClientTimeout, aiohttp.ServerTimeoutError):
-            raise HTTPException(status_code=504, detail="Request timed out")
-        except aiohttp.ClientError as e:
-            logging.exception(e)
-            raise HTTPException(status_code=502, detail=f"Upstream server error {str(e)}")
         except Exception as e:
             logging.exception(e)
             raise HTTPException(status_code=500, detail=f"Internal server error {str(e)}")

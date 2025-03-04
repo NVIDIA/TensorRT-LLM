@@ -2,6 +2,7 @@
 To launch context and gen servers, use:
 
 ```
+export TRTLLM_USE_MPI_KVCACHE=1
 mpirun --allow-run-as-root -n 2 python3 launch_disaggregated_workers.py -c disagg_config.yaml &> output_workers &
 ```
 

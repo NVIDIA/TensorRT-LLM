@@ -544,6 +544,7 @@ class ModelRunnerCpp(ModelRunnerMixin):
             prompt_tasks: Optional[str] = None,
             input_token_extra_ids: List[List[int]] = None,
             return_all_generated_tokens: bool = False,
+            language_adapter_uids: Optional[List[int]] = None,
             **kwargs) -> Union[torch.Tensor, dict]:
         """
         Generates sequences of token ids.
@@ -690,6 +691,9 @@ class ModelRunnerCpp(ModelRunnerMixin):
             external_draft_tokens_configs = [None] * len(batch_input_ids_list)
             is_draft_target_model = False
 
+        if language_adapter_uids is None:
+            language_adapter_uids = [None] * len(batch_input_ids_list)
+
         requests = [
             trtllm.Request(
                 input_token_ids=input_ids,
@@ -720,13 +724,15 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 logits_post_processor_name=logits_post_processor_name,
                 external_draft_tokens_config=external_draft_tokens_config,
                 skip_cross_attn_blocks=skip_cross_attn_blocks,
+                language_adapter_uid=language_adapter_uid,
             ) for i,
             (input_ids, stop_words, bad_words, prompt_tuning_config,
              mrope_config, lora_config, logits_post_processor_name,
-             external_draft_tokens_config) in enumerate(
+             external_draft_tokens_config, language_adapter_uid) in enumerate(
                  zip(batch_input_ids_list, stop_words_list, bad_words_list,
                      prompt_tuning_configs, mrope_configs, lora_configs,
-                     logits_processor_names, external_draft_tokens_configs))
+                     logits_processor_names, external_draft_tokens_configs,
+                     language_adapter_uids))
         ]
 
         request_ids = self.session.enqueue_requests(requests)

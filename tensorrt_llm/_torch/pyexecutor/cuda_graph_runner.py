@@ -3,6 +3,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 import torch
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+from tensorrt_llm._torch.speculative.interface import SpecMetadata
 from tensorrt_llm._torch.utils import make_weak_ref
 
 
@@ -13,6 +14,7 @@ class DecodingCUDAGraphRunner:
         batch_size: int,
         device: str,
         attn_metadata: AttentionMetadata,
+        spec_metadata: Optional[SpecMetadata] = None,
     ) -> None:
         """
         Stores a CUDA graph and its associated input buffers.
@@ -29,16 +31,18 @@ class DecodingCUDAGraphRunner:
         """
         self.batch_size = batch_size
 
+        token_per_request = spec_metadata.max_draft_tokens + 1 if spec_metadata is not None else 1
+
         # Using ones instead of zeros prevents NaNs in e.g. Deepseek
-        self.input_ids = torch.ones((batch_size, ),
+        self.input_ids = torch.ones((batch_size * token_per_request, ),
                                     device=device,
                                     dtype=torch.int64)
-        self.position_ids = torch.zeros((1, batch_size),
+        self.position_ids = torch.zeros((1, batch_size * token_per_request),
                                         device=device,
                                         dtype=torch.int64)
 
         self.attn_metadata = attn_metadata
-
+        self.spec_metadata = spec_metadata
         self._output = None
         self._graph = None
 
@@ -52,7 +56,8 @@ class DecodingCUDAGraphRunner:
             "attn_metadata": self.attn_metadata,
             "input_ids": self.input_ids,
             "position_ids": self.position_ids,
-            "inputs_embeds": None
+            "inputs_embeds": None,
+            "spec_metadata": self.spec_metadata,
         }
         # We have to do warm up runs to initialize PyTorch's
         # internal states according to the docs:
@@ -79,6 +84,12 @@ class DecodingCUDAGraphRunner:
         assert attn_metadata is self.attn_metadata, (
             "attn_metadata does not match the attn_metadata instance that was used to "
             "capture this graph.")
+
+        if "spec_metadata" in inputs:
+            spec_metadata = inputs["spec_metadata"]
+            assert spec_metadata is self.spec_metadata, (
+                "spec_metadata does not match the spec_metadata instance that was used to "
+                "capture this graph.")
 
         input_ids = inputs["input_ids"]
         position_ids = inputs["position_ids"]

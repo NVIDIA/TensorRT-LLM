@@ -1,10 +1,11 @@
 import json
 import os
 from dataclasses import dataclass, field
-from typing import Dict, Generic, Optional, TypeVar
+from typing import Dict, Generic, List, Optional, TypeVar
 
 import transformers
 
+from tensorrt_llm import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -23,6 +24,8 @@ class ModelConfig(Generic[TConfig]):
 
     attn_backend: str = 'TRTLLM'
 
+    is_generation: bool = True
+
     @property
     def fuse_pos_embd(self):
         if self.attn_backend == 'TRTLLM':
@@ -39,6 +42,19 @@ class ModelConfig(Generic[TConfig]):
             return self.per_layer_quant_configs[name]
 
         raise ValueError(f'quant config of {name} is not found')
+
+    @staticmethod
+    def is_generation_model(model_architectures: Optional[List[str]]) -> bool:
+        if model_architectures is None:
+            logger.warning(
+                "Model architectures is None, default to is_generation_model=True"
+            )
+            return True
+        return model_architectures[0] not in [
+            "Qwen2ForProcessRewardModel", "BertForSequenceClassification"
+        ]
+        # TODO: should be 'not model_type == ModelType.ENCODER_ONLY'
+        # once ModelType is used in pytorch flow.
 
     @classmethod
     def from_pretrained(cls,
@@ -79,7 +95,11 @@ class ModelConfig(Generic[TConfig]):
                     "quant_method") == "fp8" and hf_quant_config.get(
                         "weight_block_size", []):
                 quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+                quant_config.exclude_modules = ["*eh_proj"]
+
+        is_generation = cls.is_generation_model(pretrained_config.architectures)
 
         return cls(pretrained_config=pretrained_config,
                    quant_config=quant_config,
+                   is_generation=is_generation,
                    **kwargs)

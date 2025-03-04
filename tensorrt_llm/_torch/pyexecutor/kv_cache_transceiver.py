@@ -10,6 +10,7 @@ from .resource_manager import KVCacheManager
 
 CacheTransceiverCpp = tensorrt_llm.bindings.internal.batch_manager.CacheTransceiver
 CommTypeCpp = tensorrt_llm.bindings.internal.batch_manager.CommType
+AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 
 
 def mapping_to_world_config(mapping: Mapping) -> WorldConfig:
@@ -19,22 +20,24 @@ def mapping_to_world_config(mapping: Mapping) -> WorldConfig:
                        context_parallelism=mapping.cp_size,
                        rank=mapping.rank,
                        gpus_per_node=mapping.gpus_per_node,
-                       device_ids=None)
+                       device_ids=None,
+                       enable_attention_dp=mapping.enable_attention_dp)
 
 
 def create_kv_cache_transceiver(mapping: Mapping,
-                                kv_cache_manager: KVCacheManager):
+                                kv_cache_manager: KVCacheManager,
+                                attention_type: AttentionTypeCpp):
 
     comm_type = None
     if getenv("TRTLLM_USE_UCX_KVCACHE"):
         comm_type = CommTypeCpp.UCX
     elif getenv("TRTLLM_USE_MPI_KVCACHE"):
         comm_type = CommTypeCpp.MPI
-
     cache_transceiver = None
     if comm_type is not None:
         cache_transceiver = BindKvCacheTransceiver(mapping, comm_type,
-                                                   kv_cache_manager)
+                                                   kv_cache_manager,
+                                                   attention_type)
 
     return cache_transceiver
 
@@ -69,9 +72,9 @@ class KvCacheTransceiver(ABC):
 class BindKvCacheTransceiver(KvCacheTransceiver):
 
     def __init__(self, mapping: Mapping, comm_type: CommTypeCpp,
-                 kv_cache_manager: KVCacheManager):
+                 kv_cache_manager: KVCacheManager,
+                 attention_type: AttentionTypeCpp):
         world_config = mapping_to_world_config(mapping)
-
         num_kv_heads_per_layer = kv_cache_manager.num_kv_heads_per_layer
         head_dim = kv_cache_manager.head_dim
         tokens_per_block = kv_cache_manager.tokens_per_block
@@ -79,7 +82,8 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
 
         self.impl = CacheTransceiverCpp(kv_cache_manager.impl, comm_type,
                                         num_kv_heads_per_layer, head_dim,
-                                        tokens_per_block, world_config, dtype)
+                                        tokens_per_block, world_config, dtype,
+                                        attention_type)
 
     def respond_and_send_async(self, req: LlmRequest):
         return self.impl.respond_and_send_async(req)

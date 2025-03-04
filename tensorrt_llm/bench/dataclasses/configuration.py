@@ -27,7 +27,7 @@ class RuntimeConfig(BaseModel):
     sw_version: str
     settings_config: ExecutorSettingsConfig
     world_config: ExecutorWorldConfig
-    decoding_config: DecodingConfig
+    decoding_config: Optional[DecodingConfig] = None
     performance_options: PerformanceOptions
     backend: Literal["pytorch", None] = None
     extra_llm_api_options: Optional[str] = None
@@ -151,6 +151,10 @@ class ExecutorWorldConfig(BaseModel):
                 f"({num_gpus}).")
 
         return self
+
+    @property
+    def world_size(self) -> int:
+        return self.pp_size * self.tp_size
 
     def _get_tensorrt_llm_executor_worker_path(self) -> Path:
         module_path = find_spec("tensorrt_llm").loader.get_filename()

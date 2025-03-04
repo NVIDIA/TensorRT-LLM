@@ -1,8 +1,10 @@
 import argparse
+import json
+import os
 
-import tensorrt_llm.bindings
-from tensorrt_llm import SamplingParams
-from tensorrt_llm._torch import LLM
+from quickstart_advanced import add_llm_args, setup_llm
+from transformers import AutoProcessor
+
 from tensorrt_llm.inputs import load_image, load_video
 
 example_images = [
@@ -25,7 +27,7 @@ example_video_prompts = [
 ]
 
 
-def prepare_vila(inputs):
+def prepare_vila(args, inputs):
 
     def add_media_token(prompt, multi_modal_data):
         mm_tokens = ""
@@ -43,12 +45,82 @@ def prepare_vila(inputs):
     return inputs
 
 
+def prepare_llava_next(args, inputs):
+    processor = AutoProcessor.from_pretrained(args.model_dir)
+
+    # Single-image inference chat template. For multi-image template,
+    # see https://huggingface.co/docs/transformers/en/model_doc/llava_next#multi-image-inference.
+    def apply_template(prompt, multimodal_data):
+        conversation = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": prompt
+                    },
+                    {
+                        "type": "image"
+                    },
+                ],
+            },
+        ]
+        return processor.apply_chat_template(
+            conversation,
+            add_generation_prompt=True,
+        )
+
+    for input in inputs:
+        input["prompt"] = apply_template(input["prompt"],
+                                         input["multi_modal_data"])
+    return inputs
+
+
 MODEL_TYPE_MAP = {
-    "vila": prepare_vila,
+    "llava_llama": prepare_vila,
+    "llava_next": prepare_llava_next,
 }
 
 
-def main(args):
+def add_multimodal_args(parser):
+    parser.add_argument("--model_type",
+                        type=str,
+                        choices=MODEL_TYPE_MAP.keys(),
+                        help="Model type.")
+    parser.add_argument("--modality",
+                        type=str,
+                        choices=["image", "video"],
+                        default="image",
+                        help="Media type.")
+    parser.add_argument("--media",
+                        type=str,
+                        nargs="+",
+                        help="A single or a list of media filepaths / urls.")
+    parser.add_argument("--num_frames",
+                        type=int,
+                        default=8,
+                        help="The number of video frames to be sampled.")
+    return parser
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description="Multimodal models with the PyTorch workflow.")
+    parser = add_llm_args(parser)
+    parser = add_multimodal_args(parser)
+    args = parser.parse_args()
+
+    args.kv_cache_enable_block_reuse = False  # kv cache reuse does not work for multimodal, force overwrite
+    if args.kv_cache_fraction is None:
+        args.kv_cache_fraction = 0.6  # lower the default kv cache fraction for multimodal
+
+    return args
+
+
+def main():
+    args = parse_arguments()
+
+    llm, sampling_params = setup_llm(args)
 
     if args.modality == "image":
         prompts = args.prompt if args.prompt else example_image_prompts
@@ -80,58 +152,18 @@ def main(args):
     else:
         raise ValueError(f"Unsupported modality: {args.modality}")
 
-    inputs = MODEL_TYPE_MAP[args.model_type](inputs)
+    model_type = json.load(open(os.path.join(args.model_dir,
+                                             'config.json')))['model_type']
+    assert model_type in MODEL_TYPE_MAP, f"Unsupported model_type: {model_type}"
+    inputs = MODEL_TYPE_MAP[model_type](args, inputs)
 
-    llm = LLM(
-        model=args.model_dir,
-        kv_cache_config=tensorrt_llm.bindings.executor.KvCacheConfig(
-            free_gpu_memory_fraction=args.kv_cache_fraction),
-    )
-
-    outputs = llm.generate(inputs=inputs,
-                           sampling_params=SamplingParams(
-                               max_tokens=args.max_tokens,
-                               temperature=args.temperature,
-                               top_p=args.top_p,
-                           ))
+    outputs = llm.generate(inputs, sampling_params)
 
     for i, output in enumerate(outputs):
+        prompt = inputs[i]['prompt']
         generated_text = output.outputs[0].text
-        print(
-            f"[{i}] Prompt: {inputs[i]['prompt']!r}, Generated text: {generated_text!r}"
-        )
+        print(f"[{i}] Prompt: {prompt!r}, Generated text: {generated_text!r}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Multimodal models with the PyTorch workflow.")
-    parser.add_argument("--model_dir",
-                        type=str,
-                        required=True,
-                        help="Model checkpoint directory.")
-    parser.add_argument("--model_type",
-                        type=str,
-                        choices=MODEL_TYPE_MAP.keys(),
-                        help="Model type.")
-    parser.add_argument("--modality",
-                        type=str,
-                        choices=["image", "video"],
-                        help="Media type.")
-    parser.add_argument("--prompt",
-                        type=str,
-                        nargs="+",
-                        help="A single or a list of text prompts.")
-    parser.add_argument("--media",
-                        type=str,
-                        nargs="+",
-                        help="A single or a list of media filepaths / urls.")
-    parser.add_argument("--num_frames",
-                        type=int,
-                        default=8,
-                        help="The number of video frames to be sampled.")
-    parser.add_argument("--kv_cache_fraction", type=float, default=0.6)
-    parser.add_argument("--max_tokens", type=int, default=64)
-    parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--top_p", type=float, default=None)
-    args = parser.parse_args()
-    main(args)
+    main()

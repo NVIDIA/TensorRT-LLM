@@ -36,6 +36,10 @@ class TestFunctional(unittest.TestCase):
 
     def load_test_cases():
         test_cases = [(3, 9279, 24, 128, ContextFMHAType.enabled_with_fp32_acc,
+                       "bfloat16", 64, 64, 256),
+                      (3, 9279, 24, 80, ContextFMHAType.enabled_with_fp32_acc,
+                       "bfloat16", 64, 64, 256),
+                      (3, 9279, 24, 72, ContextFMHAType.enabled_with_fp32_acc,
                        "bfloat16", 64, 64, 256)]
         return test_cases
 
@@ -135,8 +139,9 @@ class TestFunctional(unittest.TestCase):
             flash_attn_output.reshape(-1).to(torch.float32))
         print("cos_similarity: ", cos_similarity)
 
-        if cos_similarity < 0.98:
-            raise Exception("cos_similarity lower than expected!")
+        if cos_similarity < 0.98 or cos_similarity == 1.0:
+            raise Exception(
+                "cos_similarity lower than expected or equal to 1.0!")
 
 
 if __name__ == "__main__":

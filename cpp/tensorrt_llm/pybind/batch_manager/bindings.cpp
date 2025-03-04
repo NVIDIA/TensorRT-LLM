@@ -234,7 +234,20 @@ void initBindings(pybind11::module_& m)
                 {
                     self.setDraftTokens(std::make_shared<GenLlmReq::VecTokens>(draftTokens.value()));
                 }
-            });
+            })
+        .def_property(
+            "context_logits",
+            [](GenLlmReq& self)
+            {
+                std::optional<at::Tensor> value{std::nullopt};
+                GenLlmReq::TensorPtr const& tensor = self.getContextLogitsHost();
+                if (tensor)
+                {
+                    value = tr::Torch::tensor(tensor);
+                }
+                return value;
+            },
+            [](GenLlmReq& self, at::Tensor& logits) { self.setContextLogitsHost(tr::TorchView::of(logits)); });
 
     py::classh<tb::LlmRequest, GenLlmReq>(m, "LlmRequest", pybind11::dynamic_attr())
         .def(py::init(
@@ -266,6 +279,7 @@ void initBindings(pybind11::module_& m)
                      tb::LlmRequest::SizeType32 num_return_sequences, std::optional<executor::EagleConfig> eagle_config,
                      std::optional<at::Tensor> skip_cross_attn_blocks, bool return_perf_metrics,
                      std::optional<executor::GuidedDecodingParams> guided_decoding_params,
+                     std::optional<tb::LlmRequest::SizeType32> language_adapter_uid,
                      std::optional<tb::LlmRequest::MillisecondsType> allotted_time_ms,
                      std::optional<executor::ContextPhaseParams> context_phase_params)
                  {
@@ -302,7 +316,7 @@ void initBindings(pybind11::module_& m)
                          encoder_input_features_tensor_ptr, encoder_output_length, cross_attention_mask_tensor_ptr,
                          llm_request_type, input_token_extra_ids, num_return_sequences, eagle_config,
                          skip_cross_attn_blocks_tensor_ptr, return_perf_metrics, guided_decoding_params,
-                         allotted_time_ms, context_phase_params};
+                         language_adapter_uid, allotted_time_ms, context_phase_params};
                  }),
             py::arg("request_id"), py::arg("max_new_tokens"), py::arg("input_tokens"), py::arg("sampling_config"),
             py::arg("is_streaming"), py::arg("end_id") = std::nullopt, py::arg("pad_id") = std::nullopt,
@@ -325,9 +339,10 @@ void initBindings(pybind11::module_& m)
             py::arg("input_token_extra_ids") = std::nullopt, py::arg("num_return_sequences") = 1,
             py::arg("eagle_config") = std::nullopt, py::arg("skip_cross_attn_blocks") = std::nullopt,
             py::arg("return_perf_metrics") = false, py::arg("guided_decoding_params") = std::nullopt,
-            py::arg("allotted_time_ms") = std::nullopt, py::arg("context_phase_params") = std::nullopt)
+            py::arg("language_adapter_uid") = std::nullopt, py::arg("allotted_time_ms") = std::nullopt,
+            py::arg("context_phase_params") = std::nullopt)
         .def("validate", &tb::LlmRequest::validate, py::arg("max_input_len"), py::arg("max_seq_len"),
-            py::arg("max_draft_len"), py::arg("max_endocer_input_len") = std::nullopt,
+            py::arg("max_draft_len"), py::arg("vocab_size_padded"), py::arg("max_endocer_input_len") = std::nullopt,
             py::arg("enable_kv_cache_reuse") = false, py::arg("gather_context_outputs") = false)
         .def("create_response", &tb::LlmRequest::createResponse, py::arg("use_fast_logits") = false,
             py::arg("mpi_world_rank") = 0)
@@ -352,9 +367,14 @@ void initBindings(pybind11::module_& m)
             py::arg("max_num_sequences"), py::arg("model_config"), py::arg("world_config"), py::arg("buffer_manager"));
 
     py::class_<tb::DecoderInputBuffers>(m, "DecoderInputBuffers")
-        .def(py::init<runtime::SizeType32, runtime::SizeType32>(), py::arg("max_batch_size"),
-            py::arg("max_tokens_per_engine_step"))
+        .def(py::init<runtime::SizeType32, runtime::SizeType32, tr::BufferManager>(), py::arg("max_batch_size"),
+            py::arg("max_tokens_per_engine_step"), py::arg("manager"))
         .def_readwrite("setup_batch_slots", &tb::DecoderInputBuffers::setupBatchSlots)
+        .def_readwrite("forward_batch_slots_request_order", &tb::DecoderInputBuffers::forwardBatchSlotsRequestOrder)
+        .def_readwrite(
+            "forward_batch_slots_request_order_device", &tb::DecoderInputBuffers::forwardBatchSlotsRequestOrderDevice)
+        .def_readwrite("fill_values", &tb::DecoderInputBuffers::fillValues)
+        .def_readwrite("fill_values_device", &tb::DecoderInputBuffers::fillValuesDevice)
         .def_readwrite("inputs_ids", &tb::DecoderInputBuffers::inputsIds)
         .def_readwrite("forward_batch_slots", &tb::DecoderInputBuffers::forwardBatchSlots);
 

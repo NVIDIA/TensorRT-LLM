@@ -237,15 +237,21 @@ class ApiStabilityTestHarness:
             f"This is probably because you changed {cls.TEST_CLASS.__name__}'s APIs, please ask for reviews from the code owners."
         )
 
+    def create_snapshot_from_inspect(self):
+        return ClassSnapshot.from_inspect(self.TEST_CLASS)
+
     def test_signature(self):
-        snapshot = ClassSnapshot.from_inspect(self.TEST_CLASS)
+        snapshot = self.create_snapshot_from_inspect()
         try:
             snapshot.assert_equal(self.reference)
         except AssertionError as e:
             raise AssertionError(self.error_msg) from e
 
+    def create_snapshot_from_docstring(self):
+        return ClassSnapshot.from_docstring(self.TEST_CLASS)
+
     def test_docstring(self):
-        snapshot = ClassSnapshot.from_docstring(self.TEST_CLASS)
+        snapshot = self.create_snapshot_from_docstring()
         try:
             snapshot.assert_equal(self.reference)
         except AssertionError as e:

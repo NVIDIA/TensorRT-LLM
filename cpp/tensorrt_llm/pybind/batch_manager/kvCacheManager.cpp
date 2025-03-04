@@ -208,6 +208,11 @@ public:
             getBatchCacheBlockIds, requestIds);
     }
 
+    std::vector<SizeType32> getNewlyAllocatedBlockIds(tb::LlmRequest::RequestIdType requestId) const override
+    {
+        PYBIND11_OVERLOAD_PURE(std::vector<SizeType32>, tbk::BaseKVCacheManager, getNewlyAllocatedBlockIds, requestId);
+    }
+
     SizeType32 getUsedNumBlocks() const override
     {
         PYBIND11_OVERLOAD_PURE(SizeType32, tbk::BaseKVCacheManager, getUsedNumBlocks);
@@ -398,7 +403,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
         .def("store_context_blocks", &BaseKVCacheManager::storeContextBlocks)
         .def("scheduling_has_free_blocks", &BaseKVCacheManager::schedulingHasFreeBlocks)
         .def("get_cache_block_ids", &BaseKVCacheManager::getCacheBlockIds)
-        .def("get_batch_cache_block_ids", &BaseKVCacheManager::getBatchCacheBlockIds);
+        .def("get_batch_cache_block_ids", &BaseKVCacheManager::getBatchCacheBlockIds)
+        .def("get_newly_allocated_block_ids", &BaseKVCacheManager::getNewlyAllocatedBlockIds);
 
     py::enum_<tbk::CacheType>(m, "CacheType")
         .value("SELF", tbk::CacheType::kSELF)

@@ -164,8 +164,7 @@ private:
 
 private:
     // helper tensors
-    std::size_t scanTempStorageBytes{0};
-    std::size_t reduceTempStorageBytes{0};
+    std::size_t scanReduceTempStorageBytes{0};
     float mDefaultPosteriorThreshold{0.09f};
     bool mDoGreedySampling{true};
     BufferPtr scanReduceTempStorage;

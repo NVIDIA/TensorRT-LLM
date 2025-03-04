@@ -7,8 +7,7 @@ import traceback
 from abc import ABC, abstractmethod
 from pathlib import Path
 from queue import Queue
-from typing import (TYPE_CHECKING, Callable, Dict, Generator, List, Optional,
-                    Union)
+from typing import TYPE_CHECKING, Generator, List, Optional, Union
 
 import numpy as np
 import torch
@@ -25,8 +24,8 @@ from ..llmapi.mpi_session import (MpiSession, external_mpi_comm_available,
 from ..llmapi.utils import (AsyncQueue, enable_llm_debug,
                             enable_worker_single_process_for_tp1, print_colored,
                             print_colored_debug)
-from ..sampling_params import SamplingParams
-from .postproc_worker import PostprocWorkerConfig
+from ..sampling_params import BatchedLogitsProcessor, SamplingParams
+from .postproc_worker import PostprocParams, PostprocWorkerConfig
 from .request import GenerationRequest, LoRARequest, PromptAdapterRequest
 from .result import GenerationResult, IterationStatsResult
 from .utils import ProcessPoolExecutorSession, RequestError, has_event_loop
@@ -93,16 +92,18 @@ class GenerationExecutor(ABC):
         pass
 
     def generate_async(
-        self,
-        prompt_token_ids: List[int],
-        sampling_params: SamplingParams,
-        query_token_ids: Optional[Union[torch.Tensor, np.ndarray, list]] = None,
-        lora_request: Optional[LoRARequest] = None,
-        prompt_adapter_request: Optional[PromptAdapterRequest] = None,
-        streaming: bool = False,
-        prompt_tuning_config: Optional[list] = None,
-        kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
-        disaggregated_params: Optional[DisaggregatedParams] = None,
+            self,
+            prompt_token_ids: List[int],
+            sampling_params: SamplingParams,
+            query_token_ids: Optional[Union[torch.Tensor, np.ndarray,
+                                            list]] = None,
+            lora_request: Optional[LoRARequest] = None,
+            prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+            streaming: bool = False,
+            prompt_tuning_config: Optional[list] = None,
+            kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
+            disaggregated_params: Optional[DisaggregatedParams] = None,
+            postproc_params: Optional[PostprocParams] = None
     ) -> GenerationResult:
         """Generate output for the given prompt token ids in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -118,10 +119,14 @@ class GenerationExecutor(ABC):
                 # expect more engine stats whenever new prompts are submitted
                 self._iter_stats_result.mark_undone()
 
+        if postproc_params:
+            postproc_params.postproc_args.num_prompt_tokens = len(
+                prompt_token_ids)
         result = self.submit(
             GenerationRequest(
                 prompt_token_ids,
                 sampling_params=sampling_params,
+                postproc_params=postproc_params,
                 query_token_ids=query_token_ids,
                 lora_request=lora_request,
                 prompt_adapter_request=prompt_adapter_request,
@@ -267,7 +272,7 @@ class GenerationExecutor(ABC):
     def create(
         engine: Union[Path, Engine],
         executor_config: Optional[tllm.ExecutorConfig] = None,
-        logits_post_processor_map: Optional[Dict[str, Callable]] = None,
+        batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         model_world_size: int = 1,
         world_size: int = 0,
         mpi_session: Optional[MpiSession] = None,
@@ -300,7 +305,7 @@ class GenerationExecutor(ABC):
         worker_kwargs = {
             "engine": engine,
             "executor_config": executor_config,
-            "logits_post_processor_map": logits_post_processor_map,
+            "batched_logits_processor": batched_logits_processor,
         }
 
         # The case where the Python main process is launched by mpirun

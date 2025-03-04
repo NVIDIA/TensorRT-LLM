@@ -44,16 +44,11 @@ struct MlaMetaParams
 template <typename T>
 struct MlaParams
 {
-    T const* fused_a_input;  // [b, s, c_q + c_k + r]
-    T* attention_input_buf;  // [b, s, 3, h, d_h + r]
+    T const* latent_cache;       // cKV + k_pe
+    T* attention_input_buf;      // [b, s, 3, h, d_h + r]
     T* context_buf;
-    T* q_buf;                // [b, h, d_h + r]
-    T const* q_b_proj;       // [(d_h + r) * h, c_q]
-    T const* kv_b_proj;      // [h * d_h * 2, c_k]
-    T const* k_b_proj_trans; // [h * c_k, d_h]
-    float const* q_b_scale;
-    float const* kv_b_scale;
-    float const* k_b_trans_scale;
+    T* q_pe;                     // [b, h, d_r], strided
+
     float2 const* cos_sin_cache; // [s, rope]
     int32_t batch_size;
     int32_t acc_q_len;
@@ -65,6 +60,8 @@ struct MlaParams
     int32_t max_input_seq_len;
     int* cu_q_seqlens;
     int* cu_kv_seqlens;
+    int32_t q_pe_ld;
+    int32_t q_pe_stride;
     MlaMetaParams meta;
 };
 

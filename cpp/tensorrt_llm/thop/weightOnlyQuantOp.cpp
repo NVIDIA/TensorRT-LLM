@@ -171,9 +171,6 @@ std::vector<Tensor> symmetric_quantize_helper(
     const size_t bits_in_type = get_weight_quant_bits(ft_quant_type);
     const size_t bytes_per_out_col = num_cols * bits_in_type / 8;
 
-    const size_t input_mat_size = num_rows * num_cols;
-    const size_t quantized_mat_size = num_rows * bytes_per_out_col;
-
     std::vector<int64_t> quantized_weight_shape;
     std::vector<int64_t> scale_shape;
     if (weight.dim() == 2)
@@ -301,7 +298,7 @@ Tensor unpack_int4_packed_tensor_to_int8(Tensor weight)
     int8_t* packed_ptr = get_ptr<int8_t>(weight);
     int8_t* unpacked_ptr = get_ptr<int8_t>(unpacked_weight);
 
-    for (size_t packed_idx = 0; packed_idx < weight.numel(); ++packed_idx)
+    for (int64_t packed_idx = 0; packed_idx < weight.numel(); ++packed_idx)
     {
         int8_t packed_data = packed_ptr[packed_idx];
 
@@ -335,7 +332,7 @@ Tensor pack_int8_tensor_to_packed_int4(Tensor weight)
     int8_t* unpacked_ptr = get_ptr<int8_t>(weight);
     int8_t* packed_ptr = get_ptr<int8_t>(packed_weight);
 
-    for (size_t packed_idx = 0; packed_idx < packed_weight.numel(); ++packed_idx)
+    for (int64_t packed_idx = 0; packed_idx < packed_weight.numel(); ++packed_idx)
     {
         int8_t packed_int4s = 0;
         int8_t elt_0 = unpacked_ptr[2 * packed_idx + 0];

@@ -49,19 +49,12 @@ void convertSpecDecodingMaskToPackedMask(torch::Tensor specDecodingGenerationLen
 
     int batchSize = specDecodingGenerationLengthsTensor.size(0);
 
-    int64_t scanTempMemoryBytes = tensorrt_llm::kernels::speculative_decoding::invokeScanGenerationLengths(
-        nullptr, 0, nullptr, nullptr, batchSize, stream);
-    int64_t reduceMaxTempMemoryBytes = tensorrt_llm::kernels::speculative_decoding::invokeReduceMaxGenerationLengths(
-        nullptr, 0, nullptr, nullptr, batchSize, stream);
+    int64_t scanReduceTempMemoryBytes = tensorrt_llm::kernels::speculative_decoding::invokeScanReduceGenerationLengths(
+        batchSize, nullptr, nullptr, 0, nullptr, nullptr, stream);
 
-    torch::Tensor scanTempMemoryStorage = torch::empty(
+    torch::Tensor scanReduceTempMemoryStorage = torch::empty(
         {
-            scanTempMemoryBytes,
-        },
-        torch::dtype(torch::kInt8).device(torch::kCUDA).requires_grad(false));
-    torch::Tensor reduceMaxTempMemoryStorage = torch::empty(
-        {
-            reduceMaxTempMemoryBytes,
+            scanReduceTempMemoryBytes,
         },
         torch::dtype(torch::kInt8).device(torch::kCUDA).requires_grad(false));
     torch::Tensor scanedSpecDecodingGenerationLengths = torch::empty(
@@ -77,10 +70,8 @@ void convertSpecDecodingMaskToPackedMask(torch::Tensor specDecodingGenerationLen
 
     tensorrt_llm::kernels::speculative_decoding::invokeScanReduceGenerationLengths(batchSize,
         specDecodingGenerationLengthsTensor.data_ptr<int>(),
-        reinterpret_cast<void*>(scanTempMemoryStorage.data_ptr<int8_t>()), scanTempMemoryBytes,
-        scanedSpecDecodingGenerationLengths.data_ptr<int>(),
-        reinterpret_cast<void*>(reduceMaxTempMemoryStorage.data_ptr<int8_t>()), reduceMaxTempMemoryBytes,
-        maxSpecDecodingGenerationLengths.data_ptr<int>(), stream);
+        reinterpret_cast<void*>(scanReduceTempMemoryStorage.data_ptr<int8_t>()), scanReduceTempMemoryBytes,
+        scanedSpecDecodingGenerationLengths.data_ptr<int>(), maxSpecDecodingGenerationLengths.data_ptr<int>(), stream);
 
     int hostMaxSpecDecodingGenerationLengths;
     cudaMemcpyAsync(&hostMaxSpecDecodingGenerationLengths, maxSpecDecodingGenerationLengths.data_ptr<int>(),

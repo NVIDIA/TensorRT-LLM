@@ -12,6 +12,8 @@ set(SRCS
     batch_manager/llmRequest.cpp
     executor/bindings.cpp
     executor/executor.cpp
+    executor/executorConfig.cpp
+    executor/request.cpp
     runtime/bindings.cpp
     userbuffers/bindings.cpp
     ../runtime/ipcNvlsMemory.cpp

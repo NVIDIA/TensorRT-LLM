@@ -10,6 +10,7 @@ from tensorrt_llm.bindings.executor import (CapacitySchedulerPolicy,
                                             DynamicBatchConfig, SchedulerConfig)
 from tensorrt_llm.llmapi import LLM, BuildConfig, KvCacheConfig
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_options
+from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.serve import OpenAIServer
 
 
@@ -29,6 +30,10 @@ from tensorrt_llm.serve import OpenAIServer
               type=click.Choice(["pytorch"]),
               default=None,
               help="Set to 'pytorch' for pytorch path. Default is cpp path.")
+@click.option('--log_level',
+              type=click.Choice(severity_map.keys()),
+              default='info',
+              help="The logging level.")
 @click.option("--max_beam_width",
               type=int,
               default=BuildConfig.max_beam_width,
@@ -69,6 +74,12 @@ from tensorrt_llm.serve import OpenAIServer
               default=0.9,
               help="Free GPU memory fraction reserved for KV Cache, "
               "after allocating model weights and buffers.")
+@click.option(
+    "--num_postprocess_workers",
+    type=int,
+    default=0,
+    help="[Experimental] Number of workers to postprocess raw responses "
+    "to comply with OpenAI protocol.")
 @click.option("--trust_remote_code",
               is_flag=True,
               default=False,
@@ -80,15 +91,17 @@ from tensorrt_llm.serve import OpenAIServer
     help=
     "Path to a YAML file that overwrites the parameters specified by trtllm-serve."
 )
-def main(model: str, tokenizer: str, host: str, port: int, backend: str,
-         max_beam_width: int, max_batch_size: int, max_num_tokens: int,
-         max_seq_len: int, tp_size: int, pp_size: int, ep_size: Optional[int],
-         gpus_per_node: Optional[int], kv_cache_free_gpu_memory_fraction: float,
+def main(model: str, tokenizer: Optional[str], host: str, port: int,
+         log_level: str, backend: str, max_beam_width: int, max_batch_size: int,
+         max_num_tokens: int, max_seq_len: int, tp_size: int, pp_size: int,
+         ep_size: Optional[int], gpus_per_node: Optional[int],
+         kv_cache_free_gpu_memory_fraction: float, num_postprocess_workers: int,
          trust_remote_code: bool, extra_llm_api_options: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
     """
+    logger.set_level(log_level)
     build_config = BuildConfig(max_batch_size=max_batch_size,
                                max_num_tokens=max_num_tokens,
                                max_beam_width=max_beam_width,
@@ -121,6 +134,8 @@ def main(model: str, tokenizer: str, host: str, port: int, backend: str,
         "kv_cache_config": kv_cache_config,
         "backend": backend if backend == "pytorch" else None,
         "pytorch_backend_config": pytorch_backend_config,
+        "_num_postprocess_workers": num_postprocess_workers,
+        "_postprocess_tokenizer_dir": tokenizer or model,
     }
 
     if extra_llm_api_options is not None:

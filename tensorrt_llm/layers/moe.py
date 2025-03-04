@@ -26,14 +26,13 @@ from tensorrt_llm.layers.lora import LoraParams
 
 from .._common import default_net, default_trtnet
 from .._utils import QuantModeWrapper, int32_array
-from ..functional import (AllReduceParams, SideStreamIDType, _add_plugin_info,
-                          _create_tensor, allreduce, cast, concat, constant,
-                          cuda_stream_sync, div, expand, gather_nd,
-                          is_gated_activation, non_gated_version, nonzero,
-                          reduce_scatter, repeat_interleave, scatter,
+from ..functional import (AllReduceParams, SideStreamIDType, Tensor,
+                          _add_plugin_info, _create_tensor, allreduce, cast,
+                          concat, constant, cuda_stream_sync, div, expand,
+                          gather_nd, is_gated_activation, non_gated_version,
+                          nonzero, reduce_scatter, repeat_interleave, scatter,
                           scatter_nd, shape, sigmoid, softmax, split, sum, topk,
                           unsqueeze)
-from ..layers import MLP, GatedMLP
 from ..mapping import Mapping
 from ..module import Module, ModuleList
 from ..parameter import Parameter
@@ -43,6 +42,7 @@ from ..quantization.functional import (postprocess_weight_only,
                                        preprocess_weights_for_mixed_gemm,
                                        quantize)
 from .linear import RowLinear
+from .mlp import MLP, GatedMLP
 
 activation_str_to_int_map = {
     # [WARNING] Keep the below in sync with cpp/tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_gemm_kernels.h
@@ -736,7 +736,8 @@ class MixtureOfExperts(Module):
                  zero=False,
                  use_w4a8_awq=False,
                  use_int8_weight=False,
-                 group_size: int = -1):
+                 group_size: int = -1,
+                 static_routing=False):
         super().__init__()
 
         self.moe_config = moe_config
@@ -763,6 +764,8 @@ class MixtureOfExperts(Module):
 
         if self.use_int8_weight:
             raise NotImplementedError("INT8-GPTQ is not implemented for MoE.")
+
+        self.static_routing = static_routing
 
         self.experts_per_node = self.num_experts
         if self.mapping.has_moe_ep():
@@ -829,19 +832,20 @@ class MixtureOfExperts(Module):
         # Note that if we see models that have large number of experts, we may
         # need to consider add TP back here.
         # TODO: Arctic has large # experts, we may need to add TP back here.
-        self.router = RowLinear(
-            hidden_size,
-            self.num_experts,
-            bias=False,
-            dtype=
-            "float32",  # Routing is sensitive since it conditions what experts are used
-            tp_group=None,
-            tp_size=1,
-            strict_dtype=True)
-        self.router.tllm_to_externel_key_dict = {
-            "mlp": "block_sparse_moe",
-            "router": "gate"
-        }
+        if not self.static_routing:
+            self.router = RowLinear(
+                hidden_size,
+                self.num_experts,
+                bias=False,
+                dtype=
+                "float32",  # Routing is sensitive since it conditions what experts are used
+                tp_group=None,
+                tp_size=1,
+                strict_dtype=True)
+            self.router.tllm_to_externel_key_dict = {
+                "mlp": "block_sparse_moe",
+                "router": "gate"
+            }
 
         self.init_experts()
 
@@ -896,18 +900,22 @@ class MixtureOfExperts(Module):
                 all_reduce_params: Optional[AllReduceParams] = None,
                 last_local_layer_residual=None,
                 side_stream_id: Optional[SideStreamIDType] = SideStreamIDType.
-                disable):
+                disable,
+                static_routing_input: Optional[Tensor] = None):
         moe_router_lora_params = None
         if lora_layer_params is not None:
             moe_router_lora_params = lora_layer_params.get_runtime_params(
                 0, "moe_router")
-        routing_input = cast(hidden_states, trt.float32)
-        routing = self.router(routing_input, moe_router_lora_params)
-        if self.moe_config.normalization_mode in [
-                MoeConfig.ExpertScaleNormalizationMode.DEVICE_LIMITED,
-                MoeConfig.ExpertScaleNormalizationMode.DEVICE_LIMITED_RENORM
-        ]:
-            routing = self.group_limited_greedy(routing)
+        if not self.static_routing:
+            routing_input = cast(hidden_states, trt.float32)
+            routing = self.router(routing_input, moe_router_lora_params)
+            if self.moe_config.normalization_mode in [
+                    MoeConfig.ExpertScaleNormalizationMode.DEVICE_LIMITED,
+                    MoeConfig.ExpertScaleNormalizationMode.DEVICE_LIMITED_RENORM
+            ]:
+                routing = self.group_limited_greedy(routing)  # bs x seq_len
+        else:
+            routing = static_routing_input  # bs
         output = self.forward_experts(hidden_states, routing, finished,
                                       lora_layer_params, side_stream_id)
         if side_stream_id != SideStreamIDType.disable:
@@ -1098,7 +1106,8 @@ class MixtureOfExperts(Module):
             quantize(new_moe, quant_config)
 
         new_moe.load_weights(self)
-        new_moe.router = self.router
+        if not self.static_routing:
+            new_moe.router = self.router
         return new_moe
 
 

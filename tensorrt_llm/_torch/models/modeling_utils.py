@@ -3,6 +3,7 @@ import fnmatch
 import math
 import time
 from abc import ABC
+from dataclasses import dataclass
 from typing import Dict, Generic, Optional, Tuple, Type, TypeVar
 
 import torch
@@ -26,6 +27,14 @@ def timing(message: str):
     yield
     end = time.time()
     print(f"{message} -- {(end-start):.2f}s")
+
+
+@dataclass
+class EagerFusionConfig:
+    PRE_MOE_FUSION: bool = False
+    PRE_MLP_FUSION: bool = False
+    POST_MLP_FUSION: bool = False
+    POST_MOE_FUSION: bool = False
 
 
 class MetaInitException(RuntimeError):

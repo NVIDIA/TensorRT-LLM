@@ -348,6 +348,11 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                     "transformer": "language_model.model",
                     "lm_head": "language_model.lm_head",
                 }
+            elif config.qwen_type == "qwen2_audio":
+                custom_dict = {
+                    "transformer": "language_model.model",
+                    "lm_head": "language_model.lm_head",
+                }
             loader = ModelWeightsLoader(hf_model_dir, custom_dict)
             model = cls(config)
             if config.qwen_type == "qwen" and model.config.mapping.has_tp():

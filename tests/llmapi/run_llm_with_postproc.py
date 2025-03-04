@@ -6,6 +6,7 @@ from typing import Optional
 
 import click
 
+from tensorrt_llm.executor.postproc_worker import PostprocArgs, PostprocParams
 from tensorrt_llm.llmapi import LLM, KvCacheConfig, SamplingParams
 from tensorrt_llm.llmapi._perf_evaluator import perform_faked_oai_postprocess
 from tensorrt_llm.llmapi.utils import print_colored
@@ -25,7 +26,6 @@ def main(model_dir: str, tp_size: int, engine_dir: Optional[str], n: int,
     postproc_config = {
         "_num_postprocess_workers": tp_size,
         "_postprocess_tokenizer_dir": model_dir,
-        "_postprocess_result_handler": perform_faked_oai_postprocess
     }
 
     print_colored("Enabled OAI postprocessing\n", "yellow")
@@ -44,6 +44,10 @@ def main(model_dir: str, tp_size: int, engine_dir: Optional[str], n: int,
                                      n=n,
                                      best_of=best_of,
                                      top_k=top_k)
+    postproc_params = PostprocParams(
+        post_processor=perform_faked_oai_postprocess,
+        postproc_args=PostprocArgs(),
+    )
 
     prompt = "A B C D E F"
 
@@ -52,6 +56,7 @@ def main(model_dir: str, tp_size: int, engine_dir: Optional[str], n: int,
     async def generate_async():
         async for output in llm.generate_async(prompt,
                                                sampling_params=sampling_params,
+                                               _postproc_params=postproc_params,
                                                streaming=True):
             print(output)
             outputs.append(output.outputs[0]._postprocess_result)

@@ -32,12 +32,12 @@ using Fp8BlockScaleGemmRunnerPtr = std::unique_ptr<CutlassFp8BlockScaleGemmRunne
 
 namespace
 {
-void check_input_dtypes(torch::Tensor mat, std::optional<torch::Tensor> matScale)
+void check_input_dtypes(torch::Tensor const& mat, torch::Tensor const& matScale)
 {
-    TORCH_CHECK(matScale.has_value(), "matrix scale must be provided for FP8 matrix");
-    CHECK_INPUT((*matScale), FP8_BLOCK_SCALING_SF_DTYPE);
     TORCH_CHECK(mat.scalar_type() == at::ScalarType::Float8_e4m3fn,
         "Matrix dtype must be FP8 (the matrix will be dequantized on the fly).");
+
+    CHECK_INPUT(matScale, FP8_BLOCK_SCALING_SF_DTYPE);
 }
 
 #define DISPATCH_SCALAR_TYPE(scalar_type, ...)                                                                         \
@@ -78,8 +78,8 @@ Fp8BlockScaleGemmRunnerPtr get_gemm_runner(at::ScalarType dtype_a, at::ScalarTyp
 
 } // namespace
 
-torch::Tensor fp8_block_scaling_gemm_hopper(torch::Tensor mat1, torch::Tensor mat2,
-    std::optional<torch::Tensor> mat1Scale, std::optional<torch::Tensor> mat2Scale)
+torch::Tensor fp8_block_scaling_gemm_hopper(torch::Tensor const& mat1, torch::Tensor const& mat2,
+    torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale)
 {
     check_input_dtypes(mat1, mat1Scale);
     check_input_dtypes(mat2, mat2Scale);
@@ -101,8 +101,8 @@ torch::Tensor fp8_block_scaling_gemm_hopper(torch::Tensor mat1, torch::Tensor ma
 
     auto stream = at::cuda::getCurrentCUDAStream(mat1.get_device());
 
-    float const* mat1ScalePtr = mat1Scale.has_value() ? mat1Scale->data_ptr<float>() : nullptr;
-    float const* mat2ScalePtr = mat2Scale.has_value() ? mat2Scale->data_ptr<float>() : nullptr;
+    float const* mat1ScalePtr = mat1Scale.data_ptr<float>();
+    float const* mat2ScalePtr = mat2Scale.data_ptr<float>();
 
     gemm_runner->gemm(reinterpret_cast<__nv_fp8_e4m3*>(mat1.data_ptr()), k,
         reinterpret_cast<__nv_fp8_e4m3*>(mat2.data_ptr()), k, reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), n, m, n,
@@ -111,8 +111,8 @@ torch::Tensor fp8_block_scaling_gemm_hopper(torch::Tensor mat1, torch::Tensor ma
     return out;
 }
 
-torch::Tensor fp8_block_scale_gemm_blackwell(
-    torch::Tensor mat1, torch::Tensor mat2, torch::Tensor mat1Scale, torch::Tensor mat2Scale)
+torch::Tensor fp8_block_scale_gemm_blackwell(torch::Tensor const& mat1, torch::Tensor const& mat2,
+    torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale)
 {
     TORCH_CHECK(mat1.scalar_type() == at::ScalarType::Float8_e4m3fn, "Matrix dtype must be FP8.");
     TORCH_CHECK(mat2.scalar_type() == at::ScalarType::Float8_e4m3fn, "Matrix dtype must be FP8.");
@@ -161,29 +161,111 @@ torch::Tensor fp8_block_scale_gemm_blackwell(
     return out;
 }
 
-extern torch::Tensor fp8_block_scaling_gemm(torch::Tensor mat1, torch::Tensor mat2,
-    std::optional<torch::Tensor> mat1Scale, std::optional<torch::Tensor> mat2Scale)
+extern torch::Tensor fp8_block_scaling_gemm(torch::Tensor const& mat1, torch::Tensor const& mat2,
+    torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale)
 {
     auto const sm = tensorrt_llm::common::getSMVersion();
     switch (sm)
     {
-    case 100:
-        TORCH_CHECK(mat1Scale.has_value(), "mat1Scale must be provided for SM100");
-        TORCH_CHECK(mat2Scale.has_value(), "mat2Scale must be provided for SM100");
-        return fp8_block_scale_gemm_blackwell(mat1, mat2, mat1Scale.value(), mat2Scale.value());
+    case 100: return fp8_block_scale_gemm_blackwell(mat1, mat2, mat1Scale, mat2Scale);
     case 90: return fp8_block_scaling_gemm_hopper(mat1, mat2, mat1Scale, mat2Scale);
     default: TORCH_CHECK(false, "Unsupported SM version for FP8 block scaling GEMM");
     }
+}
+
+// All inputs are k-major
+torch::Tensor fp8_block_scaling_bmm_out(torch::Tensor const& mat1, torch::Tensor const& mat2,
+    torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, torch::Tensor& out)
+{
+    check_input_dtypes(mat1, mat1Scale);
+    check_input_dtypes(mat2, mat2Scale);
+
+    TORCH_CHECK(mat1.dim() == 3, "mat1 must be a batched matrix");
+    TORCH_CHECK(mat2.dim() == 3, "mat2 must be a batched matrix");
+    TORCH_CHECK(mat1.sizes()[0] == mat2.sizes()[0], "mat1 and mat2 batch dim must be the same but got", mat1.sizes()[0],
+        ", and ", mat2.sizes()[0]);
+    TORCH_CHECK(mat1.sizes()[2] == mat2.sizes()[2], "mat1 and mat2 k dim must be the same but got", mat1.sizes()[2],
+        ", and ", mat2.sizes()[2]);
+    TORCH_CHECK(mat1Scale.dim() == 1, "mat1Scale must be a vector.");
+
+    // mat1 could be strided due to padding
+
+    auto const b = mat1.sizes()[0];
+    auto const m = mat1.sizes()[1];
+    auto const n = mat2.sizes()[1];
+    auto const k = mat1.sizes()[2];
+    TORCH_CHECK(k % 16 == 0, "K must be a multiple of 16, (K=", k, ")");
+    TORCH_CHECK(n % 16 == 0, "N must be a multiple of 16, (N=", n, ")");
+
+    CHECK_TH_CUDA(out);
+    CHECK_TYPE(out, at::ScalarType::BFloat16);
+    auto const& out_shape = out.sizes();
+    TORCH_CHECK(out_shape[0] == b && out_shape[1] == m && out_shape[2] == n, "out shape must be (", b, ", ", m, ", ", n,
+        "), but got (", out_shape[0], ", ", out_shape[1], ", ", out_shape[2], ").");
+
+    auto gemm_runner = get_gemm_runner(mat1.scalar_type(), mat2.scalar_type());
+
+    auto stream = at::cuda::getCurrentCUDAStream(mat1.get_device());
+
+    float* mat1ScalePtr = mat1Scale.data_ptr<float>();
+    float* mat2ScalePtr = mat2Scale.data_ptr<float>();
+
+    auto* out_ptr = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
+    auto* mat1_ptr = reinterpret_cast<__nv_fp8_e4m3*>(mat1.data_ptr());
+    auto* mat2_ptr = reinterpret_cast<__nv_fp8_e4m3*>(mat2.data_ptr());
+
+    TORCH_CHECK(out.strides()[2] == 1, "The last stride of out must be 1, not ", out.strides()[2]);
+    TORCH_CHECK(mat1.strides()[2] == 1, "The last stride of mat1 must be 1, not ", mat1.strides()[2]);
+    TORCH_CHECK(mat2.strides()[2] == 1, "The last stride of mat2 must be 1, not ", mat2.strides()[2]);
+
+    auto const strideD = out.strides()[0]; // m * n
+    auto const ldd = out.strides()[1];     // n
+
+    auto const strideA = mat1.strides()[0];
+    auto const lda = mat1.strides()[1];
+
+    auto const strideB = mat2.strides()[0];
+    auto const ldb = mat2.strides()[1];
+
+    // mat1Scale is a 1D tensor which doesn't carry any stride information
+    auto const strideScalesA = ((m + 4 - 1) / 4 * 4) * ((k + 128 - 1) / 128);
+
+    gemm_runner->strideBatchGemm(out_ptr, ldd, strideD, mat1_ptr, lda, strideA, mat2_ptr, ldb, strideB, b, m, n, k,
+        stream, mat1ScalePtr, strideScalesA, mat2ScalePtr);
+
+    return out;
+}
+
+// All inputs are k-major
+torch::Tensor fp8_block_scaling_bmm(torch::Tensor const& mat1, torch::Tensor const& mat2,
+    torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, std::optional<c10::ScalarType> out_dtype)
+{
+    auto const b = mat1.sizes()[0];
+    auto const m = mat1.sizes()[1];
+    auto const n = mat2.sizes()[1];
+
+    auto const dtype = out_dtype.value_or(at::ScalarType::BFloat16);
+
+    at::Tensor out = at::detail::empty_cuda({b, m, n}, dtype, mat1.device(), std::nullopt);
+    return fp8_block_scaling_bmm_out(mat1, mat2, mat1Scale, mat2Scale, out);
 }
 
 } // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def("fp8_block_scaling_gemm(Tensor mat1, Tensor mat2, Tensor? mat1Scale, Tensor? mat2Scale) -> Tensor");
+    m.def("fp8_block_scaling_gemm(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale) -> Tensor");
+    m.def(
+        "fp8_block_scaling_bmm(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale, ScalarType? "
+        "out_dtype=None) -> Tensor");
+    m.def(
+        "fp8_block_scaling_bmm_out(Tensor mat1, Tensor mat2, Tensor mat1Scale, Tensor mat2Scale, Tensor(a!) out) -> "
+        "Tensor(a!)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("fp8_block_scaling_gemm", &torch_ext::fp8_block_scaling_gemm);
+    m.impl("fp8_block_scaling_bmm", &torch_ext::fp8_block_scaling_bmm);
+    m.impl("fp8_block_scaling_bmm_out", &torch_ext::fp8_block_scaling_bmm_out);
 }

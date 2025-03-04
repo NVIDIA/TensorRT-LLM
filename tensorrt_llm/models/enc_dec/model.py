@@ -26,12 +26,15 @@ from tensorrt_llm.functional import (LayerNormPositionType, LayerNormType,
                                      assertion, cast, gather_last_token_logits,
                                      gelu, maximum, minimum, recv, send, shape,
                                      transpose, unsqueeze)
+# yapf: disable
 from tensorrt_llm.layers import (MLP, Attention, AttentionMaskParams,
                                  AttentionMaskType, AttentionParams,
                                  BertAttention, ColumnLinear, Conv1d, Embedding,
                                  FusedGatedMLP, GatedMLP, GroupNorm,
-                                 KeyValueCacheParams, LayerNorm, LoraParams,
+                                 KeyValueCacheParams, LanguageAdapter,
+                                 LanguageAdapterConfig, LayerNorm, LoraParams,
                                  PromptTuningEmbedding, RmsNorm)
+# yapf: enable
 from tensorrt_llm.lora_manager import (LoraConfig,
                                        get_default_trtllm_modules_to_hf_modules,
                                        use_lora)
@@ -60,6 +63,7 @@ class EncDecTransformer(Module):
     def __init__(self,
                  vocab_size,
                  hidden_size,
+                 has_vocab_embeddings=True,
                  max_position_embeddings=None,
                  has_position_embedding=False,
                  type_vocab_size=None,
@@ -81,14 +85,16 @@ class EncDecTransformer(Module):
         self.mapping = mapping
 
         if self.mapping.is_first_pp_rank():
-            self.vocab_embedding = Embedding(
-                vocab_size,
-                hidden_size,
-                dtype=dtype,
-                tp_size=mapping.tp_size if use_parallel_embedding else 1,
-                tp_group=mapping.tp_group if use_parallel_embedding else None,
-                sharding_dim=embedding_sharding_dim,
-                tp_rank=mapping.tp_rank)
+            if has_vocab_embeddings:
+                self.vocab_embedding = Embedding(
+                    vocab_size,
+                    hidden_size,
+                    dtype=dtype,
+                    tp_size=mapping.tp_size if use_parallel_embedding else 1,
+                    tp_group=mapping.tp_group
+                    if use_parallel_embedding else None,
+                    sharding_dim=embedding_sharding_dim,
+                    tp_rank=mapping.tp_rank)
 
             self.position_embedding = None
             self.max_position_embeddings = max_position_embeddings
@@ -139,8 +145,8 @@ class EncDecTransformer(Module):
                                     eps=norm_epsilon,
                                     dtype=dtype)
 
-    def assign_layers(self, layers):
-        self.layers = layers
+    def assign_module(self, module, module_name):
+        setattr(self, module_name, module)
 
     def embedding(self,
                   input_ids,
@@ -195,7 +201,8 @@ class EncoderLayer(Module):
                  max_distance=0,
                  num_buckets=0,
                  fp16_clamping=False,
-                 quant_mode=QuantMode(0)):
+                 quant_mode=QuantMode(0),
+                 language_adapter_config: LanguageAdapterConfig = None):
         super().__init__()
 
         # e.g. BART regular, T5 RMS
@@ -252,12 +259,29 @@ class EncoderLayer(Module):
         # residual add to avoid accuracy drop.
         self.fp16_clamping = fp16_clamping
 
+        self.adapter = None
+        self.adapter_layer_norm = None
+
+        if language_adapter_config:
+            self.adapter_layer_norm = ln_type(normalized_shape=hidden_size,
+                                              eps=layernorm_eps,
+                                              dtype=dtype)
+            self.adapter = LanguageAdapter(
+                language_adapter_config=language_adapter_config,
+                hidden_size=hidden_size,
+                hidden_act=hidden_act,
+                mapping=mapping,
+                has_mlp_bias=has_mlp_bias,
+                dtype=dtype,
+                quant_mode=quant_mode)
+
     def forward(self,
                 hidden_states: Tensor,
                 attention_mask=None,
                 input_lengths=None,
                 max_input_length=None,
-                lora_layer_params=None):
+                lora_layer_params=None,
+                language_adapter_routings: Optional[Tensor] = None):
         assert isinstance(hidden_states, Tensor)
 
         # self attention
@@ -303,6 +327,17 @@ class EncoderLayer(Module):
         if self.layernorm_position == LayerNormPositionType.post_layernorm:
             hidden_states = self.mlp_layernorm(hidden_states)
 
+        # MT Specific: adapters
+        if self.adapter:
+            residual = hidden_states
+            hidden_states = self.adapter_layer_norm(hidden_states)
+            hidden_states = self.adapter.layers(
+                hidden_states, static_routing_input=language_adapter_routings)
+            hidden_states = residual + hidden_states
+            if self.fp16_clamping:
+                hidden_states = maximum(-64000.0, hidden_states)
+                hidden_states = minimum(64000.0, hidden_states)
+
         return hidden_states
 
 
@@ -334,7 +369,8 @@ class DecoderLayer(Module):
                  fp16_clamping=False,
                  skip_cross_kv=False,
                  use_implicit_relative_attention=False,
-                 quant_mode=QuantMode(0)):
+                 quant_mode=QuantMode(0),
+                 language_adapter_config: LanguageAdapterConfig = None):
         super().__init__()
 
         # e.g. BART regular, T5 RMS
@@ -431,6 +467,22 @@ class DecoderLayer(Module):
         # residual add to avoid accuracy drop.
         self.fp16_clamping = fp16_clamping
 
+        self.adapter = None
+        self.adapter_layer_norm = None
+
+        if language_adapter_config:
+            self.adapter_layer_norm = ln_type(normalized_shape=hidden_size,
+                                              eps=layernorm_eps,
+                                              dtype=dtype)
+            self.adapter = LanguageAdapter(
+                language_adapter_config=language_adapter_config,
+                hidden_size=hidden_size,
+                hidden_act=hidden_act,
+                mapping=mapping,
+                has_mlp_bias=has_mlp_bias,
+                dtype=dtype,
+                quant_mode=quant_mode)
+
     def forward(self,
                 hidden_states: Tensor,
                 encoder_output: Optional[Tensor] = None,
@@ -440,7 +492,8 @@ class DecoderLayer(Module):
                 attention_params=None,
                 lora_layer_params=None,
                 cross_kv_cache_gen: Optional[Tensor] = None,
-                cross_kv_reuse: Optional[Tensor] = None):
+                cross_kv_reuse: Optional[Tensor] = None,
+                language_adapter_routings: Optional[Tensor] = None):
         assert isinstance(hidden_states, Tensor)
 
         if encoder_output:
@@ -526,6 +579,17 @@ class DecoderLayer(Module):
         if self.layernorm_position == LayerNormPositionType.post_layernorm:
             hidden_states = self.mlp_layernorm(hidden_states)
 
+        # MT Specific: adapters
+        if self.adapter:
+            residual = hidden_states
+            hidden_states = self.adapter_layer_norm(hidden_states)
+            hidden_states = self.adapter.layers(
+                hidden_states, static_routing_input=language_adapter_routings)
+            hidden_states = residual + hidden_states
+            if self.fp16_clamping:
+                hidden_states = maximum(-64000.0, hidden_states)
+                hidden_states = minimum(64000.0, hidden_states)
+
         if use_cache:
             return (hidden_states, presents_self, presents_cross)
         return hidden_states
@@ -569,6 +633,10 @@ class EncoderModel(PretrainedModel):
                               == 'float16') and (self.config.model_type == 't5')
         self.mlp_type = MLPType.MLP if not hasattr(
             self.config, "mlp_type") else self.config.mlp_type
+        self.language_adapter_config = None if not hasattr(
+            self.config,
+            'language_adapter_config') else LanguageAdapterConfig.from_dict(
+                self.config.language_adapter_config)
 
         self.transformer = EncDecTransformer(
             self.config.vocab_size,
@@ -613,10 +681,11 @@ class EncoderModel(PretrainedModel):
                 max_distance=self.config.max_distance,
                 num_buckets=self.config.num_buckets,
                 fp16_clamping=self.fp16_clamping,
-                quant_mode=self.config.quant_mode)
+                quant_mode=self.config.quant_mode,
+                language_adapter_config=self.language_adapter_config)
             for _ in self.mapping.pp_layers(self.total_num_layers)
         ])
-        self.transformer.assign_layers(encoder_layers)
+        self.transformer.assign_module(encoder_layers, "layers")
 
     def check_config(self, config: PretrainedConfig):
         config.set_if_not_exist('has_position_embedding', False)
@@ -654,8 +723,8 @@ class EncoderModel(PretrainedModel):
                 prompt_tasks=None,
                 prompt_vocab_size=None,
                 attention_mask=None,
-                lora_params: LoraParams = None):
-
+                lora_params: LoraParams = None,
+                language_adapter_routings: Optional[Tensor] = None):
         # In PP, layer 0 has ids as inputs, all other layers have hidden_states as inputs
         if self.mapping.is_first_pp_rank():
             ptuning_args = [
@@ -674,11 +743,13 @@ class EncoderModel(PretrainedModel):
             lora_layer_params = None
             if lora_params is not None and lora_params.lora_ranks is not None:
                 lora_layer_params = lora_params.get_layer_params(layer_idx)
-            hidden_states = encoder_layer(hidden_states=hidden_states,
-                                          attention_mask=attention_mask,
-                                          input_lengths=input_lengths,
-                                          max_input_length=max_input_length,
-                                          lora_layer_params=lora_layer_params)
+            hidden_states = encoder_layer(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                input_lengths=input_lengths,
+                max_input_length=max_input_length,
+                lora_layer_params=lora_layer_params,
+                language_adapter_routings=language_adapter_routings)
 
         if self.mapping.is_last_pp_rank():
             if self.has_model_final_layernorm:
@@ -919,6 +990,19 @@ class EncoderModel(PretrainedModel):
                 host_context_lengths=host_context_lengths,
             )
 
+        language_adapter_routings = None
+        if self.language_adapter_config:
+            language_adapter_routings = Tensor(
+                name="language_adapter_routings",
+                dtype=trt.float32,
+                shape=[-1, self.language_adapter_config.num_languages],
+                dim_range=OrderedDict([
+                    ('num_tokens', [num_tokens_range]),
+                    ('num_languages',
+                     [self.language_adapter_config.num_languages])
+                ]),
+            )
+
         result = {
             'input_ids': input_ids,
             'input_lengths': input_lengths,
@@ -931,6 +1015,7 @@ class EncoderModel(PretrainedModel):
             'prompt_vocab_size': prompt_vocab_size,
             'attention_mask': attention_mask,
             'lora_params': lora_params,
+            'language_adapter_routings': language_adapter_routings,
         }
 
         return result
@@ -1016,6 +1101,11 @@ class DecoderModel(PretrainedModel):
         self.use_implicit_relative_attention = self.config.use_implicit_relative_attention if hasattr(
             self.config, "use_implicit_relative_attention") else False
 
+        self.language_adapter_config = None if not hasattr(
+            self.config,
+            'language_adapter_config') else LanguageAdapterConfig.from_dict(
+                self.config.language_adapter_config)
+
         self.transformer = EncDecTransformer(
             self.config.vocab_size,
             self.config.hidden_size,
@@ -1062,9 +1152,11 @@ class DecoderModel(PretrainedModel):
                 skip_cross_kv=self.skip_cross_kv,
                 use_implicit_relative_attention=self.
                 use_implicit_relative_attention,
-                quant_mode=self.config.quant_mode) for layer_idx in layers_range
+                quant_mode=self.config.quant_mode,
+                language_adapter_config=self.language_adapter_config)
+            for layer_idx in layers_range
         ])
-        self.transformer.assign_layers(decoder_layers)
+        self.transformer.assign_module(decoder_layers, "layers")
 
         if self.mapping.is_last_pp_rank():
             self.lm_head = ColumnLinear(
@@ -1134,7 +1226,8 @@ class DecoderModel(PretrainedModel):
                 hidden_states=None,
                 lora_params: LoraParams = None,
                 cross_kv_cache_gen: Optional[Tensor] = None,
-                cross_kv_reuse: Optional[Tensor] = None):
+                cross_kv_reuse: Optional[Tensor] = None,
+                language_adapter_routings: Optional[Tensor] = None):
         if self.mapping.is_first_pp_rank():
             assert isinstance(decoder_input_ids, Tensor)
         else:
@@ -1195,7 +1288,8 @@ class DecoderModel(PretrainedModel):
                 attention_params=attention_params,
                 lora_layer_params=lora_layer_params,
                 cross_kv_cache_gen=cross_kv_cache_gen,
-                cross_kv_reuse=cross_kv_reuse)
+                cross_kv_reuse=cross_kv_reuse,
+                language_adapter_routings=language_adapter_routings)
 
             if use_cache:
                 presents_self, presents_cross = hidden_states[1], hidden_states[
@@ -1894,6 +1988,19 @@ class DecoderModel(PretrainedModel):
                     ]),
                 )
 
+        language_adapter_routings = None
+        if self.language_adapter_config:
+            language_adapter_routings = Tensor(
+                name="language_adapter_routings",
+                dtype=trt.float32,
+                shape=[-1, self.language_adapter_config.num_languages],
+                dim_range=OrderedDict([
+                    ('decoder_num_tokens_range', [decoder_num_tokens_range]),
+                    ('num_languages',
+                     [self.language_adapter_config.num_languages])
+                ]),
+            )
+
         result = {
             'decoder_input_ids': input_ids,
             'encoder_output': encoder_output,
@@ -1908,6 +2015,7 @@ class DecoderModel(PretrainedModel):
             'lora_params': lora_params,
             'cross_kv_cache_gen': cross_kv_cache_gen,
             'cross_kv_reuse': cross_kv_reuse,
+            'language_adapter_routings': language_adapter_routings,
         }
 
         return result
@@ -1945,21 +2053,28 @@ class WhisperEncoder(PretrainedModel):
     def __init__(self, config: PretrainedConfig):
         super().__init__(config)
         self._dtype = self.config.dtype
-        self.conv1 = Conv1d(config.n_mels,
-                            config.hidden_size,
-                            kernel_size=3,
-                            padding=1,
-                            dtype=self._dtype)
-        self.conv2 = Conv1d(config.hidden_size,
-                            config.hidden_size,
-                            kernel_size=3,
-                            stride=2,
-                            padding=1,
-                            dtype=self._dtype)
-        self.position_embedding = Embedding(self.config.max_position_embeddings,
-                                            self.config.hidden_size,
-                                            dtype=self.config.dtype)
-        self.encoder_layers = ModuleList([
+        conv1 = Conv1d(config.n_mels,
+                       config.hidden_size,
+                       kernel_size=3,
+                       padding=1,
+                       dtype=self._dtype)
+        conv2 = Conv1d(config.hidden_size,
+                       config.hidden_size,
+                       kernel_size=3,
+                       stride=2,
+                       padding=1,
+                       dtype=self._dtype)
+        self.transformer = EncDecTransformer(
+            0,
+            self.config.hidden_size,
+            has_vocab_embeddings=False,
+            max_position_embeddings=self.config.max_position_embeddings,
+            has_position_embedding=self.config.has_position_embedding,
+            layernorm_type=LayerNormType.LayerNorm,
+            dtype=self.config.dtype,
+            has_model_final_layernorm=True,
+            is_decoder=False)
+        encoder_layers = ModuleList([
             EncoderLayer(
                 hidden_size=config.hidden_size,
                 ffn_hidden_size=config.hidden_size * 4,
@@ -1972,8 +2087,9 @@ class WhisperEncoder(PretrainedModel):
                 hidden_act='gelu',
                 dtype=self._dtype) for _ in range(config.num_hidden_layers)
         ])
-
-        self.ln_post = LayerNorm(config.hidden_size, dtype=self._dtype)
+        self.transformer.assign_module(encoder_layers, "layers")
+        self.transformer.assign_module(conv1, "conv1")
+        self.transformer.assign_module(conv2, "conv2")
         self.max_audio_feature_seq_len = 3000
         self.downsample_factor = 2
 
@@ -1987,25 +2103,25 @@ class WhisperEncoder(PretrainedModel):
             input_features = transpose(input_features, 1, 2)
         x_type = input_features.dtype
         input_features = cast(input_features, self._dtype)
-        x = self.conv1(input_features)
+        x = self.transformer.conv1(input_features)
         x = gelu(x)
-        x = self.conv2(x)
+        x = self.transformer.conv2(x)
         x = cast(x, x_type)
         x = gelu(x)
         x = transpose(x, 2, 1)
-        x = x + cast(self.position_embedding(position_ids), x.dtype)
+        x = x + cast(self.transformer.position_embedding(position_ids), x.dtype)
 
         if default_net().plugin_config.remove_input_padding:
             #B,T,D -> BxT,D
             x = x.view([-1, self.config.hidden_size])
         hidden_states = x
         input_lengths = input_lengths // self.downsample_factor
-        for encoder_layer in self.encoder_layers:
+        for encoder_layer in self.transformer.layers:
             hidden_states = encoder_layer(hidden_states,
                                           input_lengths=input_lengths)
 
         x = hidden_states
-        x = self.ln_post(x)
+        x = self.transformer.ln_f(x)
         x.mark_output('encoder_output', self._dtype)
         return x
 

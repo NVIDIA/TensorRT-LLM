@@ -343,7 +343,6 @@ public:
         int64_t inter_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
         int const num_experts_on_rank = fc2_expert_weights.sizes()[0];
         auto const num_experts_total = static_cast<int>(num_experts_on_rank * ep_size);
-        int const moe_top_k = static_cast<int>(top_k);
         auto parallelism_config = kernels::MOEParallelismConfig(tp_size, tp_rank, ep_size, ep_rank);
         auto activation_type = tensorrt_llm::ActivationType::Swiglu;
         auto norm_mode = static_cast<kernels::MOEExpertScaleNormalizationMode>(normalization_mode);
@@ -444,7 +443,7 @@ private:
     {
         mProfiler->prepare(m, profile_workspace, stream);
         float best_time = std::numeric_limits<float>::max();
-        ProfileId best_profile_id;
+        ProfileId best_profile_id{0};
         for (int i = 0; i < static_cast<int>(mAllProfiles.size()); ++i)
         {
             auto const& profile = mAllProfiles[i];

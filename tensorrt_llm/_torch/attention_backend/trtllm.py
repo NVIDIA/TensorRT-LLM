@@ -1,5 +1,6 @@
 import math
 from dataclasses import dataclass
+from enum import IntEnum
 from typing import Optional
 
 import torch
@@ -7,10 +8,19 @@ import torch
 from tensorrt_llm._torch.attention_backend.interface import (
     AttentionBackend, AttentionMask, AttentionMetadata, MLAParams,
     PositionalEmbeddingParams, PredefinedAttentionMask, RopeParams)
+from tensorrt_llm._torch.attention_backend.vanilla import VanillaAttention
 from tensorrt_llm.functional import (AttentionMaskType, RopeEmbeddingUtils,
                                      RotaryScalingType)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
+
+
+# The type of requests in qkv passed to attention
+# Please keep sync with AttentionInputType in cpp/tensorrt_llm/thop/attentionOp.cpp
+class AttentionInputType(IntEnum):
+    mixed = 0  # contains both context and generation
+    context_only = 1
+    generation_only = 2
 
 
 @dataclass(kw_only=True, init=False)
@@ -52,10 +62,7 @@ class TrtllmAttentionWrapper:
     rotary_embedding_max_positions: int
     rotary_embedding_original_max_positions: int
     use_paged_context_fmha: bool
-    is_mla_enable: Optional[bool]
-    q_b_proj: Optional[torch.Tensor]
-    kv_b_proj: Optional[torch.Tensor]
-    k_b_proj_trans: Optional[torch.Tensor]
+    is_mla_enable: bool
     q_lora_rank: int
     kv_lora_rank: int
     qk_rope_head_dim: int
@@ -64,16 +71,15 @@ class TrtllmAttentionWrapper:
     kwargs: dict
 
     def __init__(
-            self,
-            layer_idx: int,
-            num_heads: int,
-            head_size: int,
-            num_kv_heads: Optional[int] = None,
-            pos_embd_params: Optional[PositionalEmbeddingParams] = None,
-            quant_config: Optional[QuantConfig] = None,
-            is_mla_enable: Optional[bool] = False,
-            mla_params: Optional[MLAParams] = MLAParams(),
-            **kwargs,
+        self,
+        layer_idx: int,
+        num_heads: int,
+        head_size: int,
+        num_kv_heads: Optional[int] = None,
+        pos_embd_params: Optional[PositionalEmbeddingParams] = None,
+        quant_config: Optional[QuantConfig] = None,
+        mla_params: Optional[MLAParams] = None,
+        **kwargs,
     ):
         """
         Initialize the attention wrapper.
@@ -92,15 +98,17 @@ class TrtllmAttentionWrapper:
             self.rotary_cos_sin = None
             rope_params = RopeParams()
 
-        self.is_mla_enable = is_mla_enable
-        self.q_lora_rank = mla_params.q_lora_rank
-        self.kv_lora_rank = mla_params.kv_lora_rank
-        self.qk_nope_head_dim = mla_params.qk_nope_head_dim
-        self.qk_rope_head_dim = mla_params.qk_rope_head_dim
-        self.v_head_dim = mla_params.v_head_dim
+        self.is_mla_enable = mla_params is not None
         self.q_scaling = 1.0
+        self.mla_rope_params = None
 
-        if is_mla_enable:
+        if self.is_mla_enable:
+            self.q_lora_rank = mla_params.q_lora_rank
+            self.kv_lora_rank = mla_params.kv_lora_rank
+            self.qk_nope_head_dim = mla_params.qk_nope_head_dim
+            self.qk_rope_head_dim = mla_params.qk_rope_head_dim
+            self.v_head_dim = mla_params.v_head_dim
+
             self.rotary_embedding_dim = 0
 
             def yarn_get_mscale(scale=1, mscale=1):
@@ -131,7 +139,14 @@ class TrtllmAttentionWrapper:
             self.rotary_inv_freq = None
             self.rotary_embedding_scale_type = RotaryScalingType.none
             self.rotary_embedding_scale = 1.0
+            self.mla_rope_params = rope_params
         else:
+            self.q_lora_rank = None
+            self.kv_lora_rank = None
+            self.qk_nope_head_dim = None
+            self.qk_rope_head_dim = None
+            self.v_head_dim = None
+
             self.rotary_inv_freq, self.rotary_cos_sin = rope_params.create_rope_const_params(
             )
             self.rotary_embedding_dim = rope_params.dim
@@ -178,13 +193,9 @@ class TrtllmAttentionWrapper:
         kv_scale_quant_orig: Optional[torch.Tensor] = None,
         out_scale: Optional[torch.Tensor] = None,
         use_paged_context_fmha: bool = False,
-        q_b_proj: Optional[torch.Tensor] = None,
-        kv_b_proj: Optional[torch.Tensor] = None,
-        k_b_proj_trans: Optional[torch.Tensor] = None,
-        q_b_proj_scale: Optional[torch.Tensor] = None,
-        kv_b_proj_scale: Optional[torch.Tensor] = None,
-        k_b_proj_trans_scale: Optional[torch.Tensor] = None,
-        is_fp8_block_scaling_enabled: bool = False,
+        attention_input_type: AttentionInputType = AttentionInputType.mixed,
+        latent_cache: Optional[torch.Tensor] = None,
+        q_pe: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         """
@@ -233,14 +244,28 @@ class TrtllmAttentionWrapper:
         self.kv_scale_quant_orig = kv_scale_quant_orig
         self.out_scale = out_scale
         self.use_paged_context_fmha = use_paged_context_fmha
-        self.q_b_proj = q_b_proj
-        self.kv_b_proj = kv_b_proj
-        self.k_b_proj_trans = k_b_proj_trans
-        self.q_b_proj_scale = q_b_proj_scale
-        self.kv_b_proj_scale = kv_b_proj_scale
-        self.k_b_proj_trans_scale = k_b_proj_trans_scale
-        self.is_fp8_block_scaling_enabled = is_fp8_block_scaling_enabled
+        self.attention_input_type = int(attention_input_type)
+        self.latent_cache = latent_cache
+        self.q_pe = q_pe
         self.kwargs.update(kwargs)
+
+        if self.is_mla_enable:
+            if self.max_context_length > (self.rotary_cos_sin.shape[1] /
+                                          (2 * self.qk_rope_head_dim)):
+                rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_deepseek_attention_plugin(
+                    self.max_context_length,
+                    self.qk_rope_head_dim,
+                    self.mla_rope_params.theta,
+                    self.mla_rope_params.scale,
+                    self.mla_rope_params.original_max_positions,
+                    self.mla_rope_params.beta_fast,
+                    self.mla_rope_params.beta_slow,
+                    self.mla_rope_params.mscale,
+                    self.mla_rope_params.mscale_all_dim,
+                )
+                self.rotary_cos_sin = torch.tensor(rope_cos_sin,
+                                                   dtype=torch.float32,
+                                                   device="cuda")
 
     def run(
         self,
@@ -300,9 +325,20 @@ class TrtllmAttentionWrapper:
                 raise ValueError("Unexpected attention mask type")
         else:
             assert is_fused_qkv
-            qkv_hidden_size = self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim
-            assert q.shape[1] == qkv_hidden_size
-            num_tokens = q.shape[0]
+            if self.attention_input_type == AttentionInputType.context_only:
+                qkv_hidden_size = self.num_heads * (
+                    2 * (self.qk_nope_head_dim + self.qk_rope_head_dim)
+                ) + self.num_kv_heads * self.v_head_dim
+            elif self.attention_input_type == AttentionInputType.generation_only:
+                qkv_hidden_size = self.num_heads * (self.kv_lora_rank +
+                                                    self.qk_rope_head_dim)
+            else:
+                raise ValueError(
+                    "In MLA, TrtllmAttention can only support context_only or generation_only, not mixed."
+                )
+            assert q.shape[
+                1] == qkv_hidden_size, f"q.shape[1] must be equal to qkv_hidden_size, got {q.shape[1]=}, {qkv_hidden_size=}"
+
             batch_size = self.sequence_length.shape[0]
             assert self.host_past_key_value_lengths.shape[0] == batch_size
             assert self.context_lengths.shape[0] == batch_size
@@ -337,19 +373,14 @@ class TrtllmAttentionWrapper:
             self.out_scale,
             self.rotary_inv_freq,
             self.rotary_cos_sin,
-            self.q_b_proj,
-            self.kv_b_proj,
-            self.k_b_proj_trans,
-            self.q_b_proj_scale,
-            self.kv_b_proj_scale,
-            self.k_b_proj_trans_scale,
+            self.latent_cache,
+            self.q_pe,
             is_fused_qkv,
             update_kv_cache,
             self.layer_idx,
             self.num_heads,
-            1 if self.is_mla_enable else self.num_kv_heads,
-            self.kv_lora_rank +
-            self.qk_rope_head_dim if self.is_mla_enable else self.head_size,
+            self.num_kv_heads,
+            self.head_size,
             self.tokens_per_block,
             self.max_num_requests,
             self.max_context_length,
@@ -369,13 +400,13 @@ class TrtllmAttentionWrapper:
             self.rotary_embedding_max_positions,
             self.rotary_embedding_original_max_positions,
             self.use_paged_context_fmha,
+            self.attention_input_type,
             self.is_mla_enable,
             self.q_lora_rank,
             self.kv_lora_rank,
             self.qk_nope_head_dim,
             self.qk_rope_head_dim,
             self.v_head_dim,
-            self.is_fp8_block_scaling_enabled,
         )
         return output
 
@@ -470,7 +501,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         num_kv_heads: Optional[int] = None,
         pos_embd_params: Optional[PositionalEmbeddingParams] = None,
         quant_config: Optional[QuantConfig] = None,
-        is_mla_enable: Optional[bool] = False,
         mla_params: Optional[MLAParams] = None,
     ):
         """
@@ -494,11 +524,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             num_kv_heads,
             pos_embd_params=pos_embd_params,
             quant_config=quant_config,
-            is_mla_enable=is_mla_enable,
             mla_params=mla_params,
         )
 
-        self.is_mla_enable = is_mla_enable
+        self.is_mla_enable = mla_params is not None
         self.mla_params = mla_params
 
         self.kv_cache_scaling_factor = torch.tensor(
@@ -509,15 +538,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.kv_scale_quant_orig = self.kv_cache_scaling_factor
         self.kv_scale_orig_quant = 1.0 / self.kv_scale_quant_orig
         self.has_fp8_qdq = self.has_fp8_kv_cache = self.has_nvfp4 = False
-        self.is_fp8_block_scaling_enabled = False
         if self.quant_config:
             self.has_fp8_qdq = self.quant_config.layer_quant_mode.has_fp8_qdq()
             self.has_nvfp4 = self.quant_config.layer_quant_mode.has_nvfp4()
             self.has_fp8_kv_cache = self.quant_config.layer_quant_mode.has_fp8_kv_cache(
             )
             self.has_nvfp4 = self.quant_config.layer_quant_mode.has_nvfp4()
-            self.is_fp8_block_scaling_enabled = self.quant_config.layer_quant_mode.has_fp8_block_scales(
-            )
 
     def forward(
         self,
@@ -528,12 +554,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         out_scale: Optional[torch.Tensor] = None,
         *,
         attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
-        q_b_proj: Optional[torch.Tensor] = None,
-        kv_b_proj: Optional[torch.Tensor] = None,
-        k_b_proj_trans: Optional[torch.Tensor] = None,
-        q_b_proj_scale: Optional[torch.Tensor] = None,
-        kv_b_proj_scale: Optional[torch.Tensor] = None,
-        k_b_proj_trans_scale: Optional[torch.Tensor] = None,
+        attention_input_type: AttentionInputType = AttentionInputType.mixed,
+        latent_cache: Optional[torch.Tensor] = None,
+        q_pe: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         # This is only for memory estimation for now.
@@ -553,7 +576,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 q = q.reshape(1, -1, num_heads, head_dim).contiguous()
                 k = k.reshape(1, -1, num_kv_heads, head_dim).contiguous()
                 v = v.reshape(1, -1, num_kv_heads, head_dim).contiguous()
-                return AttentionBackend.dummy_forward(q, k, v)
+                return VanillaAttention.dummy_forward(q, k, v)
             else:
                 # now the dummy_forward doesn't support mla, it's not accurate
                 num_heads = self.wrapper.num_heads
@@ -578,7 +601,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                 head_dim,
                                 dtype=q.dtype,
                                 device=q.device)
-                return AttentionBackend.dummy_forward(
+                return VanillaAttention.dummy_forward(
                     q, k, v)[..., :num_kv_heads *
                              self.mla_params.v_head_dim].contiguous()
 
@@ -624,13 +647,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             kv_scale_quant_orig=self.kv_scale_quant_orig,
             out_scale=out_scale,
             use_paged_context_fmha=use_paged_context_fmha,
-            q_b_proj=q_b_proj,
-            kv_b_proj=kv_b_proj,
-            k_b_proj_trans=k_b_proj_trans,
-            q_b_proj_scale=q_b_proj_scale,
-            kv_b_proj_scale=kv_b_proj_scale,
-            k_b_proj_trans_scale=k_b_proj_trans_scale,
-            is_fp8_block_scaling_enabled=self.is_fp8_block_scaling_enabled,
+            attention_input_type=attention_input_type,
+            latent_cache=latent_cache,
+            q_pe=q_pe,
         )
         out_dtype = None
         if out_scale is not None:

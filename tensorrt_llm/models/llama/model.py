@@ -260,7 +260,9 @@ class LLaMADecoderLayer(Module):
                     lora_layer_params=lora_layer_params,
                     all_reduce_params=AllReduceParams(
                         fusion_op=reduce_fusion_op,
-                        residual=residual_attn,
+                        residual=residual_attn
+                        if default_net().plugin_config.norm_quant_fusion else
+                        residual,
                         norm_weight=next_layer_input_layernorm_args[0],
                         scale=next_layer_input_layernorm_args[2],
                         eps=next_layer_input_layernorm_args[1]))

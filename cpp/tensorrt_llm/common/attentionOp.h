@@ -45,9 +45,6 @@ public:
     using PositionEmbeddingType = tensorrt_llm::kernels::PositionEmbeddingType;
     using AttentionMaskType = tensorrt_llm::kernels::AttentionMaskType;
 
-    using Fp8BlockScaleGemmRunnerPtr
-        = std::shared_ptr<tensorrt_llm::kernels::fp8_blockscale_gemm::CutlassFp8BlockScaleGemmRunnerInterface>;
-
     AttentionOp(){};
     ~AttentionOp() = default;
 
@@ -59,9 +56,6 @@ public:
     // total_num_seq is the sum of beam_width for multiple requests
     [[nodiscard]] size_t getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32_t total_num_seq,
         int32_t max_attention_window_size, int32_t max_num_tokens) const noexcept;
-
-    [[nodiscard]] size_t getWorkspaceSizeForMLAPreProcess(
-        nvinfer1::DataType type, size_t& remaining_size, int32_t total_token_length, int32_t rope_dim) const noexcept;
 
     template <typename T>
     class EnqueueParams
@@ -214,9 +208,6 @@ public:
     int enqueueGeneration(EnqueueGenerationParams<T> const& params, cudaStream_t stream);
 
     template <typename T>
-    int mlaPreContext(kernels::MlaParams<T>& params, cudaStream_t stream);
-
-    template <typename T>
     int mlaGeneration(
         kernels::MlaParams<T>& params, EnqueueGenerationParams<T> const& generation_params, cudaStream_t stream);
 
@@ -318,11 +309,6 @@ public:
         return mMultiBlockSemaphores.get();
     }
 
-    [[nodiscard]] auto gemmRunner() const
-    {
-        return mGemmRunner;
-    }
-
     void reserveSemaphoreArray(int32_t size);
 
     void debugCheckSemaphores(cudaStream_t stream);
@@ -375,7 +361,6 @@ public:
     int32_t mSpecDecodingMaxGenerationLength = 1;
     bool mIsMLAEnabled = false;
     tensorrt_llm::kernels::MlaMetaParams mMLAParams;
-    bool mIsFP8BlockScalingEnabled = false;
     int mCpSize = 1;
     int mCpRank = 0;
     std::set<int32_t> mCpGroup = {};
@@ -407,9 +392,9 @@ public:
             mUnfuseQkvGemm, (int32_t) mType, mMaxContextLength, mQKVBiasEnabled, mCrossAttention, mMaxDistance,
             mPosShiftEnabled, mPagedContextFMHA, mFP8ContextFMHA, mDenseContextFMHA, mHasFullAttentionMask,
             mIsSpecDecodingEnabled, mUseSpecDecoding, mSpecDecodingIsGenerationLengthVariable,
-            mSpecDecodingMaxGenerationLength, mIsMLAEnabled, mMLAParams.data(), mIsFP8BlockScalingEnabled, mCpSize,
-            mCpRank, mCpGroup, mEnableContextFMHA, mFMHAForceFP32Acc, mMultiBlockMode, mEnableXQA, mUseKVCache,
-            mSkipAttn, mFuseFp4Quant, mNbMultiBlockSemaphores);
+            mSpecDecodingMaxGenerationLength, mIsMLAEnabled, mMLAParams.data(), mCpSize, mCpRank, mCpGroup,
+            mEnableContextFMHA, mFMHAForceFP32Acc, mMultiBlockMode, mEnableXQA, mUseKVCache, mSkipAttn, mFuseFp4Quant,
+            mNbMultiBlockSemaphores);
     };
 
 private:
@@ -426,7 +411,6 @@ private:
     UniqPtrWNullCopy<tensorrt_llm::kernels::FmhaDispatcher> mFmhaDispatcher;
     UniqPtrWNullCopy<tensorrt_llm::kernels::XqaDispatcher> mXqaDispatcher;
     UniqPtrWNullCopy<tensorrt_llm::kernels::TllmGenFmhaRunner> mTllmGenFMHARunner;
-    Fp8BlockScaleGemmRunnerPtr mGemmRunner;
 
     // The default copy constructor will leave it as nullptr. clone() shall initialize it.
     UniqPtrWNullCopy<tensorrt_llm::common::CublasMMWrapper> mCublasWrapper;

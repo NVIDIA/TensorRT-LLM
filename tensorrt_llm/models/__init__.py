@@ -46,6 +46,7 @@ from .mamba.model import MambaForCausalLM
 from .medusa.config import MedusaConfig
 from .medusa.model import MedusaForCausalLm
 from .mllama.model import MLLaMAForCausalLM
+from .mmdit_sd3.model import SD3Transformer2DModel
 from .modeling_utils import (PretrainedConfig, PretrainedModel,
                              SpeculativeDecodingMode)
 from .mpt.model import MPTForCausalLM, MPTModel
@@ -67,6 +68,7 @@ __all__ = [
     'BloomModel',
     'BloomForCausalLM',
     'DiT',
+    'SD3Transformer2DModel',
     'DeepseekForCausalLM',
     'FalconConfig',
     'DeepseekV2ForCausalLM',
@@ -186,6 +188,7 @@ MODEL_MAP = {
     'RecurrentGemmaForCausalLM': RecurrentGemmaForCausalLM,
     'CogVLMForCausalLM': CogVLMForCausalLM,
     'DiT': DiT,
+    'SD3Transformer2DModel': SD3Transformer2DModel,
     'DeepseekForCausalLM': DeepseekForCausalLM,
     'DeciLMForCausalLM': DeciLMForCausalLM,
     'DeepseekV2ForCausalLM': DeepseekV2ForCausalLM,

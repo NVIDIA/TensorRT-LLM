@@ -183,3 +183,16 @@ class LlamaForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
                          config=model_config,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
+
+
+@register_auto_model("MistralForCausalLM")
+class MistralForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
+
+    def __init__(
+        self,
+        model_config: ModelConfig[LlamaConfig],
+    ):
+        super().__init__(LlamaModel(model_config),
+                         config=model_config,
+                         hidden_size=model_config.pretrained_config.hidden_size,
+                         vocab_size=model_config.pretrained_config.vocab_size)

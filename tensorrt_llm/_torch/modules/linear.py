@@ -13,6 +13,7 @@ from tensorrt_llm.functional import AllReduceFusionOp, AllReduceParams
 
 from ...models.modeling_utils import QuantConfig
 from ..distributed import ParallelConfig, TensorParallelMode
+from ..utils import Fp4QuantizedTensor
 
 E2M1_MAX = 6.0
 
@@ -137,7 +138,8 @@ class Linear(nn.Module):
                  quant_config: Optional[QuantConfig] = None,
                  weights_loading_config: Optional[WeightsLoadingConfig] = None,
                  is_expert: bool = False,
-                 skip_create_weights: bool = False):
+                 skip_create_weights: bool = False,
+                 use_custom_cublas_mm: bool = False):
         from tensorrt_llm._torch.distributed import AllReduce
 
         super().__init__()
@@ -176,6 +178,7 @@ class Linear(nn.Module):
         self.all_reduce = AllReduce(self.parallel_config)
         self._weights_created = False
         self.is_expert = is_expert
+        self.use_custom_cublas_mm = use_custom_cublas_mm
 
         if not skip_create_weights:
             self.create_weights()
@@ -306,23 +309,27 @@ class Linear(nn.Module):
             elif self.has_fp8_block_scales:
                 assert input.dtype == torch.bfloat16
 
-                act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize(
+                act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
                     input)
 
                 output = torch.ops.trtllm.fp8_block_scaling_gemm(
                     act_input_fp8, self.weight, act_input_sf, self.weight_scale)
 
             elif self.has_nv_fp4:
-                m = math.prod(input.shape[:-1])
+                if isinstance(input, Fp4QuantizedTensor):
+                    act_fp4, act_sf = input.fp4_tensor, input.scaling_factor
+                else:
+                    act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
+                        input, self.input_scale, self.scaling_vector_size,
+                        False)
+
+                m = math.prod(act_fp4.shape[:-1])
                 n = self.weight.shape[0]
                 k = self.weight.shape[1] * 2
 
                 if self.needs_profiling:
                     self.needs_profiling = False
                     self.profiler.run_profile(n, k, fp4_utils.fp4_buckets)
-
-                act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
-                    input, self.input_scale, self.scaling_vector_size, False)
 
                 best_config_id = self.profiler.get_best_config_id(m, n, k)
                 output = self.profiler.run_gemm(act_fp4, self.weight, act_sf,
@@ -332,12 +339,17 @@ class Linear(nn.Module):
                 # TODO(zhenhuanc): support other quant mode
                 raise ValueError(f'unsupported quant mode: {qc.quant_mode}')
         else:
-            output = F.linear(input, self.weight, bias)
+            # TODO: remove custom cublas_mm when default heuristics is good enough
+            if self.use_custom_cublas_mm:
+                output = torch.ops.trtllm.cublas_mm(input, self.weight.t(),
+                                                    bias)
+            else:
+                output = F.linear(input, self.weight, bias)
         return output
 
     def forward(
             self,
-            input: torch.Tensor,
+            input: Union[torch.Tensor, Fp4QuantizedTensor],
             *,
             all_reduce_params: Optional[AllReduceParams] = None
     ) -> torch.Tensor:
@@ -355,7 +367,7 @@ class Linear(nn.Module):
                         all_reduce_params.bias = bias
                         bias = None
                 else:
-                    assert all_reduce_params is None, "Cannot fuse norm/residual/bias ops into allreduce op since we do not call allreduce op when tp_size is 1."
+                    assert all_reduce_params is None or all_reduce_params.enable_allreduce is False, "Cannot fuse norm/residual/bias ops into allreduce op since we do not call allreduce op when tp_size is 1."
                 output = self.apply_linear(input, self.weight, bias)
                 output = self.all_reduce(
                     output,

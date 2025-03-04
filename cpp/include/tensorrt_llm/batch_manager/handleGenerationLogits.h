@@ -41,9 +41,9 @@ public:
 
     HandleGenerationLogits() = default;
 
-    void operator()(tr::SizeType32 logitsIndex, RequestVector const& contextRequests,
-        RequestVector const& generationRequests, RuntimeBuffers const& genRuntimeBuffers,
-        DecoderBuffers& decoderBuffers, tr::ModelConfig const& modelConfig, runtime::TllmRuntime const& runtime) const;
+    void operator()(tr::SizeType32 logitsIndex, RequestVector const& generationRequests,
+        RuntimeBuffers& genRuntimeBuffers, DecoderBuffers& decoderBuffers, tr::ModelConfig const& modelConfig,
+        runtime::TllmRuntime const& runtime) const;
 };
 
 } // namespace tensorrt_llm::batch_manager

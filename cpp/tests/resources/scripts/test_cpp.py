@@ -209,6 +209,7 @@ def run_tests(build_dir: _pl.Path,
               run_encoder=False,
               run_bart=False,
               run_t5=False,
+              run_enc_dec_language_adapter=False,
               run_redrafter=False,
               run_fp8=False,
               only_multi_gpu=False,
@@ -301,42 +302,46 @@ def run_tests(build_dir: _pl.Path,
         _log.info("Skipping unit tests")
 
     if not only_multi_gpu:
-        prepare_all_model_tests(python_exe=python_exe,
-                                root_dir=root_dir,
-                                resources_dir=resources_dir,
-                                model_cache=model_cache,
-                                run_gpt=run_gpt,
-                                run_gptj=run_gptj,
-                                run_llama=run_llama,
-                                run_chatglm=run_chatglm,
-                                run_medusa=run_medusa,
-                                run_eagle=run_eagle,
-                                run_mamba=run_mamba,
-                                run_recurrentgemma=run_recurrentgemma,
-                                run_encoder=run_encoder,
-                                run_bart=run_bart,
-                                run_t5=run_t5,
-                                run_redrafter=run_redrafter,
-                                run_fp8=run_fp8)
+        prepare_all_model_tests(
+            python_exe=python_exe,
+            root_dir=root_dir,
+            resources_dir=resources_dir,
+            model_cache=model_cache,
+            run_gpt=run_gpt,
+            run_gptj=run_gptj,
+            run_llama=run_llama,
+            run_chatglm=run_chatglm,
+            run_medusa=run_medusa,
+            run_eagle=run_eagle,
+            run_mamba=run_mamba,
+            run_recurrentgemma=run_recurrentgemma,
+            run_encoder=run_encoder,
+            run_bart=run_bart,
+            run_t5=run_t5,
+            run_enc_dec_language_adapter=run_enc_dec_language_adapter,
+            run_redrafter=run_redrafter,
+            run_fp8=run_fp8)
 
         if build_only:
             return
 
-        run_single_gpu_tests(build_dir=build_dir,
-                             run_gpt=run_gpt,
-                             run_gptj=run_gptj,
-                             run_llama=run_llama,
-                             run_chatglm=run_chatglm,
-                             run_medusa=run_medusa,
-                             run_eagle=run_eagle,
-                             run_mamba=run_mamba,
-                             run_recurrentgemma=run_recurrentgemma,
-                             run_encoder=run_encoder,
-                             run_bart=run_bart,
-                             run_t5=run_t5,
-                             run_redrafter=run_redrafter,
-                             run_fp8=run_fp8,
-                             timeout=test_timeout)
+        run_single_gpu_tests(
+            build_dir=build_dir,
+            run_gpt=run_gpt,
+            run_gptj=run_gptj,
+            run_llama=run_llama,
+            run_chatglm=run_chatglm,
+            run_medusa=run_medusa,
+            run_eagle=run_eagle,
+            run_mamba=run_mamba,
+            run_recurrentgemma=run_recurrentgemma,
+            run_encoder=run_encoder,
+            run_bart=run_bart,
+            run_t5=run_t5,
+            run_enc_dec_language_adapter=run_enc_dec_language_adapter,
+            run_redrafter=run_redrafter,
+            run_fp8=run_fp8,
+            timeout=test_timeout)
 
         if run_gpt:
             run_benchmarks(model_name="gpt",
@@ -398,6 +403,7 @@ def prepare_all_model_tests(python_exe: str,
                             run_encoder=False,
                             run_bart=False,
                             run_t5=False,
+                            run_enc_dec_language_adapter=False,
                             run_redrafter=False,
                             run_fp8=False):
     model_cache_arg = ["--model_cache", model_cache] if model_cache else []
@@ -509,6 +515,15 @@ def prepare_all_model_tests(python_exe: str,
     else:
         _log.info("Skipping T5 tests")
 
+    if run_enc_dec_language_adapter:
+        prepare_model_tests(model_name="enc_dec_language_adapter",
+                            python_exe=python_exe,
+                            root_dir=root_dir,
+                            resources_dir=resources_dir,
+                            model_cache_arg=model_cache_arg)
+    else:
+        _log.info("Skipping Enc-Dec Language Adapter tests")
+
     if run_redrafter:
         prepare_model_tests(model_name="redrafter",
                             python_exe=python_exe,
@@ -552,12 +567,6 @@ def prepare_multi_gpu_model_tests(python_exe: str,
                         resources_dir=resources_dir,
                         model_cache_arg=model_cache_arg)
 
-    prepare_model_tests(model_name="chatglm",
-                        python_exe=python_exe,
-                        root_dir=root_dir,
-                        resources_dir=resources_dir,
-                        model_cache_arg=model_cache_arg)
-
 
 def prepare_model_tests(model_name: str,
                         python_exe: str,
@@ -571,10 +580,15 @@ def prepare_model_tests(model_name: str,
     model_env = {**_os.environ, "PYTHONPATH": f"examples/{model_name}"}
     enc_dec_model_name_arg = []
     beams_arg = []
-    if model_name in ('bart', 't5'):
+    if model_name in ('bart', 't5', 'enc_dec_language_adapter'):
+        enc_dec_repo_name_dict = {
+            'bart': 'facebook/bart-large-cnn',
+            't5': 't5-small',
+            'enc_dec_language_adapter':
+            'language_adapter-enc_dec_language_adapter'
+        }
         enc_dec_model_name_arg = [
-            '--hf_repo_name',
-            'facebook/bart-large-cnn' if model_name == 'bart' else 't5-small'
+            '--hf_repo_name', enc_dec_repo_name_dict[model_name]
         ]
         if model_name == 't5' and (not only_multi_gpu_arg):
             beams_arg = ['--beams', '1,2']
@@ -701,6 +715,7 @@ def run_single_gpu_tests(build_dir: _pl.Path,
                          run_encoder,
                          run_bart,
                          run_t5,
+                         run_enc_dec_language_adapter,
                          run_redrafter,
                          run_fp8,
                          timeout=3600):
@@ -742,6 +757,9 @@ def run_single_gpu_tests(build_dir: _pl.Path,
         resultFileName = "-".join([resultFileName, "t5"])
         included_tests.append("T5BasicTest")
         included_tests.append("T5Beam2Test")
+    if run_enc_dec_language_adapter:
+        resultFileName = "-".join([resultFileName, "enc_dec_language_adapter"])
+        included_tests.append("LanguageAdapterBasicTest")
     if run_redrafter:
         resultFileName = "-".join([resultFileName, "redrafter"])
         included_tests.append("ExplicitDraftTokens")
@@ -1233,6 +1251,10 @@ if __name__ == "__main__":
     tests_config_parser.add_argument("--run_t5",
                                      action="store_true",
                                      help="Run the tests for T5")
+    tests_config_parser.add_argument(
+        "--run_enc_dec_language_adapter",
+        action="store_true",
+        help="Run the tests for Enc-Dec Language Adapter")
     tests_config_parser.add_argument("--run_redrafter",
                                      action="store_true",
                                      help="Run the tests for ReDrafter")
@@ -1285,6 +1307,7 @@ if __name__ == "__main__":
         test_args.run_encoder = True
         test_args.run_bart = True
         test_args.run_t5 = True
+        test_args.run_enc_dec_language_adapter = True
         test_args.run_medusa = True
         test_args.run_eagle = True
         test_args.run_redrafter = True

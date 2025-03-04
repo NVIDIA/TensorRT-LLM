@@ -29,12 +29,12 @@ Run the multimodal example script:
 
 ```bash
 # default inputs
-python3 quickstart_multimodal.py --model_dir Efficient-Large-Model/NVILA-8B --model_type vila --modality image
+python3 quickstart_multimodal.py --model_dir Efficient-Large-Model/NVILA-8B --modality image [--use_cuda_graph]
 
 # user inputs
 # supported modes:
 # (1) N prompt, N media (N requests are in-flight batched)
 # (2) 1 prompt, N media
 # Note: media should be either image or video. Mixing image and video is not supported.
-python3 quickstart_multimodal.py --model_dir Efficient-Large-Model/NVILA-8B --model_type vila --modality video --prompt "Tell me what you see in the video briefly." "Describe the scene in the video briefly." --media "https://huggingface.co/datasets/Efficient-Large-Model/VILA-inference-demos/resolve/main/OAI-sora-tokyo-walk.mp4" "https://huggingface.co/datasets/Efficient-Large-Model/VILA-inference-demos/resolve/main/world.mp4" --max_tokens 128
+python3 quickstart_multimodal.py --model_dir Efficient-Large-Model/NVILA-8B --modality video --prompt "Tell me what you see in the video briefly." "Describe the scene in the video briefly." --media "https://huggingface.co/datasets/Efficient-Large-Model/VILA-inference-demos/resolve/main/OAI-sora-tokyo-walk.mp4" "https://huggingface.co/datasets/Efficient-Large-Model/VILA-inference-demos/resolve/main/world.mp4" --max_tokens 128 [--use_cuda_graph]
 ```

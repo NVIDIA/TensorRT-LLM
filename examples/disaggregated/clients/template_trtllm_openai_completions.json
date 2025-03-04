@@ -13,12 +13,8 @@
   "timing_strategy": {
       "type": "fixed",
       "desired_rps": -1
-  },
-  "post_processors": [
-    {
-      "type": "response_counter",
-      "model_name": "test"
     },
+  "post_processors": [
     {
       "type": "infbench_summary",
       "model_name": "test"

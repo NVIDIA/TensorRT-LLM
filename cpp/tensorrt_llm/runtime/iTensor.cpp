@@ -169,7 +169,7 @@ ITensor::Shape ITensor::unsqueeze(Shape const& shape, SizeType32 dim)
 
 namespace
 {
-template <typename T>
+template <typename T, typename TOutput = T>
 void printTensor(ITensor const& tensor, std::ostream& out)
 {
     TLLM_CHECK_WITH_INFO(tensor.getDataType() == TRTDataType<typename std::remove_cv<T>::type>::value,
@@ -194,8 +194,6 @@ void printTensor(ITensor const& tensor, std::ostream& out)
         hostData = bufferCast<T>(tensor);
     }
 
-    using TOutput
-        = std::conditional_t<std::is_same_v<T, std::int8_t> || std::is_same_v<T, std::uint8_t>, std::int32_t, T>;
     if (shape.nbDims > 3)
     {
         out << "Not printing elements for more than 3 dims\n";
@@ -233,14 +231,17 @@ std::ostream& tensorrt_llm::runtime::operator<<(std::ostream& out, ITensor const
     switch (tensor.getDataType())
     {
     case nvinfer1::DataType::kFLOAT: printTensor<float>(tensor, out); break;
-    case nvinfer1::DataType::kHALF: printTensor<half>(tensor, out); break;
+    case nvinfer1::DataType::kHALF: printTensor<half, float>(tensor, out); break;
     case nvinfer1::DataType::kBOOL: printTensor<bool>(tensor, out); break;
-    case nvinfer1::DataType::kINT8: printTensor<std::int8_t>(tensor, out); break;
+    case nvinfer1::DataType::kINT8: printTensor<std::int8_t, std::int32_t>(tensor, out); break;
     case nvinfer1::DataType::kINT32: printTensor<std::int32_t>(tensor, out); break;
     case nvinfer1::DataType::kINT64: printTensor<std::int64_t>(tensor, out); break;
-    case nvinfer1::DataType::kUINT8: printTensor<std::uint8_t>(tensor, out); break;
+    case nvinfer1::DataType::kUINT8: printTensor<std::uint8_t, std::int32_t>(tensor, out); break;
 #ifdef ENABLE_BF16
-    case nvinfer1::DataType::kBF16: printTensor<__nv_bfloat16>(tensor, out); break;
+    case nvinfer1::DataType::kBF16: printTensor<__nv_bfloat16, float>(tensor, out); break;
+#endif
+#ifdef ENABLE_FP8
+    case nvinfer1::DataType::kFP8: printTensor<__nv_fp8_e4m3, float>(tensor, out); break;
 #endif
     default: TLLM_THROW("Unsupported data type");
     }

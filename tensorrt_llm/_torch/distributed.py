@@ -76,7 +76,9 @@ def allreduce(
     Returns:
         The reduced tensor and an optional intermediate tensor if fused.
     '''
-    if parallel_config.tensor_parallel_size == 1:
+    if parallel_config.tensor_parallel_size == 1 or (
+            all_reduce_params is not None
+            and all_reduce_params.enable_allreduce == False):
         return input
 
     mapping = Mapping(

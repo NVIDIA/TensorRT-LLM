@@ -88,4 +88,5 @@ int nextPowerOfTwo(int v);
 // from: cpp/tensorrt_llm/plugins/lowLatencyGemmPlugin/lowLatencyGemmPlugin.cpp
 std::optional<float> getFloatEnv(char const* name);
 
+cudaDataType_t convert_torch_dtype(torch::ScalarType dtype);
 } // namespace torch_ext

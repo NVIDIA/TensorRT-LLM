@@ -300,6 +300,15 @@ ModelConfig createModelConfig(Json const& json, bool engineVersionNone, SizeType
         modelConfig.setMlpHiddenSize(mlpHiddenSize.value() / tensorParallelism);
     }
 
+    bool hasLanguageAdapter
+        = json.contains("pretrained_config") && json.at("pretrained_config").contains("language_adapter_config");
+    if (hasLanguageAdapter)
+    {
+        auto const numLanguages = parseJsonFieldOptional<SizeType32>(
+            json.at("pretrained_config").at("language_adapter_config"), "num_languages");
+        modelConfig.setNumLanguages(numLanguages);
+    }
+
     return modelConfig;
 };
 

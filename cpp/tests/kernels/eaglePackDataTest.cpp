@@ -208,11 +208,9 @@ public:
         mCumSumGenerationLengths = BufferManager::pinnedPool(
             ITensor::makeShape({mSamplingParams.getBatchSize() + 1}), nvinfer1::DataType::kINT32);
 
-        mScanTempStorageBytes = tksd::invokeScanGenerationLengths(
-            nullptr, 0, nullptr, nullptr, mSamplingParams.getBatchSize(), mStream->get());
-        mReduceTempStorageBytes = tksd::invokeReduceMaxGenerationLengths(
-            nullptr, 0, nullptr, nullptr, mSamplingParams.getBatchSize(), mStream->get());
-        mScanReduceTempStorage = mBufferManager->gpu(std::max(mReduceTempStorageBytes, mScanTempStorageBytes));
+        mScanReduceTempStorageBytes = tksd::invokeScanReduceGenerationLengths(
+            mSamplingParams.getBatchSize(), nullptr, nullptr, 0, nullptr, nullptr, mStream->get());
+        mScanReduceTempStorage = mBufferManager->gpu(mScanReduceTempStorageBytes);
     }
 
     void initBuffers()
@@ -330,9 +328,9 @@ public:
             // Compute inclusive sum and max
             tksd::invokeScanReduceGenerationLengths(mSamplingParams.getNumGenRequests(),
                 bufferCast<SizeType32>(*mOutputSpecDecodingGenerationLengths),
-                bufferCast<uint8_t>(*mScanReduceTempStorage), mScanTempStorageBytes,
-                bufferCast<SizeType32>(*mCumSumGenerationLengths), bufferCast<uint8_t>(*mScanReduceTempStorage),
-                mReduceTempStorageBytes, bufferCast<SizeType32>(*mMaxGenerationLength), mStream->get());
+                bufferCast<uint8_t>(*mScanReduceTempStorage), mScanReduceTempStorageBytes,
+                bufferCast<SizeType32>(*mCumSumGenerationLengths), bufferCast<SizeType32>(*mMaxGenerationLength),
+                mStream->get());
 
             sync_check_cuda_error();
         }
@@ -464,8 +462,7 @@ private:
 
     BufferPtr mScanReduceTempStorage;
 
-    SizeType32 mScanTempStorageBytes;
-    SizeType32 mReduceTempStorageBytes;
+    SizeType32 mScanReduceTempStorageBytes;
 
     SamplingParams mSamplingParams;
 };

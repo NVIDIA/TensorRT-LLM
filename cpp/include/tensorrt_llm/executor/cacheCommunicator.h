@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,7 +31,6 @@ class UcxEndpoint;
 namespace tensorrt_llm::executor::kv_cache
 {
 
-// TODO: Rename with `DataContext`.
 struct DataContext
 {
 public:
@@ -40,7 +39,7 @@ public:
     {
     }
 
-    int getTag() const noexcept
+    [[nodiscard]] int getTag() const noexcept
     {
         return mTag;
     }
@@ -58,7 +57,7 @@ public:
 
     virtual void recv(DataContext const& ctx, void* data, size_t size) const = 0;
 
-    virtual bool isThreadSafe() const noexcept
+    [[nodiscard]] virtual bool isThreadSafe() const noexcept
     {
         return false;
     }
@@ -71,7 +70,7 @@ public:
 
     virtual Connection const* recvConnect(DataContext const& ctx, void* data, size_t size) = 0;
 
-    virtual std::vector<Connection const*> getConnections(CommState const& state) = 0;
+    [[nodiscard]] virtual std::vector<Connection const*> getConnections(CommState const& state) = 0;
 };
 
 } // namespace tensorrt_llm::executor::kv_cache

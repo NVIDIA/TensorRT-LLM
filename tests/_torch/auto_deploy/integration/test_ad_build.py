@@ -118,6 +118,9 @@ from utils.llm_data import llm_models_root
                 ),
                 "compile_backend": "torch-simple",
             },
+            marks_extra=[
+                pytest.mark.skip(reason="Pending support for custom MoE Op sharding"),
+            ],
         ),
     ],
 )

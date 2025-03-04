@@ -96,9 +96,8 @@ void tensorrt_llm::pybind::batch_manager::algorithms::initBindings(pybind11::mod
 
     py::class_<HandleGenerationLogits>(m, HandleGenerationLogits::name)
         .def(py::init())
-        .def("__call__", &HandleGenerationLogits::operator(), py::arg("logits_index"), py::arg("context_requests"),
-            py::arg("generation_requests"), py::arg("gen_runtime_buffers"), py::arg("decoder_buffers"),
-            py::arg("model_config"), py::arg("runtime"))
+        .def("__call__", &HandleGenerationLogits::operator(), py::arg("logits_index"), py::arg("generation_requests"),
+            py::arg("gen_runtime_buffers"), py::arg("decoder_buffers"), py::arg("model_config"), py::arg("runtime"))
         .def("name", [](HandleGenerationLogits const&) { return HandleGenerationLogits::name; });
 
     py::class_<GenerateRequestOptions>(m, GenerateRequestOptions::name)
@@ -112,8 +111,9 @@ void tensorrt_llm::pybind::batch_manager::algorithms::initBindings(pybind11::mod
     py::class_<MakeDecodingBatchInputOutput>(m, MakeDecodingBatchInputOutput::name)
         .def(py::init())
         .def("__call__", &MakeDecodingBatchInputOutput::operator(), py::arg("context_requests"),
-            py::arg("generation_requests"), py::arg("decoder_buffers"), py::arg("gen_runtime_buffers"),
-            py::arg("decoding_mode"), py::arg("model_config"), py::arg("max_num_sequences"))
+            py::arg("generation_requests"), py::arg("decoder_buffers"), py::arg("fused_runtime_buffers"),
+            py::arg("decoder_input_buffers"), py::arg("model_config"), py::arg("max_num_sequences"),
+            py::arg("beam_width"), py::arg("buffer_manager"), py::arg("stream"))
         .def("name", [](MakeDecodingBatchInputOutput const&) { return MakeDecodingBatchInputOutput::name; });
 
     py::class_<LogitsPostProcessor>(m, LogitsPostProcessor::name)

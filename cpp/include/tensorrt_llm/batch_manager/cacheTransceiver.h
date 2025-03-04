@@ -41,7 +41,9 @@ class CacheTransceiverFactory
 public:
     static std::unique_ptr<BaseCacheTransceiver> createCacheTransceiver(
         kv_cache_manager::BaseKVCacheManager* cacheManager, runtime::ModelConfig const& modelConfig,
-        runtime::WorldConfig const& worldConfig);
+        runtime::WorldConfig const& worldConfig,
+        executor::kv_cache::CacheState::AttentionType attentionType
+        = executor::kv_cache::CacheState::AttentionType::kDEFAULT);
 };
 
 class BaseCacheTransceiver
@@ -75,14 +77,18 @@ public:
 
     CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager, CommType commType,
         executor::kv_cache::CacheState::ModelConfig const& cacheStateModelCfg, runtime::WorldConfig const& worldConfig,
-        nvinfer1::DataType dataType);
+        nvinfer1::DataType dataType,
+        executor::kv_cache::CacheState::AttentionType attentionType
+        = executor::kv_cache::CacheState::AttentionType::kDEFAULT);
 
     CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager, CommType commType,
         std::vector<SizeType32> numKvHeadsPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
-        runtime::WorldConfig const& worldConfig, nvinfer1::DataType dataType)
+        runtime::WorldConfig const& worldConfig, nvinfer1::DataType dataType,
+        executor::kv_cache::CacheState::AttentionType attentionType
+        = executor::kv_cache::CacheState::AttentionType::kDEFAULT)
         : CacheTransceiver(cacheManager, commType,
             executor::kv_cache::CacheState::ModelConfig{numKvHeadsPerLayer, sizePerHead, tokensPerBlock}, worldConfig,
-            dataType)
+            dataType, attentionType)
     {
     }
 
@@ -113,7 +119,8 @@ private:
     std::map<LlmRequest*, std::future<void>> mResponderFutures;
     std::vector<std::pair<LlmRequest*, std::future<void>>> mRequesterFutures;
     mpi::MpiComm const *mMpiGroupComm{}, *mMpiWorldComm{};
-    std::shared_ptr<mpi::MpiComm> mMpiGroupTensorParaComm, mMpiGroupPipeParaComm;
+    std::shared_ptr<mpi::MpiComm> mMpiGroupTensorParaComm, mMpiGroupPipeParaComm, mMpiGroupDataComm,
+        mMpiGroupTPInDPComm;
     executor::kv_cache::CommState const* mCommState;
     std::unique_ptr<executor::kv_cache::CacheState> mCacheState;
     std::unique_ptr<executor::kv_cache::ConnectionManager> mManager;

@@ -106,7 +106,7 @@ inline __device__ void apply_rotary_embedding_mla(T& q, T q_left, T q_right, flo
 
 template <typename T, int BLOCK_SIZE, int K_DIM, int ROPE_DIM, typename KVCacheBuffer>
 __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* qkv_output, T const* fuse_buf, KVCacheBuffer kv_cache,
-    float2 const* cos_sin_cache, size_t head_num, int head_size, int c_q, int c_k, int* cu_q_seqlens,
+    float2 const* cos_sin_cache, size_t head_num, int head_size, int c_k, int* cu_q_seqlens,
     int32_t const* kv_cache_lengths, uint32_t max_input_seq_len)
 {
 
@@ -160,7 +160,7 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* qkv_output, T const*
 
             VecT q, k;
             VecT q_ref[2], k_ref[2];
-            auto const src_k_global_offset = static_cast<size_t>(global_token_idx) * (c_q + c_k + ROPE_DIM) + c_q + c_k;
+            auto const src_k_global_offset = static_cast<size_t>(global_token_idx) * (c_k + ROPE_DIM) + c_k;
             auto const src_q_global_offset
                 = static_cast<size_t>(global_token_idx) * head_num * ((head_size + ROPE_DIM) * 2 + head_size)
                 + (head_size + ROPE_DIM) * head_idx + head_size;
@@ -239,7 +239,7 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* qkv_output, T const*
 
             if (valid_token)
             {
-                auto const src_k_global_offset = static_cast<size_t>(global_token_idx) * (c_q + c_k + ROPE_DIM) + c_q;
+                auto const src_k_global_offset = static_cast<size_t>(global_token_idx) * (c_k + ROPE_DIM);
 
                 auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_idx_in_kv_cache));
                 auto inBlockIdx
@@ -252,9 +252,10 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* qkv_output, T const*
 }
 
 template <typename T, int BLOCK_SIZE, int K_DIM, int ROPE_DIM, typename KVCacheBuffer>
-__global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_buf, T const* fuse_buf,
-    KVCacheBuffer kv_cache, float2 const* cos_sin_cache, size_t head_num, int head_size, int c_q, int c_k,
-    int total_s_len, int* seqQOffset, uint32_t* fmha_tile_counter, int32_t const* kv_cache_lengths, int* seqKVOffsets)
+__global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe, T const* fuse_buf,
+    KVCacheBuffer kv_cache, float2 const* cos_sin_cache, size_t head_num, int c_k, int total_s_len, int seq_len,
+    int* seqQOffset, uint32_t* fmha_tile_counter, int32_t const* kv_cache_lengths, int* seqKVOffsets, int q_pe_ld,
+    int q_pe_stride)
 {
 
     // Constants.
@@ -294,23 +295,23 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_buf
         for (int global_token_idx = (threadIdx.x / VECS_PER_HEAD) + blockIdx.x * TOKENS_PER_BLOCK;
              global_token_idx < seq_len_loop_end; global_token_idx += TOKENS_PER_BLOCK * gridDim.x)
         {
-            auto batch_idx = global_token_idx;
-            bool const valid_token = batch_idx < total_s_len;
+            auto batch_idx = global_token_idx / seq_len;
+            auto local_token_idx = global_token_idx % seq_len;
+            bool const valid_token = global_token_idx < total_s_len;
             VecT data;
 
             if (valid_token)
             {
                 VecT ref[2];
 
-                auto const position_id = kv_cache_lengths[batch_idx] - 1;
+                auto const position_id = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
                 auto const src_bias = first_half ? head_dim_idx * 2 : (head_dim_idx - HALF_ROTATARY_DIM) * 2;
                 float2 const* rotary_coef_cache_buffer
                     = cos_sin_cache + static_cast<size_t>(ROPE_DIM) * position_id + (head_dim_idx);
 
                 if (head_idx == head_num)
                 {
-                    auto const src_k_global_offset
-                        = static_cast<size_t>(global_token_idx) * (c_q + c_k + ROPE_DIM) + c_q + c_k;
+                    auto const src_k_global_offset = static_cast<size_t>(global_token_idx) * (c_k + ROPE_DIM) + c_k;
 
                     for (int i = 0; i < 2; ++i)
                     {
@@ -321,13 +322,12 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_buf
                 else
                 {
                     auto const src_q_global_offset
-                        = static_cast<size_t>(global_token_idx) * head_num * (head_size + ROPE_DIM)
-                        + (head_size + ROPE_DIM) * head_idx + head_size;
+                        = static_cast<size_t>(global_token_idx) * q_pe_stride + q_pe_ld * head_idx;
 
                     for (int i = 0; i < 2; ++i)
                     {
                         ref[i]
-                            = *reinterpret_cast<VecT const*>(&q_buf[src_q_global_offset + src_bias + i * ELTS_PER_VEC]);
+                            = *reinterpret_cast<VecT const*>(&q_pe[src_q_global_offset + src_bias + i * ELTS_PER_VEC]);
                     }
                 }
 
@@ -350,8 +350,7 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_buf
             {
                 if (head_idx == head_num)
                 {
-                    auto const batch_idx = global_token_idx;
-                    auto const token_kv_idx = kv_cache_lengths[batch_idx] - 1;
+                    auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
 
                     auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_kv_idx));
                     auto inBlockIdx = kv_cache.getKVLocalIdx(
@@ -382,18 +381,19 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_buf
                  + blockIdx.x * K_TOKENS_PER_BLOCK;
              global_token_idx < seq_len_loop_end; global_token_idx += block_dim * K_TOKENS_PER_BLOCK * gridDim.x)
         {
+            auto batch_idx = global_token_idx / seq_len;
+            auto local_token_idx = global_token_idx % seq_len;
             bool valid_token = global_token_idx < total_s_len;
-            auto const batch_idx = std::min(global_token_idx, total_s_len - 1);
 
             if (valid_token)
             {
                 if (head_dim_vec_idx == 0)
                 {
-                    seqQOffset[batch_idx + 1] = head_num * (batch_idx + 1);
+                    seqQOffset[batch_idx + 1] = head_num * seq_len * (batch_idx + 1);
                 }
 
-                auto const token_kv_idx = kv_cache_lengths[batch_idx] - 1;
-                auto const src_kv_global_offset = static_cast<size_t>(global_token_idx) * (c_q + c_k + ROPE_DIM) + c_q;
+                auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
+                auto const src_kv_global_offset = static_cast<size_t>(global_token_idx) * (c_k + ROPE_DIM);
 
                 auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_kv_idx));
                 auto inBlockIdx = kv_cache.getKVLocalIdx(token_kv_idx, 0, TOTAL_VEC_PER_HEAD, head_dim_vec_idx);
@@ -413,7 +413,7 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_buf
 
     if (blockIdx.x == 0 && blockIdx.y == 0)
     {
-        int const batchSizeBound = total_s_len;
+        int const batchSizeBound = total_s_len / seq_len;
         for (int batchOffset = 0; batchOffset <= batchSizeBound; batchOffset += BLOCK_SIZE)
         {
             // The index of the batch.
@@ -438,21 +438,22 @@ void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, c
 {
     dim3 grid(int(tensorrt_llm::common::divUp(params.max_input_seq_len, 32)), params.batch_size, params.head_num + 8);
     auto head_size = params.meta.qk_nope_head_dim;
-    applyMLARopeAndAssignQKVKernelOptContext<T, 256, 512, 64, KVCacheBuffer>
-        <<<grid, 256, 0, stream>>>(params.attention_input_buf, params.fused_a_input, kv_cache_buffer,
-            params.cos_sin_cache, params.head_num, head_size, params.meta.q_lora_rank, params.meta.kv_lora_rank,
-            params.cu_q_seqlens, params.cache_seq_lens, params.max_input_seq_len);
+    applyMLARopeAndAssignQKVKernelOptContext<T, 256, 512, 64, KVCacheBuffer><<<grid, 256, 0, stream>>>(
+        params.attention_input_buf, params.latent_cache, kv_cache_buffer, params.cos_sin_cache, params.head_num,
+        head_size, params.meta.kv_lora_rank, params.cu_q_seqlens, params.cache_seq_lens, params.max_input_seq_len);
 }
 
 template <typename T, typename KVCacheBuffer>
 void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream)
 {
     dim3 grid(int(tensorrt_llm::common::divUp(params.acc_q_len, 32)), params.head_num + 1 + 8);
-    auto head_size = params.meta.qk_nope_head_dim;
-    applyMLARopeAndAssignQKVKernelGeneration<T, 256, 512, 64, KVCacheBuffer>
-        <<<grid, 256, 0, stream>>>(params.attention_input_buf, params.q_buf, params.fused_a_input, kv_cache_buffer,
-            params.cos_sin_cache, params.head_num, head_size, params.meta.q_lora_rank, params.meta.kv_lora_rank,
-            params.acc_q_len, params.seqQOffset, params.fmha_tile_counter, params.cache_seq_lens, params.cu_kv_seqlens);
+    TLLM_CHECK_WITH_INFO(params.acc_q_len % params.batch_size == 0,
+        "MLA can only support input sequences with the same sequence length.");
+    auto seq_len = params.acc_q_len / params.batch_size;
+    applyMLARopeAndAssignQKVKernelGeneration<T, 256, 512, 64, KVCacheBuffer><<<grid, 256, 0, stream>>>(
+        params.attention_input_buf, params.q_pe, params.latent_cache, kv_cache_buffer, params.cos_sin_cache,
+        params.head_num, params.meta.kv_lora_rank, params.acc_q_len, seq_len, params.seqQOffset,
+        params.fmha_tile_counter, params.cache_seq_lens, params.cu_kv_seqlens, params.q_pe_ld, params.q_pe_stride);
 }
 
 #define INSTANTIATE_MLA_ROPE(T, KVCacheBuffer)                                                                         \

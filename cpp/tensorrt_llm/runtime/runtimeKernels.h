@@ -30,7 +30,6 @@ using TensorPtr = runtime::ITensor::SharedPtr;
 template <typename T>
 void invokeFill(IBuffer& buffer, T value, CudaStream const& stream);
 
-template <typename T>
 void invokeFillBatch(
     IBuffer& buffer, IBuffer const& indices, std::size_t stride, IBuffer const& values, CudaStream const& stream);
 
@@ -91,9 +90,10 @@ void gatherLastTokenLogits(
 void copyLatestTokenLogitsInGeneration(ITensor& output, ITensor const& input, SizeType32 step,
     SizeType32 firstBatchSlotIdx, SizeType32 microBatchSize, SizeType32 beamWidth, CudaStream const& stream);
 
-void mergeLogitsFragments(BufferManager const& bufferManager, ITensor& output, std::vector<TensorPtr> inputVector,
-    ITensor& cachePointerDevice, ITensor& cachePointerHost, SizeType32 firstBatchSlotIdx,
-    SizeType32 const microBatchSize, SizeType32 const beamWidth, CudaStream const& stream, int stepOffset);
+void mergeLogitsFragments(BufferManager const& bufferManager, ITensor& output,
+    std::vector<TensorPtr> const& inputVector, ITensor& cachePointerDevice, ITensor& cachePointerHost,
+    SizeType32 firstBatchSlotIdx, SizeType32 microBatchSize, SizeType32 beamWidth, CudaStream const& stream,
+    int stepOffset);
 
 void invokeUpdateKVBlockArrayDraftTokenLocation(ITensor const& seqAcceptedDraftTokenOffsets,
     ITensor const& packedAcceptedDraftTokensIndices, ITensor const& pastKeyValueLengths, void* const* pointerArray,

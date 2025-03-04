@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
+import json
 import time
 
 import numpy as np
@@ -153,6 +154,169 @@ def test_fairseq_models(args):
         ), f"TRT-LLM output ids {output_ids} does not match Fairseq ids {fairseq_output_ids}"
 
 
+def test_language_adapter_models(args):
+    # TRT-LLM runtime
+    tllm_model = EncDecModelRunner.from_engine(args.engine_name,
+                                               args.engine_dir,
+                                               debug_mode=args.debug_mode)
+    inference_dtype = tllm_model.encoder_model_config.dtype
+
+    tokenized_inputs = [[
+        34901, 3048, 3011, 123250, 9517, 3018, 45732, 3048, 3003, 6553, 3781,
+        383416, 33356, 3032, 97339, 3382, 3003, 19143, 3022, 169460, 3001,
+        87966, 35848, 2996, 3002, 6358, 7387, 25864, 3032, 3011, 4570, 3022,
+        7235, 182168, 2992, 3003, 2991, 39861, 2997, 26629, 98419, 5339, 2993,
+        423511, 2544, 2
+    ],
+                        [
+                            34901, 3048, 3011, 123250, 9517, 3018, 45732, 3048,
+                            3003, 6553, 3781, 383416, 33356, 3032, 97339, 3382,
+                            3003, 19143, 3022, 169460, 3001, 87966, 35848, 2996,
+                            3002, 6358, 7387, 25864, 3032, 3011, 4570, 3022,
+                            7235, 182168, 2992, 3003, 2991, 39861, 2997, 26629,
+                            98419, 5339, 2993, 423512, 2712, 2
+                        ]]
+    language_task_uids = [2, 3]
+
+    target_outputs = [[
+        4094, 82383, 3501, 3073, 12672, 3535, 45217, 3018, 45732, 3158, 3116,
+        400231, 3010, 7212, 12398, 52837, 3046, 391725, 3164, 3116, 40625, 2994,
+        204507, 3001, 402406, 35848, 2996, 3002, 3003, 8317, 2994, 3007, 80104,
+        55333, 3046, 3073, 4755, 2994, 7235, 182168, 2992, 3030, 4005, 2994,
+        63261, 60932, 3010, 2991, 39861, 2993
+    ],
+                      [
+                          62366, 3099, 14803, 3056, 9517, 3056, 3495, 36942,
+                          3975, 292422, 3262, 3315, 3010, 53857, 41472, 9823,
+                          3010, 6493, 26179, 151498, 3062, 286084, 3453, 3315,
+                          45059, 2994, 286488, 3001, 53771, 16240, 35848, 2996,
+                          3002, 22161, 3072, 3315, 25864, 51019, 3062, 3072,
+                          3063, 2999, 10657, 2994, 7235, 182168, 2992, 3030,
+                          7109, 3077, 2999, 109181, 51563, 3366, 2991, 39861,
+                          2993
+                      ]]
+
+    max_new_tokens = args.max_new_tokens
+    input_ids = torch.IntTensor(tokenized_inputs)
+
+    with open(f"{args.engine_dir}/decoder/config.json", "r") as f:
+        model_config = json.load(f)
+    decoder_start_token_id = model_config['pretrained_config'][
+        'decoder_start_token_id']
+    num_languages = model_config['pretrained_config'][
+        'language_adapter_config']['num_languages']
+    decoder_input_ids = torch.IntTensor([[decoder_start_token_id]]).to('cuda')
+    decoder_input_ids = decoder_input_ids.repeat((input_ids.shape[0], 1))
+
+    def get_routings_from_language_uids(language_uids, num_languages):
+        language_adapter_routing_masks = []
+        for language_uid in language_uids:
+            mask = [0.0] * num_languages
+            mask[language_uid] = 1.0
+            language_adapter_routing_masks.append(mask)
+        return language_adapter_routing_masks
+
+    def get_language_adapter_routings(language_uids, input_ids, num_languages):
+        language_adapter_routing_masks = torch.tensor(
+            get_routings_from_language_uids(language_uids, num_languages),
+            dtype=torch.float32)
+        language_adapter_routings = []
+
+        for i, input_id in enumerate(input_ids):
+            mask = language_adapter_routing_masks[i].repeat(len(input_id), 1)
+            language_adapter_routings.append(mask)
+
+        return torch.cat(language_adapter_routings)
+
+    encoder_language_adapter_routings = get_language_adapter_routings(
+        language_task_uids, input_ids, num_languages)
+    decoder_language_adapter_routings = get_language_adapter_routings(
+        language_task_uids, decoder_input_ids, num_languages)
+
+    bos_token_id = 2
+    pad_token_id = 0
+    eos_token_id = 2
+
+    return_dict = True  # when set return_dict=True, get outputs by key
+    tik = time.time()
+    tllm_output = tllm_model.generate(
+        encoder_input_ids=input_ids,
+        decoder_input_ids=decoder_input_ids,
+        max_new_tokens=max_new_tokens,
+        num_beams=args.num_beams,
+        bos_token_id=bos_token_id,
+        pad_token_id=pad_token_id,
+        eos_token_id=eos_token_id,
+        debug_mode=args.debug_mode,
+        return_dict=return_dict,
+        encoder_language_adapter_routings=encoder_language_adapter_routings,
+        decoder_language_adapter_routings=decoder_language_adapter_routings,
+        return_encoder_output=args.output_npy and tensorrt_llm.mpi_rank() == 0)
+    torch.cuda.synchronize()
+    tok = time.time()
+
+    if tensorrt_llm.mpi_rank() == 0:
+        tllm_output_ids = tllm_output['output_ids']
+
+        output_ids = tllm_output_ids[:, 0, :]
+        output_ids_list = [
+            output_id[output_id != eos_token_id].tolist()
+            for output_id in output_ids
+        ]
+
+        decoder_input_lengths = (decoder_input_ids != pad_token_id).sum(dim=1)
+        output_gen_lengths = (output_ids != eos_token_id).sum(
+            dim=1) - decoder_input_lengths
+
+        print(
+            f"------ TRT-LLM beam = {args.num_beams} --------------------------------"
+        )
+        if 'encoder_output' in tllm_output:
+            encoder_output = tllm_output['encoder_output']
+            print_tensor('TRT-LLM encoder_output:', encoder_output)
+        print("TRT-LLM output_ids: ", output_ids)
+        print("TRT-LLM output generated lengths: ", output_gen_lengths)
+        print(f"TRT-LLM E2E time {(tok-tik)*1000}ms")
+        print("Precision:", inference_dtype)
+        print("--------------------------------------")
+
+        assert output_ids_list == target_outputs, f"TRT-LLM output ids {output_ids_list} does not match Fairseq ids {target_outputs}"
+
+    if args.output_npy:
+        output_npy(args, tokenized_inputs, tllm_output, output_ids)
+
+
+def output_npy(args, tokenized_inputs, tllm_output, output_ids):
+    os.makedirs(args.output_npy, exist_ok=True)
+
+    if hasattr(tokenized_inputs, "attention_mask"):
+        input_lengths = tokenized_inputs.attention_mask.sum(dim=1).type(
+            torch.IntTensor)
+        input_ids = tokenized_inputs.input_ids.type(torch.IntTensor)
+    else:
+        input_lengths = torch.IntTensor(
+            [len(input_ids) for input_ids in tokenized_inputs])
+        input_ids = torch.IntTensor(tokenized_inputs)
+
+    input_ids_flatten = torch.cat(
+        [input_ids[i][:input_lengths[i]] for i in range(len(input_lengths))])
+    encoder_output = tllm_output['encoder_output'].type(torch.float16)
+
+    def save_npy(tensor, name):
+        np.save(os.path.join(args.output_npy, f'{name}.npy'),
+                tensor.cpu().numpy())
+
+    print(
+        f"Saving input/output tensors to {args.output_npy} for C++ runtime testing"
+    )
+    save_npy(input_ids_flatten, 'input_ids')  # [num_tokens]
+    save_npy(input_lengths, 'input_lengths')  # [batch_size]
+    save_npy(encoder_output, 'encoder_output')  # [num_tokens, hidden_size]
+    save_npy(
+        output_ids, f'output_ids_beam{args.num_beams}'
+    )  # [batch_size, max_output_tokens], max_output_tokens = decoder_input_tokens + max_new_tokens
+
+
 if __name__ == "__main__":
     import os
 
@@ -163,6 +327,11 @@ if __name__ == "__main__":
     # FairSeq NMT test logic is different from HuggingFace models
     if 'wmt' in args.model_name:
         test_fairseq_models(args)
+        exit()
+
+    # language adapter test logic is different from HuggingFace models
+    if 'language_adapter' in args.engine_name:
+        test_language_adapter_models(args)
         exit()
 
     test_remove_padding = True
@@ -332,31 +501,7 @@ if __name__ == "__main__":
 
         # save input/output tensors for C++ runtime testing
         if args.output_npy:
-            os.makedirs(args.output_npy, exist_ok=True)
-
-            input_lengths = tokenized_inputs.attention_mask.sum(dim=1).type(
-                torch.IntTensor)
-            input_ids = tokenized_inputs.input_ids.type(torch.IntTensor)
-            input_ids_flatten = torch.cat([
-                input_ids[i][:input_lengths[i]]
-                for i in range(len(input_lengths))
-            ])
-            encoder_output = tllm_output['encoder_output'].type(torch.float16)
-
-            def save_npy(tensor, name):
-                np.save(os.path.join(args.output_npy, f'{name}.npy'),
-                        tensor.cpu().numpy())
-
-            print(
-                f"Saving input/output tensors to {args.output_npy} for C++ runtime testing"
-            )
-            save_npy(input_ids_flatten, 'input_ids')  # [num_tokens]
-            save_npy(input_lengths, 'input_lengths')  # [batch_size]
-            save_npy(encoder_output,
-                     'encoder_output')  # [num_tokens, hidden_size]
-            save_npy(
-                output_ids, f'output_ids_beam{args.num_beams}'
-            )  # [batch_size, max_output_tokens], max_output_tokens = decoder_input_tokens + max_new_tokens
+            output_npy(args, tokenized_inputs, tllm_output, output_ids)
 
         # simple accuracy check
         if args.compare_hf_fp32:

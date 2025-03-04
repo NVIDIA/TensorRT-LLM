@@ -8,6 +8,7 @@ import torch
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.llm_utils import KvCacheRetentionConfig
 from ..sampling_params import SamplingParams
+from .postproc_worker import PostprocParams
 
 __all__ = [
     "LoRARequest",
@@ -82,6 +83,7 @@ class GenerationRequest:
         prompt_tuning_config: Optional[list] = None,
         kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
         disaggregated_params: Optional[DisaggregatedParams] = None,
+        postproc_params: Optional[PostprocParams] = None,
     ):
         if isinstance(prompt_token_ids, list):
             self.prompt_token_ids = prompt_token_ids
@@ -96,6 +98,7 @@ class GenerationRequest:
             )
 
         self.sampling_params = sampling_params
+        self.postproc_params = postproc_params
         self.lora_request = lora_request
         self.prompt_adapter_request = prompt_adapter_request
         self.streaming = streaming

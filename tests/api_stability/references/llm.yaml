@@ -22,10 +22,6 @@ methods:
         annotation: bool
         default: false
         name: skip_tokenizer_init
-      speculative_model:
-        annotation: Union[str, pathlib.Path, NoneType]
-        default: null
-        name: speculative_model
       tensor_parallel_size:
         annotation: int
         default: 1

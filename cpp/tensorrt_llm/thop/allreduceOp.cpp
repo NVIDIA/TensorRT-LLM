@@ -22,13 +22,16 @@
 #include "tensorrt_llm/kernels/userbuffers/ub_interface.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
-#include "tensorrt_llm/thop/thUtils.h"
-#include <nvml.h>
-#include <torch/extension.h>
-#include <unordered_set>
+
 #if ENABLE_MULTI_DEVICE
 #include <nccl.h>
 #endif // ENABLE_MULTI_DEVICE
+#include <nvml.h>
+#include <torch/extension.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <unordered_set>
 
 // using namespace nvinfer1;
 using tensorrt_llm::kernels::AllReduceFusionOp;
@@ -61,7 +64,7 @@ std::set<int> getLocalGroup(std::set<int> const& group)
 {
     auto const myRank = COMM_SESSION.getRank();
     auto const myLocalRank = LOCAL_COMM_SESSION.getRank();
-    auto const localSize = LOCAL_COMM_SESSION.getSize();
+    auto const localSize = static_cast<uint32_t>(LOCAL_COMM_SESSION.getSize());
 
     std::vector<int32_t> ranks(localSize, 0);
     std::vector<int32_t> localRanks(localSize, 0);
@@ -148,7 +151,6 @@ public:
         torch::Tensor output;
         torch::Tensor finalOutput;
         size_t size = input.numel();
-        auto const sizePerElem = tensorrt_llm::common::getDTypeSize(mType);
 
         AllReduceStrategyType runtimeStrategy;
 
@@ -283,7 +285,7 @@ public:
                 params.fusion_params.hidden_size = hidden_size;
                 params.fusion_params.eps = mEps;
                 params.fusion_params.intermediate_buffer = output.mutable_data_ptr();
-                for (int i = 0; i < tpSize; ++i)
+                for (size_t i = 0; i < tpSize; ++i)
                 {
                     params.fusion_params.lamport_peer_comm_buffer_ptrs[i]
                         = reinterpret_cast<void**>(workspace_ptr)[tpSize * 4 + i];
@@ -402,7 +404,7 @@ private:
                         unsigned int remoteDeviceId;
                         NVML_CHECK(nvmlDeviceGetIndex(remoteDevice, &remoteDeviceId));
 
-                        if (remoteDeviceId == secondDeviceId)
+                        if (remoteDeviceId == static_cast<unsigned int>(secondDeviceId))
                         {
                             isNVLINK = true;
                         }

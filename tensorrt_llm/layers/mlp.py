@@ -17,8 +17,10 @@ from typing import Optional
 import tensorrt as trt
 
 from .._common import default_net
-from ..functional import (ACT2FN, AllReduceParams, cast, concat, gemm_swiglu,
-                          is_gated_activation, low_latency_gemm_swiglu)
+from ..functional import (ACT2FN, AllReduceParams, cast, chunk, concat,
+                          gemm_swiglu, is_gated_activation,
+                          low_latency_gemm_swiglu)
+from ..mapping import Mapping
 from ..module import Module
 from ..quantization import QuantMode
 from ..quantization.functional import quantize
@@ -437,3 +439,126 @@ class FusedGatedMLP(Module):
                            lora_runtime_params=mlp_proj_lora_params,
                            all_reduce_params=all_reduce_params)
         return output
+
+
+class LinearGELU(Module):
+
+    def __init__(self,
+                 dim_in: int,
+                 dim_out: int,
+                 approximate: str = 'tanh',
+                 bias: bool = True,
+                 mapping=Mapping(),
+                 dtype=None):
+        super().__init__()
+        self.proj = ColumnLinear(dim_in,
+                                 dim_out,
+                                 bias=bias,
+                                 dtype=dtype,
+                                 tp_group=mapping.tp_group,
+                                 tp_size=mapping.tp_size)
+        if approximate != 'tanh':
+            raise NotImplementedError('GELU only support tanh now.')
+
+    def forward(self, hidden_states):
+        hidden_states = self.proj(hidden_states)
+        hidden_states = ACT2FN['gelu_pytorch_tanh'](hidden_states)
+        return hidden_states
+
+
+class LinearGEGLU(Module):
+
+    def __init__(self,
+                 dim_in: int,
+                 dim_out: int,
+                 approximate: str = 'tanh',
+                 bias: bool = True,
+                 mapping=Mapping(),
+                 dtype=None):
+        super().__init__()
+        self.proj = ColumnLinear(dim_in,
+                                 dim_out * 2,
+                                 bias=bias,
+                                 dtype=dtype,
+                                 tp_group=mapping.tp_group,
+                                 tp_size=mapping.tp_size)
+        if approximate != 'tanh':
+            raise NotImplementedError('GELU only support tanh now.')
+
+    def forward(self, hidden_states):
+        hidden_states = self.proj(hidden_states)
+        hidden_states, gate = chunk(hidden_states,
+                                    2,
+                                    dim=(hidden_states.ndim() - 1))
+        return hidden_states * ACT2FN['gelu_pytorch_tanh'](gate)
+
+
+class LinearApproximateGELU(Module):
+
+    def __init__(self,
+                 dim_in: int,
+                 dim_out: int,
+                 bias: bool = True,
+                 mapping=Mapping(),
+                 dtype=None):
+        super().__init__()
+        self.proj = ColumnLinear(dim_in,
+                                 dim_out,
+                                 bias=bias,
+                                 dtype=dtype,
+                                 tp_group=mapping.tp_group,
+                                 tp_size=mapping.tp_size)
+
+    def forward(self, x):
+        x = self.proj(x)
+        return x * ACT2FN['sigmoid'](1.702 * x)
+
+
+class LinearSwiGLU(Module):
+
+    def __init__(self,
+                 dim_in: int,
+                 dim_out: int,
+                 bias: bool = True,
+                 mapping=Mapping(),
+                 dtype=None):
+        super().__init__()
+
+        self.proj = ColumnLinear(dim_in,
+                                 dim_out * 2,
+                                 bias=bias,
+                                 dtype=dtype,
+                                 tp_group=mapping.tp_group,
+                                 tp_size=mapping.tp_size)
+        self.hidden_act = 'silu'
+
+    def forward(self, hidden_states):
+        hidden_states = self.proj(hidden_states)
+        hidden_states, gate = chunk(hidden_states,
+                                    2,
+                                    dim=(hidden_states.ndim() - 1))
+        return hidden_states * ACT2FN[self.hidden_act](gate)
+
+
+class LinearActivation(Module):
+
+    def __init__(self,
+                 dim_in: int,
+                 dim_out: int,
+                 bias: bool = True,
+                 activation: str = "silu",
+                 mapping=Mapping(),
+                 dtype=None):
+        super().__init__()
+
+        self.proj = ColumnLinear(dim_in,
+                                 dim_out,
+                                 bias=bias,
+                                 dtype=dtype,
+                                 tp_group=mapping.tp_group,
+                                 tp_size=mapping.tp_size)
+        self.hidden_act = activation
+
+    def forward(self, hidden_states):
+        hidden_states = self.proj(hidden_states)
+        return ACT2FN[self.activation](hidden_states)

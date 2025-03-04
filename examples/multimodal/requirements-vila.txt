@@ -1,2 +1,2 @@
-git+https://github.com/bfshi/scaling_on_scales.git
+git+https://gitlab-master.nvidia.com/ftp/GitHubSync/scaling_on_scales.git
 transformers==4.36.2

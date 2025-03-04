@@ -6,7 +6,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Callable, Iterable, List, Optional
 
 import numpy as np
 import torch
@@ -20,6 +20,7 @@ from tensorrt_llm.serve.openai_protocol import (
 from .._utils import release_gc
 from ..bindings.executor import SchedulerConfig
 from ..executor import GenerationResultBase
+from ..executor.postproc_worker import PostprocArgs, PostprocParams
 from ..profiler import device_memory_info, host_memory_info
 from . import LLM, KvCacheConfig, SamplingParams
 from .llm import LLM, SamplingParams
@@ -300,7 +301,6 @@ class LLMPerfEvaluator:
 
         if num_postprocess_workers > 0:
             assert postprocess_tokenizer_dir is not None, "postprocess_tokenizer_dir is required"
-            kwargs["_postprocess_result_handler"] = postprocess_result_handler
             kwargs["_postprocess_tokenizer_dir"] = postprocess_tokenizer_dir
             kwargs["_num_postprocess_workers"] = num_postprocess_workers
 
@@ -335,7 +335,8 @@ class LLMPerfEvaluator:
                    concurrency=concurrency,
                    memory_monitor_thread=memory_monitor_thread,
                    sampling_extra_params=sampling_extra_params,
-                   enable_postprocess_parallel=num_postprocess_workers > 0)
+                   enable_postprocess_parallel=num_postprocess_workers > 0,
+                   postprocess_result_handler=postprocess_result_handler)
 
     def __init__(self,
                  llm: LLM,
@@ -346,7 +347,8 @@ class LLMPerfEvaluator:
                  memory_monitor_thread: Optional[
                      MemoryContinuousMonitorThread] = None,
                  sampling_extra_params: Optional[dict] = None,
-                 enable_postprocess_parallel=False):
+                 enable_postprocess_parallel: bool = False,
+                 postprocess_result_handler: Optional[Callable] = None):
         self.llm = llm
         self.samples = samples
         self.streaming = streaming
@@ -358,6 +360,7 @@ class LLMPerfEvaluator:
         self.memory_monitor_thread = memory_monitor_thread
         self.sampling_extra_params = sampling_extra_params
         self.enable_postprocess_parallel = enable_postprocess_parallel
+        self.postprocess_result_handler = postprocess_result_handler
 
         self.perf_items: List[PerfItem] = []
         self.start = None
@@ -373,6 +376,9 @@ class LLMPerfEvaluator:
             pad_id=end_id,
             beam_width=beam_width,
         )
+        postproc_params = PostprocParams(
+            post_processor=self.postprocess_result_handler,
+            postproc_args=PostprocArgs())
 
         async def lane(sampling_params: SamplingParams,
                        is_warmup: bool = False,
@@ -386,8 +392,8 @@ class LLMPerfEvaluator:
                 sample = self.samples[sample_offset]
                 sample_offset += 1
                 sampling_params.max_tokens = sample.output_len
-                sampling_params.end_id = -2
-                sampling_params.pad_id = -2
+                sampling_params.end_id = -1
+                sampling_params.pad_id = -1
                 if self.sampling_extra_params is not None:
                     for key, value in self.sampling_extra_params.items():
                         setattr(sampling_params, key, value)
@@ -397,6 +403,7 @@ class LLMPerfEvaluator:
                 output = self.llm.generate_async(
                     sample.input_ids,
                     sampling_params=sampling_params,
+                    _postproc_params=postproc_params,
                     streaming=self.streaming)
                 if self.streaming:
                     no = 0
@@ -530,7 +537,8 @@ class LLMPerfEvaluator:
             del self.memory_monitor_thread
 
 
-def perform_faked_oai_postprocess(rsp: GenerationResultBase):
+def perform_faked_oai_postprocess(rsp: GenerationResultBase,
+                                  args: PostprocArgs):
     first_iteration = len(rsp.outputs[0].token_ids) == 1
     num_choices = 1
     finish_reason_sent = [False] * num_choices

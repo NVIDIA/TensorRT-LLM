@@ -57,6 +57,7 @@ class LMHead(Linear):
 
         weight_shape = (self.out_features, self.in_features)
         self.weight = Parameter(torch.empty(weight_shape, dtype=dtype))
+        self.register_parameter("bias", None)
 
     def forward(
             self,

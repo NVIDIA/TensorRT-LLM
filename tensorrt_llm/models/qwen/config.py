@@ -99,9 +99,13 @@ class QWenConfig(PretrainedConfig):
         if qwen_type == 'llava_onevision':
             hf_config = hf_config.text_config
             qwen_type = f'{hf_config.model_type}_llava_onevision'
+        # Qwen2-Audio
+        if qwen_type == 'qwen2_audio':
+            hf_config = hf_config.text_config
+            hf_config.architectures = ['Qwen2ForCausalLM']
 
         valid_types = ('qwen', 'qwen2', 'qwen2_moe', 'qwen2_llava_onevision',
-                       'qwen2_vl')
+                       'qwen2_vl', 'qwen2_audio')
         assert qwen_type in valid_types, f"Unsupported Qwen type: {qwen_type}, only {valid_types} are acceptable."
         num_key_value_heads = getattr(hf_config, "num_key_value_heads",
                                       hf_config.num_attention_heads)
