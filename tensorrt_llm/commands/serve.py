@@ -1,7 +1,10 @@
 import asyncio
-from typing import Optional
+import os
+from typing import List, Optional
 
 import click
+import yaml
+from torch.cuda import device_count
 from transformers import AutoTokenizer
 
 from tensorrt_llm._torch.llm import LLM as PyTorchLLM
@@ -9,9 +12,96 @@ from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.bindings.executor import (CapacitySchedulerPolicy,
                                             DynamicBatchConfig, SchedulerConfig)
 from tensorrt_llm.llmapi import LLM, BuildConfig, KvCacheConfig
+from tensorrt_llm.llmapi.disagg_utils import (CtxGenServerConfig,
+                                              parse_disagg_config_file)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_options
 from tensorrt_llm.logger import logger, severity_map
-from tensorrt_llm.serve import OpenAIServer
+from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
+
+
+@click.group()
+def cli():
+    pass
+
+
+def get_llm_args(model: str,
+                 llm_args_dict: dict,
+                 tokenizer: Optional[str] = None,
+                 backend: Optional[str] = None,
+                 max_beam_width: int = BuildConfig.max_beam_width,
+                 max_batch_size: int = BuildConfig.max_batch_size,
+                 max_num_tokens: int = BuildConfig.max_num_tokens,
+                 max_seq_len: int = BuildConfig.max_seq_len,
+                 tensor_parallel_size: int = 1,
+                 pipeline_parallel_size: int = 1,
+                 moe_expert_parallel_size: Optional[int] = None,
+                 gpus_per_node: Optional[int] = None,
+                 free_gpu_memory_fraction: Optional[float] = None,
+                 num_postprocess_workers: int = 0,
+                 trust_remote_code: bool = False):
+
+    if gpus_per_node is None:
+        gpus_per_node = device_count()
+        if gpus_per_node == 0:
+            raise ValueError("No GPU devices found on the node")
+
+    build_config = BuildConfig(max_batch_size=max_batch_size,
+                               max_num_tokens=max_num_tokens,
+                               max_beam_width=max_beam_width,
+                               max_seq_len=max_seq_len)
+
+    kv_cache_config = KvCacheConfig(
+        free_gpu_memory_fraction=free_gpu_memory_fraction)
+
+    pytorch_backend_config = PyTorchConfig(
+        enable_overlap_scheduler=True) if backend == "pytorch" else None
+    dynamic_batch_config = DynamicBatchConfig(
+        enable_batch_size_tuning=True,
+        enable_max_num_tokens_tuning=False,
+        dynamic_batch_moving_average_window=128)
+    scheduler_config = SchedulerConfig(
+        capacity_scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
+        dynamic_batch_config=dynamic_batch_config,
+    )
+
+    llm_args = {
+        "model": model,
+        "scheduler_config": scheduler_config,
+        "tokenizer": tokenizer,
+        "tensor_parallel_size": tensor_parallel_size,
+        "pipeline_parallel_size": pipeline_parallel_size,
+        "moe_expert_parallel_size": moe_expert_parallel_size,
+        "gpus_per_node": gpus_per_node,
+        "trust_remote_code": trust_remote_code,
+        "build_config": build_config,
+        "kv_cache_config": kv_cache_config,
+        "backend": backend if backend == "pytorch" else None,
+        "pytorch_backend_config": pytorch_backend_config,
+        "_num_postprocess_workers": num_postprocess_workers,
+        "_postprocess_tokenizer_dir": tokenizer or model,
+    }
+
+    llm_args = update_llm_args_with_extra_options(llm_args, llm_args_dict)
+
+    return llm_args
+
+
+def launch_server(host: str, port: int, llm_args: dict):
+
+    backend = llm_args["backend"]
+    model = llm_args["model"]
+    tokenizer = llm_args["tokenizer"]
+
+    if backend == 'pytorch':
+        llm = PyTorchLLM(**llm_args)
+    else:
+        llm = LLM(**llm_args)
+
+    hf_tokenizer = AutoTokenizer.from_pretrained(tokenizer or model)
+
+    server = OpenAIServer(llm=llm, model=model, hf_tokenizer=hf_tokenizer)
+
+    asyncio.run(server(host, port))
 
 
 @click.command("trtllm-serve")
@@ -102,57 +192,135 @@ def main(model: str, tokenizer: Optional[str], host: str, port: int,
     MODEL: model name | HF checkpoint path | TensorRT engine path
     """
     logger.set_level(log_level)
-    build_config = BuildConfig(max_batch_size=max_batch_size,
-                               max_num_tokens=max_num_tokens,
-                               max_beam_width=max_beam_width,
-                               max_seq_len=max_seq_len)
 
-    kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction)
+    llm_args_dict = {}
+    if extra_llm_api_options is not None:
+        with open(extra_llm_api_options, 'r') as f:
+            llm_args_dict = yaml.safe_load(f)
 
-    pytorch_backend_config = PyTorchConfig(
-        enable_overlap_scheduler=True) if backend == "pytorch" else None
-    dynamic_batch_config = DynamicBatchConfig(
-        enable_batch_size_tuning=True,
-        enable_max_num_tokens_tuning=False,
-        dynamic_batch_moving_average_window=128)
-    scheduler_config = SchedulerConfig(
-        capacity_scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
-        dynamic_batch_config=dynamic_batch_config,
+    llm_args = get_llm_args(
+        model=model,
+        llm_args_dict=llm_args_dict,
+        tokenizer=tokenizer,
+        backend=backend,
+        max_beam_width=max_beam_width,
+        max_batch_size=max_batch_size,
+        max_num_tokens=max_num_tokens,
+        max_seq_len=max_seq_len,
+        tensor_parallel_size=tp_size,
+        pipeline_parallel_size=pp_size,
+        moe_expert_parallel_size=ep_size,
+        gpus_per_node=gpus_per_node,
+        kv_cache_free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
+        num_postprocess_workers=num_postprocess_workers,
+        trust_remote_code=trust_remote_code)
+
+    launch_server(host, port, tokenizer, model, llm_args)
+
+
+def get_ctx_gen_server_urls(
+        server_configs: List[CtxGenServerConfig]) -> List[str]:
+    ctx_server_urls = []
+    gen_server_urls = []
+    for cfg in server_configs:
+        if cfg.type == "ctx":
+            ctx_server_urls.append(f"http://{cfg.hostname}:{cfg.port}")
+        else:
+            gen_server_urls.append(f"http://{cfg.hostname}:{cfg.port}")
+
+    return ctx_server_urls, gen_server_urls
+
+
+@click.command("disaggregated")
+@click.option("-c",
+              "--config_file",
+              type=str,
+              default=None,
+              help="Specific option for disaggregated mode.")
+@click.option("-t",
+              "--server_start_timeout",
+              type=int,
+              default=180,
+              help="Server start timeout")
+@click.option("-r",
+              "--request_timeout",
+              type=int,
+              default=180,
+              help="Request timeout")
+def disaggregated(config_file: Optional[str], server_start_timeout: int,
+                  request_timeout: int):
+    """Running in disaggregated mode"""
+
+    disagg_cfg = parse_disagg_config_file(config_file)
+
+    ctx_server_urls, gen_server_urls = get_ctx_gen_server_urls(
+        disagg_cfg.server_configs)
+
+    server = OpenAIDisaggServer(ctx_servers=ctx_server_urls,
+                                gen_servers=gen_server_urls,
+                                req_timeout_secs=request_timeout,
+                                server_start_timeout_secs=server_start_timeout)
+
+    asyncio.run(server(disagg_cfg.hostname, disagg_cfg.port))
+
+
+@click.command("disaggregated_mpi_worker")
+@click.option("-c",
+              "--config_file",
+              type=str,
+              default=None,
+              help="Specific option for disaggregated mode.")
+@click.option("-t",
+              "--server_start_timeout",
+              type=int,
+              default=180,
+              help="Server start timeout")
+def disaggregated_mpi_worker(config_file: Optional[str],
+                             server_start_timeout: int, request_timeout: int):
+    """Running in disaggregated mode"""
+
+    from mpi4py.futures import MPICommExecutor
+    from mpi4py.MPI import COMM_WORLD
+
+    from tensorrt_llm._utils import global_mpi_rank, mpi_rank, set_mpi_comm
+    from tensorrt_llm.llmapi import MpiCommSession
+    from tensorrt_llm.llmapi.disagg_utils import split_world_comm
+
+    disagg_cfg = parse_disagg_config_file(config_file)
+
+    is_leader, instance_idx, sub_comm = split_world_comm(
+        disagg_cfg.server_configs)
+
+    os.environ['TRTLLM_USE_MPI_KVCACHE'] = "1"
+    set_mpi_comm(sub_comm)
+    logger.info(
+        f"mpi_session is provided for LLM instance. Global MPI rank: {global_mpi_rank()}, sub-comm MPI rank: {mpi_rank()}"
     )
 
-    llm_args = {
-        "model": model,
-        "scheduler_config": scheduler_config,
-        "tokenizer": tokenizer,
-        "tensor_parallel_size": tp_size,
-        "pipeline_parallel_size": pp_size,
-        "moe_expert_parallel_size": ep_size,
-        "gpus_per_node": gpus_per_node,
-        "trust_remote_code": trust_remote_code,
-        "build_config": build_config,
-        "kv_cache_config": kv_cache_config,
-        "backend": backend if backend == "pytorch" else None,
-        "pytorch_backend_config": pytorch_backend_config,
-        "_num_postprocess_workers": num_postprocess_workers,
-        "_postprocess_tokenizer_dir": tokenizer or model,
-    }
+    # Leader ranks will start the trtllm-server using it's own server config
+    if is_leader:
+        server_cfg = disagg_cfg.server_configs[instance_idx]
 
-    if extra_llm_api_options is not None:
-        llm_args = update_llm_args_with_extra_options(llm_args,
-                                                      extra_llm_api_options)
+        llm_args = get_llm_args(**server_cfg.other_args)
 
-    if backend == 'pytorch':
-        llm = PyTorchLLM(**llm_args)
+        mpi_session = MpiCommSession(
+            comm=sub_comm,
+            n_workers=sub_comm.Get_size()) if sub_comm is not None else None
+
+        llm_args["_mpi_session"] = mpi_session
+
+        launch_server(host=server_cfg.hostname,
+                      port=server_cfg.port,
+                      llm_args=llm_args)
     else:
-        llm = LLM(**llm_args)
+        with MPICommExecutor(sub_comm) as executor:
+            if not is_leader and executor is not None:
+                raise RuntimeError(f"rank{COMM_WORLD} should not have executor")
 
-    hf_tokenizer = AutoTokenizer.from_pretrained(tokenizer or model)
 
-    server = OpenAIServer(llm=llm, model=model, hf_tokenizer=hf_tokenizer)
-
-    asyncio.run(server(host, port))
-
+cli.add_command(main)
+cli.add_command(disaggregated)
+cli.add_command(disaggregated_mpi_worker)
 
 if __name__ == "__main__":
     main()
