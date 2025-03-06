@@ -14,7 +14,7 @@
 # limitations under the License.
 
 # A workflow to trigger ci on hybrid infra (github + self hosted runner)
-name: Blossom-CI
+name: L0-Test
 on:
   issue_comment:
     types: [created]
@@ -25,63 +25,54 @@ on:
             required: true
           test_result:
             description: 'test result'
-            required: true
+            required: false
           test_results_url:
             description: 'test results url'
             required: true
 jobs:
   Authorization:
-    name: Authorization
-    runs-on: blossom
-    outputs:
-      args: ${{ env.args }}
-
-    # This job only runs for pull request comments
-    if: |
-         startsWith( github.event.comment.body, '/bot' ) && contains('["chzblych", "tburt-nv", "niukuo"]', github.actor)
-    steps:
-      - name: Check if comment is issued by authorized person
-        run: blossom-ci
-        env:
-          OPERATION: 'AUTH'
-          REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO_KEY_DATA: ${{ secrets.BLOSSOM_KEY }}
-
-  Vulnerability-scan:
-    name: Vulnerability scan
-    needs: [Authorization]
     runs-on: ubuntu-latest
+    name: Authorization
+    if: startsWith( github.event.comment.body, '/bot' )
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v2
+      - name: Check Team Membership
+        uses: actions/github-script@v6
         with:
-          repository: ${{ fromJson(needs.Authorization.outputs.args).repo }}
-          ref: ${{ fromJson(needs.Authorization.outputs.args).ref }}
-          lfs: 'true'
-
-      - name: Run blossom action
-        uses: NVIDIA/blossom-action@main
-        env:
-          REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO_KEY_DATA: ${{ secrets.BLOSSOM_KEY }}
-        with:
-          args1: ${{ fromJson(needs.Authorization.outputs.args).args1 }}
-          args2: ${{ fromJson(needs.Authorization.outputs.args).args2 }}
-          args3: ${{ fromJson(needs.Authorization.outputs.args).args3 }}
+          github-token: ${{ secrets.CI_TEAM_TOKEN }}
+          script: |
+            try {
+              const { data: membership } = await github.rest.teams.getMembershipForUserInOrg({
+                org: context.repo.owner,
+                team_slug: 'trt-llm-ci-approvers',
+                username: context.actor,
+              });
+              if (membership.state != 'active') {
+                core.setFailed('only member in [trt-llm-ci-approvers] can run', membership)
+              }
+            } catch (error) {
+              console.log('check membership failed:', error);
+              core.setFailed('only member in [trt-llm-ci-approvers] can run')
+            }
 
   Job-trigger:
     name: Start ci job
-    needs: [Vulnerability-scan]
-    runs-on: blossom
+    needs: [Authorization]
+    runs-on: [self-hosted, Linux, Jenkins]
     steps:
       - name: Start ci job
-        run: blossom-ci
-        env:
-          OPERATION: 'START-CI-JOB'
-          CI_SERVER: ${{ secrets.CI_SERVER }}
-          REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CI_SERVER="${{ secrets.CI_SERVER }}"
+          JENKINS_URL=$(echo "$CI_SERVER" | cut -d '@' -f 1)
+          TOKEN=$(echo "$CI_SERVER" | cut -d '@' -f 2)
 
-  Upload-results:
+          echo '${{ toJson(github.event) }}' > githubData.json
+
+          curl -s -X POST \
+            -H "Content-Type: application/json" \
+            -d @githubData.json \
+            "$JENKINS_URL/generic-webhook-trigger/invoke?token=$TOKEN"
+
+  Upload-Test:
     name: Upload test results
     runs-on: linux-amd64-cpu4
     if: github.event_name == 'workflow_dispatch'
