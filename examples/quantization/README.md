@@ -58,7 +58,7 @@ Checkpoint saved in `output_dir` can be directly passed to `trtllm-build`.
 
 - model_dir: Hugging Face model path.
 - qformat: Specify the quantization algorithm applied to the checkpoint.
-    - nvfp4: Weights are quantized to NVFP4 block-wise with size 16. Actiavation global scale are calibrated.
+    - nvfp4: Weights are quantized to NVFP4 block-wise with size 16. Activation global scale are calibrated.
     - fp8: Weights are quantized to FP8 tensor wise. Activation ranges are calibrated tensor wise.
     - int8_sq: Weights are smoothed and quantized to INT8 channel wise. Activation ranges are calibrated tensor wise.
     - int4_awq: Weights are re-scaled and block-wise quantized to INT4. Block size is specified by `awq_block_size`.
@@ -99,7 +99,7 @@ Checkpoint saved in `output_dir` can be directly passed to `trtllm-build`.
 
 ### Building Arguments:
 
-There are several arguments for building stage which related to quantizaion.
+There are several arguments for the building stage which relate to quantization.
 - use_fp8_context_fmha: This is Hopper-only feature. Use FP8 Gemm to calculate the attention operation.
 
 ```python
@@ -170,7 +170,7 @@ There will be another file about per-layer quantization information named `quant
 }
 ```
 
-TensorRT-LLM will automatically read `quant_cfg.json` after recogniziong the `MIXED_PRECISION` quantization method in `config.json`. All the specific algorithm keeps the same as what in `quantization` filed before. If some layers are not listed, they'll be treated as no quantization.
+TensorRT-LLM will automatically read `quant_cfg.json` after recogniziong the `MIXED_PRECISION` quantization method in `config.json`. All the specific algorithm keeps the same as what in `quantization` field before. If some layers are not listed, they'll be treated as no quantization.
 
 ## APIs
 
