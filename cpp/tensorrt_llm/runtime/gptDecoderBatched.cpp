@@ -806,7 +806,6 @@ void GptDecoderBatched::newBatch(GenerationInput const& inputs, GenerationOutput
     auto inputLengthsHost = mBufferManager.copyFrom(*inputLengths, MemoryType::kCPU);
     auto inputLengthsPtr = bufferCast<SizeType32>(*inputLengthsHost);
     auto inputOffset = 0;
-    std::vector<SamplingConfig> samplingConfigs;
     for (auto batchIdx = 0; batchIdx < mActualBatchSize; ++batchIdx)
     {
         auto const inputLength = inputLengthsPtr[batchIdx];
@@ -855,8 +854,7 @@ void GptDecoderBatched::newBatch(GenerationInput const& inputs, GenerationOutput
         requestSamplingConfig.outputLogProbs = {{outputs.logProbs != nullptr}};
         // Temporary usage of CreateNewDecoderRequests - only used for static batching.
         batch_manager::CreateNewDecoderRequests().newRequest(
-            batchIdx, request, requestSamplingConfig, modelConfig, *this, mRuntimeStream, mMaxSequenceLength);
-        samplingConfigs.push_back(requestSamplingConfig);
+            batchIdx, request, requestSamplingConfig, modelConfig, *this, *mRuntimeStream, mMaxSequenceLength);
     }
 
     auto fusedSamplingConfig = samplingConfig;

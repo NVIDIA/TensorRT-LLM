@@ -10,10 +10,31 @@ and operates on a purely functional paradigm that is compatible with the torch c
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields
-from typing import Dict, List, Optional, Protocol, Sequence, Tuple, Type, Union
+from typing import Dict, List, Literal, Optional, Protocol, Sequence, Tuple, Type, Union
 
 import torch
 from torch.export import Dim
+
+
+@dataclass
+class PositionalEmbeddingConfig:
+    """A dataclass to hold positional embedding information."""
+
+    mode: Optional[Literal["rope"]] = None
+    rope_theta: float = 10000.0
+    rope_scale: float = 1.0
+
+    def __post_init__(self):
+        assert self.mode in [None, "rope"], f"Invalid mode: {self.mode}."
+        if self.mode == "rope":
+            assert self.rope_theta > 0, f"Invalid rope theta: {self.rope_theta}."
+
+
+@dataclass
+class CacheConfig:
+    """A dataclass to hold information how to configure the cache."""
+
+    dtype: Optional[torch.dtype] = None
 
 
 @dataclass
@@ -28,10 +49,9 @@ class AttentionInfo:
     num_kv_heads: int
     head_dim: int
     dtype: torch.dtype
-    cache_dtype: Optional[torch.dtype] = None
-    rope_theta: Optional[float] = None
-    rope_scale: Optional[float] = None
-    causal: bool = True
+
+    cache_config: CacheConfig
+    pos_embd_config: PositionalEmbeddingConfig
 
 
 @dataclass
@@ -367,6 +387,10 @@ class GetBufferCallable(GetCacheCallable):
     pass
 
 
+class GetAttentionInfo(Protocol):
+    def __call__() -> AttentionInfo: ...
+
+
 CacheInitializerDict = Dict[str, GetCacheCallable]
 BufferInitializerDict = Dict[str, GetBufferCallable]
 
@@ -436,7 +460,7 @@ class AttentionDescriptor(ABC):
 
     @classmethod
     @abstractmethod
-    def get_cache_initializers(cls, attention_info: AttentionInfo) -> CacheInitializerDict:
+    def get_cache_initializers(cls, get_info: GetAttentionInfo) -> CacheInitializerDict:
         """Provide a dictionary of function pointers that can be used to initialize the caches.
 
         The key corresponds to the argument name used in the attention op signature. The function
@@ -448,11 +472,15 @@ class AttentionDescriptor(ABC):
         the initial forward pass for each attention op detected in the graph. The caches will be
         managed by the global CacheManager and passed back to the attention op during the forward
         pass.
+
+        If the cache initializer requires information about the attention op, the ``get_info``
+        function can be called **inside** the cache initializer to retrieve the necessary
+        information.
         """
         raise NotImplementedError
 
     @classmethod
-    def get_global_buffer_initializers(cls, attention_info: AttentionInfo) -> BufferInitializerDict:
+    def get_global_buffer_initializers(cls, get_info: GetAttentionInfo) -> BufferInitializerDict:
         """Provide a dictionary of function pointers that can be used to initialize buffers.
 
         The key corresponds to the buffer name used in the graph module and will **not**
@@ -464,6 +492,10 @@ class AttentionDescriptor(ABC):
         Buffers are initialize *once* after the model initialization and before the initial forward
         pass for each attention op detected in the graph. The buffer will be managed by the global
         CacheManager and passed back to the attention op during the forward pass.
+
+        If the buffer initializer requires information about the attention op, the ``get_info``
+        function can be called **inside** the buffer initializer to retrieve the necessary
+        information.
         """
         return {}
 

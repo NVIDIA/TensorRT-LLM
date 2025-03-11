@@ -18,6 +18,7 @@ import sys
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
@@ -45,9 +46,42 @@ def test_cublas_mm(dtype, m, k_n):
         x,
         w.t(),
         bias=None,
+        out_dtype=None,
     )
     ref = torch.matmul(x, w.t())
     np.testing.assert_allclose(ref.float().cpu(), output.float().cpu())
+
+
+@pytest.mark.parametrize(
+    "k_n",
+    [(7168, 256)],
+)
+@pytest.mark.parametrize(
+    "m",
+    [1, 4],
+)
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.bfloat16],
+)
+def test_cublas_mm_out_fp32(dtype, m, k_n):
+    pytest.skip("https://nvbugs/5154745")
+    k, n = k_n
+    torch.random.manual_seed(44)
+    shape_x = (m, k)
+    shape_w = (n, k)
+    x = torch.randn(shape_x, device="cuda").to(dtype)
+    w = torch.randn(shape_w, device="cuda").to(dtype)
+    output = torch.ops.trtllm.cublas_mm(
+        x,
+        w.t(),
+        bias=None,
+        out_dtype=torch.float32,
+    )
+    ref = F.linear(x.float(), w.float())
+    np.testing.assert_allclose(ref.float().cpu(),
+                               output.float().cpu(),
+                               rtol=2e-3)
 
 
 if __name__ == '__main__':

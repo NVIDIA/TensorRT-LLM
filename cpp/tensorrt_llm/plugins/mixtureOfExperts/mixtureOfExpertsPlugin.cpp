@@ -40,15 +40,15 @@ static char const* MIXTURE_OF_EXPERTS_PLUGIN_NAME{"MixtureOfExperts"};
 nvinfer1::PluginFieldCollection MixtureOfExpertsPluginCreator::mFC{};
 std::vector<nvinfer1::PluginField> MixtureOfExpertsPluginCreator::mPluginAttributes;
 
-MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(bool remove_input_padding, int number_of_experts, int top_k,
+MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(bool remove_input_padding, int number_of_experts, int experts_per_token,
     int expert_hidden_size, int expert_inter_size, int groupwise_quant_algo, int group_size,
     tensorrt_llm::ActivationType activation_type, nvinfer1::DataType type, nvinfer1::DataType weight_type,
-    nvinfer1::DataType output_type, QuantMode quant_mode, bool use_finished, bool use_bias, int tp_size, int tp_rank,
-    int ep_size, int ep_rank, MOEExpertScaleNormalizationMode normalization_mode, float sparse_mixer_epsilon,
-    bool force_determinism, int side_stream_id, MixtureOfExpertsPluginProfilerPtr gemm_profiler_ptr, bool use_lora,
-    nvinfer1::DataType lora_type, LoraPluginProfilerPtr lora_profiler, int max_low_rank)
+    nvinfer1::DataType output_type, QuantMode quant_mode, bool use_final_scales, bool use_bias, int tp_size,
+    int tp_rank, int ep_size, int ep_rank, bool force_determinism, int side_stream_id,
+    MixtureOfExpertsPluginProfilerPtr gemm_profiler_ptr, bool use_lora, nvinfer1::DataType lora_type,
+    LoraPluginProfilerPtr lora_profiler, int max_low_rank)
     : mNumExperts(number_of_experts)
-    , mK(top_k)
+    , mExpertsPerToken(experts_per_token)
     , mExpertHiddenSize(expert_hidden_size)
     , mExpertInterSize(expert_inter_size)
     , mGroupwiseQuantAlgo(groupwise_quant_algo)
@@ -58,11 +58,9 @@ MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(bool remove_input_padding, int nu
     , mWeightType(weight_type)
     , mOutputType(output_type)
     , mQuantMode(quant_mode)
-    , mUseFinished(use_finished)
+    , mUseFinalScales(use_final_scales)
     , mUseBias(use_bias)
     , mParallelismConfig(MOEParallelismConfig{tp_size, tp_rank, ep_size, ep_rank})
-    , mNormalizationMode(normalization_mode)
-    , mSparseMixerEpsilon(sparse_mixer_epsilon)
     , mUseDeterministicKernels(force_determinism)
     , mSideStreamId(side_stream_id)
     , mGemmProfiler(std::move(gemm_profiler_ptr))
@@ -78,7 +76,7 @@ MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(bool remove_input_padding, int nu
 tensorrt_llm::plugins::MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(MixtureOfExpertsPlugin const& other)
     : mMOERunner()
     , mNumExperts(other.mNumExperts)
-    , mK(other.mK)
+    , mExpertsPerToken(other.mExpertsPerToken)
     , mExpertHiddenSize(other.mExpertHiddenSize)
     , mExpertInterSize(other.mExpertInterSize)
     , mGroupwiseQuantAlgo(other.mGroupwiseQuantAlgo)
@@ -88,11 +86,9 @@ tensorrt_llm::plugins::MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(MixtureOfE
     , mWeightType(other.mWeightType)
     , mOutputType(other.mOutputType)
     , mQuantMode(other.mQuantMode)
-    , mUseFinished(other.mUseFinished)
+    , mUseFinalScales(other.mUseFinalScales)
     , mUseBias(other.mUseBias)
     , mParallelismConfig(other.mParallelismConfig)
-    , mNormalizationMode(other.mNormalizationMode)
-    , mSparseMixerEpsilon(other.mSparseMixerEpsilon)
     , mDims(other.mDims)
     , mUseDeterministicKernels(other.mUseDeterministicKernels)
     , mSideStreamId(other.mSideStreamId)
@@ -116,10 +112,10 @@ tensorrt_llm::plugins::MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(MixtureOfE
 
 size_t MixtureOfExpertsPlugin::getSerializationSize() const noexcept
 {
-    size_t size = sizeof(mRemoveInputPadding) + sizeof(mNumExperts) + sizeof(mK) + sizeof(mExpertHiddenSize)
-        + sizeof(mExpertInterSize) + sizeof(mGroupwiseQuantAlgo) + sizeof(mGroupSize) + sizeof(mActivationType)
-        + sizeof(mType) + sizeof(mWeightType) + sizeof(mOutputType) + sizeof(QuantMode::BaseType) + sizeof(mUseFinished)
-        + sizeof(mUseBias) + sizeof(mParallelismConfig) + sizeof(mNormalizationMode) + sizeof(mSparseMixerEpsilon)
+    size_t size = sizeof(mRemoveInputPadding) + sizeof(mNumExperts) + sizeof(mExpertsPerToken)
+        + sizeof(mExpertHiddenSize) + sizeof(mExpertInterSize) + sizeof(mGroupwiseQuantAlgo) + sizeof(mGroupSize)
+        + sizeof(mActivationType) + sizeof(mType) + sizeof(mWeightType) + sizeof(mOutputType)
+        + sizeof(QuantMode::BaseType) + sizeof(mUseFinalScales) + sizeof(mUseBias) + sizeof(mParallelismConfig)
         + sizeof(mDims) + sizeof(mUseDeterministicKernels) + sizeof(mSideStreamId)
         + mGemmProfiler->getSerializationSize(mGemmId1) + mGemmProfiler->getSerializationSize(mGemmId2)
         + sizeof(mUseLora) + sizeof(mLoraType) + sizeof(mMaxLowRank);
@@ -142,7 +138,7 @@ MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(void const* data, size_t length,
     char const* a = d;
     read(d, mRemoveInputPadding);
     read(d, mNumExperts);
-    read(d, mK);
+    read(d, mExpertsPerToken);
     read(d, mExpertHiddenSize);
     read(d, mExpertInterSize);
     read(d, mGroupwiseQuantAlgo);
@@ -154,11 +150,9 @@ MixtureOfExpertsPlugin::MixtureOfExpertsPlugin(void const* data, size_t length,
     QuantMode::BaseType quant_mode;
     read(d, quant_mode);
     mQuantMode = QuantMode{quant_mode};
-    read(d, mUseFinished);
+    read(d, mUseFinalScales);
     read(d, mUseBias);
     read(d, mParallelismConfig);
-    read(d, mNormalizationMode);
-    read(d, mSparseMixerEpsilon);
     read(d, mDims);
     read(d, mUseDeterministicKernels);
     read(d, mSideStreamId);
@@ -191,7 +185,7 @@ void MixtureOfExpertsPlugin::serialize(void* buffer) const noexcept
 
     write(d, mRemoveInputPadding);
     write(d, mNumExperts);
-    write(d, mK);
+    write(d, mExpertsPerToken);
     write(d, mExpertHiddenSize);
     write(d, mExpertInterSize);
     write(d, mGroupwiseQuantAlgo);
@@ -201,11 +195,9 @@ void MixtureOfExpertsPlugin::serialize(void* buffer) const noexcept
     write(d, mWeightType);
     write(d, mOutputType);
     write(d, mQuantMode.value());
-    write(d, mUseFinished);
+    write(d, mUseFinalScales);
     write(d, mUseBias);
     write(d, mParallelismConfig);
-    write(d, mNormalizationMode);
-    write(d, mSparseMixerEpsilon);
     write(d, mDims);
     write(d, mUseDeterministicKernels);
     write(d, mSideStreamId);
@@ -330,13 +322,13 @@ void MixtureOfExpertsPlugin::init()
             static_cast<int>(mType), static_cast<int>(mWeightType), static_cast<int>(mOutputType));
     }
 
-    mMOERunner->use_deterministic_hopper_reduce_ = mK > 2 && mUseDeterministicKernels;
+    mMOERunner->use_deterministic_hopper_reduce_ = mExpertsPerToken > 2 && mUseDeterministicKernels;
 
-    mGemmId1 = GemmIDMoe{1, mNumExperts, mK, mParallelismConfig, mExpertHiddenSize, mExpertInterSize, mGroupSize,
-        mActivationType, mType, mWeightType, mQuantMode, mMOERunner->use_deterministic_hopper_reduce_};
-    mGemmId2 = GemmIDMoe{2, mNumExperts, mK, mParallelismConfig, mExpertHiddenSize, mExpertInterSize, mGroupSize,
-        mActivationType, mType, mWeightType, mQuantMode, mMOERunner->use_deterministic_hopper_reduce_};
-    mGemmProfiler->setMaxProfileM(16384 * mNumExperts / mK);
+    mGemmId1 = GemmIDMoe{1, mNumExperts, mExpertsPerToken, mParallelismConfig, mExpertHiddenSize, mExpertInterSize,
+        mGroupSize, mActivationType, mType, mWeightType, mQuantMode, mMOERunner->use_deterministic_hopper_reduce_};
+    mGemmId2 = GemmIDMoe{2, mNumExperts, mExpertsPerToken, mParallelismConfig, mExpertHiddenSize, mExpertInterSize,
+        mGroupSize, mActivationType, mType, mWeightType, mQuantMode, mMOERunner->use_deterministic_hopper_reduce_};
+    mGemmProfiler->setMaxProfileM(16384 * mNumExperts / mExpertsPerToken);
 
     if (hasLora())
     {
@@ -401,11 +393,11 @@ bool MixtureOfExpertsPlugin::supportsFormatCombination(
             return inOut[pos].type == mOutputType;
         }
     }
-    else if (pos == getFinishedTensorIndex() && hasFinishedTensor())
+    else if (pos == getTokenSelectedExpertsIndex())
     {
-        return inOut[pos].type == DataType::kBOOL;
+        return inOut[pos].type == DataType::kINT32;
     }
-    else if (pos == getRoutingTensorIndex())
+    else if (pos == getTokenFinalScalesIndex())
     {
         return inOut[pos].type == DataType::kFLOAT;
     }
@@ -528,10 +520,11 @@ void MixtureOfExpertsPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc c
     {
         mDims = {minM, maxM, maxN, maxK};
     }
-    mGemmId1 = GemmIDMoe{1, mNumExperts, mK, mParallelismConfig, mExpertHiddenSize, mExpertInterSize, mGroupSize,
-        mActivationType, mType, mWeightType, mQuantMode};
-    mGemmId2 = GemmIDMoe{2, mNumExperts, mK, mParallelismConfig, mExpertHiddenSize, mExpertInterSize, mGroupSize,
-        mActivationType, mType, mWeightType, mQuantMode};
+
+    mGemmId1 = GemmIDMoe{1, mNumExperts, mExpertsPerToken, mParallelismConfig, mExpertHiddenSize, mExpertInterSize,
+        mGroupSize, mActivationType, mType, mWeightType, mQuantMode};
+    mGemmId2 = GemmIDMoe{2, mNumExperts, mExpertsPerToken, mParallelismConfig, mExpertHiddenSize, mExpertInterSize,
+        mGroupSize, mActivationType, mType, mWeightType, mQuantMode};
 
     if (hasLora())
     {
@@ -543,32 +536,25 @@ void MixtureOfExpertsPlugin::configurePlugin(nvinfer1::DynamicPluginTensorDesc c
 
 auto MixtureOfExpertsPlugin::setupWorkspace(void* base_ptr, int64_t num_tokens, int num_reqs) const -> WorkspaceInfo
 {
-    size_t moe_workspace_size = mMOERunner->getWorkspaceSize(num_tokens, mExpertHiddenSize, mExpertInterSize,
-        mNumExperts, mK, mActivationType, mNormalizationMode, mParallelismConfig, hasLora(),
-        /*use_fp8_block_scaling=*/false, hasExpertPrequantScales());
-
-    // Output of post-softmax routing probabilities
-    size_t scale_probabilities_size = num_tokens * mNumExperts * sizeof(float);
+    size_t moe_workspace_size
+        = mMOERunner->getWorkspaceSize(num_tokens, mExpertHiddenSize, mExpertInterSize, mNumExperts, mExpertsPerToken,
+            mActivationType, mParallelismConfig, hasLora(), /*use_fp8_block_scaling=*/false, hasExpertPrequantScales());
 
     // Permutation map
-    size_t src_to_dest_map_size = mK * num_tokens * sizeof(int);
-
-    // Selected expert map
-    size_t selected_expert_size = mK * num_tokens * sizeof(int);
+    size_t src_to_dest_map_size = mExpertsPerToken * num_tokens * sizeof(int);
 
     size_t lora_workspace_size = 0;
     if (hasLora())
     {
-        int64_t num_reqs_lora = std::min(num_tokens * mK, static_cast<int64_t>(num_reqs * mNumExperts));
-        lora_workspace_size = std::max(mLoraImpl1->getWorkspaceSize(num_tokens * mK, num_reqs_lora, mLoraType),
-            mLoraImpl2->getWorkspaceSize(num_tokens * mK, num_reqs_lora, mLoraType));
+        int64_t num_reqs_lora = std::min(num_tokens * mExpertsPerToken, static_cast<int64_t>(num_reqs * mNumExperts));
+        lora_workspace_size
+            = std::max(mLoraImpl1->getWorkspaceSize(num_tokens * mExpertsPerToken, num_reqs_lora, mLoraType),
+                mLoraImpl2->getWorkspaceSize(num_tokens * mExpertsPerToken, num_reqs_lora, mLoraType));
     }
 
     std::vector<size_t> workspaces{
         moe_workspace_size,
-        scale_probabilities_size,
         src_to_dest_map_size,
-        selected_expert_size,
         lora_workspace_size,
     };
 
@@ -578,10 +564,8 @@ auto MixtureOfExpertsPlugin::setupWorkspace(void* base_ptr, int64_t num_tokens, 
     if (base_ptr)
     {
         info.workspace = base_ptr;
-        info.scale_probs = nextWorkspacePtr((int8_t*) info.workspace, moe_workspace_size);
-        info.src_to_dest_map = nextWorkspacePtr((int8_t*) info.scale_probs, scale_probabilities_size);
-        info.selected_experts = nextWorkspacePtr((int8_t*) info.src_to_dest_map, src_to_dest_map_size);
-        info.lora_workspace = nextWorkspacePtr((int8_t*) info.selected_experts, selected_expert_size);
+        info.src_to_dest_map = nextWorkspacePtr((int8_t*) info.workspace, moe_workspace_size);
+        info.lora_workspace = nextWorkspacePtr((int8_t*) info.src_to_dest_map, src_to_dest_map_size);
     }
 
     return info;
@@ -833,7 +817,6 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
 
     int64_t const num_tokens = getNumTokens(inputDesc);
     int64_t const num_reqs = getNumLoraRequests(inputDesc);
-    int64_t const num_not_finished = num_tokens; // TODO Take this as an input
 
     if (useSideStream())
     {
@@ -957,16 +940,14 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     }
 
     mMOERunner->setTactic(gemm1, gemm2);
-    mMOERunner->runMoe(inputs[getInputTensorIndex()], static_cast<float const*>(inputs[getRoutingTensorIndex()]),
+    mMOERunner->runMoe(inputs[getInputTensorIndex()], static_cast<int const*>(inputs[getTokenSelectedExpertsIndex()]),
+        hasFinalScales() ? static_cast<float const*>(inputs[getTokenFinalScalesIndex()]) : nullptr,
         inputs[getExpertWeights1Index()], hasBias() ? inputs[getExpertBias1Index()] : nullptr, mActivationType,
         inputs[getExpertWeights2Index()], hasBias() ? inputs[getExpertBias2Index()] : nullptr, quant_params, num_tokens,
-        mExpertHiddenSize, mExpertInterSize, mNumExperts, mK, static_cast<char*>(workspace.workspace),
+        mExpertHiddenSize, mExpertInterSize, mNumExperts, mExpertsPerToken, static_cast<char*>(workspace.workspace),
         // Outputs
-        outputs[getOutputTensorIndex()],
-        hasFinishedTensor() ? static_cast<bool const*>(inputs[getFinishedTensorIndex()]) : nullptr, num_not_finished,
-        workspace.scale_probs, static_cast<int*>(workspace.src_to_dest_map),
-        static_cast<int*>(workspace.selected_experts), mSparseMixerEpsilon, mParallelismConfig, mNormalizationMode,
-        hasLora(), lora_params, /*use_fp8_block_scaling=*/false, stream);
+        outputs[getOutputTensorIndex()], static_cast<int*>(workspace.src_to_dest_map), mParallelismConfig, hasLora(),
+        lora_params, /*use_fp8_block_scaling=*/false, stream);
 
     if (useSideStream())
     {
@@ -1072,23 +1053,21 @@ MixtureOfExpertsPluginCreator::MixtureOfExpertsPluginCreator()
     mPluginAttributes.clear();
     mPluginAttributes.emplace_back(nvinfer1::PluginField("remove_input_padding", nullptr, PluginFieldType::kINT32));
     mPluginAttributes.emplace_back(nvinfer1::PluginField("number_of_experts", nullptr, PluginFieldType::kINT32));
-    mPluginAttributes.emplace_back(nvinfer1::PluginField("top_k", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(nvinfer1::PluginField("experts_per_token", nullptr, PluginFieldType::kINT32));
     mPluginAttributes.emplace_back(nvinfer1::PluginField("expert_hidden_size", nullptr, PluginFieldType::kINT32));
     mPluginAttributes.emplace_back(nvinfer1::PluginField("expert_inter_size", nullptr, PluginFieldType::kINT32));
-    mPluginAttributes.emplace_back(nvinfer1::PluginField("groupwise_quant_algo", nullptr, PluginFieldType::kINT32, 0));
-    mPluginAttributes.emplace_back(nvinfer1::PluginField("group_size", nullptr, PluginFieldType::kINT32, -1));
+    mPluginAttributes.emplace_back(nvinfer1::PluginField("groupwise_quant_algo", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(nvinfer1::PluginField("group_size", nullptr, PluginFieldType::kINT32));
     mPluginAttributes.emplace_back(nvinfer1::PluginField("activation_type", nullptr, PluginFieldType::kINT32));
     mPluginAttributes.emplace_back(nvinfer1::PluginField("type_id", nullptr, PluginFieldType::kINT32));
     mPluginAttributes.emplace_back(nvinfer1::PluginField("weight_type_id", nullptr, PluginFieldType::kINT32));
     mPluginAttributes.emplace_back(nvinfer1::PluginField("quant_mode", nullptr, PluginFieldType::kINT32));
-    mPluginAttributes.emplace_back(nvinfer1::PluginField("use_finished", nullptr, PluginFieldType::kINT32));
+    mPluginAttributes.emplace_back(nvinfer1::PluginField("use_final_scales", nullptr, PluginFieldType::kINT32));
     mPluginAttributes.emplace_back(nvinfer1::PluginField("use_bias", nullptr, PluginFieldType::kINT32));
     mPluginAttributes.emplace_back(nvinfer1::PluginField("tp_size", nullptr, PluginFieldType::kINT32));
     mPluginAttributes.emplace_back(nvinfer1::PluginField("tp_rank", nullptr, PluginFieldType::kINT32));
     mPluginAttributes.emplace_back(nvinfer1::PluginField("ep_size", nullptr, PluginFieldType::kINT32));
     mPluginAttributes.emplace_back(nvinfer1::PluginField("ep_rank", nullptr, PluginFieldType::kINT32));
-    mPluginAttributes.emplace_back(nvinfer1::PluginField("normalization_mode", nullptr, PluginFieldType::kINT32));
-    mPluginAttributes.emplace_back(nvinfer1::PluginField("sparse_mixer_epsilon", nullptr, PluginFieldType::kFLOAT32));
     mPluginAttributes.emplace_back(nvinfer1::PluginField("side_stream_id", nullptr, PluginFieldType::kINT32));
     mPluginAttributes.emplace_back(nvinfer1::PluginField("use_lora", nullptr, PluginFieldType::kINT32));
     mPluginAttributes.emplace_back(nvinfer1::PluginField("lora_type_id", nullptr, PluginFieldType::kINT32));
@@ -1103,7 +1082,7 @@ IPluginV2* MixtureOfExpertsPluginCreator::createPlugin(
     nvinfer1::PluginField const* fields = fc->fields;
     int mRemoveInputPadding{};
     int mNumExperts{};
-    int mK{};
+    int mExpertsPerToken{};
     int mExpertHiddenSize{};
     int mExpertInterSize{};
     int mGroupwiseQuantAlgo{};
@@ -1113,20 +1092,17 @@ IPluginV2* MixtureOfExpertsPluginCreator::createPlugin(
     int mWeightType{};
     int mOutputType{INT_MAX};
     int mQuantMode{};
-    int mUseFinished{0};
+    int mUseFinalScales{1}; // Default to true
     int mUseBias{0};
     int mTPSize{};
     int mTPRank{};
     int mEPSize{};
     int mEPRank{};
-    int mNormalizationMode{};
     int mRequiresDeterminism{0};
     int mSideStreamId{0};
     int mUseLora{};
     int mLoraType{INT_MAX};
     int mMaxLowRank{0};
-
-    float mSparseMixerEpsilon = -INFINITY;
 
     // Read configurations from each fields
     struct MapPair
@@ -1140,7 +1116,7 @@ IPluginV2* MixtureOfExpertsPluginCreator::createPlugin(
     std::array input_map{
         MapPair{"remove_input_padding", std::ref(mRemoveInputPadding)},
         MapPair{"number_of_experts", std::ref(mNumExperts)},
-        MapPair{"top_k", std::ref(mK)},
+        MapPair{"experts_per_token", std::ref(mExpertsPerToken)},
         MapPair{"expert_hidden_size", std::ref(mExpertHiddenSize)},
         MapPair{"expert_inter_size", std::ref(mExpertInterSize)},
         MapPair{"groupwise_quant_algo", std::ref(mGroupwiseQuantAlgo)},
@@ -1153,11 +1129,10 @@ IPluginV2* MixtureOfExpertsPluginCreator::createPlugin(
         MapPair{"tp_rank", std::ref(mTPRank)},
         MapPair{"ep_size", std::ref(mEPSize)},
         MapPair{"ep_rank", std::ref(mEPRank)},
-        MapPair{"normalization_mode", std::ref(mNormalizationMode)},
         MapPair{"use_lora", std::ref(mUseLora)},
+        MapPair{"use_final_scales", std::ref(mUseFinalScales)},
 
         // Optional
-        MapPair{"use_finished", std::ref(mUseFinished), true},
         MapPair{"use_bias", std::ref(mUseBias), true},
         MapPair{"output_type_id", std::ref(mOutputType), true},
         MapPair{"force_determinism", std::ref(mRequiresDeterminism), true},
@@ -1178,13 +1153,6 @@ IPluginV2* MixtureOfExpertsPluginCreator::createPlugin(
                 item.set = true;
             }
         }
-
-        // Non integer inputs
-        if (!strcmp(attrName, "sparse_mixer_epsilon"))
-        {
-            TLLM_CHECK(fields[i].type == nvinfer1::PluginFieldType::kFLOAT32);
-            mSparseMixerEpsilon = *static_cast<float const*>(fields[i].data);
-        }
     }
 
     for (auto& item : input_map)
@@ -1204,25 +1172,17 @@ IPluginV2* MixtureOfExpertsPluginCreator::createPlugin(
             "MoE fuse lora, lora_type_id and max_low_rank are required but not set");
     }
 
-    if (static_cast<MOEExpertScaleNormalizationMode>(mNormalizationMode)
-        == MOEExpertScaleNormalizationMode::SPARSE_MIXER)
-    {
-        TLLM_CHECK_WITH_INFO(
-            mSparseMixerEpsilon > 0, "sparse_mixer_epsilon must be set when normalization mode is SPARSE_MIXER");
-    }
-
     try
     {
         auto gemmProfiler = moePluginProfiler.createGemmPluginProfiler(/* inference */ false);
         auto loraProfiler = loraPluginProfileManager.createGemmPluginProfiler(/* inference */ false, /* skip */ true);
         auto* obj = new MixtureOfExpertsPlugin(
             // Constructor parameters
-            mRemoveInputPadding, mNumExperts, mK, mExpertHiddenSize, mExpertInterSize, mGroupwiseQuantAlgo, mGroupSize,
-            static_cast<tensorrt_llm::ActivationType>(mActivationType), static_cast<nvinfer1::DataType>(mType),
-            static_cast<nvinfer1::DataType>(mWeightType), static_cast<nvinfer1::DataType>(mOutputType),
-            QuantMode(mQuantMode), mUseFinished != 0, mUseBias != 0, mTPSize, mTPRank, mEPSize, mEPRank,
-            static_cast<MOEExpertScaleNormalizationMode>(mNormalizationMode), mSparseMixerEpsilon,
-            mRequiresDeterminism != 0, mSideStreamId, gemmProfiler, mUseLora != 0,
+            mRemoveInputPadding, mNumExperts, mExpertsPerToken, mExpertHiddenSize, mExpertInterSize,
+            mGroupwiseQuantAlgo, mGroupSize, static_cast<tensorrt_llm::ActivationType>(mActivationType),
+            static_cast<nvinfer1::DataType>(mType), static_cast<nvinfer1::DataType>(mWeightType),
+            static_cast<nvinfer1::DataType>(mOutputType), QuantMode(mQuantMode), mUseFinalScales != 0, mUseBias != 0,
+            mTPSize, mTPRank, mEPSize, mEPRank, mRequiresDeterminism != 0, mSideStreamId, gemmProfiler, mUseLora != 0,
             static_cast<nvinfer1::DataType>(mLoraType), loraProfiler, mMaxLowRank);
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;
@@ -1304,6 +1264,6 @@ void MixtureOfExpertsGemmProfiler::checkInit()
     init_backend = true;
     auto& plugin = *mRunner;
     backend.init(*plugin.mMOERunner, backend.mGemmToProfile, plugin.mType, plugin.mWeightType, plugin.mOutputType,
-        plugin.mNumExperts, plugin.mK, plugin.mExpertHiddenSize, plugin.mExpertInterSize, plugin.mGroupSize,
-        plugin.mActivationType, plugin.hasBias(), plugin.hasLora(), plugin.getParallelismConfig());
+        plugin.mNumExperts, plugin.mExpertsPerToken, plugin.mExpertHiddenSize, plugin.mExpertInterSize,
+        plugin.mGroupSize, plugin.mActivationType, plugin.hasBias(), plugin.hasLora(), plugin.getParallelismConfig());
 }

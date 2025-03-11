@@ -147,23 +147,28 @@ def test_fp8_blockscale_gemm_reference():
     reason="The kernel only supports Blackwell. Current SM is %d." %
     getSMVersion(),
 )
-def test_fp8_blockscale_gemm_trtllmgen():
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_fp8_blockscale_gemm_trtllmgen(dtype):
     torch.random.manual_seed(0)
 
     m, k, n = 128, 512, 512
     tile_size = 128
-    a = torch.randn((m, k), device='cuda',
-                    dtype=torch.float32).to(torch.float8_e4m3fn)
+    if dtype == torch.float8_e4m3fn:
+        a = torch.randn((m, k), device='cuda',
+                        dtype=torch.float32).to(torch.float8_e4m3fn)
+        a_scale = 2 * torch.rand(
+            (k // tile_size, m), device='cuda').to(torch.float)
+
+    else:
+        a = torch.randn((m, k), device='cuda', dtype=dtype)
+        a, a_scale = torch.ops.trtllm.fp8_quantize_1x128(a)
+        a_scale = a_scale.view(-1, a.shape[0])
+
     b = torch.randn((n, k), device='cuda',
                     dtype=torch.float32).to(torch.float8_e4m3fn)
-    a_scale = torch.randint(1,
-                            8, (k // tile_size, m),
-                            device='cuda',
-                            dtype=torch.float32)
-    b_scale = torch.randint(1,
-                            8, (n // tile_size, k // tile_size),
-                            device='cuda',
-                            dtype=torch.float32)
+    b_scale = 2 * torch.rand(
+        (n // tile_size, k // tile_size), device='cuda').to(torch.float)
+
     c_expected = fp8_block_scaling_gemm_reference(a, b, a_scale, b_scale,
                                                   tile_size)
     c_actual = torch.ops.trtllm.fp8_block_scaling_gemm(a, b, a_scale, b_scale)

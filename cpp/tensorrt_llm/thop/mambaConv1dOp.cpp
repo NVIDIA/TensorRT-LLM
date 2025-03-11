@@ -159,7 +159,7 @@ std::tuple<th::Tensor, th::Tensor> mamba_conv1d(th::Tensor const& input, th::Ten
         }
     }
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     if (is_paged_state)
     {

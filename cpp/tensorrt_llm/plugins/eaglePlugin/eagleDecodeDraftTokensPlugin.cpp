@@ -513,14 +513,14 @@ void EagleDecodeDraftTokensPlugin::doTopKSampling(nvinfer1::PluginTensorDesc con
     // And fill firstTopKOutputIdsPtrs from firstTopKOutputIdsFlatten
     invokeAssembleDraftLogitsOffsets(logitsPtrs, pluginInputLogits, firstTopKOutputIdsPtrs, firstTopKOutputIdsFlatten,
         skipDecode, numValidLogits, numInputLogits, batchSize, maxDecodingDraftTokens, vocabSizePadded, stream);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     if (useDynamicTree)
     {
         // For Eagle-2, the topK value between different requests are the same, all set to 'dynamicTreeMaxTopK'.
         invokeSetTopKsFromDyanmicTreeMaxTopK(
             mLayerIdx, batchSize, numInputLogits, topKs, topKOffset, dynamicTreeMaxTopK, numValidLogits, stream);
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
 
         // Do softmax for the input logits
         // We set the 'batchSize' and 'maxBatchSize' to 'numInputLogits', while 'numInputLogits' logits may contain
@@ -542,14 +542,14 @@ void EagleDecodeDraftTokensPlugin::doTopKSampling(nvinfer1::PluginTensorDesc con
         biasSoftmaxParams.checkParams();
 
         invokeAddBiasSoftMax(biasSoftmaxParams, stream);
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
     }
     else
     {
         // For Eagle-1, extract topK value from input path.
         invokeExtractTopKsFromPath(pluginInputPaths, topKs, topKOffset, numSuccessorsForEachNode, mLayerIdx, batchSize,
             maxDecodingTokens, maxPathLen, stream);
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
     }
 
     TopKSamplingKernelParams<T> params{};
@@ -569,7 +569,7 @@ void EagleDecodeDraftTokensPlugin::doTopKSampling(nvinfer1::PluginTensorDesc con
     params.logitsHasProbs = true;
 
     invokeBatchTopKSampling(params, stream);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     if (useDynamicTree)
     {
@@ -580,7 +580,7 @@ void EagleDecodeDraftTokensPlugin::doTopKSampling(nvinfer1::PluginTensorDesc con
             // Update firstTopKOutputLogProbs with pluginInputPrevScores, which is the scores from the previous layer
             invokeUpdateScores(batchSize, dynamicTreeMaxTopK, maxDecodingDraftTokens, firstTopKOutputLogProbs,
                 pluginInputPrevScores, stream);
-            sync_check_cuda_error();
+            sync_check_cuda_error(stream);
 
             // Do the second top-dynamicTreeMaxTopK sampling among this dynamicTreeMaxTopK x dynamicTreeMaxTopK draft
             // tokens. Through the second topK sampling, we obtain the dynamicTreeMaxTopK output draft tokens of this
@@ -602,7 +602,7 @@ void EagleDecodeDraftTokensPlugin::doTopKSampling(nvinfer1::PluginTensorDesc con
             invokeAssembleSecondTopKSamplingInputs(batchSize, dynamicTreeMaxTopK, maxDecodingDraftTokens,
                 firstTopKOutputLogProbs, secondTopKInputScoresPtrs, secondTopKOutputIdsFlatten, secondTopKOutputIdsPtrs,
                 stream);
-            sync_check_cuda_error();
+            sync_check_cuda_error(stream);
 
             TopKSamplingKernelParams<float> params{};
             params.logProbsPtrs = secondTopKInputScoresPtrs;
@@ -618,7 +618,7 @@ void EagleDecodeDraftTokensPlugin::doTopKSampling(nvinfer1::PluginTensorDesc con
             params.strictTopPBoundary = false;
 
             invokeBatchTopKSampling(params, stream);
-            sync_check_cuda_error();
+            sync_check_cuda_error(stream);
         }
 
         // Copy this layer's scores and draft tokensId:
@@ -637,7 +637,7 @@ void EagleDecodeDraftTokensPlugin::doTopKSampling(nvinfer1::PluginTensorDesc con
             firstTopKOutputLogProbs,   // This layer's scores
             firstTopKOutputIdsFlatten, // This layer's draft tokens
             stream);
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
 
         // Update Path
         // For mLayerIdx == 0, the output of the first topK sampling are the output draft tokens of this layers. The
@@ -654,7 +654,7 @@ void EagleDecodeDraftTokensPlugin::doTopKSampling(nvinfer1::PluginTensorDesc con
                 secondTopKOutputIdsPtrs, // if mLayerIdx == 0, secondTopKOutputIdsPtrs == nullptr, and it's useless
                                          // during update paths
                 pluginOutputNextExpandIndices, stream);
-            sync_check_cuda_error();
+            sync_check_cuda_error(stream);
         }
 
         if (mLayerIdx != 0)
@@ -673,7 +673,7 @@ void EagleDecodeDraftTokensPlugin::doTopKSampling(nvinfer1::PluginTensorDesc con
             invokeExtractScoresAndRealDraftTokensIds(batchSize, dynamicTreeMaxTopK, maxDecodingDraftTokens,
                 secondTopKInputScoresPtrs, secondTopKOutputIdsPtrs, firstTopKOutputIdsFlatten, secondTopKOutputLogProbs,
                 stream);
-            sync_check_cuda_error();
+            sync_check_cuda_error(stream);
         }
 
         // Copy this layer's output draft tokens and scores.
@@ -685,7 +685,7 @@ void EagleDecodeDraftTokensPlugin::doTopKSampling(nvinfer1::PluginTensorDesc con
             mLayerIdx == 0 ? firstTopKOutputIdsPtrs : secondTopKOutputIdsPtrs, pluginInputDraftTokenIds,
             pluginInputDraftLens, pluginOutputDraftTokenIds, pluginOutputDraftLens,
             mLayerIdx == 0 ? firstTopKOutputLogProbs : secondTopKOutputLogProbs, pluginOutputCurrentScores, stream);
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
 
         if (mLayerIdx == mNumEagleLayers - 1)
         {
@@ -698,7 +698,7 @@ void EagleDecodeDraftTokensPlugin::doTopKSampling(nvinfer1::PluginTensorDesc con
             invokeAssembleThridTopKSamplingInputs(batchSize, dynamicTreeMaxTopK, maxDecodingDraftTokens,
                 mNumEagleLayers, maxNodesOnFinalTree, thirdTopKs, pluginOutputAllLayersScores, thirdTopKInputScoresPtrs,
                 thirdTopKOutputIds, thirdTopKOutputIdsPtrs, stream);
-            sync_check_cuda_error();
+            sync_check_cuda_error(stream);
 
             // 1) Do topK sampling among all previous draft tokens
             TopKSamplingKernelParams<float> params{};
@@ -716,19 +716,19 @@ void EagleDecodeDraftTokensPlugin::doTopKSampling(nvinfer1::PluginTensorDesc con
             params.strictTopPBoundary = false; // Make sure to select topK tokens.
 
             invokeBatchTopKSampling(params, stream);
-            sync_check_cuda_error();
+            sync_check_cuda_error(stream);
 
             // 2) Reconstruct the Path
             invokeReconstructFinalPath(batchSize, dynamicTreeMaxTopK, maxDecodingDraftTokens, maxDecodingTokens,
                 maxPathLen, mNumEagleLayers, maxNodesOnFinalTree, thirdTopKOutputIdsPtrs,
                 pluginOutputAllLayersDraftTokenIdsPredecessor, pluginOutputPaths, stream);
-            sync_check_cuda_error();
+            sync_check_cuda_error(stream);
 
             // 3) Copy this layer's outputIds to outputDraftTokenIds
             invokeCopyFinalDraftTokens(batchSize, dynamicTreeMaxTopK, maxDecodingDraftTokens, mNumEagleLayers,
                 maxNodesOnFinalTree, thirdTopKOutputIdsPtrs, pluginOutputAllLayersDraftTokenIds,
                 pluginOutputDraftTokenIds, pluginOutputDraftLens, stream);
-            sync_check_cuda_error();
+            sync_check_cuda_error(stream);
         }
     }
     else
@@ -737,7 +737,7 @@ void EagleDecodeDraftTokensPlugin::doTopKSampling(nvinfer1::PluginTensorDesc con
         invokeCopyOutputTokensIds(firstTopKOutputIdsPtrs, topKs, topKOffset, pluginInputDraftTokenIds,
             pluginInputDraftLens, numValidLogits, pluginOutputDraftTokenIds, pluginOutputDraftLens, mLayerIdx,
             batchSize, maxDecodingDraftTokens, pluginInputPaths, pluginOutputPaths, maxPathLen, stream);
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);

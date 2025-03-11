@@ -182,6 +182,14 @@ class MTPDecoder(TorchDecoder):
         self.mapping = None
         self.draft_len = config.num_nextn_predict_layers
 
+    def _draft_meet_max_token_stop_criteria(self, request: LlmRequest,
+                                            num_tokens: int, beam_idx: int):
+        if self._meet_max_token_stop_criteria(request,
+                                              num_tokens + self.draft_len):
+            request.state = LlmRequestState.GENERATION_COMPLETE
+            request.set_finished_reason(tllm_executor.FinishReason.LENGTH,
+                                        beam_idx)
+
     def update_requests(self, scheduled_requests: ScheduledRequests,
                         new_tensors_host: Dict[str, torch.Tensor],
                         decoder_event: torch.cuda.Event):
@@ -203,6 +211,9 @@ class MTPDecoder(TorchDecoder):
                 num_tokens = request.add_new_token(new_token, beam_idx)
                 should_stop = self._handle_stop_criteria(
                     request, new_token, num_tokens, beam_idx)
+                if self._draft_meet_max_token_stop_criteria(
+                        request, num_tokens, beam_idx):
+                    should_stop = True
                 if not should_stop:
                     request.py_draft_tokens = next_draft_tokens_list[idx]
             idx += 1
@@ -219,6 +230,9 @@ class MTPDecoder(TorchDecoder):
                         request, new_token, num_tokens, beam_idx)
                     if should_stop:
                         break
+                if self._draft_meet_max_token_stop_criteria(
+                        request, num_tokens, beam_idx):
+                    should_stop = True
                 if not should_stop:
                     request.py_draft_tokens = next_draft_tokens_list[idx]
                 request.py_rewind_len = self.draft_len - (num_new_tokens - 1)
@@ -226,9 +240,14 @@ class MTPDecoder(TorchDecoder):
 
     def decode_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs):
+        # new_tokens_device: all of the accepted tokens, device tensor
+        # new_tokens_lens_device: the accepted lengths, device tensor
+        # next_draft_tokens_device: predicted draft tokens, device tensor
+        # next_new_tokens_device: input tokens for the next iteration, device tensor
         new_tokens_device = model_outputs[0]
         new_tokens_lens_device = model_outputs[1]
         next_draft_tokens_device = model_outputs[2]
+        next_new_tokens_device = model_outputs[3]
         new_tokens_host = new_tokens_device.to('cpu', non_blocking=True)
         new_tokens_lens_host = new_tokens_lens_device.to('cpu',
                                                          non_blocking=True)
@@ -238,7 +257,7 @@ class MTPDecoder(TorchDecoder):
         decoder_event = torch.cuda.Event()
         decoder_event.record()
         new_tensors_device = {
-            "new_tokens_device": new_tokens_device,
+            "new_tokens_device": next_new_tokens_device,
             "new_tokens_lens_device": new_tokens_lens_device,
             "next_draft_tokens_device": next_draft_tokens_device,
         }
@@ -272,6 +291,8 @@ class MTPWorker(nn.Module):
         spec_metadata,
         mtp_layers,
     ):
+        batch_size = attn_metadata.num_seqs
+
         # Sample and verify draft tokens
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
             logits, spec_metadata, attn_metadata)
@@ -313,7 +334,16 @@ class MTPWorker(nn.Module):
             self.restore_attn_metadata(num_accepted_tokens=num_accepted_tokens,
                                        attn_metadata=attn_metadata)
 
-        return accepted_tokens, num_accepted_tokens, next_draft_tokens
+        # prepare next new tokens to support overlap scheduler
+        batch_indices = torch.arange(batch_size,
+                                     dtype=torch.int,
+                                     device=accepted_tokens.device)
+        next_new_tokens = accepted_tokens[batch_indices,
+                                          num_accepted_tokens - 1].unsqueeze(1)
+        next_new_tokens = torch.concat([next_new_tokens, next_draft_tokens],
+                                       dim=1)
+
+        return accepted_tokens, num_accepted_tokens, next_draft_tokens, next_new_tokens
 
     def update_mtp_hidden_states(
         self,

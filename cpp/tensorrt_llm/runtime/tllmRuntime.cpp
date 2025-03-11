@@ -505,7 +505,7 @@ bool TllmRuntime::executeContext(SizeType32 contextIndex) const
     NVTX3_FUNC_RANGE();
     auto& context = getContext(contextIndex);
     auto res = context.enqueueV3(mStream->get());
-    sync_check_cuda_error();
+    sync_check_cuda_error(mStream->get());
     return res;
 }
 

@@ -8,10 +8,7 @@ from tensorrt_llm._torch.auto_deploy.transformations.library.fused_moe import (
     fuse_moe,
     match_moe_pattern,
 )
-
-
-def _is_op(node: torch.fx.Node, op: callable) -> bool:
-    return node.op == "call_function" and node.target == op
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
 
 class BlockSparseTop2MLP(nn.Module):
@@ -52,7 +49,6 @@ class BlockSparseMoE(nn.Module):
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
         routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
         routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-
         routing_weights = routing_weights.to(hidden_states.dtype)
 
         final_hidden_states = torch.zeros(
@@ -121,8 +117,13 @@ class MoEOpModel(nn.Module):
         """
 
         router_logits = self.gate(x)
+        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+        routing_weights = routing_weights.to(x.dtype)
+
         out = torch.ops.moe.torch_moe(
-            x, router_logits, self.w1_weights, self.w2_weights, self.w3_weights, self.top_k
+            x, selected_experts, routing_weights, self.w1_weights, self.w2_weights, self.w3_weights
         )
         return out
 
@@ -139,7 +140,7 @@ def test_moe_matching():
         model,
         x,
         match_moe_pattern,
-        lambda gm: any(_is_op(n, torch.ops.moe.torch_moe) for n in gm.graph.nodes),
+        lambda gm: any(is_op(n, torch.ops.moe.torch_moe) for n in gm.graph.nodes),
         lambda num_p_og: num_p_og,
         atol=1e-3,
         rtol=1e-3,
@@ -157,7 +158,10 @@ def test_moe_fusion():
         model,
         x,
         fuse_moe,
-        lambda gm: any(_is_op(n, torch.ops.moe.trtllm_fused_moe) for n in gm.graph.nodes),
+        lambda gm: any(
+            is_op(n, {torch.ops.moe.torch_fused_moe, torch.ops.moe.trtllm_fused_moe})
+            for n in gm.graph.nodes
+        ),
         lambda num_p_og: num_p_og,
         atol=0.2,
         rtol=0.5,

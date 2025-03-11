@@ -51,7 +51,7 @@ void newRequests(TensorPtr const& batchSlots, std::vector<decoder_batch::Request
     std::shared_ptr<CudaStream> runtimeStream, SizeType32 maxSequenceLength)
 {
     auto newRequestsAlgo = tb::CreateNewDecoderRequests();
-    newRequestsAlgo(batchSlots, requests, samplingConfigs, modelConfig, decoder, runtimeStream, maxSequenceLength);
+    newRequestsAlgo(batchSlots, requests, samplingConfigs, modelConfig, decoder, *runtimeStream, maxSequenceLength);
 
     // Setup underlying decoder.
     auto const localBatchSize = batchSlots->getSize();

@@ -26,9 +26,6 @@
 namespace tensorrt_llm::runtime
 {
 
-namespace
-{
-
 bool canAccessPeer(WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -61,7 +58,6 @@ bool canAccessPeer(WorldConfig const& worldConfig)
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return true;
 }
-} // namespace
 
 IpcMemory::IpcMemory(std::size_t bufferSize, BufferManager const& manager, WorldConfig const& worldConfig, bool openIpc)
     : mTpRank(worldConfig.getTensorParallelRank())

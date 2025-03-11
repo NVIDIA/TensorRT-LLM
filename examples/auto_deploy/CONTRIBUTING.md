@@ -59,7 +59,7 @@ export TRTLLM_PRECOMPILED_LOCATION=https://pypi.nvidia.com/tensorrt-llm/tensorrt
 Now can you proceed to do an editable pip install of `tensorrt_llm`:
 
 ```bash
-pip install -e ".[devel]" --extra-index-url https://pypi.nvidia.com/
+pip install -e ".[devel]"
 ```
 
 ### 4. Verify install

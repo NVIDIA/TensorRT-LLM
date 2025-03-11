@@ -141,7 +141,7 @@ int TopkLastDimPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc,
     invokeTopkLastDim<T>(
         batchSize, inputLength, mK, mIsLargest, inputs[getInputTensorIdx()], outputs[0], outputs[1], workspace, stream);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
     return 0;
 }
 

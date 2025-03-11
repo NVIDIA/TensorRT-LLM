@@ -1,3 +1,4 @@
+import math
 from typing import Dict, List, NamedTuple, Optional
 
 import torch
@@ -14,17 +15,6 @@ FUSED_MOE_NVFP4_INPUT_DTYPE = torch.int64
 FUSED_MOE_NVFP4_WEIGHT_DTYPE = torch.int64
 # pack weight block scales into int32, e.g. 4 x fp8 weight values
 FUSED_MOE_NVFP4_WEIGHT_BLOCK_SCALE_DTYPE = torch.int32
-
-# The declarations aligns with moe_kernels.h MOEExpertScaleNormalizationMode
-from enum import IntEnum
-
-
-class MOEExpertScaleNormalizationMode(IntEnum):
-    NONE = 0
-    RENORMALIZE = 1
-    SPARSE_MIXER = 2
-    DEVICE_LIMITED = 3
-    DEVICE_LIMITED_RENORM = 4
 
 
 def next_positive_power_of_2(x: int) -> int:
@@ -45,6 +35,158 @@ def get_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
     return num_token_buckets
 
 
+class BaseMoeRoutingMethod(nn.Module):
+
+    def apply(self, _router_logits) -> (torch.Tensor, torch.Tensor):
+        """
+        Applies the routing method to the router logits.
+        Router logits are usually the output of the router Linear layer, but can be any type for more complex routing methods.
+        Returns (token_selected_experts: torch.Tensor<int32>, token_final_scales: torch.Tensor<float32>):
+            token_selected_experts: shape (num_tokens, experts_per_token).
+                It is a list of selected expert indices for each token
+            token_final_scales: shape (num_tokens, experts_per_token). May be None
+                It contains a final scaling/weighting factor applied to the output of each selected expert before summing the results
+        """
+        raise NotImplementedError("Subclasses must implement this method")
+
+    def get_experts_per_token(self):
+        return self.top_k
+
+    @property
+    def experts_per_token(self):
+        return self.get_experts_per_token()
+
+
+class DefaultMoeRoutingMethod(BaseMoeRoutingMethod):
+
+    def __init__(self, top_k: int):
+        super().__init__()
+        self.top_k = top_k
+
+    def apply(self,
+              router_logits: torch.Tensor) -> (torch.Tensor, torch.Tensor):
+        topk_values, topk_indices = torch.topk(torch.nn.functional.softmax(
+            router_logits.float(), dim=-1),
+                                               k=self.top_k,
+                                               dim=-1)
+        return topk_indices.to(torch.int32), topk_values
+
+
+class RenormalizeMoeRoutingMethod(BaseMoeRoutingMethod):
+
+    def __init__(self, top_k: int):
+        super().__init__()
+        self.top_k = top_k
+
+    def apply(self,
+              router_logits: torch.Tensor) -> (torch.Tensor, torch.Tensor):
+        topk_values, topk_indices = torch.topk(router_logits,
+                                               k=self.top_k,
+                                               dim=-1)
+        return topk_indices.to(torch.int32), torch.nn.functional.softmax(
+            topk_values.float(), dim=-1)
+
+
+# TODO Test this for Phi models
+class SparseMixerMoeRoutingMethod(BaseMoeRoutingMethod):
+
+    def __init__(self, top_k: int, eps: float):
+        super().__init__()
+        self.top_k = top_k
+        self.eps = eps
+
+    def apply(self,
+              router_logits: torch.Tensor) -> (torch.Tensor, torch.Tensor):
+        router_logits = router_logits.float()
+        topk_values = torch.empty(router_logits.shape[0],
+                                  self.top_k,
+                                  device=router_logits.device,
+                                  dtype=torch.float32)
+        topk_indices = torch.empty(router_logits.shape[0],
+                                   self.top_k,
+                                   device=router_logits.device,
+                                   dtype=torch.int32)
+        for i in range(self.top_k):
+            if i > 0:
+                max_elem = torch.argmax(router_logits, dim=-1)
+                # Mask out the previously selected indices to negative infinity
+                router_logits.scatter_(-1, max_elem.unsqueeze(-1),
+                                       -float('inf'))
+            # Get the max value of the remaining indices
+            max_values, max_indices = torch.max(router_logits,
+                                                dim=-1,
+                                                keepdim=True)
+            assert torch.all(max_values != -float('inf'))
+
+            topk_indices[:, i] = max_indices.squeeze(-1)
+
+            # Mask out any values that fail the condition '(max - value) / std::max(abs(value), max) > 2 * epsilon'
+            mask = (
+                (max_values - router_logits) /
+                torch.max(torch.abs(router_logits), max_values)) > 2 * self.eps
+            masked_logits = torch.where(mask, -float('inf'), router_logits)
+            softmax_masked_logits = torch.nn.functional.softmax(masked_logits,
+                                                                dim=-1)
+            selected_values = torch.gather(softmax_masked_logits, -1,
+                                           max_indices)
+            topk_values[:, i] = selected_values.squeeze(-1)
+
+        return topk_indices.to(torch.int32), topk_values
+
+
+class StaticMoeRoutingMethod(BaseMoeRoutingMethod):
+
+    def __init__(self,
+                 routing_tensor: torch.Tensor,
+                 routing_scales: Optional[torch.Tensor] = None):
+        super().__init__()
+        assert routing_tensor.dtype == torch.int32
+        if routing_scales is not None:
+            assert routing_tensor.shape[0] == routing_scales.shape[0]
+            assert routing_tensor.shape[1] == routing_scales.shape[1]
+            assert routing_scales.dtype == torch.float32
+        self.routing_tensor = routing_tensor
+        self.routing_scales = routing_scales
+
+    def apply(self,
+              router_logits: torch.Tensor) -> (torch.Tensor, torch.Tensor):
+        return self.routing_tensor, self.routing_scales
+
+    def get_experts_per_token(self):
+        return self.routing_tensor.shape[1]
+
+
+class LoadBalancedMoeRoutingMethod(BaseMoeRoutingMethod):
+
+    def __init__(self, top_k: int):
+        super().__init__()
+        self.top_k = top_k
+
+    def apply(self,
+              router_logits: torch.Tensor) -> (torch.Tensor, torch.Tensor):
+        balanced_values = torch.ones(router_logits.shape[0],
+                                     self.top_k,
+                                     device=router_logits.device,
+                                     dtype=torch.float32)
+        balanced_indices = torch.empty(router_logits.shape[0],
+                                       self.top_k,
+                                       device=router_logits.device,
+                                       dtype=torch.int32)
+
+        # Fill the balanced_indices with each expert in round-robin fashion
+        final_size = router_logits.shape[0] * self.top_k
+        repeat_count = math.ceil(final_size / router_logits.shape[1])
+        indices = torch.arange(router_logits.shape[1],
+                               device=router_logits.device,
+                               dtype=torch.int32)
+        indices = indices.repeat(repeat_count)
+        indices = indices[:final_size]
+        balanced_indices = indices.view(router_logits.shape[0],
+                                        self.top_k).contiguous()
+
+        return balanced_indices, balanced_values
+
+
 class FusedMoE(nn.Module):
     """
     Fused Mixture of Experts (MoE) Layer with performance tuning.
@@ -61,23 +203,22 @@ class FusedMoE(nn.Module):
     """
 
     def __init__(
-        self,
-        *,
-        num_experts: int,
-        top_k: int,
-        hidden_size: int,
-        intermediate_size: int,
-        dtype: Optional[torch.dtype] = None,
-        reduce_results: bool = False,
-        tune_max_num_tokens: int = 8192,
-        model_config: ModelConfig = ModelConfig(),
-        normalization_mode: int = MOEExpertScaleNormalizationMode.RENORMALIZE,
+            self,
+            *,
+            routing_method: BaseMoeRoutingMethod,
+            num_experts: int,
+            hidden_size: int,
+            intermediate_size: int,
+            dtype: Optional[torch.dtype] = None,
+            reduce_results: bool = False,
+            tune_max_num_tokens: int = 8192,
+            model_config: ModelConfig = ModelConfig(),
     ):
         from tensorrt_llm._torch.distributed import AllReduce
 
         super().__init__()
+        self.routing_method = routing_method
         self.num_experts = num_experts
-        self.top_k = top_k
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
 
@@ -111,7 +252,6 @@ class FusedMoE(nn.Module):
         self.tune_max_num_tokens = tune_max_num_tokens
         self.has_been_profiled = False
 
-        self.normalization_mode = normalization_mode
         self._weights_created = False
         if not model_config.skip_create_weights:
             self.create_weights()
@@ -268,6 +408,16 @@ class FusedMoE(nn.Module):
         quant_scales = None
         use_fp8_block_scaling = False
 
+        token_selected_experts, token_final_scales = self.routing_method.apply(
+            router_logits)
+
+        assert token_selected_experts.shape[
+            1] == self.routing_method.experts_per_token
+        assert token_selected_experts.shape == token_final_scales.shape
+        assert token_selected_experts.shape[0] == router_logits.shape[0]
+        assert token_final_scales.dtype == torch.float32
+        assert token_selected_experts.dtype == torch.int32
+
         if self.quant_config and self.quant_config.quant_mode.has_any_quant():
             if self.quant_config.quant_mode.has_fp8_qdq():
                 x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
@@ -306,29 +456,28 @@ class FusedMoE(nn.Module):
                 x.dtype, self.w3_w1_weight.dtype, output_dtype,
                 use_fp8_block_scaling)
             self.profiler.run_profile(
-                self.w2_weight, self.top_k, self.tp_size, self.tp_rank,
-                self.ep_size, self.ep_rank,
+                self.w2_weight, self.routing_method.experts_per_token,
+                self.tp_size, self.tp_rank, self.ep_size, self.ep_rank,
                 get_power_of_2_num_tokens_buckets(self.tune_max_num_tokens))
             self.has_been_profiled = True
 
         profile_ids = self.profiler.get_profile_ids(
-            next_positive_power_of_2(x.shape[0]), self.w2_weight, self.top_k,
-            self.num_experts)
+            next_positive_power_of_2(x.shape[0]), self.w2_weight,
+            self.routing_method.experts_per_token, self.num_experts)
 
         final_hidden_states = torch.ops.trtllm.fused_moe(
             x,
-            router_logits.float(),
+            token_selected_experts,
+            token_final_scales,
             self.w3_w1_weight,
             self.w2_weight,
             output_dtype,
-            self.top_k,
             quant_scales=quant_scales,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             ep_size=self.ep_size,
             ep_rank=self.ep_rank,
             profile_ids=profile_ids,
-            normalization_mode=self.normalization_mode,
             use_fp8_block_scaling=use_fp8_block_scaling,
         )
 

@@ -666,7 +666,7 @@ public:
         resetSpeculativeDecodingModule();
     }
 
-    [[nodiscard]] nvinfer1::DataType getKvDataType() const noexcept
+    [[nodiscard]] nvinfer1::DataType getKvDataType() const
     {
         if (getQuantMode().hasFp8KvCache())
         {

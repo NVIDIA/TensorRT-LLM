@@ -394,7 +394,7 @@ void BeamSearchLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const
     dim3 const grid(common::roundUp(bh.nMaxSeqLen, 32), bh.nBatchSize, bh.nBeamWidth);
     updateCacheIndirectionKernel<<<grid, 32, 0, getStream()>>>(
         tgtCI, srcCI, bh, ip->maxAttentionWindow, ip->sinkTokenLength);
-    sync_check_cuda_error();
+    sync_check_cuda_error(getStream());
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 from torch._prims_common import DeviceLikeType
 
+from ..custom_ops.attention_interface import CacheConfig, PositionalEmbeddingConfig
 from ..utils.logger import ad_logger
 
 
@@ -30,18 +31,25 @@ class ModelFactory(ABC):
     def build_model(self, device: str) -> nn.Module:
         """Build the model on the desired device."""
 
-    def get_quantization(self) -> Optional[Dict]:
+    def get_quant_config(self) -> Dict:
         """Returns the quantization config for this model or None if not quantized."""
-        return None
+        return {}
 
-    def get_positional_encoding_config(self) -> Optional[Dict[str, Any]]:
-        """Return the positional encoding configuration for the model.
+    def get_positional_embedding_config(self) -> PositionalEmbeddingConfig:
+        """Return the positional embedding configuration for the model.
 
         Returns:
-            The positional encoding configuration for the model. If the model does not use positional
-            encoding, then this method should return None.
+            The positional embedding configuration for the model.
         """
-        return None
+        return PositionalEmbeddingConfig(mode=None)
+
+    def get_cache_config(self) -> CacheConfig:
+        """Return the cache configuration for the model.
+
+        Returns:
+            The cache configuration for the model.
+        """
+        return CacheConfig()
 
     def init_tokenizer(self) -> Optional[Any]:
         """Initialize the tokenizer for the model.

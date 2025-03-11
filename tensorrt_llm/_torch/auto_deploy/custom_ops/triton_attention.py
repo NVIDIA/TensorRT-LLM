@@ -1,22 +1,14 @@
 """Custom ops for MHA/XQA attention."""
 
 import math
-from typing import List, Optional, Tuple
+from dataclasses import astuple
+from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
 import triton
 
-from .attention_interface import (
-    AttentionDescriptor,
-    AttentionInfo,
-    AttentionRegistry,
-    BufferInitializerDict,
-    CacheInitializerDict,
-    MHACallable,
-    PrepareMetadataCallable,
-    SequenceInfo,
-)
+from .attention_interface import AttentionDescriptor, AttentionRegistry, SequenceInfo
 from .triton_kernels.attention_with_kv_cache import (
     attention_kv_stage2,
     context_attention_kv,
@@ -899,47 +891,57 @@ def prepare_fused_mha_metadata_fake(
 @AttentionRegistry.register("TritonWithFlattenedInputs")
 class TritonWithFlattenedInputs(AttentionDescriptor):
     @classmethod
-    def is_paged(cls) -> bool:
+    def is_paged(cls):
         """Return if the attention op is paged or not."""
         return False
 
     @classmethod
-    def get_attention_op(cls) -> MHACallable:
+    def get_attention_op(cls):
         return torch.ops.attention.fused_flattened_mha_with_cache
 
     @classmethod
-    def get_prepare_metadata_op(cls) -> Tuple[PrepareMetadataCallable, int]:
+    def get_prepare_metadata_op(cls):
         return torch.ops.attention.prepare_fused_mha_metadata, 4
 
     @classmethod
-    def get_cache_initializers(cls, attention_info: AttentionInfo) -> CacheInitializerDict:
+    def get_cache_initializers(cls, get_info):
         def _get_cache(si: SequenceInfo):
             assert not si.is_paged, "Paged cache not supported for TritonWithFlattenedInputs"
+            attention_info = get_info()
             return torch.empty(
                 si.num_pages,
                 si.page_size,
                 attention_info.num_kv_heads,
                 attention_info.head_dim,
                 device=si.device,
-                dtype=attention_info.cache_dtype or attention_info.dtype,
+                dtype=attention_info.cache_config.dtype or attention_info.dtype,
             )
 
         return {"k_cache": _get_cache, "v_cache": _get_cache}
 
     @classmethod
-    def get_global_buffer_initializers(cls, attention_info: AttentionInfo) -> BufferInitializerDict:
+    def get_global_buffer_initializers(cls, get_info):
+        attention_info = get_info()
         head_dim = attention_info.head_dim
-        rope_theta = attention_info.rope_theta
+        pos_embd_config = attention_info.pos_embd_config
 
         def _get_freqs_cis(si: SequenceInfo):
-            if rope_theta is None:
+            if pos_embd_config.mode is None:
                 return torch.empty(0, device=si.device)
+            assert pos_embd_config.mode == "rope", f"Mode {pos_embd_config.mode=} not supported"
+            assert pos_embd_config.rope_scale == 1.0, f"{pos_embd_config.rope_scale=} not supported"
+            rope_theta = pos_embd_config.rope_theta
             return cls._precompute_freqs_cis(2 * si.max_seq_len, head_dim, rope_theta).to(si.device)
 
-        return {f"freqs_cis_{head_dim}_{rope_theta}".replace(".", "_"): _get_freqs_cis}
+        k_full = "_".join(map(str, ["freqs_cis", *astuple(pos_embd_config)])).replace(".", "_")
+        return {k_full: _get_freqs_cis}
 
     @staticmethod
-    def _precompute_freqs_cis(seq_len: int, head_dim: int, rope_theta: float = 1e4) -> torch.Tensor:
+    def _precompute_freqs_cis(
+        seq_len: int, head_dim: int, rope_theta: Optional[float] = None
+    ) -> torch.Tensor:
+        if rope_theta is None:
+            rope_theta = 1e4
         freqs = 1.0 / (
             rope_theta ** (torch.arange(0, head_dim, 2)[: (head_dim // 2)].float() / head_dim)
         )

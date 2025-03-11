@@ -122,6 +122,7 @@ def main():
 
     llm, sampling_params = setup_llm(args)
 
+    image_format = "pt"  # ["pt", "pil"]
     if args.modality == "image":
         prompts = args.prompt if args.prompt else example_image_prompts
         images = args.media if args.media else example_images
@@ -131,8 +132,11 @@ def main():
         inputs = [{
             "prompt": prompt,
             "multi_modal_data": {
-                "image": [load_image(i) for i in image] if isinstance(
-                    image, list) else [load_image(image)]
+                "image": [
+                    load_image(i, format=image_format, device="cuda")
+                    for i in image
+                ] if isinstance(image, list) else
+                [load_image(image, format=image_format, device="cuda")]
             }
         } for prompt, image in zip(prompts, images)]
     elif args.modality == "video":
@@ -144,9 +148,16 @@ def main():
         inputs = [{
             "prompt": prompt,
             "multi_modal_data": {
-                "video":
-                [load_video(i, args.num_frames) for i in video] if isinstance(
-                    video, list) else [load_video(video, args.num_frames)]
+                "video": [
+                    load_video(
+                        i, args.num_frames, format=image_format, device="cuda")
+                    for i in video
+                ] if isinstance(video, list) else [
+                    load_video(video,
+                               args.num_frames,
+                               format=image_format,
+                               device="cuda")
+                ]
             }
         } for prompt, video in zip(prompts, videos)]
     else:

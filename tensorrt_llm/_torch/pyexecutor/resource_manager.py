@@ -26,6 +26,7 @@ KvCacheConfigCpp = tensorrt_llm.bindings.KvCacheConfig
 CacheTypeCpp = tensorrt_llm.bindings.internal.batch_manager.CacheType
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 DataType = tensorrt_llm.bindings.DataType
+KVCacheEventManagerCpp = tensorrt_llm.bindings.internal.batch_manager.KVCacheEventManager
 RequestList = list[LlmRequest]
 
 
@@ -136,6 +137,7 @@ class KVCacheManager(BaseResourceManager):
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
         self.kv_factor = 1 if kv_cache_type == CacheTypeCpp.SELFKONLY else 2
+        self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
 
         if kv_cache_config.max_attention_window is None:
             max_attention_window = max_seq_len
@@ -189,7 +191,13 @@ class KVCacheManager(BaseResourceManager):
             'enable_block_reuse': kv_cache_config.enable_block_reuse,
             'onboard_blocks': kv_cache_config.onboard_blocks,
             'cache_type': kv_cache_type,
+            'enable_partial_reuse': kv_cache_config.enable_partial_reuse,
+            'copy_on_partial_reuse': kv_cache_config.copy_on_partial_reuse,
         }
+        if self.event_buffer_max_size > 0:
+            kwargs['event_manager'] = KVCacheEventManagerCpp(
+                max_kv_event_entries=self.event_buffer_max_size)
+
         self.impl = KVCacheManagerCpp(**kwargs)
 
         self.impl.allocate_pools(dtype, False)
@@ -417,6 +425,12 @@ class KVCacheManager(BaseResourceManager):
                               self.tokens_per_block,
                               self.num_kv_heads_per_layer[layer_idx],
                               self.head_dim)
+
+    def flush_iteration_events(self):
+        self.impl.flush_iteration_events()
+
+    def get_latest_events(self, timeout_ms: Optional[float] = 0):
+        return self.impl.get_latest_events(timeout_ms)
 
     def get_kv_cache_stats(self):
         return self.impl.get_kv_cache_stats()

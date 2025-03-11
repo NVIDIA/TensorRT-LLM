@@ -51,6 +51,10 @@ class PyTorchConfig:
     # If true, will iterate over sampling_params of each request and use the
     # corresponding decoding way, like top-k, top-p, etc.
     mixed_decoder: bool = False
+    # If true, will use the TRTLLM decoder instead of the PyTorch decoder.
+    # The TRTLLM decoder has a wide coverage of decoding strategies.
+    # Note: DS3 and disaggregated serving are known to have issues with the TRTLLM decoder.
+    enable_trtllm_decoder: bool = False
     kv_cache_dtype: str = "auto"
     use_kv_cache: bool = True
     enable_iter_perf_stats: bool = False

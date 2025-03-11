@@ -323,7 +323,7 @@ public:
             // Pack tensors from batch slot position to continuous array
             tksd::invokePackEagleGenerationLengths(params, mStream->get());
 
-            sync_check_cuda_error();
+            sync_check_cuda_error(mStream->get());
 
             // Compute inclusive sum and max
             tksd::invokeScanReduceGenerationLengths(mSamplingParams.getNumGenRequests(),
@@ -332,7 +332,7 @@ public:
                 bufferCast<SizeType32>(*mCumSumGenerationLengths), bufferCast<SizeType32>(*mMaxGenerationLength),
                 mStream->get());
 
-            sync_check_cuda_error();
+            sync_check_cuda_error(mStream->get());
         }
 
         mStream->synchronize();
@@ -340,7 +340,7 @@ public:
         // Pack tensors from batch slot position to continuous array
         tksd::invokePackEagle(params, mStream->get());
 
-        sync_check_cuda_error();
+        sync_check_cuda_error(mStream->get());
     }
 
     void verifyResults()

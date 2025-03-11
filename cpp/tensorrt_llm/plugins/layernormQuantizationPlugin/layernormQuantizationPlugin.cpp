@@ -177,7 +177,7 @@ int LayernormQuantizationPlugin::enqueue(nvinfer1::PluginTensorDesc const* input
             scale, dynamic_scale, output);
     }
 #endif
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
     return 0;
 }
 

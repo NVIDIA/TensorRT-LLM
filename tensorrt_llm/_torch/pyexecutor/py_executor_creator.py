@@ -1,11 +1,13 @@
 import copy
 
 import tensorrt_llm
+import tensorrt_llm.bindings as tllm
 from tensorrt_llm._torch.attention_backend.interface import \
     AttentionRuntimeFeatures
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm._torch.pyexecutor.decoder import (BertDecoder, TorchDecoder,
-                                                    TorchStarAttentionDecoder)
+                                                    TorchStarAttentionDecoder,
+                                                    TRTLLMDecoder)
 from tensorrt_llm._torch.pyexecutor.distributed import MPIDist
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import (
     AttentionTypeCpp, create_kv_cache_transceiver)
@@ -85,7 +87,12 @@ def create_py_executor(executor_config: ExecutorConfig,
         spec_config=spec_config,
     )
     # PyTorchModelEngine modifies these fields, update them to executor_config
-    max_seq_len = model_engine.max_seq_len + 1 if pytorch_backend_config.enable_overlap_scheduler else model_engine.max_seq_len
+    if pytorch_backend_config.enable_overlap_scheduler:
+        max_seq_len = model_engine.max_seq_len + 1
+        if spec_config is not None:
+            max_seq_len += spec_config.max_draft_tokens
+    else:
+        max_seq_len = model_engine.max_seq_len
     executor_config.max_seq_len = max_seq_len
     executor_config.max_num_tokens = model_engine.max_num_tokens
     if not model_engine.model.model_config.is_generation:
@@ -140,7 +147,7 @@ def create_py_executor(executor_config: ExecutorConfig,
                 SELFKONLY,
                 num_layers,
                 num_attention_heads,
-                num_key_value_heads,
+                1,
                 head_dim,
                 executor_config.tokens_per_block,
                 executor_config.max_seq_len,
@@ -184,7 +191,7 @@ def create_py_executor(executor_config: ExecutorConfig,
     if spec_config is not None:
         spec_resource_manager = get_spec_resource_manager(
             spec_config, model_engine.model.config, model_engine.batch_size * 2)
-        spec_decoder = get_spec_decoder(max_seq_len=executor_config.max_seq_len,
+        spec_decoder = get_spec_decoder(max_seq_len=model_engine.max_seq_len,
                                         spec_config=spec_config)
         if spec_resource_manager is not None:
             resources["spec_resource_manager"] = spec_resource_manager
@@ -224,16 +231,20 @@ def create_py_executor(executor_config: ExecutorConfig,
     if mapping.cp_config.get('cp_type') == 'star_attention':
         assert pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
         decoder = TorchStarAttentionDecoder(
-            max_seq_len=executor_config.max_seq_len)
+            max_seq_len=model_engine.max_seq_len)
     elif spec_decoder is not None:
         decoder = spec_decoder
+    elif pytorch_backend_config.enable_trtllm_decoder:
+        decoder = TRTLLMDecoder(executor_config, model_engine.model,
+                                model_engine.dtype, mapping,
+                                tllm.executor.DecodingMode.TopKTopP())
     else:
         # NOTE: choose decoder based on model type
         if is_bert(config):
             decoder = BertDecoder()
         else:
             decoder = TorchDecoder(
-                max_seq_len=executor_config.max_seq_len,
+                max_seq_len=model_engine.max_seq_len,
                 mixed_decoder=pytorch_backend_config.mixed_decoder)
     py_executor = PyExecutor(resource_manager,
                              scheduler,

@@ -9,8 +9,9 @@ from tqdm import tqdm
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
-                                             AllReduceParams, ParallelConfig,
-                                             allgather, reducescatter)
+                                             AllReduceParams, DeepseekAllReduce,
+                                             ParallelConfig, allgather,
+                                             reducescatter)
 from tensorrt_llm.functional import PositionEmbeddingType
 
 from ...llmapi.utils import enable_llm_debug
@@ -20,7 +21,7 @@ from ..model_config import ModelConfig
 from ..models.modeling_utils import ModelConfig
 from ..modules.attention import MLA
 from ..modules.decoder_layer import DecoderLayer
-from ..modules.fused_moe import FusedMoE, MOEExpertScaleNormalizationMode
+from ..modules.fused_moe import BaseMoeRoutingMethod, FusedMoE
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear
 from ..modules.rms_norm import RMSNorm
@@ -104,12 +105,10 @@ class DeepseekV3Attention(MLA):
                          config=model_config)
 
 
-class Deepseekv3Gate(nn.Module):
+class Deepseekv3RoutingImpl():
 
     def __init__(
         self,
-        hidden_size: int,
-        num_experts: int,
         top_k: int,
         n_group: int,
         topk_group: int,
@@ -121,19 +120,12 @@ class Deepseekv3Gate(nn.Module):
         self.topk_group = topk_group
         self.n_group = n_group
         self.routed_scaling_factor = routed_scaling_factor
-
-        self.weight = nn.Parameter(torch.empty((num_experts, hidden_size),
-                                               dtype=torch.float32),
-                                   requires_grad=False)
-        self.e_score_correction_bias = nn.Parameter(torch.empty(
-            (num_experts), dtype=torch.float32),
-                                                    requires_grad=False)
         self.is_thop = is_thop
 
-    def noaux_tc(self, logits):
+    def noaux_tc(self, logits, e_score_correction_bias):
         n_group = self.n_group
         scores = F.sigmoid(logits)
-        scores_with_bias = scores + self.e_score_correction_bias
+        scores_with_bias = scores + e_score_correction_bias
         scores_shape = list(scores_with_bias.shape)
 
         if enable_llm_debug():
@@ -174,59 +166,120 @@ class Deepseekv3Gate(nn.Module):
             score_sum = torch.sum(scores, dim=-1, keepdim=True) + 1e-20
             scores = scores / score_sum * \
                 self.routed_scaling_factor
-            return scores
+            topk_values, topk_indices = torch.topk(scores,
+                                                   k=self.top_k,
+                                                   dim=-1,
+                                                   largest=True)
+            return topk_values, topk_indices
         else:
-            scores = torch.ops.trtllm.noaux_tc_op(scores, scores_with_bias,
-                                                  n_group, self.topk_group,
-                                                  self.top_k,
-                                                  self.routed_scaling_factor)
-            return scores
+            topk_values, topk_indices = torch.ops.trtllm.noaux_tc_op(
+                scores, scores_with_bias, n_group, self.topk_group, self.top_k,
+                self.routed_scaling_factor)
+            return topk_values, topk_indices
+
+    def apply(
+            self, logits: torch.Tensor, e_score_correction_bias: torch.Tensor
+    ) -> (torch.Tensor, torch.Tensor):
+        topk_values, topk_indices = self.noaux_tc(logits,
+                                                  e_score_correction_bias)
+        return topk_indices.to(torch.int32), topk_values.to(torch.float32)
+
+
+class Deepseekv3Gate(BaseMoeRoutingMethod):
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_experts: int,
+        top_k: int,
+        n_group: int,
+        topk_group: int,
+        routed_scaling_factor: float,
+        dtype: Optional[torch.dtype] = None,
+        is_thop: bool = True,
+    ):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty((num_experts, hidden_size),
+                                               dtype=dtype),
+                                   requires_grad=False)
+        self.e_score_correction_bias = nn.Parameter(torch.empty(
+            (num_experts), dtype=torch.float32),
+                                                    requires_grad=False)
+
+        # TODO: e_score_correction_bias makes sense to live in this gate class, but it is needed for the routing impl
+        #       So we don't run into issues with weight loading, we make this gate object the BaseMoeRoutingMethod
+        #       and then dispatch to the routing impl for the actual implementation.
+        #       This is a bit of a hack and we should clean this up in the future.
+        self.routing_impl = Deepseekv3RoutingImpl(
+            top_k=top_k,
+            n_group=n_group,
+            topk_group=topk_group,
+            routed_scaling_factor=routed_scaling_factor,
+            is_thop=is_thop)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        logits = F.linear(hidden_states.to(torch.float32), self.weight)
-        return self.noaux_tc(logits)
+        logits = torch.ops.trtllm.cublas_mm(hidden_states,
+                                            self.weight.t(),
+                                            bias=None,
+                                            out_dtype=torch.float32)
+        return logits
 
     def load_weights(self, weights: List[Dict]):
         assert len(weights) == 1
-        self.weight.copy_(weights[0]["weight"][:].to(torch.float32))
+
+        self.weight.copy_(weights[0]["weight"][:])
+
         self.e_score_correction_bias.copy_(
             weights[0]["e_score_correction_bias"][:].to(torch.float32))
+
+    def apply(self, logits: torch.Tensor) -> (torch.Tensor, torch.Tensor):
+        return self.routing_impl.apply(logits, self.e_score_correction_bias)
+
+    @property
+    def routing_method(self) -> BaseMoeRoutingMethod:
+        return self
+
+    def get_experts_per_token(self):
+        return self.routing_impl.top_k
 
 
 class Deepseekv3MoE(nn.Module):
 
-    def __init__(
-        self,
-        *,
-        num_experts: int,
-        top_k: int,
-        hidden_size: int,
-        intermediate_size: int,
-        shared_expert_intermediate_size: int,
-        moe_stream: torch.cuda.Stream,
-        dtype: Optional[torch.dtype] = None,
-        tune_max_num_tokens: int = 8192,
-        model_config: ModelConfig = ModelConfig(),
-        normalization_mode: int = MOEExpertScaleNormalizationMode.
-        DEVICE_LIMITED,
-    ):
+    def __init__(self,
+                 *,
+                 num_experts: int,
+                 top_k: int,
+                 hidden_size: int,
+                 intermediate_size: int,
+                 shared_expert_intermediate_size: int,
+                 moe_stream: torch.cuda.Stream,
+                 dtype: Optional[torch.dtype] = None,
+                 tune_max_num_tokens: int = 8192,
+                 model_config: ModelConfig = ModelConfig()):
         from tensorrt_llm._torch.distributed import AllReduce
 
         super().__init__()
         config = model_config.pretrained_config
         self.top_k = top_k
         self.use_dp = model_config.mapping.enable_attention_dp
+        self.gate = Deepseekv3Gate(
+            hidden_size,
+            num_experts,
+            top_k=top_k,
+            n_group=config.n_group,
+            topk_group=config.topk_group,
+            routed_scaling_factor=config.routed_scaling_factor,
+            dtype=dtype)
         self.experts = FusedMoE(
             num_experts=num_experts,
-            top_k=top_k,
+            routing_method=self.gate.routing_method,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             dtype=dtype,
             reduce_results=
             False,  # In both low latency and attention dp scenarios, FusedMoE needs not to do allreduce inside op.
             tune_max_num_tokens=tune_max_num_tokens,
-            model_config=model_config,
-            normalization_mode=normalization_mode)
+            model_config=model_config)
 
         self.shared_experts = GatedMLP(
             hidden_size=hidden_size,
@@ -236,10 +289,6 @@ class Deepseekv3MoE(nn.Module):
             config=model_config,
             use_dp=self.use_dp,
             is_expert=not self.use_dp)
-
-        self.gate = Deepseekv3Gate(hidden_size, num_experts, top_k,
-                                   config.n_group, config.topk_group,
-                                   config.routed_scaling_factor)
 
         self.parallel_config = ParallelConfig(
             tensor_parallel_rank=model_config.mapping.tp_rank,
@@ -274,7 +323,7 @@ class Deepseekv3MoE(nn.Module):
     def compute_routed_output(self, hidden_states, all_rank_num_tokens):
         if self.use_dp:
             hidden_states = self.all_gather(hidden_states, all_rank_num_tokens)
-        router_logits = self.gate(hidden_states.to(torch.float32))
+        router_logits = self.gate(hidden_states)
         routed_output = self.experts(hidden_states, router_logits)
         if self.use_dp:
             routed_output = self.reduce_scatter(routed_output,
@@ -382,6 +431,11 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.all_reduce = AllReduce(self.parallel_config)
         self.next_layer_layernorm: RMSNorm = None
 
+        self.deepseek_allreduce = DeepseekAllReduce(self.parallel_config)
+
+        self.deepseek_allreduce_disabled = os.environ.get(
+            "TRTLLM_DEEPSEEK_ALLREDUCE_FUSION_DISABLED", "0") == "1"
+
     def forward(
         self,
         position_ids: torch.LongTensor,
@@ -390,6 +444,10 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         residual: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
+
+        # deepseek allreduce kernel is better when m < 512
+        using_prev_fusion = self.deepseek_allreduce_disabled or hidden_states.size(
+            0) >= 512
 
         # Self Attention
         hidden_states = self.self_attn(
@@ -405,28 +463,49 @@ class DeepseekV3DecoderLayer(DecoderLayer):
 
         if self.fusion_config.PRE_MOE_FUSION:
             # Custom AR Fusion for DeepseekV3
-            hidden_states, residual = self.all_reduce(
-                hidden_states,
-                all_reduce_params=AllReduceParams(
-                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                    residual=residual,
-                    norm_weight=self.post_attention_layernorm.weight,
-                    eps=self.post_attention_layernorm.variance_epsilon,
-                ))
+            if using_prev_fusion:
+                # Custom AR Fusion for DeepseekV3
+                hidden_states, residual = self.all_reduce(
+                    hidden_states,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                        residual=residual,
+                        norm_weight=self.post_attention_layernorm.weight,
+                        eps=self.post_attention_layernorm.variance_epsilon,
+                    ))
+            else:
+                hidden_states, residual = self.deepseek_allreduce(
+                    hidden_states,
+                    [residual, self.post_attention_layernorm.weight],
+                    self.post_attention_layernorm.variance_epsilon,
+                    AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                )
         elif self.fusion_config.PRE_MLP_FUSION:
             # Custom AR Fusion for DeepseekV3 with quant_fp4
-            hidden_states, residual = self.all_reduce(
-                hidden_states,
-                all_reduce_params=AllReduceParams(
-                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                    residual=residual,
-                    norm_weight=self.post_attention_layernorm.weight,
-                    eps=self.post_attention_layernorm.variance_epsilon,
-                ))
-            act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
-                hidden_states, self.mlp.gate_up_proj.input_scale,
-                self.mlp.gate_up_proj.scaling_vector_size, False)
+            if using_prev_fusion:
+                hidden_states, residual = self.all_reduce(
+                    hidden_states,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                        residual=residual,
+                        norm_weight=self.post_attention_layernorm.weight,
+                        eps=self.post_attention_layernorm.variance_epsilon,
+                    ))
+                act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
+                    hidden_states, self.mlp.gate_up_proj.input_scale,
+                    self.mlp.gate_up_proj.scaling_vector_size, False)
+            else:
+                act_fp4, act_sf, residual = self.deepseek_allreduce(
+                    hidden_states,
+                    [
+                        residual, self.post_attention_layernorm.weight,
+                        self.mlp.gate_up_proj.input_scale
+                    ],
+                    self.post_attention_layernorm.variance_epsilon,
+                    AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
+                )
             hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
+
         else:
             # No fusion
             hidden_states, residual = self.post_attention_layernorm(
@@ -445,15 +524,25 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             # Waiting for new kernel
             raise Exception("Not implemented")
         elif self.fusion_config.POST_MLP_FUSION:
-            # Custom AR Fusion for DeepseekV3
-            hidden_states, residual = self.all_reduce(
-                hidden_states,
-                all_reduce_params=AllReduceParams(
-                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                    residual=residual,
-                    norm_weight=self.next_layer_layernorm.weight,
-                    eps=self.next_layer_layernorm.variance_epsilon,
-                ))
+
+            if using_prev_fusion:
+                # Custom AR Fusion for DeepseekV3
+                hidden_states, residual = self.all_reduce(
+                    hidden_states,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                        residual=residual,
+                        norm_weight=self.next_layer_layernorm.weight,
+                        eps=self.next_layer_layernorm.variance_epsilon,
+                    ))
+            else:
+                hidden_states, residual = self.deepseek_allreduce(
+                    hidden_states,
+                    [residual, self.next_layer_layernorm.weight],
+                    self.next_layer_layernorm.variance_epsilon,
+                    AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                )
+
         else:
             # Next layer's layernorm
             hidden_states, residual = self.next_layer_layernorm(

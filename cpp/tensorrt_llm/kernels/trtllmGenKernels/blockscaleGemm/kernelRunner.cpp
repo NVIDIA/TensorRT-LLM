@@ -69,6 +69,7 @@ struct TrtllmGenBlockScaleGemmOptions
     bool mTransposeMmaOutput{false};
     TrtllmGenBlockScaleGemmKernelParams::AllReduceAlgo mAllReduceAlgo{
         TrtllmGenBlockScaleGemmKernelParams::AllReduceAlgo::None};
+    bool mSliceK{false};
 };
 
 void TrtllmGenBlockScaleGemmRunner::run(int32_t m, int32_t n, int32_t k, void const* a, float const* aScale,
@@ -93,12 +94,14 @@ void TrtllmGenBlockScaleGemmRunner::run(int32_t m, int32_t n, int32_t k, void co
     options.mDtypeAcc = mKernelInfo->dtypeAcc;
     options.mTransposeMmaOutput = mKernelInfo->transposeMmaOutput;
     options.mAllReduceAlgo = TrtllmGenBlockScaleGemmKernelParams::AllReduceAlgo::None;
+    options.mSliceK = mKernelInfo->sliceK;
 
     auto params = TrtllmGenBlockScaleGemmKernelParams::setKernelParams(options, a, aScale, b, bScale, c,
         nullptr /* multimemC */, cScale, nullptr /* ptrPartialSumsForSplitK */,
         nullptr /* multimemPartialSumsForSplitK */, nullptr /* ptrTileBars */, nullptr /* multimemTileBars */,
         nullptr /* ptrCompletionBars */, nullptr /* multimemCompletionBars */, nullptr /* ptrSplitKCompletionBars */, 0,
         1);
+    TLLM_CHECK_WITH_INFO(sizeof(params) == 832, "Size of mismatch between trtllm-gen and trtllm");
 
     CUlaunchConfig launch_config;
     launch_config.blockDimX = mKernelInfo->threadsPerCTA;

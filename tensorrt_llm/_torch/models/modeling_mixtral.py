@@ -13,7 +13,7 @@ from ..model_config import ModelConfig
 from ..models.modeling_utils import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
-from ..modules.fused_moe import FusedMoE
+from ..modules.fused_moe import FusedMoE, RenormalizeMoeRoutingMethod
 from ..modules.linear import Linear
 from ..modules.rms_norm import RMSNorm
 from ..modules.rotary_embedding import RotaryEmbedding
@@ -42,7 +42,7 @@ class MixtralMoE(nn.Module):
 
         self.experts = FusedMoE(
             num_experts=self.num_experts,
-            top_k=self.top_k,
+            routing_method=RenormalizeMoeRoutingMethod(top_k=self.top_k),
             hidden_size=self.hidden_dim,
             intermediate_size=self.ffn_dim,
             dtype=config.torch_dtype,

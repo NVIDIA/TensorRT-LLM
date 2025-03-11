@@ -44,7 +44,7 @@ struct GemmIDMoe
 {
     int gemm_idx;
     int num_experts{};
-    int moe_k{};
+    int experts_per_token{};
     MOEParallelismConfig parallelism_config{};
     int64_t hidden{};
     int64_t inter{};
@@ -57,7 +57,7 @@ struct GemmIDMoe
 
     bool operator==(GemmIDMoe const& id) const
     {
-        return id.gemm_idx == gemm_idx && id.num_experts == num_experts && id.moe_k == moe_k
+        return id.gemm_idx == gemm_idx && id.num_experts == num_experts && id.experts_per_token == experts_per_token
             && id.parallelism_config == parallelism_config && id.hidden == hidden && id.inter == inter
             && id.group_size == group_size && id.actfn == actfn && id.dtype == dtype && id.wdtype == wdtype
             && id.quant_mode == quant_mode && id.determinism_mode == determinism_mode;
@@ -65,10 +65,12 @@ struct GemmIDMoe
 
     friend std::ostream& operator<<(std::ostream& out, GemmIDMoe const& id)
     {
-        out << "gemm idx, experts, k, parallelism_config, hidden, inter, actfn, dtype, weight "
+        out << "gemm idx, experts, experts_per_token, parallelism_config, hidden, inter, group_size, actfn, dtype, "
+               "weight "
                "type, parallelism mode, determinism mode="
-            << id.gemm_idx << "," << id.num_experts << "," << id.moe_k << "," << id.parallelism_config << ","
-            << id.hidden << "," << id.inter << "," << id.group_size << "," << static_cast<int>(id.actfn) << ","
+
+            << id.gemm_idx << "," << id.num_experts << "," << id.experts_per_token << "," << id.parallelism_config
+            << "," << id.hidden << "," << id.inter << "," << id.group_size << "," << static_cast<int>(id.actfn) << ","
             << static_cast<int>(id.dtype) << "," << static_cast<int>(id.wdtype) << "," << id.quant_mode.value() << ","
             << id.determinism_mode;
         return out;
@@ -82,7 +84,7 @@ struct GemmIDMoeHash
     {
         size_t hash = std::hash<int>{}(id.gemm_idx);
         hash ^= std::hash<int>{}(id.num_experts);
-        hash ^= std::hash<int>{}(id.moe_k);
+        hash ^= std::hash<int>{}(id.experts_per_token);
         hash ^= std::hash<int>{}(id.parallelism_config.tp_size);
         hash ^= std::hash<int>{}(id.parallelism_config.ep_size);
         hash ^= std::hash<int>{}(id.parallelism_config.tp_rank);
@@ -102,18 +104,17 @@ class MixtureOfExpertsPlugin : public nvinfer1::IPluginV2DynamicExt
 {
 public:
     using MOEParallelismConfig = tensorrt_llm::kernels::MOEParallelismConfig;
-    using MOEExpertScaleNormalizationMode = tensorrt_llm::kernels::MOEExpertScaleNormalizationMode;
     using LoraPluginProfilerPtr = std::shared_ptr<CublasLtGemmPluginProfiler>;
     using LoraImplPtr = std::shared_ptr<kernels::LoraImpl>;
 
     MixtureOfExpertsPlugin() = delete;
-    MixtureOfExpertsPlugin(bool remove_input_padding, int number_of_experts, int top_k, int expert_hidden_size,
-        int expert_inter_size, int groupwise_quant_algo, int group_size, tensorrt_llm::ActivationType activation_type,
-        nvinfer1::DataType type, nvinfer1::DataType weight_type, nvinfer1::DataType output_type,
-        tensorrt_llm::common::QuantMode quant_mode, bool use_finished, bool use_bias, int tp_size, int tp_rank,
-        int ep_size, int ep_rank, MOEExpertScaleNormalizationMode normalization_mode, float sparse_mixer_epsilon,
-        bool force_determinism, int side_stream_id, MixtureOfExpertsPluginProfilerPtr gemm_profiler_ptr, bool use_lora,
-        nvinfer1::DataType lora_type, LoraPluginProfilerPtr lora_profiler, int max_low_rank);
+    MixtureOfExpertsPlugin(bool remove_input_padding, int number_of_experts, int experts_per_token,
+        int expert_hidden_size, int expert_inter_size, int groupwise_quant_algo, int group_size,
+        tensorrt_llm::ActivationType activation_type, nvinfer1::DataType type, nvinfer1::DataType weight_type,
+        nvinfer1::DataType output_type, tensorrt_llm::common::QuantMode quant_mode, bool use_final_scales,
+        bool use_bias, int tp_size, int tp_rank, int ep_size, int ep_rank, bool force_determinism, int side_stream_id,
+        MixtureOfExpertsPluginProfilerPtr gemm_profiler_ptr, bool use_lora, nvinfer1::DataType lora_type,
+        LoraPluginProfilerPtr lora_profiler, int max_low_rank);
     MixtureOfExpertsPlugin(void const* data, size_t length, MixtureOfExpertsPluginProfilerPtr gemm_profiler_ptr,
         LoraPluginProfilerPtr lora_profiler);
     MixtureOfExpertsPlugin(MixtureOfExpertsPlugin const&);
@@ -160,7 +161,7 @@ private:
     friend class MixtureOfExpertsGemmProfiler;
     std::unique_ptr<kernels::CutlassMoeFCRunnerInterface> mMOERunner{};
     int mNumExperts{};
-    int mK{};
+    int mExpertsPerToken{};
     int64_t mExpertHiddenSize{};
     int64_t mExpertInterSize{};
     int64_t mGroupwiseQuantAlgo{};
@@ -170,11 +171,9 @@ private:
     nvinfer1::DataType mWeightType{};
     nvinfer1::DataType mOutputType{};
     tensorrt_llm::common::QuantMode mQuantMode;
-    bool mUseFinished{};
+    bool mUseFinalScales{};
     bool mUseBias{};
     MOEParallelismConfig mParallelismConfig{};
-    MOEExpertScaleNormalizationMode mNormalizationMode{};
-    float mSparseMixerEpsilon = false;
 
     GemmDims mDims{};
     bool mUseDeterministicKernels = false;
@@ -218,10 +217,7 @@ private:
     struct WorkspaceInfo
     {
         void* workspace{};
-        void* scale_probs{};
-        void* fc2_output{};
         void* src_to_dest_map{};
-        void* selected_experts{};
         void* lora_workspace{};
         size_t size{};
     };
@@ -252,19 +248,19 @@ private:
         return 0;
     }
 
-    constexpr static IndexType getRoutingTensorIndex()
-    {
-        return getInputTensorIndex() + 1;
-    }
-
     constexpr static IndexType getExpertWeights1Index()
     {
-        return getRoutingTensorIndex() + 1;
+        return getInputTensorIndex() + 1;
     }
 
     constexpr static IndexType getExpertWeights2Index()
     {
         return getExpertWeights1Index() + 1;
+    }
+
+    constexpr static IndexType getTokenSelectedExpertsIndex()
+    {
+        return getExpertWeights2Index() + 1;
     }
 
     // Conditional inputs, we only allocate a new index if actually used
@@ -273,9 +269,9 @@ private:
         return mUseBias;
     }
 
-    bool hasFinishedTensor() const
+    bool hasFinalScales() const
     {
-        return mUseFinished;
+        return mUseFinalScales;
     }
 
     bool hasExpertIntQuantScales() const
@@ -333,9 +329,14 @@ private:
         return mUseLora && isGatedActivation(mActivationType);
     }
 
+    IndexType getTokenFinalScalesIndex() const
+    {
+        return getTokenSelectedExpertsIndex() + hasFinalScales();
+    }
+
     IndexType getExpertBias1Index() const
     {
-        return getExpertWeights2Index() + hasBias();
+        return getTokenFinalScalesIndex() + hasBias();
     }
 
     IndexType getExpertBias2Index() const
@@ -343,17 +344,12 @@ private:
         return getExpertBias1Index() + hasBias();
     }
 
-    IndexType getFinishedTensorIndex() const
-    {
-        return getExpertBias2Index() + hasFinishedTensor();
-    }
-
     /*
      * Weight-Only int quant scales
      */
     IndexType getExpertIntQuantScale1Index() const
     {
-        return getFinishedTensorIndex() + hasExpertIntQuantScales();
+        return getExpertBias2Index() + hasExpertIntQuantScales();
     }
 
     IndexType getExpertIntQuantScale2Index() const

@@ -288,7 +288,7 @@ int AttentionOp::ulyssesGenerationPreprocess(
     // -> (transpose) [cpSize, 1, partialQHeads + partialKvHeads + partialKVHeads, headSize]
     invokeCpTranspose(mhaOutput, mhaInput, input, partialTokenNum, mCpSize, partialQHeads, partialKVHeads, mHeadSize,
         mCpRank, stream);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     // Do all to all
 #if ENABLE_MULTI_DEVICE
@@ -309,7 +309,7 @@ int AttentionOp::ulyssesGenerationPreprocess(
         }
     }
     ncclGroupEnd();
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 #endif // ENABLE_MULTI_DEVICE
 
     input = mhaInput;
@@ -371,7 +371,7 @@ int AttentionOp::ulyssesGenerationPostprocess(
         invokeCpTransposeToSeqMajor<T>(
             (T*) output, mhaOutput, mhaInput, partialTokenNum, mCpSize, partialHeads, getHeadSize(), mCpRank, stream);
     }
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
     return 0;
 }
 
@@ -498,7 +498,7 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
     params.memory_length_per_sample = input_params.memory_length_per_sample;
 
     params.mrope_position_deltas = input_params.mrope_position_deltas;
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     masked_multihead_attention(params, input_params.kv_block_array, input_params.shift_k_cache_buffer, stream);
 }
@@ -726,7 +726,7 @@ int AttentionOp::mlaGeneration(
     params.fmha_tile_counter = fmha_tile_counter_ptr;
 
     invokeMLARopeGeneration<T>(params, kv_cache_buffer, stream);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     if (generation_params.runtime_perf_knobs)
     {
@@ -748,7 +748,7 @@ int AttentionOp::mlaGeneration(
 
         // Parameters to select kernels.
         tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
-        tllmRunnerParams.mKernelType = FmhaKernelType::SwapsMmaAbForGeneration;
+        tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
         tllmRunnerParams.mMultiCtasKvMode = mMultiBlockMode;
         // Note that the tileScheduler and multiCtasKvMode will be automatically tuned when using multi_block mode.
         // Otherwise, always enable the persistent scheduler for better performance.
@@ -847,7 +847,7 @@ int AttentionOp::mlaGeneration(
         mDecoderFMHARunner->run(fmhaParams);
     }
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
     return 0;
 }
 
@@ -1045,7 +1045,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     decoder_params.rotaryEmbeddingMaxPositions = mRotaryEmbeddingMaxPositions;
 
     invokeBuildDecoderInfo(decoder_params, stream);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     // In cross attention context phase, the attention mask should be a matrix of all ones.
     // We reassign attention_mask to override what previous invokeBuildDecoderInfo() does
@@ -1056,9 +1056,9 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         {
             std::vector<T> h_attention_mask(params.batch_size * params.input_seq_length * params.cross_kv_length, 1.);
             std::vector<int32_t> h_encoder_input_lengths(params.batch_size);
-            cudaMemcpyAsync(h_encoder_input_lengths.data(), params.encoder_input_lengths,
+            tensorrt_llm::common::cudaMemcpyAsyncSanitized(h_encoder_input_lengths.data(), params.encoder_input_lengths,
                 sizeof(int32_t) * params.batch_size, cudaMemcpyDeviceToHost, stream);
-            sync_check_cuda_error();
+            sync_check_cuda_error(stream);
 
             for (int bi = 0; bi < params.batch_size; bi++)
             {
@@ -1076,7 +1076,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             cudaMemcpyAsync(attention_mask, h_attention_mask.data(),
                 sizeof(T) * params.batch_size * params.cross_kv_length * params.input_seq_length,
                 cudaMemcpyHostToDevice, stream);
-            sync_check_cuda_error();
+            sync_check_cuda_error(stream);
         }
     }
 
@@ -1084,7 +1084,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     if (!mRemovePadding)
     {
         cudaMemsetAsync(params.context_buf, 0, params.num_tokens * local_hidden_units_qo * sizeof(T), stream);
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
     }
 
     KvCacheDataType const cache_type = mKVCacheQuantMode.hasInt8KvCache()
@@ -1149,7 +1149,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             // view_1 + transpose_1
             invokeCpTranspose(gatherInBuffer, gatherOutBuffer, params.attention_input, partialTokenNum, mCpSize,
                 partialQHeads, partialKVHeads, getHeadSize(), mCpRank, stream);
-            sync_check_cuda_error();
+            sync_check_cuda_error(stream);
 
             // Do all to all
 #if ENABLE_MULTI_DEVICE
@@ -1167,7 +1167,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
                 }
             }
             ncclGroupEnd();
-            sync_check_cuda_error();
+            sync_check_cuda_error(stream);
 #endif // ENABLE_MULTI_DEVICE
 
             // transpose_2 + view_2
@@ -1177,7 +1177,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
 
             attention_input = gatherInBuffer;
         }
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
 
         bool const enablePagedKVContextFMHA = mPagedKVCache && mPagedContextFMHA;
         TLLM_CHECK_WITH_INFO(!(mKVCacheQuantMode.hasInt8KvCache() && enablePagedKVContextFMHA),
@@ -1260,7 +1260,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         {
             invokeQKVPreprocessing(preprocessingParams, stream);
         }
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
         {
             std::string const afterRopeStr = "ctx attention after RoPE at layer " + std::to_string(mLayerIdx);
             TLLM_CHECK_DEBUG_WITH_INFO(tensorrt_llm::runtime::utils::tensorHasInvalid(params.num_tokens,
@@ -1268,7 +1268,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
                                            const_cast<T*>(attention_input), stream, afterRopeStr)
                     == false,
                 "Found invalid number (NaN or Inf) in " + afterRopeStr);
-            sync_check_cuda_error();
+            sync_check_cuda_error(stream);
         }
 
         if (params.runtime_perf_knobs)
@@ -1300,13 +1300,17 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             = (mDenseContextFMHA || isCrossAttention()) ? max_kv_seq_len : params.cyclic_attention_window_size;
         fmhaParams.totalQSeqLen = params.num_tokens;
         // TODO: set it correctly for contiguous kv buffer (cross-attention).
-        fmhaParams.totalKvSeqLen = params.num_tokens;
+        fmhaParams.totalKvSeqLen = isCrossAttention() ? params.num_encoder_tokens : params.num_tokens;
         // Device buffer pointers.
         fmhaParams.qkvPtr = mFP8ContextFMHA ? reinterpret_cast<void const*>(fp8_qkv_buffer)
                                             : reinterpret_cast<void const*>(attention_input);
         fmhaParams.qPtr = reinterpret_cast<void const*>(q_buf_2_);
         // TODO: add contiguous kv buffer (cross-attention).
         fmhaParams.kvPtr = nullptr;
+        if (isCrossAttention() && !useKVCache())
+        {
+            fmhaParams.kvPtr = params.cross_kv;
+        }
         fmhaParams.outputPtr
             = mCpSize > 1 ? gatherOutBuffer : params.context_buf; // only use [totalLength, h / cpSize, Dh]
         fmhaParams.outputSfPtr = params.context_buf_sf;
@@ -1328,12 +1332,12 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
 
         // Run the fmha kernel.
         mFmhaDispatcher->run(fmhaParams);
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
 
         // The kv cache might need to be updated after FMHA (only when sliding window attention + chunked context is
         // used together). Reuse the preprocessingParams.
         invokeKvCachePostprocessing(preprocessingParams, stream);
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
 
         if (mCpSize > 1)
         {
@@ -1408,7 +1412,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
                 invokeCpTransposeToSeqMajor<T>((T*) params.context_buf, gatherInBuffer, gatherOutBuffer,
                     partialTokenNum, mCpSize, partialHeads, getHeadSize(), mCpRank, stream);
             }
-            sync_check_cuda_error();
+            sync_check_cuda_error(stream);
         }
     }
     else
@@ -1430,7 +1434,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
                 params.batch_size, params.input_seq_length, params.num_tokens, mNumHeads, mNumKVHeads, getHeadSize(),
                 mRotaryEmbeddingDim, mRotaryEmbeddingBase, mRotaryEmbeddingScaleType, mRotaryEmbeddingScale,
                 mRotaryEmbeddingMaxPositions, position_embedding_type, (float*) nullptr, 0, stream);
-            sync_check_cuda_error();
+            sync_check_cuda_error(stream);
         }
         else
         {
@@ -1442,7 +1446,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
                 params.batch_size, params.input_seq_length, params.num_tokens, mNumHeads, mNumKVHeads, getHeadSize(),
                 mRotaryEmbeddingDim, mRotaryEmbeddingBase, mRotaryEmbeddingScaleType, mRotaryEmbeddingScale,
                 mRotaryEmbeddingMaxPositions, position_embedding_type, (float*) nullptr, 0, stream);
-            sync_check_cuda_error();
+            sync_check_cuda_error(stream);
 
             invokeAddFusedQKVBiasTranspose((T*) nullptr, k_buf_2_, v_buf_2_, const_cast<T*>(params.cross_kv),
                 const_cast<T*>(params.qkv_bias), params.encoder_input_lengths,
@@ -1450,7 +1454,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
                 params.num_encoder_tokens, /*mNumHeads*/ 0, mNumKVHeads, getHeadSize(), mRotaryEmbeddingDim,
                 mRotaryEmbeddingBase, mRotaryEmbeddingScaleType, mRotaryEmbeddingScale, mRotaryEmbeddingMaxPositions,
                 position_embedding_type, (float*) nullptr, 0, stream);
-            sync_check_cuda_error();
+            sync_check_cuda_error(stream);
         }
 
         // write KV to cache
@@ -1462,7 +1466,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
                 mNumKVHeads, cache_type, params.kv_scale_orig_quant,
                 isCrossAttention() ? params.encoder_input_lengths : params.context_lengths, stream);
         }
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
 
         T const* linear_bias_slopes = isALiBi() ? params.alibi_slopes : nullptr;
         T const* relative_attention_bias = isRelativePosition() ? params.relative_attention_bias : nullptr;
@@ -1746,7 +1750,7 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
                 reinterpret_cast<BufferDataType*>(params.key_value_cache));
         }
     }
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
 #ifndef NDEBUG
     debugCheckSemaphores(stream);
@@ -1867,7 +1871,7 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
         shift_k_cache_buffer = KVLinearBuffer(batch_beam, params.max_attention_window_size, sizePerToken,
             params.cyclic_attention_window_size, params.sink_token_length, true,
             reinterpret_cast<int8_t*>(shift_k_cache));
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
         // KV cache type
         KvCacheDataType const kv_cache_type = KvCacheDataType::BASE;
         using DataType = typename SATypeConverter<T>::Type;
@@ -2032,7 +2036,7 @@ int AttentionOp::initialize() noexcept
         {
             TLLM_LOG_WARNING("Fall back to unfused MHA because of relative position embedding.");
         }
-        else if (isCrossAttention() && !mPagedKVCache)
+        else if (isCrossAttention() && useKVCache() && !mPagedKVCache)
         {
             // TODO: add the support for cross attention + contiguous kv cache.
             TLLM_LOG_WARNING("Fall back to unfused MHA because of cross attention + contiguous kv cache.");
@@ -2060,7 +2064,12 @@ int AttentionOp::initialize() noexcept
         "Unsupported data type, pre SM 80 GPUs do not support bfloat16");
 
     // Pre-check whether the head size is supported by MMHA.
-    if (!mmha_supported(getHeadSize()) && !mIsMLAEnabled)
+    // Support head size == 72 only for fmha kernels (in Cross Attention), so skip pre-check here.
+    if (getHeadSize() == 72 && mCrossAttention)
+    {
+        ;
+    }
+    else if (!mmha_supported(getHeadSize()) && !mIsMLAEnabled)
     {
         TLLM_CHECK_WITH_INFO(false, "Head size %d is not supported by MMHA.", getHeadSize());
     }
@@ -2197,19 +2206,19 @@ int AttentionOp::initialize() noexcept
             mEnableXQA = false;
             if (mUseTllmGen)
             {
-                Data_type inputDataType = DATA_TYPE_FP32;
+                Data_type qDataType = DATA_TYPE_FP32;
                 Data_type kvDataType = DATA_TYPE_FP32;
                 Data_type outputDataType = DATA_TYPE_FP32;
 
                 if (mType == nvinfer1::DataType::kHALF)
                 {
-                    inputDataType = DATA_TYPE_FP16;
+                    qDataType = DATA_TYPE_FP16;
                     kvDataType = DATA_TYPE_FP16;
                     outputDataType = DATA_TYPE_FP16;
                 }
                 else if (mType == nvinfer1::DataType::kBF16)
                 {
-                    inputDataType = DATA_TYPE_BF16;
+                    qDataType = DATA_TYPE_BF16;
                     kvDataType = DATA_TYPE_BF16;
                     outputDataType = DATA_TYPE_BF16;
                 }
@@ -2218,17 +2227,19 @@ int AttentionOp::initialize() noexcept
                     TLLM_CHECK_WITH_INFO(false, "The data type is not supported.");
                 }
 
-                if (mKVCacheQuantMode.hasInt8KvCache())
+                if (mKVCacheQuantMode.hasFp8KvCache())
                 {
-                    kvDataType = DATA_TYPE_INT8;
-                }
-                else if (mKVCacheQuantMode.hasFp8KvCache())
-                {
+                    qDataType = DATA_TYPE_E4M3;
                     kvDataType = DATA_TYPE_E4M3;
+                }
+                // When FP8 Context FMHA is enabled, the output data type needs to be E4M3.
+                if (mFP8ContextFMHA)
+                {
+                    outputDataType = DATA_TYPE_E4M3;
                 }
 
                 // Instantiate the mTllmGenFMHARunner used for MLA
-                mTllmGenFMHARunner.reset(new TllmGenFmhaRunner(inputDataType, kvDataType, outputDataType));
+                mTllmGenFMHARunner.reset(new TllmGenFmhaRunner(qDataType, kvDataType, outputDataType));
             }
             else
             {
@@ -2391,7 +2402,7 @@ void AttentionOp::debugCheckSemaphores(cudaStream_t stream)
         return;
     }
     std::vector<uint32_t> hostBuf(mNbMultiBlockSemaphores);
-    TLLM_CUDA_CHECK(cudaMemcpyAsync(hostBuf.data(), mMultiBlockSemaphores.get(),
+    TLLM_CUDA_CHECK(tensorrt_llm::common::cudaMemcpyAsyncSanitized(hostBuf.data(), mMultiBlockSemaphores.get(),
         sizeof(uint32_t) * mNbMultiBlockSemaphores, cudaMemcpyDeviceToHost, stream));
     TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
     TLLM_CHECK(std::count(hostBuf.begin(), hostBuf.end(), 0U) == mNbMultiBlockSemaphores);

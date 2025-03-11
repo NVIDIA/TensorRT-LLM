@@ -11,7 +11,7 @@ from _dist_test_utils import get_device_counts
 from _graph_test_helpers import run_test
 
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
-from tensorrt_llm._torch.auto_deploy.transformations.library import column_row_shard_matmul_v3
+from tensorrt_llm._torch.auto_deploy.transformations.library import column_row_shard
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
 
@@ -55,7 +55,7 @@ def _run_job(
     run_test(
         model,
         x,
-        transform=partial(column_row_shard_matmul_v3, rank=rank, world_size=world_size),
+        transform=partial(column_row_shard, rank=rank, world_size=world_size),
         check_transformed_graph=lambda gm: any(is_op(n, op_expected) for n in gm.graph.nodes)
         == (world_size > 1),
         _get_expected_num_params=_get_expected_num_params,

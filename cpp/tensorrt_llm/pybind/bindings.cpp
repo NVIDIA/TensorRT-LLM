@@ -23,8 +23,8 @@
 #include <torch/extension.h>
 #include <vector>
 
-#include "tensorrt_llm/batch_manager/BatchManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheConfig.h"
+#include "tensorrt_llm/batch_manager/trtGptModel.h"
 #include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/pybind/batch_manager/algorithms.h"
@@ -59,6 +59,14 @@ using OptVec = std::optional<std::vector<T>>;
 #if not defined(TRTLLM_PYBIND_MODULE)
 #error "TRTLLM_PYBIND_MODULE must be defined"
 #endif
+
+namespace
+{
+tr::SamplingConfig makeSamplingConfig(std::vector<tr::SamplingConfig> const& configs)
+{
+    return tr::SamplingConfig(configs);
+}
+} // namespace
 
 PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
 {
@@ -104,27 +112,61 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
     auto kvCacheConfigGetState = [](tbk::KvCacheConfig const& config)
     {
         return py::make_tuple(config.maxTokens, config.maxAttentionWindowVec, config.sinkTokenLength,
-            config.freeGpuMemoryFraction, config.enableBlockReuse, config.useUvm);
+            config.freeGpuMemoryFraction, config.enableBlockReuse, config.useUvm, config.hostCacheSize,
+            config.onboardBlocks, config.crossKvCacheFraction, config.secondaryOffloadMinPriority,
+            config.eventBufferMaxSize, config.enablePartialReuse, config.copyOnPartialReuse);
     };
     auto kvCacheConfigSetState = [](py::tuple t)
     {
         return tbk::KvCacheConfig(t[0].cast<std::optional<SizeType32>>(),
             t[1].cast<std::optional<std::vector<SizeType32>>>(), t[2].cast<std::optional<SizeType32>>(),
-            t[3].cast<std::optional<float>>(), t[4].cast<bool>(), t[5].cast<bool>());
+            t[3].cast<std::optional<float>>(), t[4].cast<bool>(), t[5].cast<bool>(), t[6].cast<std::optional<size_t>>(),
+            t[7].cast<bool>(), t[8].cast<std::optional<float>>(), t[9].cast<std::optional<SizeType32>>(),
+            t[10].cast<size_t>(), t[11].cast<bool>(), t[12].cast<bool>());
     };
     py::class_<tbk::KvCacheConfig>(m, "KvCacheConfig")
         .def(py::init<std::optional<SizeType32>, std::optional<std::vector<SizeType32>>, std::optional<SizeType32>,
-                 std::optional<float>, bool>(),
+                 std::optional<float>, bool, bool, std::optional<size_t>, bool, std::optional<float>,
+                 std::optional<SizeType32>, size_t, bool, bool>(),
             py::arg("max_tokens") = py::none(), py::arg("max_attention_window") = py::none(),
             py::arg("sink_token_length") = py::none(), py::arg("free_gpu_memory_fraction") = py::none(),
-            py::arg("enable_block_reuse") = false)
+            py::arg("enable_block_reuse") = false, py::arg("use_uvm") = false, py::arg("host_cache_size") = py::none(),
+            py::arg("onboard_blocks") = true, py::arg("cross_kv_cache_fraction") = py::none(),
+            py::arg("secondary_offload_min_priority") = py::none(), py::arg("event_buffer_max_size") = 0,
+            py::arg("enable_partial_reuse") = true, py::arg("copy_on_partial_reuse") = true)
         .def_readwrite("max_tokens", &tbk::KvCacheConfig::maxTokens)
         .def_readwrite("max_attention_window", &tbk::KvCacheConfig::maxAttentionWindowVec)
         .def_readwrite("sink_token_length", &tbk::KvCacheConfig::sinkTokenLength)
         .def_readwrite("free_gpu_memory_fraction", &tbk::KvCacheConfig::freeGpuMemoryFraction)
         .def_readwrite("enable_block_reuse", &tbk::KvCacheConfig::enableBlockReuse)
+        .def_readwrite("use_uvm", &tbk::KvCacheConfig::useUvm)
+        .def_readwrite("host_cache_size", &tbk::KvCacheConfig::hostCacheSize)
+        .def_readwrite("onboard_blocks", &tbk::KvCacheConfig::onboardBlocks)
+        .def_readwrite("cross_kv_cache_fraction", &tbk::KvCacheConfig::crossKvCacheFraction)
+        .def_readwrite("secondary_offload_min_priority", &tbk::KvCacheConfig::secondaryOffloadMinPriority)
+        .def_readwrite("event_buffer_max_size", &tbk::KvCacheConfig::eventBufferMaxSize)
+        .def_readwrite("enable_partial_reuse", &tbk::KvCacheConfig::enablePartialReuse)
+        .def_readwrite("copy_on_partial_reuse", &tbk::KvCacheConfig::copyOnPartialReuse)
         .def(py::pickle(kvCacheConfigGetState, kvCacheConfigSetState))
         .def("__eq__", &tbk::KvCacheConfig::operator==);
+
+    std::optional<SizeType32> maxTokens;
+    std::optional<std::vector<SizeType32>> maxAttentionWindowVec;
+    std::optional<SizeType32> sinkTokenLength;
+    std::optional<float> freeGpuMemoryFraction;
+    bool enableBlockReuse;
+    static constexpr auto kDefaultGpuMemFraction = 0.9F;
+    bool useUvm;
+    std::optional<size_t> hostCacheSize;
+    bool onboardBlocks;
+    // Cross will use crossKvCacheFraction of KV Cache and self attention will use the rest.
+    std::optional<float> crossKvCacheFraction;
+    // The minimum priority level to allow blocks to be offloaded to secondary memory.
+    std::optional<SizeType32> secondaryOffloadMinPriority;
+    // Maximum size of the KV Cache event buffer
+    size_t eventBufferMaxSize;
+    bool enablePartialReuse;
+    bool copyOnPartialReuse;
 
     py::class_<tb::PeftCacheManagerConfig>(m, "PeftCacheManagerConfig")
         .def(py::init<SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32,
@@ -360,6 +402,8 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
 
     py::bind_vector<std::vector<tr::SamplingConfig>>(m, "VectorSamplingConfig");
 
+    m.def("make_sampling_config", &makeSamplingConfig, py::arg("configs"));
+
     py::class_<tr::GptJsonConfig>(m, "GptJsonConfig")
         .def(py::init<std::string, std::string, std::string, SizeType32, SizeType32, SizeType32, SizeType32,
                  tr::ModelConfig, std::optional<tr::RuntimeDefaults>>(),
@@ -398,7 +442,8 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .value("DISAGG_CONTEXT_TRANS_IN_PROGRESS", tb::LlmRequestState::kDISAGG_CONTEXT_TRANS_IN_PROGRESS)
         .value("DISAGG_CONTEXT_COMPLETE", tb::LlmRequestState::kDISAGG_CONTEXT_COMPLETE)
         .value("DISAGG_GENERATION_TRANS_IN_PROGRESS", tb::LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS)
-        .value("DISAGG_CONTEXT_INIT_ANS_TRANS", tb::LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS);
+        .value("DISAGG_GENERATION_TRANS_COMPLETE", tb::LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE)
+        .value("DISAGG_CONTEXT_INIT_AND_TRANS", tb::LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS);
 
     py::enum_<tb::TrtGptModelType>(m, "TrtGptModelType")
         .value("V1", tb::TrtGptModelType::V1)
@@ -427,6 +472,8 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
             py::arg("enable_trt_overlap") = false, py::arg("device_ids") = std::nullopt,
             py::arg("normalize_log_probs") = true, py::arg("enable_chunked_context") = false,
             py::arg_v("peft_cache_manager_config", tb::PeftCacheManagerConfig{}, "PeftCacheManagerConfig()"))
+        .def(py::init<tensorrt_llm::executor::ExecutorConfig const&, bool>(), py::arg("executor_config"),
+            py::arg("is_leader_in_orch_mode") = false)
         .def_readwrite("kv_cache_config", &tb::TrtGptModelOptionalParams::kvCacheConfig)
         .def_readwrite("enable_trt_overlap", &tb::TrtGptModelOptionalParams::enableTrtOverlap)
         .def_readwrite("device_ids", &tb::TrtGptModelOptionalParams::deviceIds)

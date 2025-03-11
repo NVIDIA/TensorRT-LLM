@@ -2,7 +2,7 @@ import concurrent.futures
 import time
 import traceback
 import weakref
-from typing import Dict, Optional
+from typing import Dict, Optional, Union
 
 import zmq
 import zmq.asyncio
@@ -10,6 +10,7 @@ import zmq.asyncio
 from tensorrt_llm.logger import logger
 
 from .._utils import mpi_world_size
+from ..bindings import executor as tllm
 from ..llmapi.mpi_session import MpiCommSession, MpiPoolSession, MpiSession
 from ..llmapi.tracer import enable_llm_tracer, get_tracer, global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
@@ -18,9 +19,9 @@ from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import PostprocWorkerConfig
 from .request import CancellingRequest, GenerationRequest
-from .result import GenerationResult
+from .result import GenerationResult, IterationResult
 from .utils import (IntraProcessQueue, ProcessPoolExecutorSession,
-                    WorkerCommIpcAddrs, WorkerCommQueues)
+                    WorkerCommIpcAddrs, WorkerCommQueues, _create_rsp)
 from .worker import ExecutorBindingsWorker, worker_main
 
 __all__ = [
@@ -87,7 +88,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
 
         self.dispatch_result_thread: Optional[ManagedThread] = None
         self.dispatch_stats_thread: Optional[ManagedThread] = None
-
+        self.dispatch_kv_cache_events_thread: Optional[ManagedThread] = None
         self._start_executor_workers(worker_kwargs)
 
     def _setup_queues(
@@ -117,16 +118,22 @@ class ExecutorBindingsProxy(GenerationExecutor):
             self.mp_stats_queue = FusedIpcQueue(is_server=True,
                                                 fuse_message=False,
                                                 name="proxy_stats_queue")
+            self.kv_cache_events_queue = FusedIpcQueue(
+                is_server=True,
+                fuse_message=False,
+                name="proxy_kv_cache_events_queue")
             return WorkerCommIpcAddrs(
                 request_queue_addr=self.request_queue.address,
                 request_error_queue_addr=self.request_error_queue.address,
                 result_queue_addr=self.result_queue.address,
                 stats_queue_addr=self.mp_stats_queue.address,
+                kv_cache_events_queue_addr=self.kv_cache_events_queue.address,
             )
         else:
             self.request_queue = IntraProcessQueue()
             self.request_error_queue = IntraProcessQueue()
             self.mp_stats_queue = IntraProcessQueue()
+            self.kv_cache_events_queue = IntraProcessQueue()
 
             if self.enable_postprocess_parallel:
                 self.result_queue = FusedIpcQueue(
@@ -141,6 +148,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
                     request_error_queue=self.request_error_queue,
                     result_queue=self.result_queue.address,
                     stats_queue=self.mp_stats_queue,
+                    kv_cache_events_queue=self.kv_cache_events_queue,
                 )
 
             else:
@@ -150,6 +158,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
                     request_error_queue=self.request_error_queue,
                     result_queue=self.result_queue,
                     stats_queue=self.mp_stats_queue,
+                    kv_cache_events_queue=self.kv_cache_events_queue,
                 )
 
             return res
@@ -179,6 +188,9 @@ class ExecutorBindingsProxy(GenerationExecutor):
             nonlocal event_loop
             nonlocal async_queues
 
+            if isinstance(res, tllm.Response):
+                res = _create_rsp(res)
+
             queue = self._results[client_id].queue
             if isinstance(queue, _SyncQueue):
                 queue.put_nowait(res)
@@ -204,42 +216,44 @@ class ExecutorBindingsProxy(GenerationExecutor):
 
         return True  # success
 
-    def dispatch_stats_task(self) -> bool:
-        # get-stats is not urgent, so we can sleep a bit
+    def _iteration_result_task(self, queue: Union[FusedIpcQueue,
+                                                  IntraProcessQueue],
+                               result_singleton: IterationResult) -> bool:
+        # iteration result is not urgent, so we can sleep a bit
 
-        time.sleep(0.1)
+        time.sleep(0.2)
 
         try:
-            stats = self.mp_stats_queue.get()
+            data = queue.get()
         except:
             return False
 
-        if stats is None:
+        if data is None:
             return False  # shutdown the thread
 
-        stats = stats if isinstance(stats, list) else [stats]
-        queue = self._iter_stats_result.queue
+        data = data if isinstance(data, list) else [data]
+        queue = result_singleton.queue
         async_queues = []
 
         while queue.full():
             queue.get()
 
         try:
-            for s in stats:
-                if s is None:
+            for d in data:
+                if d is None:
                     return False
 
                 if isinstance(queue, _SyncQueue):
-                    queue.put_nowait(s)
+                    queue.put_nowait(d)
                     async_queues.append(queue)
                 else:
-                    queue.put(s)
+                    queue.put(d)
 
             if async_queues:
                 _SyncQueue.notify_many(queue.loop, async_queues)
 
         except AsyncQueue.EventLoopShutdownError:
-            # This happens in the last stats loop while the generate workflow is
+            # This happens in the last loop while the generate workflow is
             # stopped, or when get_stats() or aget_stats() are not called by users
             # and therefore event loop can already be closed.
             return False
@@ -247,6 +261,14 @@ class ExecutorBindingsProxy(GenerationExecutor):
             raise e
 
         return True  # success
+
+    def dispatch_stats_task(self) -> bool:
+        return self._iteration_result_task(self.mp_stats_queue,
+                                           self._iter_stats_result)
+
+    def dispatch_kv_cache_events_task(self) -> bool:
+        return self._iteration_result_task(self.kv_cache_events_queue,
+                                           self._iter_kv_events_result)
 
     def _start_dispatch_threads(self):
         if self.dispatch_result_thread is None:
@@ -259,6 +281,10 @@ class ExecutorBindingsProxy(GenerationExecutor):
                 weakref.WeakMethod(self.dispatch_stats_task),
                 error_queue=self._error_queue,
                 name="proxy_dispatch_stats_thread")
+            self.dispatch_kv_cache_events_thread = ManagedThread(
+                weakref.WeakMethod(self.dispatch_kv_cache_events_task),
+                error_queue=self._error_queue,
+                name="proxy_dispatch_kv_cache_events_thread")
 
             self.dispatch_result_thread.start()
 
@@ -266,6 +292,9 @@ class ExecutorBindingsProxy(GenerationExecutor):
             # is via LLM API
             if self._iter_stats_result:
                 self.dispatch_stats_thread.start()
+
+            if self._iter_kv_events_result:
+                self.dispatch_kv_cache_events_thread.start()
 
         self._handle_background_error()
 
@@ -352,6 +381,10 @@ class ExecutorBindingsProxy(GenerationExecutor):
         ):
             self.dispatch_stats_thread.stop()
             self.dispatch_stats_thread.join()
+        if self.dispatch_kv_cache_events_thread is not None and self.dispatch_kv_cache_events_thread.is_alive(
+        ):
+            self.dispatch_kv_cache_events_thread.stop()
+            self.dispatch_kv_cache_events_thread.join()
 
         # step3: finish all remaining work
 
@@ -360,6 +393,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
         self.request_error_queue.close()
         self.result_queue.close()
         self.mp_stats_queue.close()
+        self.kv_cache_events_queue.close()
 
         self.workers_started = False
         self.mpi_session.shutdown()

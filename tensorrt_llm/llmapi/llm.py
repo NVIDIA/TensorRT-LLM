@@ -15,15 +15,15 @@ from ..bindings import executor as tllm
 from ..builder import EngineConfig
 from ..disaggregated_params import DisaggregatedParams
 from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
-                        GenerationResult, IterationStatsResult, LoRARequest,
+                        GenerationResult, IterationResult, LoRARequest,
                         PostprocWorkerConfig, PromptAdapterRequest)
 from ..executor.postproc_worker import PostprocParams
 from ..inputs import PromptInputs, create_input_processor, prompt_inputs
 from ..logger import logger
 from ..sampling_params import SamplingParams
-from .llm_utils import (LLMARGS_EXPLICIT_DOCSTRING, CachedModelLoader,
-                        KvCacheRetentionConfig, LlmArgs, LlmBuildStats,
-                        ModelLoader, _ModelRuntimeContext)
+from .llm_args import LLMARGS_EXPLICIT_DOCSTRING
+from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig, LlmArgs,
+                        LlmBuildStats, ModelLoader, _ModelRuntimeContext)
 from .mpi_session import (MpiCommSession, MpiPoolSession,
                           external_mpi_comm_available)
 from .tokenizer import TokenizerBase, _xgrammar_tokenizer_info
@@ -357,17 +357,60 @@ class LLM:
         '''
         return self._executor.get_stats(timeout=timeout)
 
-    def get_stats_async(self,
-                        timeout: Optional[float] = 2) -> IterationStatsResult:
+    def get_stats_async(self, timeout: Optional[float] = 2) -> IterationResult:
         '''Get iteration statistics from the runtime.
 
         Args:
-            timeout (float, optional): Max wait time in seconds when retrieving stats from queue. . Defaults to 2.
+            timeout (float, optional): Max wait time in seconds when retrieving stats from queue. Defaults to 2.
 
         Returns:
-            tensorrt_llm.executor.result.IterationStatsResult: An async iterable object containing runtime stats.
+            tensorrt_llm.executor.result.IterationResult: An async iterable object containing runtime stats.
         '''
         return self._executor.aget_stats(timeout=timeout)
+
+    def get_kv_cache_events(self, timeout: Optional[float] = 2) -> List[dict]:
+        '''Get iteration KV events from the runtime.
+
+        KV events are used to track changes and operations within the KV Cache. Types of events:
+            - KVCacheCreatedData: Indicates the creation of cache blocks.
+            - KVCacheStoredData: Represents a sequence of stored blocks.
+            - KVCacheRemovedData: Contains the hashes of blocks that are being removed from the cache.
+            - KVCacheUpdatedData: Captures updates to existing cache blocks.
+
+        To enable KV events:
+            - set `event_buffer_max_size` to a positive integer in the `KvCacheConfig`.
+            - set `enable_block_reuse` to True in the `KvCacheConfig`.
+
+        Args:
+            timeout (float, optional): Max wait time in seconds when retrieving events from queue. Defaults to 2.
+
+        Returns:
+            List[dict]: A list of runtime events as dict.
+        '''
+        return self._executor.get_kv_events(timeout=timeout)
+
+    def get_kv_cache_events_async(self,
+                                  timeout: Optional[float] = 2
+                                  ) -> IterationResult:
+        '''Get iteration KV events from the runtime.
+
+        KV events are used to track changes and operations within the KV Cache. Types of events:
+            - KVCacheCreatedData: Indicates the creation of cache blocks.
+            - KVCacheStoredData: Represents a sequence of stored blocks.
+            - KVCacheRemovedData: Contains the hashes of blocks that are being removed from the cache.
+            - KVCacheUpdatedData: Captures updates to existing cache blocks.
+
+        To enable KV events:
+            - set `event_buffer_max_size` to a positive integer in the `KvCacheConfig`.
+            - set `enable_block_reuse` to True in the `KvCacheConfig`.
+
+        Args:
+            timeout (float, optional): Max wait time in seconds when retrieving events from queue. . Defaults to 2.
+
+        Returns:
+            tensorrt_llm.executor.result.IterationResult: An async iterable object containing runtime events.
+        '''
+        return self._executor.aget_kv_events(timeout=timeout)
 
     def _prepare_sampling_params(
             self,

@@ -73,7 +73,7 @@ def main(*,
          job_count: int = None,
          extra_cmake_vars: List[str] = list(),
          extra_make_targets: str = "",
-         trt_root: str = None,
+         trt_root: str = '/usr/local/tensorrt',
          nccl_root: str = None,
          clean: bool = False,
          clean_wheel: bool = False,
@@ -410,6 +410,7 @@ def add_arguments(parser: ArgumentParser):
         nargs="+",
         default=[])
     parser.add_argument("--trt_root",
+                        default="/usr/local/tensorrt",
                         help="Directory to find TensorRT headers/libs")
     parser.add_argument("--nccl_root",
                         help="Directory to find NCCL headers/libs")

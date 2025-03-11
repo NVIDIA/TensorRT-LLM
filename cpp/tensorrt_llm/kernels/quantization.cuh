@@ -558,7 +558,8 @@ __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type>& vec, float SFScaleVal, 
 }
 
 template <class SFType, int CVT_FP4_NUM_THREADS_PER_SF>
-__device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(int rowIdx, int colIdx, int numCols, SFType* SFout)
+__device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(
+    std::optional<int> batchIdx, int rowIdx, int colIdx, std::optional<int> numRows, int numCols, SFType* SFout)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     static_assert(CVT_FP4_NUM_THREADS_PER_SF == 1 || CVT_FP4_NUM_THREADS_PER_SF == 2);
@@ -575,33 +576,139 @@ __device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(int rowIdx, int colIdx, i
         // SF layout [numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
         // --> index [mTileIdx, kTileIdx, outerMIdx, innerMIdx, innerKIdx]
 
-        int32_t mTileIdx = mIdx / (32 * 4);
-        // SF vector size 16. We round the "numCols" up to a multiple of 64.
-        int factor = CVT_FP4_SF_VEC_SIZE * 4;
-        int32_t numKTiles = (numCols + factor - 1) / factor;
-        int64_t mTileStride = numKTiles * 32 * 4 * 4;
-
-        int32_t kTileIdx = (kIdx / 4);
-        int64_t kTileStride = 32 * 4 * 4;
-
-        // M tile layout [32, 4] is column-major.
-        int32_t outerMIdx = (mIdx % 32);
-        int64_t outerMStride = 4 * 4;
-
-        int32_t innerMIdx = (mIdx % (32 * 4)) / 32;
-        int64_t innerMStride = 4;
+        // batched tensor
+        // SF layout [numBTiles, numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
+        // --> index [bTileIdx, mTileIdx, kTileIdx, outerMIdx, innerMIdx, innerKIdx]
 
         int32_t innerKIdx = (kIdx % 4);
         int64_t innerKStride = 1;
 
+        int32_t innerMIdx = (mIdx % (32 * 4)) / 32;
+        int64_t innerMStride = 4 * innerKStride; // 4
+
+        // M tile layout [32, 4] is column-major.
+        int32_t outerMIdx = (mIdx % 32);
+        int64_t outerMStride = 4 * innerMStride; // 16
+
+        int32_t kTileIdx = (kIdx / 4);
+        int64_t kTileStride = 32 * outerMStride; // 512
+
+        // SF vector size 16. We round the "numCols" up to a multiple of 64.
+        int factor = CVT_FP4_SF_VEC_SIZE * 4;
+        int32_t numKTiles = (numCols + factor - 1) / factor;
+        int32_t mTileIdx = mIdx / (32 * 4);
+        int64_t mTileStride = numKTiles * kTileStride;
+
+        // Each SF block has 128 rows so pad rows to the multiple of 128.
+        int32_t numMTiles = (numRows.value_or(0) + 128 - 1) / 128;
+        int64_t bTileStride = numMTiles * mTileStride;
+
         // Compute the global offset.
-        int64_t SFOffset = mTileIdx * mTileStride + kTileIdx * kTileStride + outerMIdx * outerMStride
-            + innerMIdx * innerMStride + innerKIdx * innerKStride;
+        int64_t SFOffset = batchIdx.value_or(0) * bTileStride + mTileIdx * mTileStride + kTileIdx * kTileStride
+            + outerMIdx * outerMStride + innerMIdx * innerMStride + innerKIdx * innerKStride;
 
         return reinterpret_cast<uint8_t*>(SFout) + SFOffset;
     }
 #endif
     return nullptr;
+}
+
+// Use UE4M3 by default.
+template <class Type, bool UE8M0_SF = false>
+__global__ void
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    __launch_bounds__(512, 4) cvt_fp16_to_fp4_3d(
+#else
+cvt_fp16_to_fp4_3d(
+#endif
+        int32_t numbatches, int32_t numRows, int32_t numCols, Type const* in, float const* SFScale, uint32_t* out,
+        uint32_t* SFout)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+
+    using PackedVec = PackedVec<Type>;
+    static constexpr int CVT_FP4_NUM_THREADS_PER_SF = CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD; // 2
+    static_assert(sizeof(PackedVec) == sizeof(Type) * CVT_FP4_ELTS_PER_THREAD, "Vec size is not matched.");
+
+    // Get the global scaling factor, which will be applied to the SF.
+    // Note SFScale is the same as next GEMM's alpha, which is (448.f / (Alpha_A / 6.f)).
+    float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
+
+    // Input tensor batch/row/col loops.
+    for (int rowIdx = blockIdx.x; rowIdx < numRows; rowIdx += gridDim.x)
+    {
+        for (int batchIdx = 0; batchIdx < numbatches; batchIdx++)
+        {
+            for (int colIdx = threadIdx.x; colIdx < numCols / CVT_FP4_ELTS_PER_THREAD; colIdx += blockDim.x)
+            {
+                int64_t inOffset = batchIdx * numRows * (numCols / CVT_FP4_ELTS_PER_THREAD)
+                    + rowIdx * (numCols / CVT_FP4_ELTS_PER_THREAD) + colIdx;
+                PackedVec in_vec = reinterpret_cast<PackedVec const*>(in)[inOffset];
+                // Get the output tensor offset.
+                // Same as inOffset because 8 elements are packed into one uint32_t.
+                int64_t outOffset = inOffset;
+                auto& out_pos = out[outOffset];
+
+                std::optional<int> optionalBatchIdx = batchIdx;
+                std::optional<int> optionalNumRows = numRows;
+
+                auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_NUM_THREADS_PER_SF>(
+                    optionalBatchIdx, rowIdx, colIdx, optionalNumRows, numCols, SFout);
+
+                out_pos = cvt_warp_fp16_to_fp4(in_vec, SFScaleVal, sf_out);
+            }
+        }
+    }
+#endif
+}
+
+// Use UE4M3 by default.
+template <bool UE8M0_SF = false>
+__global__ void
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    __launch_bounds__(512, 4) cvt_fp8_to_fp4_3d(
+#else
+cvt_fp8_to_fp4_3d(
+#endif
+        int32_t numbatches, int32_t numRows, int32_t numCols, __nv_fp8_e4m3 const* in, float const* SFScale,
+        uint32_t* out, uint32_t* SFout)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    using PackedVec = PackedVec<__nv_fp8_e4m3>;
+    static constexpr int CVT_FP4_NUM_THREADS_PER_SF = CVT_FP4_SF_VEC_SIZE / CVT_FP8_TO_FP4_ELTS_PER_THREAD;
+    static_assert(
+        sizeof(PackedVec) == sizeof(__nv_fp8_e4m3) * CVT_FP8_TO_FP4_ELTS_PER_THREAD, "Vec size is not matched.");
+
+    // Get the global scaling factor, which will be applied to the SF.
+    // Note SFScale is the same as next GEMM's alpha, which is (448.f / (Alpha_A / 6.f)).
+    float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
+
+    // Input tensor batch/row/col loops.
+    for (int rowIdx = blockIdx.x; rowIdx < numRows; rowIdx += gridDim.x)
+    {
+        for (int batchIdx = 0; batchIdx < numbatches; batchIdx++)
+        {
+            for (int colIdx = threadIdx.x; colIdx < numCols / CVT_FP8_TO_FP4_ELTS_PER_THREAD; colIdx += blockDim.x)
+            {
+                int64_t inOffset = batchIdx * numRows * (numCols / CVT_FP4_ELTS_PER_THREAD)
+                    + rowIdx * (numCols / CVT_FP4_ELTS_PER_THREAD) + colIdx;
+                PackedVec in_vec = reinterpret_cast<PackedVec const*>(in)[inOffset];
+                // Get the output tensor offset.
+                // Same as inOffset because 16 elements are packed into one uint64_t.
+                int64_t outOffset = inOffset;
+                auto& out_pos = out[outOffset];
+
+                std::optional<int> optionalBatchIdx = batchIdx;
+                std::optional<int> optionalNumRows = numRows;
+
+                auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_NUM_THREADS_PER_SF>(
+                    optionalBatchIdx, rowIdx, colIdx, optionalNumRows, numCols, SFout);
+
+                out_pos = cvt_warp_fp8_to_fp4(in_vec, SFScaleVal, sf_out);
+            }
+        }
+    }
+#endif
 }
 
 // Use UE4M3 by default.
@@ -636,7 +743,7 @@ cvt_fp16_to_fp4(
             auto& out_pos = out[outOffset];
 
             auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_NUM_THREADS_PER_SF>(
-                rowIdx, colIdx, numCols, SFout);
+                std::nullopt /* batchIdx */, rowIdx, colIdx, std::nullopt /* numRows */, numCols, SFout);
 
             out_pos = cvt_warp_fp16_to_fp4(in_vec, SFScaleVal, sf_out);
         }
@@ -677,7 +784,7 @@ cvt_fp8_to_fp4(
             auto& out_pos = out[outOffset];
 
             auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_NUM_THREADS_PER_SF>(
-                rowIdx, colIdx, numCols, SFout);
+                std::nullopt /* batchIdx */, rowIdx, colIdx, std::nullopt /* numRows */, numCols, SFout);
 
             out_pos = cvt_warp_fp8_to_fp4(in_vec, SFScaleVal, sf_out);
         }

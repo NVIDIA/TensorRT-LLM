@@ -19,5 +19,5 @@ __all__ = [
     "GenerationResultBase",
     "DetokenizedGenerationResultBase",
     "GenerationResult",
-    "IterationStatsResult",
+    "IterationResult",
 ]

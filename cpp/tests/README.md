@@ -6,20 +6,28 @@ Windows users: Be sure to set DLL paths as specified in [Extra Steps for C++ Run
 
 ## All-in-one script
 
-The script [test_cpp.py](resources/scripts/test_cpp.py) can be executed to build TRT-LLM, build engines, generate expected outputs and run C++ tests all in one go.
-To get an overview of the parameters call:
+The Pytest script [test_cpp.py](../../tests/llm-test-defs/turtle/defs/test_cpp.py) builds TRT-LLM, builds engines, and generates expected outputs and executes the C++ tests all in one go.
+To get an overview of the tests and their parameterization, call:
 
 ```bash
-python3 cpp/tests/resources/scripts/test_cpp.py -h
+pytest tests/llm-test-defs/turtle/defs/test_cpp.py --collect-only
 ```
 
-It is possible to choose a single model for end-to-end tests or skip models that should not be tested.
-An example call may look like this:
+All tests take the number of the CUDA architecture of the GPU you wish to use as a parameter e.g. 90 for Hopper.
+
+It is possible to choose unit tests or a single model for end-to-end tests.
+Example calls could look like this:
 
 ```bash
-CPP_BUILD_DIR=cpp/build
-MODEL_CACHE=/path/to/model_cache
-python3 cpp/tests/resources/scripts/test_cpp.py -a "80-real;86-real" --build_dir ${CPP_BUILD_DIR} --trt_root /usr/local/tensorrt --model_cache ${MODEL_CACHE} --run_gptj --skip_unit_tests
+export LLM_MODELS_ROOT="/path/to/model_cache"
+
+pytest tests/llm-test-defs/turtle/defs/test_cpp.py::test_unit_tests[90]
+
+pytest tests/llm-test-defs/turtle/defs/test_cpp.py::test_model[llama-90]
+
+pytest tests/llm-test-defs/turtle/defs/test_cpp.py::test_benchmarks[gpt-90]
+
+pytest tests/llm-test-defs/turtle/defs/test_cpp.py::test_multi_gpu[90]
 ```
 
 ## Manual steps
@@ -30,7 +38,7 @@ From the top-level directory call:
 
 ```bash
 CPP_BUILD_DIR=cpp/build
-python3 scripts/build_wheel.py -a "80-real;86-real" --build_dir ${CPP_BUILD_DIR} --trt_root /usr/local/tensorrt
+python3 scripts/build_wheel.py -a "80-real;86-real" --build_dir ${CPP_BUILD_DIR}
 pip install -r requirements-dev.txt
 pip install build/tensorrt_llm*.whl
 cd $CPP_BUILD_DIR && make -j$(nproc) google-tests
@@ -44,7 +52,7 @@ Single tests can be executed from `CPP_BUILD_DIR/tests`, e.g.
 
 ### End-to-end tests
 
-`gptSessionTest`, `gptManagerTest` and `trtGptModelRealDecoderTest` require pre-built TensorRT engines, which are loaded in the tests. They also require data files which are stored in [cpp/tests/resources/data](resources/data).
+`gptSessionTest`,`trtGptModelRealDecoderTest` and `executorTest` require pre-built TensorRT engines, which are loaded in the tests. They also require data files which are stored in [cpp/tests/resources/data](resources/data).
 
 #### Build engines
 

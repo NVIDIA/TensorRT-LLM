@@ -203,23 +203,12 @@ def test_language_adapter_models(args):
         model_config = json.load(f)
     decoder_start_token_id = model_config['pretrained_config'][
         'decoder_start_token_id']
-    num_languages = model_config['pretrained_config'][
-        'language_adapter_config']['num_languages']
     decoder_input_ids = torch.IntTensor([[decoder_start_token_id]]).to('cuda')
     decoder_input_ids = decoder_input_ids.repeat((input_ids.shape[0], 1))
 
-    def get_routings_from_language_uids(language_uids, num_languages):
-        language_adapter_routing_masks = []
-        for language_uid in language_uids:
-            mask = [0.0] * num_languages
-            mask[language_uid] = 1.0
-            language_adapter_routing_masks.append(mask)
-        return language_adapter_routing_masks
-
-    def get_language_adapter_routings(language_uids, input_ids, num_languages):
-        language_adapter_routing_masks = torch.tensor(
-            get_routings_from_language_uids(language_uids, num_languages),
-            dtype=torch.float32)
+    def get_language_adapter_routings(language_uids, input_ids):
+        language_adapter_routing_masks = torch.tensor(language_uids,
+                                                      dtype=torch.int32)
         language_adapter_routings = []
 
         for i, input_id in enumerate(input_ids):
@@ -229,9 +218,9 @@ def test_language_adapter_models(args):
         return torch.cat(language_adapter_routings)
 
     encoder_language_adapter_routings = get_language_adapter_routings(
-        language_task_uids, input_ids, num_languages)
+        language_task_uids, input_ids)
     decoder_language_adapter_routings = get_language_adapter_routings(
-        language_task_uids, decoder_input_ids, num_languages)
+        language_task_uids, decoder_input_ids)
 
     bos_token_id = 2
     pad_token_id = 0

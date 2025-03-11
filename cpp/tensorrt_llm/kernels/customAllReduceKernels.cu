@@ -229,11 +229,11 @@ inline __device__ int4 rms_norm(float denom, PackedStruct& vec, PackedStruct& we
         if constexpr (Affine)
         {
             float v2 = static_cast<float>(reinterpret_cast<T*>(weight.unpacked)[i]);
-            reinterpret_cast<T*>(ret.unpacked)[i] = static_cast<T>(__fdividef(v1, denom) * v2);
+            reinterpret_cast<T*>(ret.unpacked)[i] = static_cast<T>(v1 * denom * v2);
         }
         else
         {
-            reinterpret_cast<T*>(ret.unpacked)[i] = static_cast<T>(__fdividef(v1, denom));
+            reinterpret_cast<T*>(ret.unpacked)[i] = static_cast<T>(v1 * denom);
         }
     }
     return ret.packed;
@@ -295,7 +295,7 @@ __global__ void rms_norm_kernel(AllReduceParams params)
         }
     }
     acc = block_reduce_sum(acc);
-    float denom = __fsqrt_rn(__fdividef(acc, params.fusion_params.hidden_size) + params.fusion_params.eps);
+    float denom = rsqrtf(acc / params.fusion_params.hidden_size + params.fusion_params.eps);
     for (int offset = thread_offset; offset < params.fusion_params.hidden_size; offset += blockDim.x * kPackedSize)
     {
         if constexpr (UseSmem)
@@ -363,8 +363,8 @@ __global__ void rms_pre_post_norm_kernel(AllReduceParams params) // for gemma2 p
         // pre-residual norm.
         acc_pre_residual_norm = accumulate<T>(acc_pre_residual_norm, inter_vec);
         acc_pre_residual_norm = block_reduce_sum(acc_pre_residual_norm);
-        float denom_pre_residual_norm = __fsqrt_rn(
-            __fdividef(acc_pre_residual_norm, params.fusion_params.hidden_size) + params.fusion_params.eps);
+        float denom_pre_residual_norm
+            = rsqrtf(acc_pre_residual_norm / params.fusion_params.hidden_size + params.fusion_params.eps);
 
         if constexpr (Affine)
         {
@@ -383,7 +383,7 @@ __global__ void rms_pre_post_norm_kernel(AllReduceParams params) // for gemma2 p
         acc = accumulate<T>(acc, inter_vec);
     }
     acc = block_reduce_sum(acc);
-    float denom = __fsqrt_rn(__fdividef(acc, params.fusion_params.hidden_size) + params.fusion_params.eps);
+    float denom = rsqrtf(acc / params.fusion_params.hidden_size + params.fusion_params.eps);
     for (int offset = thread_offset; offset < params.fusion_params.hidden_size; offset += blockDim.x * kPackedSize)
     {
         if constexpr (Affine)
@@ -824,7 +824,7 @@ static __global__ void lamport_style_one_shot_all_reduce_norm_kernel(AllReducePa
         cluster.sync();
     }
 
-    float denom = __fsqrt_rn(__fdividef(acc, params.fusion_params.hidden_size) + params.fusion_params.eps);
+    float denom = rsqrtf(acc / params.fusion_params.hidden_size + params.fusion_params.eps);
     sum_vec.packed = rms_norm<T, Affine>(denom, sum_vec, weight_vec);
     *reinterpret_cast<int4*>(local_final_output_buffer) = sum_vec.packed;
 
@@ -986,7 +986,7 @@ static __global__ void __launch_bounds__(1024, 1) one_shot_all_reduce_norm_kerne
             }
         }
         acc = block_reduce_sum(acc);
-        float denom = __fsqrt_rn(__fdividef(acc, params.fusion_params.hidden_size) + params.fusion_params.eps);
+        float denom = rsqrtf(acc / params.fusion_params.hidden_size + params.fusion_params.eps);
         for (int offset = thread_offset; offset < params.fusion_params.hidden_size; offset += blockDim.x * kPackedSize)
         {
             if constexpr (UseSmem)
@@ -1092,8 +1092,8 @@ static __global__ void __launch_bounds__(1024, 1) one_shot_prenorm_all_reduce_no
 
             acc_pre_residual_norm = block_reduce_sum(acc_pre_residual_norm);
 
-            float denom_pre_residual_norm = __fsqrt_rn(
-                __fdividef(acc_pre_residual_norm, params.fusion_params.hidden_size) + params.fusion_params.eps);
+            float denom_pre_residual_norm
+                = rsqrtf(acc_pre_residual_norm / params.fusion_params.hidden_size + params.fusion_params.eps);
             if constexpr (Affine)
             {
                 weight_vec_pre_residual_norm.packed
@@ -1106,7 +1106,7 @@ static __global__ void __launch_bounds__(1024, 1) one_shot_prenorm_all_reduce_no
             acc = accumulate<T>(acc, sum_vec);
         }
         acc = block_reduce_sum(acc);
-        float denom = __fsqrt_rn(__fdividef(acc, params.fusion_params.hidden_size) + params.fusion_params.eps);
+        float denom = rsqrtf(acc / params.fusion_params.hidden_size + params.fusion_params.eps);
         if constexpr (Affine)
         {
             weight_vec.packed = *reinterpret_cast<int4 const*>(weight_buffer + thread_offset);
@@ -1904,7 +1904,7 @@ void customAllReduce(kernels::AllReduceParams& params, nvinfer1::DataType dataTy
     TLLM_CHECK_WITH_INFO(configurationSupported(strat, params.elts_total, params.ranks_per_node, dataType),
         "Custom all-reduce configuration unsupported");
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     switch (dataType)
     {
@@ -1917,7 +1917,7 @@ void customAllReduce(kernels::AllReduceParams& params, nvinfer1::DataType dataTy
 #endif
     default: TLLM_THROW("Unsupported dataType for customAllReduce");
     }
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 template <typename T>
@@ -1944,7 +1944,7 @@ void launchResidualRmsNormKernel(kernels::AllReduceParams& params, cudaStream_t 
 void residualRmsNorm(
     kernels::AllReduceParams& params, nvinfer1::DataType dataType, cudaStream_t stream, AllReduceFusionOp fusionOp)
 {
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
     switch (dataType)
     {
     case nvinfer1::DataType::kFLOAT: launchResidualRmsNormKernel<float>(params, stream, fusionOp); break;
@@ -1954,12 +1954,12 @@ void residualRmsNorm(
 #endif
     default: TLLM_THROW("Unsupported dataType for customAllReduce");
     }
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 void lamportInitialize(void* buffer, size_t size, nvinfer1::DataType dataType, cudaStream_t stream)
 {
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
     switch (dataType)
     {
     case nvinfer1::DataType::kFLOAT:
@@ -1975,7 +1975,7 @@ void lamportInitialize(void* buffer, size_t size, nvinfer1::DataType dataType, c
 #endif
     default: TLLM_THROW("Unsupported dataType for customAllReduce");
     }
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 } // namespace tensorrt_llm::kernels

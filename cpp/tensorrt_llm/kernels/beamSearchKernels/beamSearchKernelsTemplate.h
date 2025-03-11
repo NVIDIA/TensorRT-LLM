@@ -610,21 +610,21 @@ void beamSearchKernelLauncher(
 
         // Stage 1
         invokeTopkLastDim<T>(nBS * nBM, nV, nBM * 2, true, logProbs, pStage1LogProbs, pStage1Ids, pTopK, stream);
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
 
         int nThread = min(roundUp(nBM * nBM * 2, 32), 1024);
         addCumLogProbs<<<nBS, nThread, 0, stream>>>(
             pStage1LogProbs, bh.cumLogProbs, bh.finished, bh.endIds, bh.diversityRates, bh.batchSlots, nBS, nBM);
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
 
         // Stage 2
         invokeTopkLastDim<T>(
             nBS, nBM * nBM * 2, nBM * 2, true, pStage1LogProbs, pStage2LogProbs, pStage2Ids, pTopK, stream);
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
 
         nThread = min(roundUp(nBM * 2, 32), 1024);
         gatherId<<<nBS, nThread, 0, stream>>>(pStage1Ids, pStage2Ids, nBS, nBM, nV);
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
     }
     else // V1
     {
@@ -639,7 +639,7 @@ void beamSearchKernelLauncher(
         dim3 grid(nBS, nBM, bh.nVPart);
         beamStage1Kernel<T, PBM, nThreadStage1><<<grid, nThreadStage1, bh.nByteSharedMemoryStage1, stream>>>(
             logProbs, bias, pStage3, bh.endIds, bh.finished, nV, bh.batchSlots);
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
 
         // Stage 2
         // TODO: rewrite kernel to remove dependence of constant block size to reduce compilation time
@@ -663,7 +663,7 @@ void beamSearchKernelLauncher(
             TLLM_LOG_TRACE("Use slow Beam Search stage 2 kernel due to large beam_width or vocab_size");
             BEAM_STAGE2_KERNEL(128, false)
         }
-        sync_check_cuda_error();
+        sync_check_cuda_error(stream);
     }
 
     // Stage 3 in common
@@ -691,7 +691,7 @@ void beamSearchKernelLauncher(
         beamStage3Kernel<T, PBM, nThreadStage3, false, IS_V2>
             <<<nBS, nThreadStage3, 0, stream>>>(pStage2Ids, pStage2LogProbs, pStage3, bh);
     }
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 #undef BEAM_STAGE2_KERNEL

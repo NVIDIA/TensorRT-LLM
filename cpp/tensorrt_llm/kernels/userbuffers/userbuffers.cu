@@ -649,8 +649,8 @@ __global__ void __launch_bounds__(MAX_THREADS)
             uint8_t* sf_out = nullptr;
             if (threadIdx.x % 8 == 0)
             {
-                sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(
-                    token_idx, threadIdx.x + g * loop_step0, hidden_dim, scale_out + scale_out_offset);
+                sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(std::nullopt /* batchIdx */, token_idx,
+                    threadIdx.x + g * loop_step0, std::nullopt /* numRows */, hidden_dim, scale_out + scale_out_offset);
             }
             uint32_t val = cvt_warp_fp16_to_fp4_mc(valout, sf, sf_out);
             MULTIMEM_ST(val, mc_ptr_out + (out_lineoffset + line + g * loop_step0));
@@ -760,8 +760,8 @@ __global__ void __launch_bounds__(MAX_THREADS)
                     (threadIdx.x + g * loop_step0) * sizeof(int4) / sizeof(DType) + j));
                 i++;
             }
-            auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(
-                token_idx, threadIdx.x + g * loop_step0, hidden_dim, scale_out + scale_out_offset);
+            auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(std::nullopt /* batchIdx */, token_idx,
+                threadIdx.x + g * loop_step0, std::nullopt /* numRows */, hidden_dim, scale_out + scale_out_offset);
             mc_ptr_out[out_lineoffset + line + g * loop_step0] = cvt_warp_fp16_to_fp4(valout, sf, sf_out);
         }
     }

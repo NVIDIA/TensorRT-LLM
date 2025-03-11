@@ -27,8 +27,9 @@ from test_llm import (
     tinyllama_logits_processor_test_harness, run_llm_with_postprocess_parallel,
     run_llm_with_postprocess_parallel_and_result_handler, run_llm_abort_request,
     sampling_params_for_aborting_request)
+from test_llm_kv_cache_events import create_llm
 from utils.util import (skip_gpu_memory_less_than, skip_num_gpus_less_than,
-                        skip_single_gpu, unittest_name_func)
+                        skip_single_gpu, unittest_name_func, force_ampere)
 # isort: on
 
 # shrink the kv_cache_config to avoid OOM in CI
@@ -400,6 +401,9 @@ DummyExecutor3 = DummyExecutorMeta("DummyExecutor3", (), {},
 @skip_single_gpu
 @pytest.mark.parametrize("pytorch_backend", [False, True])
 def test_llm_get_stats_tp2(pytorch_backend):
+    if pytorch_backend:
+        pytest.skip("https://nvbugs/5150466: Flaky hang")
+        return
     llm_get_stats_test_harness(tp_size=2, pytorch_backend=pytorch_backend)
 
 
@@ -424,6 +428,27 @@ def test_llm_with_postprocess_parallel_and_result_handler_tp2(
     run_llm_with_postprocess_parallel_and_result_handler(streaming,
                                                          backend,
                                                          tp_size=2)
+
+
+@force_ampere
+@skip_single_gpu
+def test_llm_get_kv_cache_events_tp2():
+    llm = create_llm(tensor_parallel_size=2)
+    sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
+    prompt = "Hello, my name is"
+
+    _ = llm.generate(prompt, sampling_params=sampling_params)
+
+    events = llm.get_kv_cache_events(5)
+
+    # created + stored events
+    assert events and len(events) >= 2
+    for event in events:
+        if event:
+            if event[0]["event_id"] == 0:
+                assert event[0]["data"]["type"] == "created"
+            elif event[0]["event_id"] == 1:
+                assert event[0]["data"]["type"] == "stored"
 
 
 @pytest.fixture(scope="module")

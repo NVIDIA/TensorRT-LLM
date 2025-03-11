@@ -160,7 +160,7 @@ void CublasMMWrapper::Gemm(cublasOperation_t transa, cublasOperation_t transb, i
         check_cuda_error(cublasLtMatmul(getCublasLtHandle(), mOperationDesc, alpha, A, mADesc, B, mBDesc, beta, C,
             mCDesc, C, mCDesc, (hasAlgo ? (&algo) : NULL), mCublasWorkspace, workspaceSize, mStream));
 
-        sync_check_cuda_error();
+        sync_check_cuda_error(mStream);
     }
     else
     {
@@ -170,7 +170,7 @@ void CublasMMWrapper::Gemm(cublasOperation_t transa, cublasOperation_t transb, i
         cublasGemmAlgo_t cublasAlgo = CUBLAS_GEMM_DEFAULT;
         check_cuda_error(cublasGemmEx(getCublasHandle(), transa, transb, m, n, k, alpha, A, mAType, lda, B, mBType, ldb,
             beta, C, mCType, ldc, mComputeType, static_cast<cublasGemmAlgo_t>(cublasAlgo)));
-        sync_check_cuda_error();
+        sync_check_cuda_error(mStream);
     }
 }
 
@@ -419,7 +419,7 @@ bool CublasMMWrapper::checkTactic(cublasOperation_t transa, cublasOperation_t tr
         return false;
     }
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(mStream);
 
     return true;
 }
@@ -432,7 +432,7 @@ std::vector<cublasLtMatmulHeuristicResult_t> CublasMMWrapper::getTactics(cublasO
 
     auto const heuristics = getTactics(getCublasLtHandle(), mOperationDesc, mADesc, mBDesc, mCDesc, mCDesc);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(mStream);
 
     return heuristics;
 }

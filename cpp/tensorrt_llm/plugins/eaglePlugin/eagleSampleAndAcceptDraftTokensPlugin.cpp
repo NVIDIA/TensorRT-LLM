@@ -234,7 +234,7 @@ void EagleSampleAndAcceptDraftTokensPlugin::samplePrimeHeadTokens(nvinfer1::Plug
     invokeAssembleTargetLogitsOffsets(
         logitsPtrs, decodingTokens, logits, prevDraftLens, batchSize, maxDecodingTokens, vocabSizePadded, stream);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     TopKSamplingKernelParams<T> params;
     params.logProbsPtrs = logitsPtrs;
@@ -250,7 +250,7 @@ void EagleSampleAndAcceptDraftTokensPlugin::samplePrimeHeadTokens(nvinfer1::Plug
 
     invokeBatchTopKSampling(params, stream);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -293,7 +293,7 @@ void EagleSampleAndAcceptDraftTokensPlugin::doTypicalAcceptance(nvinfer1::Plugin
     invokeAssembleTargetLogitsOffsets(const_cast<T const**>(logitsPtrs), decodingTokens, logits, prevDraftLens,
         batchSize, maxDecodingTokens, vocabSizePadded, stream);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     TypicalAcceptanceSampling<T> params;
     params.logitsPtrs = logitsPtrs;
@@ -323,7 +323,7 @@ void EagleSampleAndAcceptDraftTokensPlugin::doTypicalAcceptance(nvinfer1::Plugin
 
     typicalAcceptanceSampling(params, stream);
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -388,7 +388,7 @@ void EagleSampleAndAcceptDraftTokensPlugin::acceptDraftTokens(nvinfer1::PluginTe
             batchSize * maxDecodingTokens * maxPathLen * sizeof(SizeType32), cudaMemcpyDeviceToDevice, stream);
     }
 
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

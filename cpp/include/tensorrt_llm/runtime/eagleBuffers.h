@@ -17,11 +17,11 @@
 #pragma once
 
 #include "tensorrt_llm/executor/executor.h"
+#include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/eagleModule.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
-#include "tensorrt_llm/runtime/tllmRuntime.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <cstddef>
@@ -114,8 +114,8 @@ public:
         //! numEagleLayers, maxDecodingDraftTokens * maxDecodingDraftTokens]
         TensorPtr allLayersDraftTokenIdsPredecessor;
 
-        void create(SizeType32 maxNumSequences, runtime::TllmRuntime const& runtime,
-            runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig);
+        void create(SizeType32 maxNumSequences, BufferManager const& manager, ModelConfig const& modelConfig,
+            WorldConfig const& worldConfig);
     };
 
     Inputs engineInputs;
@@ -144,13 +144,13 @@ public:
 public:
     EagleBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, runtime::BufferManager const& manager,
         runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
-        executor::DecodingConfig const& decodingConfig, runtime::TllmRuntime const& runtime);
+        executor::DecodingConfig const& decodingConfig);
 
     void reshape(SizeType32 numCtxSequences, SizeType32 numGenSequences, runtime::ModelConfig const& modelConfig);
 
     void setFromInputs(RequestVector const& contextRequests, RequestVector const& genRequests,
         runtime::ITensor const& requestTypes, ITensor const& seqSlots, EagleBuffers::Inputs const& decoderBuffers,
-        runtime::TllmRuntime const& runtime, runtime::ModelConfig const& modelConfig,
+        runtime::BufferManager const& manager, runtime::ModelConfig const& modelConfig,
         runtime::WorldConfig const& worldConfig) const;
 
     void insertInputTensors(

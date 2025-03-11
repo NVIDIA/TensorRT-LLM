@@ -19,12 +19,13 @@
 
 #include "common.h"
 #include "tensorrt_llm/common/algorithm.h"
+#include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 
 namespace tensorrt_llm::runtime
 {
-class TllmRuntime;
-}
+class BufferManager;
+} // namespace tensorrt_llm::runtime
 
 namespace tensorrt_llm::batch_manager
 {
@@ -37,13 +38,16 @@ namespace tr = tensorrt_llm::runtime;
 class HandleGenerationLogits : Algorithm
 {
 public:
+    template <typename T>
+    using OptionalRef = tensorrt_llm::common::OptionalRef<T>;
+
     constexpr static auto name{"HandleGenerationLogits"};
 
     HandleGenerationLogits() = default;
 
-    void operator()(tr::SizeType32 logitsIndex, RequestVector const& generationRequests,
-        RuntimeBuffers& genRuntimeBuffers, DecoderBuffers& decoderBuffers, tr::ModelConfig const& modelConfig,
-        runtime::TllmRuntime const& runtime) const;
+    void operator()(tr::SizeType32 logitsIndex, RequestVector const& generationRequests, DecoderBuffers& decoderBuffers,
+        tr::ModelConfig const& modelConfig, tr::BufferManager const& manager, tr::ITensor::SharedPtr const& logits,
+        OptionalRef<RuntimeBuffers> genRuntimeBuffers) const;
 };
 
 } // namespace tensorrt_llm::batch_manager

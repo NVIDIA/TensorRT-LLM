@@ -190,7 +190,7 @@ void splitkGroupedGemm_(std::vector<cutlass::gemm::GemmCoord> problemSizes, std:
     status = gemm.run(stream);
 
     TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess, "Failed to run CUTLASS Grouped GEMM kernel.");
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 
     std::free(host_workspace);
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);

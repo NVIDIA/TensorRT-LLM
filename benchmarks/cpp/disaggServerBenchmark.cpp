@@ -15,7 +15,6 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/batch_manager/GptManager.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/disaggServerUtil.h"

@@ -127,7 +127,7 @@ void invokeStopWordsCriterion(TokenIdType const** outputIds, SizeType32 const** 
 
     stopWordsCriterion<<<grid, block, 0, stream>>>(outputIds, parentIds, stopWords, finished, sequenceLengths,
         batchSlots, stopWordsLen, numNewTokens, batchSize, beamWidth, maxSeqLen);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 __global__ void lengthCriterion(FinishedState* finished, SizeType32* finishedSum, SizeType32 const* sequenceLimitLength,
@@ -191,7 +191,7 @@ void invokeLengthCriterion(FinishedState* finished, SizeType32* finishedSum, Siz
 
     lengthCriterion<<<grid, block, 0, stream>>>(
         finished, finishedSum, sequenceLimitLength, sequenceLengths, numNewTokens, batchSlots, batchSize, beamWidth);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 __global__ void explicitEOSCriterion(TokenIdType const** outputIds, TokenIdType const* endIds, FinishedState* finished,
@@ -245,7 +245,7 @@ void invokeExplicitEOSCriterion(TokenIdType const** outputIds, TokenIdType const
 
     explicitEOSCriterion<<<grid, blockSize, 0, stream>>>(
         outputIds, endIds, finished, sequenceLengths, numNewTokens, batchSlots, batchSize, maxTokensPerStep);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 } // namespace kernels

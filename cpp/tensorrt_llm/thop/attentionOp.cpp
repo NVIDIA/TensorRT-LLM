@@ -100,7 +100,7 @@ public:
         int const num_gen_tokens) const override
     {
         size_t const context_workspace_size
-            = op.getWorkspaceSizeForContext(op.mType, max_num_requests, op.mMaxContextLength, num_tokens);
+            = op.getWorkspaceSizeForContext(op.mType, max_num_requests, op.mMaxContextLength, 0, num_tokens);
         size_t const generation_workspace_size
             = op.getWorkspaceSizeForGeneration(op.mType, max_num_requests, max_attention_window_size, num_gen_tokens);
 
@@ -290,6 +290,7 @@ public:
                 }
             }
         }
+        sync_check_cuda_error(stream);
     }
 };
 
@@ -523,7 +524,6 @@ torch::Tensor attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch
             kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe);
     }
 
-    sync_check_cuda_error();
     TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);
 
     return output;

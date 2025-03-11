@@ -38,6 +38,7 @@ using VecUniqueTokens = tensorrt_llm::runtime::VecUniqueTokens;
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
 using TokenIdType = tensorrt_llm::runtime::TokenIdType;
 using VecTokens = std::vector<TokenIdType>;
+using CudaStreamPtr = std::shared_ptr<tensorrt_llm::runtime::CudaStream>;
 
 namespace
 {
@@ -319,6 +320,9 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
         .def_readwrite("alloc_new_blocks", &tbk::KvCacheStats::allocNewBlocks)
         .def_readwrite("reused_blocks", &tbk::KvCacheStats::reusedBlocks);
 
+    py::class_<tbk::KVCacheEventManager, std::shared_ptr<tbk::KVCacheEventManager>>(m, "KVCacheEventManager")
+        .def(py::init<size_t>(), py::arg("max_kv_event_entries"));
+
     py::classh<tbk::BaseKVCacheManager, PyKvCacheManager>(m, "BaseKVCacheManager")
         .def_static("calculate_max_num_blocks", &tbk::BaseKVCacheManager::calculateMaxNumBlocks, py::arg("config"),
             py::arg("dtype"), py::arg("model_config"), py::arg("world_config"), py::arg("buffer_manager"),
@@ -396,6 +400,17 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
                     self.copyBlockOffsets(*(_output.value()), i, requestIds[i]);
                 }
             })
+        .def(
+            "get_latest_events",
+            [](tbk::BaseKVCacheManager& self, std::optional<double> timeout_ms = std::nullopt)
+            {
+                if (timeout_ms)
+                {
+                    return self.getLatestEvents(std::chrono::milliseconds(static_cast<int64_t>(*timeout_ms)));
+                }
+                return self.getLatestEvents(std::nullopt);
+            },
+            py::arg("timeout_ms") = std::nullopt)
         .def_property_readonly("enable_block_reuse", &BaseKVCacheManager::isEnableBlockReuse)
         .def_property_readonly("use_one_more_block", &BaseKVCacheManager::isUseOneMoreBlock)
         .def("rewind_kv_cache", &BaseKVCacheManager::rewindKVCache)
@@ -404,7 +419,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
         .def("scheduling_has_free_blocks", &BaseKVCacheManager::schedulingHasFreeBlocks)
         .def("get_cache_block_ids", &BaseKVCacheManager::getCacheBlockIds)
         .def("get_batch_cache_block_ids", &BaseKVCacheManager::getBatchCacheBlockIds)
-        .def("get_newly_allocated_block_ids", &BaseKVCacheManager::getNewlyAllocatedBlockIds);
+        .def("get_newly_allocated_block_ids", &BaseKVCacheManager::getNewlyAllocatedBlockIds)
+        .def("flush_iteration_events", &BaseKVCacheManager::flushIterationEvents);
 
     py::enum_<tbk::CacheType>(m, "CacheType")
         .value("SELF", tbk::CacheType::kSELF)
@@ -413,13 +429,17 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
 
     py::classh<tbk::KVCacheManager, tbk::BaseKVCacheManager>(m, "KVCacheManager")
         .def(py::init<std::vector<SizeType32> const&, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32,
-                 SizeType32, SizeType32, SizeType32, SizeType32, bool, int64_t, bool, bool, tbk::CacheType>(),
+                 SizeType32, SizeType32, SizeType32, SizeType32, bool, int64_t, bool, bool, tbk::CacheType,
+                 std::optional<tensorrt_llm::executor::RetentionPriority>, std::shared_ptr<tbk::KVCacheEventManager>,
+                 bool, bool>(),
             py::arg("num_kv_heads_per_layer"), py::arg("size_per_head"), py::arg("tokens_per_block"),
             py::arg("blocks_in_primary_pool"), py::arg("blocks_in_secondary_pool"), py::arg("max_num_sequences"),
             py::arg("max_beam_width"), py::arg("max_attention_window"), py::arg("temporary_attention_window"),
             py::arg("sink_token_length"), py::arg("stream"), py::arg("max_sequence_length"),
             py::arg("enable_block_reuse") = false, py::arg("onboard_blocks") = true,
-            py::arg_v("cache_type", tbk::CacheType::kSELF, "bindings.internal.batch_manager.CacheType.SELF"));
+            py::arg_v("cache_type", tbk::CacheType::kSELF, "bindings.internal.batch_manager.CacheType.SELF"),
+            py::arg("secondary_offload_min_priority") = std::nullopt, py::arg("event_manager") = nullptr,
+            py::arg("enable_partial_reuse") = true, py::arg("copy_on_partial_reuse") = true);
 }
 
 void tb::BasePeftCacheManagerBindings::initBindings(py::module_& m)

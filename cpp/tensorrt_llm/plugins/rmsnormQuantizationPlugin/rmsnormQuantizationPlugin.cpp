@@ -259,7 +259,7 @@ int RmsnormQuantizationPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDe
     }
 #endif // ENABLE_FP8
 #endif // ENABLE_BF16
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
     return 0;
 }
 

@@ -1,5 +1,6 @@
+from collections import defaultdict
 from functools import partial
-from typing import List
+from typing import Any, Dict
 
 import torch.nn as nn
 from torch.fx import GraphModule, Node
@@ -14,6 +15,7 @@ from ...utils.node_utils import (
 from ...utils.quantization_utils import (
     QuantizationImpl,
     get_quantization_from_linear_node,
+    is_quantized_graph,
     is_quantized_op,
     remove_output_quantizers,
 )
@@ -79,35 +81,40 @@ def _insert_quantized_linear(
     node.kwargs = {**node.kwargs, **scales}
 
 
-def quantize(
-    gm: GraphModule, quantization: str, skip: List[str] = [], is_quantized_graph: bool = False
-):
+def quantize(gm: GraphModule, quant_config: Dict[str, Any]):
     """Quantize the GraphModule and replace linear with quantized linear."""
-    assert isinstance(gm, GraphModule), "Expecting GraphModule"
+    # extract info from quant_config
+    is_quant_graph = is_quantized_graph(gm)
+    quant_algo = quant_config.get("quant_algo")
+    skip = quant_config.get("exclude_modules", [])
+
+    # no quantization to do
+    if not (is_quant_graph or quant_config):
+        ad_logger.debug("No quantization to do.")
+        return gm
 
     # tracking quantized linears in the graph
-    quantized_nodes = {}
+    quantized_nodes: Dict[str, int] = defaultdict(lambda: 0)
     for n in gm.graph.nodes:
-        if is_match(n, skip):
-            ad_logger.debug(f"Skipping node for quantization: {n}")
+        # check if we should skip this node
+        if is_match(n, skip) or not is_linear_op(n, include_quantization=False):
             continue
 
-        if is_linear_op(n, include_quantization=False):
-            # get per-layer quantization format from the node
-            if is_quantized_graph:
-                quantization = get_quantization_from_linear_node(n)
-            if quantization:
-                _insert_quantized_linear(
-                    gm, n, QuantizationImpl.create(quantization), is_quantized_graph
-                )
-                quantized_nodes[quantization] = quantized_nodes.get(quantization, -1) + 1
+        # get per-layer quantization format from the node
+        quant_algo_n: str = get_quantization_from_linear_node(n) if is_quant_graph else quant_algo
+        if not quant_algo_n:
+            continue
 
-    if is_quantized_graph:
+        # insert quantized linear node
+        _insert_quantized_linear(gm, n, QuantizationImpl.create(quant_algo_n), is_quant_graph)
+        quantized_nodes[quant_algo_n] += 1
+
+    if is_quant_graph:
         remove_output_quantizers(gm)
 
     gm = canonicalize_graph(gm)
-    for quantization in quantized_nodes:
-        ad_logger.info(f"Found {quantized_nodes[quantization]} {quantization} quantized nodes.")
+    for quant_algo in quantized_nodes:
+        ad_logger.info(f"Found {quantized_nodes[quant_algo]} {quant_algo} quantized nodes.")
     ad_logger.debug("After quantization: " + str(gm))
 
     return gm

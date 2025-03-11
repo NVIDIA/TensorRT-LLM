@@ -18,8 +18,7 @@
 include(FetchContent)
 FetchContent_Declare(
   googletest
-  GIT_REPOSITORY
-    https://github.com/google/googletest.git
+  GIT_REPOSITORY https://github.com/google/googletest.git
   GIT_TAG v1.15.2)
 FetchContent_MakeAvailable(googletest)
 include(GoogleTest)
@@ -90,6 +89,8 @@ add_gtest(gptDecoderBatchedTest runtime/gptDecoderBatchedTest.cpp)
 add_gtest(gptSessionTest runtime/gptSessionTest.cpp)
 target_link_libraries(gptSessionTest PRIVATE modelSpecStatic)
 add_gtest(medusaModuleTest runtime/medusaModuleTest.cpp)
+
+add_gtest(sanitizerTest runtime/sanitizerTest.cpp)
 
 add_gtest(eaglePackDataTest kernels/eaglePackDataTest.cpp)
 

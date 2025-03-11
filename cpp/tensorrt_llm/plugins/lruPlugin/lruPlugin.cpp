@@ -211,7 +211,7 @@ int lruPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1
     {
         invokeRGLRUUpdate<T>(lru_params, stream);
     }
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
     return 0;
 }
 

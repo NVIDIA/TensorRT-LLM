@@ -105,11 +105,11 @@ void initConfigBindings(pybind11::module_& m)
         return py::make_tuple(self.getEnableBlockReuse(), self.getMaxTokens(), self.getMaxAttentionWindowVec(),
             self.getSinkTokenLength(), self.getFreeGpuMemoryFraction(), self.getHostCacheSize(),
             self.getOnboardBlocks(), self.getCrossKvCacheFraction(), self.getSecondaryOffloadMinPriority(),
-            self.getEventBufferMaxSize());
+            self.getEventBufferMaxSize(), self.getEnablePartialReuse(), self.getCopyOnPartialReuse());
     };
     auto kvCacheConfigSetstate = [](py::tuple const& state)
     {
-        if (state.size() != 10)
+        if (state.size() != 12)
         {
             throw std::runtime_error("Invalid state!");
         }
@@ -117,19 +117,20 @@ void initConfigBindings(pybind11::module_& m)
             state[2].cast<std::optional<std::vector<SizeType32>>>(), state[3].cast<std::optional<SizeType32>>(),
             state[4].cast<std::optional<float>>(), state[5].cast<std::optional<size_t>>(), state[6].cast<bool>(),
             state[7].cast<std::optional<float>>(), state[8].cast<std::optional<tle::RetentionPriority>>(),
-            state[9].cast<size_t>());
+            state[9].cast<size_t>(), std::nullopt, state[10].cast<bool>(), state[11].cast<bool>());
     };
     py::class_<tle::KvCacheConfig>(m, "KvCacheConfig")
         .def(py::init<bool, std::optional<SizeType32> const&, std::optional<std::vector<SizeType32>> const&,
                  std::optional<SizeType32> const&, std::optional<float> const&, std::optional<size_t> const&, bool,
                  std::optional<float> const&, std::optional<tle::RetentionPriority>, size_t const&,
-                 std::optional<RuntimeDefaults> const&>(),
+                 std::optional<RuntimeDefaults> const&, bool, bool>(),
             py::arg("enable_block_reuse") = true, py::arg("max_tokens") = py::none(),
             py::arg("max_attention_window") = py::none(), py::arg("sink_token_length") = py::none(),
             py::arg("free_gpu_memory_fraction") = py::none(), py::arg("host_cache_size") = py::none(),
             py::arg("onboard_blocks") = true, py::arg("cross_kv_cache_fraction") = py::none(),
             py::arg("secondary_offload_min_priority") = py::none(), py::arg("event_buffer_max_size") = 0, py::kw_only(),
-            py::arg("runtime_defaults") = py::none())
+            py::arg("runtime_defaults") = py::none(), py::arg("enable_partial_reuse") = true,
+            py::arg("copy_on_partial_reuse") = true)
         .def_property(
             "enable_block_reuse", &tle::KvCacheConfig::getEnableBlockReuse, &tle::KvCacheConfig::setEnableBlockReuse)
         .def_property("max_tokens", &tle::KvCacheConfig::getMaxTokens, &tle::KvCacheConfig::setMaxTokens)
@@ -147,6 +148,10 @@ void initConfigBindings(pybind11::module_& m)
             &tle::KvCacheConfig::setSecondaryOffloadMinPriority)
         .def_property("event_buffer_max_size", &tle::KvCacheConfig::getEventBufferMaxSize,
             &tle::KvCacheConfig::setEventBufferMaxSize)
+        .def_property("enable_partial_reuse", &tle::KvCacheConfig::getEnablePartialReuse,
+            &tle::KvCacheConfig::setEnablePartialReuse)
+        .def_property("copy_on_partial_reuse", &tle::KvCacheConfig::getCopyOnPartialReuse,
+            &tle::KvCacheConfig::setCopyOnPartialReuse)
         .def("fill_empty_fields_from_runtime_defaults", &tle::KvCacheConfig::fillEmptyFieldsFromRuntimeDefaults)
         .def(py::pickle(kvCacheConfigGetstate, kvCacheConfigSetstate));
 

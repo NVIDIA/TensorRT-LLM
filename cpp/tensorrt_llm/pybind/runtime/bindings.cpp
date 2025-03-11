@@ -16,9 +16,11 @@
  */
 
 #include "bindings.h"
+#include "tensorrt_llm/kernels/allReduceFusionKernels.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/decodingInput.h"
 #include "tensorrt_llm/runtime/decodingOutput.h"
+#include "tensorrt_llm/runtime/gptDecoder.h"
 #include "tensorrt_llm/runtime/gptDecoderBatched.h"
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
@@ -31,7 +33,9 @@
 #include "tensorrt_llm/runtime/speculativeDecodingMode.h"
 #include "tensorrt_llm/runtime/tllmRuntime.h"
 #include "tensorrt_llm/runtime/torch.h"
+#include "tensorrt_llm/runtime/torchView.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
+#include <ATen/ATen.h>
 #include <c10/cuda/CUDAStream.h>
 #include <pybind11/stl.h>
 #include <pybind11/stl_bind.h>
@@ -147,6 +151,41 @@ public:
     }
 };
 
+class PyIGptDecoder : public tr::IGptDecoder
+{
+public:
+    using tr::IGptDecoder::IGptDecoder; // Inherit constructors
+
+    void setup(tr::SamplingConfig const& samplingConfig, size_t batchSize,
+        tr::DecodingInput::TensorConstPtr const& batchSlots,
+        std::optional<tr::DecodingOutput> const& output = std::nullopt,
+        std::optional<std::vector<tr::decoder_batch::Request> const> const& requests = std::nullopt) override
+    {
+        PYBIND11_OVERRIDE_PURE(void, IGptDecoder, setup, samplingConfig, batchSize, batchSlots, output, requests);
+    }
+
+    void forwardAsync(tr::DecodingOutput& output, tr::DecodingInput const& input) override
+    {
+        PYBIND11_OVERRIDE_PURE(void, IGptDecoder, forwardAsync, output, input);
+    }
+
+    void forwardSync(tr::DecodingOutput& output, tr::DecodingInput const& input) override
+    {
+        PYBIND11_OVERRIDE_PURE(void, IGptDecoder, forwardSync, output, input);
+    }
+
+    tr::SamplingConfig const& getSamplingConfig() override
+    {
+        PYBIND11_OVERRIDE_PURE(tr::SamplingConfig const&, IGptDecoder, getSamplingConfig);
+    }
+
+    void disableLookahead(std::optional<tr::SamplingConfig> const& samplingConfig, tr::SizeType32 batchSize,
+        tr::DecodingInput::TensorConstPtr batchSlots) override
+    {
+        PYBIND11_OVERRIDE_PURE(void, IGptDecoder, disableLookahead, samplingConfig, batchSize, batchSlots);
+    }
+};
+
 namespace tensorrt_llm::pybind::runtime
 {
 
@@ -171,7 +210,7 @@ void initBindings(pybind11::module_& m)
 
     py::class_<tr::SpeculativeDecodingMode>(m, "SpeculativeDecodingMode")
         .def(py::init<tr::SpeculativeDecodingMode::UnderlyingType>(), py::arg("state"))
-        .def_static("None", &tr::SpeculativeDecodingMode::None)
+        .def_static("NoneType", &tr::SpeculativeDecodingMode::None)
         .def_static("DraftTokensExternal", &tr::SpeculativeDecodingMode::DraftTokensExternal)
         .def_static("Medusa", &tr::SpeculativeDecodingMode::Medusa)
         .def_static("LookaheadDecoding", &tr::SpeculativeDecodingMode::LookaheadDecoding)
@@ -182,7 +221,9 @@ void initBindings(pybind11::module_& m)
         .def_property_readonly("is_lookahead_decoding", &tr::SpeculativeDecodingMode::isLookaheadDecoding)
         .def_property_readonly("is_explicit_draft_tokens", &tr::SpeculativeDecodingMode::isExplicitDraftTokens)
         .def_property_readonly("needs_kv_cache_rewind", &tr::SpeculativeDecodingMode::needsKVCacheRewind)
-        .def_property_readonly("needs_decoder_prologue", &tr::SpeculativeDecodingMode::needsDecoderPrologue);
+        .def_property_readonly("needs_decoder_prologue", &tr::SpeculativeDecodingMode::needsDecoderPrologue)
+        .def_property_readonly("predicts_draft_tokens", &tr::SpeculativeDecodingMode::predictsDraftTokens)
+        .def_property_readonly("needs_kv_cache_rewind", &tr::SpeculativeDecodingMode::needsKVCacheRewind);
 
     py::classh<tr::TllmRuntime>(m, "TllmRuntime")
         .def(py::init(
@@ -291,6 +332,19 @@ void initBindings(pybind11::module_& m)
             }))
         .def("synchronize", [](tr::decoder_batch::DecoderFinishedEvent& self) { self.event.synchronize(); });
 
+    py::class_<tr::IGptDecoder, PyIGptDecoder>(m, "IGptDecoder")
+        .def(
+            "setup",
+            [](tr::IGptDecoder& self, tr::SamplingConfig const& samplingConfig, size_t batchSize,
+                at::Tensor const& batchSlots, std::optional<tr::DecodingOutput> const& output = std::nullopt,
+                std::optional<std::vector<tr::decoder_batch::Request> const> const& requests = std::nullopt)
+            {
+                auto tensorPtrBatchSlots = tr::TorchView::of(batchSlots);
+                return self.setup(samplingConfig, batchSize, std::move(tensorPtrBatchSlots), output, requests);
+            },
+            py::arg("sampling_config"), py::arg("batch_size"), py::arg("batch_slots"), py::arg("output") = std::nullopt,
+            py::arg("requests") = std::nullopt);
+
     py::class_<tr::GptDecoderBatched>(m, "GptDecoderBatched")
         .def(py::init<tr::GptDecoderBatched::CudaStreamPtr, tr::SpeculativeDecodingMode const&, nvinfer1::DataType>(),
             py::arg("stream"), py::arg("speculative_decoding_mode"), py::arg("dtype"))
@@ -306,6 +360,11 @@ void initBindings(pybind11::module_& m)
             py::arg("explicit_draft_tokens_buffers"))
         .def("setup_lookahead", py::overload_cast<tr::LookaheadDecodingBuffers>(&tr::GptDecoderBatched::setupLookahead),
             py::arg("lookahead_decoding_buffers"))
+        .def("underlying_decoder", &tr::GptDecoderBatched::getUnderlyingDecoder, py::return_value_policy::reference)
+        .def(
+            "new_tokens",
+            [](tr::GptDecoderBatched& self, int iter = 0) { return tr::Torch::tensor(self.getNewTokens(iter)); },
+            py::arg("iter") = 0)
         .def_property_readonly("decoding_mode", &tr::GptDecoderBatched::getDecodingMode)
         .def_property_readonly("joint_decoding_input", &tr::GptDecoderBatched::getJointDecodingInput)
         .def_property_readonly("joint_decoding_output", &tr::GptDecoderBatched::getJointDecodingOutput)
@@ -326,6 +385,11 @@ void initBindings(pybind11::module_& m)
                 reinterpret_cast<void*>(buffer_2), size);
         },
         "Lamport initialize all buffers");
+    m.def(
+        "lamport_initialize",
+        [](intptr_t buffer, size_t size)
+        { tensorrt_llm::kernels::ar_fusion::lamport_initialize(reinterpret_cast<void*>(buffer), size, 0); },
+        "Lmaport initialize buffer");
 }
 
 } // namespace tensorrt_llm::pybind::runtime

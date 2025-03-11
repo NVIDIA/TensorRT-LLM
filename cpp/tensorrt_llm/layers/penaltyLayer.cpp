@@ -344,7 +344,7 @@ void PenaltyLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& b
     }
 
     invokeBatchApplyPenalty(penaltyParams);
-    sync_check_cuda_error();
+    sync_check_cuda_error(penaltyParams.stream);
 
     mCyclicStep += 1;
 

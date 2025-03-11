@@ -82,6 +82,7 @@ from utils.llm_data import llm_models_root
             },
         ),
         # full llama3.1-8B model in fp8 with torch backend + simplellm runtime
+        # TODO: FP8 cache support is lacking right now: https://nvbugspro.nvidia.com/bug/5152021
         param_with_device_count(
             2,
             {
@@ -90,6 +91,7 @@ from utils.llm_data import llm_models_root
                     "nvidia/Llama-3.1-8B-Instruct-FP8",
                 ),
                 "benchmark": True,
+                "attn_backend": "FlashInfer",
             },
             marks_extra=[
                 pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support"),

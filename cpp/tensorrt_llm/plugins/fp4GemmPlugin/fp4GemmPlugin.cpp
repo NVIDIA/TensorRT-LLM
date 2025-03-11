@@ -64,7 +64,7 @@ void Fp4GemmPluginProfiler::runTactic(
     // Run profiling
     mRunner->gemm(dTmp, aTmp, bTmp, a_sf, b_sf, global_sf, m, n, k, /* batch_count */ 1, tactic, workspaceTmp,
         wsSizeRunner, stream);
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
 }
 
 void Fp4GemmPluginProfiler::computeTmpSize(size_t maxM, size_t n, size_t k)
@@ -281,7 +281,7 @@ int Fp4GemmPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1
             reinterpret_cast<float const*>(inputs[4]), m, n, k, /* batch_count */ 1, *bestTactic,
             reinterpret_cast<char*>(workspace), wsSize, stream);
     }
-    sync_check_cuda_error();
+    sync_check_cuda_error(stream);
     return 0;
 }
 

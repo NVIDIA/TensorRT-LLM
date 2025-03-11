@@ -1915,6 +1915,7 @@ def test_request_perf_metrics_kv_cache(model_path):
 
     # Enqueue the request
     request_id = executor.enqueue_request(request)
+    # Store two blocks with a total of 35 reusable tokens (4 input + 32 output, but last token is not stored)
 
     # Get the response
     responses = executor.await_responses(request_id)
@@ -1930,6 +1931,8 @@ def test_request_perf_metrics_kv_cache(model_path):
                              output_config=output_config)
 
     # Enqueue the request
+    # New query has 36 tokens that match input and output of first request plus 4 additional tokens.
+    # First block reused completely (32 tokens), from second block we'll partially reuse 3 tokens.
     request_id = executor.enqueue_request(request)
 
     # Get the response
@@ -1938,14 +1941,14 @@ def test_request_perf_metrics_kv_cache(model_path):
     result = responses[0].result
     assert result.is_final
 
-    # Check KV cache metric: one block should be reused from first request
-    # and one newly created -> 50% hit rate
+    # Check KV cache metric: Two blocks will be reused, although second block is partially reused.
+    # Cache hit rate is 100% since granularity is blocks, not tokens.
     kv_cache_metrics = result.request_perf_metrics.kv_cache_metrics
-    assert kv_cache_metrics.num_total_allocated_blocks == 1
-    assert kv_cache_metrics.num_new_allocated_blocks == 1
-    assert kv_cache_metrics.num_reused_blocks == 1
-    assert kv_cache_metrics.num_missed_blocks == 1
-    assert kv_cache_metrics.kv_cache_hit_rate == 0.5
+    assert kv_cache_metrics.num_total_allocated_blocks == 0
+    assert kv_cache_metrics.num_new_allocated_blocks == 0
+    assert kv_cache_metrics.num_reused_blocks == 2
+    assert kv_cache_metrics.num_missed_blocks == 0
+    assert kv_cache_metrics.kv_cache_hit_rate == 1.0
 
 
 @pytest.mark.parametrize("exclude_input_from_output", [False, True])

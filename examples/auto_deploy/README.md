@@ -39,7 +39,7 @@ ______________________________________________________________________
 AutoDeploy is accessible through TRT-LLM installation.
 
 ```bash
-sudo apt-get -y install libopenmpi-dev && pip3 install --upgrade pip setuptools && pip3 install tensorrt_llm --extra-index-url https://pypi.nvidia.com
+sudo apt-get -y install libopenmpi-dev && pip3 install --upgrade pip setuptools && pip3 install tensorrt_llm
 ```
 
 You can refer to [TRT-LLM installation guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/installation/linux.md) for more information.

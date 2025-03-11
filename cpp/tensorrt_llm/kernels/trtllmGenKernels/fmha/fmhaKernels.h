@@ -30,6 +30,8 @@
 #include "fmhaRunnerParams.h"
 #include "kernelParams.h"
 
+namespace tc = tensorrt_llm::common;
+
 namespace tensorrt_llm
 {
 namespace kernels
@@ -215,9 +217,9 @@ public:
 
 private:
     // Is it MLA generation kernel ?
-    inline bool isMlaGenKernel(KernelMeta const& kernelMeta) const
+    inline bool isMlaGenKernel(RunnerParams const& params) const
     {
-        return kernelMeta.mHeadDimQk == 576 && kernelMeta.mHeadDimV == 512;
+        return params.mHeadDimQk == 576 && params.mHeadDimV == 512;
     }
 
     // Compute the number of CTAs in X, Y and Z dimension.
@@ -246,7 +248,7 @@ private:
         // Compute the grid dimension Z.
         int numCtasZ = params.mBatchSize;
         // MTP kernels use different blockY to process MTP tokens.
-        if (isMlaGenKernel(kernelMeta) && params.mMaxSeqLenQ > 1)
+        if (isMlaGenKernel(params) && params.mMaxSeqLenQ > 1)
         {
             numCtasZ *= params.mMaxSeqLenQ;
             numCtasPerSeqQ = 1;
@@ -255,8 +257,9 @@ private:
         // Compute the current number of CTAs in total.
         int totalNumCtasYz = numCtasZ * numHeadsPerCta;
 
-        // The heuristic to select MLA kernels.
-        if (isMlaGenKernel(kernelMeta) && !selectKernelParams.mReuseSmemKForV)
+        // The heuristic to select MLA low-latency kernels.
+        if (isMlaGenKernel(params) && isSwapsMmaAbForGenerationKernel(selectKernelParams.mKernelType)
+            && !selectKernelParams.mReuseSmemKForV)
         {
             // Split the headDimV into multiple CTAs if the utilization is not full.
             // TODO: find better heuristic of splitting headDimV across multiple CTAs.
@@ -316,9 +319,32 @@ private:
         RunnerParams const& params, SelectKernelParams& selectKernelParams) const
     {
         // The updated kernel type.
-        FmhaKernelType kernelType = params.mKernelType;
+        FmhaKernelType& kernelType = selectKernelParams.mKernelType;
         // Generation kernelType will use either SwapsMmaAbForGeneration or KeepsMmaAbForGeneration.
-        if (isGenerationKernel(params.mKernelType))
+        if (isGenerationKernel(params.mKernelType) && isMlaGenKernel(params))
+        {
+            // We use the low-latency kernel (SwapsMmaAbForGeneration with tileSizeQ = 16) when any of the following
+            // conditions are met:
+            // 1. The number of headsQPerKv is <= 32.
+            // 2. MTP is enabled.
+            // 3. BatchSize x ceil(headsQPerKv, 16) <= the number of multiprocessors.
+            if (params.mNumHeadsQPerKv <= 32 || params.mMaxSeqLenQ > 1
+                || static_cast<int32_t>(params.mBatchSize * tc::divUp(params.mNumHeadsQPerKv, 16))
+                    <= params.mMultiProcessorCount)
+            {
+                kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
+            }
+            else
+            {
+                // Otherwise, we use the high-throughput kernel (KeepsMmaAbForGeneration with tileSizeQ = 64).
+                kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
+                // Set the multiCtasKvMode to false and use the persistent scheduler for high-throughput generation
+                // kernels.
+                selectKernelParams.mMultiCtasKvMode = false;
+                selectKernelParams.mTileScheduler = TileScheduler::Persistent;
+            }
+        }
+        else if (isGenerationKernel(params.mKernelType))
         {
             kernelType = (params.mNumHeadsQPerKv <= 16 && params.mHeadDimQk != 32)
                 ? FmhaKernelType::SwapsMmaAbForGeneration
@@ -326,14 +352,11 @@ private:
         }
 
         // The maximum number of headsQPerKv that the kernel can support in one Cta.
-        int& maxNumHeadsQPerKvInCta = selectKernelParams.mMaxNumHeadsQPerKvInCta;
+        int maxNumHeadsQPerKvInCta = 1;
         if (isSwapsMmaAbForGenerationKernel(kernelType))
         {
-            // Set maxNumHeadsQPerKvInCta automatically if not set.
-            if (maxNumHeadsQPerKvInCta == 1)
-            {
-                maxNumHeadsQPerKvInCta = (params.mNumHeadsQPerKv <= 8) ? 8 : 16;
-            }
+            // Set the corresponding maxNumHeadsQPerKvInCta (tileSizeQ) for low-latency generation kernels.
+            maxNumHeadsQPerKvInCta = (params.mNumHeadsQPerKv <= 8) ? 8 : 16;
             TLLM_CHECK_WITH_INFO((maxNumHeadsQPerKvInCta == 8 || maxNumHeadsQPerKvInCta == 16)
                     && (params.mNumHeadsQPerKv < maxNumHeadsQPerKvInCta
                         || params.mNumHeadsQPerKv % maxNumHeadsQPerKvInCta == 0),
@@ -341,14 +364,10 @@ private:
         }
         else if (isKeepsMmaAbForGenerationKernel(kernelType))
         {
-            // Set maxNumHeadsQPerKvInCta automatically if not set.
-            if (maxNumHeadsQPerKvInCta == 1)
-            {
-                maxNumHeadsQPerKvInCta = 32;
-            }
-            TLLM_CHECK_WITH_INFO(maxNumHeadsQPerKvInCta == 32
-                    && (params.mNumHeadsQPerKv < maxNumHeadsQPerKvInCta
-                        || params.mNumHeadsQPerKv % maxNumHeadsQPerKvInCta == 0),
+            // Use the maxNumHeadsQPerKvInCta (tileSizeQ) = 64 for MLA high-throughput generation kernels.
+            maxNumHeadsQPerKvInCta = isMlaGenKernel(params) ? 64 : 32;
+            TLLM_CHECK_WITH_INFO((params.mNumHeadsQPerKv < maxNumHeadsQPerKvInCta
+                                     || params.mNumHeadsQPerKv % maxNumHeadsQPerKvInCta == 0),
                 "Not supported");
         }
         else if (isContextKernel(kernelType))

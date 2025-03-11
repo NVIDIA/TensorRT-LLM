@@ -383,6 +383,25 @@ def torch_dtype_to_trt(dtype):
     return ret
 
 
+_torch_to_binding_dtype_dict = {
+    torch.float16: DataType.HALF,
+    torch.float32: DataType.FLOAT,
+    torch.int64: DataType.INT64,
+    torch.int32: DataType.INT32,
+    torch.int8: DataType.INT8,
+    torch.float8_e4m3fn: DataType.FP8,
+    torch.qint8: DataType.INT8,
+    torch.bool: DataType.BOOL,
+    torch.bfloat16: DataType.BF16
+}
+
+
+def torch_dtype_to_binding(dtype):
+    ret = _torch_to_binding_dtype_dict.get(dtype)
+    assert ret is not None, f'Unsupported dtype: {dtype}'
+    return ret
+
+
 _torch_dtype_to_np_typestr_dict = {
     torch.float16: "<f2",
     torch.float32: "<f4",
@@ -754,3 +773,113 @@ def convert_to_torch_tensor(
         raise RuntimeError(
             "Data pointer mismatch after converting to torch.Tensor")
     return new_tensor
+
+
+class KVCacheEventSerializer:
+
+    def get_event_serialize_func(event_type):
+        return {
+            "KVCacheCreatedData": KVCacheEventSerializer._created_to_json,
+            "KVCacheStoredData": KVCacheEventSerializer._stored_to_json,
+            "KVCacheStoredBlockData":
+            KVCacheEventSerializer._stored_block_to_json,
+            "KVCacheRemovedData": KVCacheEventSerializer._removed_to_json,
+            "KVCacheUpdatedData": KVCacheEventSerializer._updated_to_json,
+        }.get(event_type, None)
+
+    @staticmethod
+    def serialize(events):
+        if events is None:
+            return None
+
+        if not isinstance(events, list):
+            events = [events]
+
+        return [KVCacheEventSerializer.to_json_str(event) for event in events]
+
+    @staticmethod
+    def to_json_str(event):
+        if event is None:
+            return {}
+
+        event_type = type(event.data).__name__
+        event_serialize_func = KVCacheEventSerializer.get_event_serialize_func(
+            event_type)
+        if event_serialize_func is None:
+            raise ValueError(f"Unknown KVCache event data type: {event_type}")
+
+        return {
+            "event_id": event.event_id,
+            "data": event_serialize_func(event.data),
+        }
+
+    @staticmethod
+    def _created_to_json(data):
+        return {
+            "type": "created",
+            "num_blocks_per_cache_level": data.num_blocks_per_cache_level
+        }
+
+    @staticmethod
+    def _stored_to_json(data):
+        return {
+            "type":
+            "stored",
+            "parent_hash":
+            data.parent_hash,
+            "blocks": [
+                KVCacheEventSerializer._stored_block_to_json(block)
+                for block in data.blocks
+            ]
+        }
+
+    @staticmethod
+    def _stored_block_to_json(data):
+        return {
+            "type":
+            "stored_block",
+            "block_hash":
+            data.block_hash,
+            "tokens": [
+                KVCacheEventSerializer._unique_tokens_to_json(token)
+                for token in data.tokens
+            ],
+            # "lora_id": data.lora_id, # TODO (shreyasm): enable serialization of lora_id
+            "cache_level":
+            data.cache_level,
+            "priority":
+            data.priority
+        }
+
+    @staticmethod
+    def _removed_to_json(data):
+        return {"type": "removed", "block_hashes": data.block_hashes}
+
+    @staticmethod
+    def _updated_to_json(data):
+        return {
+            "type":
+            "updated",
+            "block_hash":
+            data.block_hash,
+            "cache_level":
+            KVCacheEventSerializer._event_diff_to_json(data.cache_level),
+            "priority":
+            KVCacheEventSerializer._event_diff_to_json(data.priority)
+        }
+
+    @staticmethod
+    def _event_diff_to_json(data):
+        return {
+            "type": "event_diff",
+            "new_value": data.new_value,
+            "old_value": data.old_value
+        }
+
+    @staticmethod
+    def _unique_tokens_to_json(data):
+        return {
+            "type": "unique_token",
+            "token_id": data.token_id,
+            "token_extra_id": data.token_extra_id
+        }
